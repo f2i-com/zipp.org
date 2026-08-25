@@ -3,7 +3,7 @@
 //! `MakeFunc` is allocation plus two pieces of execution-context metadata:
 //! the active callee's Realm and inherited dynamic EvalScope. Frame-free
 //! native cross-calls have no callee `Frame`, so entry code pins the exact
-//! callable in `Vm::jit_tierc_callee`; this module validates that identity
+//! callable in `Vm::jit_tierc_activation`; this module validates that identity
 //! against immutable bytecode before committing anything.
 
 use super::*;
@@ -62,7 +62,10 @@ fn make_func_preflight(vm: &Vm<'_>, packed_fip: u64) -> Option<MakeFuncPlan> {
         return None;
     }
 
-    let active = vm.jit_tierc_callee;
+    if !vm.jit_tierc_activation.active {
+        return None;
+    }
+    let active = vm.jit_tierc_activation.callee;
     if active == NO_CLOSURE || active as usize >= vm.heap.len() {
         return None;
     }
@@ -105,7 +108,7 @@ pub(crate) extern "win64" fn jit_make_func(vm: *mut core::ffi::c_void, packed_fi
 
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
-        // `jit_tierc_callee`, its EvalScope and all frame/register Values are
+        // The active Tier-C callable, its EvalScope and all frame/register Values are
         // explicit roots. The collector is non-moving; the preflighted ids
         // remain valid after this safe point.
         vm.maybe_gc();
@@ -210,7 +213,12 @@ mod tests {
             .alloc(HeapObj::EvalScope(std::collections::HashMap::new()));
         vm.closure_eval_scope.insert(active, scope);
         vm.obj_realm.insert(active, 7);
-        vm.jit_tierc_callee = active;
+        vm.jit_tierc_activation = TiercActivationState {
+            active: true,
+            frame_free: true,
+            closure: NO_CLOSURE,
+            callee: active,
+        };
         vm.gc_stress = true;
 
         let vm_ptr = &mut vm as *mut Vm as *mut core::ffi::c_void;
@@ -226,7 +234,7 @@ mod tests {
     fn make_func_declines_before_allocation_without_exact_active_callable() {
         let mut vm = vm("function maker() { return function child() {}; }");
         let (caller, ip, _) = make_func_site(&vm);
-        vm.jit_tierc_callee = NO_CLOSURE;
+        vm.jit_tierc_activation = TiercActivationState::EMPTY;
         let before = vm.heap.len();
         let vm_ptr = &mut vm as *mut Vm as *mut core::ffi::c_void;
         let packed = ((caller as u64) << 32) | ip as u64;

@@ -57,6 +57,8 @@ impl Compiler {
     pub(crate) fn new(source: String) -> Compiler {
         Compiler {
             functions: Vec::new(),
+            static_key_plan_sites: 0,
+            static_key_plan_retained_bytes: 0,
             globals: Vec::new(),
             global_index: rustc_hash::FxHashMap::default(),
             classes: Vec::new(),
@@ -1135,6 +1137,7 @@ impl Compiler {
             simple_params: params_ast.map(|pa| pa.simple).unwrap_or(false),
             constants: fc.constants,
             string_constants: fc.string_constants,
+            static_key_plans: fc.static_key_plans,
             bigint_consts: fc.bigint_consts,
             wtf8_consts: fc.wtf8_consts,
             name_global: None, // set by the caller for top-level declarations
@@ -1458,6 +1461,7 @@ impl Compiler {
             simple_params: false, // strict (class body) — never mapped anyway
             constants: fc.constants,
             string_constants: fc.string_constants,
+            static_key_plans: fc.static_key_plans,
             bigint_consts: fc.bigint_consts,
             wtf8_consts: fc.wtf8_consts,
             name_global: None,
@@ -1678,6 +1682,7 @@ impl Compiler {
             simple_params: a.params.simple,
             constants: fc.constants,
             string_constants: fc.string_constants,
+            static_key_plans: fc.static_key_plans,
             bigint_consts: fc.bigint_consts,
             wtf8_consts: fc.wtf8_consts,
             name_global: None,

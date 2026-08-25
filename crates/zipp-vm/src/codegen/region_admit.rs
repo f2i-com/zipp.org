@@ -1461,6 +1461,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) cross_call: usize,
     /// Same-prototype lexical-arrow/two-argument cross-call specialization.
     pub(crate) cross_call_same_proto2: usize,
+    /// Bounded immutable-bytecode static-record factory prefix.
+    pub(crate) static_record_factory: usize,
     /// `PROP_VIA_IC` continuation for GetProp (accessor / class receiver).
     pub(crate) get_prop_slow: usize,
     /// `PROP_VIA_IC` continuation for SetProp.

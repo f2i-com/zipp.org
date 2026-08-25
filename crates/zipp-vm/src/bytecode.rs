@@ -1226,6 +1226,16 @@ pub enum Instr {
         dst: Reg,
         hint: u16,
     },
+    /// A fresh ordinary object whose following `AppendDataProp` sequence has a
+    /// compiler-proved, immutable key list. `plan` indexes
+    /// `FuncProto::static_key_plans`; the runtime initially exposes an empty
+    /// prefix and advances it once per matching append. This is only a storage
+    /// optimisation: malformed/mismatching sequences materialise ordinary
+    /// owned keys before continuing.
+    NewPlannedObject {
+        dst: Reg,
+        plan: u16,
+    },
     /// `dst = ToObject(src)` — `Object(x)` / `new Object(x)`: primitives box
     /// (string/number/boolean/symbol/bigint wrappers), null/undefined → a fresh
     /// object, and an existing object is returned unchanged.
@@ -1494,8 +1504,8 @@ pub enum Instr {
     /// `__proto__:` before it. Appends without the existence probe that
     /// `ObjMap::define` performs, which is what made building a literal O(n^2)
     /// in its key count. No version bump is needed (nor done by `InitDataProp`):
-    /// the object was created by the immediately preceding `NewObject`, so no
-    /// inline cache can hold a slot for it yet.
+    /// the object was created by this literal's earlier `NewObject` or
+    /// `NewPlannedObject`, so no inline cache can hold a slot for it yet.
     AppendDataProp {
         obj: Reg,
         name: u32,
@@ -1969,6 +1979,11 @@ pub struct FuncProto {
     /// Heap-string constants referenced by `LoadConst` need their text; this
     /// parallels `constants` for the string case (resolved at load time).
     pub string_constants: Vec<String>,
+    /// Compiler-prepared key lists for allocation-surviving object literals.
+    /// The backing `Arc` is immutable after compilation and can be shared by
+    /// every object created at the same literal site without joining the GC
+    /// graph or a process-global attacker-fillable interner.
+    pub static_key_plans: Vec<StaticKeyPlan>,
     /// BigInt literal constants BEYOND i128 (`LoadBigIntBig` indexes here),
     /// parsed once at compile time. In-range literals stay inline in
     /// `LoadBigInt`; this pool is empty for virtually every function.
@@ -2004,6 +2019,138 @@ pub struct FuncProto {
     /// the synthetic top-level script body and for placeholders, in which case
     /// `toString` falls back to the native-function form.
     pub source: String,
+}
+
+/// Immutable property names shared by all objects created at one eligible
+/// object-literal bytecode site. Equality/serialization must be by key text,
+/// never by `Arc` identity.
+#[derive(Debug)]
+struct StaticKeyPlanData {
+    keys: Vec<String>,
+    /// Cached once at compilation/deserialization boundary so hot allocation
+    /// does not rescan up to 256 strings. Invalid hand-built plans fail closed.
+    runtime_valid: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct StaticKeyPlan(std::sync::Arc<StaticKeyPlanData>);
+
+/// Retained-plan ceilings. A single compiler accepts only a modest number of
+/// profitable literal sites; a live VM additionally bounds the aggregate from
+/// separately-created eval/module Compilers before their FuncProtos are leaked.
+pub(crate) const STATIC_KEY_PLAN_COMPILER_MAX_SITES: usize = 256;
+pub(crate) const STATIC_KEY_PLAN_VM_MAX_SITES: usize = 4_096;
+pub(crate) const STATIC_KEY_PLAN_MAX_RETAINED_BYTES: usize = 8 * 1024 * 1024;
+
+/// One process-wide comparator latch shared by compilation and runtime. When
+/// disabled, the compiler emits legacy NewObject bytecode and retains no plan
+/// metadata; runtime checking remains for precompiled Programs.
+#[inline]
+pub(crate) fn static_key_plans_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_STATIC_KEY_PLANS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Conservative retained heap charge for one plan. This deliberately prices
+/// more than key text:
+///
+/// * 96 bytes covers the outer plan-Vec slot/slack plus the Arc allocation,
+///   strong/weak counters, inner Vec header, and allocator metadata;
+/// * every key pays its 24-byte String record plus 24 bytes of allocator/slack;
+/// * every cloned payload pays at least one 16-byte allocation block, rounded
+///   up to a 16-byte boundary.
+///
+/// The accounting is fixed rather than `size_of`-derived so it remains
+/// conservative on 32-bit targets too.
+pub(crate) fn static_key_plan_retained_charge(keys: &[String]) -> Option<usize> {
+    let mut charge = 96usize;
+    for key in keys {
+        let payload = key.len().max(1).checked_add(15)? & !15usize;
+        charge = charge.checked_add(48)?.checked_add(payload)?;
+    }
+    Some(charge)
+}
+
+/// Actual plan allocations retained by a set of FuncProtos. Counting the
+/// pools, rather than NewPlannedObject instructions, also charges unused
+/// entries supplied by a hand-built Program. Invalid metadata declines before
+/// walking key payloads, so an oversize hand-built plan cannot amplify the VM
+/// admission pass.
+pub(crate) fn static_key_plan_usage(functions: &[FuncProto]) -> Option<(usize, usize)> {
+    let mut sites = 0usize;
+    let mut bytes = 0usize;
+    for plan in functions.iter().flat_map(|func| &func.static_key_plans) {
+        if !plan.runtime_valid() {
+            return None;
+        }
+        sites = sites.checked_add(1)?;
+        bytes = bytes.checked_add(static_key_plan_retained_charge(plan.keys())?)?;
+    }
+    Some((sites, bytes))
+}
+
+impl StaticKeyPlan {
+    pub(crate) fn new(keys: Vec<String>) -> Self {
+        let runtime_valid = if keys.len() > 256 {
+            false
+        } else {
+            // RandomState's keyed hash avoids the quadratic common-prefix and
+            // collision amplification of a prefix scan on hand-built or
+            // deserialized plans. Compiler plans are already proven unique;
+            // this is the bounded runtime trust-boundary validation.
+            let mut seen = std::collections::HashSet::with_capacity(keys.len());
+            keys.iter().all(|key| seen.insert(key.as_str()))
+        };
+        Self(std::sync::Arc::new(StaticKeyPlanData {
+            keys,
+            runtime_valid,
+        }))
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.keys.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.keys.is_empty()
+    }
+
+    #[inline]
+    pub fn keys(&self) -> &[String] {
+        self.0.keys.as_slice()
+    }
+
+    #[inline]
+    pub(crate) fn runtime_valid(&self) -> bool {
+        self.0.runtime_valid
+    }
+}
+
+#[cfg(test)]
+mod static_key_plan_layout_tests {
+    use super::*;
+
+    /// `static_key_plans` adds one empty Vec (24 bytes) to every function even
+    /// when the optimization never applies. Keep that startup/many-function
+    /// cost, plus the retained-charge assumptions for non-empty plans, explicit.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn func_proto_and_plan_metadata_layouts_are_pinned() {
+        assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);
+        assert_eq!(std::mem::size_of::<StaticKeyPlanData>(), 32);
+        assert_eq!(std::mem::size_of::<FuncProto>(), 272);
+    }
 }
 
 /// Where a closure's upvalue is sourced from, evaluated in the defining frame.

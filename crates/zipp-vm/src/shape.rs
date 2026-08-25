@@ -26,10 +26,10 @@
 //!
 //! ## What this module deliberately does NOT do yet
 //!
-//! It does not change `ObjMap`'s layout. The keys, values and attributes stay in
-//! the three parallel vectors they are in today, and the shape is maintained
-//! ALONGSIDE them as a redundant summary. That is the whole point of landing it
-//! this way round:
+//! It does not replace `ObjMap`'s authoritative layout. Keys, values and
+//! attributes stay in three parallel contiguous sequences, and the shape is
+//! maintained ALONGSIDE them as a redundant summary. That is the whole point of
+//! landing it this way round:
 //!
 //!   * the shape can be validated against the real data (a debug assertion
 //!     compares `shape_len` to `keys.len()`, and the fill path resolves the slot

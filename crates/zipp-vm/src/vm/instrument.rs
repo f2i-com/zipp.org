@@ -1190,9 +1190,11 @@ fn classify(instr: &Instr) -> (u8, Claim, Option<u16>, Option<u16>, u64, Option<
         SetIndex { obj, key, val } => (op::PROP, Claim::Flat, Some(obj), Some(key), 0, Some(val)),
 
         // ── collection construction ──
-        NewArray { dst, .. } | NewObject { dst, .. } | NewMap { dst, .. } | NewSet { dst, .. } => {
-            (op::COLLECTION, Claim::Flat, None, None, 0, Some(dst))
-        }
+        NewArray { dst, .. }
+        | NewObject { dst, .. }
+        | NewPlannedObject { dst, .. }
+        | NewMap { dst, .. }
+        | NewSet { dst, .. } => (op::COLLECTION, Claim::Flat, None, None, 0, Some(dst)),
 
         // Everything else attests only that a step happened here.
         _ => (op::OTHER, Claim::None, None, None, 0, None),
@@ -1330,11 +1332,17 @@ mod tests {
     fn exact_final_native_block_succeeds_and_the_next_attempt_fails() {
         const SRC: &str = "function add1(x) { return x + 1; }";
 
-        fn exercise(limit: i64) -> (crate::vm::Vm<'static>, Result<Value, crate::vm::Thrown>) {
+        fn exercise(
+            limit: i64,
+            interpreter_only: bool,
+        ) -> (crate::vm::Vm<'static>, Result<Value, crate::vm::Thrown>) {
             let mut vm = crate::vm::Vm::new(program(SRC));
             let mut rec = Recorder::new();
             rec.remaining = limit;
             vm.set_instrumentation(rec);
+            if interpreter_only {
+                vm.set_jit_enabled(false);
+            }
             vm.run().expect("top level initializes");
 
             let slot = vm.func(1).name_global.expect("add1 has a global slot");
@@ -1346,22 +1354,36 @@ mod tests {
                     Value::int(i + 1)
                 );
             }
-            assert!(
-                vm.jit.get(1).is_some(),
-                "the boundary call must exercise compiled code"
-            );
+            if !interpreter_only {
+                assert!(
+                    vm.jit.get(1).is_some(),
+                    "the boundary call must exercise compiled code"
+                );
+            }
             let result = vm.call_value(callee, Value::UNDEFINED, &[Value::int(8)]);
             (vm, result)
         }
 
         // First measure this deterministic run with an unlimited recorder. The
         // ninth call is the first one to enter the whole-function native body.
-        let (measured, result) = exercise(i64::MAX);
+        let (measured, result) = exercise(i64::MAX, false);
         assert_eq!(result.expect("measurement call succeeds"), Value::int(9));
         let exact_steps = measured.instr_rec.as_ref().unwrap().used;
         assert!(exact_steps > 0);
+        assert!(
+            exact_steps < NATIVE_CHUNK as u64,
+            "the tier oracle must not conflate block accounting with chunk boundaries"
+        );
 
-        let (mut exact, result) = exercise(exact_steps as i64);
+        let (interpreted, result) = exercise(i64::MAX, true);
+        assert_eq!(result.expect("interpreter oracle succeeds"), Value::int(9));
+        assert_eq!(
+            exact_steps,
+            interpreted.instr_rec.as_ref().unwrap().used,
+            "native and interpreter execution must charge the same bytecodes"
+        );
+
+        let (mut exact, result) = exercise(exact_steps as i64, false);
         assert_eq!(result.expect("exact native call succeeds"), Value::int(9));
         assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
         assert_eq!(exact.instrument_resource_limit_error(), None);
@@ -1377,7 +1399,7 @@ mod tests {
             Some(ResourceExhaustion::Steps)
         );
 
-        let (mut short, result) = exercise(exact_steps as i64 - 1);
+        let (mut short, result) = exercise(exact_steps as i64 - 1, false);
         let err = result.expect_err("one fewer step must reject the native call");
         assert!(err.0.contains("instruction budget"), "got {err:?}");
         assert_eq!(short.instrument_resource_limit_error(), Some(BUDGET_MSG));

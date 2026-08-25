@@ -827,7 +827,9 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // preserve current-realm provenance and decline exotic/malformed
             // inputs before mutation.  Kept independently ablatable because
             // each append crosses the helper ABI.
-            Instr::NewObject { .. } | Instr::AppendDataProp { .. } => {
+            Instr::NewObject { .. }
+            | Instr::NewPlannedObject { .. }
+            | Instr::AppendDataProp { .. } => {
                 if !crate::vm::tierc_object_literal_enabled() {
                     reject!("[tierC-reject] object literal op (disabled)");
                 }
@@ -971,7 +973,8 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
 
 /// W7: the callee-window registers a Tier-C body may READ BEFORE WRITING, as a
 /// u64 bitmask (bit r = register r), or `u64::MAX` when the analysis declines
-/// (reg_count > 64, or an op outside the closed Tier-C admission set). The
+/// (reg_count > 64, or an op outside the closed Tier-C admission set). Wide
+/// functions use [`cross_uninit_wide_mask`] instead. The
 /// cross-call helper zeroes exactly these slots (plus missing arguments) when
 /// it reuses an already-initialized window via `set_len` instead of the
 /// zero-filling `resize`; every other register is proven DEF-BEFORE-USE on
@@ -1007,6 +1010,21 @@ pub(crate) fn cross_uninit_mask(proto: &FuncProto) -> u64 {
         proto.param_count as usize,
         cross_ud,
     )
+}
+
+/// The owned, multi-word form of [`cross_uninit_mask`] for Tier-C callees with
+/// more than 64 registers. `None` is fail-closed: the op/use table declined,
+/// an operand was outside the declared register window, or the proto was not
+/// wide. Each returned bit has the exact same may-read-before-write meaning as
+/// its W7 counterpart; keeping the words owned by the JIT avoids embedding any
+/// bytecode or heap pointers in cross-call metadata.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn cross_uninit_wide_mask(proto: &FuncProto) -> Option<Box<[u64]>> {
+    let regs = (proto.reg_count as usize).max(1);
+    if regs <= 64 {
+        return None;
+    }
+    do_wide_mask_passes(&proto.code, regs, proto.param_count as usize, cross_ud)
 }
 
 /// W11 (B124): the leaf-SPLICE variant of the mask, over the plan's (possibly
@@ -1100,6 +1118,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             | Instr::LoadBool { dst, .. }
             | Instr::LoadGlobal { dst, .. }
             | Instr::NewObject { dst, .. }
+            | Instr::NewPlannedObject { dst, .. }
             | Instr::MakeFunc { dst, .. } => (u0(), Some(dst)),
             Instr::Move { dst, src } => (u1(src), Some(dst)),
             Instr::UpvalGet { dst, .. } => (u0(), Some(dst)),
@@ -1238,13 +1257,22 @@ mod smallvec {
             self.len += 1;
             self
         }
-        pub(super) fn for_each(&self, mut f: impl FnMut(u16)) {
+        pub(super) fn count(&self) -> usize {
+            self.len as usize + self.range.1 as usize
+        }
+        /// Visit every referenced register. A malformed internal range that
+        /// overflows `u16` is rejected instead of wrapping or panicking.
+        pub(super) fn for_each(&self, mut f: impl FnMut(u16)) -> bool {
             for k in 0..self.len as usize {
                 f(self.regs[k]);
             }
-            for r in self.range.0..self.range.0 + self.range.1 {
+            let Some(end) = self.range.0.checked_add(self.range.1) else {
+                return false;
+            };
+            for r in self.range.0..end {
                 f(r);
             }
+            true
         }
     }
 }
@@ -1264,8 +1292,7 @@ fn do_mask_passes(
     for i in code.iter() {
         let Some((u, d)) = ud(i) else { return DECLINE };
         let mut bad = false;
-        u.for_each(|r| bad |= r as usize >= 64);
-        if bad || d.is_some_and(|r| r as usize >= 64) {
+        if !u.for_each(|r| bad |= r as usize >= 64) || bad || d.is_some_and(|r| r as usize >= 64) {
             return DECLINE; // defensive: reg_count said ≤ 64
         }
         uses.push(u);
@@ -1315,13 +1342,179 @@ fn do_mask_passes(
         if s == u64::MAX {
             continue; // unreachable code never reads anything
         }
-        uses[ip].for_each(|r| {
+        if !uses[ip].for_each(|r| {
             if s & (1u64 << r) == 0 {
                 mask |= 1u64 << r;
             }
-        });
+        }) {
+            return DECLINE;
+        }
     }
     mask
+}
+
+/// Wide-register counterpart of [`do_mask_passes`]. `None` is the decline
+/// sentinel; reached states are explicit `Option`s rather than an all-ones
+/// bitset because an all-ones state is a legitimate value once the register
+/// file spans multiple words. This runs once when a function is compiled, so
+/// the small owned vectors keep the execution path simple without adding any
+/// per-call allocation or pointer lifetime.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const WIDE_MASK_MAX_REGS: usize = 1_024;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const WIDE_MASK_MAX_WORDS: usize = WIDE_MASK_MAX_REGS.div_ceil(64);
+/// Maximum backing storage for the reached-state bitsets alone. The fixed
+/// tables are capped separately below; both checks run before allocation.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const WIDE_MASK_MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const WIDE_MASK_MAX_ANALYSIS_BYTES: usize = 8 * 1024 * 1024;
+/// Operand visits cover both the validation and final marking passes.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const WIDE_MASK_MAX_OPERAND_VISITS: usize = 4 * 1024 * 1024;
+/// A pass clones at most one state and meets it into at most two successors.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const WIDE_MASK_MAX_FIXPOINT_WORK: usize = 16 * 1024 * 1024;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const WIDE_MASK_MAX_FIXPOINT_PASSES: usize = 256;
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn do_wide_mask_passes(
+    code: &[Instr],
+    regs: usize,
+    params: usize,
+    ud: fn(&Instr) -> Option<(smallvec::Uses, Option<u16>)>,
+) -> Option<Box<[u64]>> {
+    let n = code.len();
+    if n == 0 || regs <= 64 || regs > WIDE_MASK_MAX_REGS || params >= regs {
+        return None;
+    }
+    let words = regs.div_ceil(64);
+    if words > WIDE_MASK_MAX_WORDS {
+        return None;
+    }
+
+    // Attacker-provided source can maximize both dimensions independently.
+    // Budget the worst case BEFORE any O(code_len * words) allocation, and
+    // decline to the ordinary full-fill path on overflow or excess. Include
+    // the fixed Vec/use/def tables so a two-word function with enormous code
+    // cannot hide most of its allocation outside the state-byte limit.
+    let state_words = n.checked_mul(words)?;
+    let state_bytes = state_words.checked_mul(std::mem::size_of::<u64>())?;
+    if state_bytes > WIDE_MASK_MAX_STATE_BYTES {
+        return None;
+    }
+    let fixed_row_bytes = std::mem::size_of::<Option<Vec<u64>>>()
+        .checked_add(std::mem::size_of::<smallvec::Uses>())?
+        .checked_add(std::mem::size_of::<Option<u16>>())?;
+    let fixed_bytes = n.checked_mul(fixed_row_bytes)?;
+    let analysis_bytes = state_bytes.checked_add(fixed_bytes)?;
+    if analysis_bytes > WIDE_MASK_MAX_ANALYSIS_BYTES {
+        return None;
+    }
+    let work_per_pass = state_words.checked_mul(3)?.checked_add(n)?;
+    if work_per_pass == 0 || work_per_pass > WIDE_MASK_MAX_FIXPOINT_WORK {
+        return None;
+    }
+    let pass_limit = WIDE_MASK_MAX_FIXPOINT_PASSES.min(WIDE_MASK_MAX_FIXPOINT_WORK / work_per_pass);
+    if pass_limit == 0 {
+        return None;
+    }
+
+    // Pass 1: the same closed use/def table as the <=64-register path, with
+    // the proto's declared window as the bound instead of one machine word.
+    let mut uses: Vec<smallvec::Uses> = Vec::with_capacity(n);
+    let mut defs: Vec<Option<u16>> = Vec::with_capacity(n);
+    let mut operand_visits = 0usize;
+    for i in code {
+        let (u, d) = ud(i)?;
+        operand_visits = operand_visits.checked_add(u.count())?;
+        if operand_visits.checked_mul(2)? > WIDE_MASK_MAX_OPERAND_VISITS {
+            return None;
+        }
+        let mut bad = false;
+        if !u.for_each(|r| bad |= r as usize >= regs)
+            || bad
+            || d.is_some_and(|r| r as usize >= regs)
+        {
+            return None;
+        }
+        uses.push(u);
+        defs.push(d);
+    }
+
+    // Pass 2: forward MUST-DEFINED fixpoint. `None` means unreachable; a
+    // reached successor receives a cloned state and subsequent predecessors
+    // meet into it with word-wise AND.
+    let mut entry = vec![0u64; words];
+    for r in 0..=params {
+        entry[r / 64] |= 1u64 << (r % 64);
+    }
+    let mut in_state: Vec<Option<Vec<u64>>> = vec![None; n];
+    in_state[0] = Some(entry);
+    let mut converged = false;
+    for _ in 0..pass_limit {
+        let mut changed = false;
+        for ip in 0..n {
+            let Some(mut out) = in_state[ip].clone() else {
+                continue;
+            };
+            if let Some(d) = defs[ip] {
+                let d = d as usize;
+                out[d / 64] |= 1u64 << (d % 64);
+            }
+            let (s1, s2) = match code[ip] {
+                Instr::Jump { target } => (Some(target as usize), None),
+                Instr::JumpIfFalse { target, .. }
+                | Instr::JumpIfTrue { target, .. }
+                | Instr::JumpIfNotLt { target, .. }
+                | Instr::JumpIfNotLe { target, .. } => (Some(ip + 1), Some(target as usize)),
+                Instr::Return { .. } | Instr::ReturnUndefined => (None, None),
+                _ => (Some(ip + 1), None),
+            };
+            for target in [s1, s2].into_iter().flatten().filter(|t| *t < n) {
+                match &mut in_state[target] {
+                    None => {
+                        in_state[target] = Some(out.clone());
+                        changed = true;
+                    }
+                    Some(prior) => {
+                        for (slot, incoming) in prior.iter_mut().zip(&out) {
+                            let meet = *slot & *incoming;
+                            if meet != *slot {
+                                *slot = meet;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            converged = true;
+            break;
+        }
+    }
+    if !converged {
+        return None;
+    }
+
+    // Pass 3: mark each reachable read not definitely written on every path.
+    let mut mask = vec![0u64; words];
+    for ip in 0..n {
+        let Some(state) = &in_state[ip] else {
+            continue;
+        };
+        if !uses[ip].for_each(|r| {
+            let r = r as usize;
+            if state[r / 64] & (1u64 << (r % 64)) == 0 {
+                mask[r / 64] |= 1u64 << (r % 64);
+            }
+        }) {
+            return None;
+        }
+    }
+    Some(mask.into_boxed_slice())
 }
 
 /// Compile the WHOLE body of `proto` to native code via the memory-path op
@@ -1795,6 +1988,27 @@ pub(crate) fn compile_proto_mem(
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
+            Instr::NewPlannedObject { dst, plan } => {
+                // The helper validates the unified FuncProto id and plan index
+                // before its GC/allocation commit point. Packing uses the same
+                // immutable-id convention as AppendDataProp.
+                let helper = crate::vm::jit_new_planned_object as usize;
+                let packed = ((func_id as u64) << 32) | plan as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD packed as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::NewArray {
                 dst,
                 arg_base,
@@ -1962,12 +2176,11 @@ pub(crate) fn compile_proto_mem(
                     // The helper returns the old Int bits. The emitted straight
                     // line then reconstructs every skipped register write in
                     // bytecode order; no guard remains after the commit.
-                    let xorshift_helper = crate::vm::jit_tierc_upval_xorshift_i32 as usize;
                     dynasm!(ops
                         ; mov rcx, rdi
                         ; mov edx, plan.idx as i32
                         ; mov r8, QWORD plan.packed as i64
-                        ; mov rax, QWORD xorshift_helper as i64
+                        ; mov rax, QWORD crate::vm::jit_tierc_upval_xorshift_i32 as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
@@ -3019,7 +3232,39 @@ pub(crate) fn compile_proto_mem(
                 let cross = cross_site.is_some() && leaf_plan.get(&ip).is_none();
                 let cross_done = ops.new_dynamic_label();
                 if cross {
-                    let same_proto2 = cross_site.flatten();
+                    let site = cross_site.expect("cross site disappeared during emission");
+                    if let Some(record) = site.static_record_factory {
+                        debug_assert_eq!(argc, 2);
+                        let record_fallback = ops.new_dynamic_label();
+                        let packed_record = ((record.fid as u64) << 32)
+                            | ((proto.reg_count.max(1) as u64) << 16)
+                            | u64::from(arg_base);
+                        dynasm!(ops
+                            ; mov rcx, rdi
+                            ; mov rdx, rbx
+                            ; lea r8, [rbx + dreg(arg_base)]
+                            ; mov r9, QWORD packed_record as i64
+                            ; mov rax, [rbx + dreg(callee)]
+                            ; mov [rsp + 32], rax
+                            ; mov rax, QWORD heap.static_record_factory as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => record_fallback
+                            ; mov r10, QWORD CALL_THREW as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                        if let Some((vb, icb)) = refetch {
+                            emit_refetch_pinned(&mut ops, vb, Some(icb));
+                        }
+                        dynasm!(ops
+                            ; jmp => cross_done
+                            ; => record_fallback
+                        );
+                    }
+                    let same_proto2 = site.same_proto2;
                     let packed_cross: u64 = match same_proto2 {
                         Some(plan) => {
                             ((plan.fid as u64) << 32)

@@ -126,6 +126,7 @@ fn run_child(filter: &str, marker: &str, env: &[(&str, &str)]) -> std::process::
         .env_remove("ZIPP_JIT_THRESHOLD")
         .env_remove("ZIPP_JITLOG")
         .env_remove("ZIPP_NO_TIERC_OBJECT_LITERAL")
+        .env_remove("ZIPP_NO_TIERC_PLANNED_APPEND_PROBE")
         .env_remove("ZIPP_NO_TIERC_NEW_ARRAY")
         .env_remove("ZIPP_NO_TIERC_LOOSE_NULL_EQ")
         .env_remove("ZIPP_NO_TIERC_INT_STRING")
@@ -186,6 +187,14 @@ fn object_literal_ablation_nojit_and_gc_modes_match() {
             ][..],
         ),
         (
+            "planned_probe_off",
+            &[
+                ("ZIPP_JIT_THRESHOLD", "1"),
+                ("ZIPP_JITLOG", "1"),
+                ("ZIPP_NO_TIERC_PLANNED_APPEND_PROBE", "1"),
+            ][..],
+        ),
+        (
             "array_off",
             &[
                 ("ZIPP_JIT_THRESHOLD", "1"),
@@ -212,10 +221,10 @@ fn object_literal_ablation_nojit_and_gc_modes_match() {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         let stderr = String::from_utf8_lossy(&out.stderr);
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if mode == "hot" {
+        if mode == "hot" || mode == "planned_probe_off" {
             assert!(
                 stderr.contains("Tier C"),
-                "object body did not compile:\n{stderr}"
+                "{mode} object body did not compile:\n{stderr}"
             );
         } else if mode == "object_off" {
             assert!(

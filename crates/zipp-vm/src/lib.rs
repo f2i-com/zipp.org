@@ -257,13 +257,42 @@ pub fn iter_region_stats() -> (u64, u64) {
     vm::iter_region_stats()
 }
 
+/// Runtime non-vacuity counters for compiler-planned object-literal keys:
+/// `(planned objects, allocation-free appends, materializations, Tier-C planned
+/// allocation helper executions)`. Enable with
+/// `ZIPP_STATIC_KEY_STATS=1`; otherwise all values remain zero.
+pub fn static_key_plan_stats() -> (u64, u64, u64, u64) {
+    heap::static_key_plan_stats()
+}
+
+/// Bounded static-record factory mechanism counters:
+/// `(installed_plans, helper_attempts, hits, pure_declines)`. Enable with
+/// `ZIPP_STATIC_RECORD_STATS=1`; all values are zero otherwise.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub fn static_record_factory_stats() -> (u64, u64, u64, u64) {
+    codegen::static_record_stats::dump()
+}
+
+/// No x86-64 Tier C means no static-record factory prefix.
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+pub fn static_record_factory_stats() -> (u64, u64, u64, u64) {
+    (0, 0, 0, 0)
+}
+
 /// `ZIPP_ICSTATS=1` W7 cross-call window-fill counters:
 /// `(fast_fills, full_fills)` — callee windows exposed via `set_len` under the
 /// register-file high-water mark with only the may-read-before-write registers
 /// re-zeroed, vs. full zero-filling `resize`s. Zeroed unless the variable was
-/// set. `ZIPP_NO_CROSSCALL2=1` forces every fill onto the full path.
+/// set. `ZIPP_NO_CROSSCALL2=1` forces every fill onto the full path;
+/// `ZIPP_NO_CROSSCALL_WIDE_MASK=1` does so only for >64-register callees.
 pub fn cross_fill_stats() -> (u64, u64) {
     vm::cross_fill_stats()
+}
+
+/// Tier-C activations entered while a frame-free caller was suspended.
+/// Non-zero only with `ZIPP_ICSTATS=1`.
+pub fn tierc_activation_root_stats() -> u64 {
+    vm::tierc_activation_root_stats()
 }
 
 /// `ZIPP_BUILTINSTATS=1` histogram: `(receiver kind, method name, calls)`,

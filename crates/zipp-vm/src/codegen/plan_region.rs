@@ -4861,6 +4861,7 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::UpvalGet { .. }
         | Instr::LoadUpvalDyn { .. }
         | Instr::NewObject { .. }
+        | Instr::NewPlannedObject { .. }
         | Instr::MakeFunc { .. }
         // The capture sources live in the CALLEE proto; they are declared at the
         // `MakeCell*` that boxes them (see the note above).
@@ -4974,6 +4975,7 @@ fn local_sroa_dst(i: &Instr) -> Option<u16> {
         | Instr::GetProp { dst, .. }
         | Instr::GetIndex { dst, .. }
         | Instr::NewObject { dst, .. }
+        | Instr::NewPlannedObject { dst, .. }
         | Instr::NewArray { dst, .. } => Some(dst),
         _ => None,
     }
@@ -4997,6 +4999,7 @@ fn local_sroa_supported_instr(i: &Instr) -> bool {
             | Instr::JumpIfNotLt { .. }
             | Instr::Jump { .. }
             | Instr::NewObject { .. }
+            | Instr::NewPlannedObject { .. }
             | Instr::AppendDataProp { .. }
             | Instr::GetProp { .. }
             | Instr::NewArray { .. }
@@ -5122,6 +5125,18 @@ pub(crate) fn plan_local_sroa(
     for alloc_ip in s + 1..e {
         let (dst, hint) = match code[alloc_ip] {
             Instr::NewObject { dst, hint } => (dst, hint),
+            Instr::NewPlannedObject { dst, plan } => {
+                // SROA can erase the allocation/helper entirely, so it must
+                // enforce the same metadata trust boundary itself instead of
+                // relying on the interpreter/JIT allocation helper to reject
+                // a duplicate or oversize hand-built plan.
+                let plan = proto.static_key_plans.get(plan as usize)?;
+                if !plan.runtime_valid() || plan.len() > 256 {
+                    return None;
+                }
+                let hint = u16::try_from(plan.len()).ok()?;
+                (dst, hint)
+            }
             _ => continue,
         };
         let mut prefix_killed = false;
@@ -5344,7 +5359,7 @@ pub(crate) fn plan_local_sroa(
                     _ => return None,
                 };
             }
-            Instr::NewObject { dst, .. } => {
+            Instr::NewObject { dst, .. } | Instr::NewPlannedObject { dst, .. } => {
                 let oid = *obj_by_reg.get(&dst)?;
                 tys[dst as usize] = LocalScalarTy::Object(oid);
             }
@@ -5978,7 +5993,10 @@ mod local_sroa_tests {
             .iter()
             .any(|i| matches!(
                 i,
-                Instr::NewObject { .. } | Instr::NewArray { .. } | Instr::AppendDataProp { .. }
+                Instr::NewObject { .. }
+                    | Instr::NewPlannedObject { .. }
+                    | Instr::NewArray { .. }
+                    | Instr::AppendDataProp { .. }
             )));
         // `point.tag.length` remains a real primitive-string length read; the
         // three point reads and two pair reads have become Move instructions.
@@ -6108,7 +6126,7 @@ mod local_sroa_tests {
         let object_dst = proto.code[start as usize..=end as usize]
             .iter()
             .find_map(|instr| match *instr {
-                Instr::NewObject { dst, .. } => Some(dst),
+                Instr::NewObject { dst, .. } | Instr::NewPlannedObject { dst, .. } => Some(dst),
                 _ => None,
             })
             .expect("new object");

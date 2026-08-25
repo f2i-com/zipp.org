@@ -863,7 +863,8 @@ impl<'p> Vm<'p> {
             // map starts empty and the first `this.x = v` allocates all three
             // parallel vectors, the second regrows them, and so on — a two-field
             // constructor cost 71ns/field against 28ns/field for the same fields
-            // written as a literal, which gets its size from `NewObject { hint }`.
+            // written as a literal, whose NewObject hint or planned-key count
+            // supplies its size.
             let fid = match self.heap.get(cv.heap_index()) {
                 HeapObj::Func(f) => Some(*f),
                 HeapObj::Closure { func, .. } => Some(*func),

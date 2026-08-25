@@ -5,6 +5,27 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Allow the generic Tier-C cross-call prefix at a call site whose filled IC
+/// ways contain multiple plain-function FuncProto ids. This is a plan-time
+/// profitability decision only: the existing helper still resolves and checks
+/// the live callee Value/fid/entry on every invocation. Metered VMs deliberately
+/// keep the pre-change plan until this broader route has its own explicit
+/// charging gate. `ZIPP_NO_POLY_FID_CROSSCALL=1` is the same-binary off switch.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn poly_fid_crosscall_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_POLY_FID_CROSSCALL").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn computed_drop_obj_is_observable(
     code: &[Instr],
@@ -64,6 +85,57 @@ mod computed_drop_liveness_tests {
             1,
             5
         ));
+    }
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod static_record_plan_identity_tests {
+    use super::*;
+
+    fn fixture() -> Vm<'static> {
+        let source = "function target(value, kind) { return value + kind; }";
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let program = Box::leak(Box::new(
+            crate::compile::compile_program(&ast, source).expect("source compiles"),
+        ));
+        Vm::new(program)
+    }
+
+    #[test]
+    fn static_record_ic_witness_requires_live_exact_func_before_realm_lookup() {
+        let mut vm = fixture();
+        let index = vm.heap.alloc(HeapObj::Func(0));
+        let bits = Value::heap(index).bits();
+        let version = vm.heap.version_of(index);
+
+        assert!(vm.static_record_live_root_func(bits, version, 0));
+        assert!(!vm.static_record_live_root_func(Value::int(0).bits(), version, 0));
+        assert!(!vm.static_record_live_root_func(bits, version.wrapping_add(1), 0));
+        assert!(!vm.static_record_live_root_func(bits, version, 1));
+
+        vm.obj_realm.insert(index, 7);
+        assert!(!vm.static_record_live_root_func(bits, version, 0));
+        vm.obj_realm.remove(&index);
+
+        // Replacing a slot invalidates the cached version even if the new
+        // occupant happens to be the same Func/fid.
+        vm.heap.replace(index, HeapObj::Func(0));
+        assert!(!vm.static_record_live_root_func(bits, version, 0));
+        let replaced_version = vm.heap.version_of(index);
+        assert!(vm.static_record_live_root_func(bits, replaced_version, 0));
+
+        // A current-version self-referential Proxy is deliberately hostile to
+        // recursive callable/realm resolution. The exact-kind guard rejects it
+        // before following its target.
+        vm.heap.replace(
+            index,
+            HeapObj::Proxy {
+                target: Value::heap(index),
+                handler: Value::UNDEFINED,
+                revoked: false,
+            },
+        );
+        assert!(!vm.static_record_live_root_func(bits, vm.heap.version_of(index), 0));
     }
 }
 
@@ -253,6 +325,31 @@ fn span_code_unit_pred_plan(
 }
 
 impl<'p> Vm<'p> {
+    /// Validate the non-rooting call-IC witness before the record-prefix
+    /// planner consults any realm metadata. IC entries may outlive their heap
+    /// occupant, so bits alone are not an identity proof: the slot must still
+    /// be live at the cached version and contain the exact plain Func/fid.
+    ///
+    /// Once that is proven, a plain Func's realm is its direct birth tag. Do
+    /// not feed an untrusted/stale witness to `get_function_realm`, whose
+    /// general callable resolution deliberately follows Bound/Proxy targets.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn static_record_live_root_func(&self, bits: u64, version: u32, fid: u32) -> bool {
+        let value = Value::from_bits(bits);
+        if !value.is_heap() {
+            return false;
+        }
+        let index = value.heap_index();
+        if index as usize >= self.heap.len() || self.heap.version_of(index) != version {
+            return false;
+        }
+        if !matches!(self.heap.get(index), HeapObj::Func(live_fid) if *live_fid == fid) {
+            return false;
+        }
+        self.obj_realm.get(&index).copied().unwrap_or(0) == 0
+    }
+
     /// Build the TypedArray pin plan for the OSR region `[start, end]` from
     /// LIVE VM state (called right before `compile_region`, frame `base` on
     /// top): for each `GetIndex`/`SetIndex`, find the receiver's nearest
@@ -910,22 +1007,46 @@ impl<'p> Vm<'p> {
                 continue;
             };
             // A filled plain-user-function way is the signal; the helper's own
-            // live resolution is what correctness rests on. The bounded
-            // polymorphic extension accepts only multiple identities sharing
-            // one FuncProto (the rotating-closure shape).
-            let (live, same_proto) = if let Some(live) = self.ic_call_mono(func_id, ip) {
-                (Some(live), false)
+            // live resolution is what correctness rests on. The first bounded
+            // polymorphic extension accepts multiple identities sharing one
+            // FuncProto (the rotating-closure shape). The second accepts a
+            // fully-filled plain-function set containing different FuncProto
+            // ids and deliberately selects ONLY the generic helper: no callee
+            // identity, fid, executable entry or realm state is baked.
+            let (live, same_proto, poly_fid) = if let Some(live) = self.ic_call_mono(func_id, ip) {
+                (Some(live), false, false)
             } else {
-                (
-                    crate::codegen::poly_crosscall_enabled()
-                        .then(|| self.ic_call_same_proto(func_id, ip))
-                        .flatten(),
-                    true,
-                )
+                let same = crate::codegen::poly_crosscall_enabled()
+                    .then(|| self.ic_call_same_proto(func_id, ip))
+                    .flatten();
+                if same.is_some() {
+                    (same, true, false)
+                } else {
+                    #[cfg(feature = "instrument")]
+                    let unmetered = self.instr_rec.is_none();
+                    #[cfg(not(feature = "instrument"))]
+                    let unmetered = true;
+                    let mixed = (unmetered && poly_fid_crosscall_enabled())
+                        .then(|| self.ic_call_poly_fid(func_id, ip))
+                        .flatten();
+                    (mixed, false, mixed.is_some())
+                }
             };
-            let Some((_bits, _ver, fid, _closure)) = live else {
+            let Some((bits, ver, fid, closure)) = live else {
                 continue;
             };
+            // This proof must precede every realm lookup below. It is relevant
+            // only to the static-record candidate; the generic helper remains
+            // dynamically guarded on every invocation.
+            let static_record_live_root = self.static_record_live_root_func(bits, ver, fid);
+            if (fid as usize)
+                >= self
+                    .main_func_count
+                    .checked_add(self.eval_funcs.len())
+                    .unwrap_or(usize::MAX)
+            {
+                continue;
+            }
             let callee = self.func(fid as usize);
             if callee.is_generator
                 || callee.is_async
@@ -949,7 +1070,33 @@ impl<'p> Vm<'p> {
                     callee.reg_count.max(1)
                 );
             }
-            plan.insert(ip, same_proto2);
+            if poly_fid && std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!("[cross] fn{func_id}@{ip} POLY-FID generic live-resolution");
+            }
+            // The record prefix is even narrower than generic cross-call: only
+            // main-program/root-realm plain functions with an already-installed
+            // immutable-bytecode plan and the exact two-argument call shape.
+            // Runtime repeats every identity/realm/eval/tag guard before and
+            // after its GC safe point; these checks only avoid useless emission.
+            let static_record_factory = (!self.gc_stress
+                && argc == 2
+                && (func_id as usize) < self.main_func_count
+                && (fid as usize) < self.main_func_count
+                && closure == NO_CLOSURE
+                && static_record_live_root
+                && self.current_realm_id().is_none()
+                && self.jit.has_static_record_factory(fid))
+            .then_some(crate::codegen::StaticRecordCallPlan { fid });
+            if static_record_factory.is_some() && std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!("[cross] fn{func_id}@{ip} STATIC-RECORD fn{fid}");
+            }
+            plan.insert(
+                ip,
+                crate::codegen::CrossCallSitePlan {
+                    same_proto2,
+                    static_record_factory,
+                },
+            );
         }
         plan
     }

@@ -4570,6 +4570,27 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, v);
                         ip += 1;
                     }
+                    Instr::NewPlannedObject { dst, plan } => {
+                        let plan = self
+                            .func(func_id as usize)
+                            .static_key_plans
+                            .get(plan as usize)
+                            .cloned()
+                            .ok_or_else(|| {
+                                Thrown("InternalError: invalid static key plan".to_string())
+                            })?;
+                        if !plan.runtime_valid() || plan.len() > 256 {
+                            return Err(Thrown(
+                                "InternalError: invalid static key plan".to_string(),
+                            ));
+                        }
+                        let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
+                            ObjMap::with_static_key_plan(plan),
+                        ))));
+                        self.realm_born(v.heap_index(), self.obj_proto);
+                        self.set(base, dst, v);
+                        ip += 1;
+                    }
                     Instr::ToObject { dst, src } => {
                         let v = self.get(base, src);
                         let o = self.to_object(v)?;
@@ -5370,11 +5391,26 @@ impl<'p> Vm<'p> {
                         // own w/e/c data property, ignoring the prototype chain.
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
-                        let key: &'p str =
-                            &self.func(func_id as usize).string_constants[name as usize];
+                        let key: &'p str = self
+                            .func(func_id as usize)
+                            .string_constants
+                            .get(name as usize)
+                            .map(String::as_str)
+                            .ok_or_else(|| {
+                                Thrown("InternalError: invalid static property name".to_string())
+                            })?;
                         if o.is_heap() {
                             let oi = o.heap_index();
-                            if let HeapObj::Object(m) = self.heap.get_mut(oi) {
+                            if matches!(self.heap.get(oi), HeapObj::Object(_)) {
+                                // A value expression can suspend/re-enter after
+                                // NewObject and let this still-rooted literal be
+                                // promoted before the property is committed.
+                                // Publish the exact holder -> value edge before
+                                // the direct ObjMap mutation, just like set_prop.
+                                self.heap.write_barrier_val(oi, v);
+                                let HeapObj::Object(m) = self.heap.get_mut(oi) else {
+                                    unreachable!("object kind changed across write barrier")
+                                };
                                 m.define(key, v, crate::heap::PropAttr::data());
                             } else {
                                 let k = key.to_string();
@@ -5388,12 +5424,22 @@ impl<'p> Vm<'p> {
                     Instr::AppendDataProp { obj, name, val } => {
                         let o = self.get(base, obj);
                         let v = self.get(base, val);
-                        let key: &'p str =
-                            &self.func(func_id as usize).string_constants[name as usize];
+                        let key: &'p str = self
+                            .func(func_id as usize)
+                            .string_constants
+                            .get(name as usize)
+                            .map(String::as_str)
+                            .ok_or_else(|| {
+                                Thrown("InternalError: invalid static property name".to_string())
+                            })?;
                         if o.is_heap() {
                             let oi = o.heap_index();
-                            if let HeapObj::Object(m) = self.heap.get_mut(oi) {
-                                m.push_data(key.to_string(), v);
+                            if matches!(self.heap.get(oi), HeapObj::Object(_)) {
+                                self.heap.write_barrier_val(oi, v);
+                                let HeapObj::Object(m) = self.heap.get_mut(oi) else {
+                                    unreachable!("object kind changed across write barrier")
+                                };
+                                m.push_static_data(key, v);
                             } else {
                                 let k = key.to_string();
                                 self.set_prop(o, &k, v, false)?;
@@ -5409,7 +5455,12 @@ impl<'p> Vm<'p> {
                         let v = self.get(base, val);
                         let ks = self.key_of(k);
                         if o.is_heap() {
-                            if let HeapObj::Object(m) = self.heap.get_mut(o.heap_index()) {
+                            let oi = o.heap_index();
+                            if matches!(self.heap.get(oi), HeapObj::Object(_)) {
+                                self.heap.write_barrier_val(oi, v);
+                                let HeapObj::Object(m) = self.heap.get_mut(oi) else {
+                                    unreachable!("object kind changed across write barrier")
+                                };
                                 m.define(&ks, v, crate::heap::PropAttr::data());
                             } else {
                                 self.set_prop(o, &ks, v, false)?;
@@ -7848,6 +7899,7 @@ impl<'p> Vm<'p> {
             call_ic: jit_call_ic as usize,
             cross_call: crate::vm::helpers_misc::jit_cross_call as usize,
             cross_call_same_proto2: crate::vm::helpers_misc::jit_cross_call_same_proto2 as usize,
+            static_record_factory: crate::vm::helpers_misc::jit_static_record_factory as usize,
             get_prop_slow: jit_get_prop_slow as usize,
             set_prop_slow: jit_set_prop_slow as usize,
             get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as usize,
@@ -7988,18 +8040,11 @@ impl<'p> Vm<'p> {
         // regs Vec around the recursion (see its safety note).
         let regs_ptr = unsafe { self.regs.as_mut_ptr().add(base) } as *mut u64;
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
-        // Lend the native tier a bounded slice of the step budget, which its
-        // compiled body charges directly. Saved and restored around the run
-        // because native code re-enters Rust through its call helpers, and that
-        // Rust can enter native again.
-        #[cfg(feature = "instrument")]
-        let outer_steps = self.jit_steps;
-        #[cfg(feature = "instrument")]
-        let _ = self.meter_lend();
         // Tier C may access captures even when entered through a real frame.
-        // Install this activation's closure explicitly so the same native body
-        // also works for frame-free cross-calls; restore it before any bail is
-        // resumed in the interpreter.
+        // Install every activation's exact roots so the same native body also
+        // works for frame-free cross-calls.
+        // A full root stack declines before metering/native effects and leaves
+        // this real Frame to execute in the interpreter.
         let (active_closure, active_callee) = self
             .frames
             .last()
@@ -8015,11 +8060,17 @@ impl<'p> Vm<'p> {
                 )
             })
             .unwrap_or((NO_CLOSURE, NO_CLOSURE));
-        let prior_tierc_closure = std::mem::replace(&mut self.jit_tierc_closure, active_closure);
-        let prior_tierc_callee = std::mem::replace(&mut self.jit_tierc_callee, active_callee);
+        let activation_token = self.enter_tierc_activation(active_closure, active_callee, false)?;
+        // Lend the native tier a bounded slice of the step budget, which its
+        // compiled body charges directly. Saved and restored around the run
+        // because native code re-enters Rust through its call helpers, and that
+        // Rust can enter native again.
+        #[cfg(feature = "instrument")]
+        let outer_steps = self.jit_steps;
+        #[cfg(feature = "instrument")]
+        let _ = self.meter_lend();
         let (bits, bail) = unsafe { (*jitfn).run(regs_ptr, vm_ptr) };
-        self.jit_tierc_callee = prior_tierc_callee;
-        self.jit_tierc_closure = prior_tierc_closure;
+        self.leave_tierc_activation(activation_token);
         #[cfg(feature = "instrument")]
         {
             self.meter_return();

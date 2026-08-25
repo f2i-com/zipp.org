@@ -30,6 +30,25 @@ pub(crate) fn tierc_object_literal_enabled() -> bool {
     }
 }
 
+/// Independent same-binary ablation for the exact planned-next absence proof
+/// in `jit_append_data_prop`. Off restores the historical unconditional
+/// `ObjMap::pos` probe without disabling Tier C or static-key plans themselves.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn tierc_planned_append_probe_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_PLANNED_APPEND_PROBE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Independent ablation for fixed-block array literals in Tier C.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
@@ -138,6 +157,48 @@ pub(crate) extern "win64" fn jit_new_object(vm: *mut core::ffi::c_void, hint: u3
         // state.  Returning the replay sentinel would violate its pure-prefix
         // contract, so this impossible/corruption edge is deliberately
         // fail-stop instead of re-executing NewObject.
+        Err(_) => std::process::abort(),
+    }
+}
+
+/// Allocate the ordinary object described by one immutable compiler key plan.
+/// `packed = (func_id << 32) | plan_index`. All table checks precede the GC
+/// safe point; malformed direct calls decline without observable effects.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_new_planned_object(
+    vm: *mut core::ffi::c_void,
+    packed: u64,
+) -> u64 {
+    if vm.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let func_id = (packed >> 32) as u32 as usize;
+        let plan_id = packed as u32 as usize;
+        let func_count = vm.main_func_count.saturating_add(vm.eval_funcs.len());
+        if func_id >= func_count || plan_id > u16::MAX as usize {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let Some(plan) = vm.func(func_id).static_key_plans.get(plan_id).cloned() else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
+        // Plans are compiler source-capped. Retain a defensive bytecode-level
+        // bound so a hand-built FuncProto cannot force an unbounded reserve.
+        if !plan.runtime_valid() || plan.len() > 256 {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        vm.maybe_gc();
+        let idx = vm
+            .heap
+            .alloc(HeapObj::Object(Box::new(ObjMap::with_static_key_plan(
+                plan,
+            ))));
+        vm.realm_born(idx, vm.obj_proto);
+        crate::heap::note_static_key_jit_object();
+        Value::heap(idx).bits()
+    })) {
+        Ok(bits) => bits,
         Err(_) => std::process::abort(),
     }
 }
@@ -302,10 +363,10 @@ pub(crate) extern "win64" fn jit_append_data_prop(
         }
         let key = {
             let func = vm.func(func_id as usize);
-            let Some(key) = func.string_constants.get(name).cloned() else {
+            let Some(key) = func.string_constants.get(name) else {
                 return crate::codegen::SELF_CALL_DEOPT;
             };
-            key
+            key.as_str()
         };
         let val = Value::from_bits(val_bits);
         if val.is_heap() && val.heap_index() as usize >= vm.heap.len() {
@@ -314,7 +375,13 @@ pub(crate) extern "win64" fn jit_append_data_prop(
         let HeapObj::Object(map) = vm.heap.get(obj_idx) else {
             return crate::codegen::SELF_CALL_DEOPT;
         };
-        if map.pos(&key).is_some() {
+        // A valid immutable plan plus its exact visible prefix proves the next
+        // key absent. Keep the lookup for owned objects, failed/mismatched
+        // plans, and the same-binary comparator so malformed duplicate/reorder
+        // bytecode retains its pure exact-IP interpreter replay.
+        let exact_planned_next =
+            tierc_planned_append_probe_enabled() && map.planned_next_static_key(key);
+        if !exact_planned_next && map.pos(key).is_some() {
             return crate::codegen::SELF_CALL_DEOPT;
         }
 
@@ -327,7 +394,7 @@ pub(crate) extern "win64" fn jit_append_data_prop(
             // mutate the heap object, so this remains a pure decline.
             return crate::codegen::SELF_CALL_DEOPT;
         };
-        map.push_data(key, val);
+        map.push_static_data(key, val);
         0
     })) {
         Ok(bits) => bits,
@@ -365,6 +432,261 @@ mod tests {
             }
         }
         panic!("static property name not found: {wanted:?}");
+    }
+
+    fn planned_site(vm: &Vm<'_>, wanted_func: &str) -> (u32, u16) {
+        let count = vm.main_func_count + vm.eval_funcs.len();
+        for func_id in 0..count {
+            let func = vm.func(func_id);
+            if func.name != wanted_func {
+                continue;
+            }
+            if let Some(plan) = func.code.iter().find_map(|instr| match *instr {
+                Instr::NewPlannedObject { plan, .. } => Some(plan),
+                _ => None,
+            }) {
+                return (func_id as u32, plan);
+            }
+        }
+        panic!("planned object site not found in {wanted_func:?}");
+    }
+
+    fn packed_name(vm: &Vm<'_>, func_id: u32, wanted: &str) -> u64 {
+        let name = vm
+            .func(func_id as usize)
+            .string_constants
+            .iter()
+            .position(|name| name == wanted)
+            .unwrap_or_else(|| panic!("planned property name not found: {wanted:?}"));
+        ((func_id as u64) << 32) | name as u64
+    }
+
+    fn malformed_program(keys: Vec<String>) -> &'static crate::bytecode::Program {
+        let source = "var result={a:1};";
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let mut program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let plan = program.functions[0]
+            .code
+            .iter()
+            .find_map(|instr| match *instr {
+                Instr::NewPlannedObject { plan, .. } => Some(plan as usize),
+                _ => None,
+            })
+            .expect("top-level planned literal");
+        program.functions[0].static_key_plans[plan] = crate::bytecode::StaticKeyPlan::new(keys);
+        Box::leak(Box::new(program))
+    }
+
+    fn malformed_append_result(names: [&str; 2]) -> (Vec<String>, Vec<Value>) {
+        let source = "var result={a:1,b:2};";
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let mut program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let indices = names.map(|wanted| {
+            program.functions[0]
+                .string_constants
+                .iter()
+                .position(|name| name == wanted)
+                .unwrap_or_else(|| panic!("missing name constant {wanted:?}")) as u32
+        });
+        let mut next = 0usize;
+        for instr in &mut program.functions[0].code {
+            if let Instr::AppendDataProp { name, .. } = instr {
+                *name = indices[next];
+                next += 1;
+            }
+        }
+        assert_eq!(next, 2, "expected exactly two append ops");
+
+        let program = Box::leak(Box::new(program));
+        let mut vm = Vm::new(program);
+        vm.jit_enabled = false;
+        vm.run().expect("malformed append sequence stays safe");
+        let slot = vm.global_slot_of_name("result").expect("result global");
+        let value = vm.globals[slot as usize];
+        let HeapObj::Object(map) = vm.heap.get(value.heap_index()) else {
+            panic!("result was not a plain object")
+        };
+        map.verify_shape().expect("malformed sequence shape");
+        (map.keys.as_ref().to_vec(), map.vals.clone())
+    }
+
+    #[test]
+    fn malformed_duplicate_and_oversize_plans_fail_before_allocation_in_both_tiers() {
+        for keys in [vec!["a".into(), "a".into()], vec!["x".into(); 257]] {
+            let program = malformed_program(keys);
+            let mut interpreter = Vm::new(program);
+            let err = interpreter.run().expect_err("invalid interpreter plan");
+            assert!(err.0.contains("invalid static key plan"), "got {err:?}");
+
+            let mut native = Vm::new(program);
+            let before = native.heap.len();
+            let ptr = &mut native as *mut Vm as *mut core::ffi::c_void;
+            assert_eq!(
+                jit_new_planned_object(ptr, 0),
+                crate::codegen::SELF_CALL_DEOPT
+            );
+            assert_eq!(native.heap.len(), before, "invalid helper plan allocated");
+        }
+    }
+
+    #[test]
+    fn malformed_plan_index_is_an_interpreter_error_not_an_index_panic() {
+        let source = "var result={a:1};";
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let mut program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let allocation = program.functions[0]
+            .code
+            .iter_mut()
+            .find(|instr| matches!(instr, Instr::NewPlannedObject { .. }))
+            .expect("planned allocation op");
+        let Instr::NewPlannedObject { plan, .. } = allocation else {
+            unreachable!()
+        };
+        *plan = u16::MAX;
+        let program = Box::leak(Box::new(program));
+        let mut vm = Vm::new(program);
+        let err = vm.run().expect_err("invalid plan index must fail closed");
+        assert!(err.0.contains("invalid static key plan"), "got {err:?}");
+    }
+
+    #[test]
+    fn malformed_append_name_is_an_interpreter_error_not_an_index_panic() {
+        let source = "var result={a:1};";
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let mut program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let append = program.functions[0]
+            .code
+            .iter_mut()
+            .find(|instr| matches!(instr, Instr::AppendDataProp { .. }))
+            .expect("append op");
+        let Instr::AppendDataProp { name, .. } = append else {
+            unreachable!()
+        };
+        *name = u32::MAX;
+        let program = Box::leak(Box::new(program));
+        let mut vm = Vm::new(program);
+        let err = vm.run().expect_err("invalid name must fail closed");
+        assert!(
+            err.0.contains("invalid static property name"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_and_reordered_planned_bytecode_never_create_duplicate_slots() {
+        let (keys, vals) = malformed_append_result(["a", "a"]);
+        assert_eq!(keys, ["a".to_string()]);
+        assert_eq!(vals, [Value::int(2)]);
+
+        let (keys, vals) = malformed_append_result(["b", "a"]);
+        assert_eq!(keys, ["b".to_string(), "a".to_string()]);
+        assert_eq!(vals, [Value::int(1), Value::int(2)]);
+    }
+
+    #[test]
+    fn native_planned_append_duplicate_deopts_and_reorder_materializes_safely() {
+        let mut vm = vm("function planned(v) { return { a:v, b:v }; } var ready=true;");
+        let (func_id, plan) = planned_site(&vm, "planned");
+        let a = packed_name(&vm, func_id, "a");
+        let b = packed_name(&vm, func_id, "b");
+        let vm_ptr = &mut vm as *mut Vm as *mut core::ffi::c_void;
+        let alloc = ((func_id as u64) << 32) | plan as u64;
+
+        let duplicate_bits = jit_new_planned_object(vm_ptr, alloc);
+        assert_ne!(duplicate_bits, crate::codegen::SELF_CALL_DEOPT);
+        assert_eq!(
+            jit_append_data_prop(vm_ptr, duplicate_bits, a, Value::int(1).bits()),
+            0
+        );
+        assert_eq!(
+            jit_append_data_prop(vm_ptr, duplicate_bits, a, Value::int(9).bits()),
+            crate::codegen::SELF_CALL_DEOPT,
+            "a duplicate must decline before its barrier/commit"
+        );
+        let duplicate_idx = Value::from_bits(duplicate_bits).heap_index();
+        let HeapObj::Object(map) = vm.heap.get(duplicate_idx) else {
+            panic!("planned helper did not allocate an object")
+        };
+        assert_eq!(map.keys.as_ref(), &["a".to_string()]);
+        assert_eq!(map.vals, &[Value::int(1)]);
+
+        // Exact-IP interpreter replay owns malformed duplicate semantics.
+        vm.heap.write_barrier_val(duplicate_idx, Value::int(9));
+        let HeapObj::Object(map) = vm.heap.get_mut(duplicate_idx) else {
+            unreachable!()
+        };
+        map.push_static_data("a", Value::int(9));
+        assert_eq!(map.keys.as_ref(), &["a".to_string()]);
+        assert_eq!(map.vals, &[Value::int(9)]);
+
+        let reordered_bits = jit_new_planned_object(vm_ptr, alloc);
+        assert_ne!(reordered_bits, crate::codegen::SELF_CALL_DEOPT);
+        assert_eq!(
+            jit_append_data_prop(vm_ptr, reordered_bits, b, Value::int(2).bits()),
+            0,
+            "an absent out-of-order key materializes through push_static_data"
+        );
+        assert_eq!(
+            jit_append_data_prop(vm_ptr, reordered_bits, a, Value::int(1).bits()),
+            0
+        );
+        assert_eq!(
+            jit_append_data_prop(vm_ptr, reordered_bits, b, Value::int(7).bits()),
+            crate::codegen::SELF_CALL_DEOPT
+        );
+        let reordered_idx = Value::from_bits(reordered_bits).heap_index();
+        vm.heap.write_barrier_val(reordered_idx, Value::int(7));
+        let HeapObj::Object(map) = vm.heap.get_mut(reordered_idx) else {
+            unreachable!()
+        };
+        map.push_static_data("b", Value::int(7));
+        assert_eq!(map.keys.as_ref(), &["b".to_string(), "a".to_string()]);
+        assert_eq!(map.vals, &[Value::int(7), Value::int(1)]);
+        map.verify_shape().expect("native malformed append shape");
+    }
+
+    #[test]
+    fn planned_allocation_validates_ids_survives_gc_and_appends_exact_keys() {
+        let mut vm = vm("function planned(v) { return { a:v, 1:v, tail:v }; } var ready=true;");
+        let (func_id, plan) = planned_site(&vm, "planned");
+        let vm_ptr = &mut vm as *mut Vm as *mut core::ffi::c_void;
+        let before = vm.heap.len();
+        assert_eq!(
+            jit_new_planned_object(vm_ptr, (u32::MAX as u64) << 32),
+            crate::codegen::SELF_CALL_DEOPT
+        );
+        assert_eq!(
+            jit_new_planned_object(vm_ptr, ((func_id as u64) << 32) | u16::MAX as u64),
+            crate::codegen::SELF_CALL_DEOPT
+        );
+        assert_eq!(vm.heap.len(), before, "invalid plan ids are pure declines");
+
+        vm.gc_stress = true;
+        let bits = jit_new_planned_object(vm_ptr, ((func_id as u64) << 32) | plan as u64);
+        assert_ne!(bits, crate::codegen::SELF_CALL_DEOPT);
+        let object = Value::from_bits(bits);
+        for (key, value) in [("a", 11), ("1", 12), ("tail", 13)] {
+            let name = vm
+                .func(func_id as usize)
+                .string_constants
+                .iter()
+                .position(|candidate| candidate == key)
+                .expect("planned key has a matching name constant") as u32;
+            let packed_name = ((func_id as u64) << 32) | name as u64;
+            assert_eq!(
+                jit_append_data_prop(vm_ptr, bits, packed_name, Value::int(value).bits()),
+                0
+            );
+        }
+        let HeapObj::Object(map) = vm.heap.get(object.heap_index()) else {
+            panic!("planned helper did not allocate a plain object")
+        };
+        assert_eq!(
+            map.keys.as_ref(),
+            &["a".to_string(), "1".to_string(), "tail".to_string()]
+        );
+        assert_eq!(map.element_pos(1), Some(1));
+        map.verify_shape().expect("JIT planned append shape");
     }
 
     #[test]

@@ -1538,6 +1538,52 @@ impl<'p> Vm<'p> {
         Some(first)
     }
 
+    /// Read-only profitability witness for a genuinely polymorphic plain-call
+    /// site: at least two filled `Callee` ways, every filled way names a
+    /// structurally cross-callable plain function, and at least two distinct
+    /// immutable FuncProto ids occur. The first way is returned only as a
+    /// representative for the planner's existing shape checks; generated code
+    /// never trusts it. The generic cross-call helper resolves the LIVE callee
+    /// Value, fid and native entry again on every invocation.
+    ///
+    /// Requiring every filled way to be `Callee` keeps natives, bound functions,
+    /// generators, async functions and other exotic callables out of the
+    /// profitability signal. A later replacement with any of those values is
+    /// still correct: the live helper declines before effects and the ordinary
+    /// call path runs unchanged.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_call_poly_fid(&self, func_id: u32, ip: usize) -> Option<(u64, u32, u32, u32)> {
+        let site = self.ic_site(func_id, ip)?;
+        if site.n < 2 {
+            return None;
+        }
+        let first = match site.entries[0] {
+            IcEntry::Callee {
+                bits,
+                ver,
+                fid,
+                closure,
+            } => (bits, ver, fid, closure),
+            _ => return None,
+        };
+        let mut different_fid = false;
+        for entry in &site.entries[..site.n as usize] {
+            let IcEntry::Callee { fid, .. } = *entry else {
+                return None;
+            };
+            let callee = self.func(fid as usize);
+            if callee.is_generator
+                || callee.is_async
+                || callee.rest_reg.is_some()
+                || callee.arguments_reg.is_some()
+            {
+                return None;
+            }
+            different_fid |= fid != first.2;
+        }
+        different_fid.then_some(first)
+    }
+
     /// Read-only: the resolved class-method `fid` for a `CallMethod` site whose
     /// receiver belongs to `class`, taken from a FILLED `ClassMethod` IC way. For
     /// the Q7 method-inline planner (`build_method_inline_plan`). `None` if no

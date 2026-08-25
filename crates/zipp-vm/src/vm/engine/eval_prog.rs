@@ -6,6 +6,48 @@
 use super::*;
 
 impl<'p> Vm<'p> {
+    /// Bound plans retained across independently-created Compiler instances.
+    /// This is optimization-only: when an incoming eval/module would exceed
+    /// the VM-lifetime site or conservative-byte ceiling, rewrite every planned
+    /// allocation to the exact legacy capacity hint and drop all plan Arcs.
+    /// Charging is deliberately monotonic even if a later preparation phase
+    /// fails, matching the dynamic-source attempt budget and remaining safe.
+    fn admit_static_key_plans(&mut self, program: &mut crate::bytecode::Program) {
+        let incoming = crate::bytecode::static_key_plan_usage(&program.functions);
+        let fits = incoming.is_some_and(|(sites, bytes)| {
+            self.static_key_plan_sites
+                .checked_add(sites)
+                .is_some_and(|n| n <= crate::bytecode::STATIC_KEY_PLAN_VM_MAX_SITES)
+                && self
+                    .static_key_plan_retained_bytes
+                    .checked_add(bytes)
+                    .is_some_and(|n| n <= crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES)
+        });
+        if fits {
+            let (sites, bytes) = incoming.expect("checked above");
+            self.static_key_plan_sites += sites;
+            self.static_key_plan_retained_bytes += bytes;
+            return;
+        }
+
+        for func in &mut program.functions {
+            let hints: Vec<u16> = func
+                .static_key_plans
+                .iter()
+                .map(|plan| plan.len().min(u16::MAX as usize) as u16)
+                .collect();
+            for instr in &mut func.code {
+                if let Instr::NewPlannedObject { dst, plan } = *instr {
+                    *instr = Instr::NewObject {
+                        dst,
+                        hint: hints.get(plan as usize).copied().unwrap_or(0),
+                    };
+                }
+            }
+            func.static_key_plans.clear();
+        }
+    }
+
     /// Install a compiled eval/module Program into the live realm (remap its global
     /// slots, function ids, and class ids onto the running tables; hoist `var`s and
     /// top-level functions) and run its top-level function to completion, returning
@@ -17,7 +59,7 @@ impl<'p> Vm<'p> {
     /// loader cache between prepare and execute, for self/cyclic imports).
     pub(crate) fn prepare_eval_program(
         &mut self,
-        eval_prog: crate::bytecode::Program,
+        mut eval_prog: crate::bytecode::Program,
         module: bool,
         caller_home: Option<u32>,
         var_env_global: bool,
@@ -33,6 +75,7 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "instrument")]
         self.instrument_dynamic_code_install(eval_prog.functions.len(), eval_prog.classes.len())
             .map_err(|message| Thrown(message.into()))?;
+        self.admit_static_key_plans(&mut eval_prog);
         // A $262.evalScript: SCRIPT GlobalDeclarationInstantiation semantics
         // for THIS program only (lexical-collision SyntaxErrors, realm-
         // persistent lexicals, non-configurable brandNew var/fn bindings).
@@ -690,5 +733,53 @@ impl<'p> Vm<'p> {
             eval_scope_idx,
         )?;
         Ok((completion, gmap))
+    }
+}
+
+#[cfg(test)]
+mod static_key_plan_budget_tests {
+    use super::*;
+
+    fn program(source: &str) -> crate::bytecode::Program {
+        let ast = crate::front::parse_script(source).expect("source parses");
+        crate::compile::compile_program(&ast, source).expect("source compiles")
+    }
+
+    #[test]
+    fn vm_lifetime_cap_rewrites_incoming_plans_to_exact_legacy_hints() {
+        let main = Box::leak(Box::new(program("var ready=true;")));
+        let mut vm = Vm::new(main);
+        let mut incoming = program("function build(v){return {a:v,b:2}} build(1);");
+        assert!(crate::bytecode::static_key_plan_usage(&incoming.functions)
+            .is_some_and(|(sites, _)| sites > 0));
+
+        vm.static_key_plan_sites = crate::bytecode::STATIC_KEY_PLAN_VM_MAX_SITES;
+        vm.admit_static_key_plans(&mut incoming);
+        assert_eq!(
+            crate::bytecode::static_key_plan_usage(&incoming.functions),
+            Some((0, 0))
+        );
+        assert!(incoming.functions.iter().all(|func| !func
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::NewPlannedObject { .. }))));
+        assert!(incoming.functions.iter().any(|func| func
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::NewObject { hint: 2, .. }))));
+
+        let mut incoming = program("function build(v){return {a:v,b:2}} build(1);");
+        vm.static_key_plan_sites = 0;
+        vm.static_key_plan_retained_bytes = crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES;
+        vm.admit_static_key_plans(&mut incoming);
+        assert_eq!(
+            crate::bytecode::static_key_plan_usage(&incoming.functions),
+            Some((0, 0)),
+            "the retained-byte ceiling must independently decline metadata"
+        );
+        assert!(incoming.functions.iter().all(|func| !func
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::NewPlannedObject { .. }))));
     }
 }

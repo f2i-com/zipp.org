@@ -1091,6 +1091,7 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         | Instr::LoadHole { dst }
         | Instr::LoadBool { dst, .. }
         | Instr::NewObject { dst, .. }
+        | Instr::NewPlannedObject { dst, .. }
         | Instr::MakeFunc { dst, .. }
         | Instr::Now { dst, .. }
         | Instr::LoadNewTarget { dst }

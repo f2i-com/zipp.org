@@ -469,6 +469,9 @@ fn supported(instr: &Instr, reg_count: u16, code_len: usize) -> bool {
         }
         Instr::Return { src } => reg(src),
         Instr::ReturnUndefined => true,
+        // ARM's baseline is deliberately allocation/helper-free. Keep the new
+        // allocation opcode an explicit audited decline, matching NewObject.
+        Instr::NewPlannedObject { .. } => false,
         _ => false,
     }
 }
@@ -604,6 +607,7 @@ fn emit_instr(
             emit_no_bail(ops);
             dynasm!(ops ; .arch aarch64 ; ret);
         }
+        Instr::NewPlannedObject { .. } => return None,
         _ => return None,
     }
     Some(())
@@ -717,6 +721,7 @@ mod tests {
             simple_params: true,
             constants: Vec::new(),
             string_constants: Vec::new(),
+            static_key_plans: Vec::new(),
             bigint_consts: Vec::new(),
             wtf8_consts: Vec::new(),
             name_global: None,

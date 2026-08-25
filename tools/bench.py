@@ -73,6 +73,9 @@ _PUBLIC_CONTROL_ENV_KEYS = frozenset(
         "ZIPP_NO_MODULE_JIT",
         "ZIPP_NO_NURSERY_ADAPT",
         "ZIPP_NO_POLY_CALL_FALLBACK",
+        "ZIPP_NO_STATIC_KEY_PLANS",
+        "ZIPP_NO_STATIC_RECORD_FACTORY",
+        "ZIPP_NO_TIERC_PLANNED_APPEND_PROBE",
         "ZIPP_NOJIT",
         "ZIPP_NURSERY",
         "ZIPP_NURSERY_MAX_MINORS",
@@ -83,6 +86,8 @@ _PUBLIC_CONTROL_ENV_KEYS = frozenset(
         "ZIPP_RXSTATS",
         "ZIPP_SHAPE_VERIFY",
         "ZIPP_SHAPESTATS",
+        "ZIPP_STATIC_KEY_STATS",
+        "ZIPP_STATIC_RECORD_STATS",
         "ZIPP_TRACE_CALLS",
         "ZIPP_VM_DUMP",
     }
@@ -792,7 +797,7 @@ def power_mode() -> str | None:
         return None
 
 
-def relevant_environment() -> dict[str, str]:
+def recorded_environment(environment: dict[str, str]) -> dict[str, str]:
     """Return benchmark controls without copying credentials into artifacts.
 
     Only explicitly audited numeric/boolean controls are safe and useful to
@@ -802,12 +807,13 @@ def relevant_environment() -> dict[str, str]:
     """
 
     recorded: dict[str, str] = {}
-    for key, value in sorted(os.environ.items()):
-        if not key.startswith(_RECORDED_ENV_PREFIXES):
+    for key, value in sorted(environment.items()):
+        upper_key = key.upper()
+        if not upper_key.startswith(_RECORDED_ENV_PREFIXES):
             continue
         components = tuple(
             component
-            for component in re.split(r"[^A-Z0-9]+", key.upper())
+            for component in re.split(r"[^A-Z0-9]+", upper_key)
             if component
         )
         sensitive_name = any(
@@ -818,13 +824,19 @@ def relevant_environment() -> dict[str, str]:
             for component in components
         )
         public_control = (
-            key in _PUBLIC_CONTROL_ENV_KEYS
+            upper_key in _PUBLIC_CONTROL_ENV_KEYS
             and _PUBLIC_CONTROL_VALUE.fullmatch(value) is not None
         )
         recorded[key] = (
             value if public_control and not sensitive_name else _REDACTED_ENV_VALUE
         )
     return recorded
+
+
+def relevant_environment() -> dict[str, str]:
+    """Return the current process's safely recordable benchmark controls."""
+
+    return recorded_environment(dict(os.environ))
 
 
 def create_empty_script() -> Path:

@@ -146,6 +146,14 @@ pub(crate) fn blocks(code: &[Instr], start: usize, end: usize) -> Vec<(usize, u3
     };
     mark(start);
     for ip in start..=end {
+        // A return transfers control out of the activation.  The compiler keeps
+        // a synthetic ReturnUndefined after an explicit Return, but that
+        // fallback is unreachable from the returning path and must belong to a
+        // separate block or native execution bills it without executing it.
+        if matches!(code[ip], Instr::Return { .. } | Instr::ReturnUndefined) {
+            mark(ip + 1);
+            continue;
+        }
         let target = match code[ip] {
             Instr::Jump { target }
             | Instr::JumpIfFalse { target, .. }
@@ -256,5 +264,16 @@ mod tests {
     #[test]
     fn a_single_instruction_region_is_one_block_of_one() {
         assert_eq!(blocks(&[nop()], 0, 0), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn a_return_does_not_charge_the_unreachable_synthetic_fallback() {
+        let code = vec![nop(), Instr::Return { src: 0 }, Instr::ReturnUndefined];
+        assert_eq!(blocks(&code, 0, 2), vec![(0, 2), (2, 1)]);
+        assert_covers(&code, 0, 2);
+
+        let code = vec![Instr::ReturnUndefined, nop()];
+        assert_eq!(blocks(&code, 0, 1), vec![(0, 1), (1, 1)]);
+        assert_covers(&code, 0, 1);
     }
 }

@@ -133,9 +133,16 @@ impl<'p> Vm<'p> {
             }
         }
         let _ = &mut heap;
+        let (static_key_plan_sites, static_key_plan_retained_bytes) =
+            crate::bytecode::static_key_plan_usage(&program.functions).unwrap_or((
+                crate::bytecode::STATIC_KEY_PLAN_VM_MAX_SITES,
+                crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES,
+            ));
         Vm {
             program,
             eval_funcs: Vec::new(),
+            static_key_plan_sites,
+            static_key_plan_retained_bytes,
             main_func_count: program.functions.len(),
             eval_classes: Vec::new(),
             main_class_count: program.classes.len(),
@@ -414,9 +421,9 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_call_depth: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            jit_tierc_closure: NO_CLOSURE,
+            jit_tierc_activation: TiercActivationState::EMPTY,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            jit_tierc_callee: NO_CLOSURE,
+            jit_tierc_activation_stack: Vec::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             osr_deopt_exempt: false,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

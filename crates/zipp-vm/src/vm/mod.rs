@@ -68,6 +68,39 @@ const EVAL_POOL: usize = 1024;
 /// function rather than a closure. Real heap indices are always `< u32::MAX`.
 const NO_CLOSURE: u32 = u32::MAX;
 
+/// Exact roots for one active Tier-C native activation.
+/// `active` is explicit because a compiled script/plain activation can have no
+/// Closure identity while still suspending an outer frame-free activation.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TiercActivationState {
+    active: bool,
+    frame_free: bool,
+    closure: u32,
+    callee: u32,
+}
+
+/// By-value restoration record for one Tier-C native entry. A suspended
+/// frame-free `prior` is also duplicated in `jit_tierc_activation_stack` so GC
+/// can see it while this token lives only in a Rust local. A frame-backed prior
+/// needs no duplicate root: its real interpreter `Frame` remains installed.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TiercActivationToken {
+    prior: TiercActivationState,
+    rooted_prior: bool,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl TiercActivationState {
+    const EMPTY: Self = Self {
+        active: false,
+        frame_free: false,
+        closure: NO_CLOSURE,
+        callee: NO_CLOSURE,
+    };
+}
+
 /// Largest length zipp will EAGERLY materialize for a dense array (`Vec<Value>`).
 /// The spec allows up to 2^32-1, but a dense Vec of that many `Value`s would be
 /// 32 GB; real engines store such arrays sparsely. Until zipp has sparse arrays,
@@ -504,13 +537,13 @@ impl ClosureHomeTable {
     /// backend's retain scans its high-water bitmap and visits populated entries;
     /// HashMap's retain walks bucket capacity. Choose between a table scan and
     /// O(1) removals using the appropriate cost.
-    fn prune_freed(&mut self, freed: &[u32], freed_bits: &[bool]) {
+    fn prune_freed(&mut self, freed: &[u32], live_bits: &[bool]) {
         let scan_cost = match self {
             Self::Dense(table) => table.retain_scan_cost(),
             Self::Map(table) => table.capacity(),
         };
         if scan_cost <= freed.len() {
-            self.retain(|&key, _| !freed_bits[key as usize]);
+            self.retain(|&key, _| live_bits[key as usize]);
         } else {
             for key in freed {
                 self.remove(key);
@@ -537,6 +570,11 @@ pub struct Vm<'p> {
     /// unified `func_id` addresses `program.functions` for `id < main_func_count`
     /// and `eval_funcs[id - main_func_count]` beyond it.
     eval_funcs: Vec<&'static crate::bytecode::FuncProto>,
+    /// Aggregate retained static-key plans across the main Program and every
+    /// successfully/partially prepared eval/module Program. Incoming programs
+    /// beyond either ceiling are rewritten to legacy NewObject before leaking.
+    static_key_plan_sites: usize,
+    static_key_plan_retained_bytes: usize,
     /// Number of functions in the compile-time `program` (the boundary between
     /// program function ids and runtime `eval_funcs` ids).
     main_func_count: usize,
@@ -867,9 +905,9 @@ pub struct Vm<'p> {
     /// Per-function-id LEARNED own-property count of the instances a user
     /// constructor produces, used to pre-size the next instance's `ObjMap`.
     ///
-    /// An object literal gets its size from `NewObject { hint }`, which the
-    /// compiler fills in by counting the literal's static keys; a constructor
-    /// has no equivalent, so `new P(a, b)` started from an EMPTY map and every
+    /// An object literal gets its size from `NewObject { hint }` or its
+    /// compiler-prepared `NewPlannedObject` key count; a constructor has no
+    /// equivalent, so `new P(a, b)` started from an EMPTY map and every
     /// `this.x = v` paid an allocation-or-regrow of all three parallel vectors.
     /// Measured, that made a two-field constructor 71ns/field against the same
     /// two fields in a literal at 28ns/field.
@@ -1693,21 +1731,13 @@ pub struct Vm<'p> {
     /// pointers after every call helper).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_call_depth: u32,
-    /// Closure heap index for the currently executing Tier-C native activation.
-    /// A frame-free cross-call has no `Frame` for UpvalGet/Set to consult, so
-    /// the entry helper installs this value for exactly the native call's
-    /// dynamic extent and restores the previous value on return/re-entry. The
-    /// GC scans it as an explicit root while native code is suspended in a
-    /// re-entrant helper.
+    /// Exact root identities for the current Tier-C native activation. Every
+    /// nested activation saves the complete prior state below: frame-free
+    /// callable identity must survive GC while native callers are suspended.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    jit_tierc_closure: u32,
-    /// Heap index of the callable whose Tier-C body is currently executing.
-    /// Unlike `jit_tierc_closure`, this is populated for both plain `Func` and
-    /// captureful `Closure` values. Allocation helpers use it to preserve the
-    /// active callee's realm and inherited EvalScope during frame-free native
-    /// cross-calls. Explicitly rooted while native code is active.
+    jit_tierc_activation: TiercActivationState,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    jit_tierc_callee: u32,
+    jit_tierc_activation_stack: Vec<TiercActivationState>,
     /// One-shot flag a region call helper sets when its bail is NOT a
     /// region-quality signal (depth-cap deopt, or a throw the call legitimately
     /// produced): `try_run_osr` consumes it and skips the deopt-eviction count

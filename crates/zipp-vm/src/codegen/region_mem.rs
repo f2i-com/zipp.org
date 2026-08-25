@@ -2735,7 +2735,42 @@ pub(crate) fn compile_region_mem(
                 let cross = cross_site.is_some() && leaf_plan.get(&ip).is_none();
                 let cross_done = ops.new_dynamic_label();
                 if cross {
-                    let same_proto2 = cross_site.flatten();
+                    let site = cross_site.expect("cross site disappeared during emission");
+                    if let Some(record) = site.static_record_factory {
+                        debug_assert_eq!(argc, 2);
+                        let record_fallback = ops.new_dynamic_label();
+                        let packed_record = ((record.fid as u64) << 32)
+                            | ((proto.reg_count.max(1) as u64) << 16)
+                            | u64::from(arg_base);
+                        dynasm!(ops
+                            ; mov rcx, rdi
+                            ; mov rdx, rbx
+                            ; lea r8, [rbx + dreg(arg_base)]
+                            ; mov r9, QWORD packed_record as i64
+                            ; mov rax, [rbx + dreg(callee)]
+                            ; mov [rsp + 32], rax
+                            ; mov rax, QWORD heap.static_record_factory as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => record_fallback
+                            ; mov r10, QWORD CALL_THREW as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                        if refetch_pinned {
+                            emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                        }
+                        if let Some((snap, plan)) = ta_refetch {
+                            emit_refetch_ta(&mut ops, snap, plan);
+                        }
+                        dynasm!(ops
+                            ; jmp => cross_done
+                            ; => record_fallback
+                        );
+                    }
+                    let same_proto2 = site.same_proto2;
                     let packed_cross: u64 = match same_proto2 {
                         Some(plan) => {
                             ((plan.fid as u64) << 32)

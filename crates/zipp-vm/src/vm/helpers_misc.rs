@@ -176,6 +176,12 @@ pub(crate) extern "win64" fn jit_self_call_at(
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_REGION_CALL_MAX: u32 = 64;
 
+/// Suspended frame-free Tier-C activations kept as explicit VM roots. A
+/// frame-backed outer activation consumes no slot, so retain two levels of
+/// headroom under the native-call cap for fail-before-native fallback.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const TIER_C_ACTIVATION_ROOT_STACK_MAX: usize = JIT_REGION_CALL_MAX as usize - 2;
+
 /// Win64 helper for a generic `obj.m(args…)` (`CallMethod`) inside a compiled
 /// OSR region. Consults the SAME per-site inline cache the interpreter uses
 /// (`ic_call_method`, keyed by `(func_id, ip)`), frame-calls the resolved plain
@@ -377,6 +383,42 @@ pub(crate) extern "win64" fn jit_string_regexp_call_direct(
             Err(t) => vm.jit_thrown_to_sentinel(t),
         }
     })
+}
+
+/// Effectful boundary for the bounded static-record factory prefix. ABI:
+/// rcx=vm, rdx=caller window base, r8=&args[0], r9=(expected_fid<<32) |
+/// (caller_reg_count<<16) | arg_base, and the live callee bits as stack arg 5.
+/// Every ordinary miss returns SELF_CALL_DEOPT before object allocation so the
+/// emitted site can take its unchanged cross/call fallback. A panic after the
+/// required GC safe point or commit is fail-stop via `catch_effectful_jit_u64`;
+/// it is never translated into replay after a partial allocation/mutation.
+///
+/// # Safety
+/// Generated code supplies pointers into the pinned live register window. The
+/// helper validates both by integer bounds before either is dereferenced.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_static_record_factory(
+    vm: *mut core::ffi::c_void,
+    caller_base_ptr: *const u64,
+    args: *const u64,
+    packed: u64,
+    callee_bits: u64,
+) -> u64 {
+    crate::codegen::static_record_stats::attempt();
+    if vm.is_null() {
+        crate::codegen::static_record_stats::decline();
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let bits = catch_effectful_jit_u64(|| unsafe {
+        let vm = &mut *(vm as *mut Vm);
+        vm.jit_static_record_factory_impl(caller_base_ptr, args, packed, callee_bits)
+    });
+    if bits == crate::codegen::SELF_CALL_DEOPT {
+        crate::codegen::static_record_stats::decline();
+    } else {
+        crate::codegen::static_record_stats::hit();
+    }
+    bits
 }
 
 /// Win64 helper for the Tier C CROSS-CALL fast path (B83): a compiled body's
@@ -2729,9 +2771,11 @@ pub use icstats::dump as ic_stats;
 /// `ZIPP_ICSTATS=1` — W7 cross-call window-fill counters: `fill_fast` counts
 /// callee windows exposed via `set_len` under the high-water mark with only
 /// the may-read-before-write registers re-zeroed (the `cross_uninit_mask`
-/// lever engaging); `fill_full` counts full zero-filling `resize`s (new
-/// ground, analysis declined, or `ZIPP_NO_CROSSCALL2=1`). Off, one relaxed
-/// atomic load on a path that already made an FFI helper call.
+/// lever engaging, including its owned multi-word form); `fill_full` counts
+/// full zero-filling `resize`s (new ground, analysis declined,
+/// `ZIPP_NO_CROSSCALL2=1`, or wide-only
+/// `ZIPP_NO_CROSSCALL_WIDE_MASK=1`). Off, one relaxed atomic load on a path
+/// that already made an FFI helper call.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) mod crossstats {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -2784,6 +2828,45 @@ pub(crate) mod crossstats {
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub use crossstats::dump as cross_fill_stats;
+
+/// `ZIPP_ICSTATS=1` — universal Tier-C activation-root mechanism counter.
+/// It proves that a nested Tier-C activation suspended a frame-free caller that
+/// has no interpreter Frame of its own. Ordinary top-level cross calls never
+/// touch its latch.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) mod activationrootstats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    static NESTED_FRAME_FREE: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn enabled() -> bool {
+        match ON.load(Ordering::Relaxed) {
+            0 => false,
+            1 => true,
+            _ => {
+                let on = std::env::var_os("ZIPP_ICSTATS").is_some() as u8;
+                ON.store(on, Ordering::Relaxed);
+                on == 1
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn nested_under_frame_free() {
+        if enabled() {
+            NESTED_FRAME_FREE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn dump() -> u64 {
+        NESTED_FRAME_FREE.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub use activationrootstats::dump as tierc_activation_root_stats;
 
 /// `ZIPP_ICSTATS=1` — chain-link fast-helper counters: `fast_int`/`fast_str`
 /// count `StrConcatChain` links served by `jit_concat_chain_fast`'s in-place
@@ -2990,6 +3073,12 @@ pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
 #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
 pub fn cross_fill_stats() -> (u64, u64) {
     (0, 0)
+}
+
+/// Without x86-64 Tier C there are no suspended frame-free activation roots.
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+pub fn tierc_activation_root_stats() -> u64 {
+    0
 }
 
 /// Without the JIT there is no fused computed-write helper to classify.
@@ -4450,14 +4539,180 @@ pub(crate) extern "win64" fn jit_upval_get(vm: *mut core::ffi::c_void, idx: u32)
 
 /// Resolve one captured cell for a Tier-C whole-function activation. Unlike a
 /// loop region, a native cross-call deliberately has no interpreter `Frame`, so
-/// its closure identity is installed in `Vm::jit_tierc_closure` for the exact
-/// dynamic extent of the native entry. Keeping this resolver distinct from
+/// its exact activation identity is installed in the VM for the native entry's
+/// dynamic extent. Keeping this resolver distinct from
 /// `jit_upval_get` prevents an interpreter re-entry nested inside Tier C from
 /// accidentally reading the suspended native caller's closure.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl<'p> Vm<'p> {
+    /// Install every Tier-C activation's exact root identities. The returned
+    /// token restores the complete previous state. A full stack returns `None`
+    /// BEFORE native entry, so the caller must take its ordinary Frame-backed
+    /// interpreter route; it is never safe to overwrite active root ids and
+    /// rely on Rust locals across a JS GC safe point.
+    #[inline(always)]
+    pub(crate) fn enter_tierc_activation(
+        &mut self,
+        closure: u32,
+        callee: u32,
+        frame_free: bool,
+    ) -> Option<TiercActivationToken> {
+        // A frame-backed outer entry is restored from the token and therefore
+        // does not consume a root-stack slot. Leave two slots of headroom below
+        // the native-call limit so a chain that starts in such a real Frame
+        // still reaches this cap while the cross-call helper can decline cleanly
+        // before native entry. Deep recursion is cold and semantics stay exact.
+        let prior = self.jit_tierc_activation;
+        let rooted_prior = prior.active && prior.frame_free;
+        if rooted_prior {
+            if self.jit_tierc_activation_stack.len() >= TIER_C_ACTIVATION_ROOT_STACK_MAX {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!(
+                        "[jit] Tier-C activation-root stack full depth={} frame_free={frame_free}",
+                        self.jit_tierc_activation_stack.len()
+                    );
+                }
+                return None;
+            }
+            // The token is a Rust local and is invisible to VM GC. Duplicate
+            // only a suspended frame-free state here; a frame-backed prior is
+            // already rooted by its still-live interpreter Frame.
+            self.jit_tierc_activation_stack.push(prior);
+            activationrootstats::nested_under_frame_free();
+        }
+        self.jit_tierc_activation = TiercActivationState {
+            active: true,
+            frame_free,
+            closure,
+            callee,
+        };
+        Some(TiercActivationToken {
+            prior,
+            rooted_prior,
+        })
+    }
+
+    /// Restore the state replaced by [`Vm::enter_tierc_activation`]. Called
+    /// immediately after native return, before any throw, bailout, replay, or
+    /// metering continuation can re-enter the VM.
+    #[inline(always)]
+    pub(crate) fn leave_tierc_activation(&mut self, token: TiercActivationToken) {
+        if token.rooted_prior {
+            let rooted = self.jit_tierc_activation_stack.pop();
+            debug_assert_eq!(
+                rooted,
+                Some(token.prior),
+                "Tier-C activation-root stack imbalance"
+            );
+        }
+        self.jit_tierc_activation = token.prior;
+    }
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod tierc_activation_root_tests {
+    use super::*;
+
+    fn fixture() -> Program {
+        let source = "var ready = true;";
+        let ast = crate::front::parse_script(source).expect("source parses");
+        crate::compile::compile_program(&ast, source).expect("source compiles")
+    }
+
+    fn state(closure: u32, callee: u32, frame_free: bool) -> TiercActivationState {
+        TiercActivationState {
+            active: true,
+            frame_free,
+            closure,
+            callee,
+        }
+    }
+
+    #[test]
+    fn token_roots_only_suspended_frame_free_state_and_restores_exactly() {
+        let program = fixture();
+        let mut vm = Vm::new(&program);
+
+        let frame_state = state(10, 11, false);
+        let frame_token = vm
+            .enter_tierc_activation(frame_state.closure, frame_state.callee, false)
+            .expect("first entry");
+        assert_eq!(vm.jit_tierc_activation, frame_state);
+        assert!(vm.jit_tierc_activation_stack.is_empty());
+
+        let cross_state = state(20, 21, true);
+        let cross_token = vm
+            .enter_tierc_activation(cross_state.closure, cross_state.callee, true)
+            .expect("cross entry");
+        assert_eq!(vm.jit_tierc_activation, cross_state);
+        assert!(
+            vm.jit_tierc_activation_stack.is_empty(),
+            "the real Frame already roots the suspended frame-backed state"
+        );
+
+        let nested_state = state(30, 31, false);
+        let nested_token = vm
+            .enter_tierc_activation(nested_state.closure, nested_state.callee, false)
+            .expect("nested direct entry");
+        assert_eq!(vm.jit_tierc_activation, nested_state);
+        assert_eq!(
+            vm.jit_tierc_activation_stack.as_slice(),
+            &[cross_state],
+            "the suspended frame-free state must stay visible to VM GC"
+        );
+
+        vm.leave_tierc_activation(nested_token);
+        assert_eq!(vm.jit_tierc_activation, cross_state);
+        assert!(vm.jit_tierc_activation_stack.is_empty());
+        vm.leave_tierc_activation(cross_token);
+        assert_eq!(vm.jit_tierc_activation, frame_state);
+        assert!(vm.jit_tierc_activation_stack.is_empty());
+        vm.leave_tierc_activation(frame_token);
+        assert_eq!(vm.jit_tierc_activation, TiercActivationState::EMPTY);
+        assert!(vm.jit_tierc_activation_stack.is_empty());
+    }
+
+    #[test]
+    fn frame_free_root_cap_declines_without_mutating_state() {
+        let program = fixture();
+        let mut vm = Vm::new(&program);
+        let mut tokens = Vec::with_capacity(TIER_C_ACTIVATION_ROOT_STACK_MAX + 1);
+
+        tokens.push(
+            vm.enter_tierc_activation(100, 101, true)
+                .expect("first frame-free entry"),
+        );
+        for depth in 0..TIER_C_ACTIVATION_ROOT_STACK_MAX {
+            tokens.push(
+                vm.enter_tierc_activation(200 + depth as u32, 300 + depth as u32, true)
+                    .unwrap_or_else(|| panic!("entry {depth} reached the cap too early")),
+            );
+        }
+        assert_eq!(
+            vm.jit_tierc_activation_stack.len(),
+            TIER_C_ACTIVATION_ROOT_STACK_MAX
+        );
+        let current = vm.jit_tierc_activation;
+        let rooted = vm.jit_tierc_activation_stack.clone();
+        assert!(
+            vm.enter_tierc_activation(900, 901, true).is_none(),
+            "the frame-free root cap must decline before native entry"
+        );
+        assert_eq!(vm.jit_tierc_activation, current);
+        assert_eq!(vm.jit_tierc_activation_stack, rooted);
+
+        for token in tokens.into_iter().rev() {
+            vm.leave_tierc_activation(token);
+        }
+        assert_eq!(vm.jit_tierc_activation, TiercActivationState::EMPTY);
+        assert!(vm.jit_tierc_activation_stack.is_empty());
+    }
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn jit_tierc_cell(vm: &Vm<'_>, idx: u32) -> Option<u32> {
-    let closure = vm.jit_tierc_closure;
+    let closure = vm.jit_tierc_activation.closure;
     if closure == NO_CLOSURE || closure as usize >= vm.heap.len() {
         return None;
     }
@@ -4473,7 +4728,7 @@ fn jit_tierc_cell(vm: &Vm<'_>, idx: u32) -> Option<u32> {
 /// at the exact `UpvalGet` ip so the interpreter supplies the throw semantics.
 ///
 /// # Safety
-/// `vm` is the live VM whose Tier-C entry installed `jit_tierc_closure`.
+/// `vm` is the live VM whose Tier-C entry installed its exact activation state.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_tierc_upval_get(vm: *mut core::ffi::c_void, idx: u32) -> u64 {
     let vm = unsafe { &*(vm as *const Vm) };

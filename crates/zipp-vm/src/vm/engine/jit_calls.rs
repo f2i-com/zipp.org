@@ -6,6 +6,191 @@
 use super::*;
 
 impl<'p> Vm<'p> {
+    /// Pure validation/evaluation half of the static-record prefix. It reads
+    /// only live VM state and tagged Int arguments; every failure is safe to
+    /// replay through the unchanged ordinary Call path.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn static_record_factory_preflight(
+        &self,
+        caller_base_ptr: *const u64,
+        args: *const u64,
+        packed: u64,
+        callee_bits: u64,
+    ) -> Option<(u32, crate::codegen::StaticRecordArm, [Value; 5])> {
+        if self.gc_stress
+            || self.jit_call_depth >= JIT_REGION_CALL_MAX
+            || self.frames.len() >= MAX_FRAMES
+            || caller_base_ptr.is_null()
+            || args.is_null()
+        {
+            return None;
+        }
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return None;
+        }
+
+        let expected_fid = (packed >> 32) as u32;
+        let caller_regs = ((packed >> 16) & 0xffff) as usize;
+        let arg_base = (packed & 0xffff) as usize;
+        if expected_fid as usize >= self.main_func_count
+            || caller_regs == 0
+            || arg_base.checked_add(2).is_none_or(|end| end > caller_regs)
+        {
+            return None;
+        }
+
+        // Integer-address validation avoids offset_from/provenance UB for a
+        // malformed direct helper call. Generated callers always pass their
+        // topmost live register window and its exact staged argument subrange.
+        let regs_start = self.regs.as_ptr() as usize;
+        let regs_end = regs_start.checked_add(self.regs.len().checked_mul(8)?)?;
+        let caller_start = caller_base_ptr as usize;
+        let caller_end = caller_start.checked_add(caller_regs.checked_mul(8)?)?;
+        let expected_args = caller_start.checked_add(arg_base.checked_mul(8)?)?;
+        if caller_start < regs_start
+            || (caller_start - regs_start) % 8 != 0
+            || caller_end != regs_end
+            || args as usize != expected_args
+        {
+            return None;
+        }
+        let caller_slot = (caller_start - regs_start) / 8;
+        let arg_slot = caller_slot.checked_add(arg_base)?;
+        let arg_end = arg_slot.checked_add(2)?;
+        let canonical_args = self.regs.get(arg_slot..arg_end)?;
+        let arg0 = canonical_args[0];
+        let arg1 = canonical_args[1];
+
+        let callee = Value::from_bits(callee_bits);
+        if !callee.is_heap() || callee.heap_index() as usize >= self.heap.len() {
+            return None;
+        }
+        if !matches!(self.heap.get(callee.heap_index()), HeapObj::Func(fid) if *fid == expected_fid)
+        {
+            return None;
+        }
+        // Match setup_call's callee-window capacity rule before any prefix
+        // effect. A declined prefix replays the ordinary Call, which then
+        // produces its normal catchable RangeError at the same exact boundary.
+        let proto = self.func(expected_fid as usize);
+        let callee_regs = (proto.reg_count as usize).max(1);
+        let needed = self.regs.len().checked_add(callee_regs)?;
+        if self.regs_would_overflow(needed)
+            || self.current_realm_id().is_some()
+            || self.get_function_realm(callee) != 0
+            || self.closure_eval_scope.contains_key(&callee.heap_index())
+        {
+            return None;
+        }
+
+        // A frame-free Tier-C caller has no Frame of its own, so consult its
+        // exact activation closure. A frame-backed Tier-C body or OSR region
+        // must have no live dynamic EvalScope on the current interpreter frame.
+        if self.jit_tierc_activation.active && self.jit_tierc_activation.frame_free {
+            let closure = self.jit_tierc_activation.closure;
+            if closure != NO_CLOSURE && self.closure_eval_scope.contains_key(&closure) {
+                return None;
+            }
+        } else {
+            let frame_index = self.frames.len().checked_sub(1)?;
+            if self.frame_eval_scope(frame_index).is_some() {
+                return None;
+            }
+        }
+
+        if !arg0.is_int() || !arg1.is_int() {
+            return None;
+        }
+        let a0 = arg0.as_int();
+        let a1 = arg1.as_int();
+        let arm = self.jit.static_record_factory_arm(expected_fid, a1)?;
+        let key_plan = proto.static_key_plans.get(arm.plan_id as usize)?;
+        if !key_plan.runtime_valid() || key_plan.len() != arm.field_count as usize {
+            return None;
+        }
+
+        let mut values = [Value::UNDEFINED; 5];
+        for index in 0..arm.field_count as usize {
+            values[index] = match arm.values[index] {
+                crate::codegen::StaticRecordRecipe::Arg0 => arg0,
+                crate::codegen::StaticRecordRecipe::Arg1 => arg1,
+                crate::codegen::StaticRecordRecipe::Const(v) => Value::int(v),
+                crate::codegen::StaticRecordRecipe::Arg0Xor(v) => Value::int(a0 ^ v),
+                crate::codegen::StaticRecordRecipe::Arg0Add(v) => {
+                    // An overflowing JS Number addition becomes a Double; the
+                    // Int-only recipe must decline and let ordinary bytecode do
+                    // that conversion rather than wrapping.
+                    Value::int(a0.checked_add(v)?)
+                }
+                crate::codegen::StaticRecordRecipe::Empty => return None,
+            };
+        }
+        Some((expected_fid, arm, values))
+    }
+
+    /// Build one planned ordinary object for the exact hostile record-factory
+    /// grammar. Validation is repeated after the GC safe point. Once allocation
+    /// begins this method never returns the replay sentinel; its extern wrapper
+    /// uses the effectful fail-stop panic boundary.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_static_record_factory_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        args: *const u64,
+        packed: u64,
+        callee_bits: u64,
+    ) -> u64 {
+        let Some(first) =
+            self.static_record_factory_preflight(caller_base_ptr, args, packed, callee_bits)
+        else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
+
+        // `self.regs` is capacity-pinned before x86 native entry and the GC is
+        // non-moving, so the incoming addresses remain stable. They are used
+        // only as integer witnesses: preflight derives canonical self.regs
+        // indices and re-reads the two Values from that safe slice below.
+        self.maybe_gc();
+
+        let Some(second) =
+            self.static_record_factory_preflight(caller_base_ptr, args, packed, callee_bits)
+        else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
+        if first != second {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        let (fid, arm, values) = second;
+        let plan = match self
+            .func(fid as usize)
+            .static_key_plans
+            .get(arm.plan_id as usize)
+            .cloned()
+        {
+            Some(plan) if plan.runtime_valid() && plan.len() == arm.field_count as usize => plan,
+            _ => return crate::codegen::SELF_CALL_DEOPT,
+        };
+
+        // Commit boundary: all remaining operations are VM-internal allocation
+        // and mutation. Values are tagged Ints, so no old-to-young barrier is
+        // needed while the fresh, still-unpublished object is populated.
+        let idx = self
+            .heap
+            .alloc(HeapObj::Object(Box::new(ObjMap::with_static_key_plan(
+                plan.clone(),
+            ))));
+        self.realm_born(idx, self.obj_proto);
+        let HeapObj::Object(map) = self.heap.get_mut(idx) else {
+            unreachable!("fresh static-record allocation changed heap kind")
+        };
+        for (index, key) in plan.keys().iter().enumerate() {
+            map.push_static_data(key, values[index]);
+        }
+        crate::heap::note_static_key_jit_object();
+        Value::heap(idx).bits()
+    }
+
     /// The native self-recursive-call implementation behind the `jit_self_call`
     /// FFI trampoline. Runs `self`-recursion natively on a fresh register window
     /// appended to `self.regs`. Returns result Value bits, or
@@ -479,12 +664,14 @@ impl<'p> Vm<'p> {
         // (`regs_hw` — every slot below it was zero-initialized once and has
         // only ever been overwritten with live `Value`s since), expose it with
         // `set_len` and zero ONLY what the callee can observe as uninitialized:
-        //   * `uninit_mask` — the compile-time may-read-before-write register
-        //     set (`cross_uninit_mask`, a must-def dataflow over the CLOSED
-        //     Tier-C op set; `u64::MAX` = analysis declined → full fill). Every
-        //     other register is proven def-before-use on every path from entry,
-        //     and Tier C stores every def to the window (memory tier), so an
-        //     interpreter resume after a mid-body bail sees the same defs.
+        //   * the compile-time may-read-before-write register set
+        //     (`cross_uninit_mask`, a must-def dataflow over the CLOSED Tier-C
+        //     op set). Callees up to 64 registers use the inline `u64`; wide
+        //     callees use JIT-owned words looked up below. Missing or malformed
+        //     metadata declines to full fill. Every other register is proven
+        //     def-before-use on every path from entry, and Tier C stores every
+        //     def to the window (memory tier), so an interpreter resume after
+        //     a mid-body bail sees the same defs.
         //   * missing arguments `[1+n, 1+params)` — the dataflow assumes params
         //     are entry-defined; short calls must make that true.
         // GC-COMPLETENESS (the B117 argument, unchanged): `len` spans the
@@ -494,16 +681,40 @@ impl<'p> Vm<'p> {
         // The safe point above ran at `len == new_base`, so no stale slot is
         // ever scanned before this call's own `this`/args land.
         let n = argc.min(params);
-        if uninit_mask != u64::MAX && needed <= self.regs_hw {
+        // Fetch the wide words only AFTER `maybe_gc`: the slice is JIT-owned
+        // and consumed before native/user code can compile or evict anything.
+        // Its exact length is a defensive consistency check against the live
+        // immutable proto; a mismatch takes the ordinary full-fill arm.
+        let wide_uninit_mask = if uninit_mask == u64::MAX {
+            self.jit
+                .cross_wide_uninit_mask(fid)
+                .filter(|mask| mask.len() == reg_count.div_ceil(64))
+        } else {
+            None
+        };
+        if (uninit_mask != u64::MAX || wide_uninit_mask.is_some()) && needed <= self.regs_hw {
             // SAFETY: needed ≤ regs_hw ≤ capacity; [0..regs_hw] was initialized
             // by an earlier resize and the buffer is pinned, so these slots are
             // live, valid `Value`s.
             unsafe { self.regs.set_len(needed) };
-            let mut m = uninit_mask;
-            while m != 0 {
-                let r = m.trailing_zeros() as usize;
-                self.regs[new_base + r] = Value::UNDEFINED;
-                m &= m - 1;
+            if uninit_mask != u64::MAX {
+                let mut m = uninit_mask;
+                while m != 0 {
+                    let r = m.trailing_zeros() as usize;
+                    self.regs[new_base + r] = Value::UNDEFINED;
+                    m &= m - 1;
+                }
+            } else if let Some(mask) = wide_uninit_mask {
+                for (word_index, word) in mask.iter().copied().enumerate() {
+                    let mut m = word;
+                    while m != 0 {
+                        let r = word_index * 64 + m.trailing_zeros() as usize;
+                        if r < reg_count {
+                            self.regs[new_base + r] = Value::UNDEFINED;
+                        }
+                        m &= m - 1;
+                    }
+                }
             }
             for r in (1 + n)..(1 + params) {
                 self.regs[new_base + r] = Value::UNDEFINED;
@@ -511,8 +722,8 @@ impl<'p> Vm<'p> {
             crate::vm::helpers_misc::crossstats::fill_fast();
         } else {
             // Full zero-fill: new ground past the high-water mark, or the
-            // analysis declined (`ZIPP_NO_CROSSCALL2` forces this arm — the
-            // mask is pinned to `u64::MAX` at install time).
+            // analysis declined (`ZIPP_NO_CROSSCALL2` forces this arm for all
+            // callees; `ZIPP_NO_CROSSCALL_WIDE_MASK` forces it for >64 regs).
             self.regs.resize(needed, Value::UNDEFINED);
             if needed > self.regs_hw {
                 self.regs_hw = needed;
@@ -530,8 +741,19 @@ impl<'p> Vm<'p> {
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
         // SAFETY: `entry` is `fid`'s Tier-C win64 code (mmap'd, never moves);
         // the window has `reg_count` valid slots; vm is valid.
-        let prior_tierc_closure = std::mem::replace(&mut self.jit_tierc_closure, closure);
-        let prior_tierc_callee = std::mem::replace(&mut self.jit_tierc_callee, cv.heap_index());
+        let activation_token = match self.enter_tierc_activation(closure, cv.heap_index(), true) {
+            Some(token) => token,
+            None => {
+                // All window writes are scratch above the caller. Keep the
+                // initialized high-water mark (those slots remain valid), but
+                // hide the window and take the emitted call site's ordinary
+                // Frame-backed fallback before native/user effects.
+                self.regs.truncate(new_base);
+                self.jit_call_depth -= 1;
+                self.osr_deopt_exempt = true;
+                return SELF_CALL_DEOPT;
+            }
+        };
         let (bits, bail) = {
             let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
             unsafe {
@@ -542,8 +764,7 @@ impl<'p> Vm<'p> {
                 (r, b)
             }
         };
-        self.jit_tierc_callee = prior_tierc_callee;
-        self.jit_tierc_closure = prior_tierc_closure;
+        self.leave_tierc_activation(activation_token);
         let out = if bail == crate::codegen::NO_BAIL {
             self.regs.truncate(new_base);
             bits
@@ -1363,6 +1584,161 @@ impl<'p> Vm<'p> {
     /// any heap allocation on the hot path.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) const MI_MAX_REGS: usize = 24;
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod static_record_preflight_tests {
+    use super::*;
+
+    fn fixture() -> (Vm<'static>, u32, usize, u64) {
+        let source = r#"
+            "use strict";
+            function target(value, kind) {
+                return { value, kind, left: value ^ 85, right: value + 3 };
+            }
+        "#;
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let fid = program
+            .functions
+            .iter()
+            .position(|proto| proto.name == "target")
+            .expect("target proto") as u32;
+        let plan = crate::codegen::recognize_static_record_factory(
+            &program.functions[fid as usize],
+            fid,
+            true,
+        )
+        .expect("static-record plan");
+        let callee_regs = (program.functions[fid as usize].reg_count as usize).max(1);
+        let program = Box::leak(Box::new(program));
+        let mut vm = Vm::new(program);
+        vm.jit.install_static_record_factory_for_test(fid, plan);
+
+        let callee_index = vm.heap.alloc(HeapObj::Func(fid));
+        let callee_bits = Value::heap(callee_index).bits();
+        vm.regs = vec![Value::UNDEFINED; 4];
+        vm.regs[1] = Value::int(10);
+        vm.regs[2] = Value::int(2);
+        vm.regs[3] = Value::from_bits(callee_bits);
+        vm.jit_tierc_activation = TiercActivationState {
+            active: true,
+            frame_free: true,
+            closure: NO_CLOSURE,
+            callee: callee_index,
+        };
+        (vm, fid, callee_regs, callee_bits)
+    }
+
+    fn packed(fid: u32) -> u64 {
+        ((fid as u64) << 32) | (4u64 << 16) | 1
+    }
+
+    fn call_preflight(
+        vm: &Vm<'_>,
+        fid: u32,
+        caller: *const u64,
+        args: *const u64,
+        callee_bits: u64,
+    ) -> Option<(u32, crate::codegen::StaticRecordArm, [Value; 5])> {
+        vm.static_record_factory_preflight(caller, args, packed(fid), callee_bits)
+    }
+
+    fn dummy_frame() -> Frame {
+        Frame {
+            func: 0,
+            base: 0,
+            ip: 0,
+            ret_dst: 0,
+            closure: NO_CLOSURE,
+            handlers: Vec::new(),
+            callee: Value::UNDEFINED,
+            new_target: Value::UNDEFINED,
+            eval_scope: u32::MAX,
+            super_done: false,
+            args_obj: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
+        }
+    }
+
+    #[test]
+    fn exact_register_depth_and_frame_boundaries_fail_before_prefix_effects() {
+        let (mut vm, fid, callee_regs, callee_bits) = fixture();
+        let needed = vm
+            .regs
+            .len()
+            .checked_add(callee_regs)
+            .expect("small fixture window");
+        let caller = vm.regs.as_ptr() as *const u64;
+        let args = caller.wrapping_add(1);
+
+        vm.reg_capacity = needed;
+        let (_, arm, values) =
+            call_preflight(&vm, fid, caller, args, callee_bits).expect("exact capacity fits");
+        assert_eq!(arm.field_count, 4);
+        assert_eq!(
+            values,
+            [
+                Value::int(10),
+                Value::int(2),
+                Value::int(10 ^ 85),
+                Value::int(13),
+                Value::UNDEFINED,
+            ]
+        );
+
+        let heap_len = vm.heap.len();
+        vm.reg_capacity = needed - 1;
+        assert!(call_preflight(&vm, fid, caller, args, callee_bits).is_none());
+        assert_eq!(vm.heap.len(), heap_len, "capacity decline must stay pure");
+
+        vm.reg_capacity = needed;
+        vm.jit_call_depth = JIT_REGION_CALL_MAX - 1;
+        assert!(call_preflight(&vm, fid, caller, args, callee_bits).is_some());
+        vm.jit_call_depth = JIT_REGION_CALL_MAX;
+        assert!(call_preflight(&vm, fid, caller, args, callee_bits).is_none());
+        vm.jit_call_depth = 0;
+
+        vm.frames.resize_with(MAX_FRAMES - 1, dummy_frame);
+        assert!(call_preflight(&vm, fid, caller, args, callee_bits).is_some());
+        vm.frames.push(dummy_frame());
+        assert!(call_preflight(&vm, fid, caller, args, callee_bits).is_none());
+    }
+
+    #[test]
+    fn arguments_are_read_only_from_the_validated_canonical_register_slice() {
+        let (mut vm, fid, callee_regs, callee_bits) = fixture();
+        vm.reg_capacity = vm.regs.len() + callee_regs;
+        let caller_address = vm.regs.as_ptr() as usize;
+        let args_address = caller_address + std::mem::size_of::<Value>();
+
+        // Reconstituted pointers carry only the expected integer addresses.
+        // Preflight must use them as witnesses and read through self.regs, not
+        // dereference either incoming pointer.
+        let caller = caller_address as *const u64;
+        let args = args_address as *const u64;
+        assert!(call_preflight(&vm, fid, caller, args, callee_bits).is_some());
+
+        assert!(call_preflight(
+            &vm,
+            fid,
+            caller,
+            args_address.wrapping_add(1) as *const u64,
+            callee_bits,
+        )
+        .is_none());
+        assert!(call_preflight(&vm, fid, core::ptr::null(), args, callee_bits,).is_none());
+        assert!(call_preflight(
+            &vm,
+            fid,
+            usize::MAX as *const u64,
+            usize::MAX as *const u64,
+            callee_bits,
+        )
+        .is_none());
+    }
 }
 
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]

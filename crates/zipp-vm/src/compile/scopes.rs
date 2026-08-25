@@ -26,6 +26,7 @@ impl<'a> FnCompiler<'a> {
             code: Vec::new(),
             constants: Vec::new(),
             string_constants: Vec::new(),
+            static_key_plans: Vec::new(),
             bigint_consts: Vec::new(),
             wtf8_consts: Vec::new(),
             scopes: vec![Vec::new()],

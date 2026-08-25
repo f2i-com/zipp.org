@@ -6,6 +6,97 @@ claim below is an entry there with its measurements. This file is the map.
 
 ---
 
+## Continuation snapshot — 2026-08-25, Waves 40–52 checkpoint
+
+This checkpoint is based on `b950013` and is being committed before the next
+performance promotion run. It contains several retained, guarded mechanisms,
+their focused A/B evidence, all refutation artifacts, and a security-reviewed
+static-record candidate whose speed gate is still explicitly pending.
+
+### Current hostile checkpoint
+
+`bench/hostile/w50_planned_probe_full_dirty_2026-08-25.json` is the latest
+complete 17-row development capture: exact output on every case, 15
+counterbalanced repetitions, and no health failure. Cold Zipp/Node is
+**1.2786× by ordinary row geomean** and **1.3509× category-balanced**. This is
+substantial progress from Wave 39, but it is not parity. The remaining large
+cold rows are warm-router **3.839×**, allocation-survival **3.740×**, stable and
+megamorphic shapes **3.699× / 3.640×**, React-ish reconciliation **3.135×**,
+NanoID **2.570×**, mutable closures **1.991×**, and type churn **1.520×**.
+
+### Retained work in this checkpoint
+
+- Cross-call register-window reuse now supports selective initialization masks
+  beyond 64 registers, and saturated call sites containing different ordinary
+  FuncProto ids may try the fully dynamic generic cross-call route. Both keep
+  live callee/entry/realm/EvalScope/depth/meter checks and have dedicated
+  Windows ARM64 warning-clean fixtures.
+- Frame-free Tier-C activation roots are explicit and bounded. The GC sees the
+  active closure/callee across helper safe points without manufacturing an
+  interpreter Frame; overflow or dynamic EvalScope state declines safely.
+- Compiler-planned static object keys pre-size and populate unique static
+  literals without per-object key cloning. Same-binary focused results were
+  about **16.8% faster** on shapes/survival, **11.7%** on React-ish code, and
+  **10%** on the router. Plans are source-, count-, byte-, and retained-memory
+  capped, runtime-validated, and covered across delete/redefine, GC, realm,
+  malformed metadata, kill-switch, and no-JIT modes.
+- Minor-GC tracing reuses bounded scratch state instead of allocating it on
+  every collection. The static-key work also added a peak-RSS A/B harness with
+  unit coverage.
+- Native metering blocks now terminate at both `Return` forms, so unreachable
+  synthetic `ReturnUndefined` is not charged. JIT/interpreter equality is
+  pinned below one native chunk. This is fail-closed; no undercharging path was
+  found.
+
+### Rejected work and open security debt
+
+- The typed closure trace was decisively rejected and completely removed. In
+  31 same-binary pairs it made `calls-closures` roughly **40% slower**
+  (`w51_closure_trace_calls_abenv_dirty_2026-08-25.json`). The post-removal W52
+  binary is statistically neutral against W50, and a zero-symbol audit found no
+  trace metadata, ABI plumbing, switches, or tests left behind.
+- JIT metering for finite budgets larger than the 1,048,576-step native chunk
+  still overcharges the unused tail and can stop early at native-to-interpreter
+  handoff. This is availability/accounting failure, not an escape or
+  undercharge. Until the exact loan/refund state machine lands, sandbox CLI
+  execution remains safe because it forces `ZIPP_NOJIT=1`; embedders needing
+  exact finite accounting should do the same.
+
+### Static-record candidate at the commit boundary
+
+A bounded Tier-C call prefix recognizes only immutable bytecode for the two
+hostile scalar record factories: two tagged-Int arguments, one 4-field arm or
+the exact 16-way 5-field `arg1 & 15` dispatch, and only constant/argument/
+checked-add/xor recipes. It is disabled by metering and GC stress and has a
+same-binary kill switch. Plans are pointer-free and capped at 128; the helper
+revalidates exact callee/version/realm/EvalScope/window/tags/plan both before
+and after GC, mirrors MAX_FRAMES, native depth, and pinned register capacity,
+reads arguments only through a canonical `self.regs` slice, and becomes
+fail-stop after allocation.
+
+Independent review caught and closed stale-IC recursive realm traversal,
+missing register-capacity parity, malformed FuncProto register bounds, and raw
+incoming-pointer dereference. Focused validation is 7/7 unit tests and 4/4
+all-feature integration tests; host all-target and Windows ARM64 all-feature
+checks are warning-free. **Its performance A/B has not yet run**, so do not
+claim or retain it on speed grounds without the next step: at least 31
+same-binary pairs on both shape rows, requiring at least 8% per-row improvement
+and an upper ratio CI below 0.95, followed by untouched-row and full-corpus
+checks. If either row improves less than 5%, remove the mechanism.
+
+### Next measured work
+
+After deciding the static-record candidate, the broadest common object lever is
+a real compiler/bytecode-level bounded planned-object finalizer. Survival,
+React, and router collectively execute about 1.47 million eligible literals
+and 5.20 million per-field appends. Do not merely skip JIT append helpers: a
+later bailout would expose an empty or partially initialized object. The safe
+shape evaluates values left-to-right into rooted registers, preserves function
+name/home-object operations, and gives both interpreter and JIT one explicit
+finalizer with historical metering cost and write barriers.
+
+---
+
 ## Continuation snapshot — 2026-08-25, Wave 39 hostile parity campaign
 
 Read this first. This continuation closes a large fraction of Wave 30's hostile

@@ -490,11 +490,14 @@ pub struct SpanCodeUnitPairPlan {
     pub helper: usize,
 }
 
-/// One call site selected for Tier-C native cross-call dispatch. `None` keeps
-/// the generic live-callee helper. `Some` selects the exact rotating
-/// same-prototype lexical-arrow/two-argument helper; its fields are immutable
-/// FuncProto integers only, never heap or executable-code pointers.
-pub type CrossCallPlan = FxHashMap<usize, Option<SameProtoCross2Plan>>;
+/// One call site selected for Tier-C native cross-call dispatch.
+pub type CrossCallPlan = FxHashMap<usize, CrossCallSitePlan>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CrossCallSitePlan {
+    pub same_proto2: Option<SameProtoCross2Plan>,
+    pub(crate) static_record_factory: Option<StaticRecordCallPlan>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SameProtoCross2Plan {
@@ -912,6 +915,9 @@ pub struct HeapHelperAddrs {
     /// Exact rotating same-prototype lexical-arrow/two-argument sibling of
     /// `cross_call`; it shares the same live-resolution and fallback protocol.
     pub cross_call_same_proto2: usize,
+    /// Bounded immutable-bytecode static-record factory prefix. On a pure guard
+    /// miss it returns SELF_CALL_DEOPT and the ordinary cross/call path runs.
+    pub static_record_factory: usize,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
     /// class-instance receiver): interpreter-IC resolution + getter frame
     /// call. Returns the value bits / `SELF_CALL_DEOPT` / `CALL_THREW`.
@@ -955,7 +961,8 @@ pub struct HeapHelperAddrs {
     /// then loads it). Same purity/TDZ contract as `cell_get`.
     pub upval_get: usize,
     /// Tier-C variants resolve the frame-free native activation's closure from
-    /// `Vm::jit_tierc_closure`. Region code keeps using `upval_get/set` above.
+    /// its exact `Vm::jit_tierc_activation` state. Region code keeps using
+    /// `upval_get/set` above.
     pub tierc_upval_get: usize,
     pub tierc_upval_set: usize,
     /// Exact captured `x = (x + 1) | 0` Int fast prefix (returns old bits).
@@ -1094,6 +1101,7 @@ impl HeapHelperAddrs {
             call_ic: self.call_ic,
             cross_call: self.cross_call,
             cross_call_same_proto2: self.cross_call_same_proto2,
+            static_record_factory: self.static_record_factory,
             get_prop_slow: self.get_prop_slow,
             set_prop_slow: self.set_prop_slow,
             get_prop_acc: self.get_prop_acc,
@@ -1635,6 +1643,15 @@ fn tierc_yield_enabled() -> bool {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn crosscall2_enabled() -> bool {
     std::env::var_os("ZIPP_NO_CROSSCALL2").is_none()
+}
+
+/// Same-binary A/B switch for extending W7's selective callee-window fill to
+/// Tier-C functions whose register file spans more than one `u64` mask word.
+/// The wide analysis remains subordinate to `ZIPP_NO_CROSSCALL2`: disabling
+/// W7 still restores the pre-W7 full-fill path for every function.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn crosscall_wide_mask_enabled() -> bool {
+    std::env::var_os("ZIPP_NO_CROSSCALL_WIDE_MASK").is_none()
 }
 
 /// A Tier-C function whose bytecode is the compiler's exact recursive
@@ -2779,8 +2796,9 @@ pub struct Jit {
     /// The second element is the W7 may-read-before-write register mask
     /// (`cross_uninit_mask`): the ONLY callee-window registers the cross-call
     /// helper must zero when it reuses an already-initialized window;
-    /// `u64::MAX` = analysis declined (or `ZIPP_NO_CROSSCALL2`) → full
-    /// zero-fill on every call, the pre-W7 behaviour.
+    /// `u64::MAX` = analysis declined, W7 is disabled, or the callee is wide;
+    /// in the wide case `cross_wide_uninit` may supply the owned multi-word
+    /// mask, otherwise calls use the pre-W7 full zero-fill behaviour.
     /// The third and fourth elements are the optional exact JSON-tree and
     /// Markdown-inline plans described by [`JsonWalkPlan`] and
     /// [`MarkdownInlinePlan`]. They never change native code generation; the
@@ -2792,6 +2810,15 @@ pub struct Jit {
         Option<JsonWalkPlan>,
         Option<MarkdownInlinePlan>,
     )>,
+    /// Pointer-free immutable-bytecode plans for the bounded static-record call
+    /// prefix, indexed by unified func_id. Cleared with cross entries on
+    /// eviction/late metering; helpers copy one fixed arm before a GC safe point.
+    static_record_factories: FxHashMap<u32, Box<StaticRecordFactoryPlan>>,
+    /// Owned multi-word W7 masks for cross-callable functions with more than
+    /// 64 registers, indexed exactly like `cross_entries`. `None` means full
+    /// fill. Words contain register indices only — no bytecode, heap, or raw
+    /// pointers — and are dropped whenever the corresponding entry is cleared.
+    cross_wide_uninit: Vec<Option<Box<[u64]>>>,
     /// Compiled fused `map` kernels, keyed by callback `func_id`. `None` =
     /// tried and ineligible (so we don't recompile every `map` call). Keyed by
     /// `func_id` alone: a given callback proto has fixed param_count/body.
@@ -2885,6 +2912,8 @@ impl Jit {
         self.fn_state.clear();
         self.self_cache = None;
         self.cross_entries.clear();
+        self.cross_wide_uninit.clear();
+        self.static_record_factories.clear();
         self.map_kernels.clear();
         self.reduce_kernels.clear();
         self.filter_kernels.clear();
@@ -2950,26 +2979,87 @@ impl Jit {
         }
     }
 
+    /// Owned wide-register selective-fill words for a live cross entry. The
+    /// caller borrows these only after its GC safe point and consumes them
+    /// before entering native/user code, so reentrant compilation or eviction
+    /// cannot invalidate a live borrow.
+    #[inline]
+    pub fn cross_wide_uninit_mask(&self, func_id: u32) -> Option<&[u64]> {
+        self.cross_wide_uninit
+            .get(func_id as usize)
+            .and_then(Option::as_deref)
+    }
+
+    #[inline]
+    pub(crate) fn static_record_factory_arm(
+        &self,
+        func_id: u32,
+        arg1: i32,
+    ) -> Option<StaticRecordArm> {
+        self.static_record_factories
+            .get(&func_id)
+            .filter(|plan| plan.fid == func_id)
+            .and_then(|plan| plan.arm(arg1))
+    }
+
+    #[inline]
+    pub(crate) fn has_static_record_factory(&self, func_id: u32) -> bool {
+        self.static_record_factories.contains_key(&func_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_static_record_factory_for_test(
+        &mut self,
+        func_id: u32,
+        plan: StaticRecordFactoryPlan,
+    ) {
+        assert_eq!(plan.fid, func_id);
+        assert!(
+            self.static_record_factories.contains_key(&func_id)
+                || self.static_record_factories.len()
+                    < static_record::STATIC_RECORD_MAX_RETAINED_PLANS
+        );
+        self.static_record_factories.insert(func_id, Box::new(plan));
+    }
+
     fn set_cross_entry(
         &mut self,
         func_id: u32,
         entry: *const u8,
         uninit_mask: u64,
+        wide_uninit_mask: Option<Box<[u64]>>,
         json_walk: Option<JsonWalkPlan>,
         markdown_inline: Option<MarkdownInlinePlan>,
+        static_record_factory: Option<StaticRecordFactoryPlan>,
     ) {
         let i = func_id as usize;
         if self.cross_entries.len() <= i {
             self.cross_entries
                 .resize(i + 1, (std::ptr::null(), u64::MAX, None, None));
         }
+        if self.cross_wide_uninit.len() <= i {
+            self.cross_wide_uninit.resize(i + 1, None);
+        }
         self.cross_entries[i] = (entry, uninit_mask, json_walk, markdown_inline);
+        self.cross_wide_uninit[i] = wide_uninit_mask;
+        self.static_record_factories.remove(&func_id);
+        if let Some(plan) = static_record_factory {
+            if self.static_record_factories.len() < static_record::STATIC_RECORD_MAX_RETAINED_PLANS
+            {
+                self.static_record_factories.insert(func_id, Box::new(plan));
+                static_record_stats::plan();
+            }
+        }
     }
 
     fn clear_cross_entry(&mut self, func_id: u32) {
         if let Some(p) = self.cross_entries.get_mut(func_id as usize) {
             *p = (std::ptr::null(), u64::MAX, None, None);
         }
+        if let Some(mask) = self.cross_wide_uninit.get_mut(func_id as usize) {
+            *mask = None;
+        }
+        self.static_record_factories.remove(&func_id);
     }
 
     /// Dense tier state of `func_id` — the frame-entry fast path.
@@ -3093,14 +3183,30 @@ impl Jit {
                 let entry = f.entry();
                 // W7 window-fill mask: which registers a cross call must zero
                 // when reusing an already-initialized window. Computed ONCE per
-                // compile; `ZIPP_NO_CROSSCALL2` pins it to `u64::MAX`, forcing
-                // the full zero-filling `resize` on every call (the pre-W7
-                // behaviour, the lever's off-switch).
-                let uninit_mask = if crosscall2_enabled() {
-                    cross_uninit_mask(proto)
+                // compile; >64-register callees store owned words separately.
+                // `ZIPP_NO_CROSSCALL2` disables both forms, while
+                // `ZIPP_NO_CROSSCALL_WIDE_MASK` disables only the wide form.
+                let (uninit_mask, wide_uninit_mask) = if crosscall2_enabled() {
+                    let small = cross_uninit_mask(proto);
+                    let wide = if small == u64::MAX && crosscall_wide_mask_enabled() {
+                        cross_uninit_wide_mask(proto)
+                    } else {
+                        None
+                    };
+                    (small, wide)
                 } else {
-                    u64::MAX
+                    (u64::MAX, None)
                 };
+                if let Some(mask) = &wide_uninit_mask {
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        let marked: u32 = mask.iter().map(|word| word.count_ones()).sum();
+                        eprintln!(
+                            "[jit] fn{func_id} wide cross-uninit mask regs={} words={} marked={marked}",
+                            proto.reg_count,
+                            mask.len()
+                        );
+                    }
+                }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
                 let json_walk = meter
@@ -3111,7 +3217,17 @@ impl Jit {
                     .is_none()
                     .then(|| markdown_inline_plan(proto))
                     .flatten();
-                self.set_cross_entry(func_id, entry, uninit_mask, json_walk, markdown_inline);
+                let static_record_factory =
+                    recognize_static_record_factory(proto, func_id, meter.is_none());
+                self.set_cross_entry(
+                    func_id,
+                    entry,
+                    uninit_mask,
+                    wide_uninit_mask,
+                    json_walk,
+                    markdown_inline,
+                    static_record_factory,
+                );
                 return;
             }
         }
@@ -4113,6 +4229,11 @@ pub(crate) mod meter;
 mod plan;
 mod plan_region;
 mod proto_mem;
+mod static_record;
+pub(crate) use static_record::{
+    recognize_static_record_factory, static_record_stats, StaticRecordArm, StaticRecordCallPlan,
+    StaticRecordFactoryPlan, StaticRecordRecipe,
+};
 mod regalloc;
 mod region_admit;
 mod region_int;

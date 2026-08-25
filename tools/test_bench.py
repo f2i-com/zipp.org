@@ -482,6 +482,7 @@ class BenchResultTests(unittest.TestCase):
             bench.os.environ,
             {
                 "ZIPP_NOJIT": "1",
+                "ZIPP_NO_TIERC_PLANNED_APPEND_PROBE": "1",
                 "ZIPP_API_TOKEN": "zipp-secret",
                 "ZIPP_PRIVATEKEY": "123456789",
                 "ZIPP_GITHUB_PAT": "123456",
@@ -509,6 +510,7 @@ class BenchResultTests(unittest.TestCase):
                     "ZIPP_API_TOKEN": "<redacted>",
                     "ZIPP_GITHUB_PAT": "<redacted>",
                     "ZIPP_NOJIT": "1",
+                    "ZIPP_NO_TIERC_PLANNED_APPEND_PROBE": "1",
                     "ZIPP_PIN": "<redacted>",
                     "ZIPP_PRIVATEKEY": "<redacted>",
                     "ZIPP_UNKNOWN_CONTROL": "<redacted>",

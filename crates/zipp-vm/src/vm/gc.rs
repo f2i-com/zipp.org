@@ -253,19 +253,19 @@ impl Vm<'_> {
         for &v in &self.jit_const_strings {
             root_val!(v);
         }
-        // A frame-free Tier-C cross-call has no `Frame` entry for its closure.
-        // The caller's callee register normally roots it as well, but make the
-        // activation field an explicit root: helper re-entry may collect while
-        // native code is suspended, and captured-cell resolution must never see
-        // that live closure reclaimed/reused. `NO_CLOSURE` naturally fails the
-        // `i < n` check in `root_idx!`.
+        // Frame-free Tier-C activations have no `Frame` entry. Trace exact
+        // closure/callee identities for the current activation AND every
+        // suspended native caller: a nested body may detach its caller from all
+        // JS-visible objects before allocating/collecting.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        root_idx!(self.jit_tierc_closure);
-        // The exact callable also carries the active realm and inherited
-        // EvalScope for a frame-free Tier-C activation. Keep it live across a
-        // helper safe point even though the caller register normally roots it.
-        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        root_idx!(self.jit_tierc_callee);
+        for state in std::iter::once(&self.jit_tierc_activation)
+            .chain(self.jit_tierc_activation_stack.iter())
+        {
+            if state.active {
+                root_idx!(state.closure);
+                root_idx!(state.callee);
+            }
+        }
         for v in self.class_values.iter().flatten() {
             root_val!(*v);
         }
@@ -842,9 +842,14 @@ impl Vm<'_> {
             // Before the sweep, while the young log is intact.
             self.verify_minor_marks(&marks, n);
         }
-        let mut freed: Vec<u32> = Vec::new();
         let log_len = self.heap.young_log().len();
-        let swept = self.heap.sweep_young(&marks, &mut freed);
+        // `free_slot` appends every reclaimed young slot to `Heap::free`.
+        // No heap slot can be allocated or reused during this collector-only
+        // window, so the appended suffix is the exact freed set in sweep order.
+        // Reuse it rather than allocating and filling a duplicate `Vec<u32>`.
+        let free_before = self.heap.free_indices().len();
+        let swept = self.heap.sweep_young(&marks);
+        debug_assert_eq!(self.heap.free_indices().len() - free_before, swept);
         let t_sweep = gcstats::now(stats);
         // W10 survival-adaptive budget (B123) — before note_minor_done reads
         // it for the next threshold. Skipped under stress: epochs of ~1 alloc
@@ -854,11 +859,11 @@ impl Vm<'_> {
         }
         // A minor prunes only what it FREED (see `prune_freed`); the
         // whole-table retains are the major's.
-        self.prune_freed(&freed);
+        self.prune_freed(free_before, &marks);
         // W10: restore the freed slots to TRUE (their tombstones are OLD) —
         // survivors were already set true by the trace — and the vector is
         // all-true again: exactly the next minor's base. Stash it for reuse.
-        for &i in &freed {
+        for &i in &self.heap.free_indices()[free_before..] {
             marks[i as usize] = true;
         }
         self.heap.stash_nonyoung_marks(marks);
@@ -933,21 +938,26 @@ impl Vm<'_> {
     /// std tables compare `capacity()` because their `retain` walks bucket
     /// capacity (which never shrinks after a burst); `SlotTable::retain`
     /// walks live entries, so those compare `len()`.
-    fn prune_freed(&mut self, freed: &[u32]) {
+    fn prune_freed(&mut self, free_before: usize, live_bits: &[bool]) {
+        // `sweep_young` is the only operation between `free_before`'s capture
+        // and this call. It only appends to the free list, so this suffix is
+        // stable and contains each slot reclaimed by this minor exactly once.
+        let freed = &self.heap.free_indices()[free_before..];
         if freed.is_empty() {
             return;
         }
-        let mut freed_bits = vec![false; self.heap.len()];
-        for &i in freed {
-            freed_bits[i as usize] = true;
-        }
+        // Before `gc_minor` restores the cache base, `live_bits` is true for
+        // every non-young slot and every traced live young slot, and false
+        // exactly for the unreachable young slots in `freed`. It is therefore
+        // the complement of the old heap-sized `freed_bits` allocation.
+        debug_assert!(freed.iter().all(|&i| !live_bits[i as usize]));
         // Slot-keyed std HashMap: per-slot removes, unless the table's own
         // walk is cheaper.
         macro_rules! prune_map {
             ($t:expr) => {
                 if !$t.is_empty() {
                     if $t.capacity() <= freed.len() {
-                        $t.retain(|&k, _| !freed_bits[k as usize]);
+                        $t.retain(|&k, _| live_bits[k as usize]);
                     } else {
                         for i in freed {
                             $t.remove(i);
@@ -961,7 +971,7 @@ impl Vm<'_> {
             ($t:expr) => {
                 if !$t.is_empty() {
                     if $t.capacity() <= freed.len() {
-                        $t.retain(|&k| !freed_bits[k as usize]);
+                        $t.retain(|&k| live_bits[k as usize]);
                     } else {
                         for i in freed {
                             $t.remove(i);
@@ -975,7 +985,7 @@ impl Vm<'_> {
             ($t:expr) => {
                 if !$t.is_empty() {
                     if $t.len() <= freed.len() {
-                        $t.retain(|&k, _| !freed_bits[k as usize]);
+                        $t.retain(|&k, _| live_bits[k as usize]);
                     } else {
                         for i in freed {
                             $t.remove(i);
@@ -1001,7 +1011,7 @@ impl Vm<'_> {
         // most a few deleted name/length intrinsics, so scan it.
         if !self.deleted_callable_intrinsics.is_empty() {
             self.deleted_callable_intrinsics
-                .retain(|&(k, _)| !freed_bits[k as usize]);
+                .retain(|&(k, _)| live_bits[k as usize]);
         }
         prune_set!(self.array_length_nonwritable);
         prune_slots!(self.array_js_len);
@@ -1015,7 +1025,7 @@ impl Vm<'_> {
         prune_map!(self.instance_brand);
         // Keyed by brand id, pruned on its VALUE (the owning class slot).
         if !self.brand_owner.is_empty() {
-            self.brand_owner.retain(|_, &mut c| !freed_bits[c as usize]);
+            self.brand_owner.retain(|_, &mut c| live_bits[c as usize]);
         }
         prune_map!(self.closure_eval_scope);
         prune_map!(self.eval_scope_parent);
@@ -1048,14 +1058,14 @@ impl Vm<'_> {
         // object (value).
         if !self.gen_args_obj.is_empty() {
             self.gen_args_obj
-                .retain(|&k, &mut v| !freed_bits[k as usize] && !freed_bits[v as usize]);
+                .retain(|&k, &mut v| live_bits[k as usize] && live_bits[v as usize]);
         }
         prune_set!(self.fn_name_cells);
         prune_set!(self.const_cells);
         prune_map!(self.gen_callee);
         prune_set!(self.module_body_results);
         prune_map!(self.module_namespaces);
-        self.closure_home.prune_freed(freed, &freed_bits);
+        self.closure_home.prune_freed(freed, live_bits);
         prune_map!(self.closure_new_target);
         prune_map!(self.dispose_stacks);
         prune_map!(self.regexp_exact_source);

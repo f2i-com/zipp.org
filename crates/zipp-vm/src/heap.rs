@@ -11,10 +11,12 @@
 //! enumeration order and is correct (if not yet fast — shapes/inline-caches are
 //! a later tier).
 
+use crate::bytecode::{static_key_plans_enabled, StaticKeyPlan};
 use crate::value::Value;
 use std::borrow::Cow;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 /// Number of keys at which an [`ObjMap`] builds its hash [`PropIndex`].
 /// Measured on 2M-op probes (interpreter): LOOKUPS through the index win
@@ -473,10 +475,214 @@ pub fn index_key(buf: &mut [u8; 20], i: usize) -> &str {
     std::str::from_utf8(&buf[p..]).unwrap_or("")
 }
 
+mod static_key_stats {
+    use super::*;
+
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    static OBJECTS: AtomicU64 = AtomicU64::new(0);
+    static APPENDS: AtomicU64 = AtomicU64::new(0);
+    static MATERIALIZATIONS: AtomicU64 = AtomicU64::new(0);
+    static JIT_OBJECTS: AtomicU64 = AtomicU64::new(0);
+
+    #[inline]
+    fn enabled() -> bool {
+        match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var_os("ZIPP_STATIC_KEY_STATS").is_some();
+                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn object() {
+        if enabled() {
+            OBJECTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn append() {
+        if enabled() {
+            APPENDS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn materialize() {
+        if enabled() {
+            MATERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(super) fn jit_object() {
+        if enabled() {
+            JIT_OBJECTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn dump() -> (u64, u64, u64, u64) {
+        (
+            OBJECTS.load(Ordering::Relaxed),
+            APPENDS.load(Ordering::Relaxed),
+            MATERIALIZATIONS.load(Ordering::Relaxed),
+            JIT_OBJECTS.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// `(planned object allocations, allocation-free planned appends, defensive
+/// materializations, Tier-C planned-object helper allocations)`. Counters are active only with
+/// `ZIPP_STATIC_KEY_STATS=1`, so the normal path pays one relaxed latch load.
+pub fn static_key_plan_stats() -> (u64, u64, u64, u64) {
+    static_key_stats::dump()
+}
+
+/// Record that Tier C executed its planned allocation helper. Kept distinct
+/// from `OBJECTS` so tests can prove native execution rather than only native
+/// compilation; the comparator may still route that helper to owned storage.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn note_static_key_jit_object() {
+    static_key_stats::jit_object();
+}
+
+/// Authoritative insertion-ordered property names. Eligible object literals
+/// share an immutable compiler-owned list while independently exposing only
+/// the prefix whose values/attributes have actually been appended. Any
+/// structural mismatch or mutation materializes that visible prefix first.
+#[derive(Clone)]
+pub enum PropKeys {
+    Owned(Vec<String>),
+    Planned {
+        all: StaticKeyPlan,
+        visible_len: usize,
+    },
+}
+
+impl Default for PropKeys {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl std::fmt::Debug for PropKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_ref().fmt(f)
+    }
+}
+
+impl PartialEq for PropKeys {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for PropKeys {}
+
+impl AsRef<[String]> for PropKeys {
+    fn as_ref(&self) -> &[String] {
+        match self {
+            Self::Owned(keys) => keys,
+            Self::Planned { all, visible_len } => &all.keys()[..*visible_len],
+        }
+    }
+}
+
+impl Deref for PropKeys {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
+}
+
+impl DerefMut for PropKeys {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.make_owned().as_mut_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a PropKeys {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut PropKeys {
+    type Item = &'a mut String;
+    type IntoIter = std::slice::IterMut<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.make_owned().iter_mut()
+    }
+}
+
+impl PropKeys {
+    fn planned(plan: StaticKeyPlan) -> Self {
+        Self::Planned {
+            all: plan,
+            visible_len: 0,
+        }
+    }
+
+    fn make_owned(&mut self) -> &mut Vec<String> {
+        let materialized = match self {
+            Self::Owned(_) => None,
+            Self::Planned { all, visible_len } => Some(all.keys()[..*visible_len].to_vec()),
+        };
+        if let Some(keys) = materialized {
+            *self = Self::Owned(keys);
+            static_key_stats::materialize();
+        }
+        let Self::Owned(keys) = self else {
+            unreachable!("planned keys were materialized")
+        };
+        keys
+    }
+
+    fn reserve_exact(&mut self, additional: usize) {
+        self.make_owned().reserve_exact(additional);
+    }
+
+    fn push(&mut self, key: String) {
+        self.make_owned().push(key);
+    }
+
+    fn remove(&mut self, i: usize) -> String {
+        self.make_owned().remove(i)
+    }
+
+    /// Advance an exact compiler-planned key. A mismatch leaves the plan
+    /// untouched so the caller can materialize via its ordinary append path.
+    fn advance_if_next(&mut self, key: &str) -> bool {
+        let Self::Planned { all, visible_len } = self else {
+            return false;
+        };
+        if all.keys().get(*visible_len).map(String::as_str) != Some(key) {
+            return false;
+        }
+        *visible_len += 1;
+        static_key_stats::append();
+        true
+    }
+
+    fn is_planned(&self) -> bool {
+        matches!(self, Self::Planned { .. })
+    }
+}
+
 /// A JS object: insertion-ordered string-keyed properties.
 #[derive(Clone, Debug, Default)]
 pub struct ObjMap {
-    pub keys: Vec<String>,
+    pub keys: PropKeys,
     pub vals: Vec<Value>,
     /// Per-property attributes, parallel to `keys`/`vals` (a property descriptor's
     /// writable/enumerable/configurable + accessor get/set). For a DATA property
@@ -534,6 +740,11 @@ pub struct ObjMap {
     /// every JIT'd `m[i]` (which deopts to the interpreter). None of those four
     /// names can shadow an element, so the precise question is this bit.
     has_element_key: bool,
+    /// A planned literal observed a mutation or an out-of-order AppendDataProp.
+    /// From that point malformed/replayed appends use descriptor-safe `define`
+    /// rather than the compiler-proof-only unchecked push. Fits existing bool
+    /// padding, preserving ObjMap's pinned size.
+    planned_append_failed: bool,
     /// This object's hidden class — see [`crate::shape`]. A redundant summary of
     /// `keys` + `attrs`, maintained by the same methods that mutate them, so an
     /// inline cache can ask "same layout?" with one integer compare instead of
@@ -764,6 +975,30 @@ impl ObjMap {
         m
     }
 
+    /// Empty object storage backed by a compiler-prepared immutable key list.
+    /// The explicit mode seam lets tests compare both representations without
+    /// racing the process-wide environment latch.
+    pub(crate) fn with_static_key_plan_mode(plan: StaticKeyPlan, enabled: bool) -> ObjMap {
+        let n = plan.len();
+        if !enabled {
+            return ObjMap::with_capacity(n);
+        }
+        let mut m = ObjMap::new();
+        m.keys = PropKeys::planned(plan);
+        if n > 0 {
+            m.vals.reserve_exact(n);
+            m.attrs.reserve_exact(n);
+        }
+        static_key_stats::object();
+        m
+    }
+
+    /// Shipped constructor using the process-latched
+    /// `ZIPP_NO_STATIC_KEY_PLANS` comparator.
+    pub(crate) fn with_static_key_plan(plan: StaticKeyPlan) -> ObjMap {
+        Self::with_static_key_plan_mode(plan, static_key_plans_enabled())
+    }
+
     /// A map used as an engine-internal SIDE TABLE — an Array's or RegExp's
     /// named properties, a function's own properties — rather than as a JS
     /// object's own storage.
@@ -800,7 +1035,7 @@ impl ObjMap {
 
     pub fn new() -> ObjMap {
         ObjMap {
-            keys: Vec::new(),
+            keys: PropKeys::default(),
             vals: Vec::new(),
             attrs: Vec::new(),
             class: None,
@@ -812,6 +1047,7 @@ impl ObjMap {
             index: None,
             numeric_index: None,
             has_element_key: false,
+            planned_append_failed: false,
             shape: crate::shape::EMPTY,
         }
     }
@@ -884,6 +1120,29 @@ impl ObjMap {
         }
     }
 
+    /// Whether `key` is the exact next entry in an intact compiler key plan.
+    ///
+    /// This is a PURE absence proof for the Tier-C append helper: a valid plan
+    /// contains unique keys, and an intact planned map exposes exactly its
+    /// already-built prefix. Therefore the next planned key cannot already be
+    /// present and the helper may skip `pos()` before committing it. Every
+    /// invariant is rechecked here so malformed internal state falls back to
+    /// the ordinary lookup/deopt path rather than licensing an unchecked push.
+    #[cfg(any(test, all(feature = "jit", target_arch = "x86_64")))]
+    #[inline]
+    pub(crate) fn planned_next_static_key(&self, key: &str) -> bool {
+        if self.planned_append_failed {
+            return false;
+        }
+        let PropKeys::Planned { all, visible_len } = &self.keys else {
+            return false;
+        };
+        all.runtime_valid()
+            && self.vals.len() == *visible_len
+            && self.attrs.len() == *visible_len
+            && all.keys().get(*visible_len).map(String::as_str) == Some(key)
+    }
+
     /// Position of a canonical Array-index key. With the W25 side index on,
     /// absence of the table is also proof that this map has no numeric keys.
     /// The off-switch is the exact pre-wave spelling/hash lookup.
@@ -937,6 +1196,7 @@ impl ObjMap {
     /// their attributes (only the value changes). The JIT inline cache uses the
     /// return to bump the object's version on a key-add.
     pub fn set(&mut self, key: &str, val: Value) -> bool {
+        self.planned_append_failed |= self.keys.is_planned();
         if let Some(i) = self.pos(key) {
             self.vals[i] = val;
             false
@@ -965,6 +1225,7 @@ impl ObjMap {
     /// then handed each key to `set` as a `&str`, so every first insertion
     /// allocated a second copy of a string the parser had already allocated.
     pub fn set_owned(&mut self, key: String, val: Value) -> bool {
+        self.planned_append_failed |= self.keys.is_planned();
         if let Some(i) = self.pos(&key) {
             self.vals[i] = val;
             false
@@ -978,6 +1239,7 @@ impl ObjMap {
     /// with non-default enumerability). Overwrites any existing slot. Returns
     /// `true` if a new key was appended.
     pub fn define(&mut self, key: &str, val: Value, attr: PropAttr) -> bool {
+        self.planned_append_failed |= self.keys.is_planned();
         if let Some(i) = self.pos(key) {
             // Redefining an EXISTING property's attributes is not an append, so
             // the transition tree cannot describe the result — unless nothing
@@ -1010,12 +1272,38 @@ impl ObjMap {
     /// `pos`); consumes the key, skipping `set`'s re-lookup and re-clone. The
     /// caller MUST bump the object's version (a key add reallocs `vals`).
     pub fn push_data(&mut self, key: String, val: Value) {
+        self.planned_append_failed |= self.keys.is_planned();
         self.shape_pushed_owned(&key, &PropAttr::data());
         self.has_element_key |= key_names_element(&key);
         self.keys.push(key);
         self.vals.push(val);
         self.attrs.push(PropAttr::data());
         self.index_appended();
+    }
+
+    /// Append a compiler-proved static data property without allocating or
+    /// cloning its name when it is the next key in this object's plan. Any
+    /// mismatch (including malformed bytecode) falls back to the exact owned
+    /// append path, materializing only the already-visible prefix.
+    pub fn push_static_data(&mut self, key: &str, val: Value) {
+        if !self.planned_append_failed && self.keys.advance_if_next(key) {
+            self.vals.push(val);
+            self.attrs.push(PropAttr::data());
+            self.shape_pushed(key, &PropAttr::data());
+            self.has_element_key |= key_names_element(key);
+            self.index_appended();
+            return;
+        }
+        if self.keys.is_planned() {
+            self.planned_append_failed = true;
+        }
+        if self.planned_append_failed {
+            self.define(key, val, PropAttr::data());
+        } else {
+            // Legacy NewObject + compiler-proved AppendDataProp: retain the
+            // historical no-lookup push used by the OFF comparator.
+            self.push_data(key.to_string(), val);
+        }
     }
 
     /// Remove `key`'s own property; returns whether it existed. Shifts later
@@ -1042,6 +1330,7 @@ impl ObjMap {
         // A hole in the middle of the sequence: every later property's slot
         // shifts down, so no shape in the tree describes the result.
         self.shape_to_dict();
+        self.planned_append_failed |= self.keys.is_planned();
         let key = self.keys.remove(i);
         self.vals.remove(i);
         self.attrs.remove(i);
@@ -3121,19 +3410,22 @@ impl Heap {
     /// `free_slot` exactly as the major does (tombstone + version bump + free
     /// list), so every stale inline cache misses identically. Survivors are
     /// PROMOTED (`GEN_OLD`, keeping a sticky scan bit) — promotion is a
-    /// bookkeeping byte, never a copy (NURSERY_DESIGN.md §0). Each freed slot
-    /// is appended to `freed` (the caller's side-table prune set). The log is
-    /// then cleared (capacity kept).
+    /// bookkeeping byte, never a copy (NURSERY_DESIGN.md §0). `free_slot`
+    /// appends each reclaimed slot to the persistent free list; the caller
+    /// records that list's pre-sweep length and uses the appended suffix as its
+    /// exact side-table prune set. The young log is then cleared (capacity
+    /// kept), so no duplicate per-minor `Vec<u32>` is needed.
     ///
     /// No double-free is possible: a young slot is never already on the free
     /// list here, because the free list is refilled only by sweeps and a
     /// freed slot re-enters the log only when `alloc` hands it out again.
-    pub fn sweep_young(&mut self, marks: &[bool], freed: &mut Vec<u32>) -> usize {
+    pub fn sweep_young(&mut self, marks: &[bool]) -> usize {
         let mut log = std::mem::take(&mut self.young);
+        let mut swept = 0;
         for &idx in &log {
             if !marks[idx as usize] {
                 self.free_slot(idx);
-                freed.push(idx);
+                swept += 1;
             } else {
                 // Promote: OLD, keeping only the sticky scan bit — a stale
                 // GEN_VLOG must not survive promotion (W10).
@@ -3143,7 +3435,7 @@ impl Heap {
         }
         log.clear();
         self.young = log;
-        freed.len()
+        swept
     }
 
     // ── stage-3 write barrier + remembered set ─────────────────────────────
@@ -3883,6 +4175,128 @@ pub(crate) mod gcoracle {
 mod tests {
     use super::*;
 
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn static_key_plan_keeps_hot_layout_sizes_exact() {
+        assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);
+        assert_eq!(std::mem::size_of::<PropKeys>(), 24);
+        assert_eq!(std::mem::size_of::<ObjMap>(), 112);
+        assert_eq!(std::mem::size_of::<HeapObj>(), 80);
+    }
+
+    #[test]
+    fn planned_keys_advance_clone_and_materialize_independently() {
+        let plan = StaticKeyPlan::new(vec!["a".into(), "1".into(), "tail".into()]);
+        let mut original = ObjMap::with_static_key_plan_mode(plan, true);
+        assert!(original.keys.is_planned());
+        assert!(original.keys.is_empty());
+
+        original.push_static_data("a", Value::int(1));
+        let mut clone = original.clone();
+        clone.push_static_data("1", Value::int(2));
+        assert_eq!(original.keys.as_ref(), &["a".to_string()]);
+        assert_eq!(clone.keys.as_ref(), &["a".to_string(), "1".to_string()]);
+        assert_eq!(clone.element_pos(1), Some(1));
+        assert!(clone.has_element_key());
+        clone.verify_shape().expect("planned prefix shape");
+
+        // A mismatch must not publish the unbuilt `tail`; it materializes only
+        // the visible prefix and performs the ordinary append.
+        clone.push_static_data("other", Value::int(3));
+        assert!(!clone.keys.is_planned());
+        assert_eq!(
+            clone.keys.as_ref(),
+            &["a".to_string(), "1".to_string(), "other".to_string()]
+        );
+        assert_eq!(clone.pos("tail"), None);
+        clone.verify_shape().expect("materialized mismatch shape");
+
+        // Structural deletion also materializes, preserves order/indexes, and
+        // leaves the independently-cloned original prefix untouched.
+        assert!(clone.remove("1"));
+        assert_eq!(clone.keys.as_ref(), &["a".to_string(), "other".to_string()]);
+        assert_eq!(original.keys.as_ref(), &["a".to_string()]);
+        assert!(original.keys.is_planned());
+    }
+
+    #[test]
+    fn static_key_plan_off_seam_is_the_owned_capacity_path() {
+        let plan = StaticKeyPlan::new(vec!["a".into(), "b".into()]);
+        let mut map = ObjMap::with_static_key_plan_mode(plan, false);
+        assert!(!map.keys.is_planned());
+        assert!(!map.planned_next_static_key("a"));
+        map.push_static_data("a", Value::int(1));
+        map.push_static_data("b", Value::int(2));
+        assert_eq!(map.keys.as_ref(), &["a".to_string(), "b".to_string()]);
+        map.verify_shape().expect("owned comparator shape");
+    }
+
+    #[test]
+    fn planned_next_probe_is_pure_and_fails_closed_on_mutation_or_drift() {
+        let plan = StaticKeyPlan::new(vec!["a".into(), "b".into()]);
+        let mut map = ObjMap::with_static_key_plan_mode(plan.clone(), true);
+        assert!(map.planned_next_static_key("a"));
+        assert!(!map.planned_next_static_key("b"));
+        assert!(
+            map.keys.is_empty(),
+            "the absence proof must not advance the plan"
+        );
+
+        map.push_static_data("a", Value::int(1));
+        assert!(map.planned_next_static_key("b"));
+        assert!(!map.planned_next_static_key("a"));
+
+        // Even a non-structural overwrite routes later appends through the
+        // defensive path once a planned object has been mutated.
+        assert!(!map.set("a", Value::int(9)));
+        assert!(!map.planned_next_static_key("b"));
+
+        let mut vals_drift = ObjMap::with_static_key_plan_mode(plan.clone(), true);
+        vals_drift.vals.push(Value::UNDEFINED);
+        assert!(!vals_drift.planned_next_static_key("a"));
+
+        let mut attrs_drift = ObjMap::with_static_key_plan_mode(plan, true);
+        attrs_drift.attrs.push(PropAttr::data());
+        assert!(!attrs_drift.planned_next_static_key("a"));
+
+        let invalid = StaticKeyPlan::new(vec!["a".into(), "a".into()]);
+        let invalid = ObjMap::with_static_key_plan_mode(invalid, true);
+        assert!(!invalid.planned_next_static_key("a"));
+    }
+
+    #[test]
+    fn malformed_planned_appends_never_create_duplicate_slots() {
+        let plan = StaticKeyPlan::new(vec!["a".into(), "b".into()]);
+        let mut duplicate = ObjMap::with_static_key_plan_mode(plan.clone(), true);
+        assert!(duplicate.planned_next_static_key("a"));
+        duplicate.push_static_data("a", Value::int(1));
+        assert!(!duplicate.planned_next_static_key("a"));
+        assert!(duplicate.planned_next_static_key("b"));
+        duplicate.push_static_data("a", Value::int(9));
+        assert!(!duplicate.planned_next_static_key("b"));
+        duplicate.push_static_data("b", Value::int(2));
+        assert_eq!(duplicate.keys.as_ref(), &["a".to_string(), "b".to_string()]);
+        assert_eq!(duplicate.vals, &[Value::int(9), Value::int(2)]);
+        duplicate.verify_shape().expect("duplicate-safe shape");
+
+        let mut reordered = ObjMap::with_static_key_plan_mode(plan, true);
+        assert!(!reordered.planned_next_static_key("b"));
+        reordered.push_static_data("b", Value::int(2));
+        assert!(!reordered.planned_next_static_key("a"));
+        reordered.push_static_data("a", Value::int(1));
+        reordered.push_static_data("b", Value::int(7));
+        assert_eq!(reordered.keys.as_ref(), &["b".to_string(), "a".to_string()]);
+        assert_eq!(reordered.vals, &[Value::int(7), Value::int(1)]);
+        reordered.verify_shape().expect("reorder-safe shape");
+    }
+
+    #[test]
+    fn duplicate_and_oversize_plan_metadata_is_cached_invalid() {
+        assert!(!StaticKeyPlan::new(vec!["a".into(), "a".into()]).runtime_valid());
+        assert!(!StaticKeyPlan::new(vec!["x".into(); 257]).runtime_valid());
+        assert!(StaticKeyPlan::new(vec!["a".into(), "b".into()]).runtime_valid());
+    }
+
     // ── W19 M1: PropIndex layout differential ──
     //
     // The split (`tags`/`slots`) and interleaved (`Vec<(tag, slot)>`) layouts
@@ -4411,10 +4825,11 @@ mod tests {
         // exactly as the collector's root pass would).
         let mut marks = vec![true; h.len()];
         marks[b as usize] = false;
-        let mut freed = Vec::new();
-        let swept = h.sweep_young(&marks, &mut freed);
+        let free_before = h.free_indices().len();
+        let swept = h.sweep_young(&marks);
+        let freed = &h.free_indices()[free_before..];
         assert_eq!(
-            (swept, freed.as_slice()),
+            (swept, freed),
             (1, &[b][..]),
             "only the unmarked young slot"
         );
@@ -4437,6 +4852,58 @@ mod tests {
         assert!(h.free_indices().is_empty());
     }
 
+    /// The collector derives a minor's prune set from the free-list suffix
+    /// appended by `sweep_young`. Pin both halves of that contract: an older
+    /// free prefix is stable, while mixed live/dead young slots append exactly
+    /// the dead slots in young-log order. Until the caller restores them, the
+    /// same slots are exactly the false entries in the minor mark vector.
+    #[test]
+    fn a_minor_sweep_appends_an_exact_ordered_free_suffix() {
+        let mut h = Heap::new();
+        h.set_nursery(true);
+
+        // Age one slot out of the young log, then make it an existing free-list
+        // entry after constructing the next epoch. No allocation occurs after
+        // this point, matching `gc_minor`'s capture-to-prune window.
+        let prefix = h.alloc(HeapObj::Str(JsStr::new("prefix".into())));
+        let promote = vec![true; h.len()];
+        h.sweep_young(&promote);
+        let live_a = h.alloc(HeapObj::Str(JsStr::new("live-a".into())));
+        let dead_a = h.alloc(HeapObj::Str(JsStr::new("dead-a".into())));
+        let live_b = h.alloc(HeapObj::Str(JsStr::new("live-b".into())));
+        let dead_b = h.alloc(HeapObj::Str(JsStr::new("dead-b".into())));
+        assert_eq!(h.young_log(), &[live_a, dead_a, live_b, dead_b]);
+        h.free_slot(prefix);
+        assert_eq!(h.free_indices(), &[prefix]);
+
+        let mut marks = vec![true; h.len()];
+        marks[dead_a as usize] = false;
+        marks[dead_b as usize] = false;
+        let free_before = h.free_indices().len();
+        let swept = h.sweep_young(&marks);
+
+        assert_eq!(swept, 2);
+        assert_eq!(&h.free_indices()[..free_before], &[prefix]);
+        assert_eq!(
+            &h.free_indices()[free_before..],
+            &[dead_a, dead_b],
+            "the new suffix is exactly the dead young set, in sweep order"
+        );
+        let false_slots: Vec<u32> = marks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &marked)| (!marked).then_some(i as u32))
+            .collect();
+        assert_eq!(false_slots, h.free_indices()[free_before..]);
+
+        // This is the cache-restoration step `gc_minor` performs only after
+        // every side table has consumed the false bits.
+        for &i in &h.free_indices()[free_before..] {
+            marks[i as usize] = true;
+        }
+        assert!(marks.iter().all(|&marked| marked));
+    }
+
     /// The stage-3 barrier state machine, pinned at the unit level: only an
     /// OLD-CLEAN holder with a YOUNG heap value enters the remembered set;
     /// the DIRTY state dedups repeat stores; a minor's `remset_reset` returns
@@ -4451,9 +4918,9 @@ mod tests {
         let holder = h.alloc(HeapObj::Cell(Value::UNDEFINED));
         // Promote: survive a "collection" (everything marked).
         let marks = vec![true; h.len()];
-        let mut freed = Vec::new();
-        h.sweep_young(&marks, &mut freed);
-        assert!(freed.is_empty());
+        let free_before = h.free_indices().len();
+        h.sweep_young(&marks);
+        assert!(h.free_indices()[free_before..].is_empty());
 
         let young = h.alloc(HeapObj::Str(JsStr::new("yy".into())));
         // young holder / young value: no record either way.
@@ -4483,7 +4950,7 @@ mod tests {
 
         // End of minor: both sets reset; the next epoch records afresh.
         let marks = vec![true; h.len()];
-        h.sweep_young(&marks, &mut freed);
+        h.sweep_young(&marks);
         h.remset_reset();
         h.vremset_reset();
         assert_eq!(h.dirty_for_trace(), Vec::<u32>::new());

@@ -130,6 +130,10 @@ struct EnclosingFn {
 
 struct Compiler {
     functions: Vec<FuncProto>,
+    /// Program-wide source caps for compiler-prepared object-literal keys.
+    /// These count retained plan sites/bytes, not runtime objects.
+    static_key_plan_sites: usize,
+    static_key_plan_retained_bytes: usize,
     /// Global name → slot. Ordered: the index IS the slot, and the VM indexes
     /// this directly, so entries are only ever appended.
     globals: Vec<String>,
@@ -404,6 +408,7 @@ fn placeholder(name: &str) -> FuncProto {
         simple_params: false,
         constants: Vec::new(),
         string_constants: Vec::new(),
+        static_key_plans: Vec::new(),
         bigint_consts: Vec::new(),
         wtf8_consts: Vec::new(),
         name_global: None,
@@ -437,6 +442,7 @@ struct FnCompiler<'a> {
     code: Vec<Instr>,
     constants: Vec<Value>,
     string_constants: Vec<String>,
+    static_key_plans: Vec<crate::bytecode::StaticKeyPlan>,
     /// BigInt literal constants beyond i128 (see `FuncProto::bigint_consts`).
     bigint_consts: Vec<num_bigint::BigInt>,
     /// `string_constants` indices holding the lone-surrogate MARKER form

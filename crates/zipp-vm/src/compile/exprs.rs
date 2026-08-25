@@ -10,6 +10,23 @@ use super::*;
 use crate::parse::ast;
 use crate::parse::token::StrVal;
 
+// Security/source caps: plans duplicate source key text once per literal site,
+// so bound both one hostile literal and aggregate compilation memory. Exceeding
+// a cap silently retains ordinary `NewObject`; it never rejects valid source.
+const STATIC_KEY_PLAN_MAX_FIELDS: usize = 256;
+const STATIC_KEY_PLAN_MAX_BYTES: usize = 64 * 1024;
+
+/// Retain at most one plan's admissible name indices while the literal body is
+/// compiled. `static_keys` continues counting the full unique-static run, so a
+/// wider literal still fails `plan_names.len() == static_keys` and falls back;
+/// it just cannot grow an optimization-only Vec with attacker-sized source.
+#[inline]
+fn collect_static_key_plan_name(plan_names: &mut Vec<u32>, name: u32) {
+    if plan_names.len() < STATIC_KEY_PLAN_MAX_FIELDS {
+        plan_names.push(name);
+    }
+}
+
 // NOTE: parenthesization. `ast` has no ParenthesizedExpression, so every peel is
 // gone from this file (`expr_into`, `typeof (f)`, `delete (x)`). That is a
 // deliberate behaviour change in one direction only: a parenthesized operand now
@@ -1468,18 +1485,27 @@ impl<'a> FnCompiler<'a> {
             }
         }
         let all_appendable = appendable;
+        let alloc_ip = self.code.len();
         self.emit(Instr::NewObject {
             dst,
             hint: static_keys.min(u16::MAX as usize) as u16,
         });
+        let plan_enabled = crate::bytecode::static_key_plans_enabled();
+        let mut plan_names = Vec::with_capacity(if plan_enabled {
+            static_keys.min(STATIC_KEY_PLAN_MAX_FIELDS)
+        } else {
+            0
+        });
         for prop in props {
             let save = self.next_reg;
-            match prop {
+            let planned_name = match prop {
                 ast::ObjectMember::Get { key, func } => {
-                    self.object_accessor(dst, key, func, false)?
+                    self.object_accessor(dst, key, func, false)?;
+                    None
                 }
                 ast::ObjectMember::Set { key, func } => {
-                    self.object_accessor(dst, key, func, true)?
+                    self.object_accessor(dst, key, func, true)?;
+                    None
                 }
                 // NOTE: `init` (CoverInitializedName — the `= 1` in `{a = 1}`) is
                 // ignored here on purpose. `({a = 1})` is a SyntaxError and
@@ -1511,11 +1537,67 @@ impl<'a> FnCompiler<'a> {
                 ast::ObjectMember::Spread(s) => {
                     let src = self.expr(s)?;
                     self.emit(Instr::ObjectSpread { target: dst, src });
+                    None
+                }
+            };
+            if plan_enabled {
+                if let Some(name) = planned_name {
+                    collect_static_key_plan_name(&mut plan_names, name);
                 }
             }
             self.next_reg = save; // reclaim this property's scratch temps
         }
+        if plan_enabled && all_appendable && plan_names.len() == static_keys {
+            self.install_static_key_plan(alloc_ip, dst, &plan_names);
+        }
         Ok(dst)
+    }
+
+    /// Install a plan only after every property has compiled successfully. All
+    /// arithmetic and pool widths are checked before mutating either counter or
+    /// bytecode, so every decline leaves the legacy allocation intact.
+    fn install_static_key_plan(&mut self, alloc_ip: usize, dst: Reg, names: &[u32]) {
+        if names.is_empty()
+            || names.len() > STATIC_KEY_PLAN_MAX_FIELDS
+            || self.static_key_plans.len() >= u16::MAX as usize
+            || self.cx.static_key_plan_sites >= crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES
+        {
+            return;
+        }
+        let mut keys = Vec::with_capacity(names.len());
+        let mut bytes = 0usize;
+        for &name in names {
+            let Some(key) = self.string_constants.get(name as usize) else {
+                return;
+            };
+            let Some(next) = bytes.checked_add(key.len()) else {
+                return;
+            };
+            if next > STATIC_KEY_PLAN_MAX_BYTES {
+                return;
+            }
+            bytes = next;
+            keys.push(key.clone());
+        }
+        let Some(plan_charge) = crate::bytecode::static_key_plan_retained_charge(&keys) else {
+            return;
+        };
+        let Some(total_bytes) = self
+            .cx
+            .static_key_plan_retained_bytes
+            .checked_add(plan_charge)
+        else {
+            return;
+        };
+        if total_bytes > crate::bytecode::STATIC_KEY_PLAN_MAX_RETAINED_BYTES {
+            return;
+        }
+        let plan = self.static_key_plans.len() as u16;
+        self.static_key_plans
+            .push(crate::bytecode::StaticKeyPlan::new(keys));
+        self.cx.static_key_plan_sites += 1;
+        self.cx.static_key_plan_retained_bytes = total_bytes;
+        self.code[alloc_ip] = Instr::NewPlannedObject { dst, plan };
     }
 
     /// A property's value into a fresh temp, exactly as `self.expr` would have
@@ -1601,7 +1683,7 @@ impl<'a> FnCompiler<'a> {
         is_method: bool,
         shorthand: bool,
         all_appendable: bool,
-    ) -> R<()> {
+    ) -> R<Option<u32>> {
         // IsAnonymousFunctionDefinition of the value: a method's function is
         // anonymous unless it carries its own name (the property key is not one).
         let anonymous = match val {
@@ -1652,7 +1734,7 @@ impl<'a> FnCompiler<'a> {
                     home: obj,
                 });
             }
-            return Ok(());
+            return Ok(None);
         }
         // Static identifier / string / number literal key.
         let key = static_key_text(key).ok_or("unsupported object key in the zipp-vm subset")?;
@@ -1712,7 +1794,7 @@ impl<'a> FnCompiler<'a> {
                 home: obj,
             });
         }
-        Ok(())
+        Ok((!is_proto && all_appendable).then_some(name))
     }
 
     pub(crate) fn load_number(&mut self, dst: Reg, n: f64) {
@@ -2722,5 +2804,184 @@ impl<'a> FnCompiler<'a> {
             self.next_reg -= 1; // reclaim tmp
             Ok(dst) // dst still holds the (coerced) old value
         }
+    }
+}
+
+#[cfg(test)]
+mod static_key_plan_tests {
+    use super::*;
+
+    fn compile(source: &str) -> crate::bytecode::Program {
+        let ast = crate::front::parse_script(source).expect("source parses");
+        crate::compile::compile_program(&ast, source).expect("source compiles")
+    }
+
+    fn named<'a>(program: &'a crate::bytecode::Program, name: &str) -> &'a FuncProto {
+        program
+            .functions
+            .iter()
+            .find(|func| func.name == name)
+            .unwrap_or_else(|| panic!("missing function {name:?}"))
+    }
+
+    #[test]
+    fn compiler_plans_only_the_exact_unique_static_append_sequence() {
+        let program = compile("function build(x){return {a:x,b:2,m(){return this.a}}} build(1);");
+        let func = named(&program, "build");
+        let plan_id = func
+            .code
+            .iter()
+            .find_map(|instr| match *instr {
+                Instr::NewPlannedObject { plan, .. } => Some(plan),
+                _ => None,
+            })
+            .expect("eligible literal received a plan");
+        assert_eq!(
+            func.static_key_plans[plan_id as usize].keys(),
+            &["a".to_string(), "b".to_string(), "m".to_string()]
+        );
+        assert_eq!(
+            func.code
+                .iter()
+                .filter(|instr| matches!(instr, Instr::AppendDataProp { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn dynamic_duplicate_accessor_spread_and_proto_literals_stay_owned() {
+        for body in [
+            "let k='b';return {a:1,[k]:2}",
+            "return {a:1,a:2}",
+            "return {a:1,get b(){return 2}}",
+            "return {a:1,...globalThis}",
+            "return {a:1,__proto__:null}",
+        ] {
+            let source = format!("function build(){{{body}}} build();");
+            let program = compile(&source);
+            let func = named(&program, "build");
+            assert!(
+                !func
+                    .code
+                    .iter()
+                    .any(|instr| matches!(instr, Instr::NewPlannedObject { .. })),
+                "ineligible body unexpectedly planned: {body}"
+            );
+            assert!(func.static_key_plans.is_empty());
+        }
+    }
+
+    #[test]
+    fn per_literal_field_and_byte_caps_fall_back_without_rejecting_source() {
+        let fields = (0..=STATIC_KEY_PLAN_MAX_FIELDS)
+            .map(|i| format!("k{i}:{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!("function wide(){{return {{{fields}}}}} wide();");
+        let program = compile(&source);
+        let wide = named(&program, "wide");
+        assert!(wide.static_key_plans.is_empty());
+        assert!(wide
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::NewObject { .. })));
+
+        let key = "x".repeat(STATIC_KEY_PLAN_MAX_BYTES + 1);
+        let source = format!("function bytes(){{return {{'{key}':1}}}} bytes();");
+        let program = compile(&source);
+        let bytes = named(&program, "bytes");
+        assert!(bytes.static_key_plans.is_empty());
+        assert!(bytes
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::NewObject { .. })));
+    }
+
+    #[test]
+    fn retained_charge_prices_site_string_records_and_rounded_allocations() {
+        let keys = vec![String::new(), "x".into(), "y".repeat(17)];
+        // 96 site/Arc/Vec + (48 String/allocator + rounded payload) per key.
+        assert_eq!(
+            crate::bytecode::static_key_plan_retained_charge(&keys),
+            Some(96 + (48 + 16) + (48 + 16) + (48 + 32))
+        );
+    }
+
+    #[test]
+    fn plan_name_collection_stops_at_the_per_literal_field_cap() {
+        let mut names = Vec::with_capacity(STATIC_KEY_PLAN_MAX_FIELDS);
+        for name in 0..10_000u32 {
+            collect_static_key_plan_name(&mut names, name);
+        }
+        assert_eq!(names.len(), STATIC_KEY_PLAN_MAX_FIELDS);
+        assert_eq!(names.first(), Some(&0));
+        assert_eq!(names.last(), Some(&255));
+    }
+
+    #[test]
+    fn compiler_site_cap_falls_back_at_257_without_rejecting_source() {
+        let source = (0..=crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES)
+            .map(|i| format!("var x{i}={{k:{i}}};"))
+            .collect::<String>();
+        let program = compile(&source);
+        let main = &program.functions[0];
+        assert_eq!(
+            main.static_key_plans.len(),
+            crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES
+        );
+        assert_eq!(
+            main.code
+                .iter()
+                .filter(|instr| matches!(instr, Instr::NewPlannedObject { .. }))
+                .count(),
+            crate::bytecode::STATIC_KEY_PLAN_COMPILER_MAX_SITES
+        );
+        assert!(
+            main.code
+                .iter()
+                .any(|instr| matches!(instr, Instr::NewObject { hint: 1, .. })),
+            "site 257 must retain exact legacy capacity bytecode"
+        );
+    }
+
+    #[test]
+    fn compiler_off_child() {
+        if std::env::var_os("ZIPP_STATIC_KEY_COMPILER_OFF_CHILD").is_none() {
+            return;
+        }
+        let program = compile("function build(v){return {a:v,b:2}} build(1);");
+        assert!(program
+            .functions
+            .iter()
+            .all(|func| func.static_key_plans.is_empty()));
+        assert!(program.functions.iter().all(|func| !func
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::NewPlannedObject { .. }))));
+        assert!(program.functions.iter().any(|func| func
+            .code
+            .iter()
+            .any(|instr| matches!(instr, Instr::NewObject { hint: 2, .. }))));
+    }
+
+    #[test]
+    fn compiler_off_switch_declines_before_allocating_metadata() {
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "compile::exprs::static_key_plan_tests::compiler_off_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("ZIPP_STATIC_KEY_COMPILER_OFF_CHILD", "1")
+            .env("ZIPP_NO_STATIC_KEY_PLANS", "1")
+            .output()
+            .expect("spawn compiler-off child");
+        assert!(
+            out.status.success(),
+            "compiler-off child failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
