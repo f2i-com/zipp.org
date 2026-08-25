@@ -215,6 +215,76 @@ pub(crate) extern "win64" fn jit_new_planned_object(
 /// failures decline as a pure prefix and the interpreter replays the exact
 /// `FinalizeObject` bytecode.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+/// B182: the BAKED form of [`jit_finalize_object`], emitted when the site's
+/// plan resolved at COMPILE time: `plan_ptr` is the address of the exact
+/// `StaticKeyPlan` inside the root program's `static_key_plans` table (stable
+/// for the VM's life — root-program plan tables are never degraded, the B173
+/// gate that licenses `FinalizeObject` at all), and `packed` carries the
+/// emit-time `shape::add` fold (identical by construction to what
+/// `finalize_shape` memoizes: same fold, same thread-local transition tree).
+/// The general helper re-resolves, re-validates and memo-probes per call;
+/// this form keeps only the checks whose inputs a compile cannot freeze
+/// (window bounds, GC poll).
+///
+/// `packed = (shape << 32) | (val_base << 16) | count`; `reg_count` arrives
+/// as the 5th (stack) argument.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_finalize_object_baked(
+    vm: *mut core::ffi::c_void,
+    regs: *const u64,
+    plan_ptr: u64,
+    packed: u64,
+    reg_count: u32,
+) -> u64 {
+    if vm.is_null() || regs.is_null() || plan_ptr == 0 {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let shape = (packed >> 32) as u32;
+    let val_base = (packed >> 16) as u16 as usize;
+    let count = packed as u16 as usize;
+    if count == 0
+        || count > 256
+        || val_base
+            .checked_add(count)
+            .is_none_or(|end| end > reg_count as usize)
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        if !regs_window_valid(vm, regs, reg_count as usize) {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        // SAFETY: the emitter took this address from the live FuncProto's
+        // plan table, which outlives every compiled body and never mutates
+        // for a root program (see the fn doc); the debug assert pins the
+        // len agreement a stale pointer could not satisfy by accident.
+        let plan = unsafe { &*(plan_ptr as usize as *const crate::bytecode::StaticKeyPlan) };
+        debug_assert!(plan.runtime_valid() && plan.len() == count);
+        let mut vals = Vec::with_capacity(count);
+        for offset in 0..count {
+            let bits = unsafe { *regs.add(val_base + offset) };
+            vals.push(Value::from_bits(bits));
+        }
+        let idx = vm
+            .heap
+            .alloc(HeapObj::Object(Box::new(ObjMap::finalized_from_plan(
+                plan.clone(),
+                vals,
+                shape,
+            ))));
+        vm.realm_born(idx, vm.obj_proto);
+        crate::heap::note_static_key_jit_object();
+        Value::heap(idx).bits()
+    })) {
+        Ok(bits) => bits,
+        // Allocation/realm bookkeeping may already be committed. Never replay
+        // after an unwind across this boundary.
+        Err(_) => std::process::abort(),
+    }
+}
+
 pub(crate) extern "win64" fn jit_finalize_object(
     vm: *mut core::ffi::c_void,
     regs: *const u64,

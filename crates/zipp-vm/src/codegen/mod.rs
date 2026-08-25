@@ -350,6 +350,15 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// Default-on kill switch for the BAKED `FinalizeObject` form (B182):
+    /// a site whose plan resolves at compile time calls a slim helper with
+    /// the plan address and the emit-time shape fold baked in, skipping the
+    /// per-call table walk, validation and shape-memo probe. Off restores
+    /// the general helper call at every site.
+    fn finalize_baked_enabled() = "ZIPP_NO_FINALIZE_BAKED"
+);
+
+env_off_switch!(
     /// Default-on kill switch for NATIVE SHAPE WAYS at direct-miss `GetProp`
     /// sites (B178): guard the receiver's live shape mirror, read
     /// `vals[slot]` through the vals mirror, no helper call. Off restores

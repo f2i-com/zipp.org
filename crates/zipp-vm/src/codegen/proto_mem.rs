@@ -2622,22 +2622,69 @@ pub(crate) fn compile_proto_mem(
                 // as ordinary GC roots. Validation is a pure prefix; the
                 // committed object is complete before the helper returns, so
                 // no bail can ever observe partial initialization.
-                let helper = crate::vm::jit_finalize_object as usize;
-                let packed_plan = ((func_id as u64) << 32) | plan as u64;
-                let packed_window =
-                    ((proto.reg_count as u64) << 32) | ((val_base as u64) << 16) | count as u64;
-                dynasm!(ops
-                    ; mov rcx, rdi
-                    ; mov rdx, rbx
-                    ; mov r8, QWORD packed_plan as i64
-                    ; mov r9, QWORD packed_window as i64
-                    ; mov rax, QWORD helper as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov [rbx + dreg(dst)], rax
-                );
+                // B182: bake the plan address and the shape fold when the
+                // compile can resolve them — the fold over the plan's keys
+                // with data bits is exactly what `finalize_shape` memoizes
+                // (same fold, same thread-local transition tree), so the two
+                // forms are observably identical; the baked helper keeps only
+                // the checks a compile cannot freeze (window bounds, GC poll).
+                let baked = if super::finalize_baked_enabled() {
+                    proto
+                        .static_key_plans
+                        .get(plan as usize)
+                        .filter(|pl| {
+                            pl.runtime_valid()
+                                && pl.len() == count as usize
+                                && !pl.has_element_key()
+                                && (count as usize) < crate::heap::PROP_INDEX_THRESHOLD
+                        })
+                        .map(|pl| {
+                            let data = crate::shape::attr_bits(true, true, true, false);
+                            let mut shape = crate::shape::EMPTY;
+                            for key in pl.keys() {
+                                shape = crate::shape::add(shape, key, data);
+                            }
+                            (pl as *const crate::bytecode::StaticKeyPlan as u64, shape)
+                        })
+                } else {
+                    None
+                };
+                if let Some((plan_ptr, shape)) = baked {
+                    let helper = crate::vm::jit_finalize_object_baked as usize;
+                    let packed =
+                        ((shape as u64) << 32) | ((val_base as u64) << 16) | count as u64;
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, rbx
+                        ; mov r8, QWORD plan_ptr as i64
+                        ; mov r9, QWORD packed as i64
+                        ; mov DWORD [rsp + 32], proto.reg_count as i32
+                        ; mov rax, QWORD helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                } else {
+                    let helper = crate::vm::jit_finalize_object as usize;
+                    let packed_plan = ((func_id as u64) << 32) | plan as u64;
+                    let packed_window = ((proto.reg_count as u64) << 32)
+                        | ((val_base as u64) << 16)
+                        | count as u64;
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, rbx
+                        ; mov r8, QWORD packed_plan as i64
+                        ; mov r9, QWORD packed_window as i64
+                        ; mov rax, QWORD helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                }
                 if let Some((vb, icb)) = refetch {
                     emit_refetch_pinned(&mut ops, vb, Some(icb));
                 }
