@@ -242,12 +242,29 @@ excluding zero; suites + 8k soak + 4-lens adversarial review green (one
 confirmed major — realm globals' stale guardable mirrors — fixed by pinning
 every `ic_obj_ok`-excluded receiver unmatchable at registration).
 
-What v1 deliberately leaves on the table, in expected-value order:
-1. **SetProp shape ways** — `touch()` writes `object.value` once per 3 reads;
-   the write path still pays the helper. Needs the write-barrier story: a
-   native store to `vals[slot]` must run the nursery value-grain barrier
-   (old holder, young value) — the region `jit_set_index` helpers show the
-   contract. Likely worth another −5-10% on the cluster.
+**Wave 58 delivered item 1**: SET shape ways landed (B179) with the
+inline-filtered barrier — commit the store call-free, one tag compare skips
+the barrier for primitive stores, a slim infallible helper runs
+`write_barrier_val` for heap values (replacing the identity-way persistent
+scan-root trick, impossible for shape ways). Combined switch: shapes-stable
+−30.7% (→ ~2.2x node), warm-router −28.7% (→ ~2.4x), gates all green
+including gcstress/nursery-verify and a 12k soak with the gcstress mode.
+
+### Wave 58.5: the instrument-preflight catastrophe (B180) — read this one
+
+The security commit's CLI builds the VM with `instrument`, and
+`instrument_preflight_heap_growth` walked the WHOLE heap before checking
+whether a recorder was attached — every plain-run string append on the
+guarded paths paid O(heap): markdown-render 0.3s→258s+, regex-log-scan
+0.5s→139s, worsening as the slot table grew. Every switch-based A/B measured
+it as 1.00x because BOTH sides carried it. Fixed recorder-first +
+finite-limit-only (all hardening tests green). THE STANDING RULES FROM THIS:
+every wave gate includes (1) one absolute cold check vs node on at least one
+retained row, and (2) a `--no-default-features --features safe-sandbox`
+compile+test pass (wave 58's own cfg-split break was caught by exactly that).
+
+What remains on the table, in expected-value order:
+1. ~~SetProp shape ways~~ — DONE (B179).
 2. **The build half** — FinalizeObject's helper (validate + Vec build +
    alloc + shape memo + young log) is now the object rows' floor (~40-60ns
    per literal). Candidates: emit the allocation inline (bump the objs Vec

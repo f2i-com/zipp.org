@@ -495,14 +495,30 @@ impl super::Vm<'_> {
     /// lets an ArrayBuffer exceed a small budget by gigabytes before the next
     /// bytecode poll.
     pub(crate) fn instrument_preflight_heap_growth(&mut self, bytes: usize) -> Tick {
-        let resident = self.heap_bytes();
-        let Some(rec) = self.instr_rec.as_mut() else {
+        // Recorder check FIRST: `heap_bytes()` below is a full O(heap-slots)
+        // audit walk, and this preflight sits on per-part/per-result string
+        // paths (join, builders, regex results). An un-instrumented run — the
+        // ordinary `zipp js`, which the CLI now builds WITH this feature for
+        // the sandbox command's sake — must not pay a heap walk per append:
+        // that measured as markdown-render 0.3s -> 258s+ (worsening as the
+        // slot table grows) because the walk ran before this early return.
+        let Some(rec) = self.instr_rec.as_ref() else {
             return Ok(());
         };
         if let Some(message) = rec.terminal_message() {
             return Err(message);
         }
-        if rec.heap_limit != usize::MAX && bytes > rec.heap_limit.saturating_sub(resident) {
+        // The walk is priced only when a finite ceiling actually consumes it.
+        if rec.heap_limit == usize::MAX {
+            return Ok(());
+        }
+        let heap_limit = rec.heap_limit;
+        let resident = self.heap_bytes();
+        let rec = self
+            .instr_rec
+            .as_mut()
+            .expect("recorder checked present above");
+        if bytes > heap_limit.saturating_sub(resident) {
             return Err(rec.exhaust(ResourceExhaustion::Heap));
         }
         Ok(())
