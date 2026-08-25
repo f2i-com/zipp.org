@@ -3591,6 +3591,25 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
+/// Nursery barrier for a NATIVE shape-way store (B178 SET): the emitted hit
+/// commits `vals[slot] = val` call-free and then calls here ONLY when the
+/// stored value is a heap Value (one tag compare filters the numeric
+/// majority). Runs the ordinary value-grain barrier; infallible by design —
+/// the store is already committed, so nothing here may deopt. The gcoracle
+/// accounting is skipped exactly as identity-way IC-HIT stores skip it.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_shape_set_barrier(
+    vm: *mut core::ffi::c_void,
+    holder_idx: u32,
+    val_bits: u64,
+) {
+    // SAFETY: exclusive view; the running native frame holds no conflicting
+    // borrow (same contract as every jit_* helper in this file).
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.heap
+        .write_barrier_val(holder_idx, Value::from_bits(val_bits));
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_set_prop_miss(
     vm: *mut core::ffi::c_void,
@@ -3681,9 +3700,22 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
             _ => return crate::codegen::SELF_CALL_DEOPT,
         };
 
-        // Nothing below may deopt: the store is committed. Direct sites call
-        // the barrier on every write and own no identity way. Probe sites keep
+        // Nothing below may deopt: the store is committed. Probe sites keep
         // the existing persistent-root rule for future call-free stores.
+        // Direct sites (B178) get a SHAPE way instead: its native hit runs
+        // the value-grain barrier through `jit_shape_set_barrier`, so no
+        // persistent scan root is needed — and none would be possible, since
+        // a shape way serves receivers unknown at fill time.
+        if gate == crate::codegen::DirectMissGate::Direct && crate::codegen::shape_ways_enabled() {
+            vm.heap.refresh_mirror(idx);
+            if vm.jit.ic_thrashing(site_idx) {
+                if crate::codegen::ic_refill_gate_enabled() {
+                    vm.jit.ic_rot_bump(site_idx);
+                }
+            } else if let Some(e) = crate::codegen::IcEntry::shape_way(shape, slot) {
+                vm.jit.set_ic(site_idx, e);
+            }
+        }
         if gate == crate::codegen::DirectMissGate::Probe {
             let version = vm.heap.version_of(idx);
             if let Some(e) = crate::codegen::IcEntry::own(obj_bits, vals_ptr, version, slot) {

@@ -604,6 +604,64 @@ pub(crate) fn emit_ic_probe(
         // Accessors have no tagged-way consumer in this form.
         debug_assert!(acc.is_none());
         dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
+        if matches!(probe_kind, IcProbe::Set { .. }) && super::shape_ways_enabled() {
+            // ── SHAPE WAYS, STORE SIDE (B178) ── same guard scheme as the
+            // GET block below; the hit commits `vals[slot] = val` call-free
+            // and then runs the nursery value-grain barrier ONLY for a heap
+            // value (one tag compare filters the numeric majority) via the
+            // slim infallible helper. Writability needs no re-check: the
+            // fill proved `!accessor && writable` AT THIS SHAPE, and equal
+            // shape means equal attribute bits (freeze/seal/redefine all
+            // drop the object to DICT and bump, invalidating its mirror).
+            // The barrier runs after the commit — single-threaded, and the
+            // helper cannot trigger a VM collection (it only pushes to the
+            // Rust-side remset), so no minor can observe the gap.
+            let ways = ops.new_dynamic_label();
+            let hit = ops.new_dynamic_label();
+            let skip = ops.new_dynamic_label();
+            let shape_off = crate::vm::host_api::JIT_SHAPE_MIRROR_RAW_OFFSET as i32;
+            let vals_off = crate::vm::host_api::JIT_VALS_MIRROR_RAW_OFFSET as i32;
+            let IcProbe::Set { val } = probe_kind else {
+                unreachable!()
+            };
+            dynasm!(ops
+                ; mov r10, rax
+                ; shr r10, 48
+                ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
+                ; jne => skip
+                ; mov ecx, eax                        // heap idx (low 32)
+                ; mov r9, [rdi + shape_off]
+                ; mov r11d, [r9 + rcx*4]              // live mirror shape
+                ; bts r11, 32                         // compose (1<<32)|shape
+                ; lea r9, [r14 + ic_off]              // way 0 of this site
+                ; mov r8d, JIT_IC_WAYS as i32
+                ; => ways
+                ; cmp r11, [r9]
+                ; je => hit
+                ; add r9, JIT_IC_STRIDE as i32
+                ; dec r8d
+                ; jnz => ways
+                ; jmp => skip
+                ; => hit
+                ; mov r10, [rdi + vals_off]
+                ; mov rcx, [r10 + rcx*8]              // live vals base
+                ; mov edx, [r9 + 20]
+                ; and edx, 0x00FF_FFFF                // slot (low 24)
+                ; mov r10, [rbx + dreg(val)]          // val_bits
+                ; mov [rcx + rdx*8], r10              // vals[slot] = val (COMMIT)
+                ; shr r10, 48
+                ; cmp r10d, 0x7FFD                    // primitive store: no edge
+                ; jne => cont
+                ; mov rcx, rdi                        // vm
+                ; mov rax, [rbx + dreg(obj)]
+                ; mov edx, eax                        // holder heap idx
+                ; mov r8, [rbx + dreg(val)]           // val_bits
+                ; mov rax, QWORD crate::vm::jit_shape_set_barrier as i64
+                ; call rax
+                ; jmp => cont
+                ; => skip
+            );
+        }
         if matches!(probe_kind, IcProbe::Get { .. }) && super::shape_ways_enabled() {
             // ── SHAPE WAYS (B178) ── the native form of the shape-slot memo:
             // guard the receiver's LIVE shape mirror against the way's baked

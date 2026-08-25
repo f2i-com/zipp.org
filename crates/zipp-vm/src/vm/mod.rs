@@ -1983,6 +1983,8 @@ pub(crate) use gc::gc_nursery_stats;
 pub(crate) use gc::gc_stats;
 pub(crate) use gc::gc_young_budget_stats;
 pub(crate) use helpers_misc::call_inline_stats;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_shape_set_barrier;
 pub(crate) use helpers_misc::computed_call_stats;
 pub(crate) use helpers_misc::concat_set_stats;
 pub(crate) use helpers_misc::cross_fill_stats;
