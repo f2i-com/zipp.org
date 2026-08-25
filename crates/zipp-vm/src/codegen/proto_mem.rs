@@ -52,7 +52,7 @@ fn tierc_check_coercible_enabled() -> bool {
 /// intrinsic before the helper performs any mutation.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
-fn tierc_coll_mutate_enabled() -> bool {
+pub(crate) fn tierc_coll_mutate_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
 
     static ON: AtomicU8 = AtomicU8::new(2);

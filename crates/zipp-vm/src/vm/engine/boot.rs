@@ -283,6 +283,7 @@ impl<'p> Vm<'p> {
             array_ctor: 0,
             str_proto: 0,
             map_proto: 0,
+            coll_intrinsic_memo: [[None; crate::vm::COLL_MEMO_NAMES]; 2],
             set_proto: 0,
             date_proto: 0,
             promise_proto: 0,

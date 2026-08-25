@@ -2396,6 +2396,81 @@ pub(crate) fn compile_region_mem(
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                     continue;
                 }
+                // `m.set(k, v)` / `m.clear()` intrinsic (B183): the region
+                // twin of the Tier-C arm — same helper, same live proof (now
+                // memoized), no refetch (a Map mutation allocates no heap
+                // slot, so the versions table cannot move).
+                if crate::codegen::proto_mem::tierc_coll_mutate_enabled()
+                    && matches!(
+                        (key, argc),
+                        ("set", 2) | ("clear", 0) | ("add", 1) | ("delete", 1)
+                    )
+                {
+                    let bail = ops.new_dynamic_label();
+                    // 0 = Map.set, 1 = Map.clear, 2 = Set.add, 3 = Map.delete,
+                    // 4 = Set.delete. `add` is Set-only; `delete` tries Map
+                    // first and the helper's kind proof rejects the mismatch,
+                    // so the emitter retries with the Set op before deopting.
+                    let op: i32 = match key {
+                        "set" => 0,
+                        "clear" => 1,
+                        "add" => 2,
+                        _ => 3,
+                    };
+                    if argc == 2 {
+                        dynasm!(ops
+                            ; mov r8, [rbx + dreg(arg_base)]
+                            ; mov r9, [rbx + dreg(arg_base + 1)]
+                        );
+                    } else if argc == 1 {
+                        dynasm!(ops
+                            ; mov r8, [rbx + dreg(arg_base)]
+                            ; xor r9d, r9d
+                        );
+                    } else {
+                        dynasm!(ops
+                            ; xor r8d, r8d
+                            ; xor r9d, r9d
+                        );
+                    }
+                    let mutate_done = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov QWORD [rsp + 32], op
+                        ; mov rcx, rdi                          // vm
+                        ; mov rdx, [rbx + dreg(obj)]            // receiver bits
+                        ; mov rax, QWORD heap.coll_mutate as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; jne => mutate_done
+                    );
+                    if op == 3 {
+                        // `delete` on a Set: retry with the Set op (the args
+                        // registers are unchanged — r8 still holds the key,
+                        // r9 the zeroed val — but the CALL clobbered them,
+                        // so reload before the retry).
+                        dynasm!(ops
+                            ; mov r8, [rbx + dreg(arg_base)]
+                            ; xor r9d, r9d
+                            ; mov QWORD [rsp + 32], 4
+                            ; mov rcx, rdi
+                            ; mov rdx, [rbx + dreg(obj)]
+                            ; mov rax, QWORD heap.coll_mutate as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                        );
+                    } else {
+                        dynasm!(ops ; jmp => bail);
+                    }
+                    dynasm!(ops
+                        ; => mutate_done
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    continue;
+                }
                 // `m.get(k)` / `m.has(k)` / `s.has(v)` intrinsic. The receiver
                 // kind is checked in the helper (a wrong kind deopts), so a
                 // same-named method on any other object is unaffected.

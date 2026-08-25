@@ -1230,6 +1230,15 @@ pub struct Vm<'p> {
     /// method access as VALUES (`new Map().set`, `d.getHours`). 0 until set up.
     map_proto: u32,
     set_proto: u32,
+    /// B183: memo for `collection_method_is_intrinsic`'s prototype half —
+    /// per (kind: 0=Set,1=Map) × (method-name id) the proven
+    /// `(proto_version, slot, method fn bits)`. A hit re-checks the LIVE
+    /// version (key add/remove/redefine/freeze/setPrototypeOf all bump it)
+    /// AND the live slot's Value bits (an in-place overwrite of the same
+    /// slot bumps nothing — the B78-style value guard is what makes a
+    /// version cache sound here, exactly as the string-method doc warns).
+    /// Pure cache: entries self-validate, nothing invalidates them.
+    coll_intrinsic_memo: [[Option<(u32, u32, u64)>; COLL_MEMO_NAMES]; 2],
     date_proto: u32,
     promise_proto: u32,
     /// `Number`/`Boolean`.prototype — number/boolean PRIMITIVES delegate here for
@@ -1884,6 +1893,9 @@ pub struct Vm<'p> {
     gc_lock: std::rc::Rc<std::cell::Cell<u32>>,
     gc_stress: bool,
 }
+
+/// Method-name arity of [`Vm::coll_intrinsic_memo`]: get/set/has/add/delete/clear.
+pub(crate) const COLL_MEMO_NAMES: usize = 6;
 
 /// A thrown JS value rendered to a message (v1 throws are strings/RangeError).
 #[derive(Debug)]

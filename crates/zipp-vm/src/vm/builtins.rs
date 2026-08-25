@@ -274,7 +274,7 @@ impl<'p> Vm<'p> {
     /// builtin shortcut and the native collection helpers.  An own shadow, a
     /// subclass/custom prototype, a deleted/accessor/replaced prototype slot,
     /// or a child-realm prototype sends the caller through ordinary Get+Call.
-    pub(crate) fn collection_method_is_intrinsic(&self, idx: u32, name: &str, kind: u8) -> bool {
+    pub(crate) fn collection_method_is_intrinsic(&mut self, idx: u32, name: &str, kind: u8) -> bool {
         let proto = match (self.heap.get(idx), kind) {
             (HeapObj::Set(_), 3) => self.set_proto,
             (HeapObj::Map { .. }, 4) => self.map_proto,
@@ -282,20 +282,48 @@ impl<'p> Vm<'p> {
         };
         if proto == 0
             || self.active_realm_proto(proto) != proto
-            || self
-                .arr_props
-                .get(&idx)
-                .is_some_and(|props| props.pos(name).is_some())
-            || self
-                .proto_of
-                .get(&idx)
-                .is_some_and(|&actual| actual != Value::heap(proto))
+            || (!self.arr_props.is_empty()
+                && self
+                    .arr_props
+                    .get(&idx)
+                    .is_some_and(|props| props.pos(name).is_some()))
+            || (!self.proto_of.is_empty()
+                && self
+                    .proto_of
+                    .get(&idx)
+                    .is_some_and(|&actual| actual != Value::heap(proto)))
         {
             return false;
         }
-        match self.heap.get(proto) {
-            HeapObj::Object(map) => map.pos(name).is_some_and(|slot| {
-                !map.attr_at(slot).accessor
+        // ── B183 memo fast path ── the prototype half of this proof is
+        // identical for every receiver of the same kind, so cache it per
+        // (kind, method) under the version + value-bits guard pair (see the
+        // field doc for why BOTH are required). A guard miss falls through
+        // to the full proof, which refills the memo on success.
+        let kind_idx = (kind == 4) as usize;
+        let name_id = match name {
+            "get" => Some(0),
+            "set" => Some(1),
+            "has" => Some(2),
+            "add" => Some(3),
+            "delete" => Some(4),
+            "clear" => Some(5),
+            _ => None,
+        };
+        if let Some(nid) = name_id {
+            if let Some((ver, slot, fn_bits)) = self.coll_intrinsic_memo[kind_idx][nid] {
+                if self.heap.version_of(proto) == ver {
+                    if let HeapObj::Object(map) = self.heap.get(proto) {
+                        if map.vals.get(slot as usize).map(|v| v.bits()) == Some(fn_bits) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        let proven = match self.heap.get(proto) {
+            HeapObj::Object(map) => map.pos(name).and_then(|slot| {
+                (!map.attr_at(slot).accessor
                     && map.vals[slot].is_heap()
                     && matches!(
                         self.heap.get(map.vals[slot].heap_index()),
@@ -304,9 +332,20 @@ impl<'p> Vm<'p> {
                                 .is_some_and(|(method, actual_kind, _)| {
                                     method == name && actual_kind == kind
                                 })
-                    )
+                    ))
+                .then(|| (slot as u32, map.vals[slot].bits()))
             }),
-            _ => false,
+            _ => None,
+        };
+        match proven {
+            Some((slot, fn_bits)) => {
+                if let Some(nid) = name_id {
+                    self.coll_intrinsic_memo[kind_idx][nid] =
+                        Some((self.heap.version_of(proto), slot, fn_bits));
+                }
+                true
+            }
+            None => false,
         }
     }
 
@@ -642,6 +681,23 @@ impl<'p> Vm<'p> {
             }
             _ => {}
         }
+        // The intrinsic proof takes `&mut self` (it refills the B183 memo),
+        // so the collection arms re-derive the kind before proving rather
+        // than proving inside a match guard that pins the heap borrow.
+        let coll_kind = match self.heap.get(idx) {
+            HeapObj::Map { .. } => Some(4u8),
+            HeapObj::Set(_) => Some(3u8),
+            _ => None,
+        };
+        if let Some(kind) = coll_kind {
+            if self.collection_method_is_intrinsic(idx, name, kind) {
+                return if kind == 4 {
+                    self.map_method(idx, name, args)
+                } else {
+                    self.set_method(idx, name, args)
+                };
+            }
+        }
         match self.heap.get(idx) {
             HeapObj::Array(_)
                 if matches!(name, "slice" | "concat")
@@ -651,12 +707,6 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Array(_) => self.array_method(idx, name, args),
             HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, args),
-            HeapObj::Map { .. } if self.collection_method_is_intrinsic(idx, name, 4) => {
-                self.map_method(idx, name, args)
-            }
-            HeapObj::Set(_) if self.collection_method_is_intrinsic(idx, name, 3) => {
-                self.set_method(idx, name, args)
-            }
             HeapObj::Generator { .. } => self.generator_method(idx, name, args),
             HeapObj::AsyncGenerator(_) => Ok(self.async_generator_method(idx, name, args)),
             HeapObj::Promise { .. } => {

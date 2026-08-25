@@ -704,7 +704,10 @@ pub(crate) extern "win64" fn jit_coll_mutate(
     val_bits: u64,
     op: u64,
 ) -> u64 {
-    if vm.is_null() || op > 1 {
+    // op: 0 = Map.set(k, v), 1 = Map.clear(), 2 = Set.add(v),
+    //     3 = Map.delete(k), 4 = Set.delete(v) (B183 widened the set/add/
+    //     delete family — none of the five can invoke user code).
+    if vm.is_null() || op > 4 {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let recv = Value::from_bits(recv_bits);
@@ -717,8 +720,14 @@ pub(crate) extern "win64" fn jit_coll_mutate(
     if idx as usize >= vm.heap.len() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    let name = if op == 0 { "set" } else { "clear" };
-    if !vm.collection_method_is_intrinsic(idx, name, 4) {
+    let (name, kind) = match op {
+        0 => ("set", 4u8),
+        1 => ("clear", 4),
+        2 => ("add", 3),
+        3 => ("delete", 4),
+        _ => ("delete", 3),
+    };
+    if !vm.collection_method_is_intrinsic(idx, name, kind) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let key = Value::from_bits(key_bits);
@@ -730,10 +739,19 @@ pub(crate) extern "win64" fn jit_coll_mutate(
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let args = [key, val];
-        let args = if op == 0 { &args[..] } else { &args[..0] };
-        match vm.map_method(idx, name, args) {
+        let args = match op {
+            0 => &args[..2],
+            1 => &args[..0],
+            _ => &args[..1],
+        };
+        let result = if kind == 4 {
+            vm.map_method(idx, name, args)
+        } else {
+            vm.set_method(idx, name, args)
+        };
+        match result {
             Ok(Some(result)) => result.bits(),
-            // Brand/name were proved and these two arms never throw. Once the
+            // Brand/name were proved and these arms never throw. Once the
             // effectful implementation started, never replay an impossible
             // outcome as ordinary bytecode.
             Ok(None) | Err(_) => std::process::abort(),
