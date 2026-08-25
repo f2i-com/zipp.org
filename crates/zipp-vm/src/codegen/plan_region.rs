@@ -6277,7 +6277,7 @@ pub(crate) fn plan_field_promotion(
             _ => false,
         });
         match m.pos(fname) {
-            Some(slot) if !m.attrs[slot].accessor && (!need_writable || m.attrs[slot].writable) => {
+            Some(slot) if !m.attr_at(slot).accessor && (!need_writable || m.attr_at(slot).writable) => {
             }
             _ => return None,
         }

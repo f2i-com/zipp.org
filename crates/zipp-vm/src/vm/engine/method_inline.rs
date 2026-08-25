@@ -303,7 +303,7 @@ impl<'p> Vm<'p> {
                         _ => return None,
                     };
                     let s = m.pos(key)?;
-                    if m.attrs[s].accessor {
+                    if m.attr_at(s).accessor {
                         return None;
                     }
                     regs[dst as usize] = m.vals[s];

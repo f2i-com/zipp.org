@@ -863,7 +863,7 @@ impl<'p> Vm<'p> {
                     m.keys
                         .iter()
                         .position(|k| k == key)
-                        .is_some_and(|i| !m.attrs[i].accessor && pred(m.vals[i]))
+                        .is_some_and(|i| !m.attr_at(i).accessor && pred(m.vals[i]))
                 };
                 (
                     check("then", &|v: Value| {
@@ -886,7 +886,7 @@ impl<'p> Vm<'p> {
                 None => true,
                 Some(i) => {
                     let v = m.vals[i];
-                    m.attrs[i].accessor
+                    m.attr_at(i).accessor
                         && v.is_heap()
                         && matches!(self.heap.get(v.heap_index()),
                                     HeapObj::Native(id) if *id == native::SPECIES_GET)
@@ -936,7 +936,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => {
                 let intrinsic = |key: &str, target: u32| {
                     m.pos(key).is_some_and(|i| {
-                        !m.attrs[i].accessor
+                        !m.attr_at(i).accessor
                             && m.vals[i].is_heap()
                             && m.vals[i].heap_index() == target
                     })
@@ -954,7 +954,7 @@ impl<'p> Vm<'p> {
                 None => true,
                 Some(i) => {
                     let v = m.vals[i];
-                    m.attrs[i].accessor
+                    m.attr_at(i).accessor
                         && v.is_heap()
                         && matches!(self.heap.get(v.heap_index()),
                                     HeapObj::Native(id) if *id == native::SPECIES_GET)
@@ -998,10 +998,10 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        if m.attrs[ts].accessor
+        if m.attr_at(ts).accessor
             || !m.vals[ts].is_heap()
             || m.vals[ts].heap_index() != self.promise_then_intrinsic
-            || m.attrs[cs].accessor
+            || m.attr_at(cs).accessor
             || !m.vals[cs].is_heap()
             || m.vals[cs].heap_index() != self.promise_ctor_intrinsic
         {
@@ -1025,7 +1025,7 @@ impl<'p> Vm<'p> {
                 if mc.keys.get(s).map_or(true, |k| k != "@@species") {
                     return None;
                 }
-                if mc.attrs[s].accessor
+                if mc.attr_at(s).accessor
                     && mc.vals[s].is_heap()
                     && mc.vals[s].heap_index() == getter
                     && self.heap.version_of(getter) == getter_version
@@ -1056,7 +1056,7 @@ impl<'p> Vm<'p> {
         };
         let intrinsic_slot = |key: &str, target: u32| {
             m.pos(key).filter(|&i| {
-                !m.attrs[i].accessor && m.vals[i].is_heap() && m.vals[i].heap_index() == target
+                !m.attr_at(i).accessor && m.vals[i].is_heap() && m.vals[i].heap_index() == target
             })
         };
         let then_slot = intrinsic_slot("then", self.promise_then_intrinsic)?;
@@ -1069,7 +1069,7 @@ impl<'p> Vm<'p> {
             None => None,
             Some(i) => {
                 let v = mc.vals[i];
-                let pristine = mc.attrs[i].accessor
+                let pristine = mc.attr_at(i).accessor
                     && v.is_heap()
                     && matches!(self.heap.get(v.heap_index()),
                                 HeapObj::Native(id) if *id == native::SPECIES_GET);

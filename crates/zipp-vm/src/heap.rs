@@ -583,6 +583,24 @@ fn sparse_num_index_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_ATTRS_ELIDE=1` makes every map carry the explicit attribute
+/// vector from birth (`PropAttrs::Mixed`), the pre-elision representation —
+/// the single-binary A/B for the all-default elision. Latched on first use.
+#[inline]
+fn attrs_elide_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_ATTRS_ELIDE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub fn index_key(buf: &mut [u8; 20], i: usize) -> &str {
     let mut n = i;
     let mut p = buf.len();
@@ -833,8 +851,10 @@ pub struct ObjMap {
     /// Per-property attributes, parallel to `keys`/`vals` (a property descriptor's
     /// writable/enumerable/configurable + accessor get/set). For a DATA property
     /// `vals[i]` is the value; for an ACCESSOR `vals[i]` is the getter and
-    /// `attrs[i].setter` the setter.
-    pub attrs: Vec<PropAttr>,
+    /// `attrs[i].setter` the setter. PRIVATE (like `index`): all access goes
+    /// through the `attr_*`/`attrs_*` methods below, which is what lets the
+    /// common all-default case store nothing — see [`PropAttrs`].
+    attrs: PropAttrs,
     /// Heap index of the class this object is an instance of (`new C()`), used
     /// for prototype-style method lookup and `instanceof`. `None` for a plain
     /// object literal. Own properties (the fields) live in `keys`/`vals`;
@@ -903,6 +923,141 @@ pub struct ObjMap {
     shape: u32,
 }
 
+/// The attribute column of an [`ObjMap`], with the all-default case elided.
+///
+/// Almost every object ever built — literals, class instances, JSON — has
+/// nothing but writable/enumerable/configurable data properties, i.e. every
+/// slot is exactly [`PropAttr::data()`]. Storing a 16-byte `PropAttr` per
+/// property for that case cost one heap allocation (and one free at sweep)
+/// per object, ~a third of a small object's allocator traffic — priced by
+/// B176's finding that the allocator is where the object rows' time went.
+/// `AllData { len }` stores only the count; the first deviating write
+/// materializes the real vector and the map stays `Mixed` for life.
+///
+/// The IC caches raw `&attrs[i].setter` pointers ([`ObjMap::setter_ref`]).
+/// That stays sound: a setter can only be cached AFTER an accessor property
+/// exists, an accessor is a non-default attribute, so the map materialized
+/// BEFORE the pointer was taken — `Mixed` never re-allocates on attribute
+/// writes, and key adds (which can grow the vector) bump the object version
+/// exactly as they did when they could grow `vals`.
+#[derive(Clone, Debug)]
+enum PropAttrs {
+    /// Every slot is `PropAttr::data()`; only the count is stored.
+    AllData { len: u32 },
+    /// At least one slot deviated (or the elision latch is off): the full
+    /// parallel vector, exactly the pre-elision representation.
+    Mixed(Vec<PropAttr>),
+}
+
+impl Default for PropAttrs {
+    /// An empty column in the latched representation (`ObjMap` derives
+    /// `Default`, so this must make the same choice `ObjMap::new` makes).
+    fn default() -> Self {
+        if attrs_elide_enabled() {
+            PropAttrs::AllData { len: 0 }
+        } else {
+            PropAttrs::Mixed(Vec::new())
+        }
+    }
+}
+
+impl PropAttrs {
+    const DEFAULT: PropAttr = PropAttr {
+        writable: true,
+        enumerable: true,
+        configurable: true,
+        accessor: false,
+        setter: Value::UNDEFINED,
+    };
+
+    /// Is `a` bit-identical to the default data attribute? (`setter` compares
+    /// by NaN-box bits; only `UNDEFINED` matches.)
+    #[inline]
+    fn is_default(a: &PropAttr) -> bool {
+        a.writable && a.enumerable && a.configurable && !a.accessor && a.setter == Value::UNDEFINED
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            PropAttrs::AllData { len } => *len as usize,
+            PropAttrs::Mixed(v) => v.len(),
+        }
+    }
+
+    /// The slot's attributes; panics out of range in BOTH representations,
+    /// preserving the parallel-vector indexing this replaced.
+    #[inline]
+    fn at(&self, i: usize) -> PropAttr {
+        match self {
+            PropAttrs::AllData { len } => {
+                assert!(i < *len as usize, "attr index {i} out of range {len}");
+                Self::DEFAULT
+            }
+            PropAttrs::Mixed(v) => v[i],
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> Option<PropAttr> {
+        match self {
+            PropAttrs::AllData { len } => (i < *len as usize).then_some(Self::DEFAULT),
+            PropAttrs::Mixed(v) => v.get(i).copied(),
+        }
+    }
+
+    /// Switch to the explicit vector (a no-op if already there) and return it.
+    fn materialize(&mut self) -> &mut Vec<PropAttr> {
+        if let PropAttrs::AllData { len } = *self {
+            *self = PropAttrs::Mixed(vec![Self::DEFAULT; len as usize]);
+        }
+        match self {
+            PropAttrs::Mixed(v) => v,
+            PropAttrs::AllData { .. } => unreachable!(),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, a: PropAttr) {
+        match self {
+            PropAttrs::AllData { len } if Self::is_default(&a) => *len += 1,
+            _ => self.materialize().push(a),
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, i: usize) -> PropAttr {
+        match self {
+            PropAttrs::AllData { len } => {
+                assert!(i < *len as usize, "attr index {i} out of range {len}");
+                *len -= 1;
+                Self::DEFAULT
+            }
+            PropAttrs::Mixed(v) => v.remove(i),
+        }
+    }
+
+    #[inline]
+    fn reserve_exact(&mut self, n: usize) {
+        if let PropAttrs::Mixed(v) = self {
+            v.reserve_exact(n);
+        }
+    }
+
+    #[inline]
+    fn iter(&self) -> impl Iterator<Item = PropAttr> + '_ {
+        (0..self.len()).map(move |i| self.at(i))
+    }
+
+    #[inline]
+    fn capacity_bytes(&self) -> usize {
+        match self {
+            PropAttrs::AllData { .. } => 0,
+            PropAttrs::Mixed(v) => vec_capacity_bytes(v),
+        }
+    }
+}
+
 /// One property's attributes — the ECMAScript property-descriptor flags plus an
 /// accessor pair. A data property uses `writable` and the parallel `vals` entry;
 /// an accessor (`accessor == true`) uses `vals[i]` as the getter and `setter`.
@@ -936,7 +1091,7 @@ impl ObjMap {
             .keys
             .resident_bytes()
             .saturating_add(vec_capacity_bytes(&self.vals))
-            .saturating_add(vec_capacity_bytes(&self.attrs));
+            .saturating_add(self.attrs.capacity_bytes());
         if let Some(index) = &self.index {
             n = n.saturating_add(index.resident_bytes());
         }
@@ -986,12 +1141,73 @@ impl ObjMap {
 
     #[inline]
     pub fn attr_at(&self, i: usize) -> PropAttr {
-        self.attrs[i]
+        self.attrs.at(i)
     }
 
     #[inline]
     pub fn attr_get(&self, i: usize) -> Option<PropAttr> {
-        self.attrs.get(i).copied()
+        self.attrs.get(i)
+    }
+
+    /// Mutable access to one slot's attributes. Prefer [`ObjMap::set_attr_at`]
+    /// for redefinitions (it maintains `shape`); this is the raw parallel-vec
+    /// write the direct field access used to be, for the construction and
+    /// accessor-install paths whose shape discipline lives at the call site.
+    #[inline]
+    pub fn attr_mut(&mut self, i: usize) -> &mut PropAttr {
+        let n = self.attrs.len();
+        assert!(i < n, "attr index {i} out of range {n}");
+        &mut self.attrs.materialize()[i]
+    }
+
+    /// Append one slot's attributes — the raw parallel-vec push. The caller
+    /// owns the key/val pushes and any shape maintenance, exactly as with the
+    /// direct field access this replaces.
+    #[inline]
+    pub fn push_attr(&mut self, a: PropAttr) {
+        self.attrs.push(a);
+    }
+
+    /// Every slot's attributes in order, by value (`PropAttr` is `Copy`).
+    #[inline]
+    pub fn attrs_iter(&self) -> impl Iterator<Item = PropAttr> + '_ {
+        self.attrs.iter()
+    }
+
+    /// Number of attribute slots. Equals `len()` for a consistent map; the
+    /// parallel vectors can disagree transiently mid-append, which is exactly
+    /// what the callers that ask this are checking.
+    #[inline]
+    pub fn attrs_len(&self) -> usize {
+        self.attrs.len()
+    }
+
+    #[inline]
+    pub fn attrs_reserve_exact(&mut self, n: usize) {
+        self.attrs.reserve_exact(n);
+    }
+
+    /// Might any slot hold an accessor (or otherwise deviate from default
+    /// data attributes)? `false` is a proof of absence — the all-default
+    /// representation cannot store a setter — which lets the GC skip the
+    /// setter-tracing walk and enumeration skip per-slot `enumerable` checks.
+    /// `true` only means "explicit attributes present", not "has accessors".
+    #[inline]
+    pub fn may_deviate_attrs(&self) -> bool {
+        matches!(self.attrs, PropAttrs::Mixed(_))
+    }
+
+    /// The ADDRESS of slot `i`'s setter, for the accessor inline cache, which
+    /// stores it and loads through it on later hits (guarded by the object
+    /// version, which every key add bumps). Only meaningful for a slot that
+    /// holds an accessor — callers check `attr_at(i).accessor` first.
+    #[inline]
+    pub fn setter_ref(&self, i: usize) -> &Value {
+        match &self.attrs {
+            PropAttrs::Mixed(v) => &v[i].setter,
+            // Only reachable for an accessor slot, which forces `Mixed`.
+            PropAttrs::AllData { .. } => unreachable!("setter_ref on all-default attrs"),
+        }
     }
 
     /// Overwrite the value in an EXISTING slot. Not a structural change: the key
@@ -1005,7 +1221,7 @@ impl ObjMap {
     /// transition, which is why it is a method rather than a field write.
     #[inline]
     pub fn set_attr_at(&mut self, i: usize, a: PropAttr) {
-        let old = self.attrs[i];
+        let old = self.attrs.at(i);
         if old.writable != a.writable
             || old.enumerable != a.enumerable
             || old.configurable != a.configurable
@@ -1013,13 +1229,13 @@ impl ObjMap {
         {
             self.shape_to_dict();
         }
-        self.attrs[i] = a;
+        *self.attr_mut(i) = a;
     }
 
     /// `(name, value, attrs)` per own property, insertion order.
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (&str, Value, PropAttr)> {
-        (0..self.keys.len()).map(move |i| (&*self.keys[i], self.vals[i], self.attrs[i]))
+        (0..self.keys.len()).map(move |i| (&*self.keys[i], self.vals[i], self.attrs.at(i)))
     }
 
     /// This object's hidden class, or [`shape::DICT`] if it has none.
@@ -1076,7 +1292,7 @@ impl ObjMap {
                     self.shape, i, key, self.keys[i]
                 ));
             }
-            let a = self.attrs[i];
+            let a = self.attrs.at(i);
             let actual =
                 crate::shape::attr_bits(a.writable, a.enumerable, a.configurable, a.accessor);
             if *bits != actual {
@@ -1189,7 +1405,7 @@ impl ObjMap {
             visible_len: n,
         };
         m.vals = vals;
-        m.attrs = vec![PropAttr::data(); n];
+        m.attrs = PropAttrs::AllData { len: n as u32 };
         m.shape = shape;
         m.has_element_key = has_element_key;
         // The cold tails the per-append `index_appended` would have built: the
@@ -1250,7 +1466,11 @@ impl ObjMap {
         ObjMap {
             keys: PropKeys::default(),
             vals: Vec::new(),
-            attrs: Vec::new(),
+            attrs: if attrs_elide_enabled() {
+                PropAttrs::AllData { len: 0 }
+            } else {
+                PropAttrs::Mixed(Vec::new())
+            },
             class: None,
             extensible: true,
             is_ctor: false,
@@ -1306,7 +1526,7 @@ impl ObjMap {
         self.shape_to_dict(); // every property's `configurable` changes
         self.extensible = false;
         self.sealed = true;
-        for a in &mut self.attrs {
+        for a in self.attrs.materialize() {
             a.configurable = false;
         }
     }
@@ -1317,7 +1537,7 @@ impl ObjMap {
         self.extensible = false;
         self.sealed = true;
         self.frozen = true;
-        for a in &mut self.attrs {
+        for a in self.attrs.materialize() {
             a.configurable = false;
             if !a.accessor {
                 a.writable = false;
@@ -1459,13 +1679,17 @@ impl ObjMap {
             // shape-relevant actually changed, which is the common case
             // (`Object.defineProperty` re-stating the same flags, or only the
             // setter half of an accessor moving).
-            let old = self.attrs[i];
+            let old = self.attrs.at(i);
             let changed = old.writable != attr.writable
                 || old.enumerable != attr.enumerable
                 || old.configurable != attr.configurable
                 || old.accessor != attr.accessor;
             self.vals[i] = val;
-            self.attrs[i] = attr;
+            // Raw slot write (shape handled below); materializes only when the
+            // incoming attributes actually deviate from the stored defaults.
+            if !(matches!(self.attrs, PropAttrs::AllData { .. }) && PropAttrs::is_default(&attr)) {
+                self.attrs.materialize()[i] = attr;
+            }
             if changed {
                 self.shape_to_dict();
             }
@@ -4753,7 +4977,7 @@ mod tests {
         assert!(!vals_drift.planned_next_static_key("a"));
 
         let mut attrs_drift = ObjMap::with_static_key_plan_mode(plan, true);
-        attrs_drift.attrs.push(PropAttr::data());
+        attrs_drift.push_attr(PropAttr::data());
         assert!(!attrs_drift.planned_next_static_key("a"));
 
         let invalid = StaticKeyPlan::new(vec!["a".into(), "a".into()]);
@@ -5096,7 +5320,7 @@ mod tests {
         assert!(m.verify_shape().is_ok());
 
         // Every key is still at its own slot, so the key/slot check passes...
-        m.attrs[1].enumerable = false;
+        m.attr_mut(1).enumerable = false;
         assert_shape_agrees(&m);
         // ...and the shape is now lying about slot 1's descriptor.
         let why = m
@@ -5626,6 +5850,26 @@ mod tests {
 
         h.audit_resident_bytes();
         assert_eq!(h.resident_payload_current.get(), baseline + charge);
+    }
+
+    #[test]
+    fn all_default_attrs_store_nothing() {
+        let mut m = ObjMap::new();
+        for k in ["a", "b", "c", "d"] {
+            m.push_data(k.to_string(), Value::num(1.0));
+        }
+        assert!(
+            !m.may_deviate_attrs(),
+            "default-data pushes must keep the elided representation"
+        );
+        assert_eq!(m.attrs_len(), 4);
+        assert!(m.attr_at(3).writable && !m.attr_at(3).accessor);
+        // A deviating write materializes; the stored column then reports real bytes.
+        let elided = m.resident_bytes();
+        m.attr_mut(2).enumerable = false;
+        assert!(m.may_deviate_attrs());
+        assert!(m.resident_bytes() > elided, "materialized column must be charged");
+        assert!(!m.attr_at(2).enumerable && m.attr_at(3).enumerable);
     }
 
     #[test]

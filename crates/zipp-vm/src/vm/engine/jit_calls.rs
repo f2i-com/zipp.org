@@ -1055,7 +1055,7 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(m) = self.heap.get(recv.heap_index()) {
                 if m.is_ctor {
                     if let Some(i) = m.pos(key) {
-                        if !m.attrs[i].accessor {
+                        if !m.attr_at(i).accessor {
                             let f = m.vals[i];
                             if f.is_heap()
                                 && matches!(self.heap.get(f.heap_index()), HeapObj::Native(_))
@@ -1182,7 +1182,7 @@ impl<'p> Vm<'p> {
         let pristine = match self.heap.get(self.fn_proto) {
             HeapObj::Object(m) => {
                 let s = slot as usize;
-                !m.attrs[s].accessor
+                !m.attr_at(s).accessor
                     && m.vals[s].is_heap()
                     && matches!(
                         self.heap.get(m.vals[s].heap_index()),
@@ -1312,7 +1312,7 @@ impl<'p> Vm<'p> {
         let s = m.pos(field)?;
         // OWN, DATA (non-accessor) slot only — a nested accessor / inherited
         // field would need real semantics; defer those to the frame call.
-        if m.attrs[s].accessor {
+        if m.attr_at(s).accessor {
             return None;
         }
         Some(m.vals[s].bits())
@@ -1376,7 +1376,7 @@ impl<'p> Vm<'p> {
         match self.heap.get_mut(idx) {
             HeapObj::Object(m) if !m.is_ctor => {
                 let s = m.pos(field)?;
-                if m.attrs[s].accessor || !m.attrs[s].writable {
+                if m.attr_at(s).accessor || !m.attr_at(s).writable {
                     return None;
                 }
                 m.vals[s] = stored; // in-place data store — shape unchanged

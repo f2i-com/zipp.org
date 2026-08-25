@@ -496,6 +496,33 @@ mod tests {
         vm
     }
 
+    #[test]
+    fn vm_built_literals_elide_default_attrs() {
+        let vm = vm(
+            "var arr = []; for (var i = 0; i < 200; i++) arr.push({a: i, b: i, c: i, d: i}); globalThis.keep = arr;",
+        );
+        let mut objects = 0usize;
+        let mut deviating = 0usize;
+        for idx in 0..vm.heap.len() as u32 {
+            if let HeapObj::Object(m) = vm.heap.get(idx) {
+                // Boot objects (prototypes, constructors) install
+                // non-enumerable properties and are legitimately explicit;
+                // the retained `{a,b,c,d}` user literals must stay elided.
+                if m.len() == 4 && m.key_at(0) == "a" && m.key_at(3) == "d" {
+                    objects += 1;
+                    if m.may_deviate_attrs() {
+                        deviating += 1;
+                    }
+                }
+            }
+        }
+        assert!(objects >= 200, "expected the retained literals on the heap, saw {objects}");
+        assert_eq!(
+            deviating, 0,
+            "all-default 4-key literals must stay elided ({deviating}/{objects} deviate)"
+        );
+    }
+
     fn named_slot(vm: &Vm<'_>, wanted: &str) -> (u32, u32) {
         let count = vm.main_func_count + vm.eval_funcs.len();
         for func_id in 0..count {

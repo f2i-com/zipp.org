@@ -67,7 +67,7 @@ pub(crate) extern "win64" fn jit_get_iterator(vm: *mut core::ffi::c_void, v_bits
         let pristine_data = |holder: u32, key: &str, expected: Value| -> bool {
             match vm.heap.get(holder) {
                 HeapObj::Object(map) => match map.pos(key) {
-                    Some(i) => !map.attrs[i].accessor && map.vals[i] == expected,
+                    Some(i) => !map.attr_at(i).accessor && map.vals[i] == expected,
                     None => false,
                 },
                 _ => false,

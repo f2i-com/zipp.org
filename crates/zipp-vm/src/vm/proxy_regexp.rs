@@ -360,7 +360,7 @@ impl<'p> Vm<'p> {
     /// advanced `lastIndex` instead of throwing.
     pub(crate) fn regexp_last_index_writable(&self, idx: u32) -> bool {
         self.arr_props.get(&idx).map_or(true, |m| {
-            !m.frozen && m.pos("lastIndex").map_or(true, |i| m.attrs[i].writable)
+            !m.frozen && m.pos("lastIndex").map_or(true, |i| m.attr_at(i).writable)
         })
     }
 
@@ -390,7 +390,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => {
                 let intrinsic = |k: &str, id: u16| {
                     m.pos(k).is_some_and(|i| {
-                        !m.attrs[i].accessor
+                        !m.attr_at(i).accessor
                             && m.vals[i].is_heap()
                             && matches!(self.heap.get(m.vals[i].heap_index()),
                                         HeapObj::Native(n) if *n == id)
@@ -446,7 +446,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => {
                 let accessor = |name: &str, want: u16| {
                     m.pos(name).is_some_and(|i| {
-                        m.attrs[i].accessor
+                        m.attr_at(i).accessor
                             && m.vals[i].is_heap()
                             && matches!(
                                 self.heap.get(m.vals[i].heap_index()),
@@ -506,19 +506,19 @@ impl<'p> Vm<'p> {
         let proto_ok = match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => {
                 let flags_ok = m.pos("flags").is_some_and(|i| {
-                    m.attrs[i].accessor
+                    m.attr_at(i).accessor
                         && m.vals[i].is_heap()
                         && matches!(self.heap.get(m.vals[i].heap_index()),
                                     HeapObj::Native(n) if *n == native::REGEXP_GET_FLAGS)
                 });
                 let exec_ok = m.pos("exec").is_some_and(|i| {
-                    !m.attrs[i].accessor
+                    !m.attr_at(i).accessor
                         && m.vals[i].is_heap()
                         && matches!(self.heap.get(m.vals[i].heap_index()),
                                     HeapObj::Native(n) if *n == native::REGEXP_EXEC)
                 });
                 let ctor_ok = m.pos("constructor").is_some_and(|i| {
-                    !m.attrs[i].accessor
+                    !m.attr_at(i).accessor
                         && m.vals[i].is_heap()
                         && m.vals[i].heap_index() == self.regexp_ctor
                 });
@@ -527,7 +527,7 @@ impl<'p> Vm<'p> {
                 // (see the own-prop check above), and a plain replacement value
                 // changes what IsRegExp answers inside the RegExp constructor.
                 let match_ok = m.pos("@@match").is_some_and(|i| {
-                    !m.attrs[i].accessor
+                    !m.attr_at(i).accessor
                         && m.vals[i].is_heap()
                         && matches!(self.heap.get(m.vals[i].heap_index()),
                                     HeapObj::Native(n) if *n == native::REGEXP_SYM_MATCH)
@@ -542,7 +542,7 @@ impl<'p> Vm<'p> {
         // %RegExp%[@@species] still the default accessor (never replaced).
         match self.heap.get(self.regexp_ctor) {
             HeapObj::Object(m) => m.pos("@@species").is_some_and(|i| {
-                m.attrs[i].accessor
+                m.attr_at(i).accessor
                     && m.vals[i].is_heap()
                     && matches!(self.heap.get(m.vals[i].heap_index()),
                                 HeapObj::Native(n) if *n == native::SPECIES_GET)
@@ -614,7 +614,7 @@ impl<'p> Vm<'p> {
         let pinned = |m: &ObjMap, key: &str, accessor: bool, (slot, idx, ver): (u32, u32, u32)| {
             let s = slot as usize;
             m.keys.get(s).is_some_and(|k| k == key)
-                && m.attrs[s].accessor == accessor
+                && m.attr_at(s).accessor == accessor
                 && m.vals[s].is_heap()
                 && m.vals[s].heap_index() == idx
                 // The same object, un-replaced since fill proved it the right
@@ -634,7 +634,7 @@ impl<'p> Vm<'p> {
         }
         let cs = c.ctor_slot as usize;
         if m.keys.get(cs).map_or(true, |k| k != "constructor")
-            || m.attrs[cs].accessor
+            || m.attr_at(cs).accessor
             || !m.vals[cs].is_heap()
             || m.vals[cs].heap_index() != self.regexp_ctor
         {
@@ -655,7 +655,7 @@ impl<'p> Vm<'p> {
         let pin = |m: &ObjMap, key: &str, accessor: bool, id: u16| {
             let i = m.pos(key)?;
             let v = m.vals[i];
-            (m.attrs[i].accessor == accessor
+            (m.attr_at(i).accessor == accessor
                 && v.is_heap()
                 && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == id))
             .then(|| {
@@ -674,7 +674,7 @@ impl<'p> Vm<'p> {
         let exec = pin(m, "exec", false, native::REGEXP_EXEC)?;
         let matchsym = pin(m, "@@match", false, native::REGEXP_SYM_MATCH)?;
         let ctor_slot = m.pos("constructor").filter(|&i| {
-            !m.attrs[i].accessor
+            !m.attr_at(i).accessor
                 && m.vals[i].is_heap()
                 && m.vals[i].heap_index() == self.regexp_ctor
         })? as u32;
@@ -2441,7 +2441,7 @@ impl<'p> Vm<'p> {
             _ => return false,
         };
         let flags_ok = proto.pos("flags").is_some_and(|p| {
-            proto.attrs[p].accessor
+            proto.attr_at(p).accessor
                 && proto.vals[p].is_heap()
                 && matches!(
                     self.heap.get(proto.vals[p].heap_index()),
@@ -2451,7 +2451,7 @@ impl<'p> Vm<'p> {
         flags_ok
             && Self::FLAG_ACCESSORS.iter().all(|(name, want)| {
                 let ok = proto.pos(name).is_some_and(|p| {
-                    proto.attrs[p].accessor
+                    proto.attr_at(p).accessor
                         && proto.vals[p].is_heap()
                         && matches!(self.heap.get(proto.vals[p].heap_index()),
                                 HeapObj::Native(n) if n == want)
@@ -2518,7 +2518,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => m.pos(name).is_some_and(|i| {
-                !m.attrs[i].accessor
+                !m.attr_at(i).accessor
                     && m.vals[i].is_heap()
                     && matches!(self.heap.get(m.vals[i].heap_index()),
                                 HeapObj::Native(n) if *n == want)
@@ -2542,7 +2542,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => m.pos("exec").is_some_and(|i| {
-                !m.attrs[i].accessor
+                !m.attr_at(i).accessor
                     && m.vals[i].is_heap()
                     && matches!(self.heap.get(m.vals[i].heap_index()),
                                 HeapObj::Native(n) if *n == native::REGEXP_EXEC)
@@ -2772,7 +2772,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         let slot = p.pos(name)?;
-        if p.attrs[slot].accessor {
+        if p.attr_at(slot).accessor {
             return None;
         }
         let v = p.vals[slot];

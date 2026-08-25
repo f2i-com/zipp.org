@@ -280,11 +280,11 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(m) if !m.is_ctor => m,
                 _ => return None,
             };
-            if slot >= m.vals.len() || !m.attrs[slot].accessor {
+            if slot >= m.vals.len() || !m.attr_at(slot).accessor {
                 return None;
             }
             if is_set {
-                m.attrs[slot].setter
+                m.attr_at(slot).setter
             } else {
                 m.vals[slot]
             }

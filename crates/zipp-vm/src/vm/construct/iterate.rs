@@ -597,7 +597,7 @@ impl<'p> Vm<'p> {
         match self.heap.get(obj.heap_index()) {
             HeapObj::Object(m) => {
                 if let Some(i) = m.pos(key) {
-                    m.attrs[i].enumerable
+                    m.attr_at(i).enumerable
                 } else if obj.heap_index() == self.global_this && self.global_this != 0 {
                     // Slot-backed SCRIPT-declared var/function globals are
                     // enumerable bindings of the global object.
@@ -619,7 +619,7 @@ impl<'p> Vm<'p> {
                     || self
                         .arr_props
                         .get(&obj.heap_index())
-                        .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
+                        .and_then(|m| m.pos(key).map(|i| m.attr_at(i).enumerable))
                         .unwrap_or(false)
                     || self.regexp_result_prop(obj.heap_index(), key).is_some()
             }
@@ -630,7 +630,7 @@ impl<'p> Vm<'p> {
                     || self
                         .arr_props
                         .get(&obj.heap_index())
-                        .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
+                        .and_then(|m| m.pos(key).map(|i| m.attr_at(i).enumerable))
                         .unwrap_or(false)
             }
             // A function's assigned own properties live in `fn_props`.
@@ -641,14 +641,14 @@ impl<'p> Vm<'p> {
             | HeapObj::NativeClosure { .. } => self
                 .fn_props
                 .get(&obj.heap_index())
-                .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
+                .and_then(|m| m.pos(key).map(|i| m.attr_at(i).enumerable))
                 .unwrap_or(false),
             // A class's own (static) properties live in `ClassData.statics`.
             HeapObj::Class(c) => {
                 !is_private_key(key)
                     && c.statics
                         .pos(key)
-                        .map_or(false, |i| c.statics.attrs[i].enumerable)
+                        .map_or(false, |i| c.statics.attr_at(i).enumerable)
             }
             // A String wrapper's char indices are own ENUMERABLE props; `length` is
             // non-enumerable; an assigned own prop lives in the arr_props side table.
@@ -666,7 +666,7 @@ impl<'p> Vm<'p> {
                 } else {
                     self.arr_props
                         .get(&obj.heap_index())
-                        .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
+                        .and_then(|m| m.pos(key).map(|i| m.attr_at(i).enumerable))
                         .unwrap_or(false)
                 }
             }

@@ -118,7 +118,7 @@ fn replacing_the_prototype_method_with_a_non_native_is_observed() {
 
 #[test]
 fn an_accessor_on_the_prototype_is_not_taken_as_intrinsic() {
-    // `!m.attrs[i].accessor` in the probe: a getter must RUN, and its RESULT is
+    // `!m.attr_at(i).accessor` in the probe: a getter must RUN, and its RESULT is
     // what gets called.
     //
     // The count PINS A KNOWN PRE-EXISTING DIVERGENCE, deliberately, rather than

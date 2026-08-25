@@ -192,7 +192,7 @@ impl<'p> Vm<'p> {
         let methods_pristine = match self.heap.get(self.str_proto) {
             HeapObj::Object(map) => ["charCodeAt", "substring"].iter().all(|name| {
                 map.pos(name).is_some_and(|slot| {
-                    !map.attrs[slot].accessor
+                    !map.attr_at(slot).accessor
                         && map.vals[slot].is_heap()
                         && matches!(
                             self.heap.get(map.vals[slot].heap_index()),

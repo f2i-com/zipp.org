@@ -338,10 +338,10 @@ impl<'p> Vm<'p> {
         let slot = match self.heap.get(idx) {
             HeapObj::Object(m) => match m.pos(key) {
                 // Present and configurable -> the waterfall tail for this case.
-                Some(i) if m.attrs[i].configurable => i,
+                Some(i) if m.attr_at(i).configurable => i,
                 // Present and NON-configurable -> `false`, which is the very
                 // first thing the waterfall answers (access.rs, the
-                // `!m.attrs[i].configurable` branch) and the only thing it can
+                // `!m.attr_at(i).configurable` branch) and the only thing it can
                 // answer for an ordinary object.
                 Some(_) => return Some(false),
                 // ABSENT -> `true`, changing nothing. Every waterfall branch
@@ -375,7 +375,7 @@ impl<'p> Vm<'p> {
         // A non-configurable own property cannot be deleted (`delete` yields false).
         if let HeapObj::Object(m) = self.heap.get(idx) {
             if let Some(i) = m.pos(key) {
-                if !m.attrs[i].configurable {
+                if !m.attr_at(i).configurable {
                     return Value::bool(false);
                 }
             }
@@ -437,7 +437,7 @@ impl<'p> Vm<'p> {
         if canonical_u32_key(key).is_none() {
             if let Some(m) = self.arr_props.get(&idx) {
                 if let Some(p) = m.pos(key) {
-                    if !m.attrs[p].configurable {
+                    if !m.attr_at(p).configurable {
                         return Value::bool(false);
                     }
                 }
@@ -517,7 +517,7 @@ impl<'p> Vm<'p> {
             let ovr_attr = self
                 .fn_props
                 .get(&idx)
-                .and_then(|m| m.pos(key).map(|i| m.attrs[i].configurable));
+                .and_then(|m| m.pos(key).map(|i| m.attr_at(i).configurable));
             if ovr_attr == Some(false) {
                 return Value::bool(false);
             }
@@ -608,7 +608,7 @@ impl<'p> Vm<'p> {
         ) {
             if let Some(m) = self.fn_props.get(&idx) {
                 if let Some(p) = m.pos(key) {
-                    if !m.attrs[p].configurable {
+                    if !m.attr_at(p).configurable {
                         return Value::bool(false);
                     }
                 }
@@ -820,7 +820,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(m) => {
                     if let Some(i) = m.pos(key) {
                         governing =
-                            Some((m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter));
+                            Some((m.attr_at(i).accessor, m.attr_at(i).writable, m.attr_at(i).setter));
                         break;
                     }
                     if m.class.is_some() {
@@ -848,7 +848,7 @@ impl<'p> Vm<'p> {
                 _ => {
                     governing = self.arr_props.get(&cidx).and_then(|m| {
                         m.pos(key)
-                            .map(|i| (m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter))
+                            .map(|i| (m.attr_at(i).accessor, m.attr_at(i).writable, m.attr_at(i).setter))
                     });
                     break;
                 }
@@ -997,7 +997,7 @@ impl<'p> Vm<'p> {
                         return None; // accessors resolve via ClassData
                     }
                     if let Some(i) = m.pos(key) {
-                        return Some(m.attrs[i].accessor || !m.attrs[i].writable);
+                        return Some(m.attr_at(i).accessor || !m.attr_at(i).writable);
                     }
                 }
                 _ => return None, // array/proxy/class/exotic prototype
@@ -1015,7 +1015,7 @@ impl<'p> Vm<'p> {
             match self.heap.get(self.obj_proto) {
                 HeapObj::Object(m) => {
                     if let Some(i) = m.pos(key) {
-                        return Some(m.attrs[i].accessor || !m.attrs[i].writable);
+                        return Some(m.attr_at(i).accessor || !m.attr_at(i).writable);
                     }
                 }
                 _ => return None,
@@ -1050,7 +1050,7 @@ impl<'p> Vm<'p> {
                 let existing = match self.heap.get(oi) {
                     HeapObj::Object(m) => m
                         .pos(key)
-                        .map(|i| (i, m.attrs[i].accessor, m.attrs[i].writable)),
+                        .map(|i| (i, m.attr_at(i).accessor, m.attr_at(i).writable)),
                     _ => None,
                 };
                 match existing {
@@ -1306,7 +1306,7 @@ impl<'p> Vm<'p> {
                 // one) is written ordinarily.
                 if let HeapObj::Object(m) = self.heap.get(cidx) {
                     if let Some(p) = m.pos(key) {
-                        is_proto_accessor = m.attrs[p].accessor;
+                        is_proto_accessor = m.attr_at(p).accessor;
                         break;
                     }
                 }
@@ -1350,7 +1350,7 @@ impl<'p> Vm<'p> {
             let attr = self
                 .arr_props
                 .get(&idx)
-                .and_then(|m| m.pos("length").map(|i| m.attrs[i]));
+                .and_then(|m| m.pos("length").map(|i| m.attr_at(i)));
             if let Some(a) = attr {
                 if a.accessor {
                     if a.setter != Value::UNDEFINED {
@@ -1460,7 +1460,7 @@ impl<'p> Vm<'p> {
         // An OWN property's descriptor governs assignment: an accessor invokes its
         // setter; a non-writable data property silently ignores the write (sloppy).
         let own_attr = match self.heap.get(idx) {
-            HeapObj::Object(m) => m.pos(key).map(|i| m.attrs[i]),
+            HeapObj::Object(m) => m.pos(key).map(|i| m.attr_at(i)),
             // An Array's named props — and an exotic object's defineProperty'd own
             // props (Map/Set/Date/Promise/…) — live in the arr_props side table.
             HeapObj::Func(_)
@@ -1473,7 +1473,7 @@ impl<'p> Vm<'p> {
             _ => self
                 .arr_props
                 .get(&idx)
-                .and_then(|m| m.pos(key).map(|i| m.attrs[i])),
+                .and_then(|m| m.pos(key).map(|i| m.attr_at(i))),
         };
         if let Some(a) = own_attr {
             if a.accessor {
@@ -1559,7 +1559,7 @@ impl<'p> Vm<'p> {
                     // data property, now present rejects the write
                     // (staging/sm/Proxy/regress-bug1062349).
                     let now_own = match self.heap.get(idx) {
-                        HeapObj::Object(m) => m.pos(key).map(|i| m.attrs[i]),
+                        HeapObj::Object(m) => m.pos(key).map(|i| m.attr_at(i)),
                         HeapObj::Func(_)
                         | HeapObj::Closure { .. }
                         | HeapObj::Bound { .. }
@@ -1570,7 +1570,7 @@ impl<'p> Vm<'p> {
                         _ => self
                             .arr_props
                             .get(&idx)
-                            .and_then(|m| m.pos(key).map(|i| m.attrs[i])),
+                            .and_then(|m| m.pos(key).map(|i| m.attr_at(i))),
                     };
                     if let Some(a) = now_own {
                         if a.accessor || !a.writable {
@@ -1641,7 +1641,7 @@ impl<'p> Vm<'p> {
                 // set by NamedEvaluation/SetFunctionName) rejects assignment.
                 if let Some(m) = self.fn_props.get(&idx) {
                     if let Some(i) = m.pos(key) {
-                        if !m.attrs[i].accessor && !m.attrs[i].writable {
+                        if !m.attr_at(i).accessor && !m.attr_at(i).writable {
                             return self.reject_write(key, strict);
                         }
                     }
@@ -2030,7 +2030,7 @@ impl<'p> Vm<'p> {
             }
             if let HeapObj::Object(m) = self.heap.get(cidx) {
                 if let Some(i) = m.pos(key) {
-                    let a = m.attrs[i];
+                    let a = m.attr_at(i);
                     if a.accessor {
                         return Ok(if a.setter != Value::UNDEFINED {
                             ProtoSet::Setter(a.setter)
@@ -2073,9 +2073,9 @@ impl<'p> Vm<'p> {
         self.heap.write_barrier_val(idx, func);
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {
             if let Some(i) = m.pos(key) {
-                if m.attrs[i].accessor {
+                if m.attr_at(i).accessor {
                     if is_setter {
-                        m.attrs[i].setter = func;
+                        m.attr_mut(i).setter = func;
                     } else {
                         m.vals[i] = func;
                     }
@@ -2169,8 +2169,8 @@ impl<'p> Vm<'p> {
                 // for a getter-only one. A data entry keeps the own-write path.
                 HeapObj::Object(m) => {
                     if let Some(i) = m.pos(key) {
-                        if m.attrs[i].accessor {
-                            let s = m.attrs[i].setter;
+                        if m.attr_at(i).accessor {
+                            let s = m.attr_at(i).setter;
                             return Some(if s.is_undefined() { None } else { Some(s) });
                         }
                     }

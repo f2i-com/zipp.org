@@ -97,7 +97,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn own_member(&self, idx: u32, key: &str) -> Option<(PropAttr, Value)> {
         if let HeapObj::Object(m) = self.heap.get(idx) {
             if let Some(i) = m.pos(key) {
-                return Some((m.attrs[i], m.vals[i]));
+                return Some((m.attr_at(i), m.vals[i]));
             }
         }
         None
@@ -122,7 +122,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn clone_plain_object(&mut self, src: u32) -> Value {
         let pairs: Vec<(String, Value)> = match self.heap.get(src) {
             HeapObj::Object(m) => (0..m.keys.len())
-                .filter(|&i| !m.attrs[i].accessor && !is_hidden_key(&m.keys[i]))
+                .filter(|&i| !m.attr_at(i).accessor && !is_hidden_key(&m.keys[i]))
                 .map(|i| (m.keys[i].clone(), m.vals[i]))
                 .collect(),
             _ => vec![],

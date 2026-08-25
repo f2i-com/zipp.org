@@ -2362,7 +2362,7 @@ impl<'p> Vm<'p> {
                 // captures — an upvalue read has no frame to resolve against in
                 // an inlined body.
                 let (fv, is_data) = match self.heap.get(ridx) {
-                    HeapObj::Object(m) => (m.vals[slot], !m.attrs[slot].accessor),
+                    HeapObj::Object(m) => (m.vals[slot], !m.attr_at(slot).accessor),
                     _ => return None,
                 };
                 if !is_data || !fv.is_heap() {
@@ -2690,7 +2690,7 @@ impl<'p> Vm<'p> {
                 // stays on the helper -- which throws in strict mode / answers
                 // undefined exactly as the interpreter does.
                 let (f, addr) = if is_setter {
-                    (a.setter, std::ptr::addr_of!(m.attrs[slot].setter) as u64)
+                    (a.setter, m.setter_ref(slot) as *const Value as u64)
                 } else {
                     (
                         m.val_at(slot),
@@ -2896,7 +2896,7 @@ impl<'p> Vm<'p> {
             };
             let fkey = &strconsts[fname as usize];
             match m.pos(fkey) {
-                Some(s) if !m.attrs[s].accessor && (!need_writable || m.attrs[s].writable) => {
+                Some(s) if !m.attr_at(s).accessor && (!need_writable || m.attr_at(s).writable) => {
                     fs.insert(fname, s as u32);
                 }
                 _ => return None,

@@ -221,7 +221,7 @@ impl<'p> Vm<'p> {
         };
         match self.heap.get(self.fn_proto) {
             HeapObj::Object(m) => m.pos(name).is_some_and(|slot| {
-                !m.attrs[slot].accessor
+                !m.attr_at(slot).accessor
                     && m.vals[slot].is_heap()
                     && matches!(
                         self.heap.get(m.vals[slot].heap_index()),
@@ -255,7 +255,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(self.arr_proto) {
             HeapObj::Object(map) => map.pos(name).is_some_and(|slot| {
-                !map.attrs[slot].accessor
+                !map.attr_at(slot).accessor
                     && map.vals[slot].is_heap()
                     && matches!(self.heap.get(map.vals[slot].heap_index()), HeapObj::Native(id)
                         if native::proto_method(*id)
@@ -295,7 +295,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(proto) {
             HeapObj::Object(map) => map.pos(name).is_some_and(|slot| {
-                !map.attrs[slot].accessor
+                !map.attr_at(slot).accessor
                     && map.vals[slot].is_heap()
                     && matches!(
                         self.heap.get(map.vals[slot].heap_index()),
@@ -336,7 +336,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(self.str_proto) {
             HeapObj::Object(m) => m.pos(name).is_some_and(|slot| {
-                !m.attrs[slot].accessor
+                !m.attr_at(slot).accessor
                     && m.vals[slot].is_heap()
                     && matches!(
                         self.heap.get(m.vals[slot].heap_index()),
@@ -361,7 +361,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(self.str_proto) {
             HeapObj::Object(map) => map.pos(name).is_some_and(|slot| {
-                !map.attrs[slot].accessor
+                !map.attr_at(slot).accessor
                     && map.vals[slot].is_heap()
                     && matches!(
                         self.heap.get(map.vals[slot].heap_index()),
@@ -747,7 +747,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(self.promise_proto) {
             HeapObj::Object(m) => m.pos(name).is_some_and(|i| {
-                !m.attrs[i].accessor
+                !m.attr_at(i).accessor
                     && m.vals[i].is_heap()
                     && matches!(self.heap.get(m.vals[i].heap_index()),
                                 HeapObj::Native(n) if *n == want)

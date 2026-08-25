@@ -40,7 +40,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let p = m.element_pos(i)?;
-        Some((m.attrs[p], m.vals[p]))
+        Some((m.attr_at(p), m.vals[p]))
     }
 
     /// Can anything outside the dense `Vec` shadow, hide, or constrain an ELEMENT
@@ -101,7 +101,7 @@ impl<'p> Vm<'p> {
                 // A spec array index is < 2^32-1: "4294967295"/"4294967296"
                 // are ORDINARY named properties — they never block a shrink.
                 canonical_index_str(k)
-                    .filter(|ki| *ki < 4_294_967_295 && *ki >= new_len && !m.attrs[i].configurable)
+                    .filter(|ki| *ki < 4_294_967_295 && *ki >= new_len && !m.attr_at(i).configurable)
             })
             .max()
     }
@@ -164,7 +164,7 @@ impl<'p> Vm<'p> {
         // [[DefineOwnProperty]] calls on a Proxy target.
         let enum_keys = |m: &ObjMap| -> Vec<String> {
             let ordered = spec_key_order(&m.keys);
-            let live = |i: &usize| m.attrs[*i].enumerable;
+            let live = |i: &usize| m.attr_at(*i).enumerable;
             ordered
                 .iter()
                 .filter(|i| live(i) && !is_hidden_key(&m.keys[**i]))

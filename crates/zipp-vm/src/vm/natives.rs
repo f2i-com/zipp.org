@@ -229,7 +229,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(m) => {
                     if let Some(i) = m.pos(&key) {
                         governing =
-                            Some((m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter));
+                            Some((m.attr_at(i).accessor, m.attr_at(i).writable, m.attr_at(i).setter));
                         break;
                     }
                     if m.class.is_some() {
@@ -306,7 +306,7 @@ impl<'p> Vm<'p> {
         // the target here; anything else is a data/absent case whose write
         // belongs on the RECEIVER when the two differ.
         let target_own_accessor = match self.heap.get(a0.heap_index()) {
-            HeapObj::Object(m) => m.pos(&key).is_some_and(|i| m.attrs[i].accessor),
+            HeapObj::Object(m) => m.pos(&key).is_some_and(|i| m.attr_at(i).accessor),
             _ => {
                 let h = a0.heap_index();
                 let side = match self.heap.get(h) {
@@ -317,7 +317,7 @@ impl<'p> Vm<'p> {
                     | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
                     _ => self.arr_props.get(&h),
                 };
-                side.and_then(|m| m.pos(&key).map(|i| m.attrs[i].accessor))
+                side.and_then(|m| m.pos(&key).map(|i| m.attr_at(i).accessor))
                     .unwrap_or(false)
             }
         };
@@ -325,10 +325,10 @@ impl<'p> Vm<'p> {
             let ok = match self.heap.get(a0.heap_index()) {
                 HeapObj::Object(m) => match m.pos(&key) {
                     Some(i) => {
-                        if m.attrs[i].accessor {
-                            m.attrs[i].setter != Value::UNDEFINED
+                        if m.attr_at(i).accessor {
+                            m.attr_at(i).setter != Value::UNDEFINED
                         } else {
-                            m.attrs[i].writable
+                            m.attr_at(i).writable
                         }
                     }
                     None => m.extensible,
@@ -349,7 +349,7 @@ impl<'p> Vm<'p> {
                     };
                     match side.and_then(|m| {
                         m.pos(&key)
-                            .map(|i| (m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter))
+                            .map(|i| (m.attr_at(i).accessor, m.attr_at(i).writable, m.attr_at(i).setter))
                     }) {
                         Some((true, _, setter)) => setter != Value::UNDEFINED,
                         Some((_, w, _)) => w,
@@ -480,7 +480,7 @@ impl<'p> Vm<'p> {
         let own = match self.heap.get(ridx) {
             HeapObj::Object(m) => m
                 .pos(&key)
-                .map(|i| (m.attrs[i].accessor, m.attrs[i].writable)),
+                .map(|i| (m.attr_at(i).accessor, m.attr_at(i).writable)),
             HeapObj::Func(_)
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
@@ -488,11 +488,11 @@ impl<'p> Vm<'p> {
             | HeapObj::Native(_)
             | HeapObj::NativeClosure { .. } => self.fn_props.get(&ridx).and_then(|m| {
                 m.pos(&key)
-                    .map(|i| (m.attrs[i].accessor, m.attrs[i].writable))
+                    .map(|i| (m.attr_at(i).accessor, m.attr_at(i).writable))
             }),
             _ => self.arr_props.get(&ridx).and_then(|m| {
                 m.pos(&key)
-                    .map(|i| (m.attrs[i].accessor, m.attrs[i].writable))
+                    .map(|i| (m.attr_at(i).accessor, m.attr_at(i).writable))
             }),
         };
         // An Array's dense elements are not in `arr_props`, so an in-range index
@@ -720,13 +720,13 @@ impl<'p> Vm<'p> {
                         .keys
                         .iter()
                         .zip(mm.vals.iter())
-                        .zip(mm.attrs.iter())
+                        .zip(mm.attrs_iter())
                         .filter(|((k, _), _)| {
                             k.as_str() != "prototype"
                                 && k.as_str() != "name"
                                 && k.as_str() != "length"
                         })
-                        .map(|((k, v), a)| (k.clone(), *v, *a))
+                        .map(|((k, v), a)| (k.clone(), *v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -751,9 +751,9 @@ impl<'p> Vm<'p> {
                         .keys
                         .iter()
                         .zip(mm.vals.iter())
-                        .zip(mm.attrs.iter())
+                        .zip(mm.attrs_iter())
                         .filter(|((k, _), _)| k.as_str() != "constructor")
-                        .map(|((k, v), a)| (k.clone(), *v, *a))
+                        .map(|((k, v), a)| (k.clone(), *v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -836,7 +836,7 @@ impl<'p> Vm<'p> {
                         .keys
                         .iter()
                         .zip(mm.vals.iter())
-                        .zip(mm.attrs.iter())
+                        .zip(mm.attrs_iter())
                         .filter(|((k, _), _)| {
                             let k = k.as_str();
                             if skip_ctor {
@@ -845,7 +845,7 @@ impl<'p> Vm<'p> {
                                 k != "prototype" && k != "name" && k != "length"
                             }
                         })
-                        .map(|((k, v), a)| (k.clone(), *v, *a))
+                        .map(|((k, v), a)| (k.clone(), *v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -950,11 +950,11 @@ impl<'p> Vm<'p> {
                         .keys
                         .iter()
                         .zip(mm.vals.iter())
-                        .zip(mm.attrs.iter())
+                        .zip(mm.attrs_iter())
                         .filter(|((k, _), _)| {
                             k.as_str() != "constructor" && k.as_str() != "prototype"
                         })
-                        .map(|((k, v), a)| (k.clone(), *v, *a))
+                        .map(|((k, v), a)| (k.clone(), *v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -1004,9 +1004,9 @@ impl<'p> Vm<'p> {
                                 .keys
                                 .iter()
                                 .zip(mm.vals.iter())
-                                .zip(mm.attrs.iter())
+                                .zip(mm.attrs_iter())
                                 .filter(|((k, _), _)| k.as_str() != "constructor")
-                                .map(|((k, v), a)| (k.clone(), *v, *a))
+                                .map(|((k, v), a)| (k.clone(), *v, a))
                                 .collect(),
                             _ => Vec::new(),
                         };
@@ -1054,8 +1054,8 @@ impl<'p> Vm<'p> {
                         .keys
                         .iter()
                         .zip(mm.vals.iter())
-                        .zip(mm.attrs.iter())
-                        .map(|((k, v), a)| (k.clone(), *v, *a))
+                        .zip(mm.attrs_iter())
+                        .map(|((k, v), a)| (k.clone(), *v, a))
                         .collect(),
                     _ => Vec::new(),
                 };
@@ -1128,9 +1128,9 @@ impl<'p> Vm<'p> {
                     .keys
                     .iter()
                     .zip(mm.vals.iter())
-                    .zip(mm.attrs.iter())
+                    .zip(mm.attrs_iter())
                     .filter(|((k, _), _)| k.as_str() != "global" && k.as_str() != "evalScript")
-                    .map(|((k, v), a)| (k.clone(), *v, *a))
+                    .map(|((k, v), a)| (k.clone(), *v, a))
                     .collect(),
                 _ => Vec::new(),
             };

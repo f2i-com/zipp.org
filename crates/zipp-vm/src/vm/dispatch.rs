@@ -1800,7 +1800,7 @@ impl<'p> Vm<'p> {
                             match self.heap.get(s.heap_index()) {
                                 HeapObj::Object(map) => spec_key_order(&map.keys)
                                     .into_iter()
-                                    .filter(|&i| map.attrs[i].enumerable)
+                                    .filter(|&i| map.attr_at(i).enumerable)
                                     .map(|i| map.keys[i].clone())
                                     .filter(|k| !excluded.iter().any(|e| e == k))
                                     .collect(),
@@ -1859,7 +1859,7 @@ impl<'p> Vm<'p> {
                             match self.heap.get(s.heap_index()) {
                                 HeapObj::Object(map) => spec_key_order(&map.keys)
                                     .into_iter()
-                                    .filter(|&i| map.attrs[i].enumerable)
+                                    .filter(|&i| map.attr_at(i).enumerable)
                                     .map(|i| map.keys[i].clone())
                                     .filter(|k| !excluded.iter().any(|e| e == k))
                                     .collect(),

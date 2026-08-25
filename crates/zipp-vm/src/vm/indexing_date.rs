@@ -98,7 +98,7 @@ impl<'p> Vm<'p> {
                         (std::str::from_utf8(b), self.heap.get(oidx))
                     {
                         if let Some(i) = m.pos(k) {
-                            if !m.attrs[i].accessor {
+                            if !m.attr_at(i).accessor {
                                 let v = m.vals[i];
                                 if !v.is_uninitialized() {
                                     return Ok(v);
@@ -378,7 +378,7 @@ impl<'p> Vm<'p> {
                     if let Some(j) = pm.pos(key) {
                         // A writable data property on the chain is merely
                         // shadowed; an accessor or non-writable data blocks.
-                        return !pm.attrs[j].accessor && pm.attrs[j].writable;
+                        return !pm.attr_at(j).accessor && pm.attr_at(j).writable;
                     }
                 }
                 _ => return false, // exotic level: let set_prop decide
@@ -440,7 +440,7 @@ impl<'p> Vm<'p> {
                 Some(std::borrow::Cow::Borrowed(b)) => {
                     match (std::str::from_utf8(b), self.heap.get(idx)) {
                         (Ok(k), HeapObj::Object(m)) if k != "__proto__" => match m.pos(k) {
-                            Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => {
+                            Some(i) if !m.attr_at(i).accessor && m.attr_at(i).writable => {
                                 (Some(i), false)
                             }
                             Some(_) => (None, false),
@@ -704,7 +704,7 @@ impl<'p> Vm<'p> {
                 self.build_concat_key(&mut scratch, name, key.as_int(), func_id);
                 let hit = match self.heap.get(oidx) {
                     HeapObj::Object(m) => match m.pos(&scratch) {
-                        Some(i) if !m.attrs[i].accessor && !m.vals[i].is_uninitialized() => {
+                        Some(i) if !m.attr_at(i).accessor && !m.vals[i].is_uninitialized() => {
                             Some(m.vals[i])
                         }
                         _ => None,
@@ -757,7 +757,7 @@ impl<'p> Vm<'p> {
 
         let (hit, add) = match self.heap.get(idx) {
             HeapObj::Object(m) if key != "__proto__" => match m.pos(key) {
-                Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => (Some(i), false),
+                Some(i) if !m.attr_at(i).accessor && m.attr_at(i).writable => (Some(i), false),
                 Some(_) => (None, false),
                 None => (
                     None,

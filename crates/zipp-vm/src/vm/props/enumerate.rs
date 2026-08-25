@@ -83,7 +83,7 @@ impl<'p> Vm<'p> {
             }
             if let Some(m) = self.arr_props.get(&idx) {
                 for (i, k) in m.keys.iter().enumerate() {
-                    if m.attrs[i].enumerable && !is_hidden_key(k) {
+                    if m.attr_at(i).enumerable && !is_hidden_key(k) {
                         pairs.push((k.clone(), m.vals[i]));
                     }
                 }
@@ -166,7 +166,7 @@ impl<'p> Vm<'p> {
                 // array indices; they stay named, in insertion order.)
                 let mut sparse: Vec<usize> = Vec::new();
                 for (j, k) in m.keys.iter().enumerate() {
-                    if !m.attrs[j].enumerable || is_hidden_key(k) {
+                    if !m.attr_at(j).enumerable || is_hidden_key(k) {
                         continue;
                     }
                     if let Some(n) = canonical_index_str(k).filter(|n| *n < 4_294_967_295) {
@@ -180,7 +180,7 @@ impl<'p> Vm<'p> {
                 sparse.sort_unstable();
                 ks.extend(sparse.into_iter().map(|n| n.to_string()));
                 for (j, k) in m.keys.iter().enumerate() {
-                    if !m.attrs[j].enumerable || is_hidden_key(k) {
+                    if !m.attr_at(j).enumerable || is_hidden_key(k) {
                         continue;
                     }
                     // Index keys were emitted (dense range / sparse run) above.
@@ -241,7 +241,7 @@ impl<'p> Vm<'p> {
                     .keys
                     .iter()
                     .enumerate()
-                    .filter(|(i, k)| m.attrs[*i].enumerable && !is_hidden_key(k))
+                    .filter(|(i, k)| m.attr_at(*i).enumerable && !is_hidden_key(k))
                     .map(|(_, k)| k.clone())
                     .collect(),
                 None => Vec::new(),
@@ -296,7 +296,7 @@ impl<'p> Vm<'p> {
                     let enumerable = slot_names.contains(&k)
                         || match self.heap.get(obj.heap_index()) {
                             HeapObj::Object(m) => {
-                                m.pos(&k).map_or(false, |i| m.attrs[i].enumerable)
+                                m.pos(&k).map_or(false, |i| m.attr_at(i).enumerable)
                             }
                             _ => false,
                         };
@@ -353,7 +353,7 @@ impl<'p> Vm<'p> {
                 let enumerable = self
                     .fn_props
                     .get(&idx)
-                    .and_then(|m| m.pos(&k).map(|i| m.attrs[i].enumerable))
+                    .and_then(|m| m.pos(&k).map(|i| m.attr_at(i).enumerable))
                     .unwrap_or(false);
                 if !enumerable {
                     continue;
@@ -390,7 +390,7 @@ impl<'p> Vm<'p> {
             let names: Vec<String> = match self.arr_props.get(&obj.heap_index()) {
                 Some(m) => spec_key_order(&m.keys)
                     .into_iter()
-                    .filter(|&i| m.attrs[i].enumerable && !is_hidden_key(&m.keys[i]))
+                    .filter(|&i| m.attr_at(i).enumerable && !is_hidden_key(&m.keys[i]))
                     .map(|i| m.keys[i].clone())
                     .collect(),
                 None => Vec::new(),
@@ -426,7 +426,7 @@ impl<'p> Vm<'p> {
                     // Enumerable named own properties (arr.foo / match-result fields).
                     if let Some(m) = self.arr_props.get(&obj.heap_index()) {
                         for (i, k) in m.keys.iter().enumerate() {
-                            if m.attrs[i].enumerable && !is_hidden_key(k) {
+                            if m.attr_at(i).enumerable && !is_hidden_key(k) {
                                 v.push((k.clone(), m.vals[i]));
                             }
                         }
@@ -444,7 +444,7 @@ impl<'p> Vm<'p> {
                 | HeapObj::NativeClosure { .. } => match self.fn_props.get(&obj.heap_index()) {
                     Some(m) => spec_key_order(&m.keys)
                         .into_iter()
-                        .filter(|&i| m.attrs[i].enumerable && !is_hidden_key(&m.keys[i]))
+                        .filter(|&i| m.attr_at(i).enumerable && !is_hidden_key(&m.keys[i]))
                         .map(|i| (m.keys[i].clone(), m.vals[i]))
                         .collect(),
                     None => Vec::new(),
@@ -455,7 +455,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Class(c) => spec_key_order(&c.statics.keys)
                     .into_iter()
                     .filter(|&i| {
-                        c.statics.attrs[i].enumerable
+                        c.statics.attr_at(i).enumerable
                             && !is_hidden_key(&c.statics.keys[i])
                             && !c.statics.keys[i].starts_with('#')
                     })
@@ -576,7 +576,7 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                             visible = true;
-                            if m.attrs[i].enumerable {
+                            if m.attr_at(i).enumerable {
                                 emit.push(i);
                             }
                         }

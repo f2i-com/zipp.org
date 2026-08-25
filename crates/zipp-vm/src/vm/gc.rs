@@ -513,8 +513,10 @@ impl Vm<'_> {
             for &v in &m.vals {
                 root_val!(v);
             }
-            for a in &m.attrs {
-                root_val!(a.setter);
+            if m.may_deviate_attrs() {
+                for a in m.attrs_iter() {
+                    root_val!(a.setter);
+                }
             }
         }
         // A pristine RegExp match result keeps the values of its standard
@@ -1158,8 +1160,10 @@ impl Vm<'_> {
                 for &v in &map.vals {
                     m_val!(v);
                 }
-                for a in &map.attrs {
-                    m_val!(a.setter);
+                if map.may_deviate_attrs() {
+                    for a in map.attrs_iter() {
+                        m_val!(a.setter);
+                    }
                 }
                 if let Some(c) = map.class {
                     m_idx!(c);

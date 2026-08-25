@@ -210,6 +210,33 @@ Map item 1(b) (attrs elision), 2 (module-local append lane), 3 (survival GC
 share) and 4 (per-op floor) remain open and unmeasured on the post-security
 baseline.
 
+### Wave 56: attrs elision landed null and re-priced the whole map (B177)
+
+Item 1(b) was built: `ObjMap.attrs` is private behind a total accessor API and
+the all-default column stores only a count (`PropAttrs::AllData`). It is a
+real memory win (-64B on a 4-field object) and the migration the
+shared-descriptor plan needs — and it measured NULL on every object row. The
+instrument that matters: eliding 665k sweep frees moved sweep 15.4→14.7ms,
+i.e. **~1ns per small free even under mimalloc-secure**. That kills the
+"3-allocations-per-object floor" as a time theory (B175's build-phase cost is
+the FinalizeObject helper + young-gen bookkeeping, not malloc), kills any
+pool revisit at any cap, and relocates B176's secure-mode tax to page/segment
+grain. The w56 triage (post-security 17-row capture,
+`w56_triage_5675b79_2026-08-25.json`) is the standing baseline: 10 rows below
+parity, object cluster worst.
+
+Where the time actually is, measured: shapes-stable = 65% jit-fast + 17%
+jit-mem + 11% gc; 2.77M property accesses take only 242 IC misses because the
+INTERPRETER-side shape memo absorbs the identity thrash — so every access at
+a `direct_miss` site pays a helper round-trip (~10-15ns) where node pays a
+hidden-class guarded load (~1ns). `touch()` recompiles with `direct_miss=5`
+(`ZIPP_JITLOG`). The next mechanism is therefore NATIVE SHAPE WAYS at
+direct-miss sites: guard the receiver's live shape (via a version-disciplined
+mirror array), load `vals` through a parallel raw-pointer mirror, no call.
+GET-only v1; the full design contract (mirror invariant, fail-safe staleness
+for mid-construction objects, fill policy, gates) is in the w57 spec and the
+B178 ledger row.
+
 ---
 
 ## Continuation snapshot — 2026-08-25, Waves 40–52 checkpoint

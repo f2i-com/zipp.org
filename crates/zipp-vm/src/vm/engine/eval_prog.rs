@@ -316,7 +316,7 @@ impl<'p> Vm<'p> {
                         && matches!(
                             self.heap.get(self.global_this),
                             HeapObj::Object(m)
-                                if m.pos(&name).map_or(false, |i| !m.attrs[i].configurable)
+                                if m.pos(&name).map_or(false, |i| !m.attr_at(i).configurable)
                         );
                     if has_var || has_lex || restricted {
                         return Err(Thrown(format!(
@@ -396,7 +396,7 @@ impl<'p> Vm<'p> {
                         }
                         if self.global_this != 0 {
                             let pos_attrs = match self.heap.get(self.global_this) {
-                                HeapObj::Object(m) => m.pos(&name).map(|i| m.attrs[i]),
+                                HeapObj::Object(m) => m.pos(&name).map(|i| m.attr_at(i)),
                                 _ => None,
                             };
                             if let Some(a) = pos_attrs {

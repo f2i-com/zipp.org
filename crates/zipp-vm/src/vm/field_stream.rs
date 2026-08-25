@@ -779,7 +779,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         let slot = map.pos(field_name)?;
-        if map.attrs[slot].accessor {
+        if map.attr_at(slot).accessor {
             return None;
         }
         let value = map.vals[slot];
@@ -808,7 +808,7 @@ impl<'p> Vm<'p> {
                 _ => return None,
             };
             if let Some(slot) = map.pos(key) {
-                if map.attrs[slot].accessor {
+                if map.attr_at(slot).accessor {
                     return self.passthrough_getter_int(receiver, map.vals[slot]);
                 }
                 let value = map.vals[slot];
@@ -839,7 +839,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         let slot = map.pos(key)?;
-        let attr = map.attrs[slot];
+        let attr = map.attr_at(slot);
         (!attr.accessor && attr.writable).then_some((idx, slot))
     }
 
@@ -855,7 +855,7 @@ impl<'p> Vm<'p> {
         let (getter, setter) = match self.heap.get(receiver_idx) {
             HeapObj::Object(map) if !map.is_ctor && map.class.is_none() => {
                 let slot = map.pos(key)?;
-                let attr = map.attrs[slot];
+                let attr = map.attr_at(slot);
                 if !attr.accessor {
                     return None;
                 }
@@ -917,7 +917,7 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         let hidden = map.pos(getter_name)?;
-        let attr = map.attrs[hidden];
+        let attr = map.attr_at(hidden);
         (!attr.accessor && attr.writable && map.vals[hidden].is_int())
             .then_some((receiver_idx, hidden))
     }

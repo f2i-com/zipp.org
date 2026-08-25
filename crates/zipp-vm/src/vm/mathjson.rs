@@ -661,12 +661,12 @@ impl<'p> Vm<'p> {
                 let mut any = false;
                 for i in 0..map.keys.len() {
                     let key = &map.keys[i];
-                    if is_hidden_key(key) || !map.attrs[i].enumerable {
+                    if is_hidden_key(key) || !map.attr_at(i).enumerable {
                         continue;
                     }
                     // Integer keys need spec reordering; accessors can run user
                     // code. Both are clean declines before any visible result.
-                    if map.attrs[i].accessor || canonical_index_str(key).is_some() {
+                    if map.attr_at(i).accessor || canonical_index_str(key).is_some() {
                         active.pop();
                         return false;
                     }
@@ -759,7 +759,7 @@ impl<'p> Vm<'p> {
             && !self.proto_of.contains_key(&self.obj_proto)
             && matches!(self.heap.get(self.obj_proto), HeapObj::Object(m)
                 if m.keys.iter().enumerate().all(|(i, k)|
-                    is_hidden_key(k) || !m.attrs[i].enumerable));
+                    is_hidden_key(k) || !m.attr_at(i).enumerable));
 
         // `(value, exit, depth)` implements DFS without Rust recursion. Exit markers
         // keep only the current ancestry in `active`, detecting cycles while
@@ -847,10 +847,10 @@ impl<'p> Vm<'p> {
                     // per-object sort/allocation and preserves floating-add order.
                     for i in (0..map.keys.len()).rev() {
                         let key = &map.keys[i];
-                        if is_hidden_key(key) || !map.attrs[i].enumerable {
+                        if is_hidden_key(key) || !map.attr_at(i).enumerable {
                             continue;
                         }
-                        if map.attrs[i].accessor || canonical_index_str(key).is_some() {
+                        if map.attr_at(i).accessor || canonical_index_str(key).is_some() {
                             return None;
                         }
                         work.push((map.vals[i], false, depth + 1));
@@ -1329,10 +1329,10 @@ impl<'p> Vm<'p> {
         self.json_charge_key_snapshot(snapshot_budget, allocated_bytes, output_capacity)?;
         let all_prim = match self.heap.get(idx) {
             HeapObj::Object(map) => {
-                slots.retain(|&i| map.attrs[i].enumerable && !is_hidden_key(&map.keys[i]));
+                slots.retain(|&i| map.attr_at(i).enumerable && !is_hidden_key(&map.keys[i]));
                 slots
                     .iter()
-                    .all(|&i| !map.attrs[i].accessor && !map.vals[i].is_heap())
+                    .all(|&i| !map.attr_at(i).accessor && !map.vals[i].is_heap())
             }
             _ => return Ok(None),
         };
@@ -1803,7 +1803,7 @@ impl<'p> Vm<'p> {
                             // path always did (accessor / deleted ⇒ `json_get`).
                             let direct = if self.heap.version_of(idx) == v0 {
                                 match self.heap.get(idx) {
-                                    HeapObj::Object(m) if !m.attrs[*slot].accessor => {
+                                    HeapObj::Object(m) if !m.attr_at(*slot).accessor => {
                                         Some(m.vals[*slot])
                                     }
                                     _ => None,
@@ -1811,7 +1811,7 @@ impl<'p> Vm<'p> {
                             } else {
                                 match self.heap.get(idx) {
                                     HeapObj::Object(m) => match m.pos(k) {
-                                        Some(i) if !m.attrs[i].accessor => Some(m.vals[i]),
+                                        Some(i) if !m.attr_at(i).accessor => Some(m.vals[i]),
                                         _ => None,
                                     },
                                     _ => None,
@@ -1918,7 +1918,7 @@ impl<'p> Vm<'p> {
                     let direct = if use_fast {
                         match self.heap.get(idx) {
                             HeapObj::Object(m) => match m.pos(&k) {
-                                Some(i) if !m.attrs[i].accessor => Some(m.vals[i]),
+                                Some(i) if !m.attr_at(i).accessor => Some(m.vals[i]),
                                 _ => None,
                             },
                             _ => None,

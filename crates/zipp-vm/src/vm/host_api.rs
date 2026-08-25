@@ -365,12 +365,12 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Object(m) => {
                 let count = (0..m.keys.len())
-                    .filter(|&i| m.attrs[i].enumerable && !m.attrs[i].accessor)
+                    .filter(|&i| m.attr_at(i).enumerable && !m.attr_at(i).accessor)
                     .count();
                 budget.ensure_nodes(count)?;
                 let mut pairs = Vec::with_capacity(count);
                 for i in 0..m.keys.len() {
-                    let a = &m.attrs[i];
+                    let a = &m.attr_at(i);
                     // Accessors are not invoked: running user code in the middle
                     // of a marshal would let a getter mutate the graph being walked.
                     if !a.enumerable || a.accessor {
@@ -446,7 +446,7 @@ impl<'p> Vm<'p> {
         // Snapshot the old object's own data properties, then drop the borrow.
         let old_props: Vec<(String, Value)> = match self.heap.get(old.heap_index()) {
             HeapObj::Object(m) => (0..m.keys.len())
-                .filter(|&i| !m.attrs[i].accessor)
+                .filter(|&i| !m.attr_at(i).accessor)
                 .map(|i| (m.keys[i].clone(), m.vals[i]))
                 .collect(),
             _ => return self.host_in(hv, depth),

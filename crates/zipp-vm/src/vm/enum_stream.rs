@@ -1083,14 +1083,14 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         let method_ok = ap.pos(method).is_some_and(|slot| {
-            !ap.attrs[slot].accessor
+            !ap.attr_at(slot).accessor
                 && ap.vals[slot].is_heap()
                 && matches!(self.heap.get(ap.vals[slot].heap_index()), HeapObj::Native(id)
                     if native::proto_method(*id)
                         .is_some_and(|(name, kind, _)| name == method && kind == 0))
         });
         let constructor_ok = ap.pos("constructor").is_some_and(|slot| {
-            !ap.attrs[slot].accessor && ap.vals[slot] == Value::heap(self.array_ctor)
+            !ap.attr_at(slot).accessor && ap.vals[slot] == Value::heap(self.array_ctor)
         });
         if !method_ok || !constructor_ok {
             return None;
@@ -1110,8 +1110,8 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         let species_ok = ctor.pos("@@species").is_some_and(|slot| {
-            ctor.attrs[slot].accessor
-                && ctor.attrs[slot].setter == Value::UNDEFINED
+            ctor.attr_at(slot).accessor
+                && ctor.attr_at(slot).setter == Value::UNDEFINED
                 && ctor.vals[slot].is_heap()
                 && matches!(self.heap.get(ctor.vals[slot].heap_index()),
                     HeapObj::Native(id) if *id == native::SPECIES_GET)
@@ -1172,7 +1172,7 @@ impl<'p> Vm<'p> {
         }
         let prototypes_barren = [self.arr_proto, self.obj_proto].into_iter().all(|idx| {
             matches!(self.heap.get(idx), HeapObj::Object(map) if map.class.is_none()
-                && map.keys.iter().zip(&map.attrs)
+                && map.keys.iter().zip(map.attrs_iter())
                     .all(|(key, attr)| is_hidden_key(key) || !attr.enumerable))
         });
         if !prototypes_barren {
@@ -1218,7 +1218,7 @@ impl<'p> Vm<'p> {
                 // on the existing descriptor-aware path.
                 return None;
             }
-            let attr = side.attrs[slot];
+            let attr = side.attr_at(slot);
             if !attr.enumerable {
                 continue;
             }
@@ -1581,7 +1581,7 @@ impl<'p> Vm<'p> {
         if object_proto
             .keys
             .iter()
-            .zip(&object_proto.attrs)
+            .zip(object_proto.attrs_iter())
             .any(|(key, attr)| !is_hidden_key(key) && attr.enumerable)
             || self
                 .proto_of
@@ -1594,7 +1594,7 @@ impl<'p> Vm<'p> {
         let mut last_key = None;
         for slot in spec_key_order(&map.keys) {
             let key = &map.keys[slot];
-            let attr = map.attrs[slot];
+            let attr = map.attr_at(slot);
             if is_hidden_key(key) || !attr.enumerable {
                 continue;
             }
@@ -1658,7 +1658,7 @@ impl<'p> Vm<'p> {
         let count = map
             .keys
             .iter()
-            .zip(&map.attrs)
+            .zip(map.attrs_iter())
             .filter(|(key, attr)| !is_hidden_key(key) && attr.enumerable)
             .count() as u32;
         let remaining = limit.as_int() as u32;

@@ -481,7 +481,7 @@ pub(crate) extern "win64" fn jit_has_own_call(
 
     let pristine_call = match vm.heap.get(vm.fn_proto) {
         HeapObj::Object(m) => m.pos("call").is_some_and(|slot| {
-            !m.attrs[slot].accessor
+            !m.attr_at(slot).accessor
                 && m.vals[slot].is_heap()
                 && matches!(
                     vm.heap.get(m.vals[slot].heap_index()),
@@ -989,7 +989,7 @@ fn jit_default_array_proto_index(vm: &Vm<'_>, i: usize) -> Option<Value> {
             return None;
         }
         if let Some(p) = m.element_pos(i) {
-            if m.attrs[p].accessor {
+            if m.attr_at(p).accessor {
                 return None; // invoking the getter is observable user code
             }
             return Some(m.vals[p]);
@@ -1035,7 +1035,7 @@ pub(crate) extern "win64" fn jit_get_index(
                 {
                     if let HeapObj::Object(m) = vm.heap.get(oidx) {
                         if let Some(i) = m.pos(k) {
-                            if !m.attrs[i].accessor {
+                            if !m.attr_at(i).accessor {
                                 let v = m.vals[i];
                                 if !v.is_uninitialized() {
                                     return v.bits();
@@ -1226,7 +1226,7 @@ pub(crate) extern "win64" fn jit_set_index(
                 if let Ok(k) = std::str::from_utf8(bytes) {
                     if let HeapObj::Object(m) = vm.heap.get(oidx) {
                         if let Some(i) = m.pos(k) {
-                            let a = m.attrs[i];
+                            let a = m.attr_at(i);
                             if !a.accessor && a.writable && !m.vals[i].is_uninitialized() {
                                 writable_slot = Some(i);
                             }
@@ -3239,7 +3239,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             // change bumps it. The cacheability conditions above (private name,
             // deferred-ns, `ic_obj_ok`) already returned early, exactly as for
             // a data fill.
-            Some(s) if map.attrs[s].accessor => {
+            Some(s) if map.attr_at(s).accessor => {
                 // Site-gated (the B115 follow-up): `acc_way_gate` says whether
                 // this site's compiled probe carries the accessor arms.
                 // `Recompile` means it does NOT and the gate just flipped —
@@ -3302,7 +3302,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                     match vm.heap.get(next) {
                         HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
                             if let Some(i) = m2.pos(key) {
-                                if m2.attrs[i].accessor {
+                                if m2.attr_at(i).accessor {
                                     // Inherited getter: frame-called by the
                                     // interpreter-IC slow helper. B114: fill an
                                     // ACCESSOR way under the same guards a
@@ -3512,7 +3512,7 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
     match vm.heap.get(idx) {
         HeapObj::Object(map) => {
             if let Some(s) = map.pos(key) {
-                if map.attrs[s].accessor {
+                if map.attr_at(s).accessor {
                     return crate::codegen::SELF_CALL_DEOPT; // getter runs user code
                 }
                 return map.vals[s].bits();
@@ -3545,7 +3545,7 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
                 match vm.heap.get(next) {
                     HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
                         if let Some(i) = m2.pos(key) {
-                            if m2.attrs[i].accessor {
+                            if m2.attr_at(i).accessor {
                                 return crate::codegen::SELF_CALL_DEOPT;
                             }
                             return m2.vals[i].bits();
@@ -3686,14 +3686,14 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
             // hops for a store, so inherited setters stay on PROP_VIA_IC).
             // The setter lives in `attrs[s].setter`, NOT `vals[s]` — B52's
             // documented asymmetry — and the accessor helper re-reads it live.
-            Some(s) if map.attrs[s].accessor => {
+            Some(s) if map.attr_at(s).accessor => {
                 // Site-gated: see the GetProp miss helper's own-accessor fill.
                 let gate = vm.jit.acc_way_gate(site_idx);
                 if gate == crate::codegen::AccWayGate::Recompile {
                     return crate::codegen::SELF_CALL_DEOPT;
                 }
                 if gate == crate::codegen::AccWayGate::Fill {
-                    let setter = map.attrs[s].setter;
+                    let setter = map.attr_at(s).setter;
                     let baked = vm
                         .ic_plain_fn(setter)
                         .filter(|&(fid, _)| !vm.func(fid as usize).lexical_this)
@@ -3712,7 +3712,7 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
             }
             // A non-writable own data prop: sloppy no-op / strict throw —
             // the interpreter applies the right one.
-            Some(s) if !map.attrs[s].writable => return crate::codegen::SELF_CALL_DEOPT,
+            Some(s) if !map.attr_at(s).writable => return crate::codegen::SELF_CALL_DEOPT,
             Some(s) => Some(s),
             None => {
                 // Own miss. A class-instance receiver may resolve a chain
@@ -3747,12 +3747,12 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                     match vm.heap.get(next) {
                         HeapObj::Object(m2) if !m2.is_ctor && m2.class.is_none() => {
                             if let Some(i) = m2.pos(key) {
-                                if m2.attrs[i].accessor {
+                                if m2.attr_at(i).accessor {
                                     // Inherited setter governs the write —
                                     // frame-called by the slow helper.
                                     return crate::codegen::PROP_VIA_IC;
                                 }
-                                if !m2.attrs[i].writable {
+                                if !m2.attr_at(i).writable {
                                     return crate::codegen::SELF_CALL_DEOPT;
                                 }
                                 break; // writable chain data: the own add shadows it
@@ -4044,7 +4044,7 @@ pub(crate) extern "win64" fn jit_get_index_concat(
     vm.build_concat_key(&mut scratch, name, key.as_int(), func_id);
     let hit = match vm.heap.get(oidx) {
         HeapObj::Object(m) => match m.pos(&scratch) {
-            Some(i) if !m.attrs[i].accessor && !m.vals[i].is_uninitialized() => Some(m.vals[i]),
+            Some(i) if !m.attr_at(i).accessor && !m.vals[i].is_uninitialized() => Some(m.vals[i]),
             _ => None,
         },
         _ => None,

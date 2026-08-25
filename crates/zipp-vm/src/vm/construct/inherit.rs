@@ -96,7 +96,7 @@ impl<'p> Vm<'p> {
         let data_override = if c.is_heap() {
             self.fn_props.get(&c.heap_index()).and_then(|m| {
                 m.pos("prototype")
-                    .and_then(|i| (!m.attrs[i].accessor).then(|| m.vals[i]))
+                    .and_then(|i| (!m.attr_at(i).accessor).then(|| m.vals[i]))
             })
         } else {
             None
