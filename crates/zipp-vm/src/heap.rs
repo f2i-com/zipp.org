@@ -3280,6 +3280,14 @@ pub struct Heap {
     resident_payload_current: Cell<usize>,
     resident_payload_high_water: Cell<usize>,
     resident_payload_charged: Vec<Cell<usize>>,
+    /// Whether the eager per-allocation payload charge runs. OFF for a
+    /// trusted, un-instrumented run — the figure has no consumer there and the
+    /// per-object sizing walk is a measurable tax on allocation-heavy code.
+    /// The first `audit_resident_bytes` call (heap ceilings, `heap_bytes`
+    /// reporting) flips it on and simultaneously backfills every live slot's
+    /// charge, so reporting and enforcement never disagree once a consumer
+    /// exists.
+    payload_accounting: Cell<bool>,
     /// Per-object version, parallel to `objs` (one `u32` per heap object). Bumped
     /// whenever an object gains a NEW key (which may reallocate its `vals`). The
     /// JIT inline cache reads this (by heap index) to validate a cached
@@ -3605,6 +3613,7 @@ impl Heap {
             resident_payload_current: Cell::new(resident_payload_high_water),
             resident_payload_high_water: Cell::new(resident_payload_high_water),
             resident_payload_charged,
+            payload_accounting: Cell::new(false),
             versions,
             free: Vec::new(),
             live,
@@ -3668,11 +3677,19 @@ impl Heap {
 
     #[inline]
     pub fn alloc(&mut self, obj: HeapObj) -> u32 {
-        let payload = obj.resident_payload_bytes();
-        let current = self.resident_payload_current.get().saturating_add(payload);
-        self.resident_payload_current.set(current);
-        self.resident_payload_high_water
-            .set(self.resident_payload_high_water.get().max(current));
+        // Sizing every allocation is only worth paying once something reads
+        // the figure; `audit_resident_bytes` turns accounting on and backfills
+        // (see `payload_accounting`), so lazily-enabled totals stay exact.
+        let payload = if self.payload_accounting.get() {
+            let payload = obj.resident_payload_bytes();
+            let current = self.resident_payload_current.get().saturating_add(payload);
+            self.resident_payload_current.set(current);
+            self.resident_payload_high_water
+                .set(self.resident_payload_high_water.get().max(current));
+            payload
+        } else {
+            0
+        };
         self.live += 1;
         if self.live >= self.gc_threshold {
             self.gc_requested = true;
@@ -4078,8 +4095,11 @@ impl Heap {
 
     /// Reconcile in-place payload growth into the current and peak caches. This
     /// is O(n) in heap slots and is therefore deliberately called much less
-    /// often than the abort/step poll; new objects are charged eagerly.
+    /// often than the abort/step poll; new objects are charged eagerly once a
+    /// first audit proves a consumer exists (see `payload_accounting`) — this
+    /// full walk doubles as the backfill for allocations made before that.
     pub fn audit_resident_bytes(&self) -> usize {
+        self.payload_accounting.set(true);
         debug_assert_eq!(self.objs.len(), self.resident_payload_charged.len());
         let mut payload = 0usize;
         for (obj, charged) in self.objs.iter().zip(&self.resident_payload_charged) {
@@ -4210,16 +4230,18 @@ impl Heap {
     /// invariant, and it is not one a shape-keyed guard should have to make.
     #[inline]
     pub fn replace(&mut self, idx: u32, obj: HeapObj) {
-        let new_payload = obj.resident_payload_bytes();
-        let old_payload = self.resident_payload_charged[idx as usize].replace(new_payload);
-        let current = self
-            .resident_payload_current
-            .get()
-            .saturating_sub(old_payload)
-            .saturating_add(new_payload);
-        self.resident_payload_current.set(current);
-        self.resident_payload_high_water
-            .set(self.resident_payload_high_water.get().max(current));
+        if self.payload_accounting.get() {
+            let new_payload = obj.resident_payload_bytes();
+            let old_payload = self.resident_payload_charged[idx as usize].replace(new_payload);
+            let current = self
+                .resident_payload_current
+                .get()
+                .saturating_sub(old_payload)
+                .saturating_add(new_payload);
+            self.resident_payload_current.set(current);
+            self.resident_payload_high_water
+                .set(self.resident_payload_high_water.get().max(current));
+        }
         // Nursery barrier (NURSERY_DESIGN.md §1 case 8): the incoming object
         // may hold young references; if the SLOT is old, its whole edge list
         // is re-traced at the next minor (holder-grain — the value set is a
@@ -5581,9 +5603,13 @@ mod tests {
     #[test]
     fn payload_peak_tracks_resident_reuse_not_cumulative_churn() {
         let mut h = Heap::new();
+        // A first audit models the real consumer (ceilings/`heap_bytes`)
+        // switching eager accounting on; before it, charges are deferred.
+        h.audit_resident_bytes();
         let baseline = h.resident_payload_current.get();
         let first = h.alloc(HeapObj::Str(JsStr::new("x".repeat(1024))));
         let charge = h.resident_payload_charged[first as usize].get();
+        assert!(charge > 0, "eager charging must be on after an audit");
         assert_eq!(h.resident_payload_current.get(), baseline + charge);
         let first_peak = h.resident_payload_high_water.get();
 
@@ -5600,5 +5626,30 @@ mod tests {
 
         h.audit_resident_bytes();
         assert_eq!(h.resident_payload_current.get(), baseline + charge);
+    }
+
+    #[test]
+    fn payload_accounting_defers_until_first_audit_then_backfills_exactly() {
+        let mut h = Heap::new();
+        assert!(!h.payload_accounting.get(), "trusted runs skip the charge");
+        let idx = h.alloc(HeapObj::Str(JsStr::new("x".repeat(4096))));
+        assert_eq!(
+            h.resident_payload_charged[idx as usize].get(),
+            0,
+            "no consumer yet — the sizing walk must not run"
+        );
+        // First audit (a ceiling or `heap_bytes` read) backfills every live
+        // slot, so the lazily-started total matches eager-from-birth exactly.
+        h.audit_resident_bytes();
+        assert!(h.payload_accounting.get());
+        let charged = h.resident_payload_charged[idx as usize].get();
+        assert!(charged >= 4096);
+        let current = h.resident_payload_current.get();
+        let again = h.alloc(HeapObj::Str(JsStr::new("y".repeat(2048))));
+        assert_eq!(
+            h.resident_payload_current.get(),
+            current + h.resident_payload_charged[again as usize].get(),
+            "post-audit allocations are charged eagerly again"
+        );
     }
 }

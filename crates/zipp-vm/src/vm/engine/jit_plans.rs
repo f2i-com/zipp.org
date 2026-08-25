@@ -3131,6 +3131,10 @@ impl<'p> Vm<'p> {
                 return true;
             }
         }
+        // Without the instrument feature there is no growth budget to consult
+        // on this tier-less build; the parameter still names the contract.
+        #[cfg(not(feature = "instrument"))]
+        let _ = needed;
         false
     }
 

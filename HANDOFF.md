@@ -104,6 +104,112 @@ an intermediate sniff read as a 10–25% regression across three rows; the
 paired harness on a quiet machine showed every one was noise. Kill strays
 before believing any number.
 
+### Post-wave-54 scouting: where the remaining ratios actually live
+
+Measured on the committed tree, and worth more than any of it being guessed
+again. All refutations here were instrumented, not inferred.
+
+- **The cross-call theory is REFUTED for the object rows.** shapes-stable
+  runs 1.38M cross-calls (`[ic] cross-call window fills fast 1378777`), but a
+  source-level fully-inlined variant moved the row only ~146→139ms while Node
+  ran the same inlined source SLOWER than its factored form. Call overhead is
+  single-digit ms; do not build call-elision machinery for these rows.
+- **The split is allocation-machine vs access-machine.** In-source phase
+  timers on shapes-stable: zipp `build 61ms, touch 43ms` vs Node `build 5ms,
+  touch 3ms`. The build half is the per-object allocation floor —
+  `finalized_from_plan` still pays ~3 allocations per object (`Box<ObjMap>`,
+  `vals` Vec, `attrs` Vec — `PropAttr` is 16 bytes, so a 4-field object's
+  attrs alone is a 64-byte allocation) plus heap-slot/realm/Arc/memo
+  bookkeeping ≈ 85ns against Node's ~7ns slab objects. The touch half is the
+  per-access cost of HIT-path inline IC probes (~10-15ns × 4 accesses); the
+  probes hit (`GetProp misses 242` total on 2.77M accesses), so plan-keyed
+  ways would shave a few ns per access at most — priced BELOW a wave unless
+  bundled with the allocation work.
+- **Eliding the attrs Vec is the single biggest bounded allocation lever**,
+  but `ObjMap::attrs` is a public `Vec<PropAttr>` indexed at ~235 sites; the
+  representation change (an `AllData(len) | Vec` enum or an accessor-method
+  refactor) is a full wave with the fuzzer + shape-verify on its gate, not a
+  tail-of-session edit.
+- **NanoID's replaced `Math.random` IS handled**: the off-frame method
+  inliner reports `[mi] fn4@15 INLINE method arms=1` + `method LANE (ops=16
+  guards=4)` — the seeded xorshift runs as a typed schedule inside the MEM
+  region. The row's 58% jit-mem residual is the per-character
+  `id += alphabet[(random()*len)|0]` append machinery (4.5M appends/steps),
+  i.e. the string lane, not the call lane. The checksum loop already runs as
+  an INT region.
+- **The eviction churn is real but bounded**: react's fn3/fn9/fn10 each get
+  direct-miss evicted once or twice before settling (`EVICTED (direct-miss
+  site gate, ip 27, batched 4)`); after the final recompile the sites stay
+  compiled with `direct_miss=0`.
+
+### The prioritized remaining map (with today's evidence)
+
+1. **Object allocation slimming** (shapes/survival/router/react build halves;
+   worth ~20-40ms on each of four rows). Two routes, in order of preference:
+   **(a) revisit B84's ObjMap recycle pool** — it measured **−35% on object
+   construction** and was reverted only for an unexplained +2.9% json-large
+   regression, at a time when neither `ZIPP_PROF`, the gen-oracle GC stats,
+   nor the peak-RSS harness existed; all three do now, so the regression is
+   diagnosable rather than fatal. Free-list recycling at sweep retains the
+   `Box<ObjMap>` and both Vec capacities, collapsing the 3-allocations-per-
+   object floor. Use-after-recycle is the hazard class: gate with the fuzzer,
+   `ZIPP_NURSERY_VERIFY`, `verify_shape`, and the RSS harness.
+   **(b) attrs-Vec elision** for all-data planned maps (an `AllData(len)`
+   representation or accessor-method refactor over ~235 `.attrs` sites +
+   79 `.setter` sites) — wider, reviewable-only-fresh, and worth less
+   (~15ns/object) than (a).
+2. **The string append lane for NanoID** (~50-80ms on that row): the
+   `id += ch` pattern in MODULE function locals — the W25 append reducers key
+   on top-level-`var` shapes (B140/B142's scope sensitivity, again). Extending
+   the append-ASCII-char / in-place append lane to function-local accumulators
+   in module code is the named target.
+3. **Survival's GC share** (16%, ~30ms): survivor tracing of the retained
+   array (`jit_set_index` old→young 43k stores/run); the young budget already
+   adapts to 131072. This wants the valgrain/remset instruments from B141
+   before any mechanism.
+4. **Per-op Tier-C cost floor** (react/closures MEM share): the helper-per-op
+   model. Candidates: batching helper calls per basic block, or direct
+   emission for CellGet/UpvalGet-shaped ops.
+
+### Wave 55 outcome: the security merge moved the goalposts; the pool refuted
+
+Two things happened after that map was written (see B176 for the numbers).
+
+**The security-hardening commit costs real hostile time, and the cost is the
+allocator.** `4195e06` switched the CLI's mimalloc to its `secure` feature
+(guard pages, metadata integrity checks on every malloc/free). Three-way
+interleaved quiet-machine builds attribute the regression cleanly: pre-merge
+199/262ms on shapes-megamorphic/allocation-survival became 254/411ms
+(+28%/+57%), while the same merged tree with `secure` switched off measures
+207/285ms — ~85% of the tax is the allocator feature, the residual
+single-digit percent is the rest of the hardening. Slot-recycled rows
+(allocation-ephemeral, 84-87ms in all three builds) are untouched; sweep
+alone tripled (19→72ms). This is a
+deliberate security/perf trade by the maintainer and is LEFT STANDING — but
+every absolute ratio in this document predates it, so re-baseline before
+trusting any old number, and know that the next-largest perf lever on the
+object rows is now allocator policy, not VM code.
+
+**Map item 1(a), the B84 pool revisit, was built, gated, and refuted on the
+new baseline.** Thread-local `Box<ObjMap>` retire/take at sweep with an
+exhaustive-destructure reset and capacity caps measured ~NULL on both object
+rows (`bench/hostile/w55_objpool_{shapes,alloc}_abenv_2026-08-25.json`): a
+2048-entry pool covers under 1% of a 200k-object sweep, and the nursery's
+slot recycling already absorbs the ephemeral majority — the 3-allocation
+floor is per-object Vec growth inside fresh maps, which a bounded pool cannot
+amortize. Reverted whole per the no-dead-machinery rule. Two keepers landed
+instead: `Heap::payload_accounting` (the resident-payload sizing walk is now
+deferred until the first `audit_resident_bytes` consumer, whose full walk
+backfills exactly — trusted runs skip a per-allocation cost the security
+commit added) and a cfg'd unused-param fix in `regs_would_overflow` that was
+failing `-D warnings` CI off x86-64. Lesson worth keeping: order retire's
+pool-full check BEFORE the reset walk — doing the walk first showed up as
+sweep 19→64ms on its own.
+
+Map item 1(b) (attrs elision), 2 (module-local append lane), 3 (survival GC
+share) and 4 (per-op floor) remain open and unmeasured on the post-security
+baseline.
+
 ---
 
 ## Continuation snapshot — 2026-08-25, Waves 40–52 checkpoint

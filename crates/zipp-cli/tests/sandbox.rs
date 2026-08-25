@@ -158,7 +158,16 @@ fn supervisor_enforces_the_wall_clock_deadline() {
 #[test]
 fn directly_invoked_worker_has_its_own_deadline_watchdog() {
     let scratch = Scratch::new("worker-watchdog");
-    let script = scratch.write("loop.js", "for (;;) {}");
+    // Burn wall-clock while retiring almost no metered steps: each iteration
+    // is one call step plus a ~4 MiB native scan (~ hundreds of microseconds),
+    // so the step budget cannot trip inside the watchdog's grace window no
+    // matter how fast the VM's loop tiers get. A bare `for (;;) {}` stopped
+    // being a valid fixture once tiered loops could retire the 100M-step cap
+    // in under `timeout_ms + 250`.
+    let script = scratch.write(
+        "loop.js",
+        "const s = 'x'.repeat(1 << 22); for (;;) s.indexOf('y');",
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_zipp"))
         .args([
             "__sandbox-child",
