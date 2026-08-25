@@ -42,7 +42,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -54,7 +58,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node v24 on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -236,7 +244,9 @@ fn assert_split_recv_mechanism(test: &str, extra: &[(&str, &str)]) {
     );
     let mut covered = None;
     for sr in &srs {
-        let Some(&first_lg) = sr.lg.first() else { continue };
+        let Some(&first_lg) = sr.lg.first() else {
+            continue;
+        };
         let ips = deopt_ips(&log, &sr.span);
         if ips.iter().any(|&ip| ip > first_lg) {
             covered = Some((sr, first_lg, ips));
@@ -247,7 +257,9 @@ fn assert_split_recv_mechanism(test: &str, extra: &[(&str, &str)]) {
         panic!(
             "no native exit landed after a split receiver's LoadGlobal — the \
              receiver-clobber hazard is unpinned. splits={:?} \n{log}",
-            srs.iter().map(|s| (&s.span, s.reg, &s.lg)).collect::<Vec<_>>()
+            srs.iter()
+                .map(|s| (&s.span, s.reg, &s.lg))
+                .collect::<Vec<_>>()
         )
     });
     assert!(

@@ -40,7 +40,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -52,7 +56,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()

@@ -367,25 +367,82 @@ struct Mode {
 /// `intsplit` is the one OPT-IN row (`ZIPP_INT_SPLIT=1` is default-off), which
 /// is exactly where a path gets less exercise than it needs.
 const MODES: &[Mode] = &[
-    Mode { name: "base", env: &[] },
-    Mode { name: "nojit", env: &[("ZIPP_NOJIT", "1")] },
-    Mode { name: "thr1", env: &[("ZIPP_JIT_THRESHOLD", "1")] },
-    Mode { name: "thr200", env: &[("ZIPP_JIT_THRESHOLD", "200")] },
-    Mode { name: "nogprhomes", env: &[("ZIPP_NO_GPR_HOMES", "1")] },
-    Mode { name: "noicgate", env: &[("ZIPP_NO_ICGATE", "1")] },
-    Mode { name: "nofusedcmp", env: &[("ZIPP_NO_FUSED_CMPJUMP", "1")] },
-    Mode { name: "noglobrange", env: &[("ZIPP_NO_GLOB_RANGE", "1")] },
-    Mode { name: "nomultisplit", env: &[("ZIPP_NO_MULTI_SPLIT", "1")] },
-    Mode { name: "notypedsplice", env: &[("ZIPP_NO_TYPED_SPLICE", "1")] },
-    Mode { name: "notypesplit", env: &[("ZIPP_NO_TYPE_SPLIT", "1")] },
-    Mode { name: "nointsplit", env: &[("ZIPP_NO_INT_SPLIT", "1")] },
-    Mode { name: "nointsplice", env: &[("ZIPP_NO_INT_SPLICE", "1")] },
-    Mode { name: "intsplit", env: &[("ZIPP_INT_SPLIT", "1")] },
-    Mode { name: "noguardhoist", env: &[("ZIPP_NO_GUARD_HOIST", "1")] },
-    Mode { name: "nodensebackedge", env: &[("ZIPP_NO_DENSE_BACKEDGE", "1")] },
-    Mode { name: "notierc", env: &[("ZIPP_NO_FNJIT_MEM", "1")] },
-    Mode { name: "nocallinline", env: &[("ZIPP_NO_CALL_INLINE", "1")] },
-    Mode { name: "gcstress", env: &[("ZIPP_GC_STRESS", "1")] },
+    Mode {
+        name: "base",
+        env: &[],
+    },
+    Mode {
+        name: "nojit",
+        env: &[("ZIPP_NOJIT", "1")],
+    },
+    Mode {
+        name: "thr1",
+        env: &[("ZIPP_JIT_THRESHOLD", "1")],
+    },
+    Mode {
+        name: "thr200",
+        env: &[("ZIPP_JIT_THRESHOLD", "200")],
+    },
+    Mode {
+        name: "nogprhomes",
+        env: &[("ZIPP_NO_GPR_HOMES", "1")],
+    },
+    Mode {
+        name: "noicgate",
+        env: &[("ZIPP_NO_ICGATE", "1")],
+    },
+    Mode {
+        name: "nofusedcmp",
+        env: &[("ZIPP_NO_FUSED_CMPJUMP", "1")],
+    },
+    Mode {
+        name: "noglobrange",
+        env: &[("ZIPP_NO_GLOB_RANGE", "1")],
+    },
+    Mode {
+        name: "nomultisplit",
+        env: &[("ZIPP_NO_MULTI_SPLIT", "1")],
+    },
+    Mode {
+        name: "notypedsplice",
+        env: &[("ZIPP_NO_TYPED_SPLICE", "1")],
+    },
+    Mode {
+        name: "notypesplit",
+        env: &[("ZIPP_NO_TYPE_SPLIT", "1")],
+    },
+    Mode {
+        name: "nointsplit",
+        env: &[("ZIPP_NO_INT_SPLIT", "1")],
+    },
+    Mode {
+        name: "nointsplice",
+        env: &[("ZIPP_NO_INT_SPLICE", "1")],
+    },
+    Mode {
+        name: "intsplit",
+        env: &[("ZIPP_INT_SPLIT", "1")],
+    },
+    Mode {
+        name: "noguardhoist",
+        env: &[("ZIPP_NO_GUARD_HOIST", "1")],
+    },
+    Mode {
+        name: "nodensebackedge",
+        env: &[("ZIPP_NO_DENSE_BACKEDGE", "1")],
+    },
+    Mode {
+        name: "notierc",
+        env: &[("ZIPP_NO_FNJIT_MEM", "1")],
+    },
+    Mode {
+        name: "nocallinline",
+        env: &[("ZIPP_NO_CALL_INLINE", "1")],
+    },
+    Mode {
+        name: "gcstress",
+        env: &[("ZIPP_GC_STRESS", "1")],
+    },
     // ── W17 ── the engine has ~50 `ZIPP_NO_*` switches and this list held 14 of
     // them. Every one is specified as a PURE FALLBACK, which is a claim the
     // differential can check for free: a switch that changes an answer is a bug
@@ -411,23 +468,74 @@ const MODES: &[Mode] = &[
     // A mode is a PROCESS, so this list is the soak's cost driver. Measured:
     // 18 rows to 33 took a 2,000-program soak from ~6.0 to ~6.7 ms/program,
     // because the modes run as parallel threads. `CI_MODES` is unchanged.
-    Mode { name: "nogprsplit", env: &[("ZIPP_NO_GPR_SPLIT", "1")] },
-    Mode { name: "nogprnest", env: &[("ZIPP_NO_GPR_NEST", "1")] },
-    Mode { name: "nogprlazysx", env: &[("ZIPP_NO_GPR_LAZYSX", "1")] },
-    Mode { name: "nogprspill", env: &[("ZIPP_NO_GPR_SPILL_SLOTS", "1")] },
-    Mode { name: "nogprwtshare", env: &[("ZIPP_NO_GPR_WT_SHARE", "1")] },
-    Mode { name: "nodoublebitwise", env: &[("ZIPP_NO_DOUBLE_BITWISE", "1")] },
-    Mode { name: "nodoublemod", env: &[("ZIPP_NO_DOUBLE_MOD", "1")] },
-    Mode { name: "nocrosscall", env: &[("ZIPP_NO_CROSSCALL", "1")] },
-    Mode { name: "notiercleaf", env: &[("ZIPP_NO_TIERC_LEAF", "1")] },
-    Mode { name: "nomemcmpjump", env: &[("ZIPP_NO_MEM_CMPJUMP", "1")] },
-    Mode { name: "nomethodinline", env: &[("ZIPP_NO_METHOD_INLINE", "1")] },
-    Mode { name: "noleafgetprop", env: &[("ZIPP_NO_LEAF_GETPROP", "1")] },
-    Mode { name: "nosplicealias", env: &[("ZIPP_NO_SPLICE_ALIAS", "1")] },
-    Mode { name: "noshapes", env: &[("ZIPP_NO_SHAPES", "1")] },
-    Mode { name: "noarrkeyfast", env: &[("ZIPP_NO_ARRKEY_FAST", "1")] },
-    Mode { name: "nopolyeqfast", env: &[("ZIPP_NO_POLYEQ_FAST", "1")] },
-    Mode { name: "nonursery", env: &[("ZIPP_NO_NURSERY", "1")] },
+    Mode {
+        name: "nogprsplit",
+        env: &[("ZIPP_NO_GPR_SPLIT", "1")],
+    },
+    Mode {
+        name: "nogprnest",
+        env: &[("ZIPP_NO_GPR_NEST", "1")],
+    },
+    Mode {
+        name: "nogprlazysx",
+        env: &[("ZIPP_NO_GPR_LAZYSX", "1")],
+    },
+    Mode {
+        name: "nogprspill",
+        env: &[("ZIPP_NO_GPR_SPILL_SLOTS", "1")],
+    },
+    Mode {
+        name: "nogprwtshare",
+        env: &[("ZIPP_NO_GPR_WT_SHARE", "1")],
+    },
+    Mode {
+        name: "nodoublebitwise",
+        env: &[("ZIPP_NO_DOUBLE_BITWISE", "1")],
+    },
+    Mode {
+        name: "nodoublemod",
+        env: &[("ZIPP_NO_DOUBLE_MOD", "1")],
+    },
+    Mode {
+        name: "nocrosscall",
+        env: &[("ZIPP_NO_CROSSCALL", "1")],
+    },
+    Mode {
+        name: "notiercleaf",
+        env: &[("ZIPP_NO_TIERC_LEAF", "1")],
+    },
+    Mode {
+        name: "nomemcmpjump",
+        env: &[("ZIPP_NO_MEM_CMPJUMP", "1")],
+    },
+    Mode {
+        name: "nomethodinline",
+        env: &[("ZIPP_NO_METHOD_INLINE", "1")],
+    },
+    Mode {
+        name: "noleafgetprop",
+        env: &[("ZIPP_NO_LEAF_GETPROP", "1")],
+    },
+    Mode {
+        name: "nosplicealias",
+        env: &[("ZIPP_NO_SPLICE_ALIAS", "1")],
+    },
+    Mode {
+        name: "noshapes",
+        env: &[("ZIPP_NO_SHAPES", "1")],
+    },
+    Mode {
+        name: "noarrkeyfast",
+        env: &[("ZIPP_NO_ARRKEY_FAST", "1")],
+    },
+    Mode {
+        name: "nopolyeqfast",
+        env: &[("ZIPP_NO_POLYEQ_FAST", "1")],
+    },
+    Mode {
+        name: "nonursery",
+        env: &[("ZIPP_NO_NURSERY", "1")],
+    },
     // ── W19 ── the ordinary-object fast path at the head of `Vm::delete_prop`.
     // `DeoptKind::ElemDelete` emits `delete arr[7]`, so every program carrying
     // that deopt runs the new guard chain — and an Array is one of the receiver
@@ -442,7 +550,10 @@ const MODES: &[Mode] = &[
     // covered instead by `tests/w19_jit_delete.rs`, whose whole battery re-runs
     // in a child process under each latch, and by
     // `tests/w19_delete_differential.js`.
-    Mode { name: "nodeletefast", env: &[("ZIPP_NO_DELETE_FASTPATH", "1")] },
+    Mode {
+        name: "nodeletefast",
+        env: &[("ZIPP_NO_DELETE_FASTPATH", "1")],
+    },
     // ── W20 ── the two rungs that put an `arr.push(int)` and a linear-scan
     // bool allocator on the INT tier. Both are rows for the same reason the
     // W17 batch is: each is specified as a PURE FALLBACK, so a switch that
@@ -450,12 +561,24 @@ const MODES: &[Mode] = &[
     // one that matters most -- with it OFF the whole `Stmt::Push` family runs
     // on the boxed memory tier, which is the reference the register-tier arm
     // has to match byte for byte.
-    Mode { name: "nointpush", env: &[("ZIPP_NO_INT_PUSH", "1")] },
-    Mode { name: "noboolreuse", env: &[("ZIPP_NO_BOOL_REUSE", "1")] },
+    Mode {
+        name: "nointpush",
+        env: &[("ZIPP_NO_INT_PUSH", "1")],
+    },
+    Mode {
+        name: "noboolreuse",
+        env: &[("ZIPP_NO_BOOL_REUSE", "1")],
+    },
     // Two OPT-IN rows beside `intsplit`, which is where a path gets less
     // exercise than it needs by construction.
-    Mode { name: "arrpinloose", env: &[("ZIPP_ARR_PIN_LOOSE", "1")] },
-    Mode { name: "accalways", env: &[("ZIPP_ACC_ALWAYS_EMIT", "1")] },
+    Mode {
+        name: "arrpinloose",
+        env: &[("ZIPP_ARR_PIN_LOOSE", "1")],
+    },
+    Mode {
+        name: "accalways",
+        env: &[("ZIPP_ACC_ALWAYS_EMIT", "1")],
+    },
 ];
 
 /// The subset the normal suite runs: the interpreter, both threshold shifts, and
@@ -472,7 +595,10 @@ const CI_MODES: &[&str] = &[
 ];
 
 fn mode(name: &str) -> &'static Mode {
-    MODES.iter().find(|m| m.name == name).unwrap_or_else(|| panic!("unknown mode {name}"))
+    MODES
+        .iter()
+        .find(|m| m.name == name)
+        .unwrap_or_else(|| panic!("unknown mode {name}"))
 }
 
 // ──────────────────────────────── prng ────────────────────────────────
@@ -566,7 +692,16 @@ impl Arr {
         }
     }
     fn all() -> [Arr; ARRS] {
-        [Arr::Dense, Arr::Dense2, Arr::F64, Arr::I32, Arr::U8, Arr::Holey, Arr::Dbl, Arr::Str]
+        [
+            Arr::Dense,
+            Arr::Dense2,
+            Arr::F64,
+            Arr::I32,
+            Arr::U8,
+            Arr::Holey,
+            Arr::Dbl,
+            Arr::Str,
+        ]
     }
 }
 
@@ -644,28 +779,109 @@ enum DeoptKind {
 
 #[derive(Clone, Debug)]
 enum Stmt {
-    Int { op: IntOp, a: Src, b: Src, n: u8 },
-    BoolDef { k: u8, a: Src, b: Src, cmp: Cmp, neg: bool },
-    BoolUse { k: u8, c: i32, style: u8 },
-    Read { arr: Arr, idx: Idx, t: u8, coerce: u8 },
-    Write { arr: Arr, idx: Idx, v: Src },
-    ALen { arr: Arr },
-    If { a: Src, b: Src, cmp: Cmp, neg: bool, then_: Vec<Stmt>, else_: Vec<Stmt> },
-    Loop { var: char, n: u32, label: Option<u32>, body: Vec<Stmt> },
-    Break { label: Option<u32>, at: Cond },
-    Continue { label: Option<u32>, at: Cond },
-    Ret { at: Cond },
-    Leaf { f: u8, a: Src, b: Src },
-    Deep { a: Src },
-    Closure { a: Src },
-    Indirect { a: Src },
-    GlobRw { k: u8, a: Src, write: bool },
-    UpRw { a: Src },
-    Dbl { k: u8, op: u8, a: Src, f: u8 },
-    DblMix { k: u8, style: u8 },
-    Prop { k: u8, poly: u32, write: bool },
-    Deopt { kind: DeoptKind, at: Cond, k: u8 },
-    Try { a: Src, body: Vec<Stmt> },
+    Int {
+        op: IntOp,
+        a: Src,
+        b: Src,
+        n: u8,
+    },
+    BoolDef {
+        k: u8,
+        a: Src,
+        b: Src,
+        cmp: Cmp,
+        neg: bool,
+    },
+    BoolUse {
+        k: u8,
+        c: i32,
+        style: u8,
+    },
+    Read {
+        arr: Arr,
+        idx: Idx,
+        t: u8,
+        coerce: u8,
+    },
+    Write {
+        arr: Arr,
+        idx: Idx,
+        v: Src,
+    },
+    ALen {
+        arr: Arr,
+    },
+    If {
+        a: Src,
+        b: Src,
+        cmp: Cmp,
+        neg: bool,
+        then_: Vec<Stmt>,
+        else_: Vec<Stmt>,
+    },
+    Loop {
+        var: char,
+        n: u32,
+        label: Option<u32>,
+        body: Vec<Stmt>,
+    },
+    Break {
+        label: Option<u32>,
+        at: Cond,
+    },
+    Continue {
+        label: Option<u32>,
+        at: Cond,
+    },
+    Ret {
+        at: Cond,
+    },
+    Leaf {
+        f: u8,
+        a: Src,
+        b: Src,
+    },
+    Deep {
+        a: Src,
+    },
+    Closure {
+        a: Src,
+    },
+    Indirect {
+        a: Src,
+    },
+    GlobRw {
+        k: u8,
+        a: Src,
+        write: bool,
+    },
+    UpRw {
+        a: Src,
+    },
+    Dbl {
+        k: u8,
+        op: u8,
+        a: Src,
+        f: u8,
+    },
+    DblMix {
+        k: u8,
+        style: u8,
+    },
+    Prop {
+        k: u8,
+        poly: u32,
+        write: bool,
+    },
+    Deopt {
+        kind: DeoptKind,
+        at: Cond,
+        k: u8,
+    },
+    Try {
+        a: Src,
+        body: Vec<Stmt>,
+    },
     /// A definition that does not DOMINATE its uses: `if (cond) { t{k} = v; }`
     /// with an int constant, so the region still admits on a register tier and
     /// the fall-through path reaches every later read of `t{k}` without the def.
@@ -677,12 +893,22 @@ enum Stmt {
     /// generator reached it once in 60,000 programs by accident (a
     /// `DeoptKind::TypedOob` guard that happened to write a temp a later index
     /// read), which is not reach, it is luck.
-    CondDef { k: u8, at: Cond, v: i32 },
+    CondDef {
+        k: u8,
+        at: Cond,
+        v: i32,
+    },
     /// Self-recursion — the ONLY shape that reaches Tier A.
-    Rec { a: Src },
+    Rec {
+        a: Src,
+    },
     /// A kernel-local object whose fields are read and written in the loop: the
     /// admission shape for object scalar replacement (`[jit] SROA region`).
-    Sroa { f: u8, op: u8, a: Src },
+    Sroa {
+        f: u8,
+        op: u8,
+        a: Src,
+    },
     /// W20: `parr.push(v & 255)` -- the append the INT tier admits as of this
     /// wave, and the ONLY op on that tier that issues a call. `style` decides
     /// what the kernel reads back afterwards, which is what makes a STALE pin
@@ -692,7 +918,10 @@ enum Stmt {
     /// The generator emits it into ordinary kernel bodies, so it lands beside
     /// bool temps, pinned element reads and nested loops -- the combination
     /// that has to survive the call-save/restore around the append.
-    Push { v: Src, style: u8 },
+    Push {
+        v: Src,
+        style: u8,
+    },
 }
 
 /// Where the kernel lives.
@@ -854,7 +1083,24 @@ struct Gen<'a> {
 }
 
 const HOIST_POOL: [i64; 18] = [
-    0, 1, 2, 3, 5, 7, 11, 13, 17, 31, 32, 63, 255, 1024, 1000003, -1, -7, -2147483648,
+    0,
+    1,
+    2,
+    3,
+    5,
+    7,
+    11,
+    13,
+    17,
+    31,
+    32,
+    63,
+    255,
+    1024,
+    1000003,
+    -1,
+    -7,
+    -2147483648,
 ];
 
 /// Constants for COMPARE operands, spelled as literals inside the loop.
@@ -925,7 +1171,11 @@ fn gen_program(seed: u64, big: bool) -> Program {
         rng.pick(&[12u32, 40, 120, 400, 400])
     };
     let cap: u32 = if big { 48_000 } else { 4_800 };
-    let reps = *[1u32, 3, 12, 40].iter().filter(|r| n * **r <= cap).last().unwrap_or(&1);
+    let reps = *[1u32, 3, 12, 40]
+        .iter()
+        .filter(|r| n * **r <= cap)
+        .last()
+        .unwrap_or(&1);
     let reps = rng.pick(&[1u32, 3, reps]).max(1);
 
     let mut hoists = [0i64; HOISTS];
@@ -967,8 +1217,16 @@ fn gen_program(seed: u64, big: bool) -> Program {
     // Post-region uses go on MOST programs: a live-out that nothing looks at
     // afterwards cannot expose a live-out defect, and the tight flavors are
     // where the register allocator is under the most pressure.
-    let post = if g.rng.chance(72) { gen_post(&mut g, &body) } else { Vec::new() };
-    let dead_out = if g.rng.chance(35) { gen_dead_out(&mut g, &body, &post) } else { None };
+    let post = if g.rng.chance(72) {
+        gen_post(&mut g, &body)
+    } else {
+        Vec::new()
+    };
+    let dead_out = if g.rng.chance(35) {
+        gen_dead_out(&mut g, &body, &post)
+    } else {
+        None
+    };
     // Script scope is an orthogonal axis (see `Scope`) and is drawn for every
     // flavor — but at a LOW rate, because it is not free: a script-scope loop
     // recycles registers, and a recycled register that carries two TYPES makes
@@ -1025,7 +1283,15 @@ fn gen_pressure_body(g: &mut Gen, strict: bool) -> Vec<Stmt> {
 
     let mut defs: Vec<Stmt> = Vec::new();
     for k in 0..nb {
-        let cmp = g.rng.pick(&[Cmp::SEq, Cmp::SNe, Cmp::Lt, Cmp::Gt, Cmp::Le, Cmp::Ge, Cmp::Eq]);
+        let cmp = g.rng.pick(&[
+            Cmp::SEq,
+            Cmp::SNe,
+            Cmp::Lt,
+            Cmp::Gt,
+            Cmp::Le,
+            Cmp::Ge,
+            Cmp::Eq,
+        ]);
         // The loop accumulator is admissible in an ORDERING compare (which
         // requires a number) but not in an equality one, so it is only offered
         // where the comparison is relational. Same reason the negated spelling is
@@ -1036,19 +1302,33 @@ fn gen_pressure_body(g: &mut Gen, strict: bool) -> Vec<Stmt> {
         let a = if equality {
             g.rng.pick(&[Src::I, Src::I, Src::Temp(0), Src::Temp(0)])
         } else {
-            g.rng.pick(&[Src::I, Src::I, Src::Temp(0), Src::Temp(0), Src::H])
+            g.rng
+                .pick(&[Src::I, Src::I, Src::Temp(0), Src::Temp(0), Src::H])
         };
         let neg = !equality && g.rng.chance(40);
-        defs.push(Stmt::BoolDef { k: k as u8, a, b: konst(k), cmp, neg });
+        defs.push(Stmt::BoolDef {
+            k: k as u8,
+            a,
+            b: konst(k),
+            cmp,
+            neg,
+        });
     }
     // Strictly integer filler. `region_is_int` is all-or-nothing: one uncoerced
     // add, one `Math.max`, one f64 multiply anywhere in the loop and the region
     // declines to MEM, taking the whole shape out of reach of the INT emitter.
     let int_filler = |g: &mut Gen| -> Stmt {
-        let op = g.rng.pick(&[IntOp::Add, IntOp::Add, IntOp::XorShl, IntOp::Imul]);
+        let op = g
+            .rng
+            .pick(&[IntOp::Add, IntOp::Add, IntOp::XorShl, IntOp::Imul]);
         let a = g.rng.pick(&[Src::I, Src::H, Src::Temp(0), Src::Lit(3)]);
         let n = g.rng.pick(&[1u8, 2, 3, 5]);
-        Stmt::Int { op, a, b: Src::I, n }
+        Stmt::Int {
+            op,
+            a,
+            b: Src::I,
+            n,
+        }
     };
 
     let mut tail: Vec<Stmt> = Vec::new();
@@ -1058,8 +1338,16 @@ fn gen_pressure_body(g: &mut Gen, strict: bool) -> Vec<Stmt> {
         // into a select.
         // `if (bk) …` almost always: a branch keeps the bool in its gpr home
         // across the element read, where a select can fold it away.
-        let style = if strict { 0 } else { g.rng.pick(&[0u8, 0, 0, 0, 0, 1, 2]) };
-        tail.push(Stmt::BoolUse { k: k as u8, c: g.rng.pick(&[1i32, 2, 4, 8, 17]), style });
+        let style = if strict {
+            0
+        } else {
+            g.rng.pick(&[0u8, 0, 0, 0, 0, 1, 2])
+        };
+        tail.push(Stmt::BoolUse {
+            k: k as u8,
+            c: g.rng.pick(&[1i32, 2, 4, 8, 17]),
+            style,
+        });
     }
     // Distinct hoisted constants used as compare operands: each one claims a
     // `gpr_const` mirror out of the SAME four-register pool the bools use.
@@ -1078,12 +1366,22 @@ fn gen_pressure_body(g: &mut Gen, strict: bool) -> Vec<Stmt> {
             b: konst(nb + c),
             cmp,
             neg,
-            then_: vec![Stmt::Int { op: IntOp::AddInt, a: Src::I, b: Src::I, n }],
+            then_: vec![Stmt::Int {
+                op: IntOp::AddInt,
+                a: Src::I,
+                b: Src::I,
+                n,
+            }],
             else_: Vec::new(),
         });
     }
     let op = g.rng.pick(&[IntOp::Add, IntOp::Add, IntOp::XorShl]);
-    tail.push(Stmt::Int { op, a: Src::Temp(0), b: Src::I, n: 3 });
+    tail.push(Stmt::Int {
+        op,
+        a: Src::Temp(0),
+        b: Src::I,
+        n: 3,
+    });
 
     if strict {
         // Nothing but the defs, one read, and the uses — see `Flavor::Scan`.
@@ -1102,7 +1400,14 @@ fn gen_pressure_body(g: &mut Gen, strict: bool) -> Vec<Stmt> {
         // Dense int Arrays carried the defect; the typed, holey and string twins
         // are the controls that must not move.
         let arr = if r == 0 {
-            g.rng.pick(&[Arr::Dense, Arr::Dense, Arr::Dense, Arr::Dense2, Arr::I32, Arr::Str])
+            g.rng.pick(&[
+                Arr::Dense,
+                Arr::Dense,
+                Arr::Dense,
+                Arr::Dense2,
+                Arr::I32,
+                Arr::Str,
+            ])
         } else {
             g.rng.pick(&[
                 Arr::Dense,
@@ -1118,7 +1423,11 @@ fn gen_pressure_body(g: &mut Gen, strict: bool) -> Vec<Stmt> {
         let idx = gen_idx(g);
         // `(t | 0)` and the imul mix keep the value integral; the `* 1024` mix
         // does not, and one of those in the loop declines the region.
-        let coerce = if strict { 0 } else { g.rng.pick(&[0u8, 0, 0, 0, 3, 2]) };
+        let coerce = if strict {
+            0
+        } else {
+            g.rng.pick(&[0u8, 0, 0, 0, 3, 2])
+        };
         // Mostly BETWEEN the definitions and the uses, which is where a scratched
         // register is observable; sometimes anywhere, which covers the variant
         // whose clobber is only seen after the back-edge.
@@ -1127,7 +1436,15 @@ fn gen_pressure_body(g: &mut Gen, strict: bool) -> Vec<Stmt> {
         } else {
             g.rng.below(body.len() + 1)
         };
-        body.insert(at, Stmt::Read { arr, idx, t: r as u8, coerce });
+        body.insert(
+            at,
+            Stmt::Read {
+                arr,
+                idx,
+                t: r as u8,
+                coerce,
+            },
+        );
     }
     // A couple of statements on top, appended rather than interleaved so they
     // cannot disturb the define/read/use ordering the shape is built around, and
@@ -1195,42 +1512,68 @@ fn gen_double_body(g: &mut Gen) -> Vec<Stmt> {
         let a = if k == 0 {
             g.rng.pick(&[Src::I, Src::H, Src::Temp(0), Src::Lit(3)])
         } else {
-            g.rng.pick(&[Src::I, Src::H, Src::Temp(0), Src::Dbl(0), Src::Lit(3)])
+            g.rng
+                .pick(&[Src::I, Src::H, Src::Temp(0), Src::Dbl(0), Src::Lit(3)])
         };
-        out.push(Stmt::Dbl { k: k as u8, op, a, f: g.rng.below(6) as u8 });
+        out.push(Stmt::Dbl {
+            k: k as u8,
+            op,
+            a,
+            f: g.rng.below(6) as u8,
+        });
     }
     // Bools from f64 compares — W16's two DOUBLE-tier defects were both a live
     // Bool losing `BOOL_GPRS[2]`, and a bool defined from a DOUBLE is the only
     // way to have one on this tier without an int chain beside it.
     for k in 0..nb {
         let cmp = g.rng.pick(&[Cmp::Lt, Cmp::Gt, Cmp::Le, Cmp::Ge]);
-        let a = g.rng.pick(&[Src::Dbl(0), Src::Dbl(0), Src::H, Src::I, Src::Temp(0)]);
+        let a = g
+            .rng
+            .pick(&[Src::Dbl(0), Src::Dbl(0), Src::H, Src::I, Src::Temp(0)]);
         let (k1, k2) = (g.rng.pick(&KONST_POOL), g.rng.pick(&KONST_POOL));
-        let b = g.rng.pick(&[
-            Src::Dbl((nd - 1) as u8),
-            Src::Lit(k1),
-            Src::Lit(k2),
-            Src::I,
-        ]);
-        out.push(Stmt::BoolDef { k: k as u8, a, b, cmp, neg: g.rng.chance(35) });
+        let b = g
+            .rng
+            .pick(&[Src::Dbl((nd - 1) as u8), Src::Lit(k1), Src::Lit(k2), Src::I]);
+        out.push(Stmt::BoolDef {
+            k: k as u8,
+            a,
+            b,
+            cmp,
+            neg: g.rng.chance(35),
+        });
     }
     for k in 0..nb {
         // Style 0 is a real branch on the bool home, which is what keeps it live
         // across the element traffic instead of folding it into a select.
         let style = g.rng.pick(&[0u8, 0, 0, 1, 2]);
-        out.push(Stmt::BoolUse { k: k as u8, c: g.rng.pick(&[1i32, 2, 4, 8, 17]), style });
+        out.push(Stmt::BoolUse {
+            k: k as u8,
+            c: g.rng.pick(&[1i32, 2, 4, 8, 17]),
+            style,
+        });
     }
     // Element traffic, from the arrays this tier pins: a Float64Array (kind 8)
     // and a dense ordinary Array (B95). Reads only, plus the one admitted write.
     for r in 0..g.rng.below(3) {
-        let arr = g.rng.pick(&[Arr::F64, Arr::F64, Arr::Dbl, Arr::Dense, Arr::Dense2]);
+        let arr = g
+            .rng
+            .pick(&[Arr::F64, Arr::F64, Arr::Dbl, Arr::Dense, Arr::Dense2]);
         let idx = gen_idx(g);
         // coerce 2 (`=== undefined`) and 3 (`Math.imul`) both decline.
         let coerce = g.rng.pick(&[0u8, 0, 1]);
-        out.push(Stmt::Read { arr, idx, t: r as u8, coerce });
+        out.push(Stmt::Read {
+            arr,
+            idx,
+            t: r as u8,
+            coerce,
+        });
     }
     if g.rng.chance(30) {
-        out.push(Stmt::Write { arr: Arr::F64, idx: gen_idx(g), v: Src::H });
+        out.push(Stmt::Write {
+            arr: Arr::F64,
+            idx: gen_idx(g),
+            v: Src::H,
+        });
     }
     // An inner loop, so a double home has to survive a back-edge — the shape
     // that carried W16's `loop_home_liverange` class on this exact tier.
@@ -1238,8 +1581,16 @@ fn gen_double_body(g: &mut Gen) -> Vec<Stmt> {
         let k = g.rng.below(DBLS) as u8;
         // `Src::J`, not `Src::Dbl(0)` — see the boundedness rule above.
         let inner = vec![
-            Stmt::Dbl { k, op: g.rng.pick(&[0u8, 3]), a: Src::J, f: g.rng.below(6) as u8 },
-            Stmt::DblMix { k, style: g.rng.pick(&[0u8, 2]) },
+            Stmt::Dbl {
+                k,
+                op: g.rng.pick(&[0u8, 3]),
+                a: Src::J,
+                f: g.rng.below(6) as u8,
+            },
+            Stmt::DblMix {
+                k,
+                style: g.rng.pick(&[0u8, 2]),
+            },
         ];
         out.push(Stmt::Loop {
             var: 'j',
@@ -1255,9 +1606,19 @@ fn gen_double_body(g: &mut Gen) -> Vec<Stmt> {
             b: Src::Lit(g.rng.pick(&KONST_POOL)),
             cmp,
             neg: g.rng.chance(35),
-            then_: vec![Stmt::Int { op: IntOp::AddInt, a: Src::I, b: Src::I, n: 3 }],
+            then_: vec![Stmt::Int {
+                op: IntOp::AddInt,
+                a: Src::I,
+                b: Src::I,
+                n: 3,
+            }],
             else_: if g.rng.chance(40) {
-                vec![Stmt::Int { op: IntOp::Sub, a: Src::I, b: Src::I, n: 1 }]
+                vec![Stmt::Int {
+                    op: IntOp::Sub,
+                    a: Src::I,
+                    b: Src::I,
+                    n: 1,
+                }]
             } else {
                 Vec::new()
             },
@@ -1265,8 +1626,14 @@ fn gen_double_body(g: &mut Gen) -> Vec<Stmt> {
     }
     if g.rng.chance(22) {
         match g.rng.below(3) {
-            0 => out.push(Stmt::Continue { label: None, at: gen_cond(g, 0) }),
-            1 => out.push(Stmt::Break { label: None, at: gen_cond(g, 1) }),
+            0 => out.push(Stmt::Continue {
+                label: None,
+                at: gen_cond(g, 0),
+            }),
+            1 => out.push(Stmt::Break {
+                label: None,
+                at: gen_cond(g, 1),
+            }),
             _ => out.push(Stmt::Ret { at: gen_cond(g, 2) }),
         }
     }
@@ -1276,7 +1643,10 @@ fn gen_double_body(g: &mut Gen) -> Vec<Stmt> {
     }
     // Always fold a double into `h`: style 1 is `Math.floor` and declines.
     for k in 0..nd {
-        out.push(Stmt::DblMix { k: k as u8, style: g.rng.pick(&[0u8, 0, 2]) });
+        out.push(Stmt::DblMix {
+            k: k as u8,
+            style: g.rng.pick(&[0u8, 0, 2]),
+        });
     }
     out
 }
@@ -1312,22 +1682,54 @@ fn gen_split_body(g: &mut Gen) -> Vec<Stmt> {
     // enclosing region is where the receiver and the inner counter compete.
     if g.rng.chance(25) {
         let inner = if dbl {
-            vec![Stmt::Dbl { k: 0, op: g.rng.pick(&[0u8, 3]), a: Src::J, f: g.rng.below(6) as u8 }]
+            vec![Stmt::Dbl {
+                k: 0,
+                op: g.rng.pick(&[0u8, 3]),
+                a: Src::J,
+                f: g.rng.below(6) as u8,
+            }]
         } else {
-            vec![Stmt::Int { op: IntOp::Add, a: Src::J, b: Src::I, n: 1 }]
+            vec![Stmt::Int {
+                op: IntOp::Add,
+                a: Src::J,
+                b: Src::I,
+                n: 1,
+            }]
         };
-        out.push(Stmt::Loop { var: 'j', n: g.rng.pick(&[2u32, 3]), label: None, body: inner });
+        out.push(Stmt::Loop {
+            var: 'j',
+            n: g.rng.pick(&[2u32, 3]),
+            label: None,
+            body: inner,
+        });
     }
     for r in 0..nreads {
         let arr = if dbl {
-            g.rng.pick(&[Arr::F64, Arr::F64, Arr::Dbl, Arr::Dense, Arr::Dense2])
+            g.rng
+                .pick(&[Arr::F64, Arr::F64, Arr::Dbl, Arr::Dense, Arr::Dense2])
         } else {
-            g.rng.pick(&[Arr::Dense, Arr::Dense, Arr::Dense2, Arr::I32, Arr::U8, Arr::Str])
+            g.rng.pick(&[
+                Arr::Dense,
+                Arr::Dense,
+                Arr::Dense2,
+                Arr::I32,
+                Arr::U8,
+                Arr::Str,
+            ])
         };
         // coerce 2 (`=== undefined`) and 3 (`Math.imul`) both decline the DOUBLE
         // tier; on the int side they are fine and 3 is the fnv chain.
-        let coerce = if dbl { g.rng.pick(&[0u8, 0, 1]) } else { g.rng.pick(&[0u8, 0, 1, 3]) };
-        out.push(Stmt::Read { arr, idx: gen_idx(g), t: r as u8, coerce });
+        let coerce = if dbl {
+            g.rng.pick(&[0u8, 0, 1])
+        } else {
+            g.rng.pick(&[0u8, 0, 1, 3])
+        };
+        out.push(Stmt::Read {
+            arr,
+            idx: gen_idx(g),
+            t: r as u8,
+            coerce,
+        });
     }
     if dbl {
         out.push(Stmt::Dbl {
@@ -1336,10 +1738,24 @@ fn gen_split_body(g: &mut Gen) -> Vec<Stmt> {
             a: Src::Temp(0),
             f: g.rng.below(6) as u8,
         });
-        out.push(Stmt::DblMix { k: 0, style: g.rng.pick(&[0u8, 0, 2]) });
+        out.push(Stmt::DblMix {
+            k: 0,
+            style: g.rng.pick(&[0u8, 0, 2]),
+        });
     } else {
-        let op = g.rng.pick(&[IntOp::Add, IntOp::XorShl, IntOp::Imul, IntOp::Or, IntOp::Sub]);
-        out.push(Stmt::Int { op, a: Src::Temp(0), b: Src::I, n: g.rng.pick(&[1u8, 3, 5]) });
+        let op = g.rng.pick(&[
+            IntOp::Add,
+            IntOp::XorShl,
+            IntOp::Imul,
+            IntOp::Or,
+            IntOp::Sub,
+        ]);
+        out.push(Stmt::Int {
+            op,
+            a: Src::Temp(0),
+            b: Src::I,
+            n: g.rng.pick(&[1u8, 3, 5]),
+        });
     }
     if g.rng.chance(25) {
         let k = g.rng.below(2) as u8;
@@ -1350,7 +1766,11 @@ fn gen_split_body(g: &mut Gen) -> Vec<Stmt> {
     // makes the split's write-through observable rather than merely planned.
     if g.rng.chance(28) {
         let arr = if dbl { Arr::F64 } else { Arr::Dense2 };
-        out.push(Stmt::Write { arr, idx: masked_idx(g), v: Src::H });
+        out.push(Stmt::Write {
+            arr,
+            idx: masked_idx(g),
+            v: Src::H,
+        });
     }
     // One late type change, so the region actually DEOPTS inside the receiver
     // window — the exit W16's `cold_pinned_recv` suite is about.
@@ -1361,7 +1781,11 @@ fn gen_split_body(g: &mut Gen) -> Vec<Stmt> {
             DeoptKind::ArrShrink,
             DeoptKind::TypedOob,
         ]);
-        out.push(Stmt::Deopt { kind, at: gen_cond(g, 2), k: 0 });
+        out.push(Stmt::Deopt {
+            kind,
+            at: gen_cond(g, 2),
+            k: 0,
+        });
     }
     out
 }
@@ -1455,7 +1879,10 @@ fn gen_post(g: &mut Gen, body: &[Stmt]) -> Vec<Post> {
                 for _ in 0..1 + g.rng.below(3) {
                     picked.push(vals[g.rng.below(vals.len())]);
                 }
-                Post::Loop2 { n: g.rng.pick(&[12u32, 40, 120]), vals: picked }
+                Post::Loop2 {
+                    n: g.rng.pick(&[12u32, 40, 120]),
+                    vals: picked,
+                }
             }
             _ => Post::DblShape(dbl.unwrap()),
         });
@@ -1470,7 +1897,10 @@ fn gen_src(g: &mut Gen) -> Src {
         Src::Hoist(g.rng.below(HOISTS) as u8),
         Src::Hoist(g.rng.below(HOISTS) as u8),
         Src::Temp(g.rng.below(TEMPS) as u8),
-        Src::Lit(g.rng.pick(&[0i32, 1, 2, 3, 7, 255, -1, 65535, 1000003, -2147483648])),
+        Src::Lit(
+            g.rng
+                .pick(&[0i32, 1, 2, 3, 7, 255, -1, 65535, 1000003, -2147483648]),
+        ),
     ];
     if g.depth >= 1 {
         pool.push(Src::J);
@@ -1524,7 +1954,12 @@ fn masked_idx(g: &mut Gen) -> Idx {
 
 fn gen_idx(g: &mut Gen) -> Idx {
     let base = {
-        let mut pool = vec![Src::I, Src::I, Src::H, Src::Hoist(g.rng.below(HOISTS) as u8)];
+        let mut pool = vec![
+            Src::I,
+            Src::I,
+            Src::H,
+            Src::Hoist(g.rng.below(HOISTS) as u8),
+        ];
         if g.depth >= 1 {
             pool.push(Src::J);
         }
@@ -1539,7 +1974,11 @@ fn gen_idx(g: &mut Gen) -> Idx {
         0 => Idx::Mod(base, g.rng.pick(&[8u32, 16, 32])),
         1 => Idx::Raw(base),
         2 => Idx::Minus(base, g.rng.pick(&[1i32, 4, -3])),
-        3 => Idx::Mul(base, g.rng.pick(&[3i32, 5, 7]), g.rng.pick(&[15u32, 31, 63])),
+        3 => Idx::Mul(
+            base,
+            g.rng.pick(&[3i32, 5, 7]),
+            g.rng.pick(&[15u32, 31, 63]),
+        ),
         _ => Idx::Mask(base, g.rng.pick(&[7u32, 15, 31, 63])),
     }
 }
@@ -1550,7 +1989,11 @@ fn gen_cond(g: &mut Gen, kind: u8) -> Cond {
     // (`i === 100000`, past every bound this generator emits) — the cold-block
     // spelling, where the interpreter has no profile for the block at all.
     if kind == 3 {
-        return Cond { src: Src::I, mask: 0, val: 100_000 };
+        return Cond {
+            src: Src::I,
+            mask: 0,
+            val: 100_000,
+        };
     }
     let src = match g.rng.below(if g.depth >= 1 { 4 } else { 3 }) {
         0 => Src::I,
@@ -1559,13 +2002,29 @@ fn gen_cond(g: &mut Gen, kind: u8) -> Cond {
         _ => Src::J,
     };
     match kind {
-        0 => Cond { src, mask: g.rng.pick(&[3u32, 7, 15]), val: g.rng.below(4) as u32 },
-        1 => Cond { src, mask: g.rng.pick(&[15u32, 31, 63]), val: g.rng.below(8) as u32 },
+        0 => Cond {
+            src,
+            mask: g.rng.pick(&[3u32, 7, 15]),
+            val: g.rng.below(4) as u32,
+        },
+        1 => Cond {
+            src,
+            mask: g.rng.pick(&[15u32, 31, 63]),
+            val: g.rng.below(8) as u32,
+        },
         _ => {
             if g.rng.chance(60) {
-                Cond { src: Src::I, mask: 0, val: g.rng.pick(&[5u32, 9, 17, 33, 65, 200]) }
+                Cond {
+                    src: Src::I,
+                    mask: 0,
+                    val: g.rng.pick(&[5u32, 9, 17, 33, 65, 200]),
+                }
             } else {
-                Cond { src, mask: g.rng.pick(&[127u32, 255]), val: g.rng.pick(&[100u32, 200]) }
+                Cond {
+                    src,
+                    mask: g.rng.pick(&[127u32, 255]),
+                    val: g.rng.pick(&[100u32, 200]),
+                }
             }
         }
     }
@@ -1577,7 +2036,11 @@ fn gen_cond(g: &mut Gen, kind: u8) -> Cond {
 fn gen_cond_def(g: &mut Gen, k: u8) -> Stmt {
     let kind = if g.rng.chance(50) { 3 } else { 2 };
     let at = gen_cond(g, kind);
-    Stmt::CondDef { k, at, v: g.rng.pick(&[1i32, 2, 5, 7, 13, 0, -1]) }
+    Stmt::CondDef {
+        k,
+        at,
+        v: g.rng.pick(&[1i32, 2, 5, 7, 13, 0, -1]),
+    }
 }
 
 fn gen_stmts(g: &mut Gen, count: usize) -> Vec<Stmt> {
@@ -1590,7 +2053,12 @@ fn gen_stmts(g: &mut Gen, count: usize) -> Vec<Stmt> {
         out.push(gen_stmt(g));
     }
     if out.is_empty() {
-        out.push(Stmt::Int { op: IntOp::Add, a: Src::I, b: Src::I, n: 1 });
+        out.push(Stmt::Int {
+            op: IntOp::Add,
+            a: Src::I,
+            b: Src::I,
+            n: 1,
+        });
     }
     out
 }
@@ -1711,7 +2179,12 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
             };
             let a = gen_src(g);
             let b = gen_src(g);
-            Stmt::Int { op, a, b, n: g.rng.pick(&[1u8, 2, 3, 5, 8, 13, 31]) }
+            Stmt::Int {
+                op,
+                a,
+                b,
+                n: g.rng.pick(&[1u8, 2, 3, 5, 8, 13, 31]),
+            }
         }
         1 => {
             if g.rng.chance(55) {
@@ -1752,12 +2225,19 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
             } else if g.rng.chance(15) {
                 Stmt::ALen { arr }
             } else if g.rng.chance(22) {
-                Stmt::Push { v: gen_src(g), style: g.rng.below(3) as u8 }
+                Stmt::Push {
+                    v: gen_src(g),
+                    style: g.rng.below(3) as u8,
+                }
             } else {
                 // Writes always use a masked index so an array cannot grow
                 // without bound; reads deliberately may go out of range.
                 let idx = masked_idx(g);
-                Stmt::Write { arr, idx, v: gen_src(g) }
+                Stmt::Write {
+                    arr,
+                    idx,
+                    v: gen_src(g),
+                }
             }
         }
         3 => {
@@ -1769,14 +2249,21 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
                     f: g.rng.below(6) as u8,
                 }
             } else {
-                Stmt::DblMix { k: g.rng.below(DBLS) as u8, style: g.rng.below(3) as u8 }
+                Stmt::DblMix {
+                    k: g.rng.below(DBLS) as u8,
+                    style: g.rng.below(3) as u8,
+                }
             }
         }
         4 => match g.rng.below(4) {
             0 => Stmt::Deep { a: gen_src(g) },
             1 => Stmt::Closure { a: gen_src(g) },
             2 => Stmt::Indirect { a: gen_src(g) },
-            _ => Stmt::Leaf { f: g.rng.below(LEAFS) as u8, a: gen_src(g), b: gen_src(g) },
+            _ => Stmt::Leaf {
+                f: g.rng.below(LEAFS) as u8,
+                a: gen_src(g),
+                b: gen_src(g),
+            },
         },
         5 => {
             if g.rng.chance(70) {
@@ -1800,8 +2287,14 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
                 None
             };
             match g.rng.below(6) {
-                0 | 1 => Stmt::Continue { label: lbl, at: gen_cond(g, 0) },
-                2 | 3 => Stmt::Break { label: lbl, at: gen_cond(g, 1) },
+                0 | 1 => Stmt::Continue {
+                    label: lbl,
+                    at: gen_cond(g, 0),
+                },
+                2 | 3 => Stmt::Break {
+                    label: lbl,
+                    at: gen_cond(g, 1),
+                },
                 4 => Stmt::Ret { at: gen_cond(g, 2) },
                 _ => {
                     if g.rng.chance(50) {
@@ -1835,7 +2328,11 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
                 DeoptKind::FnSwap,
                 DeoptKind::TypedOob,
             ]);
-            Stmt::Deopt { kind, at: gen_cond(g, 2), k: g.rng.below(TEMPS) as u8 }
+            Stmt::Deopt {
+                kind,
+                at: gen_cond(g, 2),
+                k: g.rng.below(TEMPS) as u8,
+            }
         }
         8 => {
             let var = if g.depth == 0 { 'j' } else { 'q' };
@@ -1861,11 +2358,23 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
                 g.labels.pop();
             }
             g.depth -= 1;
-            Stmt::Loop { var, n, label, body }
+            Stmt::Loop {
+                var,
+                n,
+                label,
+                body,
+            }
         }
         9 => {
-            let cmp =
-                g.rng.pick(&[Cmp::Lt, Cmp::Le, Cmp::Gt, Cmp::Ge, Cmp::Eq, Cmp::Ne, Cmp::SEq]);
+            let cmp = g.rng.pick(&[
+                Cmp::Lt,
+                Cmp::Le,
+                Cmp::Gt,
+                Cmp::Ge,
+                Cmp::Eq,
+                Cmp::Ne,
+                Cmp::SEq,
+            ]);
             let a = gen_cmp_src(g);
             let b = gen_cmp_src(g);
             let neg = g.rng.chance(45);
@@ -1874,16 +2383,30 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
             let then_ = gen_stmts(g, nt);
             let want_else = g.rng.chance(35);
             let ne = 1 + g.rng.below(2);
-            let else_ = if want_else { gen_stmts(g, ne) } else { Vec::new() };
+            let else_ = if want_else {
+                gen_stmts(g, ne)
+            } else {
+                Vec::new()
+            };
             g.depth -= 1;
-            Stmt::If { a, b, cmp, neg, then_, else_ }
+            Stmt::If {
+                a,
+                b,
+                cmp,
+                neg,
+                then_,
+                else_,
+            }
         }
         10 => {
             g.depth += 1;
             let nb = 1 + g.rng.below(2);
             let body = gen_stmts(g, nb);
             g.depth -= 1;
-            Stmt::Try { a: gen_src(g), body }
+            Stmt::Try {
+                a: gen_src(g),
+                body,
+            }
         }
         _ => {
             if g.rng.chance(35) {
@@ -1891,7 +2414,11 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
             } else {
                 let f = g.rng.below(3) as u8;
                 let op = g.rng.below(3) as u8;
-                Stmt::Sroa { f, op, a: gen_src(g) }
+                Stmt::Sroa {
+                    f,
+                    op,
+                    a: gen_src(g),
+                }
             }
         }
     }
@@ -1977,9 +2504,11 @@ impl Used {
     }
     fn idx(&mut self, i: Idx) {
         match i {
-            Idx::Mask(s, _) | Idx::Mod(s, _) | Idx::Raw(s) | Idx::Minus(s, _) | Idx::Mul(s, _, _) => {
-                self.src(s)
-            }
+            Idx::Mask(s, _)
+            | Idx::Mod(s, _)
+            | Idx::Raw(s)
+            | Idx::Minus(s, _)
+            | Idx::Mul(s, _, _) => self.src(s),
         }
     }
     fn close(&mut self, prog: &Program) {
@@ -2103,7 +2632,9 @@ fn collect_stmts(ss: &[Stmt], u: &mut Used) {
                 u.push_arr = true;
                 u.src(*v);
             }
-            Stmt::If { a, b, then_, else_, .. } => {
+            Stmt::If {
+                a, b, then_, else_, ..
+            } => {
                 u.src(*a);
                 u.src(*b);
                 collect_stmts(then_, u);
@@ -2307,7 +2838,11 @@ fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
             line(o, ind, &s);
         }
         Stmt::BoolDef { k, a, b, cmp, neg } => {
-            line(o, ind, &format!("{l}b{k} = {};", cmp_txt(p, *a, *b, *cmp, *neg)));
+            line(
+                o,
+                ind,
+                &format!("{l}b{k} = {};", cmp_txt(p, *a, *b, *cmp, *neg)),
+            );
         }
         Stmt::BoolUse { k, c, style } => {
             let s = match style {
@@ -2317,7 +2852,12 @@ fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
             };
             line(o, ind, &s);
         }
-        Stmt::Read { arr, idx, t, coerce } => {
+        Stmt::Read {
+            arr,
+            idx,
+            t,
+            coerce,
+        } => {
             let ix = idx_txt(p, *idx);
             let load = if *arr == Arr::Str {
                 format!("{l}t{t} = {p}str.charCodeAt({ix});")
@@ -2344,7 +2884,11 @@ fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
             line(o, ind, &s);
         }
         Stmt::ALen { arr } => {
-            line(o, ind, &format!("{l}h = ({l}h + {p}{}.length) | 0;", arr.name()));
+            line(
+                o,
+                ind,
+                &format!("{l}h = ({l}h + {p}{}.length) | 0;", arr.name()),
+            );
         }
         Stmt::Push { v, style } => {
             let val = s_txt(p, *v);
@@ -2352,14 +2896,23 @@ fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
             let back = match style {
                 0 => format!("{l}h = ({l}h + {p}parr.length) | 0;"),
                 1 => format!("{l}h = ({l}h + {p}parr[{p}parr.length - 1]) | 0;"),
-                _ => format!(
-                    "{l}h = ({l}h + ({p}parr.length > 8 ? {p}parr[7] : 1)) | 0;"
-                ),
+                _ => format!("{l}h = ({l}h + ({p}parr.length > 8 ? {p}parr[7] : 1)) | 0;"),
             };
             line(o, ind, &back);
         }
-        Stmt::If { a, b, cmp, neg, then_, else_ } => {
-            line(o, ind, &format!("if ({}) {{", cmp_txt(p, *a, *b, *cmp, *neg)));
+        Stmt::If {
+            a,
+            b,
+            cmp,
+            neg,
+            then_,
+            else_,
+        } => {
+            line(
+                o,
+                ind,
+                &format!("if ({}) {{", cmp_txt(p, *a, *b, *cmp, *neg)),
+            );
             emit_stmts(o, ind + 2, p, then_);
             if else_.is_empty() {
                 line(o, ind, "}");
@@ -2369,9 +2922,18 @@ fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
                 line(o, ind, "}");
             }
         }
-        Stmt::Loop { var, n, label, body } => {
+        Stmt::Loop {
+            var,
+            n,
+            label,
+            body,
+        } => {
             let lbl = label.map(|x| format!("L{x}: ")).unwrap_or_default();
-            line(o, ind, &format!("{lbl}for ({l}{var} = 0; {l}{var} < {n}; {l}{var}++) {{"));
+            line(
+                o,
+                ind,
+                &format!("{lbl}for ({l}{var} = 0; {l}{var} < {n}; {l}{var}++) {{"),
+            );
             emit_stmts(o, ind + 2, p, body);
             line(o, ind, "}");
         }
@@ -2399,21 +2961,41 @@ fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
             line(
                 o,
                 ind,
-                &format!("{l}h = ({l}h + {p}leaf{f}({}, {})) | 0;", s_txt(p, *a), s_txt(p, *b)),
+                &format!(
+                    "{l}h = ({l}h + {p}leaf{f}({}, {})) | 0;",
+                    s_txt(p, *a),
+                    s_txt(p, *b)
+                ),
             );
         }
         Stmt::Deep { a } => {
-            line(o, ind, &format!("{l}h = ({l}h + {p}deep({})) | 0;", s_txt(p, *a)));
+            line(
+                o,
+                ind,
+                &format!("{l}h = ({l}h + {p}deep({})) | 0;", s_txt(p, *a)),
+            );
         }
         Stmt::Closure { a } => {
-            line(o, ind, &format!("{l}h = ({l}h + {p}cl({})) | 0;", s_txt(p, *a)));
+            line(
+                o,
+                ind,
+                &format!("{l}h = ({l}h + {p}cl({})) | 0;", s_txt(p, *a)),
+            );
         }
         Stmt::Indirect { a } => {
-            line(o, ind, &format!("{l}h = ({l}h + {p}fnref({}, 3)) | 0;", s_txt(p, *a)));
+            line(
+                o,
+                ind,
+                &format!("{l}h = ({l}h + {p}fnref({}, 3)) | 0;", s_txt(p, *a)),
+            );
         }
         Stmt::GlobRw { k, a, write } => {
             if *write {
-                line(o, ind, &format!("{p}g{k} = ({p}g{k} + {}) | 0;", s_txt(p, *a)));
+                line(
+                    o,
+                    ind,
+                    &format!("{p}g{k} = ({p}g{k} + {}) | 0;", s_txt(p, *a)),
+                );
             }
             line(o, ind, &format!("{l}h = ({l}h ^ ({p}g{k} | 0)) | 0;"));
         }
@@ -2470,10 +3052,18 @@ fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
             line(o, ind, &format!("if ({}) {{ {body} }}", cond_txt(p, *at)));
         }
         Stmt::CondDef { k, at, v } => {
-            line(o, ind, &format!("if ({}) {{ {l}t{k} = {v}; }}", cond_txt(p, *at)));
+            line(
+                o,
+                ind,
+                &format!("if ({}) {{ {l}t{k} = {v}; }}", cond_txt(p, *at)),
+            );
         }
         Stmt::Rec { a } => {
-            line(o, ind, &format!("{l}h = ({l}h + {p}rec((({}) & 7) + 2)) | 0;", s_txt(p, *a)));
+            line(
+                o,
+                ind,
+                &format!("{l}h = ({l}h + {p}rec((({}) & 7) + 2)) | 0;", s_txt(p, *a)),
+            );
         }
         Stmt::Sroa { f, op, a } => {
             let fld = ["x", "y", "z"][*f as usize % 3];
@@ -2486,7 +3076,11 @@ fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
         }
         Stmt::Try { a, body } => {
             line(o, ind, "try {");
-            line(o, ind + 2, &format!("{l}h = ({l}h + {p}thrower({})) | 0;", s_txt(p, *a)));
+            line(
+                o,
+                ind + 2,
+                &format!("{l}h = ({l}h + {p}thrower({})) | 0;", s_txt(p, *a)),
+            );
             emit_stmts(o, ind + 2, p, body);
             line(o, ind, "} catch (e) {");
             line(o, ind + 2, &format!("{l}h = ({l}h + 1) | 0;"));
@@ -2571,12 +3165,20 @@ fn emit_post(o: &mut String, ind: usize, p: &Ctx, ps: &[Post]) {
                 );
             }
             Post::Probe(v) => {
-                line(o, ind, &format!("{l}h = ({l}h + {p}probe({})) | 0;", pv_txt(p, *v)));
+                line(
+                    o,
+                    ind,
+                    &format!("{l}h = ({l}h + {p}probe({})) | 0;", pv_txt(p, *v)),
+                );
             }
             Post::Escape(v) => {
                 let x = pv_txt(p, *v);
                 line(o, ind, &format!("{p}arr2[5] = {x};"));
-                line(o, ind, &format!("{l}h = ({l}h + ({p}arr2[5] === {x} ? 1 : 2)) | 0;"));
+                line(
+                    o,
+                    ind,
+                    &format!("{l}h = ({l}h + ({p}arr2[5] === {x} ? 1 : 2)) | 0;"),
+                );
             }
             Post::Loop2 { n, vals } => {
                 // A SECOND compiled region whose live-INS are the first
@@ -2597,7 +3199,10 @@ fn emit_post(o: &mut String, ind: usize, p: &Ctx, ps: &[Post]) {
 const STR_LIT: &str = "the quick brown fox jumps over the lazy dog 0123456789 ABCDEF";
 
 fn int_list(n: usize, f: impl Fn(usize) -> i64) -> String {
-    (0..n).map(|i| f(i).to_string()).collect::<Vec<_>>().join(", ")
+    (0..n)
+        .map(|i| f(i).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn emit_leaf(o: &mut String, p: &Ctx, k: usize, kind: u8) {
@@ -2626,7 +3231,11 @@ fn emit_leaf(o: &mut String, p: &Ctx, k: usize, kind: u8) {
 /// split receivers live there), and node's answer cannot depend on that.
 fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
     let script = prog.scope == Scope::Script;
-    let p = &Ctx { g: gp, l: if script { gp } else { "" }, script };
+    let p = &Ctx {
+        g: gp,
+        l: if script { gp } else { "" },
+        script,
+    };
     let l = p.l;
     let u = collect(prog);
     let mut o = String::new();
@@ -2639,10 +3248,18 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
     }
     if u.arrs[Arr::Dense.ix()] {
         // Small values on purpose: `A[i] === 1` has to MATCH sometimes.
-        line(&mut o, 0, &format!("var {p}arr = [{}];", int_list(32, |i| (i as i64 * 3) % 7)));
+        line(
+            &mut o,
+            0,
+            &format!("var {p}arr = [{}];", int_list(32, |i| (i as i64 * 3) % 7)),
+        );
     }
     if u.arrs[Arr::Dense2.ix()] {
-        line(&mut o, 0, &format!("var {p}arr2 = [{}];", int_list(32, |i| (i as i64 * 5) % 11)));
+        line(
+            &mut o,
+            0,
+            &format!("var {p}arr2 = [{}];", int_list(32, |i| (i as i64 * 5) % 11)),
+        );
     }
     if u.arrs[Arr::F64.ix()] {
         line(
@@ -2650,7 +3267,10 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
             0,
             &format!(
                 "var {p}farr = new Float64Array([{}]);",
-                (0..32).map(|i| format!("{}.5", i * 2)).collect::<Vec<_>>().join(", ")
+                (0..32)
+                    .map(|i| format!("{}.5", i * 2))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         );
     }
@@ -2660,7 +3280,11 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
             0,
             &format!(
                 "var {p}iarr = new Int32Array([{}]);",
-                int_list(32, |i| if i % 4 == 3 { (i as i64 * 1103515245) as i32 as i64 } else { (i as i64 * 5) % 9 })
+                int_list(32, |i| if i % 4 == 3 {
+                    (i as i64 * 1103515245) as i32 as i64
+                } else {
+                    (i as i64 * 5) % 9
+                })
             ),
         );
     }
@@ -2668,11 +3292,18 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
         line(
             &mut o,
             0,
-            &format!("var {p}uarr = new Uint8Array([{}]);", int_list(32, |i| (i as i64 * 11) % 13)),
+            &format!(
+                "var {p}uarr = new Uint8Array([{}]);",
+                int_list(32, |i| (i as i64 * 11) % 13)
+            ),
         );
     }
     if u.arrs[Arr::Holey.ix()] {
-        line(&mut o, 0, &format!("var {p}harr = [1, 2, 3, 4]; {p}harr[12] = 9;"));
+        line(
+            &mut o,
+            0,
+            &format!("var {p}harr = [1, 2, 3, 4]; {p}harr[12] = 9;"),
+        );
     }
     if u.arrs[Arr::Dbl.ix()] {
         line(
@@ -2680,7 +3311,10 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
             0,
             &format!(
                 "var {p}darr = [{}];",
-                (0..32).map(|i| format!("{}.25", i * 3)).collect::<Vec<_>>().join(", ")
+                (0..32)
+                    .map(|i| format!("{}.25", i * 3))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         );
     }
@@ -2705,11 +3339,19 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
             }
             shapes.push(format!("{{ {} }}", fields.join(", ")));
         }
-        line(&mut o, 0, &format!("var {p}objs = [{}];", shapes.join(", ")));
+        line(
+            &mut o,
+            0,
+            &format!("var {p}objs = [{}];", shapes.join(", ")),
+        );
     }
     for (k, used) in u.globs.iter().enumerate() {
         if *used {
-            line(&mut o, 0, &format!("var {p}g{k} = {};", (k as i64 + 1) * 11));
+            line(
+                &mut o,
+                0,
+                &format!("var {p}g{k} = {};", (k as i64 + 1) * 11),
+            );
         }
     }
     for k in 0..LEAFS {
@@ -2754,7 +3396,10 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
         line(
             &mut o,
             0,
-            &format!("function {p}probe(x) {{ return {} | 0; }}", typeof_code("x")),
+            &format!(
+                "function {p}probe(x) {{ return {} | 0; }}",
+                typeof_code("x")
+            ),
         );
     }
     if u.thrower {
@@ -2775,7 +3420,11 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
     {
         let d = &mut decls;
         let z = &mut init;
-        line(d, 0, &format!("var {l}h = 1, {l}i = 0, {l}j = 0, {l}q = 0;"));
+        line(
+            d,
+            0,
+            &format!("var {l}h = 1, {l}i = 0, {l}j = 0, {l}q = 0;"),
+        );
         line(z, 0, &format!("{l}h = 1; {l}i = 0; {l}j = 0; {l}q = 0;"));
         if u.loop2 {
             line(d, 0, &format!("var {l}w = 0;"));
@@ -2817,7 +3466,11 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
         Bound::ArrLen(a) => format!("{p}{}.length", a.name()),
     };
     let mut body = String::new();
-    line(&mut body, 0, &format!("for ({l}i = 0; {l}i < {bound_txt}; {l}i++) {{"));
+    line(
+        &mut body,
+        0,
+        &format!("for ({l}i = 0; {l}i < {bound_txt}; {l}i++) {{"),
+    );
     emit_stmts(&mut body, 2, p, &prog.body);
     line(&mut body, 0, "}");
     emit_post(&mut body, 0, p, &prog.post);
@@ -2835,13 +3488,20 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
             // reads it as an ordinary `false` and the digest never moves.
             // `typeof` is the only spelling that separates them, and it is
             // exactly specified for every value these programs can hold.
-            mix.push(format!("({} * {})", typeof_code(&format!("{l}t{k}")), 64 + k));
+            mix.push(format!(
+                "({} * {})",
+                typeof_code(&format!("{l}t{k}")),
+                64 + k
+            ));
         }
     }
     for k in 0..BOOLS {
         if u.bools[k] && !dead(PostVal::Bool(k as u8)) {
             mix.push(format!("({l}b{k} ? {} : 0)", 17 + k));
-            mix.push(format!("(typeof {l}b{k} === \"boolean\" ? 0 : {})", 1024 + k));
+            mix.push(format!(
+                "(typeof {l}b{k} === \"boolean\" ? 0 : {})",
+                1024 + k
+            ));
         }
     }
     for k in 0..DBLS {
@@ -2919,14 +3579,22 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
         }
         inner.push_str(&decls);
         line(&mut inner, 0, &format!("var {l}acc = 1;"));
-        line(&mut inner, 0, &format!("for (var {l}r = 0; {l}r < {}; {l}r++) {{", prog.reps));
+        line(
+            &mut inner,
+            0,
+            &format!("for (var {l}r = 0; {l}r < {}; {l}r++) {{", prog.reps),
+        );
         for ln in init.lines() {
             line(&mut inner, 2, ln);
         }
         for ln in body.lines() {
             line(&mut inner, 2, ln);
         }
-        line(&mut inner, 2, &format!("{l}acc = (Math.imul({l}acc, 31) + ({mix})) | 0;"));
+        line(
+            &mut inner,
+            2,
+            &format!("{l}acc = (Math.imul({l}acc, 31) + ({mix})) | 0;"),
+        );
         line(&mut inner, 0, "}");
         inner.push_str(&checksum);
         line(
@@ -3075,9 +3743,11 @@ fn run_digest(src: &str, tag: &str) -> String {
                 // is not portable; the fact is.
                 format!("{tag} UNCAUGHT")
             } else {
-                o.output.iter().find(|l| l.starts_with(tag)).cloned().unwrap_or_else(|| {
-                    format!("{tag} NO-OUTPUT({})", o.output.len())
-                })
+                o.output
+                    .iter()
+                    .find(|l| l.starts_with(tag))
+                    .cloned()
+                    .unwrap_or_else(|| format!("{tag} NO-OUTPUT({})", o.output.len()))
             }
         }
     }
@@ -3094,10 +3764,16 @@ struct ChildOut {
 fn spawn_job(job: &str, m: &Mode, timeout: Duration, jitlog: bool) -> ChildOut {
     let exe = std::env::current_exe().expect("test exe path");
     let mut cmd = Command::new(exe);
-    cmd.args(["fuzz_child", "--exact", "--nocapture", "--test-threads", "1"])
-        .env("ZIPP_FUZZ_JOB", job)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args([
+        "fuzz_child",
+        "--exact",
+        "--nocapture",
+        "--test-threads",
+        "1",
+    ])
+    .env("ZIPP_FUZZ_JOB", job)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
     // Never inherit an outer mode; the parent may itself be running under one.
     for m2 in MODES {
         for (k, _) in m2.env {
@@ -3148,8 +3824,12 @@ fn spawn_job(job: &str, m: &Mode, timeout: Duration, jitlog: bool) -> ChildOut {
             Err(_) => break None,
         }
     };
-    let out = rx1.recv_timeout(Duration::from_secs(20)).unwrap_or_default();
-    let err = rx2.recv_timeout(Duration::from_secs(20)).unwrap_or_default();
+    let out = rx1
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap_or_default();
+    let err = rx2
+        .recv_timeout(Duration::from_secs(20))
+        .unwrap_or_default();
     // libtest prints `test fuzz_child ... ` with no newline before the body runs,
     // so the opening marker shares a line with it.
     let inside = out
@@ -3172,7 +3852,12 @@ fn spawn_job(job: &str, m: &Mode, timeout: Duration, jitlog: bool) -> ChildOut {
 /// which is also how a CRASH gets attributed to a single program.
 fn batch_digests(seed: u64, lo: u64, hi: u64, m: &Mode, big: bool) -> BTreeMap<u64, String> {
     let secs = 30 + (hi - lo) / 4;
-    let out = spawn_job(&format!("batch:{seed}:{lo}:{hi}"), m, Duration::from_secs(secs), false);
+    let out = spawn_job(
+        &format!("batch:{seed}:{lo}:{hi}"),
+        m,
+        Duration::from_secs(secs),
+        false,
+    );
     let mut map = BTreeMap::new();
     if out.ok {
         for l in &out.lines {
@@ -3487,9 +4172,7 @@ fn remove_nth(ss: &mut Vec<Stmt>, k: usize, idx: &mut usize) -> bool {
         }
         *idx += 1;
         let done = match &mut ss[i] {
-            Stmt::If { then_, else_, .. } => {
-                remove_nth(then_, k, idx) || remove_nth(else_, k, idx)
-            }
+            Stmt::If { then_, else_, .. } => remove_nth(then_, k, idx) || remove_nth(else_, k, idx),
             Stmt::Loop { body, .. } | Stmt::Try { body, .. } => remove_nth(body, k, idx),
             _ => false,
         };
@@ -3604,7 +4287,10 @@ enum Flake {
     /// cross-mode comparison that flagged this program is meaningless until
     /// that is fixed. An ENGINE bug, and the most serious kind — a wrong answer
     /// that is not even stable.
-    Nondeterministic { mode: &'static str, answers: Vec<String> },
+    Nondeterministic {
+        mode: &'static str,
+        answers: Vec<String>,
+    },
     /// The BATCH run disagreed, but every standalone re-run of both modes
     /// agrees. The divergence is in running many programs in one process — engine
     /// state carried between them, or a chunk that died and was refilled — not
@@ -3667,7 +4353,10 @@ fn mode_table(src: &str) -> (Vec<(String, String)>, Flake) {
     for m in MODES {
         let ans = self_answers(src, m, 2);
         if ans.len() > 1 && matches!(flake, Flake::Stable) {
-            flake = Flake::Nondeterministic { mode: m.name, answers: ans.clone() };
+            flake = Flake::Nondeterministic {
+                mode: m.name,
+                answers: ans.clone(),
+            };
         }
         rows.push((m.name.to_string(), ans.join("  ≠  ")));
     }
@@ -3695,9 +4384,7 @@ fn describe(d: &Divergence, seed: u64) -> String {
             s.push_str(
                 "    ENGINE read of something never written — an unfilled home at OSR entry,\n",
             );
-            s.push_str(
-                "    an uninitialised register — not for a tier that computes the wrong\n",
-            );
+            s.push_str("    an uninitialised register — not for a tier that computes the wrong\n");
             s.push_str("    thing. The table below is two runs per mode.\n");
         }
         Flake::BatchOrderOnly => {
@@ -3705,9 +4392,7 @@ fn describe(d: &Divergence, seed: u64) -> String {
                 "\n═══ BATCH-ORDER DIVERGENCE  seed={seed} index={}  ═══\n",
                 d.index
             ));
-            s.push_str(
-                "    The batch disagreed; every standalone re-run of both modes agrees.\n",
-            );
+            s.push_str("    The batch disagreed; every standalone re-run of both modes agrees.\n");
             s.push_str(
                 "    The finding is in running many programs in ONE process (engine state\n",
             );
@@ -3783,7 +4468,11 @@ fn sweep(
         // own first (see `SELF_RUNS`); the samples are reused, so the old
         // reproduces-standalone check costs nothing extra.
         let sa = self_answers(&base_src, a, SELF_RUNS);
-        let sb = if sa.len() > 1 { Vec::new() } else { self_answers(&base_src, b, SELF_RUNS) };
+        let sb = if sa.len() > 1 {
+            Vec::new()
+        } else {
+            self_answers(&base_src, b, SELF_RUNS)
+        };
         if let Some((fm, answers)) = match (sa.len() > 1, sb.len() > 1) {
             (true, _) => Some((a, sa.clone())),
             (_, true) => Some((b, sb.clone())),
@@ -3817,7 +4506,10 @@ fn sweep(
                 source: src,
                 digests,
                 trace,
-                flake: Flake::Nondeterministic { mode: fm.name, answers },
+                flake: Flake::Nondeterministic {
+                    mode: fm.name,
+                    answers,
+                },
             });
             continue;
         }
@@ -3840,7 +4532,13 @@ fn sweep(
                 Flake::Stable => Flake::BatchOrderOnly,
                 other => other,
             };
-            out.push(Divergence { index: i, source: base_src, digests, trace, flake });
+            out.push(Divergence {
+                index: i,
+                source: base_src,
+                digests,
+                trace,
+                flake,
+            });
             continue;
         }
 
@@ -3866,7 +4564,13 @@ fn sweep(
         // evidence for it is the same kind, just cheaper.
         let (digests, flake) = mode_table(&src);
         let trace = tier_trace(&src);
-        out.push(Divergence { index: i, source: src, digests, trace, flake });
+        out.push(Divergence {
+            index: i,
+            source: src,
+            digests,
+            trace,
+            flake,
+        });
     }
     out
 }
@@ -3936,7 +4640,11 @@ fn tier_differential_ci_slice() {
     let modes = selected_modes(CI_MODES);
     let found: Vec<Divergence> = sweep(SEED, 0, COUNT, &modes, false, false)
         .into_iter()
-        .filter(|d| !KNOWN_OPEN.iter().any(|&(s, i, _)| s == SEED && i == d.index))
+        .filter(|d| {
+            !KNOWN_OPEN
+                .iter()
+                .any(|&(s, i, _)| s == SEED && i == d.index)
+        })
         .collect();
     assert!(
         found.is_empty(),
@@ -3953,7 +4661,10 @@ fn tier_differential_ci_slice() {
 /// batch-order one is not an engine defect at all.
 fn flake_tally(ds: &[Divergence]) -> String {
     let nd = ds.iter().filter(|d| d.is_nondeterministic()).count();
-    let bo = ds.iter().filter(|d| matches!(d.flake, Flake::BatchOrderOnly)).count();
+    let bo = ds
+        .iter()
+        .filter(|d| matches!(d.flake, Flake::BatchOrderOnly))
+        .count();
     let mut parts = Vec::new();
     if nd > 0 {
         parts.push(format!(
@@ -3961,7 +4672,9 @@ fn flake_tally(ds: &[Divergence]) -> String {
         ));
     }
     if bo > 0 {
-        parts.push(format!("{bo} BATCH-ORDER ONLY (a harness finding: standalone re-runs agree)"));
+        parts.push(format!(
+            "{bo} BATCH-ORDER ONLY (a harness finding: standalone re-runs agree)"
+        ));
     }
     if parts.is_empty() {
         String::new()
@@ -3990,9 +4703,14 @@ fn tier_differential_soak() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0x5A17_2026_0F1E_2D3C);
-    let count: u64 =
-        std::env::var("ZIPP_FUZZ_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(2000);
-    let start: u64 = std::env::var("ZIPP_FUZZ_START").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let count: u64 = std::env::var("ZIPP_FUZZ_COUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2000);
+    let start: u64 = std::env::var("ZIPP_FUZZ_START")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     let big = std::env::var_os("ZIPP_FUZZ_BIG").is_some();
     let names: Vec<String> = match std::env::var("ZIPP_FUZZ_MODES") {
         Ok(s) => s.split(',').map(|x| x.trim().to_string()).collect(),
@@ -4016,7 +4734,10 @@ fn tier_differential_soak() {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs().to_string())
             .unwrap_or_else(|| "?".into());
-        eprintln!("[fuzz] engine under test: {} (mtime {stamp})", exe.display());
+        eprintln!(
+            "[fuzz] engine under test: {} (mtime {stamp})",
+            exe.display()
+        );
     }
     let chunk: u64 = 64;
     let mut all = Vec::new();
@@ -4039,7 +4760,12 @@ fn tier_differential_soak() {
             t0.elapsed().as_secs_f64()
         );
     }
-    assert!(all.is_empty(), "{} divergent programs (see above){}", all.len(), flake_tally(&all));
+    assert!(
+        all.is_empty(),
+        "{} divergent programs (see above){}",
+        all.len(),
+        flake_tally(&all)
+    );
 }
 
 /// node is the SECONDARY oracle: it catches the case where every zipp tier is
@@ -4055,8 +4781,10 @@ fn node_oracle_slice() {
     // raises it for a one-off audit of the generator itself: if the generator
     // could emit anything implementation-defined, a big node comparison is where
     // it would surface, and a fuzzer with false positives gets ignored.
-    let count: u64 =
-        std::env::var("ZIPP_FUZZ_NODE_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(96);
+    let count: u64 = std::env::var("ZIPP_FUZZ_NODE_COUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(96);
     let big = false;
 
     let mut batch = String::new();
@@ -4073,15 +4801,25 @@ fn node_oracle_slice() {
         .output()
         .expect("node on PATH (the secondary oracle)");
     let _ = std::fs::remove_file(&path);
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let node: BTreeMap<u64, String> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.split_once(' '))
         .filter_map(|(k, v)| {
-            k.strip_prefix('D').and_then(|s| s.parse::<u64>().ok()).map(|i| (i, v.to_string()))
+            k.strip_prefix('D')
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(|i| (i, v.to_string()))
         })
         .collect();
-    assert_eq!(node.len() as u64, count, "node did not report every program");
+    assert_eq!(
+        node.len() as u64,
+        count,
+        "node did not report every program"
+    );
 
     let ours = batch_digests(SEED, 0, count, mode("base"), big);
     let mut bad = Vec::new();
@@ -4098,7 +4836,12 @@ fn node_oracle_slice() {
             ));
         }
     }
-    assert!(bad.is_empty(), "zipp disagrees with node on {} programs:{}", bad.len(), bad.concat());
+    assert!(
+        bad.is_empty(),
+        "zipp disagrees with node on {} programs:{}",
+        bad.len(),
+        bad.concat()
+    );
 }
 
 /// OPEN #1, found by this harness on the tree it was written against.
@@ -4172,15 +4915,25 @@ console.log(kernel(120));
 /// in the interpreter would pass that.
 fn assert_matches_node(src: &str) {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     let node = Command::new("node")
         .arg("-e")
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(node.status.success(), "node failed: {}", String::from_utf8_lossy(&node.stderr));
-    let want: Vec<String> =
-        String::from_utf8_lossy(&node.stdout).lines().map(|l| l.to_string()).collect();
+    assert!(
+        node.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&node.stderr)
+    );
+    let want: Vec<String> = String::from_utf8_lossy(&node.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
     assert_eq!(out.output, want, "zipp != node for:{src}");
 }
 
@@ -4646,7 +5399,10 @@ fn generator_emits_only_exact_js() {
         n_stmts += count_stmts(&prog.body);
         let src = emit(&prog, "", "D", false);
         for b in BANNED {
-            assert!(!src.contains(b), "generator emitted banned construct {b:?}:\n{src}");
+            assert!(
+                !src.contains(b),
+                "generator emitted banned construct {b:?}:\n{src}"
+            );
         }
         // Every reported number is funnelled through ToInt32, so no answer can
         // depend on Number→String formatting.
@@ -4654,7 +5410,10 @@ fn generator_emits_only_exact_js() {
             src.contains(">>> 0).toString(16)"),
             "the digest must be an unsigned int32 in hex"
         );
-        assert!(!src.contains("while ("), "only counted `for` loops terminate by construction");
+        assert!(
+            !src.contains("while ("),
+            "only counted `for` loops terminate by construction"
+        );
     }
     assert!(
         n_stmts > 10_000,
@@ -4674,7 +5433,10 @@ fn generator_is_deterministic() {
         let b = emit(&gen_program(prog_seed(42, i), false), "", "D", false);
         assert_eq!(a, b, "generator is not deterministic at index {i}");
         let c = emit(&gen_program(prog_seed(43, i), false), "", "D", false);
-        assert_ne!(a, c, "different seeds produced the same program at index {i}");
+        assert_ne!(
+            a, c,
+            "different seeds produced the same program at index {i}"
+        );
     }
 }
 
@@ -4691,8 +5453,10 @@ fn tier_coverage_report() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0x5A17_2026_0F1E_2D3C);
-    let count: u64 =
-        std::env::var("ZIPP_FUZZ_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
+    let count: u64 = std::env::var("ZIPP_FUZZ_COUNT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(400);
     let out = spawn_job(
         &format!("batch:{seed}:0:{count}"),
         mode("base"),
@@ -4722,10 +5486,22 @@ fn tier_coverage_report() {
         ("MEM regions", count_of(&compiled("MEM"))),
         ("INT regions", count_of(&compiled("INT"))),
         ("DOUBLE regions", count_of(&compiled("DOUBLE"))),
-        ("SROA regions", count_of(&|k| k.starts_with("[jit] SROA region"))),
-        ("Tier C fns", count_of(&|k| k.starts_with("[jit] Tier C") && k.contains("compiled"))),
-        ("Tier A fns", count_of(&|k| k.starts_with("[jit] Tier A") && k.contains("compiled"))),
-        ("B94 split receivers", count_of(&|k| k.contains("split receiver"))),
+        (
+            "SROA regions",
+            count_of(&|k| k.starts_with("[jit] SROA region")),
+        ),
+        (
+            "Tier C fns",
+            count_of(&|k| k.starts_with("[jit] Tier C") && k.contains("compiled")),
+        ),
+        (
+            "Tier A fns",
+            count_of(&|k| k.starts_with("[jit] Tier A") && k.contains("compiled")),
+        ),
+        (
+            "B94 split receivers",
+            count_of(&|k| k.contains("split receiver")),
+        ),
         ("deopts", count_of(&|k| k.contains("deopt at ip"))),
         ("evictions", count_of(&|k| k.contains("EVICTED"))),
     ];
@@ -4740,7 +5516,11 @@ fn tier_coverage_report() {
             script += 1;
         }
         posts += prog.post.len();
-        loop2 += prog.post.iter().filter(|p| matches!(p, Post::Loop2 { .. })).count();
+        loop2 += prog
+            .post
+            .iter()
+            .filter(|p| matches!(p, Post::Loop2 { .. }))
+            .count();
         if emit(&prog, "", "D", false).contains("probe(") {
             dblscan += 1;
         }
@@ -4793,7 +5573,9 @@ console.log(h);
     );
     let _ = std::fs::remove_file(&path);
     assert!(
-        out.stderr.lines().any(|l| l.contains("[jit] Tier A") && l.contains("compiled")),
+        out.stderr
+            .lines()
+            .any(|l| l.contains("[jit] Tier A") && l.contains("compiled")),
         "no Tier A compile logged for a fib-shaped self-recursion; JITLOG said:\n{}",
         out.stderr
     );
@@ -4801,13 +5583,21 @@ console.log(h);
     // of a string that only lives in this file.
     let mut found = false;
     for i in 0..400u64 {
-        let s = emit(&gen_program(prog_seed(0x7E1A_2026, i), false), "", "D", false);
+        let s = emit(
+            &gen_program(prog_seed(0x7E1A_2026, i), false),
+            "",
+            "D",
+            false,
+        );
         if s.contains("function rec(x) { if (x < 2) return x; return rec(x - 1) + rec(x - 2); }") {
             found = true;
             break;
         }
     }
-    assert!(found, "the generator no longer emits the Tier A recursion shape");
+    assert!(
+        found,
+        "the generator no longer emits the Tier A recursion shape"
+    );
 }
 
 /// Every axis W17/W20 added must still be GENERATED. Cheap (no engine), and it is
@@ -4850,8 +5640,12 @@ fn widened_axes_are_still_generated() {
         if prog.dead_out.is_some() {
             dead_out += 1;
         }
-        if src.contains("t0 = 1; }") || src.contains("t0 = 2; }") || src.contains("t0 = 5; }")
-            || src.contains("t0 = 7; }") || src.contains("t0 = 13; }") || src.contains("t0 = 0; }")
+        if src.contains("t0 = 1; }")
+            || src.contains("t0 = 2; }")
+            || src.contains("t0 = 5; }")
+            || src.contains("t0 = 7; }")
+            || src.contains("t0 = 13; }")
+            || src.contains("t0 = 0; }")
             || src.contains("t0 = -1; }")
         {
             cond_def += 1;
@@ -4879,7 +5673,10 @@ fn widened_axes_are_still_generated() {
         (push, "Stmt::Push / parr.push emission"),
         (not, "negated Stmt::BoolDef / Instr::Not emission"),
     ] {
-        assert!(n > 0, "{what} is no longer generated at all (0 in 1500 programs)");
+        assert!(
+            n > 0,
+            "{what} is no longer generated at all (0 in 1500 programs)"
+        );
     }
 }
 
@@ -4893,15 +5690,25 @@ fn classify_jitlog(l: &str) -> Option<String> {
         // `fn=<name> [start,end]: <reason>` — the region is what makes the line
         // attributable and the REASON is what makes it a coverage fact, so keep
         // the reason and drop the region.
-        (r.split_once(": ").map(|(_, why)| why).unwrap_or(r), "decline")
+        (
+            r.split_once(": ").map(|(_, why)| why).unwrap_or(r),
+            "decline",
+        )
     } else if let Some(r) = l.strip_prefix("[mi] ") {
         (r, "mi")
     } else {
         return None;
     };
     // Collapse the numeric detail: what matters is WHICH decision, not where.
-    let body: String = rest.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+    let body: String = rest
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect();
     let body = body.split(" (").next().unwrap_or(&body).to_string();
-    let body = body.split_whitespace().take(6).collect::<Vec<_>>().join(" ");
+    let body = body
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
     Some(format!("[{kind}] {body}"))
 }

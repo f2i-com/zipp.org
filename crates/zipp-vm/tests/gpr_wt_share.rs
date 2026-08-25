@@ -41,7 +41,11 @@ var N = 30000;
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -57,9 +61,18 @@ fn node_output(src: &str) -> Vec<String> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("node v24 on PATH (expected values come from node)");
-    child.stdin.take().expect("stdin piped").write_all(src.as_bytes()).expect("write to node");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(src.as_bytes())
+        .expect("write to node");
     let out = child.wait_with_output().expect("node exits");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -128,6 +141,58 @@ for (var r = 0; r < 6; r++) {
   }
 }
 console.log("tail h=" + h + " tail=" + tail + " k=" + k);
+"#,
+    ));
+}
+
+/// The mechanism fixture is intentionally a pure-result sibling of the real
+/// parse-style helper above. Returning `h` and computing the third input from
+/// the loop counter keep the flattened body entirely numeric and isolate the
+/// write-through home allocator from the pinned-string/replayable-prefix plan.
+#[test]
+fn gprwt_parity_flattenable_pure_mix_loop() {
+    assert_matches_node(&prog(
+        r#"var kinds = [], starts = [], ends = [];
+var src = "";
+for (var i = 0; i < 64; i++) src += "abcdefghijklmnopqrstuvwxyz0123456789 ";
+for (var i = 0; i < N; i++) { kinds.push(i % 13); starts.push(i % 2000); ends.push((i % 2000) + 3); }
+var h = 0, tail = 0, k = 0;
+function mixPure(a, x) { return Math.imul(a ^ x, 16777619) >>> 0; }
+for (var r = 0; r < 5; r++) {
+  h = 2166136261;
+  for (var ti = 0; ti < kinds.length; ti++) {
+    h = mixPure(h, kinds[ti]); h = mixPure(h, ends[ti] - starts[ti]); h = mixPure(h, ti);
+  }
+}
+for (k = 0; k + 2 < kinds.length; k += 977) {
+  tail = (tail + kinds[k] + (ends[k + 1] - starts[k + 1]) + k) | 0;
+}
+console.log("pure mix h=" + h + " tail=" + tail + " k=" + k);
+"#,
+    ));
+}
+
+/// The same flattenable shape followed by reads of recycled top-level temps.
+/// This is the exit-flush hazard B97's write-through sharing must preserve.
+#[test]
+fn gprwt_parity_flattenable_recycled_temps_read_after_the_loop() {
+    assert_matches_node(&prog(
+        r#"var kinds = [], starts = [], ends = [];
+var src = "";
+for (var i = 0; i < 64; i++) src += "abcdefghijklmnopqrstuvwxyz0123456789 ";
+for (var i = 0; i < N; i++) { kinds.push(i % 13); starts.push(i % 2000); ends.push((i % 2000) + 3); }
+var h = 0, tail = 0, k = 0;
+function mixPure(a, x) { return Math.imul(a ^ x, 16777619) >>> 0; }
+for (var r = 0; r < 6; r++) {
+  h = 2166136261;
+  for (var ti = 0; ti < kinds.length; ti++) {
+    h = mixPure(h, kinds[ti]); h = mixPure(h, ends[ti] - starts[ti]); h = mixPure(h, ti);
+  }
+  for (k = 0; k + 2 < kinds.length; k += 977) {
+    tail = (tail + kinds[k] + (ends[k + 1] - starts[k + 1]) + k) | 0;
+  }
+}
+console.log("pure tail h=" + h + " tail=" + tail + " k=" + k);
 "#,
     ));
 }
@@ -217,17 +282,21 @@ console.log("seen h=" + h + " seen=" + seen);
 /// off-switch.
 #[test]
 fn gprwt_mechanism_the_flattened_mix_loop_reaches_the_gpr_emitter() {
-    // `gprwt_parity_stored_global_read_between_the_calls` is deliberately NOT
-    // here: its extra in-loop read of `h` widens the body past INT admission
-    // and it compiles on MEM. It stays a parity case (the answer must hold
-    // whatever tier hosts it), but it cannot pin this mechanism.
-    for name in
-        ["gprwt_parity_top_level_mix_loop", "gprwt_parity_recycled_temps_read_after_the_loop"]
-    {
+    // The real parse-style/global-write siblings stay parity-only: their pinned
+    // string prefix widens this body past the current GPR plan. These pure
+    // result siblings isolate B97 from that independent admission boundary.
+    for name in [
+        "gprwt_parity_flattenable_pure_mix_loop",
+        "gprwt_parity_flattenable_recycled_temps_read_after_the_loop",
+    ] {
         let on = jitlog_of(name, &[]);
-        assert!(on.contains("INT splice ["), "{name}: no region was flattened:\n{on}");
         assert!(
-            on.contains("GPR homes engaged"),
+            on.contains("INT splice ["),
+            "{name}: no region was flattened:\n{on}"
+        );
+        let on_span = first_gpr_retry_span(&on);
+        assert!(
+            on.contains(&format!("INT region [{on_span}] GPR homes engaged")),
             "{name}: the flattened region never reached the GPR emitter:\n{on}"
         );
 
@@ -236,10 +305,18 @@ fn gprwt_mechanism_the_flattened_mix_loop_reaches_the_gpr_emitter() {
             off.contains("INT splice ["),
             "{name}: the off-switch must not disturb the flatten:\n{off}"
         );
+        let off_span = first_gpr_retry_span(&off);
         assert!(
-            off.lines().any(|l| l.starts_with("[jit] INT-GPR decline") && l.contains("gprs")),
+            off.lines()
+                .filter(|l| l.contains(&format!("INT-GPR decline [{off_span}]")))
+                .count()
+                >= 2,
             "{name}: with the switch off the re-plan must still overflow the \
              GPR pool:\n{off}"
+        );
+        assert!(
+            !off.contains(&format!("INT region [{off_span}] GPR homes engaged")),
+            "{name}: the disabled write-through plan unexpectedly engaged:\n{off}"
         );
     }
 }
@@ -249,9 +326,10 @@ fn gprwt_mechanism_the_flattened_mix_loop_reaches_the_gpr_emitter() {
 /// body. Pin both halves: the first attempt overflows, the retry fits.
 #[test]
 fn gprwt_mechanism_the_shared_home_replan_is_what_fits() {
-    let on = jitlog_of("gprwt_parity_top_level_mix_loop", &[]);
+    let on = jitlog_of("gprwt_parity_flattenable_pure_mix_loop", &[]);
     assert!(
-        on.lines().any(|l| l.starts_with("[jit] INT-GPR decline") && l.contains("gprs")),
+        on.lines()
+            .any(|l| l.starts_with("[jit] INT-GPR decline") && l.contains("gprs")),
         "the FIRST (distinct-homes) attempt is expected to overflow:\n{on}"
     );
     assert!(
@@ -261,14 +339,19 @@ fn gprwt_mechanism_the_shared_home_replan_is_what_fits() {
     // The plan the retry produces must be strictly narrower than the one the
     // off-switch produces — that difference IS the released permanent homes.
     let homes = |log: &str| -> usize {
+        let span = first_gpr_retry_span(log);
         log.lines()
+            .filter(|l| l.contains(&format!("region [{span}] glob-range plan:")))
             .filter_map(|l| l.split("glob-range plan:").nth(1))
             .filter_map(|t| t.split("homes=").nth(1))
             .filter_map(|t| t.trim().parse::<usize>().ok())
-            .min()
-            .expect("a glob-range plan line with a home count")
+            .next()
+            .expect("the retry region's glob-range plan line with a home count")
     };
-    let off = jitlog_of("gprwt_parity_top_level_mix_loop", &[("ZIPP_NO_GPR_WT_SHARE", "1")]);
+    let off = jitlog_of(
+        "gprwt_parity_flattenable_pure_mix_loop",
+        &[("ZIPP_NO_GPR_WT_SHARE", "1")],
+    );
     assert!(
         homes(&on) < homes(&off),
         "sharing did not narrow the plan ({} on vs {} off):\n{on}",
@@ -309,6 +392,13 @@ fn gprwt_all_modes_answer_identically() {
             "the gprwt_parity_ filter matched nothing under {mode:?}:\n{stdout}"
         );
     }
+}
+
+fn first_gpr_retry_span(log: &str) -> &str {
+    log.lines()
+        .find(|l| l.contains("INT-GPR nest retry"))
+        .and_then(|l| l.split(['[', ']']).nth(3))
+        .expect("an INT-GPR nest retry carrying its region span")
 }
 
 fn jitlog_of(test_name: &str, env: &[(&str, &str)]) -> String {

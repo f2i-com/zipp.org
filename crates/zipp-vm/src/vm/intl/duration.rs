@@ -3,14 +3,13 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
-use crate::vm::{cldr_en, dtf_pattern};
 use crate::vm::*;
+use crate::vm::{cldr_en, dtf_pattern};
 
 impl<'p> Vm<'p> {
-
     /// PartitionDurationFormatPattern (ECMA-402 §1.1.14, with FormatNumericUnits
     /// / FormatNumericHours / FormatNumericMinutes / FormatNumericSeconds folded
     /// in) as a typed part list; `format` is this joined, `formatToParts` is this
@@ -32,8 +31,16 @@ impl<'p> Vm<'p> {
         /// The `unit` identifier NumberFormat takes for each Duration field, in
         /// DURATION_FIELDS order (`years` → `year`).
         const SINGULAR: [&str; 10] = [
-            "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
-            "microsecond", "nanosecond",
+            "year",
+            "month",
+            "week",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
         ];
         let locale = self.intl_slot(resolved, "locale");
         let ns = self.display(self.intl_slot(resolved, "numberingSystem"));
@@ -72,8 +79,14 @@ impl<'p> Vm<'p> {
                 if next == "numeric" {
                     let exponent = [9u32, 6, 3][i - 6];
                     exact = duration_fractional_decimal(&d, exponent);
-                    opts.set("maximumFractionDigits", Value::num(frac.unwrap_or(9) as f64));
-                    opts.set("minimumFractionDigits", Value::num(frac.unwrap_or(0) as f64));
+                    opts.set(
+                        "maximumFractionDigits",
+                        Value::num(frac.unwrap_or(9) as f64),
+                    );
+                    opts.set(
+                        "minimumFractionDigits",
+                        Value::num(frac.unwrap_or(0) as f64),
+                    );
                     let tv = self.alloc_str("trunc".to_string());
                     opts.set("roundingMode", tv);
                     done = true;
@@ -83,9 +96,9 @@ impl<'p> Vm<'p> {
             // seconds field will follow them ("1:00:30", not "1:30").
             let mut display_required = false;
             if i == 5 && need_separator {
-                display_required =
-                    self.display(self.intl_slot(resolved, "secondsDisplay")) == "always"
-                        || d[6..].iter().any(|&v| v != 0.0);
+                display_required = self.display(self.intl_slot(resolved, "secondsDisplay"))
+                    == "always"
+                    || d[6..].iter().any(|&v| v != 0.0);
             }
             let is_zero = exact.is_none() && value == 0.0;
             if is_zero && display == "auto" && !display_required {
@@ -138,8 +151,11 @@ impl<'p> Vm<'p> {
                 }
                 None => value,
             };
-            let mut run: Vec<(String, String, &'static str)> =
-                self.nf_parts(nf_resolved, n)?.into_iter().map(|(t, v)| (t, v, nf_unit)).collect();
+            let mut run: Vec<(String, String, &'static str)> = self
+                .nf_parts(nf_resolved, n)?
+                .into_iter()
+                .map(|(t, v)| (t, v, nf_unit))
+                .collect();
             match elements.last_mut() {
                 Some(last) if need_separator => {
                     // [[HoursMinutesSeparator]] / [[MinutesSecondsSeparator]]: a
@@ -161,7 +177,11 @@ impl<'p> Vm<'p> {
 
         // Steps 11-18: join the elements with ListFormat's `unit` type. "digital"
         // is not a ListFormat style, so it maps to "short".
-        let list_style = if base_style == "digital" { "short" } else { base_style.as_str() };
+        let list_style = if base_style == "digital" {
+            "short"
+        } else {
+            base_style.as_str()
+        };
         let strings: Vec<String> = elements
             .iter()
             .map(|p| p.iter().map(|(_, v, _)| v.as_str()).collect::<String>())
@@ -177,21 +197,57 @@ impl<'p> Vm<'p> {
         }
         Ok(out)
     }
-
 }
-
 
 /// The sanctioned single-unit identifiers of ECMA-402 Table 2. `unit` may name
 /// one of these or a `<numerator>-per-<denominator>` pair of them.
 pub(crate) const SANCTIONED_UNITS: &[&str] = &[
-    "acre", "bit", "byte", "celsius", "centimeter", "day", "degree", "fluid-ounce", "foot",
-    "gallon", "gigabit", "gigabyte", "gram", "hectare", "hour", "inch", "kilobit", "kilobyte",
-    "kilogram", "kilometer", "liter", "megabit", "megabyte", "meter", "microsecond", "mile",
-    "mile-scandinavian", "milliliter", "millimeter", "millisecond", "minute", "month",
-    "nanosecond", "ounce", "percent", "petabyte", "pound", "second", "stone", "terabit",
-    "terabyte", "week", "yard", "year", "fahrenheit",
+    "acre",
+    "bit",
+    "byte",
+    "celsius",
+    "centimeter",
+    "day",
+    "degree",
+    "fluid-ounce",
+    "foot",
+    "gallon",
+    "gigabit",
+    "gigabyte",
+    "gram",
+    "hectare",
+    "hour",
+    "inch",
+    "kilobit",
+    "kilobyte",
+    "kilogram",
+    "kilometer",
+    "liter",
+    "megabit",
+    "megabyte",
+    "meter",
+    "microsecond",
+    "mile",
+    "mile-scandinavian",
+    "milliliter",
+    "millimeter",
+    "millisecond",
+    "minute",
+    "month",
+    "nanosecond",
+    "ounce",
+    "percent",
+    "petabyte",
+    "pound",
+    "second",
+    "stone",
+    "terabit",
+    "terabyte",
+    "week",
+    "yard",
+    "year",
+    "fahrenheit",
 ];
-
 
 pub(crate) fn is_well_formed_unit(u: &str) -> bool {
     if SANCTIONED_UNITS.contains(&u) {

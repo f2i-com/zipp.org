@@ -16,7 +16,10 @@ impl<'p> Vm<'p> {
         {
             return Err(Thrown("RangeError: invalid time value".into()));
         }
-        let idx = self.heap.alloc(HeapObj::Temporal { kind: 2, fields: f.to_vec() });
+        let idx = self.heap.alloc(HeapObj::Temporal {
+            kind: 2,
+            fields: f.to_vec(),
+        });
         if self.plaintime_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.plaintime_proto));
         }
@@ -128,10 +131,17 @@ impl<'p> Vm<'p> {
                 return Ok(f);
             }
         }
-        Err(Thrown("TypeError: cannot convert value to a Temporal.PlainTime".into()))
+        Err(Thrown(
+            "TypeError: cannot convert value to a Temporal.PlainTime".into(),
+        ))
     }
 
-    pub(crate) fn plain_time_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn plain_time_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
         let f = match self.plain_time_fields(idx) {
             Some(f) => f,
             None => return Ok(None),
@@ -145,7 +155,9 @@ impl<'p> Vm<'p> {
                 let t = ns_to_time(rounded);
                 Ok(Some(self.alloc_str(format_time_part(&t, digits, omit))))
             }
-            "valueOf" => Err(Thrown("TypeError: Called Temporal.PlainTime.prototype.valueOf".into())),
+            "valueOf" => Err(Thrown(
+                "TypeError: Called Temporal.PlainTime.prototype.valueOf".into(),
+            )),
             "equals" => {
                 let o = self.to_plain_time(a0)?;
                 Ok(Some(Value::bool(f == o)))
@@ -172,9 +184,12 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if !any {
-                    return Err(Thrown("TypeError: with() requires a partial time object".into()));
+                    return Err(Thrown(
+                        "TypeError: with() requires a partial time object".into(),
+                    ));
                 }
-                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let reject =
+                    self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let mut nf = f;
                 for (i, slot) in raw.iter().enumerate() {
                     if let Some(x) = *slot {
@@ -207,12 +222,21 @@ impl<'p> Vm<'p> {
                 };
                 let inc_ns = unit_ns(&smallest) * inc;
                 let rounded = round_increment(diff, inc_ns, &mode);
-                Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest)?)))
+                Ok(Some(
+                    self.make_duration(balance_duration_ns(rounded, &largest)?),
+                ))
             }
             "round" => {
                 let (su, inc, mode) = self.read_round_options(
                     a0,
-                    &["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"],
+                    &[
+                        "hour",
+                        "minute",
+                        "second",
+                        "millisecond",
+                        "microsecond",
+                        "nanosecond",
+                    ],
                     true,
                 )?;
                 let ns = time_to_ns(&f);
@@ -235,12 +259,13 @@ impl<'p> Vm<'p> {
                     o.set(nm, Value::num(f[i] as f64));
                 }
                 o.set("calendar", cal);
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))))
+                Ok(Some(Value::heap(
+                    self.heap.alloc(HeapObj::Object(Box::new(o))),
+                )))
             }
             _ => Ok(None),
         }
     }
 
     // ── Temporal.PlainDateTime ──
-
 }

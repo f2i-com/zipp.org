@@ -13,7 +13,11 @@ use std::process::Command;
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -23,7 +27,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -102,7 +110,11 @@ fn pair_jit_tier_c_census() {
         .output()
         .expect("spawn Tier-C census child");
     let stderr = String::from_utf8_lossy(&got.stderr);
-    assert!(got.status.success(), "Tier-C census child failed:\n{}\n{stderr}", String::from_utf8_lossy(&got.stdout));
+    assert!(
+        got.status.success(),
+        "Tier-C census child failed:\n{}\n{stderr}",
+        String::from_utf8_lossy(&got.stdout)
+    );
     assert!(
         stderr.contains("Tier C fn") && stderr.contains("whole-function mem path"),
         "AddRightPair body did not compile on Tier C:\n{stderr}"
@@ -217,11 +229,26 @@ fn pair_bytecode_child() {
     }
     let bc = zipp_vm::compile_to_text(BYTECODE_SRC, false).expect("compile bytecode");
     if std::env::var_os("ZIPP_NO_CONCAT_PAIR_FUSE").is_some() {
-        assert!(!bc.contains("AddRightPair"), "off switch left fused bytecode:\n{bc}");
-        assert_eq!(bc.matches("Add {").count(), 2, "off switch did not restore the exact inner+outer Add pair:\n{bc}");
+        assert!(
+            !bc.contains("AddRightPair"),
+            "off switch left fused bytecode:\n{bc}"
+        );
+        assert_eq!(
+            bc.matches("Add {").count(),
+            2,
+            "off switch did not restore the exact inner+outer Add pair:\n{bc}"
+        );
     } else {
-        assert_eq!(bc.matches("AddRightPair {").count(), 1, "fused opcode absent/duplicated:\n{bc}");
-        assert_eq!(bc.matches("Add {").count(), 0, "fused lowering retained an intermediate Add:\n{bc}");
+        assert_eq!(
+            bc.matches("AddRightPair {").count(),
+            1,
+            "fused opcode absent/duplicated:\n{bc}"
+        );
+        assert_eq!(
+            bc.matches("Add {").count(),
+            0,
+            "fused lowering retained an intermediate Add:\n{bc}"
+        );
     }
 }
 
@@ -235,8 +262,14 @@ fn pair_bytecode_switch_and_local_append_license() {
         false,
     )
     .expect("compile local accumulator");
-    assert!(!local.contains("AddRightPair"), "mutable local was pair-fused:\n{local}");
-    assert!(local.contains("StrAppendInPlace"), "pair lowering displaced the local append licence:\n{local}");
+    assert!(
+        !local.contains("AddRightPair"),
+        "mutable local was pair-fused:\n{local}"
+    );
+    assert!(
+        local.contains("StrAppendInPlace"),
+        "pair lowering displaced the local append licence:\n{local}"
+    );
 
     let exe = std::env::current_exe().expect("test exe path");
     for off in [false, true] {
@@ -289,16 +322,23 @@ fn pair_mechanism_child() {
     }
     assert_matches_node(MECHANISM_SRC);
     let (fast_str, fast_int, in_place, fallback) = zipp_vm::concat_pair_stats();
-    eprintln!(
-        "[pair-test] str={fast_str} int={fast_int} in_place={in_place} fallback={fallback}"
-    );
+    eprintln!("[pair-test] str={fast_str} int={fast_int} in_place={in_place} fallback={fallback}");
     if std::env::var_os("ZIPP_NO_CONCAT_PAIR_FUSE").is_some() {
         assert_eq!((fast_str, fast_int, in_place, fallback), (0, 0, 0, 0));
     } else {
-        assert!(fast_str > 1_000, "string one-allocation arm did not engage: {fast_str}/{fast_int}/{in_place}/{fallback}");
-        assert!(fast_int > 1_000, "int one-allocation arm did not engage: {fast_str}/{fast_int}/{in_place}/{fallback}");
+        assert!(
+            fast_str > 1_000,
+            "string one-allocation arm did not engage: {fast_str}/{fast_int}/{in_place}/{fallback}"
+        );
+        assert!(
+            fast_int > 1_000,
+            "int one-allocation arm did not engage: {fast_str}/{fast_int}/{in_place}/{fallback}"
+        );
         assert!(in_place > 1_000, "proven-linear in-place arm did not engage: {fast_str}/{fast_int}/{in_place}/{fallback}");
-        assert!(fallback > 500, "pairwise fallback did not engage: {fast_str}/{fast_int}/{in_place}/{fallback}");
+        assert!(
+            fallback > 500,
+            "pairwise fallback did not engage: {fast_str}/{fast_int}/{in_place}/{fallback}"
+        );
     }
 }
 

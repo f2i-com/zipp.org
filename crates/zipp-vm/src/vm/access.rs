@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -53,7 +53,10 @@ impl<'p> Vm<'p> {
     /// evaluated before `setup_globals`), so this can never return a bad handle.
     pub(crate) fn typeof_value(&mut self, v: Value) -> Value {
         let name = self.type_of(v);
-        match crate::bytecode::TYPEOF_NAMES.iter().position(|&n| n == name) {
+        match crate::bytecode::TYPEOF_NAMES
+            .iter()
+            .position(|&n| n == name)
+        {
             Some(i) if !self.typeof_strs[i].is_undefined() => self.typeof_strs[i],
             _ => self.alloc_str(name.to_string()),
         }
@@ -80,7 +83,8 @@ impl<'p> Vm<'p> {
                 HeapObj::Func(_)
                 | HeapObj::Closure { .. }
                 | HeapObj::Class(_)
-                | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. }
                 | HeapObj::Bound { .. }
                 | HeapObj::Wrapped { .. }
                 | HeapObj::BoundResolver { .. }
@@ -92,11 +96,21 @@ impl<'p> Vm<'p> {
                 // The built-in constructor globals (Object/Array/Map/…) are callable.
                 HeapObj::Object(m) if m.is_ctor => "function",
                 // %Function.prototype% is itself a (no-op) callable function.
-                HeapObj::Object(_) if v.heap_index() == self.fn_proto && self.fn_proto != 0 => "function",
+                HeapObj::Object(_) if v.heap_index() == self.fn_proto && self.fn_proto != 0 => {
+                    "function"
+                }
                 // `Symbol` is callable (typeof "function") but NOT a constructor
                 // (so `new Symbol()` throws and IsConstructor is false).
-                HeapObj::Object(_) if v.heap_index() == self.symbol_ctor && self.symbol_ctor != 0 => "function",
-                HeapObj::Object(_) if v.heap_index() == self.bigint_ctor && self.bigint_ctor != 0 => "function",
+                HeapObj::Object(_)
+                    if v.heap_index() == self.symbol_ctor && self.symbol_ctor != 0 =>
+                {
+                    "function"
+                }
+                HeapObj::Object(_)
+                    if v.heap_index() == self.bigint_ctor && self.bigint_ctor != 0 =>
+                {
+                    "function"
+                }
                 _ => "object", // Array, ordinary Object, namespace globals
             }
         } else {
@@ -123,7 +137,9 @@ impl<'p> Vm<'p> {
         if obj.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
                 if revoked {
-                    return Err(Thrown("TypeError: Cannot perform 'deleteProperty' on a revoked proxy".into()));
+                    return Err(Thrown(
+                        "TypeError: Cannot perform 'deleteProperty' on a revoked proxy".into(),
+                    ));
                 }
                 return match self.proxy_trap(handler, "deleteProperty")? {
                     Some(trap) => {
@@ -364,10 +380,7 @@ impl<'p> Vm<'p> {
         // globals NaN/Infinity/undefined are non-configurable, so they can't be
         // deleted (any configurable own entry was already removed by the path above
         // for a user prop; the non-configurable own case returned false earlier).
-        if idx == self.global_this
-            && self.global_this != 0
-            && self.global_by_name(key).is_some()
-        {
+        if idx == self.global_this && self.global_this != 0 && self.global_by_name(key).is_some() {
             if matches!(key, "NaN" | "Infinity" | "undefined") {
                 return Value::bool(false);
             }
@@ -432,8 +445,7 @@ impl<'p> Vm<'p> {
         // boxed form made `delete "foo".length` / `delete "foo"[0]` answer true
         // (staging/sm/strict/15.5.5.{1,2}.js).
         if let Some((_, len)) = self.string_exotic_chars(obj) {
-            let blocked =
-                key == "length" || canonical_index_str(key).is_some_and(|i| i < len);
+            let blocked = key == "length" || canonical_index_str(key).is_some_and(|i| i < len);
             if blocked {
                 return Value::bool(false);
             }
@@ -471,7 +483,10 @@ impl<'p> Vm<'p> {
         // A legacy sloppy function's own `caller`/`arguments` are non-configurable
         // too — `delete f.caller` fails and the live property stays.
         if self.fn_has_legacy_caller_prop(idx, key)
-            && self.fn_props.get(&idx).map_or(true, |m| m.pos(key).is_none())
+            && self
+                .fn_props
+                .get(&idx)
+                .map_or(true, |m| m.pos(key).is_none())
         {
             return Value::bool(false);
         }
@@ -483,7 +498,11 @@ impl<'p> Vm<'p> {
         if (key == "name" || key == "length") && self.is_callable(obj) {
             // A frozen/sealed function's name/length are non-configurable
             // (%ThrowTypeError% is born frozen) — `delete` fails.
-            if self.arr_props.get(&idx).map_or(false, |m| m.frozen || m.sealed) {
+            if self
+                .arr_props
+                .get(&idx)
+                .map_or(false, |m| m.frozen || m.sealed)
+            {
                 return Value::bool(false);
             }
             let ovr_attr = self
@@ -538,7 +557,10 @@ impl<'p> Vm<'p> {
                 let in_bounds =
                     matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len());
                 if in_bounds
-                    && self.arr_props.get(&idx).map_or(false, |m| m.sealed || m.frozen)
+                    && self
+                        .arr_props
+                        .get(&idx)
+                        .map_or(false, |m| m.sealed || m.frozen)
                 {
                     return Value::bool(false);
                 }
@@ -568,7 +590,12 @@ impl<'p> Vm<'p> {
         // (defineProperties/15.2.3.7-6-a-12's verifyProperty deletion probe).
         if matches!(
             self.heap.get(idx),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+            HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Bound { .. }
+                | HeapObj::Wrapped { .. }
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. }
         ) {
             if let Some(m) = self.fn_props.get(&idx) {
                 if let Some(p) = m.pos(key) {
@@ -592,7 +619,9 @@ impl<'p> Vm<'p> {
                     false // array slot stays (a hole); no version bump needed
                 } else {
                     // A named (non-index) own property in arr_props.
-                    self.arr_props.get_mut(&idx).map_or(false, |m| m.remove(key))
+                    self.arr_props
+                        .get_mut(&idx)
+                        .map_or(false, |m| m.remove(key))
                 }
             }
             HeapObj::Class(c) => {
@@ -610,13 +639,21 @@ impl<'p> Vm<'p> {
             }
             // A function's assigned own property (`delete fn.x`) — the
             // non-configurable case already returned false above.
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => {
                 self.fn_props.get_mut(&idx).map_or(false, |m| m.remove(key))
             }
             // Every other exotic heap kind (TypedArray, DataView, ArrayBuffer,
             // Map, Set, Date, RegExp, Promise, Boxed, ...) keeps its named/symbol
             // own properties in arr_props — where define_property put them.
-            _ => self.arr_props.get_mut(&idx).map_or(false, |m| m.remove(key)),
+            _ => self
+                .arr_props
+                .get_mut(&idx)
+                .map_or(false, |m| m.remove(key)),
         };
         if removed {
             self.heap.bump_version(idx); // a key was removed → slots shifted (IC)
@@ -655,7 +692,9 @@ impl<'p> Vm<'p> {
             None => return Ok(None),
         };
         if revoked {
-            return Err(Thrown("TypeError: Cannot perform 'set' on a revoked proxy".into()));
+            return Err(Thrown(
+                "TypeError: Cannot perform 'set' on a revoked proxy".into(),
+            ));
         }
         let trap = match self.proxy_trap(handler, "set")? {
             Some(t) => t,
@@ -718,7 +757,9 @@ impl<'p> Vm<'p> {
         // shortcut — or recurses to its target.
         if let Some((t2, h2, revoked2)) = self.proxy_parts(target.heap_index()) {
             if revoked2 {
-                return Err(Thrown("TypeError: Cannot perform 'set' on a revoked proxy".into()));
+                return Err(Thrown(
+                    "TypeError: Cannot perform 'set' on a revoked proxy".into(),
+                ));
             }
             return match self.proxy_trap(h2, "set")? {
                 Some(trap) => {
@@ -767,11 +808,8 @@ impl<'p> Vm<'p> {
             match self.heap.get(cidx) {
                 HeapObj::Object(m) => {
                     if let Some(i) = m.pos(key) {
-                        governing = Some((
-                            m.attrs[i].accessor,
-                            m.attrs[i].writable,
-                            m.attrs[i].setter,
-                        ));
+                        governing =
+                            Some((m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter));
                         break;
                     }
                     if m.class.is_some() {
@@ -798,9 +836,8 @@ impl<'p> Vm<'p> {
                 }
                 _ => {
                     governing = self.arr_props.get(&cidx).and_then(|m| {
-                        m.pos(key).map(|i| {
-                            (m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter)
-                        })
+                        m.pos(key)
+                            .map(|i| (m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter))
                     });
                     break;
                 }
@@ -1000,7 +1037,9 @@ impl<'p> Vm<'p> {
                 // change, so no version bump (the JIT addresses values through
                 // `vals_ptr + slot`, which stays valid).
                 let existing = match self.heap.get(oi) {
-                    HeapObj::Object(m) => m.pos(key).map(|i| (i, m.attrs[i].accessor, m.attrs[i].writable)),
+                    HeapObj::Object(m) => m
+                        .pos(key)
+                        .map(|i| (i, m.attrs[i].accessor, m.attrs[i].writable)),
                     _ => None,
                 };
                 match existing {
@@ -1026,7 +1065,9 @@ impl<'p> Vm<'p> {
         }
         if !obj.is_heap() {
             if obj.is_nullish() {
-                return Err(Thrown("TypeError: cannot set property of non-object".into()));
+                return Err(Thrown(
+                    "TypeError: cannot set property of non-object".into(),
+                ));
             }
             // PutValue 6.a: a PRIMITIVE base (number/boolean here; the heap
             // primitives are routed below) is conceptually ToObject'd and the
@@ -1035,7 +1076,11 @@ impl<'p> Vm<'p> {
         }
         if matches!(
             self.heap.get(obj.heap_index()),
-            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+            HeapObj::Str(_)
+                | HeapObj::Cons { .. }
+                | HeapObj::Symbol { .. }
+                | HeapObj::BigInt(_)
+                | HeapObj::BigIntBig(_)
         ) {
             return self.primitive_base_set(obj, key, val, strict);
         }
@@ -1061,7 +1106,11 @@ impl<'p> Vm<'p> {
             && self.realm_global_objs.contains_key(&obj.heap_index())
             && !key.starts_with("@@")
         {
-            if let Some(&s) = self.realm_globals.get(&obj.heap_index()).and_then(|m| m.get(key)) {
+            if let Some(&s) = self
+                .realm_globals
+                .get(&obj.heap_index())
+                .and_then(|m| m.get(key))
+            {
                 self.globals[s as usize] = val;
                 self.bump_global_gen(s);
                 return Ok(true);
@@ -1083,7 +1132,11 @@ impl<'p> Vm<'p> {
         // own integer-index properties >= n).
         if key == "length" && obj.heap_index() == self.arr_proto && self.arr_proto != 0 {
             let nu = self.to_number_coerce(val)?;
-            let u = if nu.is_finite() { (nu.trunc() as i64 as u32) as f64 } else { 0.0 };
+            let u = if nu.is_finite() {
+                (nu.trunc() as i64 as u32) as f64
+            } else {
+                0.0
+            };
             let number_len = self.to_number_coerce(val)?;
             if u != number_len {
                 return Err(Thrown("RangeError: Invalid array length".into()));
@@ -1111,7 +1164,9 @@ impl<'p> Vm<'p> {
         // Proxy `set` trap (or fall through to the target).
         if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
             if revoked {
-                return Err(Thrown("TypeError: Cannot perform 'set' on a revoked proxy".into()));
+                return Err(Thrown(
+                    "TypeError: Cannot perform 'set' on a revoked proxy".into(),
+                ));
             }
             return match self.proxy_trap(handler, "set")? {
                 Some(trap) => {
@@ -1224,7 +1279,10 @@ impl<'p> Vm<'p> {
                         Some(false) => return self.reject_write(key, strict),
                         // No set trap: forward — keep walking from the target.
                         None => {
-                            cur = self.proxy_parts(cidx).map(|(t, _, _)| t).unwrap_or(Value::NULL);
+                            cur = self
+                                .proxy_parts(cidx)
+                                .map(|(t, _, _)| t)
+                                .unwrap_or(Value::NULL);
                             continue;
                         }
                     }
@@ -1292,7 +1350,10 @@ impl<'p> Vm<'p> {
                     return self.reject_write("length", strict);
                 }
             }
-            let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table);
+            let m = self
+                .arr_props
+                .entry(idx)
+                .or_insert_with(ObjMap::new_side_table);
             if attr.is_some() {
                 m.set("length", val);
             } else {
@@ -1312,10 +1373,7 @@ impl<'p> Vm<'p> {
             }
             if val.is_number() {
                 let n = val.as_f64();
-                if n >= 0.0
-                    && n.fract() == 0.0
-                    && (n as usize) <= crate::vm::MAX_DENSE_ARRAY_LEN
-                {
+                if n >= 0.0 && n.fract() == 0.0 && (n as usize) <= crate::vm::MAX_DENSE_ARRAY_LEN {
                     if let HeapObj::Array(items) = self.heap.get_mut(idx) {
                         items.resize(n as usize, Value::HOLE);
                     }
@@ -1337,7 +1395,11 @@ impl<'p> Vm<'p> {
             // NaN / 1.5 / 2^32) is a RangeError — same model as the
             // defineProperty path in props.rs.
             let nu = self.to_number_coerce(val)?; // ToNumber inside ToUint32
-            let u = if nu.is_finite() { (nu.trunc() as i64 as u32) as f64 } else { 0.0 };
+            let u = if nu.is_finite() {
+                (nu.trunc() as i64 as u32) as f64
+            } else {
+                0.0
+            };
             let number_len = self.to_number_coerce(val)?; // numberLen
             if u != number_len {
                 return Err(Thrown("RangeError: Invalid array length".into()));
@@ -1388,8 +1450,17 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => m.pos(key).map(|i| m.attrs[i]),
             // An Array's named props — and an exotic object's defineProperty'd own
             // props (Map/Set/Date/Promise/…) — live in the arr_props side table.
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } | HeapObj::Class(_) => None,
-            _ => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| m.attrs[i])),
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. }
+            | HeapObj::Class(_) => None,
+            _ => self
+                .arr_props
+                .get(&idx)
+                .and_then(|m| m.pos(key).map(|i| m.attrs[i])),
         };
         if let Some(a) = own_attr {
             if a.accessor {
@@ -1463,7 +1534,7 @@ impl<'p> Vm<'p> {
                 }
                 ProtoSet::GetterOnly => return self.reject_write(key, strict),
                 ProtoSet::Proxy(true) => return Ok(true), // chain proxy's set trap handled it
-                ProtoSet::Absorbed => return Ok(true), // TA chain node absorbed the index
+                ProtoSet::Absorbed => return Ok(true),    // TA chain node absorbed the index
                 ProtoSet::Proxy(false) => return self.reject_write(key, strict),
                 ProtoSet::NonWritable => return self.reject_write(key, strict),
                 ProtoSet::DataWrite => {
@@ -1476,8 +1547,17 @@ impl<'p> Vm<'p> {
                     // (staging/sm/Proxy/regress-bug1062349).
                     let now_own = match self.heap.get(idx) {
                         HeapObj::Object(m) => m.pos(key).map(|i| m.attrs[i]),
-                        HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } | HeapObj::Class(_) => None,
-                        _ => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| m.attrs[i])),
+                        HeapObj::Func(_)
+                        | HeapObj::Closure { .. }
+                        | HeapObj::Bound { .. }
+                        | HeapObj::Wrapped { .. }
+                        | HeapObj::Native(_)
+                        | HeapObj::NativeClosure { .. }
+                        | HeapObj::Class(_) => None,
+                        _ => self
+                            .arr_props
+                            .get(&idx)
+                            .and_then(|m| m.pos(key).map(|i| m.attrs[i])),
                     };
                     if let Some(a) = now_own {
                         if a.accessor || !a.writable {
@@ -1502,9 +1582,7 @@ impl<'p> Vm<'p> {
                 // prototype data property and stays shadowable, and a private FIELD
                 // is an own data property (so map.get(key) is Some and this branch
                 // is skipped, leaving it writable).
-                if is_private_key(key)
-                    && self.lookup_instance_method_or_getter(map.class, key)
-                {
+                if is_private_key(key) && self.lookup_instance_method_or_getter(map.class, key) {
                     return Err(Thrown(format!(
                         "TypeError: Cannot write to private member '{key}': it is a method or a getter-only accessor"
                     )));
@@ -1515,7 +1593,12 @@ impl<'p> Vm<'p> {
         // lives in a side table (functions carry no inline property map).
         if matches!(
             self.heap.get(idx),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+            HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Bound { .. }
+                | HeapObj::Wrapped { .. }
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. }
         ) {
             // `caller`/`arguments` on a restricted function (anything but a legacy
             // sloppy ordinary one) are the inherited %ThrowTypeError% accessors —
@@ -1554,11 +1637,17 @@ impl<'p> Vm<'p> {
                 // extensibility flag lives in the arr_props side table). The intrinsic
                 // name/length/prototype already exist, so they are not "new".
                 let present = matches!(key, "name" | "length" | "prototype")
-                    || self.fn_props.get(&idx).map_or(false, |m| m.pos(key).is_some());
+                    || self
+                        .fn_props
+                        .get(&idx)
+                        .map_or(false, |m| m.pos(key).is_some());
                 if !present && self.arr_props.get(&idx).map_or(false, |m| !m.extensible) {
                     return self.reject_write(key, strict);
                 }
-                self.fn_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
+                self.fn_props
+                    .entry(idx)
+                    .or_insert_with(ObjMap::new_side_table)
+                    .set(key, val);
             }
             return Ok(true);
         }
@@ -1605,7 +1694,10 @@ impl<'p> Vm<'p> {
                     // own_attr block above, so only a writable data index reaches
                     // here — update it in place (preserving its attributes).
                     if self.array_index_override(idx, n).is_some() {
-                        self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
+                        self.arr_props
+                            .entry(idx)
+                            .or_insert_with(ObjMap::new_side_table)
+                            .set(key, val);
                         self.heap.bump_version(idx);
                         return Ok(true);
                     }
@@ -1631,14 +1723,20 @@ impl<'p> Vm<'p> {
                     // billions-of-holes resize). Mirrors set_index's numeric path.
                     if n >= crate::vm::MAX_DENSE_ARRAY_LEN && !present {
                         if !self.arguments_objs.contains_key(&idx) {
-                            self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
+                            self.arr_props
+                                .entry(idx)
+                                .or_insert_with(ObjMap::new_side_table)
+                                .set(key, val);
                             self.array_grow_js_len(idx, n);
                             self.heap.bump_version(idx);
                             return Ok(true);
                         }
                         // An ARGUMENTS object's past-the-end index stays an
                         // ordinary named own property (length is argc).
-                        self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
+                        self.arr_props
+                            .entry(idx)
+                            .or_insert_with(ObjMap::new_side_table)
+                            .set(key, val);
                         self.heap.bump_version(idx);
                         return Ok(true);
                     }
@@ -1661,7 +1759,11 @@ impl<'p> Vm<'p> {
             {
                 return self.reject_write(key, strict);
             }
-            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
+            let added = self
+                .arr_props
+                .entry(idx)
+                .or_insert_with(ObjMap::new_side_table)
+                .set(key, val);
             if added {
                 self.heap.bump_version(idx);
             }
@@ -1691,7 +1793,11 @@ impl<'p> Vm<'p> {
             {
                 return self.reject_write(key, strict);
             }
-            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
+            let added = self
+                .arr_props
+                .entry(idx)
+                .or_insert_with(ObjMap::new_side_table)
+                .set(key, val);
             if added {
                 self.heap.bump_version(idx);
             }
@@ -1737,7 +1843,11 @@ impl<'p> Vm<'p> {
                     return self.reject_write(key, strict);
                 }
             }
-            let added = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(key, val);
+            let added = self
+                .arr_props
+                .entry(idx)
+                .or_insert_with(ObjMap::new_side_table)
+                .set(key, val);
             if added {
                 self.heap.bump_version(idx);
             }
@@ -1848,7 +1958,13 @@ impl<'p> Vm<'p> {
     /// * `Some(None)` — a getter-only accessor (assignment is a sloppy no-op);
     /// * `None` — no accessor reached (a data property shadows / the chain ends),
     ///   so the caller writes an own data property.
-    fn proto_chain_set(&mut self, start_idx: u32, key: &str, val: Value, receiver: Value) -> Result<ProtoSet, Thrown> {
+    fn proto_chain_set(
+        &mut self,
+        start_idx: u32,
+        key: &str,
+        val: Value,
+        receiver: Value,
+    ) -> Result<ProtoSet, Thrown> {
         let start = self.object_get_prototype_of(Value::heap(start_idx));
         self.proto_chain_set_from(start, key, val, receiver)
     }
@@ -1856,7 +1972,13 @@ impl<'p> Vm<'p> {
     /// `proto_chain_set` starting AT `cur` itself (inclusive) — the entry point
     /// for a PRIMITIVE-base [[Set]], whose walk begins at the primitive's
     /// wrapper prototype (the conceptual ToObject(base)'s [[Prototype]]).
-    fn proto_chain_set_from(&mut self, mut cur: Value, key: &str, val: Value, receiver: Value) -> Result<ProtoSet, Thrown> {
+    fn proto_chain_set_from(
+        &mut self,
+        mut cur: Value,
+        key: &str,
+        val: Value,
+        receiver: Value,
+    ) -> Result<ProtoSet, Thrown> {
         for _ in 0..1000 {
             if !cur.is_heap() {
                 return Ok(ProtoSet::DataWrite);
@@ -1870,7 +1992,10 @@ impl<'p> Vm<'p> {
                 match self.proxy_set_bool(cur, key, val, receiver)? {
                     Some(ok) => return Ok(ProtoSet::Proxy(ok)),
                     None => {
-                        let target = self.proxy_parts(cidx).map(|(t, _, _)| t).unwrap_or(Value::NULL);
+                        let target = self
+                            .proxy_parts(cidx)
+                            .map(|(t, _, _)| t)
+                            .unwrap_or(Value::NULL);
                         cur = target;
                         continue;
                     }
@@ -1919,7 +2044,13 @@ impl<'p> Vm<'p> {
     /// get+set pair becomes one get/set accessor). Object-literal accessors are
     /// enumerable + configurable. A getter is stored in `vals[i]`, a setter in
     /// `attrs[i].setter`.
-    pub(crate) fn define_object_accessor(&mut self, obj: Value, key: &str, func: Value, is_setter: bool) {
+    pub(crate) fn define_object_accessor(
+        &mut self,
+        obj: Value,
+        key: &str,
+        func: Value,
+        is_setter: bool,
+    ) {
         if !obj.is_heap() {
             return;
         }
@@ -1998,7 +2129,11 @@ impl<'p> Vm<'p> {
     ///   `Some(Some(setter))` → invoke `setter`;
     ///   `Some(None)`         → a getter-only accessor shadows the write (no-op);
     ///   `None`               → no accessor shadows it → write a static data prop.
-    pub(crate) fn lookup_static_accessor(&self, start: Option<u32>, key: &str) -> Option<Option<Value>> {
+    pub(crate) fn lookup_static_accessor(
+        &self,
+        start: Option<u32>,
+        key: &str,
+    ) -> Option<Option<Value>> {
         let mut cur = start;
         while let Some(cidx) = cur {
             match self.heap.get(cidx) {
@@ -2033,5 +2168,4 @@ impl<'p> Vm<'p> {
         }
         None
     }
-
 }

@@ -30,10 +30,10 @@
 //! missing from it while the program still returned the right answer — and a
 //! proof over that trace would attest to an execution that never happened.
 //!
-//! Two paths execute user work with neither an interpreter loop nor a VM
-//! pointer to charge against: the fused array kernels and the off-frame method
-//! inliner. The inliner knows its body length and charges it in Rust; the
-//! kernels are declined outright in a metered VM (`Vm::jit_fused_ok`).
+//! Two paths execute user work outside the interpreter's pre-execution charge:
+//! the fused array kernels and the off-frame method inliner. Both are declined
+//! outright in a metered VM (`Vm::jit_fused_ok` for kernels and the inliner's
+//! own entry gate), so neither can overshoot or omit nested bytecode work.
 //!
 //! # The trace contract
 //!
@@ -544,10 +544,7 @@ impl super::Vm<'_> {
         if rec.exhaustion.is_none() && rec.output_exhausted {
             rec.exhaust(ResourceExhaustion::Output);
         }
-        if rec.exhaustion.is_none()
-            && rec.heap_limit != usize::MAX
-            && heap_bytes > rec.heap_limit
-        {
+        if rec.exhaustion.is_none() && rec.heap_limit != usize::MAX && heap_bytes > rec.heap_limit {
             rec.exhaust(ResourceExhaustion::Heap);
         }
         rec.terminal_message()
@@ -1303,18 +1300,16 @@ mod tests {
         let mut measured = crate::vm::Vm::new(program(src));
         measured.set_instrumentation(Recorder::new());
         measured.run().expect("measurement run succeeds");
-        let used = measured
-            .instr_rec
-            .as_ref()
-            .expect("recorder attached")
-            .used;
+        let used = measured.instr_rec.as_ref().expect("recorder attached").used;
         assert!(used > 0);
 
         let mut exact = crate::vm::Vm::new(program(src));
         let mut exact_rec = Recorder::new();
         exact_rec.remaining = used as i64;
         exact.set_instrumentation(exact_rec);
-        exact.run().expect("the final permitted instruction may halt");
+        exact
+            .run()
+            .expect("the final permitted instruction may halt");
         assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
         assert_eq!(exact.instrument_resource_limit_error(), None);
 
@@ -1335,12 +1330,7 @@ mod tests {
     fn exact_final_native_block_succeeds_and_the_next_attempt_fails() {
         const SRC: &str = "function add1(x) { return x + 1; }";
 
-        fn exercise(
-            limit: i64,
-        ) -> (
-            crate::vm::Vm<'static>,
-            Result<Value, crate::vm::Thrown>,
-        ) {
+        fn exercise(limit: i64) -> (crate::vm::Vm<'static>, Result<Value, crate::vm::Thrown>) {
             let mut vm = crate::vm::Vm::new(program(SRC));
             let mut rec = Recorder::new();
             rec.remaining = limit;
@@ -1390,10 +1380,7 @@ mod tests {
         let (mut short, result) = exercise(exact_steps as i64 - 1);
         let err = result.expect_err("one fewer step must reject the native call");
         assert!(err.0.contains("instruction budget"), "got {err:?}");
-        assert_eq!(
-            short.instrument_resource_limit_error(),
-            Some(BUDGET_MSG)
-        );
+        assert_eq!(short.instrument_resource_limit_error(), Some(BUDGET_MSG));
     }
 
     #[test]
@@ -1413,13 +1400,11 @@ mod tests {
             aborted.instr_rec.as_ref().unwrap().exhaustion,
             Some(ResourceExhaustion::Abort)
         );
-        assert_eq!(
-            aborted.instrument_resource_limit_error(),
-            Some(ABORT_MSG)
-        );
+        assert_eq!(aborted.instrument_resource_limit_error(), Some(ABORT_MSG));
 
         let mut heap = instrumented_vm("var answer = 42;");
-        heap.run().expect("short run need not hit the periodic heap poll");
+        heap.run()
+            .expect("short run need not hit the periodic heap poll");
         heap.instr_rec.as_mut().unwrap().heap_limit = 0;
         assert_eq!(
             heap.instrument_resource_limit_error(),
@@ -1501,11 +1486,13 @@ mod tests {
             failed.instr_rec.as_ref().unwrap().exhaustion,
             Some(ResourceExhaustion::DynamicCalls)
         );
-        assert!(failed.eval_funcs.is_empty(), "neither malformed source installs code");
-
-        let mut oversized = instrumented_vm(
-            "try { Function('('.repeat(128)); } catch (_) {} var after = 1;",
+        assert!(
+            failed.eval_funcs.is_empty(),
+            "neither malformed source installs code"
         );
+
+        let mut oversized =
+            instrumented_vm("try { Function('('.repeat(128)); } catch (_) {} var after = 1;");
         oversized.set_dynamic_code_limits(64, 4096, 16, 128, 32);
         oversized
             .run()
@@ -1514,11 +1501,12 @@ mod tests {
             oversized.instr_rec.as_ref().unwrap().exhaustion,
             Some(ResourceExhaustion::DynamicSource)
         );
-        assert!(oversized.eval_funcs.is_empty(), "oversized source installs no code");
-
-        let mut valid = instrumented_vm(
-            "var made = Function('return 7'); var answer = made();",
+        assert!(
+            oversized.eval_funcs.is_empty(),
+            "oversized source installs no code"
         );
+
+        let mut valid = instrumented_vm("var made = Function('return 7'); var answer = made();");
         valid.set_dynamic_code_limits(1024, 4096, 1, 128, 32);
         valid
             .run()
@@ -1540,11 +1528,13 @@ mod tests {
             functions.instr_rec.as_ref().unwrap().exhaustion,
             Some(ResourceExhaustion::DynamicFunctions)
         );
-        assert!(functions.eval_funcs.is_empty(), "rejection must precede leaks");
-
-        let mut classes = instrumented_vm(
-            "try { eval('class A {}; class B {}'); } catch (_) {} var after = 1;",
+        assert!(
+            functions.eval_funcs.is_empty(),
+            "rejection must precede leaks"
         );
+
+        let mut classes =
+            instrumented_vm("try { eval('class A {}; class B {}'); } catch (_) {} var after = 1;");
         classes.set_dynamic_code_limits(1024, 4096, 16, 128, 1);
         classes
             .run()
@@ -1553,7 +1543,13 @@ mod tests {
             classes.instr_rec.as_ref().unwrap().exhaustion,
             Some(ResourceExhaustion::DynamicClasses)
         );
-        assert!(classes.eval_funcs.is_empty(), "rejection must precede leaks");
-        assert!(classes.eval_classes.is_empty(), "rejection must precede leaks");
+        assert!(
+            classes.eval_funcs.is_empty(),
+            "rejection must precede leaks"
+        );
+        assert!(
+            classes.eval_classes.is_empty(),
+            "rejection must precede leaks"
+        );
     }
 }

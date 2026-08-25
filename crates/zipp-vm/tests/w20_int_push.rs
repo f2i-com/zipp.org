@@ -458,11 +458,7 @@ console.log("store " + h + ":" + first.length + ":" + swap.length + ":" + bb.len
 fn push3_home_pressure_case(n: usize) -> String {
     let decls: String = (0..20).map(|j| format!("p{j} = 0, ")).collect();
     let pressure: String = (0..20)
-        .map(|j| {
-            format!(
-                "    p{j} = (i + {j}) | 0; h = (h + p{j}) | 0;\n"
-            )
-        })
+        .map(|j| format!("    p{j} = (i + {j}) | 0; h = (h + p{j}) | 0;\n"))
         .collect();
     format!(
         r#"var aa = [], bb = [], cc = [];
@@ -572,10 +568,7 @@ fn intpush3_off_switch_and_atomic_helper_replay_match_node() {
 
     let pressure = push3_home_pressure_case(400);
     assert_eq!(
-        child_output(
-            &pressure,
-            &[("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE", "1")]
-        ),
+        child_output(&pressure, &[("ZIPP_TEST_FORCE_INT_PUSH3_DECLINE", "1")]),
         node_output(&pressure),
         "forced decline corrupted a home-reuse pressure region"
     );
@@ -977,10 +970,7 @@ fn intpush3_mechanism_engages_declines_atomically_and_switches_off() {
         "split-mode forced decline did not batch and replay; log was:\n{split_forced}"
     );
 
-    let receiver_store = jitlog_of(
-        &push3_receiver_store_case(),
-        &[("ZIPP_JIT_THRESHOLD", "1")],
-    );
+    let receiver_store = jitlog_of(&push3_receiver_store_case(), &[("ZIPP_JIT_THRESHOLD", "1")]);
     assert!(
         !receiver_store.contains("array-push3 groups="),
         "batch ignored an in-region receiver-global store; log was:\n{receiver_store}"
@@ -1047,8 +1037,7 @@ fn push_pin_filter_is_tier_specific_and_non_vacuous() {
     assert!(
         shared.contains("[jit] MEM region fn")
             && shared.lines().any(|line| {
-                line.contains("fallback push-pin filter")
-                    && !line.contains("retained_shared=0")
+                line.contains("fallback push-pin filter") && !line.contains("retained_shared=0")
             }),
         "push+GetIndex receiver was not retained as a shared fallback pin; log was:\n{shared}"
     );

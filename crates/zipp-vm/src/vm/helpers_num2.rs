@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -149,7 +149,11 @@ pub(crate) fn f16_round(x: f64) -> f64 {
     // Largest finite half is 65504; the round-to-nearest-even tie point to infinity
     // is 65520 (midpoint between 65504 and 2^16).
     if a >= 65520.0 {
-        return if neg { f64::NEG_INFINITY } else { f64::INFINITY };
+        return if neg {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
     }
     // Determine the binade exponent e with 2^e <= a < 2^(e+1) (robust to log2 noise).
     let mut e = a.log2().floor() as i32;
@@ -178,9 +182,9 @@ pub(crate) fn f16_bits_to_f64(bits: u16) -> f64 {
     let exp = (bits >> 10) & 0x1f;
     let mant = (bits & 0x3ff) as f64;
     match exp {
-        0 => sign * mant * 2f64.powi(-24),            // subnormal (±0 when mant == 0)
-        0x1f if mant == 0.0 => sign * f64::INFINITY,  // ±Infinity
-        0x1f => f64::NAN,                             // NaN
+        0 => sign * mant * 2f64.powi(-24), // subnormal (±0 when mant == 0)
+        0x1f if mant == 0.0 => sign * f64::INFINITY, // ±Infinity
+        0x1f => f64::NAN,                  // NaN
         _ => sign * (1.0 + mant / 1024.0) * 2f64.powi((exp as i32) - 15),
     }
 }
@@ -344,7 +348,11 @@ pub(crate) fn sum_precise(nums: &[f64]) -> f64 {
     let q0 = {
         let (idx, sh) = ((ulp / 64) as usize, (ulp % 64) as u32);
         let lo = limbs[idx] >> sh;
-        let hi = if sh > 0 && idx + 1 < LIMBS { limbs[idx + 1] << (64 - sh) } else { 0 };
+        let hi = if sh > 0 && idx + 1 < LIMBS {
+            limbs[idx + 1] << (64 - sh)
+        } else {
+            0
+        };
         lo | hi
     };
     let round = ulp > 0 && bit_at(ulp - 1);
@@ -352,7 +360,11 @@ pub(crate) fn sum_precise(nums: &[f64]) -> f64 {
         let (idx, sh) = (((ulp - 1) / 64) as usize, ((ulp - 1) % 64) as u32);
         limbs[..idx].iter().any(|&l| l != 0) || (limbs[idx] & ((1u64 << sh) - 1)) != 0
     };
-    let q = if round && (sticky || q0 & 1 == 1) { q0 + 1 } else { q0 };
+    let q = if round && (sticky || q0 & 1 == 1) {
+        q0 + 1
+    } else {
+        q0
+    };
     // Exact power of two for the scale; q·2^(ulp−1074) is exact (≤ 53
     // significant bits landing on representable weights), and a magnitude at
     // or beyond 2^1024 overflows to Infinity in the multiply per IEEE 754 —
@@ -395,7 +407,11 @@ pub(crate) fn num_is_finite(v: Value) -> bool {
 /// `Number.isSafeInteger`: an integer within ±(2^53 − 1).
 pub(crate) fn num_is_safe_integer(v: Value) -> bool {
     num_is_integer(v) && {
-        let n = if v.is_int() { v.as_int() as f64 } else { v.as_f64() };
+        let n = if v.is_int() {
+            v.as_int() as f64
+        } else {
+            v.as_f64()
+        };
         n.abs() <= 9_007_199_254_740_991.0
     }
 }
@@ -509,18 +525,38 @@ pub(crate) fn time_clip(n: f64) -> f64 {
 pub(crate) fn date_to_iso(ms: f64) -> String {
     let (y, mo0, d, h, mi, s, mss, _) = date_parts(ms);
     if (0..=9999).contains(&y) {
-        format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, mo0 + 1, d, h, mi, s, mss)
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            y,
+            mo0 + 1,
+            d,
+            h,
+            mi,
+            s,
+            mss
+        )
     } else {
         let sign = if y < 0 { '-' } else { '+' };
-        format!("{}{:06}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", sign, y.abs(), mo0 + 1, d, h, mi, s, mss)
+        format!(
+            "{}{:06}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            sign,
+            y.abs(),
+            mo0 + 1,
+            d,
+            h,
+            mi,
+            s,
+            mss
+        )
     }
 }
 
 /// Abbreviated weekday names, `date_parts` weekday order (0 = Sunday).
 const WEEKDAY: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 /// Abbreviated month names, 0-based (`date_parts` month0 order).
-const MONTH: [&str; 12] =
-    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTH: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 /// A year zero-padded to at least 4 digits, a negative year sign-prefixed
 /// (`-1` → `-0001`, `20` → `0020`, `2014` → `2014`) — the year field shared by the
@@ -536,7 +572,13 @@ fn fmt_year(y: i64) -> String {
 /// `Date.prototype.toDateString`: `"Thu Jan 01 1970"` (Weekday Mon DD YYYY, UTC).
 pub(crate) fn date_to_date_string(ms: f64) -> String {
     let (y, mo0, d, _, _, _, _, wd) = date_parts(ms);
-    format!("{} {} {:02} {}", WEEKDAY[wd as usize], MONTH[mo0 as usize], d, fmt_year(y))
+    format!(
+        "{} {} {:02} {}",
+        WEEKDAY[wd as usize],
+        MONTH[mo0 as usize],
+        d,
+        fmt_year(y)
+    )
 }
 
 /// `Date.prototype.toTimeString`: `"00:00:00 GMT+0000"`. The engine is UTC-only, so
@@ -561,7 +603,13 @@ pub(crate) fn date_to_utc_string(ms: f64) -> String {
     let (y, mo0, d, h, mi, s, _, wd) = date_parts(ms);
     format!(
         "{}, {:02} {} {} {:02}:{:02}:{:02} GMT",
-        WEEKDAY[wd as usize], d, MONTH[mo0 as usize], fmt_year(y), h, mi, s
+        WEEKDAY[wd as usize],
+        d,
+        MONTH[mo0 as usize],
+        fmt_year(y),
+        h,
+        mi,
+        s
     )
 }
 
@@ -892,7 +940,11 @@ fn parse_legacy_date(s: &str) -> f64 {
             let word = &s[start..i];
             // V8 keys its keyword table on the first three letters and ignores
             // whatever follows, so `March` and `Mar` are the same token.
-            let key: String = word.chars().take(3).flat_map(|c| c.to_lowercase()).collect();
+            let key: String = word
+                .chars()
+                .take(3)
+                .flat_map(|c| c.to_lowercase())
+                .collect();
             if let Some(m) = MONTH.iter().position(|x| x.eq_ignore_ascii_case(&key)) {
                 if named_month.is_some() {
                     return f64::NAN;
@@ -939,7 +991,11 @@ fn parse_legacy_date(s: &str) -> f64 {
             }
         }
         Some(m) => {
-            let (y, d) = if !is_day_num(nums[0]) { (nums[0], nums[1]) } else { (nums[1], nums[0]) };
+            let (y, d) = if !is_day_num(nums[0]) {
+                (nums[0], nums[1])
+            } else {
+                (nums[1], nums[0])
+            };
             (y, m + 1, d)
         }
     };
@@ -969,8 +1025,7 @@ fn parse_legacy_date(s: &str) -> f64 {
     if h > 24 || mi > 59 || sec > 59 || (h == 24 && (mi != 0 || sec != 0 || ms != 0)) {
         return f64::NAN;
     }
-    ms_from_utc(year, month - 1, day, h, mi, sec, ms)
-        - offset_min.unwrap_or(0) as f64 * 60_000.0
+    ms_from_utc(year, month - 1, day, h, mi, sec, ms) - offset_min.unwrap_or(0) as f64 * 60_000.0
 }
 
 /// Read a run of ASCII digits at `i` (at least one), advancing `i`.
@@ -1000,7 +1055,11 @@ pub(crate) fn to_fixed(n: f64, f: usize) -> String {
         return "NaN".into();
     }
     if n.is_infinite() {
-        return if n > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        return if n > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
     }
     if n.abs() >= 1e21 {
         // JS switches to exponential here — use the ECMAScript Number→String
@@ -1053,7 +1112,11 @@ pub(crate) fn num_to_radix(n: f64, radix: u32) -> String {
         return "NaN".into();
     }
     if n.is_infinite() {
-        return if n > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        return if n > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
     }
     let neg = n < 0.0;
     let mut int = n.abs().trunc() as u64;
@@ -1217,7 +1280,11 @@ mod fmt_f64_int_fast_path_tests {
             // What the code did before the fast path, for the integral branch.
             let neg = n < 0.0;
             let abs = n.abs();
-            if neg { format!("-{abs}") } else { format!("{abs}") }
+            if neg {
+                format!("-{abs}")
+            } else {
+                format!("{abs}")
+            }
         }
         let mut vals: Vec<f64> = Vec::new();
         for i in 0..2000u64 {

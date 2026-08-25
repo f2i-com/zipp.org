@@ -27,8 +27,7 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         // A data descriptor carries an own "value" key; an accessor carries get/set.
-        let is_data =
-            matches!(self.heap.get(desc.heap_index()), HeapObj::Object(m) if m.pos("value").is_some());
+        let is_data = matches!(self.heap.get(desc.heap_index()), HeapObj::Object(m) if m.pos("value").is_some());
         if is_data {
             let wv = self.get_prop(desc, "writable")?;
             let writable = self.truthy(wv);
@@ -37,7 +36,13 @@ impl<'p> Vm<'p> {
         } else {
             let g = self.get_prop(desc, "get")?;
             let s = self.get_prop(desc, "set")?;
-            Ok(Some((false, Value::UNDEFINED, false, g != Value::UNDEFINED, s != Value::UNDEFINED)))
+            Ok(Some((
+                false,
+                Value::UNDEFINED,
+                false,
+                g != Value::UNDEFINED,
+                s != Value::UNDEFINED,
+            )))
         }
     }
 
@@ -98,7 +103,9 @@ impl<'p> Vm<'p> {
             None => return Ok(None),
         };
         if revoked {
-            return Err(Thrown("TypeError: Cannot perform 'isExtensible' on a revoked proxy".into()));
+            return Err(Thrown(
+                "TypeError: Cannot perform 'isExtensible' on a revoked proxy".into(),
+            ));
         }
         match self.proxy_trap(handler, "isExtensible")? {
             Some(trap) => {
@@ -118,8 +125,15 @@ impl<'p> Vm<'p> {
                 }
                 let ext = match self.heap.get(target.heap_index()) {
                     HeapObj::Object(m) => m.extensible,
-                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => false,
-                    _ => self.arr_props.get(&target.heap_index()).map_or(true, |m| m.extensible),
+                    HeapObj::Str(_)
+                    | HeapObj::Cons { .. }
+                    | HeapObj::Symbol { .. }
+                    | HeapObj::BigInt(_)
+                    | HeapObj::BigIntBig(_) => false,
+                    _ => self
+                        .arr_props
+                        .get(&target.heap_index())
+                        .map_or(true, |m| m.extensible),
                 };
                 Ok(Some(ext))
             }
@@ -167,9 +181,16 @@ impl<'p> Vm<'p> {
                     self.heap.bump_version(ti);
                 } else if !matches!(
                     self.heap.get(ti),
-                    HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+                    HeapObj::Str(_)
+                        | HeapObj::Cons { .. }
+                        | HeapObj::Symbol { .. }
+                        | HeapObj::BigInt(_)
+                        | HeapObj::BigIntBig(_)
                 ) {
-                    self.arr_props.entry(ti).or_insert_with(ObjMap::new_side_table).extensible = false;
+                    self.arr_props
+                        .entry(ti)
+                        .or_insert_with(ObjMap::new_side_table)
+                        .extensible = false;
                 }
                 Ok(Some(true))
             }
@@ -188,7 +209,9 @@ impl<'p> Vm<'p> {
             None => return Ok(None),
         };
         if revoked {
-            return Err(Thrown("TypeError: Cannot perform 'ownKeys' on a revoked proxy".into()));
+            return Err(Thrown(
+                "TypeError: Cannot perform 'ownKeys' on a revoked proxy".into(),
+            ));
         }
         match self.proxy_trap(handler, "ownKeys")? {
             Some(trap) => {
@@ -208,8 +231,8 @@ impl<'p> Vm<'p> {
                 let mut seen: Vec<String> = Vec::with_capacity(items.len());
                 for k in &items {
                     let is_str = k.is_heap() && self.heap.is_str_like(k.heap_index());
-                    let is_sym =
-                        k.is_heap() && matches!(self.heap.get(k.heap_index()), HeapObj::Symbol { .. });
+                    let is_sym = k.is_heap()
+                        && matches!(self.heap.get(k.heap_index()), HeapObj::Symbol { .. });
                     if !is_str && !is_sym {
                         return Err(Thrown(
                             "TypeError: ownKeys trap result must contain only Strings and Symbols"
@@ -223,7 +246,8 @@ impl<'p> Vm<'p> {
                     };
                     if seen.contains(&id) {
                         return Err(Thrown(
-                            "TypeError: ownKeys trap result must not contain duplicate entries".into(),
+                            "TypeError: ownKeys trap result must not contain duplicate entries"
+                                .into(),
                         ));
                     }
                     seen.push(id);
@@ -307,5 +331,4 @@ impl<'p> Vm<'p> {
             }
         }
     }
-
 }

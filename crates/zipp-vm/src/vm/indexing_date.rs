@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -37,7 +37,8 @@ impl<'p> Vm<'p> {
             // Symbol Value — `key_of` maps it to its "@@…" form — rather than wrongly
             // throwing on a stringify; any other primitive is ToString'd.
             let prim = self.to_primitive_string(key)?;
-            if prim.is_heap() && matches!(self.heap.get(prim.heap_index()), HeapObj::Symbol { .. }) {
+            if prim.is_heap() && matches!(self.heap.get(prim.heap_index()), HeapObj::Symbol { .. })
+            {
                 return Ok(prim);
             }
             let s = self.to_js_string(prim)?;
@@ -85,8 +86,10 @@ impl<'p> Vm<'p> {
         if key.is_heap() {
             let oidx = obj.heap_index();
             if !(oidx == self.global_this && self.global_this != 0)
-                && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&oidx))
-                && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&oidx))
+                && !(!self.module_namespaces.is_empty()
+                    && self.module_namespaces.contains_key(&oidx))
+                && !(!self.deferred_ns_state.is_empty()
+                    && self.deferred_ns_state.contains_key(&oidx))
             {
                 if let Some(std::borrow::Cow::Borrowed(b)) =
                     self.heap.str_wtf8_cow(key.heap_index())
@@ -360,8 +363,10 @@ impl<'p> Vm<'p> {
             }
             let pidx = proto.heap_index();
             if (pidx == self.global_this && self.global_this != 0)
-                || (!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&pidx))
-                || (!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&pidx))
+                || (!self.module_namespaces.is_empty()
+                    && self.module_namespaces.contains_key(&pidx))
+                || (!self.deferred_ns_state.is_empty()
+                    && self.deferred_ns_state.contains_key(&pidx))
             {
                 return false;
             }
@@ -395,7 +400,9 @@ impl<'p> Vm<'p> {
         self.store_barrier_v(crate::heap::gcoracle::SET_INDEX, obj, val);
         if !obj.is_heap() {
             if obj.is_nullish() {
-                return Err(Thrown("TypeError: cannot set property of non-object".into()));
+                return Err(Thrown(
+                    "TypeError: cannot set property of non-object".into(),
+                ));
             }
             // PutValue 6: a non-nullish PRIMITIVE base (a number or a boolean —
             // the heap primitives are heap values and fall through) is ToObject'd
@@ -505,7 +512,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::Class(_)
                 | HeapObj::Bound { .. }
                 | HeapObj::Wrapped { .. }
-                | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. }
                 | HeapObj::Proxy { .. }
         ) {
             let k = self.key_of(key);
@@ -593,7 +601,7 @@ impl<'p> Vm<'p> {
                         && i >= self.js_array_len(idx)))
             {
                 self.reject_write(&self.key_of(key), strict)?;
-            return Ok(());
+                return Ok(());
             }
         }
         // An ARGUMENTS object's `length` is a fixed own data property (argc):
@@ -605,7 +613,10 @@ impl<'p> Vm<'p> {
                 && matches!(self.heap.get(idx), HeapObj::Array(items) if i >= items.len())
             {
                 let k = self.key_of(key);
-                self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).set(&k, val);
+                self.arr_props
+                    .entry(idx)
+                    .or_insert_with(ObjMap::new_side_table)
+                    .set(&k, val);
                 self.heap.bump_version(idx);
                 return Ok(());
             }
@@ -683,8 +694,10 @@ impl<'p> Vm<'p> {
         if key.is_int() && obj.is_heap() {
             let oidx = obj.heap_index();
             if !(oidx == self.global_this && self.global_this != 0)
-                && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&oidx))
-                && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&oidx))
+                && !(!self.module_namespaces.is_empty()
+                    && self.module_namespaces.contains_key(&oidx))
+                && !(!self.deferred_ns_state.is_empty()
+                    && self.deferred_ns_state.contains_key(&oidx))
                 && matches!(self.heap.get(oidx), HeapObj::Object(_))
             {
                 let mut scratch = std::mem::take(&mut self.idx_key_scratch);
@@ -744,9 +757,7 @@ impl<'p> Vm<'p> {
 
         let (hit, add) = match self.heap.get(idx) {
             HeapObj::Object(m) if key != "__proto__" => match m.pos(key) {
-                Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => {
-                    (Some(i), false)
-                }
+                Some(i) if !m.attrs[i].accessor && m.attrs[i].writable => (Some(i), false),
                 Some(_) => (None, false),
                 None => (
                     None,
@@ -827,17 +838,19 @@ impl<'p> Vm<'p> {
         if key.is_int() && obj.is_heap() {
             let oidx = obj.heap_index();
             if !(oidx == self.global_this && self.global_this != 0)
-                && !(!self.module_namespaces.is_empty() && self.module_namespaces.contains_key(&oidx))
-                && !(!self.deferred_ns_state.is_empty() && self.deferred_ns_state.contains_key(&oidx))
+                && !(!self.module_namespaces.is_empty()
+                    && self.module_namespaces.contains_key(&oidx))
+                && !(!self.deferred_ns_state.is_empty()
+                    && self.deferred_ns_state.contains_key(&oidx))
                 && matches!(self.heap.get(oidx), HeapObj::Object(_))
             {
                 let mut scratch = std::mem::take(&mut self.idx_key_scratch);
                 self.build_concat_key(&mut scratch, name, key.as_int(), func_id);
                 let r = self.delete_property(obj, &scratch);
                 let out = match r {
-                    Ok(v) if strict && v == Value::bool(false) => {
-                        Err(Thrown(format!("TypeError: Cannot delete property '{scratch}'")))
-                    }
+                    Ok(v) if strict && v == Value::bool(false) => Err(Thrown(format!(
+                        "TypeError: Cannot delete property '{scratch}'"
+                    ))),
                     other => other,
                 };
                 self.idx_key_scratch = scratch;
@@ -897,7 +910,10 @@ impl<'p> Vm<'p> {
                 // is ToNumber'd (so `new Date({valueOf:()=>1000})` works).
                 let prim = self.to_primitive_default(a)?;
                 if prim.is_heap()
-                    && matches!(self.heap.get(prim.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. })
+                    && matches!(
+                        self.heap.get(prim.heap_index()),
+                        HeapObj::Str(_) | HeapObj::Cons { .. }
+                    )
                 {
                     let s = self.heap.str_cow(prim.heap_index()).unwrap().into_owned();
                     return Ok(parse_date(&s));
@@ -955,7 +971,12 @@ impl<'p> Vm<'p> {
 
     /// Dispatch a method on a `Date` receiver (`idx` is its heap index). All
     /// getters/setters are UTC. Returns `Ok(None)` if `name` isn't a Date method.
-    pub(crate) fn date_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn date_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
         let ms = match self.heap.get(idx) {
             HeapObj::Date(m) => *m,
             // thisTimeValue brand check: every Date.prototype method requires a
@@ -964,7 +985,13 @@ impl<'p> Vm<'p> {
             _ => return Err(Thrown("TypeError: this is not a Date object".into())),
         };
         let p = date_parts(ms); // (year, month0, day, hour, min, sec, ms, weekday)
-        let field = |v: i64| if ms.is_nan() { Value::num(f64::NAN) } else { Value::num(v as f64) };
+        let field = |v: i64| {
+            if ms.is_nan() {
+                Value::num(f64::NAN)
+            } else {
+                Value::num(v as f64)
+            }
+        };
         let r = match name {
             "getTime" | "valueOf" => Value::num(ms),
             // `Date.prototype.toTemporalInstant()` → a Temporal.Instant at the date's
@@ -1057,7 +1084,11 @@ impl<'p> Vm<'p> {
                     Value::num(f64::NAN)
                 } else {
                     let yi = y as i64;
-                    let full = if (0..=99).contains(&yi) { 1900 + yi } else { yi };
+                    let full = if (0..=99).contains(&yi) {
+                        1900 + yi
+                    } else {
+                        yi
+                    };
                     self.date_set(idx, &p, &[Value::num(full as f64)], 0)?
                 }
             }
@@ -1125,12 +1156,13 @@ impl<'p> Vm<'p> {
         let ms = if any_nan {
             f64::NAN
         } else {
-            time_clip(ms_from_utc(comp[0], comp[1], comp[2], comp[3], comp[4], comp[5], comp[6]))
+            time_clip(ms_from_utc(
+                comp[0], comp[1], comp[2], comp[3], comp[4], comp[5], comp[6],
+            ))
         };
         if let HeapObj::Date(m) = self.heap.get_mut(idx) {
             *m = ms;
         }
         Ok(Value::num(ms))
     }
-
 }

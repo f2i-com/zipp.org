@@ -19,6 +19,21 @@
 use super::*;
 use crate::bytecode::{BitwiseOp, Instr};
 
+/// Test-only fault injection at a deliberately post-commit point. Production
+/// builds inline the empty sibling away; unit tests use the unwind to prove the
+/// native FFI boundary cannot translate partially committed state into a replay.
+#[cfg(test)]
+#[inline(never)]
+fn test_panic_after_first_global_commit() {
+    if std::env::var_os("ZIPP_TEST_FIELD_STREAM_POST_COMMIT_PANIC").is_some() {
+        panic!("field-stream post-commit test panic");
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn test_panic_after_first_global_commit() {}
+
 /// Where an exact cyclic field loop reads its invariant upper bound. Captured
 /// limits are read from the running closure on every prefix entry; they are not
 /// baked into the plan, so mutation between calls remains observable.
@@ -239,12 +254,19 @@ fn recognize_mask_read(
     };
     let (mask_reg, mask) = match c[start + 6] {
         Instr::LoadInt { dst, val }
-            if val >= 0 && ((val as u32).wrapping_add(1)).is_power_of_two() => (dst, val),
+            if val >= 0 && ((val as u32).wrapping_add(1)).is_power_of_two() =>
+        {
+            (dst, val)
+        }
         _ => return None,
     };
     let index = match c[start + 7] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::And }
-            if a == i_index && b == mask_reg => dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::And,
+        } if a == i_index && b == mask_reg => dst,
         _ => return None,
     };
     let receiver = match c[start + 8] {
@@ -264,7 +286,12 @@ fn recognize_mask_read(
         _ => return None,
     };
     let reduced = match c[start + 12] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::Or } if a == add && b == zero => dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Or,
+        } if a == add && b == zero => dst,
         _ => return None,
     };
     match c[start + 13] {
@@ -277,12 +304,16 @@ fn recognize_mask_read(
         _ => return None,
     };
     match c[start + 15] {
-        Instr::AddInt { dst, a, imm: 1, upd: true } if dst == i_tail && a == i_tail => {}
+        Instr::AddInt {
+            dst,
+            a,
+            imm: 1,
+            upd: true,
+        } if dst == i_tail && a == i_tail => {}
         _ => return None,
     }
     match c[start + 16] {
-        Instr::StoreGlobalResolved { idx, src }
-            if idx == i_global && src == i_tail => {}
+        Instr::StoreGlobalResolved { idx, src } if idx == i_global && src == i_tail => {}
         _ => return None,
     }
     if !matches!(c[start + 17], Instr::Jump { target } if target as usize == start) {
@@ -355,7 +386,12 @@ fn recognize_global_field_sum(
         _ => return None,
     };
     let reduced = match c[cursor + 1] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::Or } if a == acc && b == zero => dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Or,
+        } if a == acc && b == zero => dst,
         _ => return None,
     };
     match c[cursor + 2] {
@@ -368,7 +404,12 @@ fn recognize_global_field_sum(
         _ => return None,
     };
     match c[cursor + 4] {
-        Instr::AddInt { dst, a, imm: 1, upd: true } if dst == i_tail && a == i_tail => {}
+        Instr::AddInt {
+            dst,
+            a,
+            imm: 1,
+            upd: true,
+        } if dst == i_tail && a == i_tail => {}
         _ => return None,
     }
     match c[cursor + 5] {
@@ -386,7 +427,11 @@ fn recognize_global_field_sum(
     })
 }
 
-fn recognize_mixed(proto: &crate::bytecode::FuncProto, start: usize, end: usize) -> Option<FieldMixedLoop> {
+fn recognize_mixed(
+    proto: &crate::bytecode::FuncProto,
+    start: usize,
+    end: usize,
+) -> Option<FieldMixedLoop> {
     if end.checked_sub(start)? != 26 || end + 1 >= proto.code.len() {
         return None;
     }
@@ -414,12 +459,19 @@ fn recognize_mixed(proto: &crate::bytecode::FuncProto, start: usize, end: usize)
     };
     let (object_mask_reg, object_mask) = match c[start + 5] {
         Instr::LoadInt { dst, val }
-            if val >= 0 && ((val as u32).wrapping_add(1)).is_power_of_two() => (dst, val),
+            if val >= 0 && ((val as u32).wrapping_add(1)).is_power_of_two() =>
+        {
+            (dst, val)
+        }
         _ => return None,
     };
     let index = match c[start + 6] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::And }
-            if a == i_index && b == object_mask_reg => dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::And,
+        } if a == i_index && b == object_mask_reg => dst,
         _ => return None,
     };
     let receiver = match c[start + 7] {
@@ -440,12 +492,19 @@ fn recognize_mixed(proto: &crate::bytecode::FuncProto, start: usize, end: usize)
     };
     let (value_mask_reg, value_mask) = match c[start + 11] {
         Instr::LoadInt { dst, val }
-            if val >= 0 && ((val as u32).wrapping_add(1)).is_power_of_two() => (dst, val),
+            if val >= 0 && ((val as u32).wrapping_add(1)).is_power_of_two() =>
+        {
+            (dst, val)
+        }
         _ => return None,
     };
     let masked_value = match c[start + 12] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::And }
-            if a == i_value && b == value_mask_reg => dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::And,
+        } if a == i_value && b == value_mask_reg => dst,
         _ => return None,
     };
     let (add_reg, add) = match c[start + 13] {
@@ -457,8 +516,12 @@ fn recognize_mixed(proto: &crate::bytecode::FuncProto, start: usize, end: usize)
         _ => return None,
     };
     let set_name = match c[start + 15] {
-        Instr::SetProp { obj, name, val, strict: false }
-            if obj == receiver_for_set && val == value => name,
+        Instr::SetProp {
+            obj,
+            name,
+            val,
+            strict: false,
+        } if obj == receiver_for_set && val == value => name,
         _ => return None,
     };
     let (sum, sum_global) = match c[start + 16] {
@@ -482,7 +545,12 @@ fn recognize_mixed(proto: &crate::bytecode::FuncProto, start: usize, end: usize)
         _ => return None,
     };
     let reduced = match c[start + 21] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::Or } if a == added && b == zero => dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Or,
+        } if a == added && b == zero => dst,
         _ => return None,
     };
     match c[start + 22] {
@@ -495,7 +563,12 @@ fn recognize_mixed(proto: &crate::bytecode::FuncProto, start: usize, end: usize)
         _ => return None,
     };
     match c[start + 24] {
-        Instr::AddInt { dst, a, imm: 1, upd: true } if dst == i_tail && a == i_tail => {}
+        Instr::AddInt {
+            dst,
+            a,
+            imm: 1,
+            upd: true,
+        } if dst == i_tail && a == i_tail => {}
         _ => return None,
     }
     match c[start + 25] {
@@ -505,8 +578,18 @@ fn recognize_mixed(proto: &crate::bytecode::FuncProto, start: usize, end: usize)
     if !matches!(c[start + 26], Instr::Jump { target } if target as usize == start) {
         return None;
     }
-    let globals = [array_global, receiver_global, sum_global, i_global, limit_global];
-    if globals.iter().enumerate().any(|(i, g)| globals[..i].contains(g)) {
+    let globals = [
+        array_global,
+        receiver_global,
+        sum_global,
+        i_global,
+        limit_global,
+    ];
+    if globals
+        .iter()
+        .enumerate()
+        .any(|(i, g)| globals[..i].contains(g))
+    {
         return None;
     }
     Some(FieldMixedLoop {
@@ -650,9 +733,7 @@ impl<'p> Vm<'p> {
         }
         match self.heap.get(callable.heap_index()) {
             HeapObj::Func(fid) => Some(*fid as usize),
-            HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => {
-                Some(*func as usize)
-            }
+            HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => Some(*func as usize),
             _ => None,
         }
     }
@@ -685,11 +766,11 @@ impl<'p> Vm<'p> {
             [Instr::GetProp { dst, obj: 0, name }, Instr::Return { src }] if dst == src => {
                 getter_proto.string_constants.get(*name as usize)?
             }
-            [
-                Instr::GetProp { dst, obj: 0, name },
-                Instr::Return { src },
-                Instr::ReturnUndefined,
-            ] if dst == src => getter_proto.string_constants.get(*name as usize)?,
+            [Instr::GetProp { dst, obj: 0, name }, Instr::Return { src }, Instr::ReturnUndefined]
+                if dst == src =>
+            {
+                getter_proto.string_constants.get(*name as usize)?
+            }
             _ => return None,
         };
         let receiver_idx = receiver.heap_index();
@@ -803,20 +884,29 @@ impl<'p> Vm<'p> {
             [Instr::GetProp { dst, obj: 0, name }, Instr::Return { src }] if dst == src => {
                 getter_proto.string_constants.get(*name as usize)?
             }
-            [
-                Instr::GetProp { dst, obj: 0, name },
-                Instr::Return { src },
-                Instr::ReturnUndefined,
-            ] if dst == src => getter_proto.string_constants.get(*name as usize)?,
+            [Instr::GetProp { dst, obj: 0, name }, Instr::Return { src }, Instr::ReturnUndefined]
+                if dst == src =>
+            {
+                getter_proto.string_constants.get(*name as usize)?
+            }
             _ => return None,
         };
         let setter_name = match setter_proto.code.as_slice() {
-            [
-                Instr::LoadInt { dst: zero, val: 0 },
-                Instr::Bitwise { dst: value, a: 1, b, op: BitwiseOp::Or },
-                Instr::SetProp { obj: 0, name, val, strict: false },
-                Instr::ReturnUndefined,
-            ] if b == zero && val == value => setter_proto.string_constants.get(*name as usize)?,
+            [Instr::LoadInt { dst: zero, val: 0 }, Instr::Bitwise {
+                dst: value,
+                a: 1,
+                b,
+                op: BitwiseOp::Or,
+            }, Instr::SetProp {
+                obj: 0,
+                name,
+                val,
+                strict: false,
+            }, Instr::ReturnUndefined]
+                if b == zero && val == value =>
+            {
+                setter_proto.string_constants.get(*name as usize)?
+            }
             _ => return None,
         };
         if getter_name != setter_name {
@@ -1029,8 +1119,7 @@ impl<'p> Vm<'p> {
             .into_iter()
             .chain(p.terms.iter().map(|&(g, _)| g))
             .any(|g| g as usize >= self.globals.len())
-            || p
-                .terms
+            || p.terms
                 .iter()
                 .any(|&(_, name)| name as usize >= proto.string_constants.len())
         {
@@ -1058,6 +1147,10 @@ impl<'p> Vm<'p> {
         let remaining = (limit - i) as u32;
         let sum = (sum_v.as_int() as u32).wrapping_add(delta.wrapping_mul(remaining));
         self.globals[p.sum_global as usize] = Value::int(sum as i32);
+        // The sum is now observable VM state. A panic from this point onward
+        // must fail-stop at the native boundary; returning "not served" would
+        // run the original loop again and add the complete reduction twice.
+        test_panic_after_first_global_commit();
         self.globals[p.i_global as usize] = Value::int(limit);
         if std::env::var_os("ZIPP_JITLOG").is_some() {
             eprintln!(
@@ -1146,8 +1239,7 @@ impl<'p> Vm<'p> {
             cycles * (period * (period - 1) / 2) + tail * (tail - 1) / 2
         };
         let masked_sum = prefix(limit as u64) - prefix(i as u64);
-        let delta = (masked_sum as u32)
-            .wrapping_add((p.add as u32).wrapping_mul(remaining));
+        let delta = (masked_sum as u32).wrapping_add((p.add as u32).wrapping_mul(remaining));
         let sum = (sum_v.as_int() as u32).wrapping_add(delta);
 
         // Only the last write to each cyclic lane survives.  Replaying the last
@@ -1298,7 +1390,13 @@ pub(crate) extern "win64" fn jit_field_read_loop(
         let end = (packed & 0xffff) as usize;
         vm.field_read_loop(regs, func_id, start, end) as u64
     }));
-    result.unwrap_or(0)
+    match result {
+        Ok(served) => served,
+        // Reducers return `false` themselves only while still a pure prefix.
+        // An unwind can happen after a register/global commit, so replaying the
+        // unchanged region would duplicate observable effects.
+        Err(_) => std::process::abort(),
+    }
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1314,5 +1412,75 @@ pub(crate) extern "win64" fn jit_field_write_loop(
         let end = (packed & 0xffff) as usize;
         vm.field_write_loop(regs, func_id, start, end) as u64
     }));
-    result.unwrap_or(0)
+    match result {
+        Ok(served) => served,
+        // Writes may already have published one or more object slots. Never
+        // turn an invariant panic into the ordinary pre-effect decline value.
+        Err(_) => std::process::abort(),
+    }
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod panic_boundary_tests {
+    const GLOBAL_FIELD_SUM: &str = r#"
+        "use strict";
+        var LIMIT = 20007;
+        var p0 = { d0: 1 };
+        var p1 = Object.create(p0); p1.d1 = 2;
+        var p2 = Object.create(p1); p2.d2 = 3;
+        var p3 = Object.create(p2); p3.d3 = 4;
+        var p4 = Object.create(p3); p4.d4 = 5;
+        var acc = { hidden: 8 };
+        Object.defineProperty(acc, "val", {
+            get: function () { return this.hidden; }
+        });
+        var sum = -10, i = 7;
+        for (; i < LIMIT; i++) {
+            sum = (sum + p4.d0 + p4.d2 + p4.d4 + acc.val) | 0;
+        }
+        console.log(sum + ":" + i);
+    "#;
+
+    /// Child half: with the injection enabled, the global-field reducer has
+    /// already stored its new sum when it panics. If the FFI boundary ever
+    /// regresses to returning zero, native code replays the original loop and
+    /// this marker becomes visible.
+    #[test]
+    fn field_stream_post_commit_abort_child() {
+        if std::env::var_os("ZIPP_TEST_FIELD_STREAM_ABORT_CHILD").is_none() {
+            return;
+        }
+        let out = crate::run(GLOBAL_FIELD_SUM).expect("fault-injection source compiles");
+        assert!(out.error.is_none(), "unexpected JS error: {:?}", out.error);
+        println!("FIELD_STREAM_REPLAY_MARKER {:?}", out.output);
+    }
+
+    #[test]
+    fn post_commit_panic_aborts_instead_of_replaying() {
+        let exe = std::env::current_exe().expect("unit-test binary path");
+        let out = std::process::Command::new(exe)
+            .args(["field_stream_post_commit_abort_child", "--nocapture"])
+            .env("ZIPP_TEST_FIELD_STREAM_ABORT_CHILD", "1")
+            .env("ZIPP_TEST_FIELD_STREAM_POST_COMMIT_PANIC", "1")
+            .env("ZIPP_JIT_THRESHOLD", "1")
+            .env("ZIPP_JITLOG", "1")
+            .env_remove("ZIPP_NOJIT")
+            .env_remove("ZIPP_NO_FIELD_SUM_STREAM")
+            .output()
+            .expect("spawn post-commit fault child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "post-commit panic returned to the replay path:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stderr.contains("field-stream post-commit test panic"),
+            "child failed before reaching the committed reducer point:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("FIELD_STREAM_REPLAY_MARKER"),
+            "partially committed reducer was replayed:\n{stdout}\n{stderr}"
+        );
+    }
 }

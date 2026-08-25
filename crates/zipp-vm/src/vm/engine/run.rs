@@ -83,7 +83,22 @@ impl<'p> Vm<'p> {
         // only the top frame so the reservation math is relative to a known base.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         self.reserve_jit_regs();
-        self.frames.push(Frame { super_done: false, args_obj: u32::MAX, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval: false, func: 0, base, ip: 0, ret_dst: 0, closure: NO_CLOSURE, handlers: Vec::new(), new_target: Value::UNDEFINED, callee: Value::UNDEFINED });
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval: false,
+            func: 0,
+            base,
+            ip: 0,
+            ret_dst: 0,
+            closure: NO_CLOSURE,
+            handlers: Vec::new(),
+            new_target: Value::UNDEFINED,
+            callee: Value::UNDEFINED,
+        });
         // Everything allocated so far (interned strings, all built-ins, hoisted
         // top-level functions) is pinned: the GC never collects below this floor.
         self.set_gc_floor();
@@ -126,9 +141,7 @@ impl<'p> Vm<'p> {
                     _ => None,
                 };
                 if let Some((crate::heap::PromiseState::Rejected, reason)) = st {
-                    if let HeapObj::Promise { handled, .. } =
-                        self.heap.get_mut(bp.heap_index())
-                    {
+                    if let HeapObj::Promise { handled, .. } = self.heap.get_mut(bp.heap_index()) {
                         *handled = true;
                     }
                     let msg = self.throw_message(reason);
@@ -182,8 +195,7 @@ impl<'p> Vm<'p> {
                 };
                 match state {
                     Some((crate::heap::PromiseState::Rejected, r)) => {
-                        if let HeapObj::Promise { handled, .. } =
-                            self.heap.get_mut(v.heap_index())
+                        if let HeapObj::Promise { handled, .. } = self.heap.get_mut(v.heap_index())
                         {
                             *handled = true;
                         }
@@ -223,8 +235,11 @@ impl<'p> Vm<'p> {
         let p = self.alloc_async(0, NO_CLOSURE, Value::UNDEFINED, &[]);
         self.run_event_loop();
         if p.is_heap() {
-            if let HeapObj::Promise { state: PromiseState::Rejected, result, .. } =
-                self.heap.get(p.heap_index())
+            if let HeapObj::Promise {
+                state: PromiseState::Rejected,
+                result,
+                ..
+            } = self.heap.get(p.heap_index())
             {
                 let reason = *result;
                 // Render the rejection like an uncaught throw ("Name: message")
@@ -309,7 +324,12 @@ impl<'p> Vm<'p> {
         }
     }
 
-    pub(crate) fn call_value(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+    pub(crate) fn call_value(
+        &mut self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
         // The overwhelmingly common callee — a plain JS function or closure —
         // is decided by ONE heap-discriminant load. Every exotic receiver the
         // cascade in `call_value_exotic` distinguishes is keyed either on a
@@ -349,15 +369,26 @@ impl<'p> Vm<'p> {
     /// call routes here, which IS the old path verbatim.
     #[cold]
     #[inline(never)]
-    pub(crate) fn call_value_exotic(&mut self, callee: Value, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+    pub(crate) fn call_value_exotic(
+        &mut self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
         // An [[IsHTMLDDA]] exotic (`document.all`) is callable: its [[Call]] returns
         // null when called with NO arguments or a first argument that is the empty
         // String, and undefined otherwise (Annex B).
-        if callee.is_heap() && !self.is_htmldda.is_empty() && self.is_htmldda.contains(&callee.heap_index()) {
+        if callee.is_heap()
+            && !self.is_htmldda.is_empty()
+            && self.is_htmldda.contains(&callee.heap_index())
+        {
             let first_is_empty_str = args.first().is_some_and(|a| {
                 a.is_heap()
                     && self.heap.is_str_like(a.heap_index())
-                    && self.heap.str_cow(a.heap_index()).is_some_and(|s| s.is_empty())
+                    && self
+                        .heap
+                        .str_cow(a.heap_index())
+                        .is_some_and(|s| s.is_empty())
             });
             return Ok(if args.is_empty() || first_is_empty_str {
                 Value::NULL
@@ -369,7 +400,9 @@ impl<'p> Vm<'p> {
         if callee.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(callee.heap_index()) {
                 if revoked {
-                    return Err(Thrown("TypeError: Cannot perform 'apply' on a revoked proxy".into()));
+                    return Err(Thrown(
+                        "TypeError: Cannot perform 'apply' on a revoked proxy".into(),
+                    ));
                 }
                 return match self.proxy_trap(handler, "apply")? {
                     Some(trap) => {
@@ -388,9 +421,9 @@ impl<'p> Vm<'p> {
             if let HeapObj::Wrapped { target, .. } = self.heap.get(callee.heap_index()) {
                 let t = *target;
                 let _gc = self.gc_lock_guard(); // wargs held across allocating calls
-                // The wrapper's CALLER realm: a wrapper built by a createRealm
-                // child's `evaluate` re-wraps callable results (and throws its
-                // boundary TypeErrors) with the CHILD's identities.
+                                                // The wrapper's CALLER realm: a wrapper built by a createRealm
+                                                // child's `evaluate` re-wraps callable results (and throws its
+                                                // boundary TypeErrors) with the CHILD's identities.
                 let wr = self.get_function_realm(callee);
                 let prev_ncr = self.native_callee_realm;
                 let adopt = |vm: &mut Self, msg: &str| {
@@ -457,7 +490,12 @@ impl<'p> Vm<'p> {
         // A bound function: invoke its target with the fixed `this` and the bound
         // arguments prepended (handles bind-of-bind by recursing).
         if callee.is_heap() {
-            if let HeapObj::Bound { target, this: bthis, args: bargs } = self.heap.get(callee.heap_index()) {
+            if let HeapObj::Bound {
+                target,
+                this: bthis,
+                args: bargs,
+            } = self.heap.get(callee.heap_index())
+            {
                 let (t, th) = (*target, *bthis);
                 let mut all = Vec::with_capacity(bargs.len() + args.len());
                 all.extend_from_slice(bargs);
@@ -510,7 +548,12 @@ impl<'p> Vm<'p> {
         }
         // A native resolve/reject function settles its bound promise.
         if callee.is_heap() {
-            if let HeapObj::BoundResolver { promise, is_reject, pair } = self.heap.get(callee.heap_index()) {
+            if let HeapObj::BoundResolver {
+                promise,
+                is_reject,
+                pair,
+            } = self.heap.get(callee.heap_index())
+            {
                 let (p, isr, pr) = (*promise, *is_reject, *pair);
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                 // [[AlreadyResolved]]: only the pair's FIRST call acts.
@@ -525,12 +568,19 @@ impl<'p> Vm<'p> {
             }
             // A combinator resolve/reject element invoked directly (a custom
             // thenable calling the `then` callback): run the combinator step.
-            if let HeapObj::CombinatorResolver { combinator, index, is_reject } =
-                self.heap.get(callee.heap_index())
+            if let HeapObj::CombinatorResolver {
+                combinator,
+                index,
+                is_reject,
+            } = self.heap.get(callee.heap_index())
             {
                 let (c, i, isr) = (*combinator, *index, *is_reject);
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let kind = if isr { ReactionKind::Reject } else { ReactionKind::Fulfill };
+                let kind = if isr {
+                    ReactionKind::Reject
+                } else {
+                    ReactionKind::Fulfill
+                };
                 self.combinator_step(c, i, kind, arg);
                 return Ok(Value::UNDEFINED);
             }
@@ -553,8 +603,10 @@ impl<'p> Vm<'p> {
                     // optional, and only these two have it — Collator does not):
                     // `Intl.DateTimeFormat.call(obj)` returns `obj` carrying the
                     // service under %Intl%.[[FallbackSymbol]].
-                    if matches!(kind as u8, native::INTL_NUMBERFORMAT | native::INTL_DATETIMEFORMAT)
-                    {
+                    if matches!(
+                        kind as u8,
+                        native::INTL_NUMBERFORMAT | native::INTL_DATETIMEFORMAT
+                    ) {
                         return self.intl_chain_legacy(callee, built, this);
                     }
                     return Ok(built);
@@ -680,21 +732,30 @@ impl<'p> Vm<'p> {
             return Ok(self.alloc_async(func_id, closure, this, args));
         }
         if self.frames.len() >= MAX_FRAMES {
-            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
         }
         // Copy the scalar layout fields out so the FuncProto borrow (which now
         // spans the whole `&self` via `func()`) ends before the `self.regs` /
         // `self.heap` mutations below.
         let (callee_regs, callee_params, rest_reg, arguments_reg) = {
             let proto = self.func(func_id as usize);
-            ((proto.reg_count as usize).max(1), proto.param_count as usize, proto.rest_reg, proto.arguments_reg)
+            (
+                (proto.reg_count as usize).max(1),
+                proto.param_count as usize,
+                proto.rest_reg,
+                proto.arguments_reg,
+            )
         };
 
         let new_base = self.regs.len();
         // Never grow past the pinned capacity (would realloc and dangle a live
         // native window pointer) — throw a catchable RangeError instead.
         if self.regs_would_overflow(new_base + callee_regs) {
-            return Err(Thrown("RangeError: Maximum call stack size exceeded".into()));
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
         }
         self.regs.resize(new_base + callee_regs, Value::UNDEFINED);
         self.regs[new_base] = this; // reg 0 = this
@@ -736,7 +797,22 @@ impl<'p> Vm<'p> {
         let is_eval = std::mem::take(&mut self.pending_eval_frame);
         // The arguments arrived as a slice, not as a caller register window —
         // `f.arguments` falls back to the frame's own `arguments` object / params.
-        self.frames.push(Frame { super_done: false, args_obj, eval_scope: u32::MAX, arg_win: u32::MAX, argc: 0, is_eval, func: func_id, base: new_base, ip: 0, ret_dst: 0, closure, handlers: Vec::new(), new_target, callee });
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval,
+            func: func_id,
+            base: new_base,
+            ip: 0,
+            ret_dst: 0,
+            closure,
+            handlers: Vec::new(),
+            new_target,
+            callee,
+        });
         self.run_loop(stop_depth)
     }
 
@@ -797,7 +873,10 @@ impl<'p> Vm<'p> {
         self.eval_global_next += 1;
         self.globals[s as usize] = seed;
         self.bump_global_gen(s);
-        self.realm_globals.entry(rid).or_default().insert(name.to_string(), s);
+        self.realm_globals
+            .entry(rid)
+            .or_default()
+            .insert(name.to_string(), s);
         Ok(s)
     }
 
@@ -912,7 +991,9 @@ impl<'p> Vm<'p> {
         });
         let implicit = !script_decl
             && !self.builtin_globals.contains_key(key)
-            && named.and_then(|i| self.globals.get(i)).is_some_and(|v| !v.is_uninitialized());
+            && named
+                .and_then(|i| self.globals.get(i))
+                .is_some_and(|v| !v.is_uninitialized());
         let attr = |writable, enumerable, configurable| crate::heap::PropAttr {
             writable,
             enumerable,
@@ -955,16 +1036,12 @@ impl<'p> Vm<'p> {
         if m.keys.is_empty() {
             return false;
         }
-        let name = self
-            .program
-            .global_names
-            .get(idx as usize)
-            .or_else(|| {
-                self.eval_global_map
-                    .iter()
-                    .find(|(_, &v)| v == idx)
-                    .map(|(k, _)| k)
-            });
+        let name = self.program.global_names.get(idx as usize).or_else(|| {
+            self.eval_global_map
+                .iter()
+                .find(|(_, &v)| v == idx)
+                .map(|(k, _)| k)
+        });
         match name {
             Some(n) => m.pos(n).is_some(),
             None => false,
@@ -992,8 +1069,8 @@ impl<'p> Vm<'p> {
     /// `globals[slot]` must call this (all such writers are cold paths); the
     /// baked `slot_guard` generation compare in spliced leaf calls then misses
     /// and the site degrades to the per-call helper — exactly what a baked
-    /// bits-guard miss does today. Slots past the table (late `globals.push`
-    /// module slots) are never keyable — no-op. Wrapping keeps compares exact.
+    /// bits-guard miss does today. The globals and generation tables are sized
+    /// together at boot and never reallocated. Wrapping keeps compares exact.
     #[inline]
     pub(crate) fn bump_global_gen(&mut self, slot: u32) {
         if let Some(g) = self.global_gens.get_mut(slot as usize) {
@@ -1046,7 +1123,11 @@ impl<'p> Vm<'p> {
     ///   and a raw slot access does neither.
     #[inline]
     pub(crate) fn global_slot_directly_routable(&self, slot: u32) -> bool {
-        if self.globals.get(slot as usize).is_none_or(|v| v.is_uninitialized()) {
+        if self
+            .globals
+            .get(slot as usize)
+            .is_none_or(|v| v.is_uninitialized())
+        {
             return false;
         }
         if !self.global_obj_has_own_keys() || !self.global_real_own_route(slot) {
@@ -1061,6 +1142,19 @@ impl<'p> Vm<'p> {
         // interpreter's rule.
         let name = self.global_slot_name(slot).unwrap_or_default();
         self.global_name_is_lexical(&name)
+    }
+
+    /// Store-specific half of [`Self::global_slot_directly_routable`]. A raw
+    /// slot write must additionally prove that the binding is mutable. Dynamic
+    /// `$262.evalScript` installation can add a persistent const binding after
+    /// native code was compiled, so this predicate is also used by epoch-time
+    /// revalidation rather than only by cold planners.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn global_store_slot_directly_routable(&self, slot: u32) -> bool {
+        self.global_slot_directly_routable(slot)
+            && !self.program.const_globals.contains(&slot)
+            && !self.eval_const_globals.contains(&slot)
     }
 
     /// Entry-time revalidation for Tier A/C: may `func_id`'s compiled body still be
@@ -1092,7 +1186,7 @@ impl<'p> Vm<'p> {
             Instr::StoreGlobal { idx, .. }
             | Instr::StoreGlobalStrict { idx, .. }
             | Instr::StoreGlobalResolved { idx, .. } => {
-                self.global_slot_directly_routable(idx)
+                self.global_store_slot_directly_routable(idx)
             }
             _ => true,
         });
@@ -1164,7 +1258,10 @@ impl<'p> Vm<'p> {
             // `ast.strict` folds force_strict and the directive prologue.
             if !ast.strict {
                 for n in crate::compile::eval_var_and_fn_names(&ast) {
-                    if param_collisions.as_ref().map_or(false, |c| c.iter().any(|c| *c == n)) {
+                    if param_collisions
+                        .as_ref()
+                        .map_or(false, |c| c.iter().any(|c| *c == n))
+                    {
                         return Err(Thrown(format!(
                             "SyntaxError: Identifier '{n}' has already been declared"
                         )));
@@ -1223,12 +1320,14 @@ impl<'p> Vm<'p> {
             // The caller class's inner NAME comes from its ClassDef, so a class
             // EXPRESSION's name (which has no outer binding at all) is visible
             // to the eval'd code too.
-            inherit_super.map(|(cid, stat, derived, name_ok)| crate::compile::EvalClassCtx {
-                static_ctx: stat,
-                derived_ctor: derived,
-                name: Some(self.class_def(cid as usize).name.clone())
-                    .filter(|n| name_ok && !n.is_empty()),
-            }),
+            inherit_super.map(
+                |(cid, stat, derived, name_ok)| crate::compile::EvalClassCtx {
+                    static_ctx: stat,
+                    derived_ctor: derived,
+                    name: Some(self.class_def(cid as usize).name.clone())
+                        .filter(|n| name_ok && !n.is_empty()),
+                },
+            ),
             ban_arguments,
             visible,
             false,
@@ -1371,7 +1470,23 @@ impl<'p> Vm<'p> {
     return A;
   }
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None, None)?;
+        let f = self.do_eval(
+            SRC,
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+            Value::UNDEFINED,
+            None,
+            false,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+        )?;
         self.from_async_fn = Some(f);
         Ok(f)
     }
@@ -1395,7 +1510,23 @@ impl<'p> Vm<'p> {
   await ret.call(O);
   return undefined;
 })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None, None)?;
+        let f = self.do_eval(
+            SRC,
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+            Value::UNDEFINED,
+            None,
+            false,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+        )?;
         self.async_dispose_fn = Some(f);
         Ok(f)
     }
@@ -1418,7 +1549,23 @@ impl<'p> Vm<'p> {
             return Ok(f);
         }
         const SRC: &str = r#"(function(O) { "use strict"; this.call(O); })"#;
-        let f = self.do_eval(SRC, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None, None)?;
+        let f = self.do_eval(
+            SRC,
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+            Value::UNDEFINED,
+            None,
+            false,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+        )?;
         self.sync_dispose_shim_fn = Some(f);
         Ok(f)
     }

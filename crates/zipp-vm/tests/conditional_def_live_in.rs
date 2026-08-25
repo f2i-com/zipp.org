@@ -72,7 +72,11 @@ use std::process::Command;
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -84,7 +88,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -93,7 +101,11 @@ fn node_output(src: &str) -> Vec<String> {
 }
 
 fn assert_matches_node(tag: &str, src: &str) {
-    assert_eq!(run_ok(src), node_output(src), "[{tag}] zipp != node for:\n{src}");
+    assert_eq!(
+        run_ok(src),
+        node_output(src),
+        "[{tag}] zipp != node for:\n{src}"
+    );
 }
 
 // ── the matrix ──────────────────────────────────────────────────────────────
@@ -114,19 +126,39 @@ struct Def {
 
 const DEFS: &[Def] = &[
     // The minimized repro: fires on exactly one iteration of forty.
-    Def { tag: "eq3", stmt: "if (i === 3) { t = 7; }", dominates: false },
+    Def {
+        tag: "eq3",
+        stmt: "if (i === 3) { t = 7; }",
+        dominates: false,
+    },
     // The cold-block spelling — the branch the interpreter NEVER takes, so the
     // block is `cold` in the plan. This is the one an engine author is likeliest
     // to reason wrongly about ("it never runs, so it cannot matter") and the one
     // that survives every `ZIPP_NO_*` switch unchanged.
-    Def { tag: "never", stmt: "if (i === 100000) { t = 7; }", dominates: false },
+    Def {
+        tag: "never",
+        stmt: "if (i === 100000) { t = 7; }",
+        dominates: false,
+    },
     // Fires on all but the first iteration — so the home is garbage exactly
     // once, which is the hardest version to see in an answer.
-    Def { tag: "gt0", stmt: "if (i > 0) { t = (i + 1) | 0; }", dominates: false },
+    Def {
+        tag: "gt0",
+        stmt: "if (i > 0) { t = (i + 1) | 0; }",
+        dominates: false,
+    },
     // Fires every other iteration.
-    Def { tag: "even", stmt: "if ((i & 1) === 0) { t = (i + 2) | 0; }", dominates: false },
+    Def {
+        tag: "even",
+        stmt: "if ((i & 1) === 0) { t = (i + 2) | 0; }",
+        dominates: false,
+    },
     // The def on the ELSE arm, with an empty consequent.
-    Def { tag: "elsearm", stmt: "if (i > 100000) { } else { t = (i + 3) | 0; }", dominates: false },
+    Def {
+        tag: "elsearm",
+        stmt: "if (i > 100000) { } else { t = (i + 3) | 0; }",
+        dominates: false,
+    },
     // A zero-trip inner loop: `t`'s def is inside a nested region that runs on
     // half the outer iterations and not at all on the rest.
     Def {
@@ -142,8 +174,16 @@ const DEFS: &[Def] = &[
         dominates: false,
     },
     // ── controls: these DO dominate and must keep answering correctly ──
-    Def { tag: "ifelse", stmt: "if ((i & 1) === 0) { t = 4; } else { t = 9; }", dominates: true },
-    Def { tag: "uncond", stmt: "t = (i & 3) | 0;", dominates: true },
+    Def {
+        tag: "ifelse",
+        stmt: "if ((i & 1) === 0) { t = 4; } else { t = 9; }",
+        dominates: true,
+    },
+    Def {
+        tag: "uncond",
+        stmt: "t = (i & 3) | 0;",
+        dominates: true,
+    },
 ];
 
 /// The INT kernel: everything stays int32, so `region_is_int` holds and the
@@ -153,7 +193,11 @@ const DEFS: &[Def] = &[
 /// hid the defect, because a read-after-region register used to be pinned to a
 /// permanent home with an entry load.
 fn int_case(d: &Def, after: bool) -> String {
-    let tail = if after { "return h + t * 1000;" } else { "return h;" };
+    let tail = if after {
+        "return h + t * 1000;"
+    } else {
+        "return h;"
+    };
     format!(
         "function kernel(n) {{\n  \
            var h = 1, i = 0, t = 2, j = 0;\n  \
@@ -171,7 +215,11 @@ fn int_case(d: &Def, after: bool) -> String {
 /// The DOUBLE kernel: the accumulator is an f64, so the region declines INT and
 /// lands on `regalloc.rs` — the emitter that gave the OTHER wrong answer.
 fn double_case(d: &Def, after: bool) -> String {
-    let tail = if after { "return h + t * 0.125;" } else { "return h;" };
+    let tail = if after {
+        "return h + t * 0.125;"
+    } else {
+        "return h;"
+    };
     format!(
         "function kernel(n) {{\n  \
            var h = 1.5, i = 0, t = 2, j = 0;\n  \
@@ -226,8 +274,14 @@ fn conddef_parity_double_matrix() {
 fn conddef_matrix_covers_both_halves() {
     let nondom = DEFS.iter().filter(|d| !d.dominates).count();
     let dom = DEFS.iter().filter(|d| d.dominates).count();
-    assert!(nondom >= 6, "the defect half of the matrix shrank to {nondom} rows");
-    assert!(dom >= 2, "the control half of the matrix shrank to {dom} rows");
+    assert!(
+        nondom >= 6,
+        "the defect half of the matrix shrank to {nondom} rows"
+    );
+    assert!(
+        dom >= 2,
+        "the control half of the matrix shrank to {dom} rows"
+    );
 }
 
 /// The exact two-line case from the W17 report, kept verbatim so the number in
@@ -348,7 +402,9 @@ fn jitlog_of(src: &str) -> String {
 #[test]
 #[ignore = "worker: spawned by jitlog_of with ZIPP_CONDDEF_SRC set"]
 fn conddef_jitlog_child() {
-    let Some(src) = std::env::var_os("ZIPP_CONDDEF_SRC") else { return };
+    let Some(src) = std::env::var_os("ZIPP_CONDDEF_SRC") else {
+        return;
+    };
     let _ = zipp_vm::run(&src.to_string_lossy()).expect("source compiles");
 }
 

@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -35,7 +35,11 @@ impl<'p> Vm<'p> {
         // no usable prototype OBJECT (OrdinaryCreateFromConstructor then falls back to
         // the intrinsic default), so report None.
         if let Some(&v) = self.fn_proto_override.get(&idx) {
-            return if v.is_heap() && self.is_object_value(v) { Some(v) } else { None };
+            return if v.is_heap() && self.is_object_value(v) {
+                Some(v)
+            } else {
+                None
+            };
         }
         if let Some(&p) = self.prototypes.get(&idx) {
             return Some(Value::heap(p));
@@ -69,8 +73,13 @@ impl<'p> Vm<'p> {
         // Methods and the constructor back-reference are NON-enumerable
         // (writable + configurable), matching ES `class`/function semantics that
         // test262's verifyProperty checks.
-        let nonenum =
-            PropAttr { writable: true, enumerable: false, configurable: true, accessor: false, setter: Value::UNDEFINED };
+        let nonenum = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
         // A generator / async-generator function's prototype object owns NO
         // `constructor` property (MakeMethod-less ordinary object per spec).
         let is_gen_fn = match self.heap.get(idx) {
@@ -89,8 +98,13 @@ impl<'p> Vm<'p> {
         // `attr.setter`) so getOwnPropertyDescriptor / getOwnPropertyNames /
         // enumeration reflect them; non-enumerable + configurable per spec. A
         // get+set pair on one key merges into a single accessor property.
-        let acc_attr =
-            PropAttr { writable: false, enumerable: false, configurable: true, accessor: true, setter: Value::UNDEFINED };
+        let acc_attr = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: true,
+            setter: Value::UNDEFINED,
+        };
         // Walk the class body's SOURCE order (`proto_order`), not method-list
         // then accessor-list: the three lists are grouped by kind, so replaying
         // them in turn reported `class C { get g(){} m(){} }` as
@@ -147,8 +161,10 @@ impl<'p> Vm<'p> {
         if !self.realm_global_objs.is_empty() {
             let r = self.get_function_realm(obj);
             if r != 0 {
-                if let Some(&rp) =
-                    self.realms.get(r as usize).and_then(|m| m.get(&self.obj_proto))
+                if let Some(&rp) = self
+                    .realms
+                    .get(r as usize)
+                    .and_then(|m| m.get(&self.obj_proto))
                 {
                     self.proto_of.insert(p, Value::heap(rp));
                     self.obj_realm.insert(p, r);
@@ -174,7 +190,11 @@ impl<'p> Vm<'p> {
             let fp = self.func(fid);
             let (is_gen, is_async) = (fp.is_generator, fp.is_async);
             if is_gen {
-                let mut gp = if is_async { self.asyncgen_proto } else { self.gen_proto };
+                let mut gp = if is_async {
+                    self.asyncgen_proto
+                } else {
+                    self.gen_proto
+                };
                 // A REALM-BORN generator function's `prototype` chains to the
                 // realm's image of %GeneratorPrototype% / %AsyncGeneratorPrototype%
                 // (create_realm's hidden intrinsics), so its instances reach the
@@ -544,7 +564,10 @@ impl<'p> Vm<'p> {
         // side table (a Native has no inline map); the descriptor/delete paths
         // read them to report name/length non-configurable.
         {
-            let m = self.arr_props.entry(thrower.heap_index()).or_insert_with(ObjMap::new);
+            let m = self
+                .arr_props
+                .entry(thrower.heap_index())
+                .or_insert_with(ObjMap::new);
             m.extensible = false;
             m.sealed = true;
             m.frozen = true;
@@ -590,7 +613,16 @@ impl<'p> Vm<'p> {
             ],
             Some(obj_proto),
         );
-        let array_ctor = build(self, &[("isArray", ARR_IS_ARRAY), ("from", ARR_FROM), ("fromAsync", ARR_FROM_ASYNC), ("of", ARR_OF)], Some(arr_proto));
+        let array_ctor = build(
+            self,
+            &[
+                ("isArray", ARR_IS_ARRAY),
+                ("from", ARR_FROM),
+                ("fromAsync", ARR_FROM_ASYNC),
+                ("of", ARR_OF),
+            ],
+            Some(arr_proto),
+        );
         self.array_ctor = array_ctor;
         let function_ctor = build(self, &[], Some(fn_proto));
         self.function_ctor = function_ctor;
@@ -740,12 +772,24 @@ impl<'p> Vm<'p> {
             ],
             None,
         );
-        let weakset_proto = build(self, &[("add", WS_ADD), ("has", WS_HAS), ("delete", WS_DELETE)], None);
+        let weakset_proto = build(
+            self,
+            &[("add", WS_ADD), ("has", WS_HAS), ("delete", WS_DELETE)],
+            None,
+        );
         let weakref_proto = build(self, &[("deref", WR_DEREF)], None);
-        let finreg_proto = build(self, &[("register", FR_REGISTER), ("unregister", FR_UNREGISTER)], None);
+        let finreg_proto = build(
+            self,
+            &[("register", FR_REGISTER), ("unregister", FR_UNREGISTER)],
+            None,
+        );
         // %ArrayIteratorPrototype% (next + @@iterator). Array entries/keys/values
         // iterators delegate here.
-        let array_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
+        let array_iter_proto = build(
+            self,
+            &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)],
+            None,
+        );
         self.array_iter_proto = array_iter_proto;
         // Remember the pristine `next` so the for-of fast path can detect a
         // patched %ArrayIteratorPrototype%.next and fall back to the protocol.
@@ -755,10 +799,22 @@ impl<'p> Vm<'p> {
         };
         // Distinct %MapIteratorPrototype% / %SetIteratorPrototype% (same natives,
         // different identity so getPrototypeOf discriminates them).
-        self.map_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
-        self.set_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
+        self.map_iter_proto = build(
+            self,
+            &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)],
+            None,
+        );
+        self.set_iter_proto = build(
+            self,
+            &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)],
+            None,
+        );
         // %StringIteratorPrototype% + String.prototype[@@iterator] (code points).
-        self.string_iter_proto = build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
+        self.string_iter_proto = build(
+            self,
+            &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)],
+            None,
+        );
         {
             let it = Value::heap(self.heap.alloc(HeapObj::Native(STR_ITERATOR)));
             if let HeapObj::Object(m) = self.heap.get_mut(str_proto) {
@@ -806,8 +862,11 @@ impl<'p> Vm<'p> {
             m.define("constructor", ctor_get, acc_attr(ctor_set));
         }
         // %IteratorHelperPrototype% (next/return for lazy helpers) chains to root.
-        let helper_proto =
-            build(self, &[("next", ITER_HELPER_NEXT), ("return", ITER_HELPER_RETURN)], None);
+        let helper_proto = build(
+            self,
+            &[("next", ITER_HELPER_NEXT), ("return", ITER_HELPER_RETURN)],
+            None,
+        );
         self.iterator_helper_proto = helper_proto;
         self.proto_of.insert(helper_proto, Value::heap(iter_root));
         let helper_tag = self.alloc_str("Iterator Helper".to_string());
@@ -854,7 +913,8 @@ impl<'p> Vm<'p> {
             ],
             None,
         );
-        self.proto_of.insert(async_iter_root, Value::heap(obj_proto));
+        self.proto_of
+            .insert(async_iter_root, Value::heap(obj_proto));
         // SetFunctionName: this @@asyncIterator function is named
         // "[Symbol.asyncIterator]" (ITER_SELF's intrinsic name belongs to the
         // @@iterator slot, so override THIS object's name via fn_props).
@@ -887,7 +947,8 @@ impl<'p> Vm<'p> {
             ],
             None,
         );
-        self.proto_of.insert(asyncgen_proto, Value::heap(async_iter_root));
+        self.proto_of
+            .insert(asyncgen_proto, Value::heap(async_iter_root));
         let asyncgen_tag = self.alloc_str("AsyncGenerator".to_string());
         if let HeapObj::Object(m) = self.heap.get_mut(asyncgen_proto) {
             m.define("@@toStringTag", asyncgen_tag, tag_data);
@@ -949,9 +1010,10 @@ impl<'p> Vm<'p> {
             accessor: false,
             setter: Value::UNDEFINED,
         };
-        for (fn_proto, inst_proto) in
-            [(self.gen_fn_proto, self.gen_proto), (self.asyncgen_fn_proto, self.asyncgen_proto)]
-        {
+        for (fn_proto, inst_proto) in [
+            (self.gen_fn_proto, self.gen_proto),
+            (self.asyncgen_fn_proto, self.asyncgen_proto),
+        ] {
             if fn_proto != 0 && inst_proto != 0 {
                 let pv = Value::heap(inst_proto);
                 if let HeapObj::Object(m) = self.heap.get_mut(fn_proto) {
@@ -1026,9 +1088,22 @@ impl<'p> Vm<'p> {
             setter: Value::UNDEFINED,
         };
         for name in [
-            "at", "copyWithin", "entries", "fill", "find", "findIndex", "findLast",
-            "findLastIndex", "flat", "flatMap", "includes", "keys", "toReversed",
-            "toSorted", "toSpliced", "values",
+            "at",
+            "copyWithin",
+            "entries",
+            "fill",
+            "find",
+            "findIndex",
+            "findLast",
+            "findLastIndex",
+            "flat",
+            "flatMap",
+            "includes",
+            "keys",
+            "toReversed",
+            "toSorted",
+            "toSpliced",
+            "values",
         ] {
             unsc.define(name, Value::TRUE, unsc_data_attr);
         }
@@ -1303,8 +1378,11 @@ impl<'p> Vm<'p> {
             }
             // %RegExpStringIteratorPrototype% — inherits %Iterator.prototype%,
             // carries the "RegExp String Iterator" toStringTag.
-            let rsi_proto =
-                build(self, &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)], None);
+            let rsi_proto = build(
+                self,
+                &[("next", ITER_NEXT), ("@@iterator", ITER_SELF)],
+                None,
+            );
             let iter_root = self.iterator_proto_root;
             self.proto_of.insert(rsi_proto, Value::heap(iter_root));
             let tag = self.alloc_str("RegExp String Iterator".to_string());
@@ -1507,7 +1585,8 @@ impl<'p> Vm<'p> {
                 let set_from_hex = Value::heap(self.heap.alloc(HeapObj::Native(U8_SET_FROM_HEX)));
                 let from_hex = Value::heap(self.heap.alloc(HeapObj::Native(U8_FROM_HEX)));
                 let to_base64 = Value::heap(self.heap.alloc(HeapObj::Native(U8_TO_BASE64)));
-                let set_from_base64 = Value::heap(self.heap.alloc(HeapObj::Native(U8_SET_FROM_BASE64)));
+                let set_from_base64 =
+                    Value::heap(self.heap.alloc(HeapObj::Native(U8_SET_FROM_BASE64)));
                 let from_base64 = Value::heap(self.heap.alloc(HeapObj::Native(U8_FROM_BASE64)));
                 if let HeapObj::Object(m) = self.heap.get_mut(u8_proto) {
                     m.define("toHex", to_hex, method_attr);
@@ -1525,16 +1604,24 @@ impl<'p> Vm<'p> {
                 &[
                     ("slice", ARRAYBUFFER_SLICE),
                     ("resize", ARRAYBUFFER_RESIZE),
-                    ("transferToImmutable", native::ARRAYBUFFER_TRANSFER_IMMUTABLE),
+                    (
+                        "transferToImmutable",
+                        native::ARRAYBUFFER_TRANSFER_IMMUTABLE,
+                    ),
                     ("sliceToImmutable", native::ARRAYBUFFER_SLICE_IMMUTABLE),
                     ("transfer", native::ARRAYBUFFER_TRANSFER),
                     ("transferToFixedLength", native::ARRAYBUFFER_TRANSFER_FIXED),
                 ],
                 None,
             );
-            self.proto_of.insert(arraybuffer_proto, Value::heap(obj_proto));
+            self.proto_of
+                .insert(arraybuffer_proto, Value::heap(obj_proto));
             self.arraybuffer_proto = arraybuffer_proto;
-            let arraybuffer_ctor = build(self, &[("isView", ARRAYBUFFER_ISVIEW)], Some(arraybuffer_proto));
+            let arraybuffer_ctor = build(
+                self,
+                &[("isView", ARRAYBUFFER_ISVIEW)],
+                Some(arraybuffer_proto),
+            );
             self.arraybuffer_ctor = arraybuffer_ctor;
             let ab_tag_attr = PropAttr {
                 writable: false,
@@ -1552,8 +1639,11 @@ impl<'p> Vm<'p> {
             // ArrayBuffer representation, flagged in `shared_buffers`). Reuses
             // `slice`; adds `grow` (grow-only), growable/byteLength/maxByteLength
             // accessor getters, and @@toStringTag "SharedArrayBuffer".
-            let sab_proto =
-                build(self, &[("slice", native::SAB_SLICE), ("grow", native::SAB_GROW)], None);
+            let sab_proto = build(
+                self,
+                &[("slice", native::SAB_SLICE), ("grow", native::SAB_GROW)],
+                None,
+            );
             self.proto_of.insert(sab_proto, Value::heap(obj_proto));
             self.sab_proto = sab_proto;
             let sab_ctor = build(self, &[], Some(sab_proto));
@@ -1573,8 +1663,10 @@ impl<'p> Vm<'p> {
                 setter: Value::UNDEFINED,
             };
             for (g, &name) in native::SAB_GETTERS.iter().enumerate() {
-                let getter =
-                    Value::heap(self.heap.alloc(HeapObj::Native(native::SAB_GETTER_BASE + g as u16)));
+                let getter = Value::heap(
+                    self.heap
+                        .alloc(HeapObj::Native(native::SAB_GETTER_BASE + g as u16)),
+                );
                 if let HeapObj::Object(m) = self.heap.get_mut(sab_proto) {
                     m.define(name, getter, sab_acc);
                 }
@@ -1609,7 +1701,8 @@ impl<'p> Vm<'p> {
             };
             for (g, &(name, kind)) in native::BUFFER_GETTERS.iter().enumerate() {
                 let getter = Value::heap(
-                    self.heap.alloc(HeapObj::Native(native::BUFFER_GETTER_BASE + g as u16)),
+                    self.heap
+                        .alloc(HeapObj::Native(native::BUFFER_GETTER_BASE + g as u16)),
                 );
                 let target = match kind {
                     0 => arraybuffer_proto,
@@ -1659,7 +1752,8 @@ impl<'p> Vm<'p> {
                 .map(|(i, &n)| (n, native::PD_M_BASE + i as u16))
                 .collect();
             let plaindate_proto = build(self, &pd_methods, None);
-            self.proto_of.insert(plaindate_proto, Value::heap(obj_proto));
+            self.proto_of
+                .insert(plaindate_proto, Value::heap(obj_proto));
             self.plaindate_proto = plaindate_proto;
             let pdfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATE_FROM)));
             let pdcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATE_COMPARE)));
@@ -1685,7 +1779,8 @@ impl<'p> Vm<'p> {
                 .map(|(i, &n)| (n, native::PT_M_BASE + i as u16))
                 .collect();
             let plaintime_proto = build(self, &pt_methods, None);
-            self.proto_of.insert(plaintime_proto, Value::heap(obj_proto));
+            self.proto_of
+                .insert(plaintime_proto, Value::heap(obj_proto));
             self.plaintime_proto = plaintime_proto;
             let ptfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINTIME_FROM)));
             let ptcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINTIME_COMPARE)));
@@ -1711,7 +1806,8 @@ impl<'p> Vm<'p> {
                 .map(|(i, &n)| (n, native::PDT_M_BASE + i as u16))
                 .collect();
             let plaindatetime_proto = build(self, &pdt_methods, None);
-            self.proto_of.insert(plaindatetime_proto, Value::heap(obj_proto));
+            self.proto_of
+                .insert(plaindatetime_proto, Value::heap(obj_proto));
             self.plaindatetime_proto = plaindatetime_proto;
             let pdtfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATETIME_FROM)));
             let pdtcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINDATETIME_COMPARE)));
@@ -1772,7 +1868,8 @@ impl<'p> Vm<'p> {
                 .map(|(i, &n)| (n, native::PYM_M_BASE + i as u16))
                 .collect();
             let plainyearmonth_proto = build(self, &pym_methods, None);
-            self.proto_of.insert(plainyearmonth_proto, Value::heap(obj_proto));
+            self.proto_of
+                .insert(plainyearmonth_proto, Value::heap(obj_proto));
             self.plainyearmonth_proto = plainyearmonth_proto;
             let pymfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINYEARMONTH_FROM)));
             let pymcompare = Value::heap(self.heap.alloc(HeapObj::Native(PLAINYEARMONTH_COMPARE)));
@@ -1798,7 +1895,8 @@ impl<'p> Vm<'p> {
                 .map(|(i, &n)| (n, native::PMD_M_BASE + i as u16))
                 .collect();
             let plainmonthday_proto = build(self, &pmd_methods, None);
-            self.proto_of.insert(plainmonthday_proto, Value::heap(obj_proto));
+            self.proto_of
+                .insert(plainmonthday_proto, Value::heap(obj_proto));
             self.plainmonthday_proto = plainmonthday_proto;
             let pmdfrom = Value::heap(self.heap.alloc(HeapObj::Native(PLAINMONTHDAY_FROM)));
             let pmdname = self.alloc_str("PlainMonthDay".to_string());
@@ -1822,7 +1920,8 @@ impl<'p> Vm<'p> {
                 .map(|(i, &n)| (n, native::ZDT_M_BASE + i as u16))
                 .collect();
             let zoneddatetime_proto = build(self, &zdt_methods, None);
-            self.proto_of.insert(zoneddatetime_proto, Value::heap(obj_proto));
+            self.proto_of
+                .insert(zoneddatetime_proto, Value::heap(obj_proto));
             self.zoneddatetime_proto = zoneddatetime_proto;
             let zdtfrom = Value::heap(self.heap.alloc(HeapObj::Native(native::ZDT_FROM)));
             let zdtcompare = Value::heap(self.heap.alloc(HeapObj::Native(native::ZDT_COMPARE)));
@@ -1861,11 +1960,27 @@ impl<'p> Vm<'p> {
             tn.define("Duration", Value::heap(duration_ctor), method_attr);
             tn.define("PlainDate", Value::heap(plaindate_ctor), method_attr);
             tn.define("PlainTime", Value::heap(plaintime_ctor), method_attr);
-            tn.define("PlainDateTime", Value::heap(plaindatetime_ctor), method_attr);
+            tn.define(
+                "PlainDateTime",
+                Value::heap(plaindatetime_ctor),
+                method_attr,
+            );
             tn.define("Instant", Value::heap(instant_ctor), method_attr);
-            tn.define("PlainYearMonth", Value::heap(plainyearmonth_ctor), method_attr);
-            tn.define("PlainMonthDay", Value::heap(plainmonthday_ctor), method_attr);
-            tn.define("ZonedDateTime", Value::heap(zoneddatetime_ctor), method_attr);
+            tn.define(
+                "PlainYearMonth",
+                Value::heap(plainyearmonth_ctor),
+                method_attr,
+            );
+            tn.define(
+                "PlainMonthDay",
+                Value::heap(plainmonthday_ctor),
+                method_attr,
+            );
+            tn.define(
+                "ZonedDateTime",
+                Value::heap(zoneddatetime_ctor),
+                method_attr,
+            );
             tn.define("Now", Value::heap(now_ns), method_attr);
             // The Temporal namespace has @@toStringTag "Temporal" (so
             // Object.prototype.toString.call(Temporal) === "[object Temporal]"),
@@ -2090,8 +2205,10 @@ impl<'p> Vm<'p> {
             };
             let locale_proto = self.intl_protos[native::INTL_LOCALE as usize];
             for (i, gname) in native::LOCALE_ACCESSORS.iter().enumerate() {
-                let getter =
-                    Value::heap(self.heap.alloc(HeapObj::Native(INTL_LOCALE_GET_BASE + i as u16)));
+                let getter = Value::heap(
+                    self.heap
+                        .alloc(HeapObj::Native(INTL_LOCALE_GET_BASE + i as u16)),
+                );
                 if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
                     p.define(gname, getter, accessor_attr);
                 }
@@ -2109,8 +2226,10 @@ impl<'p> Vm<'p> {
             }
             // The Intl.Locale-info methods (ordinary data-property built-ins).
             for (i, mname) in native::LOCALE_INFO_METHODS.iter().enumerate() {
-                let f =
-                    Value::heap(self.heap.alloc(HeapObj::Native(INTL_LOCALE_INFO_BASE + i as u16)));
+                let f = Value::heap(
+                    self.heap
+                        .alloc(HeapObj::Native(INTL_LOCALE_INFO_BASE + i as u16)),
+                );
                 if let HeapObj::Object(p) = self.heap.get_mut(locale_proto) {
                     p.define(mname, f, method_attr);
                 }
@@ -2137,13 +2256,17 @@ impl<'p> Vm<'p> {
             // "Segmenter String Iterator" toStringTag.
             let segments_proto = build(
                 self,
-                &[("containing", INTL_SEGMENTS_CONTAINING), ("@@iterator", INTL_SEGMENTS_ITERATOR)],
+                &[
+                    ("containing", INTL_SEGMENTS_CONTAINING),
+                    ("@@iterator", INTL_SEGMENTS_ITERATOR),
+                ],
                 None,
             );
             self.proto_of.insert(segments_proto, Value::heap(obj_proto));
             self.intl_protos[native::INTL_SEGMENTS as usize] = segments_proto;
             let seg_iter_proto = build(self, &[("next", INTL_SEGMENT_ITER_NEXT)], None);
-            self.proto_of.insert(seg_iter_proto, Value::heap(self.iterator_proto_root));
+            self.proto_of
+                .insert(seg_iter_proto, Value::heap(self.iterator_proto_root));
             self.intl_protos[native::INTL_SEGMENT_ITERATOR as usize] = seg_iter_proto;
             let seg_tag = self.alloc_str("Segmenter String Iterator".to_string());
             if let HeapObj::Object(p) = self.heap.get_mut(seg_iter_proto) {
@@ -2294,8 +2417,10 @@ impl<'p> Vm<'p> {
             ];
             let p = build(self, methods, None);
             self.proto_of.insert(p, Value::heap(obj_proto));
-            let getter =
-                Value::heap(self.heap.alloc(HeapObj::Native(native::DISPOSABLE_DISPOSED_GET)));
+            let getter = Value::heap(
+                self.heap
+                    .alloc(HeapObj::Native(native::DISPOSABLE_DISPOSED_GET)),
+            );
             // [Symbol.dispose] is the SAME function object as `dispose`
             // (spec: the property is an alias, not a fresh built-in).
             let dispose_fn = match self.heap.get(p) {
@@ -2341,8 +2466,10 @@ impl<'p> Vm<'p> {
             ];
             let p = build(self, methods, None);
             self.proto_of.insert(p, Value::heap(obj_proto));
-            let getter =
-                Value::heap(self.heap.alloc(HeapObj::Native(native::DISPOSABLE_DISPOSED_GET)));
+            let getter = Value::heap(
+                self.heap
+                    .alloc(HeapObj::Native(native::DISPOSABLE_DISPOSED_GET)),
+            );
             // [Symbol.asyncDispose] is the SAME function object as `disposeAsync`.
             let dispose_fn = match self.heap.get(p) {
                 HeapObj::Object(m) => m.get("disposeAsync").unwrap_or(Value::UNDEFINED),
@@ -2445,7 +2572,8 @@ impl<'p> Vm<'p> {
             let p = build(self, &[], None);
             self.proto_of.insert(p, Value::heap(obj_proto));
             let tag_get = Value::heap(
-                self.heap.alloc(HeapObj::Native(native::ABSTRACT_MODULE_SOURCE_TAG_GET)),
+                self.heap
+                    .alloc(HeapObj::Native(native::ABSTRACT_MODULE_SOURCE_TAG_GET)),
             );
             let tag_acc = PropAttr {
                 writable: false,
@@ -2477,11 +2605,13 @@ impl<'p> Vm<'p> {
         let eval_fn = self.heap.alloc(HeapObj::Native(GLOBAL_EVAL));
         self.eval_fn_idx = eval_fn;
         let encode_uri_fn = self.heap.alloc(HeapObj::Native(GLOBAL_ENCODE_URI));
-        let encode_uri_component_fn =
-            self.heap.alloc(HeapObj::Native(GLOBAL_ENCODE_URI_COMPONENT));
+        let encode_uri_component_fn = self
+            .heap
+            .alloc(HeapObj::Native(GLOBAL_ENCODE_URI_COMPONENT));
         let decode_uri_fn = self.heap.alloc(HeapObj::Native(GLOBAL_DECODE_URI));
-        let decode_uri_component_fn =
-            self.heap.alloc(HeapObj::Native(GLOBAL_DECODE_URI_COMPONENT));
+        let decode_uri_component_fn = self
+            .heap
+            .alloc(HeapObj::Native(GLOBAL_DECODE_URI_COMPONENT));
         let escape_fn = self.heap.alloc(HeapObj::Native(GLOBAL_ESCAPE));
         let unescape_fn = self.heap.alloc(HeapObj::Native(GLOBAL_UNESCAPE));
         // Host `print` as a first-class value (shells + the test262 harness
@@ -2490,8 +2620,7 @@ impl<'p> Vm<'p> {
         // The Annex-B call-assignment-target ReferenceError thrower (lib.rs
         // parse-retry rewrite). Resolvable as a global under its reserved name
         // only; hidden from globalThis own-keys reflection (props.rs).
-        let annexb_ref_error_fn =
-            self.heap.alloc(HeapObj::Native(native::ANNEXB_REF_ERROR));
+        let annexb_ref_error_fn = self.heap.alloc(HeapObj::Native(native::ANNEXB_REF_ERROR));
         // The embedder trampoline (`crate::embed`). Like the Annex-B helper it is
         // a RESERVED internal name, not a spec global: resolvable when named, but
         // hidden from globalThis own-keys reflection so `Object.keys(globalThis)`
@@ -2506,7 +2635,8 @@ impl<'p> Vm<'p> {
         // The test262 `$262` host object: { global, detachArrayBuffer, gc }.
         let d262_detach = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_DETACH)));
         let d262_gc = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_GC)));
-        let d262_create_realm = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_CREATE_REALM)));
+        let d262_create_realm =
+            Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_CREATE_REALM)));
         // `$262.IsHTMLDDA` — the `document.all` [[IsHTMLDDA]] emulation: an ordinary
         // object tagged in `is_htmldda` (typeof "undefined", == null/undefined,
         // falsy, callable→undefined).
@@ -2538,8 +2668,7 @@ impl<'p> Vm<'p> {
         agent.define("report", ag_rep, method_attr);
         agent.define("leaving", ag_leave, method_attr);
         let agent_obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(agent))));
-        let d262_eval_script =
-            Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_EVAL_SCRIPT)));
+        let d262_eval_script = Value::heap(self.heap.alloc(HeapObj::Native(DOLLAR262_EVAL_SCRIPT)));
         let mut d262 = ObjMap::new();
         d262.define("agent", agent_obj, method_attr);
         d262.define("evalScript", d262_eval_script, method_attr);
@@ -2639,8 +2768,15 @@ impl<'p> Vm<'p> {
             if matches!(self.heap.get(v), HeapObj::Object(m) if m.is_ctor) {
                 let len = match name {
                     "Date" => 7.0,
-                    "Map" | "Set" | "WeakMap" | "WeakSet" | "Iterator" | "Symbol"
-                    | "DisposableStack" | "AsyncDisposableStack" | "ShadowRealm" => 0.0,
+                    "Map"
+                    | "Set"
+                    | "WeakMap"
+                    | "WeakSet"
+                    | "Iterator"
+                    | "Symbol"
+                    | "DisposableStack"
+                    | "AsyncDisposableStack"
+                    | "ShadowRealm" => 0.0,
                     "AggregateError" => 2.0,  // (errors, message?)
                     "SuppressedError" => 3.0, // (error, suppressed, message?)
                     "RegExp" => 2.0,          // (pattern, flags)
@@ -2709,5 +2845,4 @@ impl<'p> Vm<'p> {
             }
         }
     }
-
 }

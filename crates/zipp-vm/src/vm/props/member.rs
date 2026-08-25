@@ -58,19 +58,16 @@ impl<'p> Vm<'p> {
     /// accessor names, reporting whether the intrinsic getter is still what a
     /// spec `Get` would reach. The common instance sits directly on
     /// %RegExp.prototype% with the slot untouched, so this is one map lookup.
-    fn regexp_accessor_source(
-        &self,
-        obj_idx: u32,
-        key: &str,
-        getter_id: u16,
-    ) -> RegExpAccessor {
-        let mut p = self.proto_of.get(&obj_idx).copied().unwrap_or(
-            if self.regexp_proto != 0 {
+    fn regexp_accessor_source(&self, obj_idx: u32, key: &str, getter_id: u16) -> RegExpAccessor {
+        let mut p = self
+            .proto_of
+            .get(&obj_idx)
+            .copied()
+            .unwrap_or(if self.regexp_proto != 0 {
                 Value::heap(self.regexp_proto)
             } else {
                 Value::NULL
-            },
-        );
+            });
         for _ in 0..32 {
             if !p.is_heap() {
                 break;
@@ -121,7 +118,11 @@ impl<'p> Vm<'p> {
             }
             if let Some((attr, raw)) = self.own_member(cur, key) {
                 return if attr.accessor {
-                    if raw == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { self.call_value(raw, receiver, &[]) }
+                    if raw == Value::UNDEFINED {
+                        Ok(Value::UNDEFINED)
+                    } else {
+                        self.call_value(raw, receiver, &[])
+                    }
                 } else {
                     Ok(raw)
                 };
@@ -134,7 +135,11 @@ impl<'p> Vm<'p> {
         if self.obj_proto != 0 && proto != self.obj_proto {
             if let Some((attr, raw)) = self.own_member(self.obj_proto, key) {
                 return if attr.accessor {
-                    if raw == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { self.call_value(raw, receiver, &[]) }
+                    if raw == Value::UNDEFINED {
+                        Ok(Value::UNDEFINED)
+                    } else {
+                        self.call_value(raw, receiver, &[])
+                    }
                 } else {
                     Ok(raw)
                 };
@@ -202,7 +207,10 @@ impl<'p> Vm<'p> {
     /// none — for those the pair is the inherited %ThrowTypeError% accessor.
     pub(crate) fn fn_has_legacy_caller_prop(&self, idx: u32, key: &str) -> bool {
         (key == "caller" || key == "arguments")
-            && matches!(self.heap.get(idx), HeapObj::Func(_) | HeapObj::Closure { .. })
+            && matches!(
+                self.heap.get(idx),
+                HeapObj::Func(_) | HeapObj::Closure { .. }
+            )
             && !self.fn_restricted_caller(idx)
     }
 
@@ -274,7 +282,11 @@ impl<'p> Vm<'p> {
             let censored = match self.callable_func_id(callee.heap_index()) {
                 Some(f) => {
                     let fd = self.func(f as usize);
-                    fd.is_strict || fd.is_generator || fd.is_async || fd.lexical_this || fd.non_constructable
+                    fd.is_strict
+                        || fd.is_generator
+                        || fd.is_async
+                        || fd.lexical_this
+                        || fd.non_constructable
                 }
                 None => true, // bound/native/class: not a legacy caller
             };
@@ -306,7 +318,13 @@ impl<'p> Vm<'p> {
             // indices a mapped arguments object would alias, so a parameter
             // reassigned since entry is what `f.arguments[i]` reports.
             (0..argc)
-                .map(|k| if k < pcount { self.regs[base + 1 + k] } else { self.regs[arg_win + k] })
+                .map(|k| {
+                    if k < pcount {
+                        self.regs[base + 1 + k]
+                    } else {
+                        self.regs[arg_win + k]
+                    }
+                })
                 .collect()
         } else {
             // Entered from native code (`call_value`), where the arguments were
@@ -320,7 +338,11 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn callable_name_length(&self, obj: Value) -> Option<(String, f64)> {
         let clean = |n: &str| -> String {
-            if n.starts_with('<') { String::new() } else { n.to_string() }
+            if n.starts_with('<') {
+                String::new()
+            } else {
+                n.to_string()
+            }
         };
         match self.heap.get(obj.heap_index()) {
             HeapObj::Func(fid) => {
@@ -362,7 +384,8 @@ impl<'p> Vm<'p> {
                     ..native::BUFFER_GETTER_BASE + native::BUFFER_GETTERS.len() as u16)
                     .contains(&id)
                 {
-                    let (name, _) = native::BUFFER_GETTERS[(id - native::BUFFER_GETTER_BASE) as usize];
+                    let (name, _) =
+                        native::BUFFER_GETTERS[(id - native::BUFFER_GETTER_BASE) as usize];
                     return Some((format!("get {name}"), 0.0));
                 }
                 if (native::SAB_GETTER_BASE
@@ -375,7 +398,9 @@ impl<'p> Vm<'p> {
                 native::proto_method(id)
                     .map(|(n, _, l)| (n.to_string(), l as f64))
                     .or_else(|| native::math_method(id).map(|(n, _, l)| (n.to_string(), l as f64)))
-                    .or_else(|| native::static_name_length(id).map(|(n, l)| (n.to_string(), l as f64)))
+                    .or_else(|| {
+                        native::static_name_length(id).map(|(n, l)| (n.to_string(), l as f64))
+                    })
             }
             HeapObj::Bound { target, args, .. } if target.is_heap() => {
                 // The anonymous functions returned by the Intl format/compare
@@ -405,8 +430,9 @@ impl<'p> Vm<'p> {
                 // the target's EFFECTIVE name/length so a `defineProperty`-redefined
                 // value flows through to the bound function.
                 let nbound = args.len() as f64;
-                let (tname, tlen) =
-                    self.effective_name_length(*target).unwrap_or((String::new(), 0.0));
+                let (tname, tlen) = self
+                    .effective_name_length(*target)
+                    .unwrap_or((String::new(), 0.0));
                 // L = max(0, ToIntegerOrInfinity(target.length) − boundArgs): a +Inf
                 // target length stays +Inf; the f64 channel avoids the i32 overflow
                 // a 2^31 length would hit.
@@ -429,11 +455,17 @@ impl<'p> Vm<'p> {
             let idx = obj.heap_index();
             let name_ovr = match self.heap.get(idx) {
                 HeapObj::Class(c) => c.statics.pos("name").map(|i| c.statics.vals[i]),
-                _ => self.fn_props.get(&idx).and_then(|m| m.pos("name").map(|i| m.vals[i])),
+                _ => self
+                    .fn_props
+                    .get(&idx)
+                    .and_then(|m| m.pos("name").map(|i| m.vals[i])),
             };
             let len_ovr = match self.heap.get(idx) {
                 HeapObj::Class(c) => c.statics.pos("length").map(|i| c.statics.vals[i]),
-                _ => self.fn_props.get(&idx).and_then(|m| m.pos("length").map(|i| m.vals[i])),
+                _ => self
+                    .fn_props
+                    .get(&idx)
+                    .and_then(|m| m.pos("length").map(|i| m.vals[i])),
             };
             if let Some(v) = name_ovr {
                 name = if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
@@ -449,7 +481,11 @@ impl<'p> Vm<'p> {
                     v.as_int() as f64
                 } else if v.is_double() {
                     let d = v.as_f64();
-                    if d.is_nan() { 0.0 } else { d.trunc() }
+                    if d.is_nan() {
+                        0.0
+                    } else {
+                        d.trunc()
+                    }
                 } else {
                     0.0
                 };
@@ -472,7 +508,12 @@ impl<'p> Vm<'p> {
         let is_class = matches!(self.heap.get(fi), HeapObj::Class(_));
         let is_callable = matches!(
             self.heap.get(fi),
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+            HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Bound { .. }
+                | HeapObj::Wrapped { .. }
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. }
         );
         if !is_class && !is_callable {
             return;
@@ -504,17 +545,20 @@ impl<'p> Vm<'p> {
             return;
         }
         let nv = self.alloc_str(name);
-        self.fn_props.entry(fi).or_insert_with(ObjMap::new_side_table).define(
-            "name",
-            nv,
-            PropAttr {
-                writable: false,
-                enumerable: false,
-                configurable: true,
-                accessor: false,
-                setter: Value::UNDEFINED,
-            },
-        );
+        self.fn_props
+            .entry(fi)
+            .or_insert_with(ObjMap::new_side_table)
+            .define(
+                "name",
+                nv,
+                PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                },
+            );
         // The explicit `name` IS the function's name — suppress the synthesized
         // intrinsic so it doesn't reappear if the explicit one is deleted (the
         // property is a single configurable own `name`, per SetFunctionName).
@@ -529,7 +573,11 @@ impl<'p> Vm<'p> {
             "length" => 1u8,
             _ => return false,
         };
-        if !obj.is_heap() || self.deleted_callable_intrinsics.contains(&(obj.heap_index(), bit)) {
+        if !obj.is_heap()
+            || self
+                .deleted_callable_intrinsics
+                .contains(&(obj.heap_index(), bit))
+        {
             return false;
         }
         // An EXPLICIT own `name`/`length` overrides the synthesized intrinsic: a
@@ -544,9 +592,15 @@ impl<'p> Vm<'p> {
                     || c.static_getters.iter().any(|(k, _)| k == key)
                     || c.static_setters.iter().any(|(k, _)| k == key)
             }
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
-                self.fn_props.get(&idx).is_some_and(|m| m.pos(key).is_some())
-            }
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => self
+                .fn_props
+                .get(&idx)
+                .is_some_and(|m| m.pos(key).is_some()),
             _ => false,
         };
         if has_explicit_own {
@@ -612,14 +666,23 @@ impl<'p> Vm<'p> {
     /// own property in the generic `arr_props` side table (invoking a getter with
     /// `this = obj`), else delegate to the type's prototype. Lets these objects
     /// carry own properties defined via `Object.defineProperty`.
-    pub(crate) fn exotic_own_or_proto(&mut self, obj: Value, proto: u32, key: &str) -> Result<Value, Thrown> {
+    pub(crate) fn exotic_own_or_proto(
+        &mut self,
+        obj: Value,
+        proto: u32,
+        key: &str,
+    ) -> Result<Value, Thrown> {
         let found = self
             .arr_props
             .get(&obj.heap_index())
             .and_then(|m| m.pos(key).map(|i| (m.attrs[i].accessor, m.vals[i])));
         if let Some((is_accessor, v)) = found {
             if is_accessor {
-                return if v == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { self.call_value(v, obj, &[]) };
+                return if v == Value::UNDEFINED {
+                    Ok(Value::UNDEFINED)
+                } else {
+                    self.call_value(v, obj, &[])
+                };
             }
             return Ok(v);
         }
@@ -643,7 +706,12 @@ impl<'p> Vm<'p> {
     /// started from. It equals `obj` at the top level; during prototype-chain
     /// delegation `obj` advances up the chain while `receiver` stays the original,
     /// so an INHERITED accessor's getter is invoked with the correct `this`.
-    pub(crate) fn get_member(&mut self, obj: Value, key: &str, receiver: Value) -> Result<Value, Thrown> {
+    pub(crate) fn get_member(
+        &mut self,
+        obj: Value,
+        key: &str,
+        receiver: Value,
+    ) -> Result<Value, Thrown> {
         // FAST PATH: walk plain-Object own maps + the `proto_of` chain directly.
         // A read on a plain (non-constructor, non-global, non-namespace) Object —
         // the overwhelmingly common case — pays NONE of the exotic machinery in
@@ -708,15 +776,11 @@ impl<'p> Vm<'p> {
                         while let Some(cidx) = c2 {
                             match self.heap.get(cidx) {
                                 HeapObj::Class(c) => {
-                                    if let Some((_, v)) =
-                                        c.methods.iter().find(|(k, _)| k == key)
-                                    {
+                                    if let Some((_, v)) = c.methods.iter().find(|(k, _)| k == key) {
                                         method = Some(*v);
                                         break;
                                     }
-                                    if let Some((_, v)) =
-                                        c.getters.iter().find(|(k, _)| k == key)
-                                    {
+                                    if let Some((_, v)) = c.getters.iter().find(|(k, _)| k == key) {
                                         getter = Some(*v);
                                         break;
                                     }
@@ -759,19 +823,29 @@ impl<'p> Vm<'p> {
     /// The full (exotic-aware) property GET — see [`Vm::get_member`], whose
     /// fast path handles the plain-Object chain and delegates everything else
     /// (and every chain object it bails on) here.
-    pub(crate) fn get_member_slow(&mut self, obj: Value, key: &str, receiver: Value) -> Result<Value, Thrown> {
+    pub(crate) fn get_member_slow(
+        &mut self,
+        obj: Value,
+        key: &str,
+        receiver: Value,
+    ) -> Result<Value, Thrown> {
         self.defer_check(obj, key)?; // a deferred-namespace Get may evaluate
-        // Inside a ShadowRealm's evaluate, `globalThis.x` reads the REALM's
-        // own binding for x when one exists (bare `x` and `globalThis.x`
-        // alias the same realm slot).
+                                     // Inside a ShadowRealm's evaluate, `globalThis.x` reads the REALM's
+                                     // own binding for x when one exists (bare `x` and `globalThis.x`
+                                     // alias the same realm slot).
         if let Some(rid) = self.active_realm {
-            if obj.is_heap()
-                && self.global_this != 0
-                && obj.heap_index() == self.global_this
-            {
+            if obj.is_heap() && self.global_this != 0 && obj.heap_index() == self.global_this {
                 if let Some(&s) = self.realm_globals.get(&rid).and_then(|m| m.get(key)) {
-                    let v = self.globals.get(s as usize).copied().unwrap_or(Value::UNDEFINED);
-                    return Ok(if v.is_uninitialized() { Value::UNDEFINED } else { v });
+                    let v = self
+                        .globals
+                        .get(s as usize)
+                        .copied()
+                        .unwrap_or(Value::UNDEFINED);
+                    return Ok(if v.is_uninitialized() {
+                        Value::UNDEFINED
+                    } else {
+                        v
+                    });
                 }
             }
         }
@@ -785,8 +859,16 @@ impl<'p> Vm<'p> {
             && obj.is_heap()
             && self.realm_global_objs.contains_key(&obj.heap_index())
         {
-            if let Some(&s) = self.realm_globals.get(&obj.heap_index()).and_then(|m| m.get(key)) {
-                let v = self.globals.get(s as usize).copied().unwrap_or(Value::UNDEFINED);
+            if let Some(&s) = self
+                .realm_globals
+                .get(&obj.heap_index())
+                .and_then(|m| m.get(key))
+            {
+                let v = self
+                    .globals
+                    .get(s as usize)
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED);
                 if !v.is_uninitialized() {
                     return Ok(v);
                 }
@@ -796,7 +878,9 @@ impl<'p> Vm<'p> {
         if obj.is_heap() {
             if let Some((target, handler, revoked)) = self.proxy_parts(obj.heap_index()) {
                 if revoked {
-                    return Err(Thrown("TypeError: Cannot perform 'get' on a revoked proxy".into()));
+                    return Err(Thrown(
+                        "TypeError: Cannot perform 'get' on a revoked proxy".into(),
+                    ));
                 }
                 return match self.proxy_trap(handler, "get")? {
                     Some(trap) => {
@@ -1019,7 +1103,10 @@ impl<'p> Vm<'p> {
             // pattern against 120ns for a 20,000-char one, on a read that returns
             // an integer. `re.flags` read nine such properties, so it cost 227ns
             // against node's 3ns.
-            if let HeapObj::RegExp { flags, last_index, .. } = self.heap.get(obj.heap_index()) {
+            if let HeapObj::RegExp {
+                flags, last_index, ..
+            } = self.heap.get(obj.heap_index())
+            {
                 if key == "lastIndex" {
                     return Ok(*last_index);
                 }
@@ -1055,8 +1142,10 @@ impl<'p> Vm<'p> {
         }
         // An Array's named (non-index) own properties (arr.foo, and a match
         // result's index/input/groups) live in arr_props and shadow the prototype.
-        let arr_entry =
-            self.arr_props.get(&obj.heap_index()).and_then(|m| m.pos(key).map(|i| (m.vals[i], m.attrs[i])));
+        let arr_entry = self
+            .arr_props
+            .get(&obj.heap_index())
+            .and_then(|m| m.pos(key).map(|i| (m.vals[i], m.attrs[i])));
         if let Some((raw, attr)) = arr_entry {
             if attr.accessor {
                 return if raw == Value::UNDEFINED {
@@ -1082,7 +1171,13 @@ impl<'p> Vm<'p> {
             return Ok(raw);
         }
         // TypedArray / ArrayBuffer / DataView instance properties.
-        if let HeapObj::TypedArray { buffer, kind, byte_offset, .. } = self.heap.get(obj.heap_index()) {
+        if let HeapObj::TypedArray {
+            buffer,
+            kind,
+            byte_offset,
+            ..
+        } = self.heap.get(obj.heap_index())
+        {
             let (buffer, kind, byte_offset) = (*buffer, *kind, *byte_offset);
             let size = native::TA_KINDS[kind as usize].1;
             // A CANONICAL numeric string index reads the element. usize's FromStr
@@ -1096,6 +1191,56 @@ impl<'p> Vm<'p> {
             // length/byteLength/byteOffset as 0; a length-tracking view reflects
             // the buffer's current size.
             let eff = self.ta_effective_len(obj.heap_index());
+            // `length` is NOT an own integer-indexed exotic property. Resolve
+            // the receiver's real chain first: a data/getter shadow on the kind
+            // prototype, the hidden %TypedArray%.prototype, or a user-installed
+            // custom prototype must win. The direct internal-slot answer is
+            // legal only when the nearest property is the intrinsic accessor.
+            //
+            // `create_realm` now builds and links a hidden realm-local
+            // %TypedArray%.prototype carrying copied accessors, so
+            // `ta_named_is_intrinsic` works for foreign-realm instances too.
+            // The JIT pin deliberately keeps its stricter same-realm proof;
+            // cross-realm correctness stays on this ordinary path.
+            if key == "length" {
+                if self.ta_named_is_intrinsic(obj.heap_index(), key) {
+                    if receiver != obj {
+                        // The accessor validates its receiver's TypedArray slot;
+                        // it does not require receiver identity.  This matters
+                        // for Reflect.get(ta, "length", anotherTa), and when a
+                        // TypedArray itself appears in another view's prototype
+                        // chain.  A Proxy around a TypedArray intentionally does
+                        // not pass this direct internal-slot check.
+                        if receiver.is_heap()
+                            && matches!(
+                                self.heap.get(receiver.heap_index()),
+                                HeapObj::TypedArray { .. }
+                            )
+                        {
+                            return Ok(Value::num(
+                                self.ta_effective_len(receiver.heap_index()).unwrap_or(0) as f64,
+                            ));
+                        }
+                        let msg = "TypeError: get %TypedArray%.prototype.length called on a value that is not a TypedArray".to_string();
+                        return Err(self.realm_thrown_from_proto(obj.heap_index(), msg));
+                    }
+                    return Ok(Value::num(eff.unwrap_or(0) as f64));
+                }
+                let proto = self
+                    .proto_of
+                    .get(&obj.heap_index())
+                    .copied()
+                    .unwrap_or_else(|| Value::heap(self.ta_protos[kind as usize]));
+                // An explicit null prototype ends the lookup.  Otherwise use
+                // the full exotic-aware [[Get]] path: a custom prototype may be
+                // an Array, another TypedArray, or a Proxy rather than an
+                // ordinary ObjMap.
+                return if proto.is_heap() {
+                    self.get_member(proto, key, receiver)
+                } else {
+                    Ok(Value::UNDEFINED)
+                };
+            }
             // …but a FOREIGN receiver never gets them. 10.4.5 integer-indexed
             // exotics own no `length`/`byteLength`/`byteOffset`/`buffer`: those
             // are %TypedArray%.prototype accessors whose first step is
@@ -1107,30 +1252,27 @@ impl<'p> Vm<'p> {
             // (staging/sm/regress/regress-571014.js). BYTES_PER_ELEMENT is a
             // genuine inherited DATA property and @@toStringTag returns undefined
             // rather than throwing, so both stay reachable.
-            if receiver != obj && matches!(key, "length" | "byteLength" | "byteOffset" | "buffer") {
+            if receiver != obj && matches!(key, "byteLength" | "byteOffset" | "buffer") {
                 let msg = format!(
                     "TypeError: get %TypedArray%.prototype.{key} called on a value that is not a TypedArray"
                 );
                 return Err(self.realm_thrown_from_proto(obj.heap_index(), msg));
             }
-            // KNOWN DEVIATION: these six names are answered from the instance
+            // KNOWN DEVIATION: the remaining five names are answered from the instance
             // without consulting the prototype chain, so
-            // `Object.setPrototypeOf(ta, {length: 7}); ta.length` reports the
-            // TypedArray's length instead of 7 (V8 reports 7).
+            // `Object.setPrototypeOf(ta, {byteLength: 7}); ta.byteLength`
+            // reports the TypedArray's byte length instead of 7.
             //
             // Gating them on a chain lookup (`ta_named_is_intrinsic`, kept in
             // vm/typedarray.rs) is the spec-correct shape, but it cannot be
-            // enabled yet: `$262.createRealm()` does not build the
-            // %TypedArray%.prototype level for the new realm — a cross-realm
-            // TypedArray's prototype chain is `OtherUint8Array.prototype ->
-            // Object.prototype`, carrying none of these accessors — so a
-            // faithful lookup returns `undefined` and breaks 24 cross-realm
-            // tests that currently pass only because this path ignores the
-            // chain. Fix the realm setup first, then flip this back.
+            // enabled as a group yet; `.length` is fixed above independently.
             return Ok(match key {
-                "length" => Value::num(eff.unwrap_or(0) as f64),
                 "byteLength" => Value::num((eff.unwrap_or(0) * size) as f64),
-                "byteOffset" => Value::num(if eff.is_none() { 0.0 } else { byte_offset as f64 }),
+                "byteOffset" => Value::num(if eff.is_none() {
+                    0.0
+                } else {
+                    byte_offset as f64
+                }),
                 "BYTES_PER_ELEMENT" => Value::num(size as f64),
                 "buffer" => Value::heap(buffer),
                 "@@toStringTag" => self.alloc_str(native::TA_KINDS[kind as usize].0.to_string()),
@@ -1192,11 +1334,16 @@ impl<'p> Vm<'p> {
                 "immutable" if !shared => Value::bool(immut),
                 "growable" if shared => Value::bool(max.is_some()),
                 "resizable" if !shared => Value::bool(max.is_some() && !immut),
-                "detached" if !shared => Value::bool(
-                    matches!(self.heap.get(ai), HeapObj::ArrayBuffer { detached: true, .. }),
-                ),
+                "detached" if !shared => Value::bool(matches!(
+                    self.heap.get(ai),
+                    HeapObj::ArrayBuffer { detached: true, .. }
+                )),
                 _ => {
-                    let default = if shared { self.sab_proto } else { self.arraybuffer_proto };
+                    let default = if shared {
+                        self.sab_proto
+                    } else {
+                        self.arraybuffer_proto
+                    };
                     let proto = self
                         .proto_of
                         .get(&ai)
@@ -1211,18 +1358,29 @@ impl<'p> Vm<'p> {
                 }
             });
         }
-        if let HeapObj::DataView { buffer, byte_offset, byte_length } = self.heap.get(obj.heap_index()) {
+        if let HeapObj::DataView {
+            buffer,
+            byte_offset,
+            byte_length,
+        } = self.heap.get(obj.heap_index())
+        {
             let (buffer, byte_offset, byte_length) = (*buffer, *byte_offset, *byte_length);
             // IsViewOutOfBounds: byteLength / byteOffset throw a TypeError when the
             // viewed buffer is detached, or when a resizable buffer has shrunk so the
             // view no longer fits (fixed-length: offset+length > current size;
             // length-tracking: offset > current size). `buffer` stays readable.
-            let detached =
-                matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. });
+            let detached = matches!(
+                self.heap.get(buffer),
+                HeapObj::ArrayBuffer { detached: true, .. }
+            );
             let tracking = self.dv_tracking.contains(&obj.heap_index());
             let cur = self.array_buffer_len(buffer);
             let oob = detached
-                || if tracking { byte_offset > cur } else { byte_offset + byte_length > cur };
+                || if tracking {
+                    byte_offset > cur
+                } else {
+                    byte_offset + byte_length > cur
+                };
             // %DataView.prototype%'s three accessors all start with
             // RequireInternalSlot(this, [[DataView]]); a foreign receiver that
             // merely inherits from this view must get that TypeError, not the
@@ -1236,8 +1394,8 @@ impl<'p> Vm<'p> {
             return Ok(match key {
                 "byteLength" | "byteOffset" if oob => {
                     return Err(Thrown(format!(
-                        "TypeError: get DataView.prototype.{key}: the viewed buffer is out of bounds"
-                    )))
+                    "TypeError: get DataView.prototype.{key}: the viewed buffer is out of bounds"
+                )))
                 }
                 // A length-tracking view reports the buffer's current remaining size.
                 "byteLength" if tracking => Value::num((cur - byte_offset) as f64),
@@ -1283,7 +1441,9 @@ impl<'p> Vm<'p> {
         }
         // Temporal.PlainDate getters; methods via the prototype.
         if let HeapObj::Temporal { kind: 1, .. } = self.heap.get(obj.heap_index()) {
-            let (y, m, d) = self.plain_date_fields(obj.heap_index()).unwrap_or((0, 0, 0));
+            let (y, m, d) = self
+                .plain_date_fields(obj.heap_index())
+                .unwrap_or((0, 0, 0));
             let cal = self.cal_of(obj.heap_index());
             if let Some(v) = self.cal_date_getter(cal, (y, m, d), key) {
                 return Ok(v);
@@ -1406,9 +1566,7 @@ impl<'p> Vm<'p> {
                                 .into(),
                         ));
                     }
-                    Value::num(
-                        (tomorrow_start - today_start) as f64 / 3_600_000_000_000.0,
-                    )
+                    Value::num((tomorrow_start - today_start) as f64 / 3_600_000_000_000.0)
                 }
                 // FLOOR division (toward −∞), not truncation, for negative epochs.
                 "epochSeconds" => Value::num(epoch.div_euclid(1_000_000_000) as f64),
@@ -1443,9 +1601,10 @@ impl<'p> Vm<'p> {
             // An Intl instance is an ordinary object as far as property access
             // goes: an assigned own property lives in the generic arr_props side
             // table (see `set_prop`) and shadows the prototype.
-            let own = self.arr_props.get(&obj.heap_index()).and_then(|m| {
-                m.pos(key).map(|i| (m.attrs[i], m.vals[i]))
-            });
+            let own = self
+                .arr_props
+                .get(&obj.heap_index())
+                .and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i])));
             if let Some((attr, raw)) = own {
                 if attr.accessor {
                     return if raw == Value::UNDEFINED {
@@ -1474,7 +1633,11 @@ impl<'p> Vm<'p> {
         if let Some((a, raw)) = own {
             if a.accessor {
                 // `raw` is the getter (UNDEFINED ⇒ no getter ⇒ read is undefined).
-                return if raw == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { self.call_value(raw, receiver, &[]) };
+                return if raw == Value::UNDEFINED {
+                    Ok(Value::UNDEFINED)
+                } else {
+                    self.call_value(raw, receiver, &[])
+                };
             }
             return Ok(raw);
         }
@@ -1526,7 +1689,11 @@ impl<'p> Vm<'p> {
                     }
                 } else if key == "raw" {
                     // A tagged-template strings array's `.raw` (side table).
-                    Ok(self.template_raws.get(&obj.heap_index()).copied().unwrap_or(Value::UNDEFINED))
+                    Ok(self
+                        .template_raws
+                        .get(&obj.heap_index())
+                        .copied()
+                        .unwrap_or(Value::UNDEFINED))
                 } else {
                     // A method as a VALUE (`arr.map`, `arr.slice`, …) → Array.prototype,
                     // or the subclass prototype for a `class extends Array` instance.
@@ -1674,7 +1841,9 @@ impl<'p> Vm<'p> {
             HeapObj::WeakMap { .. } => self.exotic_own_or_proto(obj, self.weakmap_proto, key),
             HeapObj::WeakSet(_) => self.exotic_own_or_proto(obj, self.weakset_proto, key),
             HeapObj::WeakRef(_) => self.exotic_own_or_proto(obj, self.weakref_proto, key),
-            HeapObj::FinalizationRegistry { .. } => self.exotic_own_or_proto(obj, self.finreg_proto, key),
+            HeapObj::FinalizationRegistry { .. } => {
+                self.exotic_own_or_proto(obj, self.finreg_proto, key)
+            }
             HeapObj::Iterator { proto, .. } => {
                 let p = *proto;
                 self.proto_chain_get(p, key, obj)
@@ -1743,7 +1912,12 @@ impl<'p> Vm<'p> {
             // (`assert.sameValue`), then Function.prototype (`call`/`apply`/`bind`).
             _ if matches!(
                 self.heap.get(obj.heap_index()),
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+                HeapObj::Func(_)
+                    | HeapObj::Closure { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::Wrapped { .. }
+                    | HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. }
             ) =>
             {
                 // An own property in the fn_props bag (incl. an explicitly defined
@@ -1801,5 +1975,4 @@ impl<'p> Vm<'p> {
             _ => Ok(Value::UNDEFINED),
         }
     }
-
 }

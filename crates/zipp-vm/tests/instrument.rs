@@ -330,8 +330,29 @@ fn the_jit_charges_exactly_what_the_interpreter_would() {
         "const a=[]; for(let i=0;i<50000;i++)a.push(i*3);          let t=0; for(let i=0;i<a.length;i++)t+=a[i]; t",
         // Property access, which routes through the inline-cache memory tier.
         "let o={n:0}; for(let i=0;i<100000;i++){ o.n = o.n + 1; } o.n",
+        // Many receiver identities at one Get/Set site. The adaptive direct-
+        // miss gate must not deopt/replay a block after it has been charged;
+        // metered execution keeps the probe form and therefore the exact count.
+        "let a=[]; for(let i=0;i<64;i++)a.push({n:i,p:i}); function touch(o,v){o.n=v;return o.n} let s=0; for(let i=0;i<50000;i++)s=(s+touch(a[i&63],i))|0; s",
         // String building — the helper-call path.
         "let s=''; for(let i=0;i<2000;i++) s+='x'; s.length",
+        // Runtime-declining Tier-C primitives stay interpreter-owned under a
+        // meter: modulo, nested-member RequireObjectCoercible, guarded
+        // Map.set/clear and guarded string case conversion must not pre-charge
+        // a native block and then charge replayed bytecode a second time.
+        "function hot(m,h,i){let r=i%4;m.set('k',r);if((i&255)===255)m.clear();return h.text.toUpperCase().length+r} const m=new Map(),h={text:'ab'};let s=0;for(let i=0;i<5000;i++)s+=hot(m,h,i);s",
+        // Rotating closures with a capture-free same-prototype leaf. Leaf
+        // splices deliberately stay disabled for metered VMs until the splice
+        // can charge the callee body (including its default prologue) exactly.
+        "let fs=[]; function mk(){ let f=function rot(x,n=5){return (x<<n)|(x>>>(32-n))}; return function(x){return f(x,3)} } for(let i=0;i<16;i++)fs.push(mk()); let s=0; for(let i=0;i<100000;i++)s=(s+fs[i&15](i))|0; s",
+        // Own-data random-method direct-slot probing is deliberately omitted
+        // from metered Tier-C bodies until its native prefix has an exact
+        // charge proof. The ordinary method/callee bodies still charge exactly.
+        "function random(){return this.n} function hot(o){let s=0;for(let i=0;i<100000;i++)s+=o.random();return s} hot({n:3,random:random})",
+        // Likewise, the transactional own-method/global splice intentionally
+        // declines under a meter until nested callee-bytecode charging is
+        // represented exactly. This seed/update shape would otherwise engage.
+        "let st=123456789;function random(){st^=st<<13;st^=st>>>17;st^=st<<5;return(st>>>0)/4294967296}const o={random:random};function call(){return o.random()}let s=0;for(let i=0;i<5000;i++)s=(s+((call()*1000000)|0))|0;s",
     ] {
         let (jit, jit_out) = steps_and_result(script, false);
         let (interp, interp_out) = steps_and_result(script, true);
@@ -356,7 +377,11 @@ fn a_jit_hot_loop_still_hits_its_budget() {
     assert_eq!(st.steps_remaining(), 0);
     // A billion iterations would take seconds even compiled; stopping at half a
     // million steps must be immediate.
-    assert!(started.elapsed().as_millis() < 500, "took {:?}", started.elapsed());
+    assert!(
+        started.elapsed().as_millis() < 500,
+        "took {:?}",
+        started.elapsed()
+    );
 }
 
 /// The abort flag has to reach compiled code too. It is polled in Rust once per
@@ -376,7 +401,11 @@ fn the_abort_flag_stops_a_jit_hot_loop() {
         .eval_in_context("(0,eval)('let s=0; for(let i=0;i<100000000000;i++) s+=i; s')")
         .expect_err("must be aborted");
     assert!(err.contains("aborted by the host"), "got {err:?}");
-    assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+    assert!(
+        started.elapsed().as_secs() < 5,
+        "took {:?}",
+        started.elapsed()
+    );
     t.join().unwrap();
 }
 
@@ -387,10 +416,22 @@ fn the_abort_flag_stops_a_jit_hot_loop() {
 fn metering_does_not_change_results() {
     for (script, want) in [
         ("let s=0; for(let i=0;i<100000;i++) s+=i; s", "4999950000"),
-        ("function fib(n){return n<2?n:fib(n-1)+fib(n-2)} fib(24)", "46368"),
-        ("const a=[]; for(let i=0;i<10000;i++)a.push(i%7); a.filter(x=>x===3).length", "1429"),
-        ("let o={a:0,b:0}; for(let i=0;i<50000;i++){o.a+=1;o.b+=o.a;} o.b", "1250025000"),
-        ("let s=0; for(let i=0;i<50000;i++){ s = (s + i*3) | 0; } s", "-545042296"),
+        (
+            "function fib(n){return n<2?n:fib(n-1)+fib(n-2)} fib(24)",
+            "46368",
+        ),
+        (
+            "const a=[]; for(let i=0;i<10000;i++)a.push(i%7); a.filter(x=>x===3).length",
+            "1429",
+        ),
+        (
+            "let o={a:0,b:0}; for(let i=0;i<50000;i++){o.a+=1;o.b+=o.a;} o.b",
+            "1250025000",
+        ),
+        (
+            "let s=0; for(let i=0;i<50000;i++){ s = (s + i*3) | 0; } s",
+            "-545042296",
+        ),
     ] {
         let mut metered = instrumented(u64::MAX, None);
         let got = metered
@@ -425,7 +466,9 @@ fn the_test262_host_object_is_not_exposed_to_embedded_code() {
     );
     // Reaching it through the global object must fail too.
     assert_eq!(
-        st.eval_in_context("typeof globalThis.$262").unwrap().as_str(),
+        st.eval_in_context("typeof globalThis.$262")
+            .unwrap()
+            .as_str(),
         Some("undefined")
     );
     // And the thread-spawning corner specifically.
@@ -461,7 +504,9 @@ fn a_script_that_allocates_without_bound_is_stopped() {
     st.set_heap_limit(baseline + 400_000);
 
     let err = st
-        .eval_in_context("(function(){var a=[];for(var i=0;i<1000000;i++)a.push({n:i});return a.length})()")
+        .eval_in_context(
+            "(function(){var a=[];for(var i=0;i<1000000;i++)a.push({n:i});return a.length})()",
+        )
         .expect_err("must not be allowed to finish");
     assert!(err.contains("memory budget"), "unexpected error: {err}");
 
@@ -482,8 +527,10 @@ fn a_script_within_its_heap_budget_is_left_alone() {
     st.set_heap_limit(st.heap_bytes() + 4_000_000);
 
     assert_eq!(
-        st.eval_in_context("(function(){var a=[];for(var i=0;i<2000;i++)a.push({n:i});return a.length})()")
-            .unwrap(),
+        st.eval_in_context(
+            "(function(){var a=[];for(var i=0;i<2000;i++)a.push({n:i});return a.length})()"
+        )
+        .unwrap(),
         embed::JsValue::Number(2000.0)
     );
 }
@@ -519,8 +566,10 @@ fn no_heap_limit_means_no_heap_limit() {
     st.set_limits(50_000_000, None);
 
     assert_eq!(
-        st.eval_in_context("(function(){var a=[];for(var i=0;i<50000;i++)a.push({n:i});return a.length})()")
-            .unwrap(),
+        st.eval_in_context(
+            "(function(){var a=[];for(var i=0;i<50000;i++)a.push({n:i});return a.length})()"
+        )
+        .unwrap(),
         embed::JsValue::Number(50000.0)
     );
 }

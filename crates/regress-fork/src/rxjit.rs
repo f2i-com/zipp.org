@@ -36,11 +36,11 @@
 //! regexes never pay compilation. `ZIPP_RXSTATS=1` reports compiled/declined/
 //! native/interpreted counts (see `stats`).
 
-use crate::bytesearch::{charset_contains, ByteSet};
+use crate::bytesearch::{ByteSet, charset_contains};
 use crate::insn::{CompiledRegex, Insn};
 use crate::matchers::{ASCIICharProperties, CharProperties};
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use dynasmrt::{dynasm, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 use std::cell::RefCell;
 use std::sync::OnceLock;
 
@@ -351,8 +351,13 @@ unsafe impl Send for JitCode {}
 unsafe impl Sync for JitCode {}
 
 pub(crate) enum Outcome {
-    Match { end: usize, skip_hint: u64 },
-    NoMatch { skip_hint: u64 },
+    Match {
+        end: usize,
+        skip_hint: u64,
+    },
+    NoMatch {
+        skip_hint: u64,
+    },
     /// Native gave up (backtrack buffer cap); rerun the attempt interpreted.
     Bail,
 }
@@ -423,7 +428,9 @@ pub(crate) fn run_attempt(
                     if crate::classicalbacktrack::rxstats::enabled() {
                         NATIVE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                     }
-                    return Outcome::NoMatch { skip_hint: ctx.skip_hint };
+                    return Outcome::NoMatch {
+                        skip_hint: ctx.skip_hint,
+                    };
                 }
                 end => {
                     if crate::classicalbacktrack::rxstats::enabled() {
@@ -432,7 +439,10 @@ pub(crate) fn run_attempt(
                     for g in 0..code.groups {
                         set_group(g, s.groups[g * 2], s.groups[g * 2 + 1]);
                     }
-                    return Outcome::Match { end: end as usize, skip_hint: ctx.skip_hint };
+                    return Outcome::Match {
+                        end: end as usize,
+                        skip_hint: ctx.skip_hint,
+                    };
                 }
             }
         }
@@ -504,7 +514,12 @@ impl<'s> Session<'s> {
             bt_limit: unsafe { bt.as_mut_ptr().add(bt.len() - 4) },
             skip_hint: u64::MAX,
         };
-        Self { code, ctx, groups, bt }
+        Self {
+            code,
+            ctx,
+            groups,
+            bt,
+        }
     }
 
     /// Run one native attempt at byte offset `start`; the per-attempt
@@ -545,14 +560,15 @@ impl<'s> Session<'s> {
                     // The resize can move the buffer: recompute the context
                     // pointers before the retry.
                     self.ctx.bt_base = self.bt.as_mut_ptr();
-                    self.ctx.bt_limit =
-                        unsafe { self.bt.as_mut_ptr().add(self.bt.len() - 4) };
+                    self.ctx.bt_limit = unsafe { self.bt.as_mut_ptr().add(self.bt.len() - 4) };
                 }
                 -1 => {
                     if crate::classicalbacktrack::rxstats::enabled() {
                         NATIVE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                     }
-                    return Outcome::NoMatch { skip_hint: self.ctx.skip_hint };
+                    return Outcome::NoMatch {
+                        skip_hint: self.ctx.skip_hint,
+                    };
                 }
                 end => {
                     if crate::classicalbacktrack::rxstats::enabled() {
@@ -561,7 +577,10 @@ impl<'s> Session<'s> {
                     for g in 0..self.code.groups {
                         set_group(g, self.groups[g * 2], self.groups[g * 2 + 1]);
                     }
-                    return Outcome::Match { end: end as usize, skip_hint: self.ctx.skip_hint };
+                    return Outcome::Match {
+                        end: end as usize,
+                        skip_hint: self.ctx.skip_hint,
+                    };
                 }
             }
         }
@@ -584,7 +603,14 @@ enum Node {
     Seq(Vec<u8>),
     /// One-char loop over table `t`; continuation is the node after the
     /// (skipped) body.
-    Loop { t: usize, min: u64, max: u64, greedy: bool, possessive: bool, hint: bool },
+    Loop {
+        t: usize,
+        min: u64,
+        max: u64,
+        greedy: bool,
+        possessive: bool,
+        hint: bool,
+    },
     /// The consumed body of a preceding Loop; nothing may jump here.
     Skip,
     Jump(usize),
@@ -592,9 +618,18 @@ enum Node {
     Begin(u32),
     End(u32),
     Reset(u32),
-    Sol { multiline: bool, lt: usize },
-    Eol { multiline: bool, lt: usize },
-    Wb { invert: bool, w: usize },
+    Sol {
+        multiline: bool,
+        lt: usize,
+    },
+    Eol {
+        multiline: bool,
+        lt: usize,
+    },
+    Wb {
+        invert: bool,
+        w: usize,
+    },
     Goal,
     JustFail,
 }
@@ -685,7 +720,13 @@ fn plan(re: &CompiledRegex) -> Option<Plan> {
     while i < n {
         let insn = &insns[i];
         // Loops first: they consume their body insn.
-        if let &Insn::Loop1CharBody { min_iters, max_iters, greedy, possessive } = insn {
+        if let &Insn::Loop1CharBody {
+            min_iters,
+            max_iters,
+            greedy,
+            possessive,
+        } = insn
+        {
             if i + 2 >= n {
                 return unsupported();
             }
@@ -799,8 +840,11 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let nodes = &plan.nodes;
     let labels: Vec<DynamicLabel> = nodes.iter().map(|_| ops.new_dynamic_label()).collect();
-    let tbl_labels: Vec<DynamicLabel> =
-        plan.tables.iter().map(|_| ops.new_dynamic_label()).collect();
+    let tbl_labels: Vec<DynamicLabel> = plan
+        .tables
+        .iter()
+        .map(|_| ops.new_dynamic_label())
+        .collect();
     // Trailer handlers emitted after the main stream:
     // (handler label, continuation/secondary label, kind).
     enum Handler {
@@ -933,7 +977,14 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
                 }
                 dynasm!(ops ; mov rbx, rax);
             }
-            &Node::Loop { t, min, max, greedy, possessive, hint } => {
+            &Node::Loop {
+                t,
+                min,
+                max,
+                greedy,
+                possessive,
+                hint,
+            } => {
                 // Scan forward while the byte matches, bounded by
                 // min(len, pos + max). rax = cursor; after the scan,
                 // rdx = min_pos, rax = max_pos (mirrors run_scm_loop).
@@ -1218,5 +1269,10 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
         )
     };
     COMPILED.fetch_add(1, Ordering::Relaxed);
-    Some(JitCode { _buf: buf, entry, groups: ngroups, resets_groups })
+    Some(JitCode {
+        _buf: buf,
+        entry,
+        groups: ngroups,
+        resets_groups,
+    })
 }

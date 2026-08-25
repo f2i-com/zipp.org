@@ -1799,10 +1799,6 @@ pub enum Instr {
         site: u32,
         src: Reg,
     },
-    /// `Math.random()` → a float in [0, 1) from the VM's PRNG.
-    Random {
-        dst: Reg,
-    },
     /// Install a method on a class value at runtime under a COMPUTED key
     /// (`class C { [expr]() {} }`). `class` holds the class value, `key` the
     /// evaluated key, `func` the method's function id, `kind` selects 0=method /

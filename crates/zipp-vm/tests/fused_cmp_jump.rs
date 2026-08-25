@@ -16,7 +16,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -62,7 +66,10 @@ fn double_and_nan_compares_drive_branches() {
         console.log("done");
         "#,
     );
-    assert_eq!(out, ["d1", "d2", "d3", "d4", "nan1", "nan2", "nan3", "done"]);
+    assert_eq!(
+        out,
+        ["d1", "d2", "d3", "d4", "nan1", "nan2", "nan3", "done"]
+    );
 }
 
 #[test]
@@ -241,7 +248,16 @@ fn comparison_used_as_a_value_stays_correct() {
         if (x < y && r) console.log("and-taken"); else console.log("x");
         "#,
     );
-    assert_eq!(out, ["true boolean", "false", "true,true,false,false,false", "true", "and-taken"]);
+    assert_eq!(
+        out,
+        [
+            "true boolean",
+            "false",
+            "true,true,false,false,false",
+            "true",
+            "and-taken"
+        ]
+    );
 }
 
 #[test]
@@ -251,7 +267,10 @@ fn bytecode_shape_branch_tests_fuse_value_uses_do_not() {
     let t = text_of("function f(a, b) { if (a < b) return a; return b; }");
     if fused_mode() {
         assert!(t.contains("JumpIfNotLt"), "branch `<` should fuse:\n{t}");
-        assert!(!t.contains("JumpIfFalse"), "fused test leaves no JumpIfFalse:\n{t}");
+        assert!(
+            !t.contains("JumpIfFalse"),
+            "fused test leaves no JumpIfFalse:\n{t}"
+        );
     } else {
         assert!(!t.contains("JumpIfNotLt"), "switch off, no fused op:\n{t}");
         assert!(t.contains("JumpIfFalse"), "unfused pair expected:\n{t}");
@@ -259,11 +278,19 @@ fn bytecode_shape_branch_tests_fuse_value_uses_do_not() {
 
     // `<=` in a for-loop head.
     let t = text_of("function g(n) { var s = 0; for (var i = 0; i <= n; i++) s += i; return s; }");
-    assert_eq!(t.contains("JumpIfNotLe"), fused_mode(), "for `<=` guard:\n{t}");
+    assert_eq!(
+        t.contains("JumpIfNotLe"),
+        fused_mode(),
+        "for `<=` guard:\n{t}"
+    );
 
     // The for-in index guard.
     let t = text_of("function h(o) { var n = 0; for (var k in o) n++; return n; }");
-    assert_eq!(t.contains("JumpIfNotLt"), fused_mode(), "for-in guard:\n{t}");
+    assert_eq!(
+        t.contains("JumpIfNotLt"),
+        fused_mode(),
+        "for-in guard:\n{t}"
+    );
 
     // A comparison whose result is ALSO a value never fuses, in either mode.
     let t = text_of("function v(a, b) { var r = a < b; return r; }");

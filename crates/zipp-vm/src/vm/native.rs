@@ -154,7 +154,7 @@ pub const FR_UNREGISTER: u16 = 299;
 // Built-in iterator methods.
 pub const ITER_NEXT: u16 = 300;
 pub const ITER_SELF: u16 = 301; // `[Symbol.iterator]()` → returns the iterator
-// ES2025 Iterator Helpers (%Iterator.prototype%).
+                                // ES2025 Iterator Helpers (%Iterator.prototype%).
 pub const ITER_MAP: u16 = 600;
 pub const ITER_FILTER: u16 = 601;
 pub const ITER_TAKE: u16 = 602;
@@ -328,7 +328,7 @@ pub const OBJPROTO_LOOKUP_SETTER: u16 = 625;
 pub const OBJPROTO_PROTO_GET: u16 = 626;
 pub const OBJPROTO_PROTO_SET: u16 = 627;
 pub const PROTO_TO_LOCALE_STRING: u16 = 302; // Object.prototype.toLocaleString
-// Number static methods as first-class values (the CALL form is a StaticFn).
+                                             // Number static methods as first-class values (the CALL form is a StaticFn).
 pub const NUM_IS_INTEGER: u16 = 303;
 pub const NUM_IS_NAN: u16 = 304;
 pub const NUM_IS_FINITE: u16 = 305;
@@ -404,8 +404,14 @@ pub const ERROR_TO_STRING: u16 = 317;
 /// Canonical native error names, indexed by error kind (parallels compile.rs
 /// `error_kind_index` and the VM's `error_protos`/`error_ctors`).
 pub const ERROR_NAMES: [&str; 8] = [
-    "Error", "TypeError", "RangeError", "SyntaxError",
-    "ReferenceError", "EvalError", "URIError", "AggregateError",
+    "Error",
+    "TypeError",
+    "RangeError",
+    "SyntaxError",
+    "ReferenceError",
+    "EvalError",
+    "URIError",
+    "AggregateError",
 ];
 /// TypedArray element kinds, indexed by `kind`: (ctor name, element byte size,
 /// is_bigint, is_float). Uint8Clamped (index 2) clamps on write. Float16Array
@@ -429,10 +435,37 @@ pub const TA_KINDS: &[(&str, usize, bool, bool)] = &[
 /// `TA_METHOD_BASE + index` so the value form (`TypedArray.prototype.map`,
 /// `.call(...)`, `typeof`) works; the method-call form dispatches directly.
 pub const TA_PROTO_METHODS: &[&str] = &[
-    "at", "join", "toString", "indexOf", "lastIndexOf", "includes", "forEach", "map",
-    "filter", "find", "findIndex", "findLast", "findLastIndex", "every", "some", "reduce",
-    "reduceRight", "fill", "reverse", "slice", "subarray", "sort", "copyWithin", "set",
-    "keys", "values", "entries", "@@iterator", "toReversed", "toSorted", "with",
+    "at",
+    "join",
+    "toString",
+    "indexOf",
+    "lastIndexOf",
+    "includes",
+    "forEach",
+    "map",
+    "filter",
+    "find",
+    "findIndex",
+    "findLast",
+    "findLastIndex",
+    "every",
+    "some",
+    "reduce",
+    "reduceRight",
+    "fill",
+    "reverse",
+    "slice",
+    "subarray",
+    "sort",
+    "copyWithin",
+    "set",
+    "keys",
+    "values",
+    "entries",
+    "@@iterator",
+    "toReversed",
+    "toSorted",
+    "with",
     // NB: append-only — ids are TA_METHOD_BASE + index, and DV_METHOD_BASE (372)
     // follows this list; keep new entries before that boundary.
     "toLocaleString",
@@ -440,12 +473,29 @@ pub const TA_PROTO_METHODS: &[&str] = &[
 pub const TA_METHOD_BASE: u16 = 340;
 /// `DataView.prototype` get/set method names (registered at DV_METHOD_BASE+i).
 pub const DV_PROTO_METHODS: &[&str] = &[
-    "getInt8", "getUint8", "getInt16", "getUint16", "getInt32", "getUint32", "getFloat32",
-    "getFloat64", "getBigInt64", "getBigUint64", "setInt8", "setUint8", "setInt16",
-    "setUint16", "setInt32", "setUint32", "setFloat32", "setFloat64", "setBigInt64",
+    "getInt8",
+    "getUint8",
+    "getInt16",
+    "getUint16",
+    "getInt32",
+    "getUint32",
+    "getFloat32",
+    "getFloat64",
+    "getBigInt64",
+    "getBigUint64",
+    "setInt8",
+    "setUint8",
+    "setInt16",
+    "setUint16",
+    "setInt32",
+    "setUint32",
+    "setFloat32",
+    "setFloat64",
+    "setBigInt64",
     "setBigUint64",
     // append-only — keep below DV_METHOD_BASE + count < ARRAYBUFFER_SLICE (396).
-    "getFloat16", "setFloat16",
+    "getFloat16",
+    "setFloat16",
 ];
 pub const DV_METHOD_BASE: u16 = 372;
 pub const ARRAYBUFFER_SLICE: u16 = 396;
@@ -476,8 +526,9 @@ pub const PROXY_REVOCABLE: u16 = 397;
 pub const PROXY_REVOKE: u16 = 398;
 /// Temporal.Duration.prototype instance methods (dispatched by name via
 /// `temporal_method`), at TEMPORAL_M_BASE + index.
-pub const TEMPORAL_DURATION_METHODS: &[&str] =
-    &["with", "negated", "abs", "toString", "toJSON", "valueOf", "add", "subtract", "round", "total"];
+pub const TEMPORAL_DURATION_METHODS: &[&str] = &[
+    "with", "negated", "abs", "toString", "toJSON", "valueOf", "add", "subtract", "round", "total",
+];
 pub const TEMPORAL_M_BASE: u16 = 400;
 pub const TEMPORAL_DURATION_FROM: u16 = 410;
 pub const TEMPORAL_DURATION_COMPARE: u16 = 411;
@@ -488,8 +539,19 @@ pub const TEMPORAL_DURATION_COMPARE: u16 = 411;
 /// absent from these tables — dropping the NAME is what un-exposes the method;
 /// the implementation arms are left in place and simply unreachable.
 pub const PLAINDATE_METHODS: &[&str] = &[
-    "with", "add", "subtract", "until", "since", "equals", "toString", "toJSON", "valueOf",
-    "toPlainDateTime", "toZonedDateTime", "withCalendar", "toPlainYearMonth",
+    "with",
+    "add",
+    "subtract",
+    "until",
+    "since",
+    "equals",
+    "toString",
+    "toJSON",
+    "valueOf",
+    "toPlainDateTime",
+    "toZonedDateTime",
+    "withCalendar",
+    "toPlainYearMonth",
     "toPlainMonthDay",
 ];
 pub const PD_M_BASE: u16 = 420;
@@ -497,23 +559,42 @@ pub const PLAINDATE_FROM: u16 = 448;
 pub const PLAINDATE_COMPARE: u16 = 449;
 /// Temporal.PlainTime.prototype methods at PT_M_BASE + index.
 pub const PLAINTIME_METHODS: &[&str] = &[
-    "with", "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON",
-    "valueOf",
+    "with", "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON", "valueOf",
 ];
 pub const PT_M_BASE: u16 = 450;
 pub const PLAINTIME_FROM: u16 = 470;
 pub const PLAINTIME_COMPARE: u16 = 471;
 /// Temporal.PlainDateTime.prototype methods at PDT_M_BASE + index.
 pub const PLAINDATETIME_METHODS: &[&str] = &[
-    "with", "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON",
-    "valueOf", "toPlainDate", "toPlainTime", "toZonedDateTime", "withCalendar",
+    "with",
+    "add",
+    "subtract",
+    "until",
+    "since",
+    "round",
+    "equals",
+    "toString",
+    "toJSON",
+    "valueOf",
+    "toPlainDate",
+    "toPlainTime",
+    "toZonedDateTime",
+    "withCalendar",
 ];
 pub const PDT_M_BASE: u16 = 472;
 pub const PLAINDATETIME_FROM: u16 = 490;
 pub const PLAINDATETIME_COMPARE: u16 = 491;
 /// Temporal.Instant.prototype methods at INST_M_BASE + index.
 pub const INSTANT_METHODS: &[&str] = &[
-    "add", "subtract", "until", "since", "round", "equals", "toString", "toJSON", "valueOf",
+    "add",
+    "subtract",
+    "until",
+    "since",
+    "round",
+    "equals",
+    "toString",
+    "toJSON",
+    "valueOf",
     "toZonedDateTimeISO",
 ];
 pub const INST_M_BASE: u16 = 492;
@@ -525,24 +606,54 @@ pub const INST_FROM_EPOCH_US: u16 = 509;
 pub const INST_COMPARE: u16 = 510;
 /// Temporal.PlainYearMonth.prototype methods at PYM_M_BASE + index.
 pub const PLAINYEARMONTH_METHODS: &[&str] = &[
-    "with", "add", "subtract", "until", "since", "equals", "toString", "toJSON", "valueOf",
+    "with",
+    "add",
+    "subtract",
+    "until",
+    "since",
+    "equals",
+    "toString",
+    "toJSON",
+    "valueOf",
     "toPlainDate",
 ];
 pub const PYM_M_BASE: u16 = 512;
 pub const PLAINYEARMONTH_FROM: u16 = 524;
 pub const PLAINYEARMONTH_COMPARE: u16 = 525;
 /// Temporal.PlainMonthDay.prototype methods at PMD_M_BASE + index.
-pub const PLAINMONTHDAY_METHODS: &[&str] =
-    &["with", "equals", "toString", "toJSON", "valueOf", "toPlainDate"];
+pub const PLAINMONTHDAY_METHODS: &[&str] = &[
+    "with",
+    "equals",
+    "toString",
+    "toJSON",
+    "valueOf",
+    "toPlainDate",
+];
 pub const PMD_M_BASE: u16 = 528;
 pub const PLAINMONTHDAY_FROM: u16 = 536;
 /// Temporal.ZonedDateTime.prototype methods at ZDT_M_BASE + index. Instance is
 /// HeapObj::Temporal kind 7, fields [epochNs hi, epochNs lo, offsetNanoseconds];
 /// the time-zone id is the heap string in `zdt_tz[idx]`.
 pub const ZONEDDATETIME_METHODS: &[&str] = &[
-    "with", "withPlainTime", "withTimeZone", "withCalendar", "add", "subtract", "until",
-    "since", "round", "equals", "toString", "toJSON", "toLocaleString", "valueOf",
-    "startOfDay", "toInstant", "toPlainDate", "toPlainTime", "toPlainDateTime",
+    "with",
+    "withPlainTime",
+    "withTimeZone",
+    "withCalendar",
+    "add",
+    "subtract",
+    "until",
+    "since",
+    "round",
+    "equals",
+    "toString",
+    "toJSON",
+    "toLocaleString",
+    "valueOf",
+    "startOfDay",
+    "toInstant",
+    "toPlainDate",
+    "toPlainTime",
+    "toPlainDateTime",
 ];
 pub const ZDT_M_BASE: u16 = 660;
 pub const ZDT_FROM: u16 = 680;
@@ -595,15 +706,30 @@ pub const INTL_PLURAL_SELECT_RANGE: u16 = 580;
 /// Intl.Locale prototype getters at INTL_LOCALE_GET_BASE + index of LOCALE_ACCESSORS.
 pub const INTL_LOCALE_GET_BASE: u16 = 581;
 pub const LOCALE_ACCESSORS: &[&str] = &[
-    "language", "script", "region", "baseName", "calendar", "caseFirst", "collation",
-    "hourCycle", "numeric", "numberingSystem",
+    "language",
+    "script",
+    "region",
+    "baseName",
+    "calendar",
+    "caseFirst",
+    "collation",
+    "hourCycle",
+    "numeric",
+    "numberingSystem",
 ];
 /// The SetFunctionName ("get <prop>") form of each LOCALE_ACCESSORS entry — an
 /// accessor's own `name` is the prefixed string, and `static_name_length` must
 /// hand back a `&'static str`, so the pairs are spelled out rather than formatted.
 pub const LOCALE_ACCESSOR_GET_NAMES: &[&str] = &[
-    "get language", "get script", "get region", "get baseName", "get calendar",
-    "get caseFirst", "get collation", "get hourCycle", "get numeric",
+    "get language",
+    "get script",
+    "get region",
+    "get baseName",
+    "get calendar",
+    "get caseFirst",
+    "get collation",
+    "get hourCycle",
+    "get numeric",
     "get numberingSystem",
 ];
 /// `format`/`compare` bound-function getters (spec: these are accessors that
@@ -628,8 +754,13 @@ pub const INTL_LOCALE_GET_FIRSTDAY: u16 = 924;
 /// LOCALE_INFO_METHODS.
 pub const INTL_LOCALE_INFO_BASE: u16 = 925;
 pub const LOCALE_INFO_METHODS: &[&str] = &[
-    "getCalendars", "getCollations", "getHourCycles", "getNumberingSystems", "getTimeZones",
-    "getTextInfo", "getWeekInfo",
+    "getCalendars",
+    "getCollations",
+    "getHourCycles",
+    "getNumberingSystems",
+    "getTimeZones",
+    "getTextInfo",
+    "getWeekInfo",
 ];
 /// `%Segments.prototype%.containing` and the two iterator ids behind
 /// `%Segments.prototype%[@@iterator]`.
@@ -670,8 +801,16 @@ pub const INTL_SEGMENT_ITERATOR: u8 = 11;
 pub const INTL_KINDS: usize = 12;
 /// Field names of a Temporal.Duration, in slot order.
 pub const DURATION_FIELDS: [&str; 10] = [
-    "years", "months", "weeks", "days", "hours", "minutes", "seconds",
-    "milliseconds", "microseconds", "nanoseconds",
+    "years",
+    "months",
+    "weeks",
+    "days",
+    "hours",
+    "minutes",
+    "seconds",
+    "milliseconds",
+    "microseconds",
+    "nanoseconds",
 ];
 
 /// Duration fields in the spec's alphabetical read order, paired with their index
@@ -697,42 +836,156 @@ pub const DURATION_FIELDS_ALPHA: [(usize, &str); 10] = [
 /// function (the value still resolves via the fast get_member path).
 pub const TEMPORAL_GETTER_BASE: u16 = 700;
 pub const TEMPORAL_GETTER_FIELDS: &[&str] = &[
-    "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds",
-    "microseconds", "nanoseconds", "sign", "blank", "year", "month", "day", "dayOfWeek",
-    "dayOfYear", "weekOfYear", "daysInWeek", "daysInMonth", "daysInYear", "monthsInYear",
-    "inLeapYear", "monthCode", "calendarId", "hour", "minute", "second", "millisecond",
-    "microsecond", "nanosecond", "epochMilliseconds", "epochNanoseconds", "epochSeconds",
-    "epochMicroseconds", "era", "eraYear", "timeZoneId", "offset", "offsetNanoseconds",
-    "hoursInDay", "yearOfWeek",
+    "years",
+    "months",
+    "weeks",
+    "days",
+    "hours",
+    "minutes",
+    "seconds",
+    "milliseconds",
+    "microseconds",
+    "nanoseconds",
+    "sign",
+    "blank",
+    "year",
+    "month",
+    "day",
+    "dayOfWeek",
+    "dayOfYear",
+    "weekOfYear",
+    "daysInWeek",
+    "daysInMonth",
+    "daysInYear",
+    "monthsInYear",
+    "inLeapYear",
+    "monthCode",
+    "calendarId",
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "nanosecond",
+    "epochMilliseconds",
+    "epochNanoseconds",
+    "epochSeconds",
+    "epochMicroseconds",
+    "era",
+    "eraYear",
+    "timeZoneId",
+    "offset",
+    "offsetNanoseconds",
+    "hoursInDay",
+    "yearOfWeek",
 ];
 pub const TEMP_G_ZONEDDATETIME: &[&str] = &[
-    "calendarId", "timeZoneId", "year", "month", "monthCode", "day", "hour", "minute",
-    "second", "millisecond", "microsecond", "nanosecond", "epochMilliseconds",
-    "epochNanoseconds", "dayOfWeek", "dayOfYear", "weekOfYear", "yearOfWeek",
-    "hoursInDay", "daysInWeek", "daysInMonth", "daysInYear", "monthsInYear", "inLeapYear",
-    "offset", "offsetNanoseconds", "era", "eraYear",
+    "calendarId",
+    "timeZoneId",
+    "year",
+    "month",
+    "monthCode",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "nanosecond",
+    "epochMilliseconds",
+    "epochNanoseconds",
+    "dayOfWeek",
+    "dayOfYear",
+    "weekOfYear",
+    "yearOfWeek",
+    "hoursInDay",
+    "daysInWeek",
+    "daysInMonth",
+    "daysInYear",
+    "monthsInYear",
+    "inLeapYear",
+    "offset",
+    "offsetNanoseconds",
+    "era",
+    "eraYear",
 ];
 // Per-prototype getter sets (match the get_member field computations).
 pub const TEMP_G_DURATION: &[&str] = &[
-    "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds",
-    "microseconds", "nanoseconds", "sign", "blank",
+    "years",
+    "months",
+    "weeks",
+    "days",
+    "hours",
+    "minutes",
+    "seconds",
+    "milliseconds",
+    "microseconds",
+    "nanoseconds",
+    "sign",
+    "blank",
 ];
 pub const TEMP_G_PLAINDATE: &[&str] = &[
-    "year", "month", "day", "dayOfWeek", "dayOfYear", "weekOfYear", "yearOfWeek", "daysInMonth",
-    "daysInYear", "daysInWeek", "monthsInYear", "inLeapYear", "monthCode", "calendarId",
-    "era", "eraYear",
+    "year",
+    "month",
+    "day",
+    "dayOfWeek",
+    "dayOfYear",
+    "weekOfYear",
+    "yearOfWeek",
+    "daysInMonth",
+    "daysInYear",
+    "daysInWeek",
+    "monthsInYear",
+    "inLeapYear",
+    "monthCode",
+    "calendarId",
+    "era",
+    "eraYear",
 ];
-pub const TEMP_G_PLAINTIME: &[&str] =
-    &["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
+pub const TEMP_G_PLAINTIME: &[&str] = &[
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "nanosecond",
+];
 pub const TEMP_G_PLAINDATETIME: &[&str] = &[
-    "year", "month", "day", "hour", "minute", "second", "millisecond", "microsecond",
-    "nanosecond", "dayOfWeek", "dayOfYear", "weekOfYear", "yearOfWeek", "daysInMonth", "daysInYear",
-    "daysInWeek", "monthsInYear", "inLeapYear", "monthCode", "calendarId", "era", "eraYear",
+    "year",
+    "month",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
+    "nanosecond",
+    "dayOfWeek",
+    "dayOfYear",
+    "weekOfYear",
+    "yearOfWeek",
+    "daysInMonth",
+    "daysInYear",
+    "daysInWeek",
+    "monthsInYear",
+    "inLeapYear",
+    "monthCode",
+    "calendarId",
+    "era",
+    "eraYear",
 ];
 pub const TEMP_G_INSTANT: &[&str] = &["epochMilliseconds", "epochNanoseconds"];
 pub const TEMP_G_PLAINYEARMONTH: &[&str] = &[
-    "year", "month", "monthCode", "daysInMonth", "daysInYear", "monthsInYear", "inLeapYear",
-    "era", "eraYear", "calendarId",
+    "year",
+    "month",
+    "monthCode",
+    "daysInMonth",
+    "daysInYear",
+    "monthsInYear",
+    "inLeapYear",
+    "era",
+    "eraYear",
+    "calendarId",
 ];
 pub const TEMP_G_PLAINMONTHDAY: &[&str] = &["monthCode", "day", "calendarId"];
 // RegExp.prototype methods.
@@ -780,17 +1033,39 @@ pub const MATH_METHOD_BASE: u16 = 256;
 pub const MATH_METHODS: &[(&str, crate::bytecode::MathFn, u8)] = {
     use crate::bytecode::MathFn as F;
     &[
-        ("abs", F::Abs, 1), ("floor", F::Floor, 1), ("ceil", F::Ceil, 1),
-        ("round", F::Round, 1), ("trunc", F::Trunc, 1), ("sign", F::Sign, 1),
-        ("sqrt", F::Sqrt, 1), ("cbrt", F::Cbrt, 1), ("exp", F::Exp, 1),
-        ("log", F::Log, 1), ("log2", F::Log2, 1), ("log10", F::Log10, 1),
-        ("expm1", F::Expm1, 1), ("log1p", F::Log1p, 1), ("sin", F::Sin, 1),
-        ("cos", F::Cos, 1), ("tan", F::Tan, 1), ("asin", F::Asin, 1),
-        ("acos", F::Acos, 1), ("atan", F::Atan, 1), ("sinh", F::Sinh, 1),
-        ("cosh", F::Cosh, 1), ("tanh", F::Tanh, 1), ("asinh", F::Asinh, 1),
-        ("acosh", F::Acosh, 1), ("atanh", F::Atanh, 1), ("clz32", F::Clz32, 1),
-        ("fround", F::Fround, 1), ("pow", F::Pow, 2), ("atan2", F::Atan2, 2),
-        ("imul", F::Imul, 2), ("min", F::Min, 2), ("max", F::Max, 2),
+        ("abs", F::Abs, 1),
+        ("floor", F::Floor, 1),
+        ("ceil", F::Ceil, 1),
+        ("round", F::Round, 1),
+        ("trunc", F::Trunc, 1),
+        ("sign", F::Sign, 1),
+        ("sqrt", F::Sqrt, 1),
+        ("cbrt", F::Cbrt, 1),
+        ("exp", F::Exp, 1),
+        ("log", F::Log, 1),
+        ("log2", F::Log2, 1),
+        ("log10", F::Log10, 1),
+        ("expm1", F::Expm1, 1),
+        ("log1p", F::Log1p, 1),
+        ("sin", F::Sin, 1),
+        ("cos", F::Cos, 1),
+        ("tan", F::Tan, 1),
+        ("asin", F::Asin, 1),
+        ("acos", F::Acos, 1),
+        ("atan", F::Atan, 1),
+        ("sinh", F::Sinh, 1),
+        ("cosh", F::Cosh, 1),
+        ("tanh", F::Tanh, 1),
+        ("asinh", F::Asinh, 1),
+        ("acosh", F::Acosh, 1),
+        ("atanh", F::Atanh, 1),
+        ("clz32", F::Clz32, 1),
+        ("fround", F::Fround, 1),
+        ("pow", F::Pow, 2),
+        ("atan2", F::Atan2, 2),
+        ("imul", F::Imul, 2),
+        ("min", F::Min, 2),
+        ("max", F::Max, 2),
         ("hypot", F::Hypot, 2),
     ]
 };
@@ -812,70 +1087,192 @@ pub const PROTO_METHOD_BASE: u16 = 64;
 pub const PROTO_METHODS: &[(&str, u8, u8)] = &[
     // (name, kind, spec `length`). join/push already on arr_proto via ARR_*.
     // Array.prototype.
-    ("at", 0, 1), ("concat", 0, 1), ("every", 0, 1), ("fill", 0, 1), ("filter", 0, 1),
-    ("find", 0, 1), ("findIndex", 0, 1), ("findLast", 0, 1), ("findLastIndex", 0, 1),
-    ("flat", 0, 0), ("flatMap", 0, 1), ("forEach", 0, 1), ("includes", 0, 1),
-    ("indexOf", 0, 1), ("lastIndexOf", 0, 1), ("map", 0, 1), ("pop", 0, 0), ("reduce", 0, 1),
-    ("reduceRight", 0, 1), ("reverse", 0, 0), ("shift", 0, 0), ("slice", 0, 2),
-    ("some", 0, 1), ("sort", 0, 1), ("splice", 0, 2), ("toReversed", 0, 0),
-    ("toSorted", 0, 1), ("toSpliced", 0, 2), ("toString", 0, 0), ("with", 0, 2),
-    ("copyWithin", 0, 2), ("entries", 0, 0), ("keys", 0, 0), ("values", 0, 0),
-    ("toLocaleString", 0, 0), ("unshift", 0, 1),
+    ("at", 0, 1),
+    ("concat", 0, 1),
+    ("every", 0, 1),
+    ("fill", 0, 1),
+    ("filter", 0, 1),
+    ("find", 0, 1),
+    ("findIndex", 0, 1),
+    ("findLast", 0, 1),
+    ("findLastIndex", 0, 1),
+    ("flat", 0, 0),
+    ("flatMap", 0, 1),
+    ("forEach", 0, 1),
+    ("includes", 0, 1),
+    ("indexOf", 0, 1),
+    ("lastIndexOf", 0, 1),
+    ("map", 0, 1),
+    ("pop", 0, 0),
+    ("reduce", 0, 1),
+    ("reduceRight", 0, 1),
+    ("reverse", 0, 0),
+    ("shift", 0, 0),
+    ("slice", 0, 2),
+    ("some", 0, 1),
+    ("sort", 0, 1),
+    ("splice", 0, 2),
+    ("toReversed", 0, 0),
+    ("toSorted", 0, 1),
+    ("toSpliced", 0, 2),
+    ("toString", 0, 0),
+    ("with", 0, 2),
+    ("copyWithin", 0, 2),
+    ("entries", 0, 0),
+    ("keys", 0, 0),
+    ("values", 0, 0),
+    ("toLocaleString", 0, 0),
+    ("unshift", 0, 1),
     // String.prototype.
-    ("at", 1, 1), ("charAt", 1, 1), ("charCodeAt", 1, 1), ("codePointAt", 1, 1),
-    ("endsWith", 1, 1), ("includes", 1, 1), ("indexOf", 1, 1), ("padEnd", 1, 1),
-    ("padStart", 1, 1), ("repeat", 1, 1), ("replace", 1, 2), ("replaceAll", 1, 2),
-    ("slice", 1, 2), ("split", 1, 2), ("startsWith", 1, 1), ("substring", 1, 2),
-    ("toLowerCase", 1, 0), ("toUpperCase", 1, 0), ("trim", 1, 0), ("trimEnd", 1, 0),
-    ("trimStart", 1, 0), ("concat", 1, 1), ("substr", 1, 2), ("localeCompare", 1, 1),
-    ("normalize", 1, 0), ("isWellFormed", 1, 0), ("toWellFormed", 1, 0),
-    ("valueOf", 1, 0), ("toString", 1, 0), ("lastIndexOf", 1, 1),
-    ("toLocaleLowerCase", 1, 0), ("toLocaleUpperCase", 1, 0),
-    ("match", 1, 1), ("matchAll", 1, 1), ("search", 1, 1),
+    ("at", 1, 1),
+    ("charAt", 1, 1),
+    ("charCodeAt", 1, 1),
+    ("codePointAt", 1, 1),
+    ("endsWith", 1, 1),
+    ("includes", 1, 1),
+    ("indexOf", 1, 1),
+    ("padEnd", 1, 1),
+    ("padStart", 1, 1),
+    ("repeat", 1, 1),
+    ("replace", 1, 2),
+    ("replaceAll", 1, 2),
+    ("slice", 1, 2),
+    ("split", 1, 2),
+    ("startsWith", 1, 1),
+    ("substring", 1, 2),
+    ("toLowerCase", 1, 0),
+    ("toUpperCase", 1, 0),
+    ("trim", 1, 0),
+    ("trimEnd", 1, 0),
+    ("trimStart", 1, 0),
+    ("concat", 1, 1),
+    ("substr", 1, 2),
+    ("localeCompare", 1, 1),
+    ("normalize", 1, 0),
+    ("isWellFormed", 1, 0),
+    ("toWellFormed", 1, 0),
+    ("valueOf", 1, 0),
+    ("toString", 1, 0),
+    ("lastIndexOf", 1, 1),
+    ("toLocaleLowerCase", 1, 0),
+    ("toLocaleUpperCase", 1, 0),
+    ("match", 1, 1),
+    ("matchAll", 1, 1),
+    ("search", 1, 1),
     // Annex B HTML wrapper methods.
-    ("anchor", 1, 1), ("big", 1, 0), ("blink", 1, 0), ("bold", 1, 0), ("fixed", 1, 0),
-    ("fontcolor", 1, 1), ("fontsize", 1, 1), ("italics", 1, 0), ("link", 1, 1),
-    ("small", 1, 0), ("strike", 1, 0), ("sub", 1, 0), ("sup", 1, 0),
+    ("anchor", 1, 1),
+    ("big", 1, 0),
+    ("blink", 1, 0),
+    ("bold", 1, 0),
+    ("fixed", 1, 0),
+    ("fontcolor", 1, 1),
+    ("fontsize", 1, 1),
+    ("italics", 1, 0),
+    ("link", 1, 1),
+    ("small", 1, 0),
+    ("strike", 1, 0),
+    ("sub", 1, 0),
+    ("sup", 1, 0),
     // Number.prototype (kind 2 → number_method, receiver is a number value).
-    ("toFixed", 2, 1), ("toString", 2, 1), ("valueOf", 2, 0), ("toLocaleString", 2, 0),
-    ("toExponential", 2, 1), ("toPrecision", 2, 1),
+    ("toFixed", 2, 1),
+    ("toString", 2, 1),
+    ("valueOf", 2, 0),
+    ("toLocaleString", 2, 0),
+    ("toExponential", 2, 1),
+    ("toPrecision", 2, 1),
     // Set.prototype (kind 3 → set_method on the Set receiver).
-    ("add", 3, 1), ("clear", 3, 0), ("delete", 3, 1), ("entries", 3, 0), ("forEach", 3, 1),
-    ("has", 3, 1), ("keys", 3, 0), ("values", 3, 0), ("union", 3, 1), ("intersection", 3, 1),
-    ("difference", 3, 1), ("symmetricDifference", 3, 1), ("isSubsetOf", 3, 1),
-    ("isSupersetOf", 3, 1), ("isDisjointFrom", 3, 1),
+    ("add", 3, 1),
+    ("clear", 3, 0),
+    ("delete", 3, 1),
+    ("entries", 3, 0),
+    ("forEach", 3, 1),
+    ("has", 3, 1),
+    ("keys", 3, 0),
+    ("values", 3, 0),
+    ("union", 3, 1),
+    ("intersection", 3, 1),
+    ("difference", 3, 1),
+    ("symmetricDifference", 3, 1),
+    ("isSubsetOf", 3, 1),
+    ("isSupersetOf", 3, 1),
+    ("isDisjointFrom", 3, 1),
     // Map.prototype (kind 4 → map_method on the Map receiver).
-    ("clear", 4, 0), ("delete", 4, 1), ("entries", 4, 0), ("forEach", 4, 1), ("get", 4, 1),
-    ("has", 4, 1), ("keys", 4, 0), ("set", 4, 2), ("values", 4, 0),
+    ("clear", 4, 0),
+    ("delete", 4, 1),
+    ("entries", 4, 0),
+    ("forEach", 4, 1),
+    ("get", 4, 1),
+    ("has", 4, 1),
+    ("keys", 4, 0),
+    ("set", 4, 2),
+    ("values", 4, 0),
     // Boolean.prototype (kind 5 → boolean_method on the boolean value).
-    ("toString", 5, 0), ("valueOf", 5, 0),
+    ("toString", 5, 0),
+    ("valueOf", 5, 0),
     // Promise.prototype (kind 7 → promise_method on the Promise receiver).
-    ("then", 7, 2), ("catch", 7, 1), ("finally", 7, 1),
+    ("then", 7, 2),
+    ("catch", 7, 1),
+    ("finally", 7, 1),
     // Date.prototype (kind 6 → date_method on the Date receiver). Getters length 0;
     // setters per spec (setHours=4, setMinutes/setFullYear=3, setMonth/setSeconds=2, …).
-    ("getDate", 6, 0), ("getDay", 6, 0), ("getFullYear", 6, 0), ("getHours", 6, 0),
-    ("getMilliseconds", 6, 0), ("getMinutes", 6, 0), ("getMonth", 6, 0), ("getSeconds", 6, 0),
-    ("getTime", 6, 0), ("getTimezoneOffset", 6, 0), ("getUTCDate", 6, 0), ("getUTCDay", 6, 0),
-    ("getUTCFullYear", 6, 0), ("getUTCHours", 6, 0), ("getUTCMilliseconds", 6, 0),
-    ("getUTCMinutes", 6, 0), ("getUTCMonth", 6, 0), ("getUTCSeconds", 6, 0), ("setDate", 6, 1),
-    ("setFullYear", 6, 3), ("setHours", 6, 4), ("setMilliseconds", 6, 1), ("setMinutes", 6, 3),
-    ("setMonth", 6, 2), ("setSeconds", 6, 2), ("setTime", 6, 1), ("setUTCDate", 6, 1),
-    ("setUTCFullYear", 6, 3), ("setUTCHours", 6, 4), ("setUTCMilliseconds", 6, 1),
-    ("setUTCMinutes", 6, 3), ("setUTCMonth", 6, 2), ("setUTCSeconds", 6, 2), ("toDateString", 6, 0),
-    ("toISOString", 6, 0), ("toJSON", 6, 1), ("toLocaleDateString", 6, 0), ("toLocaleString", 6, 0),
-    ("toLocaleTimeString", 6, 0), ("toString", 6, 0), ("toTimeString", 6, 0), ("toUTCString", 6, 0),
-    ("toGMTString", 6, 0), ("getYear", 6, 0), ("setYear", 6, 1),
+    ("getDate", 6, 0),
+    ("getDay", 6, 0),
+    ("getFullYear", 6, 0),
+    ("getHours", 6, 0),
+    ("getMilliseconds", 6, 0),
+    ("getMinutes", 6, 0),
+    ("getMonth", 6, 0),
+    ("getSeconds", 6, 0),
+    ("getTime", 6, 0),
+    ("getTimezoneOffset", 6, 0),
+    ("getUTCDate", 6, 0),
+    ("getUTCDay", 6, 0),
+    ("getUTCFullYear", 6, 0),
+    ("getUTCHours", 6, 0),
+    ("getUTCMilliseconds", 6, 0),
+    ("getUTCMinutes", 6, 0),
+    ("getUTCMonth", 6, 0),
+    ("getUTCSeconds", 6, 0),
+    ("setDate", 6, 1),
+    ("setFullYear", 6, 3),
+    ("setHours", 6, 4),
+    ("setMilliseconds", 6, 1),
+    ("setMinutes", 6, 3),
+    ("setMonth", 6, 2),
+    ("setSeconds", 6, 2),
+    ("setTime", 6, 1),
+    ("setUTCDate", 6, 1),
+    ("setUTCFullYear", 6, 3),
+    ("setUTCHours", 6, 4),
+    ("setUTCMilliseconds", 6, 1),
+    ("setUTCMinutes", 6, 3),
+    ("setUTCMonth", 6, 2),
+    ("setUTCSeconds", 6, 2),
+    ("toDateString", 6, 0),
+    ("toISOString", 6, 0),
+    ("toJSON", 6, 1),
+    ("toLocaleDateString", 6, 0),
+    ("toLocaleString", 6, 0),
+    ("toLocaleTimeString", 6, 0),
+    ("toString", 6, 0),
+    ("toTimeString", 6, 0),
+    ("toUTCString", 6, 0),
+    ("toGMTString", 6, 0),
+    ("getYear", 6, 0),
+    ("setYear", 6, 1),
     ("valueOf", 6, 0),
     // Map.prototype upsert proposal (kind 4) — appended here (not in the Map
     // block) so existing entries keep their native ids.
-    ("getOrInsert", 4, 2), ("getOrInsertComputed", 4, 2),
+    ("getOrInsert", 4, 2),
+    ("getOrInsertComputed", 4, 2),
     // Date.prototype.toTemporalInstant (kind 6) — appended (keeps existing ids).
     ("toTemporalInstant", 6, 0),
     // Annex B String.prototype.trimLeft / trimRight (kind 1) — legacy aliases of
     // trimStart / trimEnd; appended (keeps existing ids). setup.rs overwrites
     // their proto slots with the trimStart/trimEnd VALUES so they are the SAME
     // function object (===, name "trimStart"/"trimEnd").
-    ("trimLeft", 1, 0), ("trimRight", 1, 0),
+    ("trimLeft", 1, 0),
+    ("trimRight", 1, 0),
 ];
 
 /// `(name, kind)` for a prototype-method native id, if it is one.
@@ -927,7 +1324,11 @@ pub fn promise_proto_method_id(name: &str) -> Option<u16> {
                 .map(|i| PROTO_METHOD_BASE + i as u16)
                 .expect("Promise.prototype method missing from PROTO_METHODS")
         };
-        [("then", find("then")), ("catch", find("catch")), ("finally", find("finally"))]
+        [
+            ("then", find("then")),
+            ("catch", find("catch")),
+            ("finally", find("finally")),
+        ]
     });
     ids.iter().find(|(n, _)| *n == name).map(|(_, id)| *id)
 }
@@ -964,7 +1365,11 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
             "slice" | "subarray" | "copyWithin" | "with" => 2,
             _ => 1,
         };
-        let name = if m == "@@iterator" { "[Symbol.iterator]" } else { m };
+        let name = if m == "@@iterator" {
+            "[Symbol.iterator]"
+        } else {
+            m
+        };
         return Some((name, len));
     }
     // DataView.prototype get*/set* natives (get* length 1, set* length 2).
@@ -995,12 +1400,19 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
     }
     // Intl.Locale.prototype subtag getters — accessor functions named "get <prop>".
     if (INTL_LOCALE_GET_BASE..INTL_LOCALE_GET_BASE + LOCALE_ACCESSORS.len() as u16).contains(&id) {
-        return Some((LOCALE_ACCESSOR_GET_NAMES[(id - INTL_LOCALE_GET_BASE) as usize], 0));
+        return Some((
+            LOCALE_ACCESSOR_GET_NAMES[(id - INTL_LOCALE_GET_BASE) as usize],
+            0,
+        ));
     }
     // Intl.Locale-info methods: ordinary built-ins named after themselves.
-    if (INTL_LOCALE_INFO_BASE..INTL_LOCALE_INFO_BASE + LOCALE_INFO_METHODS.len() as u16).contains(&id)
+    if (INTL_LOCALE_INFO_BASE..INTL_LOCALE_INFO_BASE + LOCALE_INFO_METHODS.len() as u16)
+        .contains(&id)
     {
-        return Some((LOCALE_INFO_METHODS[(id - INTL_LOCALE_INFO_BASE) as usize], 0));
+        return Some((
+            LOCALE_INFO_METHODS[(id - INTL_LOCALE_INFO_BASE) as usize],
+            0,
+        ));
     }
     // Temporal.<Type>.prototype method natives: name + length as own properties.
     for (base, methods) in [
@@ -1255,12 +1667,21 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         DATE_UTC => ("UTC", 7),
         // Temporal static methods: from (length 1), compare (length 2), and
         // Instant.fromEpoch* (length 1).
-        TEMPORAL_DURATION_FROM | PLAINDATE_FROM | PLAINTIME_FROM | PLAINDATETIME_FROM
-        | INST_FROM | PLAINYEARMONTH_FROM | PLAINMONTHDAY_FROM | ZDT_FROM => ("from", 1),
-        TEMPORAL_DURATION_COMPARE | PLAINDATE_COMPARE | PLAINTIME_COMPARE
-        | PLAINDATETIME_COMPARE | INST_COMPARE | PLAINYEARMONTH_COMPARE | ZDT_COMPARE => {
-            ("compare", 2)
-        }
+        TEMPORAL_DURATION_FROM
+        | PLAINDATE_FROM
+        | PLAINTIME_FROM
+        | PLAINDATETIME_FROM
+        | INST_FROM
+        | PLAINYEARMONTH_FROM
+        | PLAINMONTHDAY_FROM
+        | ZDT_FROM => ("from", 1),
+        TEMPORAL_DURATION_COMPARE
+        | PLAINDATE_COMPARE
+        | PLAINTIME_COMPARE
+        | PLAINDATETIME_COMPARE
+        | INST_COMPARE
+        | PLAINYEARMONTH_COMPARE
+        | ZDT_COMPARE => ("compare", 2),
         INST_FROM_EPOCH_MS => ("fromEpochMilliseconds", 1),
         INST_FROM_EPOCH_NS => ("fromEpochNanoseconds", 1),
         INST_FROM_EPOCH_SEC => ("fromEpochSeconds", 1),
@@ -1286,9 +1707,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         | INTL_LIST_FORMAT_TO_PARTS
         | INTL_DURATION_FORMAT_TO_PARTS => ("formatToParts", 1),
         INTL_NF_FORMAT_RANGE | INTL_DTF_FORMAT_RANGE => ("formatRange", 2),
-        INTL_NF_FORMAT_RANGE_TO_PARTS | INTL_DTF_FORMAT_RANGE_TO_PARTS => {
-            ("formatRangeToParts", 2)
-        }
+        INTL_NF_FORMAT_RANGE_TO_PARTS | INTL_DTF_FORMAT_RANGE_TO_PARTS => ("formatRangeToParts", 2),
         INTL_PLURAL_SELECT => ("select", 1),
         INTL_PLURAL_SELECT_RANGE => ("selectRange", 2),
         INTL_LIST_FORMAT | INTL_DURATION_FORMAT => ("format", 1),

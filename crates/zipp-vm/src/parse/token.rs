@@ -107,14 +107,63 @@ pub enum Keyword {
     /// Not any known keyword.
     None,
     // Always reserved.
-    Break, Case, Catch, Class, Const, Continue, Debugger, Default, Delete, Do,
-    Else, Enum, Export, Extends, False, Finally, For, Function, If, Import, In,
-    Instanceof, New, Null, Return, Super, Switch, This, Throw, True, Try,
-    Typeof, Var, Void, While, With,
+    Break,
+    Case,
+    Catch,
+    Class,
+    Const,
+    Continue,
+    Debugger,
+    Default,
+    Delete,
+    Do,
+    Else,
+    Enum,
+    Export,
+    Extends,
+    False,
+    Finally,
+    For,
+    Function,
+    If,
+    Import,
+    In,
+    Instanceof,
+    New,
+    Null,
+    Return,
+    Super,
+    Switch,
+    This,
+    Throw,
+    True,
+    Try,
+    Typeof,
+    Var,
+    Void,
+    While,
+    With,
     // Reserved only in strict mode.
-    Implements, Interface, Let, Package, Private, Protected, Public, Static, Yield,
+    Implements,
+    Interface,
+    Let,
+    Package,
+    Private,
+    Protected,
+    Public,
+    Static,
+    Yield,
     // Contextual: meaning depends entirely on position.
-    Async, Await, As, From, Get, Of, Set, Target, Meta, Accessor,
+    Async,
+    Await,
+    As,
+    From,
+    Get,
+    Of,
+    Set,
+    Target,
+    Meta,
+    Accessor,
 }
 
 impl Keyword {
@@ -124,49 +173,85 @@ impl Keyword {
         use Keyword::*;
         match s.len() {
             2 => match s {
-                "do" => Do, "if" => If, "in" => In, "as" => As, "of" => Of,
+                "do" => Do,
+                "if" => If,
+                "in" => In,
+                "as" => As,
+                "of" => Of,
                 _ => None,
             },
             3 => match s {
-                "for" => For, "new" => New, "try" => Try, "var" => Var,
-                "let" => Let, "get" => Get, "set" => Set,
+                "for" => For,
+                "new" => New,
+                "try" => Try,
+                "var" => Var,
+                "let" => Let,
+                "get" => Get,
+                "set" => Set,
                 _ => None,
             },
             4 => match s {
-                "case" => Case, "else" => Else, "enum" => Enum, "from" => From,
-                "meta" => Meta, "null" => Null, "this" => This, "true" => True,
-                "void" => Void, "with" => With,
+                "case" => Case,
+                "else" => Else,
+                "enum" => Enum,
+                "from" => From,
+                "meta" => Meta,
+                "null" => Null,
+                "this" => This,
+                "true" => True,
+                "void" => Void,
+                "with" => With,
                 _ => None,
             },
             5 => match s {
-                "async" => Async, "await" => Await, "break" => Break,
-                "catch" => Catch, "class" => Class, "const" => Const,
-                "false" => False, "super" => Super, "throw" => Throw,
-                "while" => While, "yield" => Yield,
+                "async" => Async,
+                "await" => Await,
+                "break" => Break,
+                "catch" => Catch,
+                "class" => Class,
+                "const" => Const,
+                "false" => False,
+                "super" => Super,
+                "throw" => Throw,
+                "while" => While,
+                "yield" => Yield,
                 _ => None,
             },
             6 => match s {
-                "delete" => Delete, "export" => Export, "import" => Import,
-                "public" => Public, "return" => Return, "static" => Static,
-                "switch" => Switch, "target" => Target, "typeof" => Typeof,
+                "delete" => Delete,
+                "export" => Export,
+                "import" => Import,
+                "public" => Public,
+                "return" => Return,
+                "static" => Static,
+                "switch" => Switch,
+                "target" => Target,
+                "typeof" => Typeof,
                 _ => None,
             },
             7 => match s {
-                "default" => Default, "extends" => Extends, "finally" => Finally,
-                "package" => Package, "private" => Private,
+                "default" => Default,
+                "extends" => Extends,
+                "finally" => Finally,
+                "package" => Package,
+                "private" => Private,
                 _ => None,
             },
             8 => match s {
-                "continue" => Continue, "debugger" => Debugger, "function" => Function,
+                "continue" => Continue,
+                "debugger" => Debugger,
+                "function" => Function,
                 "accessor" => Accessor,
                 _ => None,
             },
             9 => match s {
-                "interface" => Interface, "protected" => Protected,
+                "interface" => Interface,
+                "protected" => Protected,
                 _ => None,
             },
             10 => match s {
-                "implements" => Implements, "instanceof" => Instanceof,
+                "implements" => Implements,
+                "instanceof" => Instanceof,
                 _ => None,
             },
             _ => None,
@@ -178,11 +263,42 @@ impl Keyword {
         use Keyword::*;
         matches!(
             self,
-            Break | Case | Catch | Class | Const | Continue | Debugger | Default
-                | Delete | Do | Else | Enum | Export | Extends | False | Finally
-                | For | Function | If | Import | In | Instanceof | New | Null
-                | Return | Super | Switch | This | Throw | True | Try | Typeof
-                | Var | Void | While | With
+            Break
+                | Case
+                | Catch
+                | Class
+                | Const
+                | Continue
+                | Debugger
+                | Default
+                | Delete
+                | Do
+                | Else
+                | Enum
+                | Export
+                | Extends
+                | False
+                | Finally
+                | For
+                | Function
+                | If
+                | Import
+                | In
+                | Instanceof
+                | New
+                | Null
+                | Return
+                | Super
+                | Switch
+                | This
+                | Throw
+                | True
+                | Try
+                | Typeof
+                | Var
+                | Void
+                | While
+                | With
         )
     }
 
@@ -191,8 +307,7 @@ impl Keyword {
         use Keyword::*;
         matches!(
             self,
-            Implements | Interface | Let | Package | Private | Protected | Public
-                | Static | Yield
+            Implements | Interface | Let | Package | Private | Protected | Public | Static | Yield
         )
     }
 }
@@ -217,7 +332,10 @@ pub enum TokenKind {
     /// A regular expression literal: the pattern's exact source and its flags.
     /// The pattern is kept as written (escapes uninterpreted) because that is
     /// what the regex engine compiles.
-    Regex { pattern: StrVal, flags: String },
+    Regex {
+        pattern: StrVal,
+        flags: String,
+    },
     /// One piece of a template literal. `head` is true for the first chunk,
     /// `tail` for the last; a `\`...\`` with no substitutions is both.
     Template {
@@ -236,22 +354,64 @@ pub enum TokenKind {
 /// Punctuators, including the compound-assignment forms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Punct {
-    LBrace, RBrace, LParen, RParen, LBracket, RBracket,
-    Semi, Comma, Dot, DotDotDot, Colon, Question,
+    LBrace,
+    RBrace,
+    LParen,
+    RParen,
+    LBracket,
+    RBracket,
+    Semi,
+    Comma,
+    Dot,
+    DotDotDot,
+    Colon,
+    Question,
     /// `?.` — distinguished from `?` `.` because `a?.5:b` is a conditional.
-    QuestionDot, QuestionQuestion, QuestionQuestionEq,
+    QuestionDot,
+    QuestionQuestion,
+    QuestionQuestionEq,
     Arrow,
-    Lt, Gt, LtEq, GtEq,
-    EqEq, NotEq, EqEqEq, NotEqEq,
-    Plus, Minus, Star, Slash, Percent, StarStar,
-    PlusPlus, MinusMinus,
-    Shl, Shr, UShr,
-    Amp, Pipe, Caret, Bang, Tilde,
-    AmpAmp, PipePipe,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
+    EqEq,
+    NotEq,
+    EqEqEq,
+    NotEqEq,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    StarStar,
+    PlusPlus,
+    MinusMinus,
+    Shl,
+    Shr,
+    UShr,
+    Amp,
+    Pipe,
+    Caret,
+    Bang,
+    Tilde,
+    AmpAmp,
+    PipePipe,
     Eq,
-    PlusEq, MinusEq, StarEq, SlashEq, PercentEq, StarStarEq,
-    ShlEq, ShrEq, UShrEq, AmpEq, PipeEq, CaretEq,
-    AmpAmpEq, PipePipeEq,
+    PlusEq,
+    MinusEq,
+    StarEq,
+    SlashEq,
+    PercentEq,
+    StarStarEq,
+    ShlEq,
+    ShrEq,
+    UShrEq,
+    AmpEq,
+    PipeEq,
+    CaretEq,
+    AmpAmpEq,
+    PipePipeEq,
     /// `@` — not JS, but reserved so decorator syntax fails with a clear error.
     At,
 }

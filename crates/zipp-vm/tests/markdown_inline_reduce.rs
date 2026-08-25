@@ -299,7 +299,11 @@ fn child_realm_helper_uses_its_own_string_intrinsics() {
         "#;
         let src = format!("{definitions}\n{body}");
         let out = zipp_vm::run(&src).expect("source compiles");
-        assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+        assert!(
+            out.error.is_none(),
+            "unexpected runtime error: {:?}",
+            out.error
+        );
         // Primitive String prototype overrides are not yet observable through
         // zipp's generic name-dispatched builtins. These values pin current
         // generic-path parity; the parent verifies the reducer declined.
@@ -320,7 +324,10 @@ fn child_realm_helper_uses_its_own_string_intrinsics() {
         .output()
         .expect("realm guard child");
     let stderr = String::from_utf8_lossy(&child.stderr);
-    assert!(child.status.success(), "helper realm child failed:\n{stderr}");
+    assert!(
+        child.status.success(),
+        "helper realm child failed:\n{stderr}"
+    );
     assert!(
         stderr.contains("markdown-inline plan installed"),
         "helper realm plan never installed; guard test was vacuous:\n{stderr}"

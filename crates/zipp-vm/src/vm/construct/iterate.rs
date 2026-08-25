@@ -81,7 +81,10 @@ impl<'p> Vm<'p> {
                     // are read-only.
                     let slen = self.heap_str_units(value.heap_index());
                     let readonly = k == "length"
-                        || k.parse::<usize>().ok().filter(|n| n.to_string() == k).map_or(false, |n| n < slen);
+                        || k.parse::<usize>()
+                            .ok()
+                            .filter(|n| n.to_string() == k)
+                            .map_or(false, |n| n < slen);
                     if readonly {
                         return Err(Thrown(format!(
                             "TypeError: Cannot assign to read-only property '{k}' of a String"
@@ -113,11 +116,13 @@ impl<'p> Vm<'p> {
         }
         // A string source spreads as index → 1-UNIT string (unit-position keys;
         // a surrogate half is a REAL 1-unit lone-surrogate string).
-        if matches!(self.heap.get(src.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. }) {
-            let units: Vec<u16> = crate::heap::wtf8_units_iter(
-                &self.heap.str_wtf8_cow(src.heap_index()).unwrap(),
-            )
-            .collect();
+        if matches!(
+            self.heap.get(src.heap_index()),
+            HeapObj::Str(_) | HeapObj::Cons { .. }
+        ) {
+            let units: Vec<u16> =
+                crate::heap::wtf8_units_iter(&self.heap.str_wtf8_cow(src.heap_index()).unwrap())
+                    .collect();
             for (i, u) in units.into_iter().enumerate() {
                 let k = i.to_string();
                 if excluded.iter().any(|e| *e == k) {
@@ -167,7 +172,11 @@ impl<'p> Vm<'p> {
     /// `map`/`filter` callback or called via `.call`/`.apply`. String/Number/
     /// Boolean coerce their argument to a primitive (matching the compiler's
     /// lowered direct-call form); every other core constructor constructs.
-    pub(crate) fn call_ctor_as_function(&mut self, callee: Value, args: &[Value]) -> Result<Value, Thrown> {
+    pub(crate) fn call_ctor_as_function(
+        &mut self,
+        callee: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
         // The dynamic-function constructors called WITHOUT `new` behave exactly
         // like `new <Ctor>(...)` — both compile and return a fresh function.
         let ci = callee.heap_index();
@@ -202,7 +211,10 @@ impl<'p> Vm<'p> {
             return Ok(self.make_bigint_val(n));
         }
         let proto = match self.heap.get(callee.heap_index()) {
-            HeapObj::Object(m) => m.get("prototype").filter(|p| p.is_heap()).map(|p| p.heap_index()),
+            HeapObj::Object(m) => m
+                .get("prototype")
+                .filter(|p| p.is_heap())
+                .map(|p| p.heap_index()),
             _ => None,
         };
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -221,7 +233,11 @@ impl<'p> Vm<'p> {
                 return Ok(self.alloc_str(s));
             }
             if p == self.num_proto && self.num_proto != 0 {
-                let n = if args.is_empty() { 0.0 } else { self.to_number_coerce(a0)? };
+                let n = if args.is_empty() {
+                    0.0
+                } else {
+                    self.to_number_coerce(a0)?
+                };
                 return Ok(Value::num(n));
             }
             if p == self.bool_proto && self.bool_proto != 0 {
@@ -261,7 +277,9 @@ impl<'p> Vm<'p> {
                 .unwrap_or_default(),
             _ => String::new(),
         };
-        Err(Thrown(format!("TypeError: constructor {name} requires 'new'")))
+        Err(Thrown(format!(
+            "TypeError: constructor {name} requires 'new'"
+        )))
     }
 
     /// GetWrappedValue: a primitive crosses the realm boundary as-is, a
@@ -273,7 +291,11 @@ impl<'p> Vm<'p> {
         }
         if matches!(
             self.heap.get(v.heap_index()),
-            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+            HeapObj::Str(_)
+                | HeapObj::Cons { .. }
+                | HeapObj::Symbol { .. }
+                | HeapObj::BigInt(_)
+                | HeapObj::BigIntBig(_)
         ) {
             return Ok(v);
         }
@@ -306,8 +328,7 @@ impl<'p> Vm<'p> {
                     Err(_) => {
                         self.pending_throw.take();
                         return Err(Thrown(
-                            "TypeError: WrappedFunction: copying target name/length failed"
-                                .into(),
+                            "TypeError: WrappedFunction: copying target name/length failed".into(),
                         ));
                     }
                 }
@@ -329,7 +350,11 @@ impl<'p> Vm<'p> {
         } else {
             String::new()
         };
-        let idx = self.heap.alloc(HeapObj::Wrapped { target, name, length });
+        let idx = self.heap.alloc(HeapObj::Wrapped {
+            target,
+            name,
+            length,
+        });
         // The wrapper is created in the CALLER realm — the realm of the
         // `evaluate` function running now (a realm copy wraps with ITS realm's
         // %Function.prototype%; the main realm's is the identity).
@@ -348,9 +373,12 @@ impl<'p> Vm<'p> {
         }
         v.is_heap()
             && match self.heap.get(v.heap_index()) {
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
-                    true
-                }
+                HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Bound { .. }
+                | HeapObj::Wrapped { .. }
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. } => true,
                 // The native resolve/reject functions (new Promise executor args,
                 // capability functions) and combinator elements are functions.
                 HeapObj::BoundResolver { .. } | HeapObj::CombinatorResolver { .. } => true,
@@ -467,7 +495,8 @@ impl<'p> Vm<'p> {
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
             | HeapObj::Wrapped { .. }
-            | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. }
             | HeapObj::BoundResolver { .. }
             | HeapObj::CombinatorResolver { .. } => {
                 self.fn_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some())
@@ -480,7 +509,11 @@ impl<'p> Vm<'p> {
             // keep their named own props in the arr_props side table; a boxed String
             // also owns the wrapped string's chars + `length`.
             _ => {
-                if self.arr_props.get(&obj.heap_index()).map_or(false, |m| m.pos(key).is_some()) {
+                if self
+                    .arr_props
+                    .get(&obj.heap_index())
+                    .map_or(false, |m| m.pos(key).is_some())
+                {
                     return true;
                 }
                 // A RegExp owns `lastIndex` (a writable data property).
@@ -594,7 +627,8 @@ impl<'p> Vm<'p> {
             HeapObj::Func(_)
             | HeapObj::Closure { .. }
             | HeapObj::Bound { .. }
-            | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => self
                 .fn_props
                 .get(&obj.heap_index())
                 .and_then(|m| m.pos(key).map(|i| m.attrs[i].enumerable))
@@ -602,7 +636,9 @@ impl<'p> Vm<'p> {
             // A class's own (static) properties live in `ClassData.statics`.
             HeapObj::Class(c) => {
                 !is_private_key(key)
-                    && c.statics.pos(key).map_or(false, |i| c.statics.attrs[i].enumerable)
+                    && c.statics
+                        .pos(key)
+                        .map_or(false, |i| c.statics.attrs[i].enumerable)
             }
             // A String wrapper's char indices are own ENUMERABLE props; `length` is
             // non-enumerable; an assigned own prop lives in the arr_props side table.
@@ -655,7 +691,10 @@ impl<'p> Vm<'p> {
     pub(crate) fn get_iterator_direct(&mut self, v: Value) -> Result<Value, Thrown> {
         let m = self.get_prop(v, "@@iterator")?;
         if !self.is_callable(m) {
-            return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(v)
+            )));
         }
         let it = self.call_value(m, v, &[])?;
         if !self.is_object_value(it) {
@@ -703,9 +742,7 @@ impl<'p> Vm<'p> {
                     // %ArrayIteratorPrototype%.next — a patched next must be
                     // honoured by going through the real iterator protocol.
                     let next_intact = match self.heap.get(self.array_iter_proto) {
-                        HeapObj::Object(p) => {
-                            p.get("next") == Some(self.default_array_iter_next)
-                        }
+                        HeapObj::Object(p) => p.get("next") == Some(self.default_array_iter_next),
                         _ => false,
                     };
                     if m.bits() != self.default_array_iter.bits() || !next_intact {
@@ -715,7 +752,10 @@ impl<'p> Vm<'p> {
                         // @@iterator deleted/poisoned (undefined / non-callable):
                         // GetIterator throws rather than falling back to the dense
                         // positional walk.
-                        return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+                        return Err(Thrown(format!(
+                            "TypeError: {} is not iterable",
+                            self.display(v)
+                        )));
                     }
                     return Ok(v);
                 }
@@ -743,9 +783,7 @@ impl<'p> Vm<'p> {
                             let it = self.call_value(m, v, &[])?;
                             // GetIterator step 5: a non-object iterator is a TypeError.
                             if !self.is_object_value(it) {
-                                return Err(Thrown(
-                                    "TypeError: iterator is not an object".into(),
-                                ));
+                                return Err(Thrown("TypeError: iterator is not an object".into()));
                             }
                             return Ok(it);
                         }
@@ -753,7 +791,10 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))))
+        Err(Thrown(format!(
+            "TypeError: {} is not iterable",
+            self.display(v)
+        )))
     }
 
     /// `for await`: resolve the ASYNC iterator. An async generator is its own
@@ -767,9 +808,7 @@ impl<'p> Vm<'p> {
         // An async generator is its OWN async iterator: its yielded values are
         // already settled by the generator machinery — NOT sync (no extra
         // value-await, which would shift promise interleaving by a tick).
-        if v.is_heap()
-            && matches!(self.heap.get(v.heap_index()), HeapObj::AsyncGenerator(_))
-        {
+        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::AsyncGenerator(_)) {
             return Ok((v, false));
         }
         if v.is_heap()
@@ -800,7 +839,9 @@ impl<'p> Vm<'p> {
             let sm = self.get_prop(v, "@@iterator")?;
             if !sm.is_nullish() {
                 if !self.is_callable(sm) {
-                    return Err(Thrown("TypeError: [Symbol.iterator] is not a function".into()));
+                    return Err(Thrown(
+                        "TypeError: [Symbol.iterator] is not a function".into(),
+                    ));
                 }
                 let it = self.call_value(sm, v, &[])?;
                 if !self.is_object_value(it) {
@@ -824,14 +865,20 @@ impl<'p> Vm<'p> {
         // RequireObjectCoercible — so null/undefined throw a TypeError even for an
         // empty pattern (`[] = null`), before any element is read.
         if v == Value::NULL || v == Value::UNDEFINED {
-            return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(v)
+            )));
         }
         // A non-iterable PRIMITIVE — a number or boolean (non-heap), or a Symbol /
         // BigInt (heap primitives) — has no `@@iterator`, so GetIterator throws.
         // (Strings are heap and ARE iterable; they fall through to the positional
         // fast path below. Plain objects without `@@iterator` are left lenient.)
         if !v.is_heap() {
-            return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(v)
+            )));
         }
         if matches!(
             self.heap.get(v.heap_index()),
@@ -887,7 +934,10 @@ impl<'p> Vm<'p> {
                     // @@iterator was deleted or poisoned (undefined / non-callable):
                     // GetIterator throws a TypeError rather than silently falling
                     // back to positional indexing.
-                    return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+                    return Err(Thrown(format!(
+                        "TypeError: {} is not iterable",
+                        self.display(v)
+                    )));
                 }
             }
             // An ITERATOR OBJECT is iterable through the protocol and nothing
@@ -897,9 +947,7 @@ impl<'p> Vm<'p> {
             // `var [p, q] = [10, 20].values()` bound two `undefined`s. Arrays,
             // Sets, strings and generators all worked, which is why it survived:
             // the broken shape is the one nobody writes by hand.
-            HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } => {
-                DestructureIter::Existing
-            }
+            HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } => DestructureIter::Existing,
             _ => DestructureIter::Positional,
         };
         // Hold the captured method, returned iterator, and not-yet-rooted
@@ -973,7 +1021,10 @@ impl<'p> Vm<'p> {
     pub(crate) fn get_iterator_object(&mut self, iterable: Value) -> Result<Value, Thrown> {
         let m = self.get_prop(iterable, "@@iterator")?;
         if !self.is_callable(m) {
-            return Err(Thrown(format!("TypeError: {} is not iterable", self.display(iterable))));
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(iterable)
+            )));
         }
         self.call_value(m, iterable, &[])
     }
@@ -1020,7 +1071,9 @@ impl<'p> Vm<'p> {
                 let msg = self.alloc_str("Iterator value is not an entry object".to_string());
                 let te = self.make_error(1, Some(msg));
                 self.pending_throw = Some(te);
-                close_and_throw!(Thrown("TypeError: Iterator value is not an entry object".into()));
+                close_and_throw!(Thrown(
+                    "TypeError: Iterator value is not an entry object".into()
+                ));
             }
             let k = match self.get_index(entry, Value::int(0)) {
                 Ok(k) => k,
@@ -1122,13 +1175,17 @@ impl<'p> Vm<'p> {
         }
         if !self.is_callable(ret) {
             if strict {
-                return Err(Thrown("TypeError: iterator return() is not callable".into()));
+                return Err(Thrown(
+                    "TypeError: iterator return() is not callable".into(),
+                ));
             }
             return Ok(());
         }
         let r = self.call_value(ret, iter, &[])?;
         if !self.is_object_value(r) {
-            return Err(Thrown("TypeError: iterator return() result is not an object".into()));
+            return Err(Thrown(
+                "TypeError: iterator return() result is not an object".into(),
+            ));
         }
         Ok(())
     }
@@ -1215,7 +1272,16 @@ impl<'p> Vm<'p> {
         // without it `[...segmenter.segment(s)]` fell past this drain to the
         // positional plan below and reported the iterator "not iterable", even
         // though `for-of` over the same object worked.
-        if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Object(_) | HeapObj::Proxy { .. } | HeapObj::Iterator { .. } | HeapObj::IterHelper { .. } | HeapObj::Intl { .. }) {
+        if v.is_heap()
+            && matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Object(_)
+                    | HeapObj::Proxy { .. }
+                    | HeapObj::Iterator { .. }
+                    | HeapObj::IterHelper { .. }
+                    | HeapObj::Intl { .. }
+            )
+        {
             let next = self.get_prop(v, "next")?;
             if self.is_callable(next) {
                 let mut out = Vec::new();
@@ -1234,7 +1300,8 @@ impl<'p> Vm<'p> {
                     out.push(self.get_prop(res, "value")?);
                     if out.len() > crate::vm::MAX_DENSE_ARRAY_LEN {
                         return Err(Thrown(
-                            "RangeError: iterator produced more values than the engine's limit".into(),
+                            "RangeError: iterator produced more values than the engine's limit"
+                                .into(),
                         ));
                     }
                 }
@@ -1266,15 +1333,26 @@ impl<'p> Vm<'p> {
                         .filter(|(k, _)| !k.is_hole())
                         .collect(),
                 ),
-                _ => return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v)))),
+                _ => {
+                    return Err(Thrown(format!(
+                        "TypeError: {} is not iterable",
+                        self.display(v)
+                    )))
+                }
             }
         } else {
-            return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+            return Err(Thrown(format!(
+                "TypeError: {} is not iterable",
+                self.display(v)
+            )));
         };
         Ok(match plan {
             Plan::Vals(v) => v,
             Plan::ArrayAt(idx) => self.spread_array_elements(idx)?,
-            Plan::Chars(cs) => cs.into_iter().map(|c| self.alloc_str(c.to_string())).collect(),
+            Plan::Chars(cs) => cs
+                .into_iter()
+                .map(|c| self.alloc_str(c.to_string()))
+                .collect(),
             Plan::Pairs(ps) => ps
                 .into_iter()
                 .map(|(k, v)| Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))))
@@ -1295,7 +1373,9 @@ impl<'p> Vm<'p> {
         // A given (non-undefined) mapfn must be callable; null/undefined source is
         // not coercible to an object (ToObject throws).
         if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
-            return Err(Thrown("TypeError: Array.from mapfn is not a function".into()));
+            return Err(Thrown(
+                "TypeError: Array.from mapfn is not a function".into(),
+            ));
         }
         if src.is_nullish() {
             return Err(Thrown(
@@ -1325,7 +1405,11 @@ impl<'p> Vm<'p> {
             // BEFORE the iterator is obtained; then drive next() manually with
             // mapfn interleaved per element (its mutations of the source are
             // observed) and IteratorClose on an abrupt mapfn/define.
-            let dest = if custom_ctor { Some(self.construct(this_ctor, &[])?) } else { None };
+            let dest = if custom_ctor {
+                Some(self.construct(this_ctor, &[])?)
+            } else {
+                None
+            };
             let iter = self.call_value(using_iter, src, &[])?;
             if !self.is_object_value(iter) {
                 return Err(Thrown("TypeError: iterator is not an object".into()));
@@ -1415,7 +1499,11 @@ impl<'p> Vm<'p> {
         let obj = self.to_object(src)?;
         let len_v = self.get_prop(obj, "length")?;
         let n_i = self.to_integer_or_zero(len_v)?;
-        let n = if n_i > 0 { (n_i as u64).min((1u64 << 53) - 1) as usize } else { 0 };
+        let n = if n_i > 0 {
+            (n_i as u64).min((1u64 << 53) - 1) as usize
+        } else {
+            0
+        };
         if custom_ctor {
             let a = self.construct(this_ctor, &[Value::num(n as f64)])?;
             for i in 0..n {
@@ -1447,5 +1535,4 @@ impl<'p> Vm<'p> {
         }
         Ok(self.alloc_array_current_realm(out))
     }
-
 }

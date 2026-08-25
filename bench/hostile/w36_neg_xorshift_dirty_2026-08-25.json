@@ -1,0 +1,2491 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-08-24T20:36:49.757893+00:00",
+  "workspace_commit": "e1662202d14d2b2b567dcac993e539e35b0f0da5",
+  "publishable": false,
+  "provenance_reasons": [
+    "zipp: built from a DIRTY tree (e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.08392ada9a546d37); the commit it names is the parent it was based on, not the code that ran"
+  ],
+  "publication_reasons": [
+    "filtered corpus (all default cases required)",
+    "only 3000 bootstrap samples (at least 10000 required)",
+    "publication sources include untracked files",
+    "benchmark-affecting environment variables are set (canonical publication requires a clean inherited environment)"
+  ],
+  "publication_sources_head_before": false,
+  "publication_sources_head_after": false,
+  "manifest": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\manifest.json",
+  "manifest_sha256_before": "7ada4c9fe96ad17d32a21a365e48332dca98e85257b650db839afd09568c9411",
+  "manifest_sha256_after": "7ada4c9fe96ad17d32a21a365e48332dca98e85257b650db839afd09568c9411",
+  "harness_sha256_before": {
+    "tools/bench_hostile.py": "4f6d451b778f00d873fede9fb1c9b9c562095d723f75351f89d15354e6e22b36",
+    "tools/bench.py": "eb140837840962d8fbbd31f0233fb6afce15a8d3ca49b22efc7ef0ee07f7ed34"
+  },
+  "harness_sha256_after": {
+    "tools/bench_hostile.py": "4f6d451b778f00d873fede9fb1c9b9c562095d723f75351f89d15354e6e22b36",
+    "tools/bench.py": "eb140837840962d8fbbd31f0233fb6afce15a8d3ca49b22efc7ef0ee07f7ed34"
+  },
+  "input_sha256_before": {
+    "errors/branch-control.js": "6b683b52ef558331ac2a81e9ab1981813833cb66f47457f989c3dd24a35765cf",
+    "vendor/nanoid-3.3.17/LICENSE": "da4db1480d9beea3483a2eda5c53b22238d0827d57da162b48f122e04d2d9987",
+    "vendor/nanoid-3.3.17/PROVENANCE.json": "e44a42766a4b4029142af02d98e2a7ccd8050708a50ce2e78a84ec209fb306de",
+    "vendor/nanoid-3.3.17/non-secure/index.mjs": "f501474edb0fbf91fd3d53e3556f8f1e19c0dd41da37eb63ae3779447d7ef573",
+    "vendor/nanoid-non-secure.mjs": "44a207d28e50d4f8fb7e7ac251e2b67b48d03c4f6553ec54f20e2265dabfff97"
+  },
+  "input_sha256_after": {
+    "errors/branch-control.js": "6b683b52ef558331ac2a81e9ab1981813833cb66f47457f989c3dd24a35765cf",
+    "vendor/nanoid-3.3.17/LICENSE": "da4db1480d9beea3483a2eda5c53b22238d0827d57da162b48f122e04d2d9987",
+    "vendor/nanoid-3.3.17/PROVENANCE.json": "e44a42766a4b4029142af02d98e2a7ccd8050708a50ce2e78a84ec209fb306de",
+    "vendor/nanoid-3.3.17/non-secure/index.mjs": "f501474edb0fbf91fd3d53e3556f8f1e19c0dd41da37eb63ae3779447d7ef573",
+    "vendor/nanoid-non-secure.mjs": "44a207d28e50d4f8fb7e7ac251e2b67b48d03c4f6553ec54f20e2265dabfff97"
+  },
+  "source_drift": [],
+  "cases": [
+    {
+      "id": "branch-control",
+      "entry": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js",
+      "entry_rel": "errors/branch-control.js",
+      "category": "errors",
+      "goal": "script",
+      "family": "error-control-flow",
+      "variant": "baseline",
+      "inputs": [
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "input_rels": [
+        "errors/branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "features": [
+        "functions",
+        "branches",
+        "long-loop"
+      ],
+      "description": "Branch-and-return error signalling provides the control for frequent thrown values."
+    },
+    {
+      "id": "npm-nanoid",
+      "entry": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs",
+      "entry_rel": "vendor/nanoid-non-secure.mjs",
+      "category": "npm",
+      "goal": "module",
+      "family": null,
+      "variant": null,
+      "inputs": [
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-3.3.17\\non-secure\\index.mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-3.3.17\\LICENSE",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-3.3.17\\PROVENANCE.json"
+      ],
+      "input_rels": [
+        "vendor/nanoid-non-secure.mjs",
+        "vendor/nanoid-3.3.17/non-secure/index.mjs",
+        "vendor/nanoid-3.3.17/LICENSE",
+        "vendor/nanoid-3.3.17/PROVENANCE.json"
+      ],
+      "timeout_s": 300.0,
+      "features": [
+        "npm",
+        "vendored-source",
+        "modules",
+        "esm",
+        "dynamic-import",
+        "top-level-await",
+        "closures",
+        "strings",
+        "allocation",
+        "math-random"
+      ],
+      "description": "The exact nanoid 3.3.17 non-secure ESM source runs behind a deterministic seeded Math.random boundary."
+    }
+  ],
+  "selection": {
+    "cases": [
+      "branch-control",
+      "npm-nanoid"
+    ],
+    "categories": [],
+    "families": [],
+    "features": []
+  },
+  "reps": 15,
+  "seed": 3106,
+  "bootstrap_samples": 3000,
+  "timeout_override_s": null,
+  "engines_before": [
+    {
+      "name": "node",
+      "argv": [
+        "node"
+      ],
+      "executable": "C:\\Program Files\\nodejs\\node.exe",
+      "version": "v24.12.0",
+      "version_probe_error": null,
+      "size": 89935872,
+      "mtime_ns": 1765317568000000000,
+      "sha256": "2ffe3acc0458fdde999f50d11809bbe7c9b7ef204dcf17094e325d26ace101d8",
+      "build_identity": null
+    },
+    {
+      "name": "zipp",
+      "argv": [
+        ".\\target\\release\\zipp.exe"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7219200,
+      "mtime_ns": 1787603786340131700,
+      "sha256": "49b116f2f32906ce98866d162e4f72b77f7d1fd899b4d99e7358519e149b96fc",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.08392ada9a546d37",
+        "commit": "e1662202d14d2b2b567dcac993e539e35b0f0da5",
+        "dirty": true,
+        "diff_digest": "08392ada9a546d37",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      }
+    }
+  ],
+  "engines_after": [
+    {
+      "name": "node",
+      "argv": [
+        "node"
+      ],
+      "executable": "C:\\Program Files\\nodejs\\node.exe",
+      "version": "v24.12.0",
+      "version_probe_error": null,
+      "size": 89935872,
+      "mtime_ns": 1765317568000000000,
+      "sha256": "2ffe3acc0458fdde999f50d11809bbe7c9b7ef204dcf17094e325d26ace101d8",
+      "build_identity": null
+    },
+    {
+      "name": "zipp",
+      "argv": [
+        ".\\target\\release\\zipp.exe"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7219200,
+      "mtime_ns": 1787603786340131700,
+      "sha256": "49b116f2f32906ce98866d162e4f72b77f7d1fd899b4d99e7358519e149b96fc",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.08392ada9a546d37",
+        "commit": "e1662202d14d2b2b567dcac993e539e35b0f0da5",
+        "dirty": true,
+        "diff_digest": "08392ada9a546d37",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      }
+    }
+  ],
+  "engine_drift": [],
+  "host": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "python": "3.11.6",
+    "power_mode": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "environment": {
+    "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "<redacted>",
+    "RUST_LOG": "<redacted>"
+  },
+  "schedules": [
+    {
+      "rep": 0,
+      "case_order": [
+        "npm-nanoid",
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 1,
+      "case_order": [
+        "npm-nanoid",
+        "branch-control"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 2,
+      "case_order": [
+        "branch-control",
+        "npm-nanoid"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 3,
+      "case_order": [
+        "npm-nanoid",
+        "branch-control"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 4,
+      "case_order": [
+        "branch-control",
+        "npm-nanoid"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 5,
+      "case_order": [
+        "branch-control",
+        "npm-nanoid"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 6,
+      "case_order": [
+        "npm-nanoid",
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 7,
+      "case_order": [
+        "npm-nanoid",
+        "branch-control"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 8,
+      "case_order": [
+        "npm-nanoid",
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 9,
+      "case_order": [
+        "branch-control",
+        "npm-nanoid"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 10,
+      "case_order": [
+        "branch-control",
+        "npm-nanoid"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 11,
+      "case_order": [
+        "branch-control",
+        "npm-nanoid"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 12,
+      "case_order": [
+        "npm-nanoid",
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 13,
+      "case_order": [
+        "npm-nanoid",
+        "branch-control"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 14,
+      "case_order": [
+        "branch-control",
+        "npm-nanoid"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "rep": 0,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03821030003018677,
+      "cold_s": 0.09064189996570349,
+      "adjusted_s": 0.052431599935516715,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.011764999944716692,
+      "cold_s": 0.43816749996040016,
+      "adjusted_s": 0.42640250001568347,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.035932500031776726,
+      "cold_s": 0.04478580004069954,
+      "adjusted_s": 0.008853300008922815,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.011287300032563508,
+      "cold_s": 0.04472110001370311,
+      "adjusted_s": 0.0334337999811396,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00938869995297864,
+      "cold_s": 0.43251519999466836,
+      "adjusted_s": 0.4231265000416897,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03726359998108819,
+      "cold_s": 0.08827519998885691,
+      "adjusted_s": 0.05101160000776872,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010244500008411705,
+      "cold_s": 0.045714100007899106,
+      "adjusted_s": 0.0354695999994874,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.033029999991413206,
+      "cold_s": 0.04332470003282651,
+      "adjusted_s": 0.010294700041413307,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03537209995556623,
+      "cold_s": 0.046810800035018474,
+      "adjusted_s": 0.011438700079452246,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.01092380000045523,
+      "cold_s": 0.04543950001243502,
+      "adjusted_s": 0.03451570001197979,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03727870003785938,
+      "cold_s": 0.0886674000066705,
+      "adjusted_s": 0.051388699968811125,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.01062459999229759,
+      "cold_s": 0.43560269998852164,
+      "adjusted_s": 0.42497809999622405,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010369499970693141,
+      "cold_s": 0.4372852999949828,
+      "adjusted_s": 0.42691580002428964,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03718829998979345,
+      "cold_s": 0.08919760002754629,
+      "adjusted_s": 0.05200930003775284,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010539100039750338,
+      "cold_s": 0.043921499978750944,
+      "adjusted_s": 0.03338239993900061,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03363140003057197,
+      "cold_s": 0.045168999989982694,
+      "adjusted_s": 0.011537599959410727,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03553079999983311,
+      "cold_s": 0.04403970000566915,
+      "adjusted_s": 0.00850890000583604,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009810200019273907,
+      "cold_s": 0.0437528999755159,
+      "adjusted_s": 0.033942699956241995,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03509169997414574,
+      "cold_s": 0.08955999999307096,
+      "adjusted_s": 0.05446830001892522,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.01093729998683557,
+      "cold_s": 0.43563130003167316,
+      "adjusted_s": 0.4246940000448376,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010710699949413538,
+      "cold_s": 0.04390779999084771,
+      "adjusted_s": 0.03319710004143417,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.034197599976323545,
+      "cold_s": 0.046059600019361824,
+      "adjusted_s": 0.011862000043038279,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010303199989721179,
+      "cold_s": 0.4337290999828838,
+      "adjusted_s": 0.4234258999931626,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03723590000299737,
+      "cold_s": 0.0869302999926731,
+      "adjusted_s": 0.04969439998967573,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0352402999997139,
+      "cold_s": 0.08891719998791814,
+      "adjusted_s": 0.05367689998820424,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010380499996244907,
+      "cold_s": 0.4343131000059657,
+      "adjusted_s": 0.4239326000097208,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.035405100032221526,
+      "cold_s": 0.043460499960929155,
+      "adjusted_s": 0.00805539992870763,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009713599982205778,
+      "cold_s": 0.04479029995854944,
+      "adjusted_s": 0.03507669997634366,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00969710003118962,
+      "cold_s": 0.4365111999795772,
+      "adjusted_s": 0.4268140999483876,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.042863500013481826,
+      "cold_s": 0.09294949995819479,
+      "adjusted_s": 0.05008599994471297,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.011133099964354187,
+      "cold_s": 0.04684700001962483,
+      "adjusted_s": 0.03571390005527064,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03597179998178035,
+      "cold_s": 0.04505119996611029,
+      "adjusted_s": 0.009079399984329939,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03908290003892034,
+      "cold_s": 0.09343629999784753,
+      "adjusted_s": 0.054353399958927184,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.012089000025298446,
+      "cold_s": 0.437973799998872,
+      "adjusted_s": 0.42588479997357354,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03670360002433881,
+      "cold_s": 0.04795669997110963,
+      "adjusted_s": 0.011253099946770817,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.011180499976035208,
+      "cold_s": 0.04587199998786673,
+      "adjusted_s": 0.03469150001183152,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010808099992573261,
+      "cold_s": 0.04486179997911677,
+      "adjusted_s": 0.034053699986543506,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03703410003799945,
+      "cold_s": 0.04723950003972277,
+      "adjusted_s": 0.01020540000172332,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.011179799970705062,
+      "cold_s": 0.43678029999136925,
+      "adjusted_s": 0.4256005000206642,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0382312000147067,
+      "cold_s": 0.09307270002318546,
+      "adjusted_s": 0.05484150000847876,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03679220000049099,
+      "cold_s": 0.047838900005444884,
+      "adjusted_s": 0.011046700004953891,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010721600032411516,
+      "cold_s": 0.045204700028989464,
+      "adjusted_s": 0.03448309999657795,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03854719997616485,
+      "cold_s": 0.09266150003531948,
+      "adjusted_s": 0.05411430005915463,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.011660100019071251,
+      "cold_s": 0.4427455000113696,
+      "adjusted_s": 0.43108539999229833,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.011519599996972829,
+      "cold_s": 0.04526029998669401,
+      "adjusted_s": 0.03374069998972118,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.036298400023952127,
+      "cold_s": 0.04718049999792129,
+      "adjusted_s": 0.010882099973969162,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010933600016869605,
+      "cold_s": 0.43824609997682273,
+      "adjusted_s": 0.42731249995995313,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.04026270000031218,
+      "cold_s": 0.09872249996988103,
+      "adjusted_s": 0.05845979996956885,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0389324999996461,
+      "cold_s": 0.09401830000570044,
+      "adjusted_s": 0.05508580000605434,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.012095199956092983,
+      "cold_s": 0.4418916999711655,
+      "adjusted_s": 0.4297965000150725,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03962070000125095,
+      "cold_s": 0.048544000019319355,
+      "adjusted_s": 0.008923300018068403,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.015671800007112324,
+      "cold_s": 0.04630320001160726,
+      "adjusted_s": 0.030631400004494935,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.01113259996054694,
+      "cold_s": 0.43971470004180446,
+      "adjusted_s": 0.4285821000812575,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "case": "npm-nanoid",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.04130830004578456,
+      "cold_s": 0.09376760001759976,
+      "adjusted_s": 0.0524592999718152,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.011030399997252971,
+      "cold_s": 0.04626179998740554,
+      "adjusted_s": 0.03523139999015257,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "case": "branch-control",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.037651100021321326,
+      "cold_s": 0.04851549997692928,
+      "adjusted_s": 0.01086439995560795,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03792929998598993,
+      "cold_s": 0.04799049999564886,
+      "adjusted_s": 0.010061200009658933,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-t2hax0w7.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.011102599964942783,
+      "cold_s": 0.04597710003145039,
+      "adjusted_s": 0.03487450006650761,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "module",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03966599999694154,
+      "cold_s": 0.09356330003356561,
+      "adjusted_s": 0.053897300036624074,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "case": "npm-nanoid",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "module",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-j03h_tia.mjs"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "mjs",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\vendor\\nanoid-non-secure.mjs"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.011448899982497096,
+      "cold_s": 0.4414981000008993,
+      "adjusted_s": 0.4300492000184022,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 68,
+      "stdout_sha256": "f987fc98cbf6bf73d2579705d75e94dbb6a2b8123af244b5ae27d1129e039fa6",
+      "valid_for_stats": true
+    }
+  ],
+  "all_correct": true,
+  "health_failures": [],
+  "correctness_failures": [],
+  "summary": {
+    "case_summaries": {
+      "branch-control": {
+        "category": "errors",
+        "family": "error-control-flow",
+        "variant": "baseline",
+        "metrics": {
+          "startup": {
+            "median_ms": {
+              "node": 35.97179998178035,
+              "zipp": 10.92380000045523
+            },
+            "paired_ratio": 0.30882531752928166,
+            "paired_ratio_ci95": [
+              0.29184184255816753,
+              0.31337083886397754
+            ],
+            "nonpositive_pairs": 0
+          },
+          "cold": {
+            "median_ms": {
+              "node": 46.810800035018474,
+              "zipp": 45.26029998669401
+            },
+            "paired_ratio": 0.9593009821576312,
+            "paired_ratio_ci95": [
+              0.9538324900231491,
+              0.9985553450661229
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "node": 10.294700041413307,
+              "zipp": 34.48309999657795
+            },
+            "paired_ratio": 3.336831479490572,
+            "paired_ratio_ci95": [
+              3.082839411000395,
+              3.466236635095959
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      },
+      "npm-nanoid": {
+        "category": "npm",
+        "family": null,
+        "variant": null,
+        "metrics": {
+          "startup": {
+            "median_ms": {
+              "node": 38.2312000147067,
+              "zipp": 10.93729998683557
+            },
+            "paired_ratio": 0.28863258164120076,
+            "paired_ratio_ci95": [
+              0.2767007105747895,
+              0.3024888974109953
+            ],
+            "nonpositive_pairs": 0
+          },
+          "cold": {
+            "median_ms": {
+              "node": 92.66150003531948,
+              "zipp": 437.2852999949828
+            },
+            "paired_ratio": 4.778095539599615,
+            "paired_ratio_ci95": [
+              4.692893833342778,
+              4.8996229977305665
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "node": 53.67689998820424,
+              "zipp": 426.4025000156835
+            },
+            "paired_ratio": 7.97904903819258,
+            "paired_ratio_ci95": [
+              7.83547671894304,
+              8.26987451043035
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      }
+    },
+    "suite_summaries": {
+      "startup": {
+        "overall": {
+          "benches": [
+            "branch-control",
+            "npm-nanoid"
+          ],
+          "geomean_paired_ratio": 0.298558283547183,
+          "ci95": [
+            0.2889566612429971,
+            0.30629916735703794
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "errors": [
+              "branch-control"
+            ],
+            "npm": [
+              "npm-nanoid"
+            ]
+          },
+          "geomean_paired_ratio": 0.298558283547183,
+          "ci95": [
+            0.2889566612429971,
+            0.30695737979655574
+          ]
+        },
+        "categories": {
+          "errors": {
+            "benches": [
+              "branch-control"
+            ],
+            "geomean_paired_ratio": 0.30882531752928166,
+            "ci95": [
+              0.29184184255816753,
+              0.3132003402820377
+            ]
+          },
+          "npm": {
+            "benches": [
+              "npm-nanoid"
+            ],
+            "geomean_paired_ratio": 0.28863258164120076,
+            "ci95": [
+              0.27155655275937357,
+              0.30790127100342435
+            ]
+          }
+        }
+      },
+      "cold": {
+        "overall": {
+          "benches": [
+            "branch-control",
+            "npm-nanoid"
+          ],
+          "geomean_paired_ratio": 2.140941789022043,
+          "ci95": [
+            2.1173343755264398,
+            2.1982837093739764
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "errors": [
+              "branch-control"
+            ],
+            "npm": [
+              "npm-nanoid"
+            ]
+          },
+          "geomean_paired_ratio": 2.140941789022043,
+          "ci95": [
+            2.1173343755264398,
+            2.1982837093739764
+          ]
+        },
+        "categories": {
+          "errors": {
+            "benches": [
+              "branch-control"
+            ],
+            "geomean_paired_ratio": 0.9593009821576312,
+            "ci95": [
+              0.9535468048232947,
+              0.9934876933740165
+            ]
+          },
+          "npm": {
+            "benches": [
+              "npm-nanoid"
+            ],
+            "geomean_paired_ratio": 4.778095539599615,
+            "ci95": [
+              4.696218916464356,
+              4.8996229977305665
+            ]
+          }
+        }
+      },
+      "adjusted": {
+        "overall": {
+          "benches": [
+            "branch-control",
+            "npm-nanoid"
+          ],
+          "geomean_paired_ratio": 5.1599168604775,
+          "ci95": [
+            4.948520602791779,
+            5.337903972213065
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "errors": [
+              "branch-control"
+            ],
+            "npm": [
+              "npm-nanoid"
+            ]
+          },
+          "geomean_paired_ratio": 5.1599168604775,
+          "ci95": [
+            4.948520602791779,
+            5.461286668382175
+          ]
+        },
+        "categories": {
+          "errors": {
+            "benches": [
+              "branch-control"
+            ],
+            "geomean_paired_ratio": 3.3368314794905722,
+            "ci95": [
+              3.100568830504369,
+              3.7764223450513685
+            ]
+          },
+          "npm": {
+            "benches": [
+              "npm-nanoid"
+            ],
+            "geomean_paired_ratio": 7.9790490381925805,
+            "ci95": [
+              7.802310213663678,
+              8.269874510430352
+            ]
+          }
+        }
+      }
+    },
+    "degradations": [
+      {
+        "family": "error-control-flow",
+        "available": false,
+        "reason": "selected cases do not include baseline and stressor"
+      }
+    ]
+  }
+}

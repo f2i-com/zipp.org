@@ -29,7 +29,17 @@ impl<'p> Vm<'p> {
     ) -> u64 {
         use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
         if self
-            .setup_call(fid, closure, this_v, caller_base, arg_base, argc, 0, ip + 1, callee_v)
+            .setup_call(
+                fid,
+                closure,
+                this_v,
+                caller_base,
+                arg_base,
+                argc,
+                0,
+                ip + 1,
+                callee_v,
+            )
             .is_err()
         {
             // MAX_FRAMES / regs overflow / this-boxing error. If a JS error
@@ -98,7 +108,11 @@ impl<'p> Vm<'p> {
             let val = self.get(base, val_reg);
             match self.ic_set_prop(func_id, ip, recv, key, val) {
                 SetAct::Done => 0,
-                SetAct::Setter { fid, closure, setter } => {
+                SetAct::Setter {
+                    fid,
+                    closure,
+                    setter,
+                } => {
                     // An ARROW accessor binds `this` LEXICALLY — reg 0 is its
                     // captured `this_val`, not `recv`. Every path below hands it
                     // `recv` (`accessor_fast_set`, `try_method_inline`, and
@@ -146,7 +160,11 @@ impl<'p> Vm<'p> {
             let recv = self.get(base, obj_reg);
             match self.ic_get_prop(func_id, ip, recv, key) {
                 GetAct::Value(v) => v.bits(),
-                GetAct::Accessor { fid, closure, getter } => {
+                GetAct::Accessor {
+                    fid,
+                    closure,
+                    getter,
+                } => {
                     // An ARROW accessor binds `this` LEXICALLY — reg 0 is its
                     // captured `this_val`, not `recv`. Every path below hands it
                     // `recv` (`accessor_fast_get`, `try_method_inline`, and
@@ -218,7 +236,8 @@ impl<'p> Vm<'p> {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
-        if let Some(bits) = self.jit_prop_acc_baked(&e, caller_base_ptr, packed_fip, packed2, is_set)
+        if let Some(bits) =
+            self.jit_prop_acc_baked(&e, caller_base_ptr, packed_fip, packed2, is_set)
         {
             return bits;
         }
@@ -264,7 +283,11 @@ impl<'p> Vm<'p> {
             if slot >= m.vals.len() || !m.attrs[slot].accessor {
                 return None;
             }
-            if is_set { m.attrs[slot].setter } else { m.vals[slot] }
+            if is_set {
+                m.attrs[slot].setter
+            } else {
+                m.vals[slot]
+            }
         };
         if live.bits() != ((e.hops[3].0 as u64) | ((e.hops[3].1 as u64) << 32)) {
             return None; // swapped without a bump → full re-resolution
@@ -289,7 +312,11 @@ impl<'p> Vm<'p> {
                 None => {}
             }
             let r = self.jit_frame_call(fid, closure, recv, base, val_reg, 1, ip, live);
-            Some(if r == CALL_THREW || r == SELF_CALL_DEOPT { r } else { 0 })
+            Some(if r == CALL_THREW || r == SELF_CALL_DEOPT {
+                r
+            } else {
+                0
+            })
         } else {
             let obj_reg = (packed2 & 0xFFFF) as u16;
             let recv = self.get(base, obj_reg);
@@ -379,5 +406,4 @@ impl<'p> Vm<'p> {
         self.module_load_depth = 0;
         Ok(())
     }
-
 }

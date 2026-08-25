@@ -1,0 +1,1417 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-08-24T20:29:42.987168+00:00",
+  "workspace_commit": "e1662202d14d2b2b567dcac993e539e35b0f0da5",
+  "publishable": false,
+  "provenance_reasons": [
+    "zipp: built from a DIRTY tree (e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.4e2dbc66efb3617d); the commit it names is the parent it was based on, not the code that ran"
+  ],
+  "publication_reasons": [
+    "filtered corpus (all default cases required)",
+    "only 3000 bootstrap samples (at least 10000 required)",
+    "publication sources include untracked files",
+    "benchmark-affecting environment variables are set (canonical publication requires a clean inherited environment)"
+  ],
+  "publication_sources_head_before": false,
+  "publication_sources_head_after": false,
+  "manifest": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\manifest.json",
+  "manifest_sha256_before": "7ada4c9fe96ad17d32a21a365e48332dca98e85257b650db839afd09568c9411",
+  "manifest_sha256_after": "7ada4c9fe96ad17d32a21a365e48332dca98e85257b650db839afd09568c9411",
+  "harness_sha256_before": {
+    "tools/bench_hostile.py": "4f6d451b778f00d873fede9fb1c9b9c562095d723f75351f89d15354e6e22b36",
+    "tools/bench.py": "eb140837840962d8fbbd31f0233fb6afce15a8d3ca49b22efc7ef0ee07f7ed34"
+  },
+  "harness_sha256_after": {
+    "tools/bench_hostile.py": "4f6d451b778f00d873fede9fb1c9b9c562095d723f75351f89d15354e6e22b36",
+    "tools/bench.py": "eb140837840962d8fbbd31f0233fb6afce15a8d3ca49b22efc7ef0ee07f7ed34"
+  },
+  "input_sha256_before": {
+    "errors/branch-control.js": "6b683b52ef558331ac2a81e9ab1981813833cb66f47457f989c3dd24a35765cf"
+  },
+  "input_sha256_after": {
+    "errors/branch-control.js": "6b683b52ef558331ac2a81e9ab1981813833cb66f47457f989c3dd24a35765cf"
+  },
+  "source_drift": [],
+  "cases": [
+    {
+      "id": "branch-control",
+      "entry": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js",
+      "entry_rel": "errors/branch-control.js",
+      "category": "errors",
+      "goal": "script",
+      "family": "error-control-flow",
+      "variant": "baseline",
+      "inputs": [
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "input_rels": [
+        "errors/branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "features": [
+        "functions",
+        "branches",
+        "long-loop"
+      ],
+      "description": "Branch-and-return error signalling provides the control for frequent thrown values."
+    }
+  ],
+  "selection": {
+    "cases": [
+      "branch-control"
+    ],
+    "categories": [],
+    "families": [],
+    "features": []
+  },
+  "reps": 15,
+  "seed": 3105,
+  "bootstrap_samples": 3000,
+  "timeout_override_s": null,
+  "engines_before": [
+    {
+      "name": "node",
+      "argv": [
+        "node"
+      ],
+      "executable": "C:\\Program Files\\nodejs\\node.exe",
+      "version": "v24.12.0",
+      "version_probe_error": null,
+      "size": 89935872,
+      "mtime_ns": 1765317568000000000,
+      "sha256": "2ffe3acc0458fdde999f50d11809bbe7c9b7ef204dcf17094e325d26ace101d8",
+      "build_identity": null
+    },
+    {
+      "name": "zipp",
+      "argv": [
+        ".\\target\\release\\zipp.exe"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7224832,
+      "mtime_ns": 1787603369784911100,
+      "sha256": "9befe17013dbdfafae5ee37a9338769eebe86c5b85fd30ea7f6cfe26d886697f",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.4e2dbc66efb3617d",
+        "commit": "e1662202d14d2b2b567dcac993e539e35b0f0da5",
+        "dirty": true,
+        "diff_digest": "4e2dbc66efb3617d",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      }
+    }
+  ],
+  "engines_after": [
+    {
+      "name": "node",
+      "argv": [
+        "node"
+      ],
+      "executable": "C:\\Program Files\\nodejs\\node.exe",
+      "version": "v24.12.0",
+      "version_probe_error": null,
+      "size": 89935872,
+      "mtime_ns": 1765317568000000000,
+      "sha256": "2ffe3acc0458fdde999f50d11809bbe7c9b7ef204dcf17094e325d26ace101d8",
+      "build_identity": null
+    },
+    {
+      "name": "zipp",
+      "argv": [
+        ".\\target\\release\\zipp.exe"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7224832,
+      "mtime_ns": 1787603369784911100,
+      "sha256": "9befe17013dbdfafae5ee37a9338769eebe86c5b85fd30ea7f6cfe26d886697f",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.4e2dbc66efb3617d",
+        "commit": "e1662202d14d2b2b567dcac993e539e35b0f0da5",
+        "dirty": true,
+        "diff_digest": "4e2dbc66efb3617d",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      }
+    }
+  ],
+  "engine_drift": [],
+  "host": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "python": "3.11.6",
+    "power_mode": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "environment": {
+    "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "<redacted>",
+    "RUST_LOG": "<redacted>"
+  },
+  "schedules": [
+    {
+      "rep": 0,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 1,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 2,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 3,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 4,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 5,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 6,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 7,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 8,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 9,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 10,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 11,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 12,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 13,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 14,
+      "case_order": [
+        "branch-control"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "rep": 0,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03734209999674931,
+      "cold_s": 0.05070949997752905,
+      "adjusted_s": 0.013367399980779737,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.013783600006718189,
+      "cold_s": 0.05083369999192655,
+      "adjusted_s": 0.03705009998520836,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009130899969022721,
+      "cold_s": 0.05191219999687746,
+      "adjusted_s": 0.04278130002785474,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03549610002664849,
+      "cold_s": 0.0466706000152044,
+      "adjusted_s": 0.011174499988555908,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.035553299996536225,
+      "cold_s": 0.0452672999817878,
+      "adjusted_s": 0.009713999985251576,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009790599986445159,
+      "cold_s": 0.049433300038799644,
+      "adjusted_s": 0.039642700052354485,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009100899973418564,
+      "cold_s": 0.050369400007184595,
+      "adjusted_s": 0.04126850003376603,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03483289998257533,
+      "cold_s": 0.045782200002577156,
+      "adjusted_s": 0.010949300020001829,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03659669996704906,
+      "cold_s": 0.04774589999578893,
+      "adjusted_s": 0.01114920002873987,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010743199964053929,
+      "cold_s": 0.04911219998029992,
+      "adjusted_s": 0.03836900001624599,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009211900003720075,
+      "cold_s": 0.04887629998847842,
+      "adjusted_s": 0.03966439998475835,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.034679299977142364,
+      "cold_s": 0.044478700030595064,
+      "adjusted_s": 0.0097994000534527,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03472330002114177,
+      "cold_s": 0.04482259997166693,
+      "adjusted_s": 0.010099299950525165,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010470099980011582,
+      "cold_s": 0.05147130001569167,
+      "adjusted_s": 0.041001200035680085,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010697700025048107,
+      "cold_s": 0.05028839997248724,
+      "adjusted_s": 0.039590699947439134,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.037774200027342886,
+      "cold_s": 0.04866530001163483,
+      "adjusted_s": 0.010891099984291941,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03537900000810623,
+      "cold_s": 0.04368990001967177,
+      "adjusted_s": 0.008310900011565536,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010095299978274852,
+      "cold_s": 0.050318999972660094,
+      "adjusted_s": 0.04022369999438524,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.013476099993567914,
+      "cold_s": 0.05291369999758899,
+      "adjusted_s": 0.03943760000402108,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.04245489998720586,
+      "cold_s": 0.04352090001339093,
+      "adjusted_s": 0.0010660000261850655,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03654520004056394,
+      "cold_s": 0.04472399997757748,
+      "adjusted_s": 0.008178799937013537,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.01062750001437962,
+      "cold_s": 0.05026529997121543,
+      "adjusted_s": 0.039637799956835806,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009135400003287941,
+      "cold_s": 0.04866289999336004,
+      "adjusted_s": 0.0395274999900721,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.034514800005126745,
+      "cold_s": 0.04560040001524612,
+      "adjusted_s": 0.011085600010119379,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03554080001777038,
+      "cold_s": 0.04417870001634583,
+      "adjusted_s": 0.008637899998575449,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010139599966350943,
+      "cold_s": 0.049247700022533536,
+      "adjusted_s": 0.03910810005618259,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009278600045945495,
+      "cold_s": 0.049235699989367276,
+      "adjusted_s": 0.03995709994342178,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0336513000074774,
+      "cold_s": 0.04593850002856925,
+      "adjusted_s": 0.012287200021091849,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03374980000080541,
+      "cold_s": 0.044048800016753376,
+      "adjusted_s": 0.010299000015947968,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "case": "branch-control",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-vytczeyh.js"
+      ],
+      "argv": [
+        ".\\target\\release\\zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\errors\\branch-control.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010078799969051033,
+      "cold_s": 0.0487746000289917,
+      "adjusted_s": 0.038695800059940666,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "f935b61efb900ae2983d7c1b707cab1e6e17823948e0aa83886294e3d267d18c",
+      "valid_for_stats": true
+    }
+  ],
+  "all_correct": true,
+  "health_failures": [],
+  "correctness_failures": [],
+  "summary": {
+    "case_summaries": {
+      "branch-control": {
+        "category": "errors",
+        "family": "error-control-flow",
+        "variant": "baseline",
+        "metrics": {
+          "startup": {
+            "median_ms": {
+              "node": 35.49610002664849,
+              "zipp": 10.095299978274852
+            },
+            "paired_ratio": 0.2852946461892008,
+            "paired_ratio_ci95": [
+              0.2753780939434316,
+              0.2986328798633032
+            ],
+            "nonpositive_pairs": 0
+          },
+          "cold": {
+            "median_ms": {
+              "node": 45.2672999817878,
+              "zipp": 50.26529997121543
+            },
+            "paired_ratio": 1.1001961461954475,
+            "paired_ratio_ci95": [
+              1.0716588509608223,
+              1.11496758479682
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "node": 10.299000015947968,
+              "zipp": 39.637799956835806
+            },
+            "paired_ratio": 3.828475553417886,
+            "paired_ratio_ci95": [
+              3.5656617552491356,
+              4.527500904459678
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      }
+    },
+    "suite_summaries": {
+      "startup": {
+        "overall": {
+          "benches": [
+            "branch-control"
+          ],
+          "geomean_paired_ratio": 0.2852946461892008,
+          "ci95": [
+            0.26563108280131875,
+            0.2936834310811103
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "errors": [
+              "branch-control"
+            ]
+          },
+          "geomean_paired_ratio": 0.2852946461892008,
+          "ci95": [
+            0.2753780939434316,
+            0.29355652213797667
+          ]
+        },
+        "categories": {
+          "errors": {
+            "benches": [
+              "branch-control"
+            ],
+            "geomean_paired_ratio": 0.2852946461892008,
+            "ci95": [
+              0.2753780939434316,
+              0.29355652213797667
+            ]
+          }
+        }
+      },
+      "cold": {
+        "overall": {
+          "benches": [
+            "branch-control"
+          ],
+          "geomean_paired_ratio": 1.1001961461954475,
+          "ci95": [
+            1.0671594980984815,
+            1.1147385505755536
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "errors": [
+              "branch-control"
+            ]
+          },
+          "geomean_paired_ratio": 1.1001961461954475,
+          "ci95": [
+            1.0717742189829336,
+            1.1147385505755536
+          ]
+        },
+        "categories": {
+          "errors": {
+            "benches": [
+              "branch-control"
+            ],
+            "geomean_paired_ratio": 1.1001961461954475,
+            "ci95": [
+              1.0671594980984815,
+              1.1238999194261716
+            ]
+          }
+        }
+      },
+      "adjusted": {
+        "overall": {
+          "benches": [
+            "branch-control"
+          ],
+          "geomean_paired_ratio": 3.828475553417886,
+          "ci95": [
+            3.5656617552491356,
+            4.527500904459678
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "errors": [
+              "branch-control"
+            ]
+          },
+          "geomean_paired_ratio": 3.828475553417886,
+          "ci95": [
+            3.5656617552491356,
+            4.527500904459678
+          ]
+        },
+        "categories": {
+          "errors": {
+            "benches": [
+              "branch-control"
+            ],
+            "geomean_paired_ratio": 3.828475553417886,
+            "ci95": [
+              3.5656617552491356,
+              4.527500904459678
+            ]
+          }
+        }
+      }
+    },
+    "degradations": [
+      {
+        "family": "error-control-flow",
+        "available": false,
+        "reason": "selected cases do not include baseline and stressor"
+      }
+    ]
+  }
+}

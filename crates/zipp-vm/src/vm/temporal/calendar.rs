@@ -225,7 +225,11 @@ fn islamic_year_start(epoch: i64, y: i64) -> i64 {
 /// Length of tabular-Islamic month `m` of year `y`: 30/29 alternating, with a
 /// 30-day twelfth month in a leap year.
 fn islamic_tabular_month_len(y: i64, m: i64) -> i64 {
-    if m % 2 == 1 || (m == 12 && islamic_leap(y)) { 30 } else { 29 }
+    if m % 2 == 1 || (m == 12 && islamic_leap(y)) {
+        30
+    } else {
+        29
+    }
 }
 
 // ── Umm al-Qura (islamic-umalqura) ──────────────────────────────────────────
@@ -361,7 +365,9 @@ fn umalqura_row(c: Cal, y: i64) -> Option<usize> {
         return None;
     }
     let i = y - UMALQURA_FIRST_YEAR;
-    (0..UMALQURA_YEARS as i64).contains(&i).then_some(i as usize)
+    (0..UMALQURA_YEARS as i64)
+        .contains(&i)
+        .then_some(i as usize)
 }
 
 /// Epoch day of umalqura `y`-01-01: tabulated inside the window, islamic-civil
@@ -451,7 +457,11 @@ fn hebrew_elapsed_days(y: i64) -> i64 {
     // One mean lunation is 29d 12h 793p; 12h 793p = 13753 parts of 25920 per day.
     let parts = 12084 + 13753 * months;
     let day = 29 * months + parts.div_euclid(25920);
-    if (3 * (day + 1)).rem_euclid(7) < 3 { day + 1 } else { day }
+    if (3 * (day + 1)).rem_euclid(7) < 3 {
+        day + 1
+    } else {
+        day
+    }
 }
 
 /// Epoch day of 1 Tishri of Hebrew year `y`, with dechiyot #3 and #4: a year
@@ -744,9 +754,13 @@ pub(crate) fn cal_month_of_code_constrain(c: Cal, y: i64, num: i64, leap: bool) 
     // "M05L is constrained to M05 in year 2022"), where hebrew's Adar I becomes
     // the following Adar.
     if c.lunisolar().is_some() {
-        return cal_month_of_code(c, y, num, false).unwrap_or(miy).clamp(1, miy);
+        return cal_month_of_code(c, y, num, false)
+            .unwrap_or(miy)
+            .clamp(1, miy);
     }
-    cal_month_of_code(c, y, num, false).map_or(miy, |m| m + 1).clamp(1, miy)
+    cal_month_of_code(c, y, num, false)
+        .map_or(miy, |m| m + 1)
+        .clamp(1, miy)
 }
 
 /// `CalendarDateDaysInMonth` for a calendar year/ordinal month.
@@ -988,7 +1002,11 @@ pub(crate) fn cal_to_epoch_days(c: Cal, y: i64, m: i64, d: i64) -> i64 {
     }
     if c == Cal::Persian {
         // 31 days each precede months 2..=7, then 30 each.
-        let before = if m <= 7 { 31 * (m - 1) } else { 186 + 30 * (m - 7) };
+        let before = if m <= 7 {
+            31 * (m - 1)
+        } else {
+            186 + 30 * (m - 7)
+        };
         return persian_year_start(y) + before + d - 1;
     }
     if c == Cal::Indian {
@@ -1326,7 +1344,16 @@ pub(crate) fn cal_until_year_split(
     let step = if sign == 0 { 1 } else { sign };
     let (ny, nm, _) = cal_add_years(c, y1, m1, years + step, false).unwrap();
     let span = cal_month_index(c, ny, nm) - cal_month_index(c, ay, am);
-    (years, ay, am, if span == 0 { cal_months_in_year(c, ay) } else { span.abs() })
+    (
+        years,
+        ay,
+        am,
+        if span == 0 {
+            cal_months_in_year(c, ay)
+        } else {
+            span.abs()
+        },
+    )
 }
 
 /// `CalendarDateUntil`: the years/months/weeks/days from `d1` to `d2`, both
@@ -1406,8 +1433,14 @@ mod tests {
             UMALQURA_YEAR_STARTS[UMALQURA_YEARS] as i64,
             islamic_year_start(civil, 1601)
         );
-        assert_eq!(cal_to_epoch_days(c, 1300, 1, 1), islamic_year_start(civil, 1300));
-        assert_eq!(cal_to_epoch_days(c, 1601, 1, 1), islamic_year_start(civil, 1601));
+        assert_eq!(
+            cal_to_epoch_days(c, 1300, 1, 1),
+            islamic_year_start(civil, 1300)
+        );
+        assert_eq!(
+            cal_to_epoch_days(c, 1601, 1, 1),
+            islamic_year_start(civil, 1601)
+        );
     }
 
     /// Every tabulated year is 354 or 355 days of twelve 29/30-day months, and

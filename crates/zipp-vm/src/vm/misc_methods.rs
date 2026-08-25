@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -86,9 +86,14 @@ impl<'p> Vm<'p> {
     /// `Error.prototype.toString` semantics for the read-only `display` path:
     /// "name: message", dropping the separator when either part is empty.
     pub(crate) fn error_display_string(&self, idx: u32) -> String {
-        let name =
-            self.read_data_prop(idx, "name").map(|v| self.display(v)).unwrap_or_else(|| "Error".into());
-        let msg = self.read_data_prop(idx, "message").map(|v| self.display(v)).unwrap_or_default();
+        let name = self
+            .read_data_prop(idx, "name")
+            .map(|v| self.display(v))
+            .unwrap_or_else(|| "Error".into());
+        let msg = self
+            .read_data_prop(idx, "message")
+            .map(|v| self.display(v))
+            .unwrap_or_default();
         if name.is_empty() {
             msg
         } else if msg.is_empty() {
@@ -101,7 +106,12 @@ impl<'p> Vm<'p> {
     /// Methods on a number receiver: `toFixed`, `toString`. Returns `Ok(None)`
     /// for an unrecognised name (the caller then treats it as a missing property
     /// → TypeError, matching JS).
-    pub(crate) fn number_method(&mut self, recv: Value, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn number_method(
+        &mut self,
+        recv: Value,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
         // thisNumberValue brand check: a Number primitive uses its value; the
         // Number.prototype object itself has [[NumberData]] = +0; anything else
         // (a String/object via `Number.prototype.toString.call(x)`) is a TypeError.
@@ -114,7 +124,11 @@ impl<'p> Vm<'p> {
                 "TypeError: Number.prototype method called on a non-Number".into(),
             ));
         };
-        let nv = if recv.is_number() { recv } else { Value::num(n) };
+        let nv = if recv.is_number() {
+            recv
+        } else {
+            Value::num(n)
+        };
         // ToIntegerOrInfinity(ToNumber(arg)): coerce (valueOf/string), truncate;
         // NaN -> 0. Absent arg behaves as `undefined` -> NaN -> 0.
         let int_arg = |vm: &mut Self, i: usize| -> Result<f64, Thrown> {
@@ -173,8 +187,8 @@ impl<'p> Vm<'p> {
                     None
                 } else {
                     let d = int_arg(self, 0)?; // ToNumber side effect (valueOf) first
-                    // A NaN/Infinity receiver returns "NaN"/"Infinity" BEFORE the
-                    // RangeError on the digits argument (spec steps 4 & 7).
+                                               // A NaN/Infinity receiver returns "NaN"/"Infinity" BEFORE the
+                                               // RangeError on the digits argument (spec steps 4 & 7).
                     if !n.is_finite() {
                         return Ok(Some(self.alloc_str(fmt_exponential(n, None))));
                     }
@@ -193,8 +207,8 @@ impl<'p> Vm<'p> {
                     return Ok(Some(self.alloc_str(self.display(nv))));
                 }
                 let p = int_arg(self, 0)?; // ToNumber side effect (valueOf) first
-                // A NaN/Infinity receiver returns "NaN"/"Infinity" BEFORE the
-                // RangeError on the precision argument (spec steps 4 & 7).
+                                           // A NaN/Infinity receiver returns "NaN"/"Infinity" BEFORE the
+                                           // RangeError on the precision argument (spec steps 4 & 7).
                 if !n.is_finite() {
                     return Ok(Some(self.alloc_str(self.display(nv))));
                 }
@@ -230,9 +244,14 @@ impl<'p> Vm<'p> {
             )));
         };
         Ok(match name {
-            "toString" => {
-                self.alloc_str(if b == Value::bool(true) { "true" } else { "false" }.to_string())
-            }
+            "toString" => self.alloc_str(
+                if b == Value::bool(true) {
+                    "true"
+                } else {
+                    "false"
+                }
+                .to_string(),
+            ),
             "valueOf" => b,
             _ => Value::UNDEFINED,
         })
@@ -266,8 +285,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         if self.jit.get(fid).is_none() {
-            let proto: *const crate::bytecode::FuncProto =
-                self.func(fid as usize);
+            let proto: *const crate::bytecode::FuncProto = self.func(fid as usize);
             // SAFETY: program functions are immutable during execution; the raw
             // ptr dodges the self.jit (&mut) vs self.program (&) borrow conflict.
             let proto_ref = unsafe { &*proto };
@@ -288,7 +306,7 @@ impl<'p> Vm<'p> {
                 Instr::StoreGlobal { idx, .. }
                 | Instr::StoreGlobalStrict { idx, .. }
                 | Instr::StoreGlobalResolved { idx, .. } => {
-                    self.global_slot_directly_routable(idx)
+                    self.global_store_slot_directly_routable(idx)
                 }
                 _ => true,
             }) {
@@ -306,6 +324,9 @@ impl<'p> Vm<'p> {
             } else {
                 rustc_hash::FxHashMap::default()
             };
+            // Callback compilation happens outside a live caller bytecode
+            // frame/site, so there is no receiver exemplar to bake.
+            let method_plan = rustc_hash::FxHashMap::default();
             let cross_plan = self.build_cross_call_plan(fid);
             self.jit.compile(
                 fid,
@@ -316,12 +337,17 @@ impl<'p> Vm<'p> {
                 heap_helper_addrs,
                 &const_strs,
                 &leaf_plan,
+                &method_plan,
                 &cross_plan,
             );
         }
         let entry = self.jit.get(fid)?.entry();
         let proto = self.func(fid as usize);
-        Some((entry, (proto.reg_count as usize).max(1), proto.param_count as usize))
+        Some((
+            entry,
+            (proto.reg_count as usize).max(1),
+            proto.param_count as usize,
+        ))
     }
 
     #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
@@ -397,7 +423,6 @@ impl<'p> Vm<'p> {
         let _ = (native, win);
         self.call_value(cb, this_val, args)
     }
-
 }
 
 /// `Number.prototype.toExponential` formatting → JS form "d.ddde±X" (the exponent
@@ -426,11 +451,18 @@ fn fmt_exponential(n: f64, digits: Option<usize>) -> String {
         None => {
             let raw = format!("{a:e}");
             let epos = raw.find('e').unwrap();
-            (raw[..epos].to_string(), raw[epos + 1..].parse::<i32>().unwrap_or(0))
+            (
+                raw[..epos].to_string(),
+                raw[epos + 1..].parse::<i32>().unwrap_or(0),
+            )
         }
         Some(d) => round_exp_half_away(a, d),
     };
-    format!("{sign}{mant}e{}{}", if exp >= 0 { "+" } else { "-" }, exp.abs())
+    format!(
+        "{sign}{mant}e{}{}",
+        if exp >= 0 { "+" } else { "-" },
+        exp.abs()
+    )
 }
 
 /// Round a POSITIVE finite `a` to `d` fractional mantissa digits in exponential
@@ -445,7 +477,11 @@ fn round_exp_half_away(a: f64, d: usize) -> (String, i32) {
     let mantissa = &raw[..epos]; // "D.FFFF…"
     let mut exp: i32 = raw[epos + 1..].parse().unwrap_or(0);
     // Digit string without the '.': 1 leading (integer) digit + `guard` fractional.
-    let mut ds: Vec<u8> = mantissa.bytes().filter(|&b| b != b'.').map(|b| b - b'0').collect();
+    let mut ds: Vec<u8> = mantissa
+        .bytes()
+        .filter(|&b| b != b'.')
+        .map(|b| b - b'0')
+        .collect();
     // For a positive value, nearest-rounding (half-away) rounds the kept prefix up
     // iff the first dropped digit is >= 5 (the >= folds the exact-tie case to up).
     let keep = 1 + d;
@@ -493,7 +529,11 @@ fn fmt_precision(n: f64, p: usize) -> String {
         return if n < 0.0 { "-Infinity" } else { "Infinity" }.to_string();
     }
     if n == 0.0 {
-        return if p == 1 { "0".to_string() } else { format!("0.{}", "0".repeat(p - 1)) };
+        return if p == 1 {
+            "0".to_string()
+        } else {
+            format!("0.{}", "0".repeat(p - 1))
+        };
     }
     let neg = n < 0.0;
     let a = n.abs();

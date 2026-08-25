@@ -72,8 +72,10 @@ fn reflection_materializes_descriptors_order_and_a_sparse_overlay() {
     );
     assert_eq!(
         out,
-        ["true | 0+1+2+1048576+length+index+input+groups+indices+extra | \
-          0+1+2+1048576+index+input+groups+indices+extra | far | later | 1048577"]
+        [
+            "true | 0+1+2+1048576+length+index+input+groups+indices+extra | \
+          0+1+2+1048576+index+input+groups+indices+extra | far | later | 1048577"
+        ]
     );
 }
 

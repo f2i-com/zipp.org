@@ -140,17 +140,50 @@ pub(crate) fn emit_kernel_arith(
             store_xmm(ops, dst);
             Some(KBody::Plain)
         }
-        Instr::Add { dst, a, b } => { kmap_dbinop(ops, bail, dst, a, b, DOp::Add); Some(KBody::Plain) }
-        Instr::Sub { dst, a, b } => { kmap_dbinop(ops, bail, dst, a, b, DOp::Sub); Some(KBody::Plain) }
-        Instr::Mul { dst, a, b } => { kmap_dbinop(ops, bail, dst, a, b, DOp::Mul); Some(KBody::Plain) }
-        Instr::Div { dst, a, b } => { kmap_dbinop(ops, bail, dst, a, b, DOp::Div); Some(KBody::Plain) }
-        Instr::Mod { dst, a, b } => { kmap_dmod(ops, bail, dst, a, b); Some(KBody::Plain) }
-        Instr::Lt { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Lt); Some(KBody::Plain) }
-        Instr::Le { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Le); Some(KBody::Plain) }
-        Instr::Gt { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Gt); Some(KBody::Plain) }
-        Instr::Ge { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Ge); Some(KBody::Plain) }
-        Instr::Eq { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Eq); Some(KBody::Plain) }
-        Instr::Ne { dst, a, b } => { kmap_dcmp(ops, bail, dst, a, b, Cmp::Ne); Some(KBody::Plain) }
+        Instr::Add { dst, a, b } => {
+            kmap_dbinop(ops, bail, dst, a, b, DOp::Add);
+            Some(KBody::Plain)
+        }
+        Instr::Sub { dst, a, b } => {
+            kmap_dbinop(ops, bail, dst, a, b, DOp::Sub);
+            Some(KBody::Plain)
+        }
+        Instr::Mul { dst, a, b } => {
+            kmap_dbinop(ops, bail, dst, a, b, DOp::Mul);
+            Some(KBody::Plain)
+        }
+        Instr::Div { dst, a, b } => {
+            kmap_dbinop(ops, bail, dst, a, b, DOp::Div);
+            Some(KBody::Plain)
+        }
+        Instr::Mod { dst, a, b } => {
+            kmap_dmod(ops, bail, dst, a, b);
+            Some(KBody::Plain)
+        }
+        Instr::Lt { dst, a, b } => {
+            kmap_dcmp(ops, bail, dst, a, b, Cmp::Lt);
+            Some(KBody::Plain)
+        }
+        Instr::Le { dst, a, b } => {
+            kmap_dcmp(ops, bail, dst, a, b, Cmp::Le);
+            Some(KBody::Plain)
+        }
+        Instr::Gt { dst, a, b } => {
+            kmap_dcmp(ops, bail, dst, a, b, Cmp::Gt);
+            Some(KBody::Plain)
+        }
+        Instr::Ge { dst, a, b } => {
+            kmap_dcmp(ops, bail, dst, a, b, Cmp::Ge);
+            Some(KBody::Plain)
+        }
+        Instr::Eq { dst, a, b } => {
+            kmap_dcmp(ops, bail, dst, a, b, Cmp::Eq);
+            Some(KBody::Plain)
+        }
+        Instr::Ne { dst, a, b } => {
+            kmap_dcmp(ops, bail, dst, a, b, Cmp::Ne);
+            Some(KBody::Plain)
+        }
         Instr::Return { src } => Some(KBody::Ret(src)),
         Instr::ReturnUndefined => Some(KBody::RetUndef),
         _ => None,
@@ -258,7 +291,11 @@ pub(crate) fn compile_map_kernel(proto: &FuncProto) -> Option<JitFn> {
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
+    Some(JitFn {
+        _buf: buf,
+        entry: entry_ptr,
+        self_binding: None,
+    })
 }
 
 /// Compile a fused native `reduce` kernel for callback `proto` (2-param
@@ -346,7 +383,11 @@ pub(crate) fn compile_reduce_kernel(proto: &FuncProto) -> Option<JitFn> {
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
+    Some(JitFn {
+        _buf: buf,
+        entry: entry_ptr,
+        self_binding: None,
+    })
 }
 
 /// Compile a fused native `filter` kernel for predicate `proto`. The predicate
@@ -465,7 +506,11 @@ pub(crate) fn compile_filter_kernel(proto: &FuncProto) -> Option<JitFn> {
 
     let buf = ops.finalize().ok()?;
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
+    Some(JitFn {
+        _buf: buf,
+        entry: entry_ptr,
+        self_binding: None,
+    })
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -508,4 +553,3 @@ pub(crate) fn compile_filter_kernel(proto: &FuncProto) -> Option<JitFn> {
 // 4 pushes (rbx, rsi, rdi, r12) + `sub rsp, 40`. From the 8-mod-16 entry: after
 // 4 pushes rsp ≡ 8, after sub 40 rsp ≡ 0 (mod 16) — aligned for the prologue
 // helper call (and any future heap-op helper), with 32B of shadow space.
-

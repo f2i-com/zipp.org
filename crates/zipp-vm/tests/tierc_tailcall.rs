@@ -26,7 +26,11 @@ fn run_guarded(src: &'static str) -> Vec<String> {
         .recv_timeout(Duration::from_secs(120))
         .expect("engine hung: tail chain neither completed nor threw")
         .expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 

@@ -65,7 +65,11 @@ impl<'a> FnCompiler<'a> {
                     && !self.cx.eval_catch_params.iter().any(|n| *n == name)
                 {
                     let slot = self.cx.global_slot(&name) as u32;
-                    self.emit(Instr::LoadUpvalDyn { dst, idx: *idx, name: slot });
+                    self.emit(Instr::LoadUpvalDyn {
+                        dst,
+                        idx: *idx,
+                        name: slot,
+                    });
                 } else {
                     self.emit(Instr::UpvalGet { dst, idx: *idx });
                 }
@@ -80,7 +84,10 @@ impl<'a> FnCompiler<'a> {
                 dst
             }
             Binding::ClassName(class_id) => {
-                self.emit(Instr::LoadClassValue { dst, class_id: *class_id });
+                self.emit(Instr::LoadClassValue {
+                    dst,
+                    class_id: *class_id,
+                });
                 dst
             }
         }
@@ -116,7 +123,13 @@ impl<'a> FnCompiler<'a> {
             return false;
         }
         let e = self.alloc_reg();
-        self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
+        self.emit(Instr::NewError {
+            dst: e,
+            kind: 4,
+            arg: None,
+            opts: None,
+            errors: None,
+        });
         self.emit(Instr::Throw { src: e });
         true
     }
@@ -139,7 +152,13 @@ impl<'a> FnCompiler<'a> {
             if self.is_self_name_reg(*r) {
                 if self.cx.in_strict {
                     let e = self.alloc_reg();
-                    self.emit(Instr::NewError { dst: e, kind: 1, arg: None, opts: None, errors: None });
+                    self.emit(Instr::NewError {
+                        dst: e,
+                        kind: 1,
+                        arg: None,
+                        opts: None,
+                        errors: None,
+                    });
                     self.emit(Instr::Throw { src: e });
                     self.next_reg -= 1;
                 }
@@ -158,7 +177,13 @@ impl<'a> FnCompiler<'a> {
         };
         if is_const {
             let e = self.alloc_reg();
-            self.emit(Instr::NewError { dst: e, kind: 1, arg: None, opts: None, errors: None });
+            self.emit(Instr::NewError {
+                dst: e,
+                kind: 1,
+                arg: None,
+                opts: None,
+                errors: None,
+            });
             self.emit(Instr::Throw { src: e });
             self.next_reg -= 1;
             return;
@@ -190,7 +215,11 @@ impl<'a> FnCompiler<'a> {
                     && !self.cx.eval_catch_params.iter().any(|n| *n == name)
                 {
                     let slot = self.cx.global_slot(&name) as u32;
-                    self.emit(Instr::StoreUpvalDyn { idx: *idx, src, name: slot });
+                    self.emit(Instr::StoreUpvalDyn {
+                        idx: *idx,
+                        src,
+                        name: slot,
+                    });
                 } else {
                     self.emit(Instr::UpvalSet { idx: *idx, src });
                 }
@@ -359,7 +388,10 @@ impl<'a> FnCompiler<'a> {
                         self.emit_is_nullish(v, isnull, undef);
                         let j = self.here();
                         // non-nullish → return v
-                        self.emit(Instr::JumpIfFalse { cond: isnull, target: 0 });
+                        self.emit(Instr::JumpIfFalse {
+                            cond: isnull,
+                            target: 0,
+                        });
                         self.next_reg = tsave;
                         // nullish: the right operand is the tail position
                         self.emit_tail_return(right)?;
@@ -449,9 +481,18 @@ impl<'a> FnCompiler<'a> {
                 let exprs: Vec<&Expr> = c.args.iter().filter_map(arg_expr).collect();
                 let arg_base = self.eval_contiguous(&exprs)?;
                 let argc = exprs.len() as u16;
-                self.emit(Instr::TailCall { callee: ct, arg_base, argc });
+                self.emit(Instr::TailCall {
+                    callee: ct,
+                    arg_base,
+                    argc,
+                });
                 let dst = self.alloc_reg();
-                self.emit(Instr::Call { dst, callee: ct, arg_base, argc });
+                self.emit(Instr::Call {
+                    dst,
+                    callee: ct,
+                    arg_base,
+                    argc,
+                });
                 self.emit(Instr::Return { src: dst });
                 self.next_reg = save;
                 Ok(())
@@ -516,9 +557,7 @@ impl<'a> FnCompiler<'a> {
         read_first: bool,
     ) {
         let (p, name_slot, static_store): (Reg, u32, Instr) = match (snap, b) {
-            (Some(p), Binding::Global(idx)) => {
-                (p, *idx, Instr::StoreGlobal { idx: *idx, src })
-            }
+            (Some(p), Binding::Global(idx)) => (p, *idx, Instr::StoreGlobal { idx: *idx, src }),
             (Some(p), Binding::Upvalue(uidx)) => {
                 let name = self.upvalues.borrow()[*uidx as usize].0.clone();
                 let slot = self.cx.global_slot(&name) as u32;
@@ -536,7 +575,10 @@ impl<'a> FnCompiler<'a> {
         self.emit(Instr::Jump { target: 0 });
         let at_scope = self.here();
         self.patch_jump(j_scope, at_scope);
-        self.emit(Instr::EvalScopeSet { idx: name_slot, src });
+        self.emit(Instr::EvalScopeSet {
+            idx: name_slot,
+            src,
+        });
         let end = self.here();
         self.patch_jump(j_end, end);
     }
@@ -631,7 +673,11 @@ impl<'a> FnCompiler<'a> {
         let undef = self.alloc_reg();
         self.emit(Instr::LoadUndefined { dst: undef });
         let cond = self.alloc_reg();
-        self.emit(Instr::Eq { dst: cond, a: pr, b: undef });
+        self.emit(Instr::Eq {
+            dst: cond,
+            a: pr,
+            b: undef,
+        });
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 }); // skip when x !== undefined
         let dtmp = self.alloc_reg();
@@ -645,5 +691,4 @@ impl<'a> FnCompiler<'a> {
         self.next_reg = save;
         Ok(())
     }
-
 }

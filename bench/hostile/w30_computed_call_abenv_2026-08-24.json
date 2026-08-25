@@ -1,0 +1,663 @@
+{
+  "schema_version": 2,
+  "created_utc": "2026-08-24T13:21:55.909681+00:00",
+  "git_commit": "e1662202d14d2b2b567dcac993e539e35b0f0da5",
+  "workspace_source": "e1662202d14d2b2b567dcac993e539e35b0f0da5",
+  "engine_source_before": {
+    "old": "e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.c79d0d5d1e711445",
+    "new": "e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.c79d0d5d1e711445"
+  },
+  "engine_source_after": {
+    "old": "e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.c79d0d5d1e711445",
+    "new": "e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.c79d0d5d1e711445"
+  },
+  "engine_binary_sha_before": {
+    "old": "17861882ae7da4bf57a7e620c83ac0f5192bb8d74dbe3d6fb7b5aa3577263404",
+    "new": "17861882ae7da4bf57a7e620c83ac0f5192bb8d74dbe3d6fb7b5aa3577263404"
+  },
+  "engine_binary_sha_after": {
+    "old": "17861882ae7da4bf57a7e620c83ac0f5192bb8d74dbe3d6fb7b5aa3577263404",
+    "new": "17861882ae7da4bf57a7e620c83ac0f5192bb8d74dbe3d6fb7b5aa3577263404"
+  },
+  "publishable": false,
+  "provenance_reasons": [
+    "old: built from a DIRTY tree (e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.c79d0d5d1e711445); the commit it names is the parent it was based on, not the code that ran",
+    "new: built from a DIRTY tree (e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.c79d0d5d1e711445); the commit it names is the parent it was based on, not the code that ran"
+  ],
+  "engine_drift": [],
+  "harness": {
+    "bench_py_sha256": "1ced45cd57cdf4e906a603121bea644abfe2c3dff81ea28fb469f175cd0249d5",
+    "run_real_sh_sha256": "c74f4c9f8fb862ce62b023b31832604fd8ff896bb73756012980c709875100ea"
+  },
+  "bench_input_sha256": {
+    "bytecode-vm": "df5dbf5b33f812cc2bb569b1c20423dd04f6cff56a27b1f06569ec5b56cca806"
+  },
+  "headline_benches": [],
+  "diagnostic_benches": [],
+  "unclassified_benches": [
+    "bytecode-vm"
+  ],
+  "row_set_summaries": {
+    "all_measured": {
+      "benches": [
+        "bytecode-vm"
+      ],
+      "geomean_paired_ratio": 0.22115936648173531,
+      "ci95": [
+        0.2188651051867237,
+        0.22301279803170518
+      ]
+    }
+  },
+  "seed": 1511464998,
+  "reps": 9,
+  "metric": "cold",
+  "report_mode": "modern",
+  "headline_metric": "cold",
+  "timeout_s": 300.0,
+  "bootstrap_samples": 2000,
+  "benches": [
+    "bytecode-vm"
+  ],
+  "bench_dir": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\endurance",
+  "baseline": "old",
+  "engines": [
+    {
+      "name": "old",
+      "argv": [
+        "target/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7154176,
+      "mtime_ns": 1787577518059553000,
+      "sha256": "17861882ae7da4bf57a7e620c83ac0f5192bb8d74dbe3d6fb7b5aa3577263404",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.c79d0d5d1e711445",
+        "commit": "e1662202d14d2b2b567dcac993e539e35b0f0da5",
+        "dirty": true,
+        "diff_digest": "c79d0d5d1e711445",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {
+        "ZIPP_NO_COMPUTED_CALL_DENSE": "1"
+      }
+    },
+    {
+      "name": "new",
+      "argv": [
+        "target/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7154176,
+      "mtime_ns": 1787577518059553000,
+      "sha256": "17861882ae7da4bf57a7e620c83ac0f5192bb8d74dbe3d6fb7b5aa3577263404",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "e1662202d14d2b2b567dcac993e539e35b0f0da5+dirty.c79d0d5d1e711445",
+        "commit": "e1662202d14d2b2b567dcac993e539e35b0f0da5",
+        "dirty": true,
+        "diff_digest": "c79d0d5d1e711445",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {}
+    }
+  ],
+  "host": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "python": "3.11.6",
+    "power_mode": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "environment": {
+    "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "c5e8b73f10ecc47ad1be38f14ba6b79cd3af06fcd86637f7b6b857ae209a686e,f204d340535055781952b10ed396de20b842f00a19e430852f7e121ad1ce91f6",
+    "RUST_LOG": "warn"
+  },
+  "schedule": [
+    {
+      "rep": 0,
+      "bench_order": [
+        "bytecode-vm"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 1,
+      "bench_order": [
+        "bytecode-vm"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 2,
+      "bench_order": [
+        "bytecode-vm"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 3,
+      "bench_order": [
+        "bytecode-vm"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 4,
+      "bench_order": [
+        "bytecode-vm"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 5,
+      "bench_order": [
+        "bytecode-vm"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 6,
+      "bench_order": [
+        "bytecode-vm"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 7,
+      "bench_order": [
+        "bytecode-vm"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 8,
+      "bench_order": [
+        "bytecode-vm"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "rep": 0,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.011745600029826164,
+      "cold_s": 0.9230253000278026,
+      "adjusted_s": 0.9112796999979764,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.01124379999237135,
+      "cold_s": 0.21107219997793436,
+      "adjusted_s": 0.199828399985563,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.011111400031950325,
+      "cold_s": 0.20094959996640682,
+      "adjusted_s": 0.1898381999344565,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.011065100028645247,
+      "cold_s": 0.9189550000010058,
+      "adjusted_s": 0.9078898999723606,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.011087599967140704,
+      "cold_s": 0.9126015999936499,
+      "adjusted_s": 0.9015140000265092,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010887600015848875,
+      "cold_s": 0.2021091000060551,
+      "adjusted_s": 0.1912214999902062,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.01102909998735413,
+      "cold_s": 0.20139559998642653,
+      "adjusted_s": 0.1903664999990724,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010691899980884045,
+      "cold_s": 0.9164026000071317,
+      "adjusted_s": 0.9057107000262477,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.01113270001951605,
+      "cold_s": 0.9195390000240877,
+      "adjusted_s": 0.9084063000045717,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.011922400037292391,
+      "cold_s": 0.20125499996356666,
+      "adjusted_s": 0.18933259992627427,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.01115949999075383,
+      "cold_s": 0.20302439999068156,
+      "adjusted_s": 0.19186489999992773,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010924300004262477,
+      "cold_s": 0.9117574000265449,
+      "adjusted_s": 0.9008331000222825,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.01103329996112734,
+      "cold_s": 0.915746099955868,
+      "adjusted_s": 0.9047127999947406,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010863800009246916,
+      "cold_s": 0.20422310003777966,
+      "adjusted_s": 0.19335930002853274,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.011018300021532923,
+      "cold_s": 0.2015131000080146,
+      "adjusted_s": 0.19049479998648167,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010898499982431531,
+      "cold_s": 0.9116713000112213,
+      "adjusted_s": 0.9007728000287898,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.011104199977125973,
+      "cold_s": 0.9156777000171132,
+      "adjusted_s": 0.9045735000399873,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "bytecode-vm",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.010902200010605156,
+      "cold_s": 0.20251070003723726,
+      "adjusted_s": 0.1916085000266321,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 51,
+      "stdout_sha256": "fc29e618e8fb5778d2691ee2d365f863eefe27aab2acdbe6038e5481a2c38aa9",
+      "valid_for_stats": true
+    }
+  ],
+  "summary": {
+    "headline_metric": "cold",
+    "rows": {
+      "bytecode-vm": {
+        "median_ms": {
+          "old": 915.746099955868,
+          "new": 202.1091000060551
+        },
+        "paired_ratio": 0.22115936648173534,
+        "paired_ratio_ci95": [
+          0.21886510518672367,
+          0.22301279803170515
+        ],
+        "metrics": {
+          "cold": {
+            "median_ms": {
+              "old": 915.746099955868,
+              "new": 202.1091000060551
+            },
+            "paired_ratio": 0.22115936648173534,
+            "paired_ratio_ci95": [
+              0.21886510518672367,
+              0.22301279803170515
+            ],
+            "nonpositive_pairs": 0
+          },
+          "startup": {
+            "median_ms": {
+              "old": 11.065100028645247,
+              "new": 11.02909998735413
+            },
+            "paired_ratio": 1.0041843275872082,
+            "paired_ratio_ci95": [
+              0.9818086879796001,
+              1.0315378938329913
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "old": 904.7127999947406,
+              "new": 191.2214999902062
+            },
+            "paired_ratio": 0.2118219249382852,
+            "paired_ratio_ci95": [
+              0.2090982617388252,
+              0.21372451017566768
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      }
+    },
+    "geomean_paired_ratio": 0.22115936648173531,
+    "geomean_paired_ratio_ci95": [
+      0.2188651051867237,
+      0.22301279803170518
+    ],
+    "metric_geomean_paired_ratio": {
+      "cold": 0.22115936648173531,
+      "startup": 1.0041843275872082,
+      "adjusted": 0.2118219249382852
+    },
+    "startup_median_ms": {
+      "old": 11.065100028645247,
+      "new": 11.02909998735413
+    }
+  },
+  "all_correct": true,
+  "health_failures": [],
+  "correctness_failures": [],
+  "failures": []
+}

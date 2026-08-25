@@ -19,7 +19,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -422,7 +426,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node v24 on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -523,7 +531,11 @@ fn gate_mechanism_child() {
         console.log(total + ":" + o.hidden);
         "#;
     let ours = run_ok(src);
-    assert_eq!(ours, node_output(src), "zipp != node for the mechanism program");
+    assert_eq!(
+        ours,
+        node_output(src),
+        "zipp != node for the mechanism program"
+    );
     // 30 post-accessor calls x 5000 iterations x (1 getter read + 1 setter
     // write) ≈ 300k accessor dispatches; all but the pre-recompile sliver must
     // be served by the ACCESSOR WAY (a native probe hit), not the permanent
@@ -581,9 +593,9 @@ fn zz_gate_evicts_once_then_serves_natively() {
         "the data-only phase should compile with NO accessor arms:\n{stderr}"
     );
     let last_evict = stderr.rfind("accessor site gate").unwrap();
-    let last_full = stderr.rfind("acc_arms=2/3").unwrap_or_else(|| {
-        panic!("no recompile carrying both marked ops' arms:\n{stderr}")
-    });
+    let last_full = stderr
+        .rfind("acc_arms=2/3")
+        .unwrap_or_else(|| panic!("no recompile carrying both marked ops' arms:\n{stderr}"));
     assert!(
         last_full > last_evict,
         "an eviction happened AFTER the fully-armed recompile (oscillation):\n{stderr}"

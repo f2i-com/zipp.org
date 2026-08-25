@@ -500,8 +500,7 @@ fn dv_inner_additive_proof(
             Some(DvDep::Num(DvDepNum { coeff: 1, bound: Some(b), .. })) if *b <= DV_I32_ABS_BOUND
         );
     let scratch_globs_ok = globs.iter().all(|(&g, dep)| {
-        g == accumulator_global
-            || !matches!(dep, DvDep::Num(DvDepNum { coeff, .. }) if *coeff != 0)
+        g == accumulator_global || !matches!(dep, DvDep::Num(DvDepNum { coeff, .. }) if *coeff != 0)
     });
     let tainted_regs_dead = regs.iter().all(|(&r, dep)| {
         !matches!(dep, DvDep::Num(DvDepNum { coeff, .. }) if *coeff != 0)
@@ -1465,7 +1464,7 @@ fn gpr_home_map(
             .zip(pool)
             .map(|(x, h)| (x, Loc::R(h)))
             .collect()
-    } else if allow_spill && gpr_spill_slots_enabled() {
+    } else if allow_spill {
         // ── W10.3 spill slots ── the overflow is no longer final: rank homes
         // by weighted use count, keep the hottest resident, park the coldest
         // in frame slots (canonical i64, [rsp + spill_base + 8k]). Engaged
@@ -2387,12 +2386,28 @@ pub(crate) fn compile_region_int_gpr(
     // W10.3 frame spill slots sit AFTER the resume-ip slot (see the frame
     // layout at the prologue below): slot k at [rsp + spill_base + 8k].
     let spill_base = 40 + 32 * ta_plan.pins.len() as i32;
-    let (map, hoist_c, inline_guards, n_spill) =
-        match gpr_home_map(proto, plan, s, e, meter.is_some(), allow_spill, spill_base) {
-            Ok(m) => m,
-            Err(true) => return GprAttempt::PoolOverflow,
-            Err(false) => return GprAttempt::OutOfScope,
-        };
+    // Generic spill slots remain opt-in after their measured W10 regression.
+    // A dense-computed splice is a separate, bounded consumer: its virtual
+    // plan cannot reach an XMM emitter, so spilling is the fail-closed bridge
+    // from symbolic home colours to the existing GPR allocator.  The global
+    // spill kill switch still disables both uses, and the computed lane's own
+    // switch prevents this branch from existing at all.
+    let computed_spill =
+        !entry.computed_guards.is_empty() && std::env::var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
+    let spill_enabled = allow_spill && (gpr_spill_slots_enabled() || computed_spill);
+    let (map, hoist_c, inline_guards, n_spill) = match gpr_home_map(
+        proto,
+        plan,
+        s,
+        e,
+        meter.is_some(),
+        spill_enabled,
+        spill_base,
+    ) {
+        Ok(m) => m,
+        Err(true) => return GprAttempt::PoolOverflow,
+        Err(false) => return GprAttempt::OutOfScope,
+    };
     // W8: homes that defer sign-extension, and the entry loads that must be
     // i32-strict to license it (empty sets under ZIPP_NO_GPR_LAZYSX=1; split,
     // write-through and W10.3 spilled homes are never members — see
@@ -2609,11 +2624,17 @@ pub(crate) fn compile_region_int_gpr(
         emit_int_entry_load_gpr(&mut ops, gx(x), entry_bail, strict);
     }
     for &(r, x) in &plan.live_in_regs {
+        if entry.is_scratch(r) {
+            continue;
+        }
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_int_entry_load_gpr(&mut ops, gx(x), entry_bail, is_strict(gx(x)));
     }
     emit_bool_home_zero(&mut ops, plan);
     for &(r, gb) in &plan.live_in_bools {
+        if entry.is_scratch(r) {
+            continue;
+        }
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_bool_entry_load(&mut ops, gb, entry_bail);
     }
@@ -2625,6 +2646,9 @@ pub(crate) fn compile_region_int_gpr(
     // def is inside the region) takes entry_bail, and the next OSR attempt —
     // after the interpreter has run one iteration — finds a real Bool.
     for r in plan.write_through.iter() {
+        if entry.is_scratch(*r) {
+            continue;
+        }
         if let Some(&Home::Gpr(gb)) = plan.reg_home.get(r) {
             if !plan.live_in_bools.iter().any(|&(br, _)| br == *r) {
                 dynasm!(ops ; mov rax, [rbx + dreg(*r)]);
@@ -3090,8 +3114,9 @@ pub(crate) fn compile_region_int_gpr(
                                 dynasm!(ops ; mov Rq(d), Rq(ag));
                             }
                             dynasm!(ops ; add Rq(d), imm); // sign-extended imm32 == i64 add
-                            wt_pre =
-                                emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, dst, false);
+                            wt_pre = emit_int_wt_gpr(
+                                &mut ops, plan, &map, &shadow, &lazy, ip, dst, false,
+                            );
                             if !plan.elide_guard.contains(&ip) {
                                 emit_i53_guard_gpr(
                                     &mut ops,
@@ -3125,8 +3150,9 @@ pub(crate) fn compile_region_int_gpr(
                             if let Loc::R(d) = dl {
                                 dynasm!(ops ; mov Rq(d), rax);
                             }
-                            wt_pre =
-                                emit_int_wt_gpr(&mut ops, plan, &map, &shadow, &lazy, ip, dst, false);
+                            wt_pre = emit_int_wt_gpr(
+                                &mut ops, plan, &map, &shadow, &lazy, ip, dst, false,
+                            );
                             if !plan.elide_guard.contains(&ip) {
                                 emit_i53_guard_gpr(
                                     &mut ops,
@@ -3337,9 +3363,24 @@ pub(crate) fn compile_region_int_gpr(
                         ; movsxd Rq(d), eax              // Int payload, sign-extended
                     );
                 } else {
-                    dynasm!(ops
-                        ; movsxd Rq(d), DWORD [rdx + rcx * 4] // sign-extend i32 element
-                    );
+                    match int_ta_load_kind(ta_plan.pins[j].kind) {
+                        Some(IntTaLoadKind::I8) => {
+                            dynasm!(ops ; movsx Rq(d), BYTE [rdx + rcx])
+                        }
+                        Some(IntTaLoadKind::U8) => {
+                            dynasm!(ops ; movzx Rd(d), BYTE [rdx + rcx])
+                        }
+                        Some(IntTaLoadKind::I16) => {
+                            dynasm!(ops ; movsx Rq(d), WORD [rdx + rcx * 2])
+                        }
+                        Some(IntTaLoadKind::U16) => {
+                            dynasm!(ops ; movzx Rd(d), WORD [rdx + rcx * 2])
+                        }
+                        Some(IntTaLoadKind::I32) => {
+                            dynasm!(ops ; movsxd Rq(d), DWORD [rdx + rcx * 4])
+                        }
+                        None => return GprAttempt::OutOfScope,
+                    }
                 }
                 store_dst(&mut ops, dl); // W10.3 spilled dst: park the canonical qword
                 dynasm!(ops
@@ -3699,10 +3740,8 @@ pub(crate) fn compile_region_int_gpr(
             // ── pinned length ── str.length / arr.length from the snapshot.
             Instr::GetProp { dst, .. }
                 if ta_plan.access.get(&ip).map_or(false, |&j| {
-                    matches!(
-                        ta_plan.pins[j as usize].kind,
-                        STR_PIN_KIND | ARR_INT_PIN_KIND
-                    )
+                    matches!(ta_plan.pins[j as usize].kind, STR_PIN_KIND)
+                        || int_length_pin_kind(ta_plan.pins[j as usize].kind)
                 }) =>
             {
                 let j = ta_plan.access[&ip] as usize;
@@ -3849,7 +3888,9 @@ pub(crate) fn compile_region_int_gpr(
                 // must still hold the earlier range's value — is correct
                 // without knowing which range is live at it.
                 if plan.is_split_bool_ip(d, ip) {
-                    let g = plan.split_bool_gpr(d).expect("split bool ip implies a bool gpr");
+                    let g = plan
+                        .split_bool_gpr(d)
+                        .expect("split bool ip implies a bool gpr");
                     dynasm!(ops
                         ; mov rax, QWORD BOOL_TAG as i64
                         ; or rax, Rq(g)
@@ -3906,6 +3947,9 @@ pub(crate) fn compile_region_int_gpr(
         emit_gpr_deopt_shadow_flush(&mut ops, slot, GprDeoptShadowDst::Glob(gi));
     }
     for &(r, x) in &plan.num_regs {
+        if entry.is_scratch(r) {
+            continue;
+        }
         // A B94 split receiver is written through (boxed) at each numeric def,
         // so memory is already current; flushing its home here would overwrite
         // the receiver object at any exit taken inside the receiver range.
@@ -3922,6 +3966,9 @@ pub(crate) fn compile_region_int_gpr(
         dynasm!(ops ; mov [rbx + dreg(r)], rax);
     }
     for &(r, gb) in &plan.bool_regs {
+        if entry.is_scratch(r) {
+            continue;
+        }
         dynasm!(ops ; mov rax, QWORD BOOL_TAG as i64 ; or rax, Rq(gb) ; mov [rbx + dreg(r)], rax);
     }
     for &(gi, x) in &plan.globs {

@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -30,7 +30,6 @@ pub(crate) struct PdtBag {
     era_year: Option<i64>,
     year: Option<i64>,
 }
-
 
 /// `IsValidDuration` (spec): all fields finite, |years|/|months|/|weeks| < 2^32,
 /// and the combined days+time span is under 2^53 seconds. Operates on the raw
@@ -64,8 +63,12 @@ fn annotations_valid(ann: &str) -> bool {
             // AnnotationKey grammar: (a-z | _) then (a-z | _ | 0-9 | -)*. An
             // upper-cased or otherwise malformed key (e.g. "U-CA", "FOO") is a
             // syntax error — NOT an ignorable unknown annotation.
-            let key_char = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_';
-            let valid_key = key.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+            let key_char =
+                |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_';
+            let valid_key = key
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
                 && key.bytes().all(key_char);
             if !valid_key {
                 return false;
@@ -84,7 +87,8 @@ fn annotations_valid(ann: &str) -> bool {
                 let sub_minute = off.contains('.')
                     || off.contains(',')
                     || off.matches(':').count() >= 2
-                    || (!off.contains(':') && off.bytes().filter(|c| c.is_ascii_digit()).count() > 4);
+                    || (!off.contains(':')
+                        && off.bytes().filter(|c| c.is_ascii_digit()).count() > 4);
                 if sub_minute {
                     return false;
                 }
@@ -130,7 +134,10 @@ fn temporal_string_ok(s: &str, reject_utc_designator: bool, require_known_calend
     let chars: Vec<char> = main.chars().collect();
     for (i, &c) in chars.iter().enumerate() {
         if c == '.' || c == ',' {
-            let n = chars[i + 1..].iter().take_while(|c| c.is_ascii_digit()).count();
+            let n = chars[i + 1..]
+                .iter()
+                .take_while(|c| c.is_ascii_digit())
+                .count();
             if n > 9 {
                 return false;
             }
@@ -264,7 +271,8 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
         if !prefix.is_empty() {
             let pure_offset = prefix.strip_prefix(['+', '-']).is_some_and(|r| {
                 !r.is_empty()
-                    && r.chars().all(|c| c.is_ascii_digit() || matches!(c, ':' | '.' | ','))
+                    && r.chars()
+                        .all(|c| c.is_ascii_digit() || matches!(c, ':' | '.' | ','))
             });
             if pure_offset {
                 if parse_offset_ns(prefix).is_none() {
@@ -300,8 +308,16 @@ fn parse_time_zone(s: &str) -> Option<(String, i64)> {
                 return None;
             }
             let hh: i64 = body[0..2].parse().ok()?;
-            let mm: i64 = if body.len() >= 4 { body[2..4].parse().ok()? } else { 0 };
-            let ss: i64 = if body.len() >= 6 { body[4..6].parse().ok()? } else { 0 };
+            let mm: i64 = if body.len() >= 4 {
+                body[2..4].parse().ok()?
+            } else {
+                0
+            };
+            let ss: i64 = if body.len() >= 6 {
+                body[4..6].parse().ok()?
+            } else {
+                0
+            };
             (hh, mm, ss)
         };
         if hh > 23 || mm > 59 || ss > 59 {
@@ -383,8 +399,10 @@ pub(crate) fn tz_start_of_day(id: &str, local_midnight_ns: i128) -> Result<i128,
         Some(z) => z.zone,
         None => return Ok(local_midnight_ns),
     };
-    let (sec, rem) =
-        (local_midnight_ns.div_euclid(1_000_000_000), local_midnight_ns.rem_euclid(1_000_000_000));
+    let (sec, rem) = (
+        local_midnight_ns.div_euclid(1_000_000_000),
+        local_midnight_ns.rem_euclid(1_000_000_000),
+    );
     if let Some(&first) = tzdb::possible_instants(zone, sec as i64).first() {
         return Ok(first as i128 * 1_000_000_000 + rem);
     }
@@ -452,8 +470,10 @@ pub(crate) fn interpret_iso_offset(
     // between throwing and falling back to the zone's own answer.
     if !id.starts_with(['+', '-']) {
         if let Some(z) = tzdb::lookup(id) {
-            let (sec, rem) =
-                (local_ns.div_euclid(1_000_000_000), local_ns.rem_euclid(1_000_000_000));
+            let (sec, rem) = (
+                local_ns.div_euclid(1_000_000_000),
+                local_ns.rem_euclid(1_000_000_000),
+            );
             for c in tzdb::possible_instants(z.zone, sec as i64) {
                 let cand = c as i128 * 1_000_000_000 + rem;
                 let off = tzdb::offset_seconds(z.zone, c) as i64 * 1_000_000_000;
@@ -476,7 +496,9 @@ pub(crate) fn interpret_iso_offset(
         return Ok(local_ns - offset_ns as i128);
     }
     if offset_option == "reject" {
-        return Err(Thrown("RangeError: the offset does not match the time zone".into()));
+        return Err(Thrown(
+            "RangeError: the offset does not match the time zone".into(),
+        ));
     }
     tz_local_to_instant(id, local_ns, disambiguation)
 }
@@ -499,7 +521,10 @@ pub(crate) fn tz_local_to_instant(
     };
     // Offsets are whole seconds, so the sub-second part of the wall clock rides
     // along untouched and only the second-granular part needs the database.
-    let (sec, rem) = (local_ns.div_euclid(1_000_000_000), local_ns.rem_euclid(1_000_000_000));
+    let (sec, rem) = (
+        local_ns.div_euclid(1_000_000_000),
+        local_ns.rem_euclid(1_000_000_000),
+    );
     let cands = tzdb::possible_instants(zone, sec as i64);
     let pick = |v: &[i64], last: bool| -> i128 {
         (if last { v[v.len() - 1] } else { v[0] }) as i128 * 1_000_000_000 + rem
@@ -601,7 +626,18 @@ pub(crate) fn add_zoned(cal: Cal, tz: &str, ns: i128, f: &[f64; 10]) -> Result<i
         let moved = dt_add_dur(
             cal,
             zoned_wall(tz, ns),
-            [f[0] as i64, f[1] as i64, f[2] as i64, f[3] as i64, 0, 0, 0, 0, 0, 0],
+            [
+                f[0] as i64,
+                f[1] as i64,
+                f[2] as i64,
+                f[3] as i64,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
         );
         if !iso_datetime_ns_in_range(moved) {
             return Err(oor());
@@ -665,7 +701,11 @@ fn difference_zoned(
     // 2000-04-02T03:00 in Vancouver is −29 days −23 hours, not −1 month (the
     // uncorrected −30 days lands on 02:00, an hour that does not exist, and
     // disambiguating it forward hides the overshoot).
-    let mut first = if (et - st).signum() as i64 == -sign { 1 } else { 0 };
+    let mut first = if (et - st).signum() as i64 == -sign {
+        1
+    } else {
+        0
+    };
     // …unless correcting would push the DATE part backwards, which happens when
     // the start's own wall clock is the SECOND occurrence of a repeated hour: the
     // clocks run backwards there while the instants run forwards, and the
@@ -684,7 +724,9 @@ fn difference_zoned(
         // beyond ns2 and the sign test below would reject it anyway. Letting it
         // throw turned `instance.until(limit, {largestUnit:"years"})` — an
         // ordinary difference — into a RangeError.
-        let Ok(ins) = zoned_step(cal, tz, ns1, [0, 0, 0, idays - s_days]) else { continue };
+        let Ok(ins) = zoned_step(cal, tz, ns1, [0, 0, 0, idays - s_days]) else {
+            continue;
+        };
         let t = ns2 - ins;
         fallback = Some((inter, t));
         if t.signum() as i64 != -sign {
@@ -693,8 +735,15 @@ fn difference_zoned(
         }
     }
     let (inter, time_ns) = chosen.or(fallback).unwrap_or(((e[0], e[1], e[2]), 0));
-    let date_largest = if matches!(largest, "year" | "month" | "week") { largest } else { "day" };
-    Ok((cal_difference_date(cal, (s[0], s[1], s[2]), inter, date_largest), time_ns))
+    let date_largest = if matches!(largest, "year" | "month" | "week") {
+        largest
+    } else {
+        "day"
+    };
+    Ok((
+        cal_difference_date(cal, (s[0], s[1], s[2]), inter, date_largest),
+        time_ns,
+    ))
 }
 
 /// The outcome of a nudge: the rounded date part, the rounded time remainder,
@@ -711,13 +760,7 @@ struct Nudge {
 /// magnitudes, `num` ≤ `den`) rather than as an f64. The half of a 25-hour day
 /// is 45000000000000 out of 90000000000000 nanoseconds; an f64 quotient cannot
 /// be trusted to land on the right side of a tie at that magnitude.
-pub(crate) fn round_fraction_exact(
-    lower: i64,
-    sign: i64,
-    num: i128,
-    den: i128,
-    mode: &str,
-) -> i64 {
+pub(crate) fn round_fraction_exact(lower: i64, sign: i64, num: i128, den: i128, mode: &str) -> i64 {
     if num == 0 {
         return lower;
     }
@@ -744,7 +787,11 @@ pub(crate) fn round_fraction_exact(
             }
         }
     };
-    if pick_upper { upper } else { lower }
+    if pick_upper {
+        upper
+    } else {
+        lower
+    }
 }
 
 /// NudgeToCalendarUnit: bracket the duration between the two whole multiples of
@@ -787,7 +834,11 @@ fn nudge_calendar(
         }
         _ => {
             let k = (date[3] / inc) * inc;
-            (k, [date[0], date[1], date[2], k], [date[0], date[1], date[2], k + step])
+            (
+                k,
+                [date[0], date[1], date[2], k],
+                [date[0], date[1], date[2], k + step],
+            )
         }
     };
     let s_ns = zoned_step(cal, tz, origin, sd)?;
@@ -801,10 +852,18 @@ fn nudge_calendar(
     } else {
         rational_to_f64(r1 as i128 * den + num * inc as i128 * sign as i128, den)
     };
-    let expanded = den != 0
-        && round_fraction_exact(r1 / inc, sign, num.abs(), den.abs(), mode) != r1 / inc;
+    let expanded =
+        den != 0 && round_fraction_exact(r1 / inc, sign, num.abs(), den.abs(), mode) != r1 / inc;
     let (date, nudged_ns) = if expanded { (ed, e_ns) } else { (sd, s_ns) };
-    Ok((Nudge { date, time_ns: 0, nudged_ns, expanded }, total))
+    Ok((
+        Nudge {
+            date,
+            time_ns: 0,
+            nudged_ns,
+            expanded,
+        },
+        total,
+    ))
 }
 
 /// NudgeToZonedTime: round only the TIME part, against the length of the real
@@ -897,16 +956,36 @@ fn round_relative_zoned(
     smallest: &str,
     mode: &str,
 ) -> Result<([i64; 4], i128), Thrown> {
-    let dsign = date.iter().map(|x| x.signum()).find(|&s| s != 0).unwrap_or(0);
-    let sign = if (if dsign != 0 { dsign } else { time_ns.signum() as i64 }) < 0 { -1 } else { 1 };
+    let dsign = date
+        .iter()
+        .map(|x| x.signum())
+        .find(|&s| s != 0)
+        .unwrap_or(0);
+    let sign = if (if dsign != 0 {
+        dsign
+    } else {
+        time_ns.signum() as i64
+    }) < 0
+    {
+        -1
+    } else {
+        1
+    };
     let n = if matches!(smallest, "year" | "month" | "week" | "day") {
-        nudge_calendar(cal, tz, origin, date, dest_ns, sign, inc as i64, smallest, mode)?.0
+        nudge_calendar(
+            cal, tz, origin, date, dest_ns, sign, inc as i64, smallest, mode,
+        )?
+        .0
     } else {
         nudge_zoned_time(cal, tz, origin, date, time_ns, sign, inc, smallest, mode)?
     };
     let mut out = n.date;
     if n.expanded && smallest != "week" {
-        let from = if matches!(smallest, "year" | "month") { smallest } else { "day" };
+        let from = if matches!(smallest, "year" | "month") {
+            smallest
+        } else {
+            "day"
+        };
         out = bubble_relative(cal, tz, origin, out, n.nudged_ns, sign, largest, from)?;
     }
     Ok((out, n.time_ns))
@@ -915,7 +994,11 @@ fn round_relative_zoned(
 /// TemporalDurationFromInternal for a zoned result: with a DATE largestUnit the
 /// time remainder balances into UNCAPPED hours (a 25-hour day differencing to
 /// "day" is P1DT1H) and the days come from the date part, not from the clock.
-fn zoned_duration_record(date: [i64; 4], time_ns: i128, largest: &str) -> Result<[f64; 10], Thrown> {
+fn zoned_duration_record(
+    date: [i64; 4],
+    time_ns: i128,
+    largest: &str,
+) -> Result<[f64; 10], Thrown> {
     if !matches!(largest, "year" | "month" | "week" | "day") {
         return balance_duration_ns(time_ns, largest);
     }
@@ -940,13 +1023,18 @@ pub(crate) fn diff_zoned_rounded(
     // A time largestUnit never consults the calendar or the zone: the answer is
     // the exact elapsed nanoseconds, rounded (DifferenceInstant).
     if !matches!(largest, "year" | "month" | "week" | "day") {
-        return balance_duration_ns(round_increment(ns2 - ns1, unit_ns(smallest) * inc, mode), largest);
+        return balance_duration_ns(
+            round_increment(ns2 - ns1, unit_ns(smallest) * inc, mode),
+            largest,
+        );
     }
     let (date, time_ns) = difference_zoned(cal, tz, ns1, ns2, largest)?;
     let (date, time_ns) = if inc == 1 && smallest == "nanosecond" {
         (date, time_ns)
     } else {
-        round_relative_zoned(cal, tz, ns1, date, time_ns, ns2, largest, inc, smallest, mode)?
+        round_relative_zoned(
+            cal, tz, ns1, date, time_ns, ns2, largest, inc, smallest, mode,
+        )?
     };
     zoned_duration_record(date, time_ns, largest)
 }
@@ -966,8 +1054,21 @@ pub(crate) fn diff_zoned_total(
         return Ok(rational_to_f64(ns2 - ns1, unit_ns(unit)));
     }
     let (date, time_ns) = difference_zoned(cal, tz, ns1, ns2, unit)?;
-    let dsign = date.iter().map(|x| x.signum()).find(|&s| s != 0).unwrap_or(0);
-    let sign = if (if dsign != 0 { dsign } else { time_ns.signum() as i64 }) < 0 { -1 } else { 1 };
+    let dsign = date
+        .iter()
+        .map(|x| x.signum())
+        .find(|&s| s != 0)
+        .unwrap_or(0);
+    let sign = if (if dsign != 0 {
+        dsign
+    } else {
+        time_ns.signum() as i64
+    }) < 0
+    {
+        -1
+    } else {
+        1
+    };
     Ok(nudge_calendar(cal, tz, ns1, date, ns2, sign, 1, unit, "trunc")?.1)
 }
 
@@ -1024,7 +1125,9 @@ fn check_relative_target(
         start_ok && end_ns.abs() <= NS_MAX_INSTANT + DAY_NS
     };
     if !ok {
-        return Err(Thrown("RangeError: Temporal result is outside the representable range".into()));
+        return Err(Thrown(
+            "RangeError: Temporal result is outside the representable range".into(),
+        ));
     }
     Ok(())
 }
@@ -1047,8 +1150,11 @@ fn dur_day_time_ns(f: &[f64; 10]) -> i128 {
 /// exact) goes through date math, the day+time portion adds in i128 — a huge
 /// sub-second field must not saturate through an i64 conversion.
 fn dur_end_epoch_ns(cal: Cal, start: [i64; 9], f: &[f64; 10]) -> i128 {
-    let cal_end =
-        dt_add_dur(cal, start, [f[0] as i64, f[1] as i64, f[2] as i64, 0, 0, 0, 0, 0, 0, 0]);
+    let cal_end = dt_add_dur(
+        cal,
+        start,
+        [f[0] as i64, f[1] as i64, f[2] as i64, 0, 0, 0, 0, 0, 0, 0],
+    );
     dt_epoch_ns(cal_end) + dur_day_time_ns(f)
 }
 
@@ -1081,8 +1187,8 @@ fn round_datetime_diff_daytime(
     inc: i128,
     mode: &str,
 ) -> [i64; 10] {
-    let time_ns = (df[3] as i128) * DAY_NS
-        + time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
+    let time_ns =
+        (df[3] as i128) * DAY_NS + time_to_ns(&[df[4], df[5], df[6], df[7], df[8], df[9]]);
     let rounded = round_increment(time_ns, unit_ns(smallest) * inc, mode);
     if rounded == time_ns {
         return df;
@@ -1110,7 +1216,10 @@ fn round_relative_datetime_diff(
     inc: i128,
     mode: &str,
 ) -> Result<[i64; 10], Thrown> {
-    let si = ["year", "month", "week"].iter().position(|&x| x == smallest).unwrap_or(2);
+    let si = ["year", "month", "week"]
+        .iter()
+        .position(|&x| x == smallest)
+        .unwrap_or(2);
     let ns1 = dt_epoch_ns(dt1);
     let ns2 = dt_epoch_ns(dt2);
     let sign = (ns2 > ns1) as i64 - (ns2 < ns1) as i64;
@@ -1123,7 +1232,11 @@ fn round_relative_datetime_diff(
     let base = difference_datetime_cal(cal, dt1, dt2, largest);
     // smallestUnit = week: difference dumps the sub-month remainder into days, so
     // derive the whole-week count from the full sub-week day span.
-    let sval = if si == 2 { (base[2] * 7 + base[3]) / 7 } else { base[si] };
+    let sval = if si == 2 {
+        (base[2] * 7 + base[3]) / 7
+    } else {
+        base[si]
+    };
     let mk = |k: i64| -> [i64; 10] {
         let mut d = [0i64; 10];
         d[..si].copy_from_slice(&base[..si]);
@@ -1160,7 +1273,11 @@ fn round_relative_datetime_diff(
         r1
     } else {
         let ud = dt_epoch_ns(upper);
-        let progress = if ud != ld { (ns2 - ld) as f64 / (ud - ld) as f64 } else { 0.0 };
+        let progress = if ud != ld {
+            (ns2 - ld) as f64 / (ud - ld) as f64
+        } else {
+            0.0
+        };
         round_fraction(r1 / inc as i64, sign, progress, mode) * inc as i64
     };
     // Weeks never fold into a larger calendar unit: keep years/months + rounded weeks.
@@ -1305,14 +1422,24 @@ fn parse_zdt_string(s: &str) -> Option<([i64; 9], i64, String, i64, i8)> {
                     || off_str.contains(',')
                     || (!off_str.contains(':')
                         && off_str.bytes().filter(u8::is_ascii_digit).count() > 4);
-                (&t[..opos], parse_offset_ns(off_str)? as i64, if sub_minute { 3i8 } else { 2i8 })
+                (
+                    &t[..opos],
+                    parse_offset_ns(off_str)? as i64,
+                    if sub_minute { 3i8 } else { 2i8 },
+                )
             } else {
                 (t, tz_offset, 0i8)
             }
         }
     };
-    let time = if time_str.is_empty() { [0i64; 6] } else { parse_iso_time(time_str)? };
-    let f = [date.0, date.1, date.2, time[0], time[1], time[2], time[3], time[4], time[5]];
+    let time = if time_str.is_empty() {
+        [0i64; 6]
+    } else {
+        parse_iso_time(time_str)?
+    };
+    let f = [
+        date.0, date.1, date.2, time[0], time[1], time[2], time[3], time[4], time[5],
+    ];
     // Return the zone's offset alongside the (possibly explicit) string offset so the
     // caller can reconcile a mismatch per the `offset` option / offset behaviour.
     Some((f, offset_ns, tz_id, tz_offset, behaviour))
@@ -1390,7 +1517,11 @@ fn format_offset(ns: i64) -> String {
 fn format_offset_rounded(ns: i64) -> String {
     const MIN: i64 = 60_000_000_000;
     let (q, r) = (ns / MIN, ns % MIN);
-    let minutes = if r.abs() * 2 >= MIN { q + if ns < 0 { -1 } else { 1 } } else { q };
+    let minutes = if r.abs() * 2 >= MIN {
+        q + if ns < 0 { -1 } else { 1 }
+    } else {
+        q
+    };
     let sign = if minutes < 0 { '-' } else { '+' };
     let a = minutes.abs();
     format!("{sign}{:02}:{:02}", a / 60, a % 60)
@@ -1406,12 +1537,12 @@ mod chinese;
 // The IANA time zone database: a generated table and the reader over it.
 #[rustfmt::skip]
 mod tzdata;
-pub(crate) mod tzdb;
 mod duration;
-mod plain_date;
-mod plain_time;
-mod plain_date_time;
 mod instant_zdt;
+mod plain_date;
+mod plain_date_time;
+mod plain_time;
+pub(crate) mod tzdb;
 mod year_month_day;
 
 pub(crate) fn tzdb_version() -> &'static str {

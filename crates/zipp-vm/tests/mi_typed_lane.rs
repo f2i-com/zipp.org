@@ -41,7 +41,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -51,7 +55,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -189,9 +197,16 @@ fn mi_wide_imm_matrix(cases: &[(&str, &str)], iters: u32) -> String {
             names.push(f);
         }
     }
-    let calls = names.iter().map(|f| format!("o.{f}()")).collect::<Vec<_>>().join(" + ");
-    let probes =
-        names.iter().map(|f| format!("probes.push(o.{f}());")).collect::<Vec<_>>().join(" ");
+    let calls = names
+        .iter()
+        .map(|f| format!("o.{f}()"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let probes = names
+        .iter()
+        .map(|f| format!("probes.push(o.{f}());"))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
         r#""use strict";
         class K {{
@@ -219,7 +234,10 @@ fn lane_parity_imm_wide_fold_matrix() {
             // 2^31: one past — the first wide positive.
             ("w2p31", "var k = 2147483647, m = 1; var c = k + m;"),
             // -2^31-1: one past the most negative imm32, the other sign.
-            ("wm2p31", "var z = 0; var k = z - 2147483647, m = z - 2; var c = k + m;"),
+            (
+                "wm2p31",
+                "var z = 0; var k = z - 2147483647, m = z - 2; var c = k + m;",
+            ),
         ],
         60000,
     ));
@@ -495,7 +513,10 @@ fn lane_parity_setter_roundtrip() {
 fn jitlog_stderr(filter: &str, env: &[(&str, &str)]) -> String {
     let exe = std::env::current_exe().expect("test exe path");
     let mut cmd = std::process::Command::new(&exe);
-    cmd.arg(filter).arg("--exact").arg("--nocapture").env("ZIPP_JITLOG", "1");
+    cmd.arg(filter)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("ZIPP_JITLOG", "1");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -596,7 +617,10 @@ fn lane_off_switch_never_plans() {
         "lane_parity_polymorphic_area_cycle",
         &[("ZIPP_NO_MI_LANE", "1"), ("ZIPP_JIT_THRESHOLD", "1")],
     );
-    assert!(!stderr.contains("LANE ("), "off-switch still planned mi lanes:\n{stderr}");
+    assert!(
+        !stderr.contains("LANE ("),
+        "off-switch still planned mi lanes:\n{stderr}"
+    );
     assert!(
         stderr.contains("INLINE method"),
         "the off-switch also disabled the method inline itself:\n{stderr}"

@@ -19,7 +19,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -89,7 +93,10 @@ fn mabatch_parity_exec_swapped_to_a_logger_and_restored_mid_iteration() {
         console.log("t2=" + log.join(","));
         "#
     ));
-    assert_eq!(out[0], "t2=a1,b2,li5,rc3,c3,li8,rd4,d4,e5/e5,f6/f6,g7/g7,h8/h8");
+    assert_eq!(
+        out[0],
+        "t2=a1,b2,li5,rc3,c3,li8,rd4,d4,e5/e5,f6/f6,g7/g7,h8/h8"
+    );
 }
 
 #[test]
@@ -146,7 +153,10 @@ fn mabatch_parity_break_early_then_a_second_matchall() {
         console.log("t5=" + out.join(",") + " li=" + re.lastIndex);
         "#
     ));
-    assert_eq!(out[0], "t5=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19 li=0");
+    assert_eq!(
+        out[0],
+        "t5=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19 li=0"
+    );
 }
 
 #[test]
@@ -191,7 +201,10 @@ fn mabatch_parity_legacy_statics_read_every_iteration() {
         console.log("t7=" + seen.join(" "));
         "#
     ));
-    assert_eq!(out[0], "t7=s1|s1|/ t22 s333 t22|t22|s1 / s333 s333|s333|s1 t22 /");
+    assert_eq!(
+        out[0],
+        "t7=s1|s1|/ t22 s333 t22|t22|s1 / s333 s333|s333|s1 t22 /"
+    );
 }
 
 #[test]

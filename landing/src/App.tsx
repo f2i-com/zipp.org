@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
 const DOCS_URL = `${GITHUB_URL}/blob/main/DOC.md#embedding`
 const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/four_engine_cc0d557_pgo_2026-08-24.json`
+const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/README.md`
 
 const installCommands = `git clone https://github.com/f2i-com/zipp.org.git zipp
 cd zipp
@@ -205,7 +206,7 @@ function App() {
         <section className="hero section-wrap" id="top">
           <div className="hero-copy">
             <a className="result-pill" href="#benchmarks">
-              <span>New benchmark</span>
+              <span>Retained benchmark</span>
               <strong>Lowest median in 13 / 13 workloads</strong>
               <span aria-hidden="true">↓</span>
             </a>
@@ -393,7 +394,7 @@ function App() {
           <div className="benchmark-heading">
             <div>
               <p className="section-kicker">Measured performance</p>
-              <h2>The lowest median. Every measured row.</h2>
+              <h2>The lowest median. Every retained row.</h2>
             </div>
             <div className="benchmark-statement">
               <strong>13<span>/13</span></strong>
@@ -500,9 +501,14 @@ function App() {
               10,000 paired-bootstrap samples; exact-byte outputs. Node 24.12.0, Bun 1.3.14,
               Deno 2.6.10, Zipp 0.0.1 at clean PGO source <code>cc0d557</code>. The three diagnostics
               remain separate from the retained-ten headline, and these workloads are not a claim
-              of universal runtime superiority.
+              of universal runtime superiority. A separate hostile application corpus tracks
+              closures, mixed shapes and types, modules, allocation pressure, and npm source; it is
+              deliberately not folded into this result.
             </p>
-            <ExternalLink className="text-link" href={BENCHMARK_URL}>Raw capture</ExternalLink>
+            <div className="methodology-links">
+              <ExternalLink className="text-link" href={BENCHMARK_URL}>Raw capture</ExternalLink>
+              <ExternalLink className="text-link" href={HOSTILE_BENCHMARK_URL}>Hostile corpus</ExternalLink>
+            </div>
           </div>
         </section>
 

@@ -19,7 +19,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -34,8 +38,7 @@ fn hot(body: &str) -> String {
 fn super_method_inline_matches_interpreter_and_follows_reassignment() {
     // `super.area()` inlines; then the PARENT's method is replaced on the
     // prototype. The holder-slot re-read must observe the new function.
-    let out = run_ok(&hot(
-        r#"
+    let out = run_ok(&hot(r#"
         class A { constructor(v) { this._v = v | 0; } area() { return this._v + 1; } }
         class B extends A { area() { return super.area() * 3 + 1; } }
         var o = new B(11);
@@ -46,8 +49,7 @@ fn super_method_inline_matches_interpreter_and_follows_reassignment() {
         var acc2 = 0;
         for (var i = 0; i < HOT; i++) acc2 = (acc2 + o.area()) | 0;
         console.log("after", o.area(), acc2);
-        "#,
-    ));
+        "#));
     // (11+1)*3+1 = 37 ; (11+100)*3+1 = 334. Both accumulators are HOT * the
     // per-call value — node agrees byte for byte.
     assert_eq!(out[0], format!("before {} 37", 37 * HOT));
@@ -56,8 +58,7 @@ fn super_method_inline_matches_interpreter_and_follows_reassignment() {
 
 #[test]
 fn super_method_inline_follows_set_prototype_of() {
-    let out = run_ok(&hot(
-        r#"
+    let out = run_ok(&hot(r#"
         class A { constructor(v) { this._v = v | 0; } area() { return this._v + 1; } }
         class B extends A { area() { return super.area() * 3 + 1; } }
         var o = new B(11);
@@ -68,8 +69,7 @@ fn super_method_inline_follows_set_prototype_of() {
         // A.prototype, so `super.area` resolves somewhere else entirely.
         Object.setPrototypeOf(B.prototype, { area() { return this._v + 1000; } });
         console.log("retargeted", o.area());
-        "#,
-    ));
+        "#));
     assert_eq!(out[0], "hot 37");
     assert_eq!(out[1], "retargeted 3034"); // (11+1000)*3+1
 }
@@ -78,8 +78,7 @@ fn super_method_inline_follows_set_prototype_of() {
 fn super_method_inline_declines_on_own_shadow() {
     // An own property shadowing the class method must win, both before the
     // inline installs and after.
-    let out = run_ok(&hot(
-        r#"
+    let out = run_ok(&hot(r#"
         class A { constructor(v) { this._v = v | 0; } area() { return this._v + 1; } }
         class B extends A { area() { return super.area() * 3 + 1; } }
         var o = new B(11);
@@ -89,8 +88,7 @@ fn super_method_inline_declines_on_own_shadow() {
         var seen = 0;
         for (var i = 0; i < HOT; i++) seen = o.area();
         console.log("shadowed", seen, acc);
-        "#,
-    ));
+        "#));
     assert_eq!(out[0], "shadowed -7 2220000");
 }
 
@@ -99,8 +97,7 @@ fn super_accessor_inline_getter_and_setter_round_trip() {
     // The `get v(){ return super.v * 2 }` / `set v(x){ super.v = x }` pair —
     // the SuperGet read and the SuperSet store, the latter being the inlined
     // body's only committing effect.
-    let out = run_ok(&hot(
-        r#"
+    let out = run_ok(&hot(r#"
         class A {
           constructor(v) { this._v = v | 0; }
           get v() { return this._v; }
@@ -114,8 +111,7 @@ fn super_accessor_inline_getter_and_setter_round_trip() {
         var g = 0;
         for (var i = 0; i < HOT; i++) { o.v = (i & 1023) - 7; g = (g + o.v) | 0; }
         console.log("roundtrip", g, o.v, o._v);
-        "#,
-    ));
+        "#));
     // Interpreted control: gacc accumulates 2*((i&1023)-7).
     let mut expect: i64 = 0;
     let mut last = 0i64;
@@ -130,8 +126,7 @@ fn super_accessor_inline_getter_and_setter_round_trip() {
 fn super_setter_inline_follows_parent_setter_swap() {
     // `defineProperty` can swap the setter half in place with no version bump
     // and no realloc, so only the baked setter-value compare catches it.
-    let out = run_ok(&hot(
-        r#"
+    let out = run_ok(&hot(r#"
         class A {
           constructor(v) { this._v = v | 0; }
           get v() { return this._v; }
@@ -148,8 +143,7 @@ fn super_setter_inline_follows_parent_setter_swap() {
         });
         o.v = 5;
         console.log("swapped", o._v);
-        "#,
-    ));
+        "#));
     assert_eq!(out[0], "hot 5");
     assert_eq!(out[1], "swapped 1005");
 }
@@ -170,8 +164,7 @@ fn super_method_inline_class_redefinition_is_tier_consistent() {
     // declaration makes a distinct class. Fixing it means giving `super`
     // resolution a per-closure home object rather than a per-class-id slot —
     // a semantics change, not a codegen one.
-    let out = run_ok(&hot(
-        r#"
+    let out = run_ok(&hot(r#"
         function make(k) {
           class A { constructor(v) { this._v = v | 0; } area() { return this._v + k; } }
           class B extends A { area() { return super.area() * 3 + 1; } }
@@ -182,8 +175,7 @@ fn super_method_inline_class_redefinition_is_tier_consistent() {
         var b = make(50), acc2 = 0;
         for (var i = 0; i < HOT; i++) acc2 = (acc2 + b.area()) | 0;
         console.log("epoch", a.area(), b.area());
-        "#,
-    ));
+        "#));
     assert_eq!(out[0], "epoch 184 184");
 }
 
@@ -191,8 +183,7 @@ fn super_method_inline_class_redefinition_is_tier_consistent() {
 fn super_method_inline_polymorphic_receivers() {
     // Four receivers cycling through one site — the shape the benchmark uses.
     // Two arms use super, two do not; every arm must give its own answer.
-    let out = run_ok(&hot(
-        r#"
+    let out = run_ok(&hot(r#"
         class A { constructor(v) { this._v = v | 0; } area() { return this._v + 1; } }
         class C extends A { area() { return super.area() * 3 + 1; } }
         class S extends A { constructor(v) { super(v); this.side = v * 2; }
@@ -203,19 +194,20 @@ fn super_method_inline_polymorphic_receivers() {
         var acc = 0;
         for (var i = 0; i < HOT; i++) acc = (acc + objs[i & 3].area()) | 0;
         console.log("poly", acc, objs[0].area(), objs[1].area(), objs[2].area(), objs[3].area());
-        "#,
-    ));
+        "#));
     // C:(11+1)*3+1=37  S:(22+1)*4+44=136  P:33+7=40  I:44+1=45
     let per: i64 = 37 + 136 + 40 + 45;
-    assert_eq!(out[0], format!("poly {} 37 136 40 45", per * (HOT as i64 / 4)));
+    assert_eq!(
+        out[0],
+        format!("poly {} 37 136 40 45", per * (HOT as i64 / 4))
+    );
 }
 
 #[test]
 fn super_method_inline_throwing_target_propagates_once() {
     // A super target that throws must throw exactly once and be catchable —
     // the inlined body must not commit-then-re-run it.
-    let out = run_ok(&hot(
-        r#"
+    let out = run_ok(&hot(r#"
         class A { constructor(v) { this._v = v | 0; } area() { return this._v + 1; } }
         class B extends A { area() { return super.area() * 3 + 1; } }
         var o = new B(11), acc = 0;
@@ -225,8 +217,7 @@ fn super_method_inline_throwing_target_propagates_once() {
         var caught = 0;
         try { o.area(); } catch (e) { caught = e.message; }
         console.log("throw", caught, calls);
-        "#,
-    ));
+        "#));
     assert_eq!(out[0], "throw boom 1");
 }
 
@@ -246,8 +237,7 @@ fn super_ordering_argument_list_swap_is_tier_consistent() {
     // the method after the argument list, so it sees the swap. Closing it means
     // resolving the method at `SuperBase` time and carrying the callee, not the
     // base — a separate correctness change.
-    let out = run_ok(&hot(
-        r#"
+    let out = run_ok(&hot(r#"
         class A { m(x) { return "A" + x; } }
         class B extends A {
           hit(swap) { return super.m(swap()); }
@@ -260,16 +250,14 @@ fn super_ordering_argument_list_swap_is_tier_consistent() {
         console.log("warm", o.hit(function () { return 1; }));
         var seen = o.hit(function () { Object.setPrototypeOf(B.prototype, later); return 2; });
         console.log("ordered", seen, o.hit(function () { return 3; }));
-        "#,
-    ));
+        "#));
     assert_eq!(out[0], "warm A1");
     assert_eq!(out[1], "ordered LATER2 LATER3");
 }
 
 #[test]
 fn super_ordering_assignment_rhs_swap_matches_node() {
-    let out = run_ok(&hot(
-        r#"
+    let out = run_ok(&hot(r#"
         var log = [];
         class A { set p(v) { log.push("A:" + v); } }
         class B extends A { set q(v) { super.p = v; } }
@@ -284,8 +272,7 @@ fn super_ordering_assignment_rhs_swap_matches_node() {
         o.q = (Object.setPrototypeOf(B.prototype, later), 2);
         o.q = 3;
         console.log("ordered", log[log.length - 2], log[log.length - 1]);
-        "#,
-    ));
+        "#));
     assert_eq!(out[0], format!("warm {HOT} A:1"));
     assert_eq!(out[1], "ordered LATER:2 LATER:3");
 }

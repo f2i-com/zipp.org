@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -217,7 +217,9 @@ pub(crate) fn json_parse_string(src: &[u8], i: &mut usize) -> Result<crate::heap
             // A raw control character (< 0x20) is invalid in a JSON string — it
             // must be escaped (`\n`, `	`, …). (Matches the spec / node.)
             Some(c) if c < 0x20 => {
-                return Err(Thrown("SyntaxError: Bad control character in string literal in JSON".into()));
+                return Err(Thrown(
+                    "SyntaxError: Bad control character in string literal in JSON".into(),
+                ));
             }
             Some(_) => *i += 1, // plain byte (ASCII or UTF-8 continuation) — sliced later
         }
@@ -267,9 +269,11 @@ pub(crate) fn json_parse_number(b: &[u8], i: &mut usize) -> Result<Value, Thrown
             *i += 1;
         }
     }
-    match std::str::from_utf8(&b[start..*i]).unwrap_or("").parse::<f64>() {
+    match std::str::from_utf8(&b[start..*i])
+        .unwrap_or("")
+        .parse::<f64>()
+    {
         Ok(n) => Ok(Value::num(n)),
         Err(_) => Err(err()),
     }
 }
-

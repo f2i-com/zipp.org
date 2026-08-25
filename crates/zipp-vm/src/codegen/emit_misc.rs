@@ -42,6 +42,25 @@ pub(crate) fn mem_cmp_fuse_enabled() -> bool {
     }
 }
 
+/// Fast Int/Int head for the memory-path fused relational jumps. The generic
+/// path below has to convert both numeric operands to f64 for mixed Int/double
+/// semantics; two tagged Ints can compare their signed i32 payloads directly.
+/// `ZIPP_NO_MEM_INT_CMPJUMP=1` restores the conversion-only emission.
+#[inline]
+fn mem_int_cmpjump_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_MEM_INT_CMPJUMP").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// Fused compare→branch fast head for the MEMORY path (B118): when a
 /// `Lt/Le/Gt/Ge/Eq/Ne {dst,a,b}` is IMMEDIATELY followed by a
 /// `JumpIfTrue/False{cond: dst}`, two Int-tagged operands compare and branch on
@@ -124,7 +143,9 @@ pub(crate) fn region_target(
     if target >= start && target <= end {
         in_region[(target - start) as usize]
     } else {
-        *exit_stubs.entry(target).or_insert_with(|| ops.new_dynamic_label())
+        *exit_stubs
+            .entry(target)
+            .or_insert_with(|| ops.new_dynamic_label())
     }
 }
 
@@ -144,7 +165,11 @@ pub(crate) enum DOp {
 /// |x| ≥ 2^63 (rare; ToInt32 still defined but not via i64) / bool / null /
 /// undefined / heap — jumps to `bail` so the interpreter applies complete
 /// ToInt32 semantics. Clobbers rax/r10/xmm0/xmm1.
-pub(crate) fn load_toint32(ops: &mut dynasmrt::x64::Assembler, reg: u16, bail: dynasmrt::DynamicLabel) {
+pub(crate) fn load_toint32(
+    ops: &mut dynasmrt::x64::Assembler,
+    reg: u16,
+    bail: dynasmrt::DynamicLabel,
+) {
     let int_path = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
@@ -188,7 +213,12 @@ pub(crate) fn load_toint32(ops: &mut dynasmrt::x64::Assembler, reg: u16, bail: d
 
 /// Load `regs[reg]` as an f64 into `xmm{which}` (0 or 1). Int-tagged → cvtsi2sd;
 /// a real double → movq; bool/null/undef/heap → jump to `bail`.
-pub(crate) fn load_num_xmm(ops: &mut dynasmrt::x64::Assembler, reg: u16, which: u8, bail: dynasmrt::DynamicLabel) {
+pub(crate) fn load_num_xmm(
+    ops: &mut dynasmrt::x64::Assembler,
+    reg: u16,
+    which: u8,
+    bail: dynasmrt::DynamicLabel,
+) {
     let int_path = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
@@ -599,10 +629,10 @@ pub(crate) fn dcmp(
     // Compute the boolean into al. ucomisd sets CF/ZF/PF; ordering tricks below
     // keep NaN-false semantics (see jump variant for the rationale).
     match cmp {
-        Cmp::Lt => dynasm!(ops ; ucomisd xmm1, xmm0 ; seta al),   // a<b  ⇔ b>a ordered
-        Cmp::Le => dynasm!(ops ; ucomisd xmm1, xmm0 ; setae al),  // a<=b ⇔ b>=a ordered
-        Cmp::Gt => dynasm!(ops ; ucomisd xmm0, xmm1 ; seta al),   // a>b
-        Cmp::Ge => dynasm!(ops ; ucomisd xmm0, xmm1 ; setae al),  // a>=b
+        Cmp::Lt => dynasm!(ops ; ucomisd xmm1, xmm0 ; seta al), // a<b  ⇔ b>a ordered
+        Cmp::Le => dynasm!(ops ; ucomisd xmm1, xmm0 ; setae al), // a<=b ⇔ b>=a ordered
+        Cmp::Gt => dynasm!(ops ; ucomisd xmm0, xmm1 ; seta al), // a>b
+        Cmp::Ge => dynasm!(ops ; ucomisd xmm0, xmm1 ; setae al), // a>=b
         Cmp::Eq => dynasm!(ops
             ; ucomisd xmm0, xmm1
             ; sete al            // ZF=1 (equal OR unordered)
@@ -638,6 +668,40 @@ pub(crate) fn djump_if_not_cmp(
     cmp: Cmp,
     target: dynasmrt::DynamicLabel,
 ) {
+    let generic = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    if mem_int_cmpjump_enabled() {
+        // Mirror `emit_fused_cmp_branch_head`'s representation proof: an Int
+        // has high16 == INT_TAG_HI and its low32 is the exact signed payload.
+        // The not-taken arm jumps over the generic f64 conversion below; any
+        // mixed/double/non-number input reaches that old path byte-for-byte.
+        dynasm!(ops
+            ; mov rax, [rbx + dreg(a)]
+            ; mov rcx, [rbx + dreg(b)]
+            ; mov r10, rax
+            ; shr r10, 48
+            ; cmp r10d, INT_TAG_HI as i32
+            ; jne => generic
+            ; mov r10, rcx
+            ; shr r10, 48
+            ; cmp r10d, INT_TAG_HI as i32
+            ; jne => generic
+            ; cmp eax, ecx                    // signed i32 payload comparison
+        );
+        match cmp {
+            Cmp::Lt => dynasm!(ops ; jge => target), // !(a < b)
+            Cmp::Le => dynasm!(ops ; jg => target),  // !(a <= b)
+            _ => {}
+        }
+        dynasm!(ops
+            ; jmp => done
+            ; => generic
+        );
+    } else {
+        // Keep the off-switch stream label-complete without emitting a branch
+        // or any fast-head instructions.
+        dynasm!(ops ; => generic);
+    }
     load_num_xmm(ops, a, 0, bail);
     load_num_xmm(ops, b, 1, bail);
     // Jump when the comparison is FALSE. ucomisd(b,a): CF=1 ⇔ b<a OR unordered.
@@ -648,6 +712,7 @@ pub(crate) fn djump_if_not_cmp(
         Cmp::Le => dynasm!(ops ; ucomisd xmm1, xmm0 ; jb => target),
         _ => {}
     }
+    dynasm!(ops ; => done);
     emit_region_bail(ops, ip, bail, epilogue);
 }
 

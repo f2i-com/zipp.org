@@ -168,10 +168,7 @@ fn distinct(globals: &[u32]) -> bool {
 /// The recognizer intentionally includes both loop skeletons, the liveness
 /// check and every global route. Any extra expression, coercion, mutation,
 /// break/continue or observable store changes the bytecode and fails closed.
-fn recognize_forin_count(
-    proto: &crate::bytecode::FuncProto,
-    ip: usize,
-) -> Option<ForInCountPlan> {
+fn recognize_forin_count(proto: &crate::bytecode::FuncProto, ip: usize) -> Option<ForInCountPlan> {
     let start = ip.checked_sub(4)?;
     let end = start.checked_add(20)?;
     if end >= proto.code.len() || !matches!(proto.code[ip], Instr::ForInKeys { .. }) {
@@ -204,8 +201,9 @@ fn recognize_forin_count(
         _ => return None,
     };
     let index = match c[start + 6] {
-        Instr::LoadInt { dst, val }
-            if val as usize == crate::bytecode::FORIN_SNAPSHOT_PREFIX => dst,
+        Instr::LoadInt { dst, val } if val as usize == crate::bytecode::FORIN_SNAPSHOT_PREFIX => {
+            dst
+        }
         _ => return None,
     };
     if !matches!(c[start + 7], Instr::JumpIfNotLt { a, b, target }
@@ -230,7 +228,10 @@ fn recognize_forin_count(
         Instr::StoreGlobal { idx, src }
         | Instr::StoreGlobalStrict { idx, src }
         | Instr::StoreGlobalResolved { idx, src }
-            if src == key => idx,
+            if src == key =>
+        {
+            idx
+        }
         _ => return None,
     };
     let (count, count_global) = match c[start + 12] {
@@ -302,8 +303,9 @@ fn recognize_sparse_forin_fold(
         _ => return None,
     };
     let index = match *c.get(ip + 2)? {
-        Instr::LoadInt { dst, val }
-            if val as usize == crate::bytecode::FORIN_SNAPSHOT_PREFIX => dst,
+        Instr::LoadInt { dst, val } if val as usize == crate::bytecode::FORIN_SNAPSHOT_PREFIX => {
+            dst
+        }
         _ => return None,
     };
     if !matches!(*c.get(ip + 3)?, Instr::JumpIfNotLt { a, b, target }
@@ -328,7 +330,10 @@ fn recognize_sparse_forin_fold(
         Instr::StoreGlobal { idx, src }
         | Instr::StoreGlobalStrict { idx, src }
         | Instr::StoreGlobalResolved { idx, src }
-            if src == key => idx,
+            if src == key =>
+        {
+            idx
+        }
         _ => return None,
     };
     let (count, count_global) = match *c.get(ip + 8)? {
@@ -435,7 +440,10 @@ fn periodic_in_key(
         };
         let key = match *code.get(ip + 4)? {
             Instr::Add { dst, a, b }
-                if (a == offset_reg && b == rem) || (a == rem && b == offset_reg) => dst,
+                if (a == offset_reg && b == rem) || (a == rem && b == offset_reg) =>
+            {
+                dst
+            }
             _ => return None,
         };
         return Some((ip + 5, key, modulus, 1, offset));
@@ -456,8 +464,13 @@ fn periodic_in_key(
     };
     let mut next = ip + 3;
     let mut scale = 1i32;
-    if let (Some(Instr::LoadInt { dst: scale_reg, val }), Some(Instr::Mul { dst, a, b })) =
-        (code.get(next), code.get(next + 1))
+    if let (
+        Some(Instr::LoadInt {
+            dst: scale_reg,
+            val,
+        }),
+        Some(Instr::Mul { dst, a, b }),
+    ) = (code.get(next), code.get(next + 1))
     {
         if (*a == key && *b == *scale_reg) || (*a == *scale_reg && *b == key) {
             key = *dst;
@@ -515,8 +528,16 @@ fn recognize_in_probe_reduce(
             // Outer-loop tail.
             if let (
                 Some(Instr::LoadGlobal { dst: tail, idx }),
-                Some(Instr::AddInt { dst, a, imm: 1, upd: true }),
-                Some(Instr::StoreGlobalResolved { idx: store_idx, src }),
+                Some(Instr::AddInt {
+                    dst,
+                    a,
+                    imm: 1,
+                    upd: true,
+                }),
+                Some(Instr::StoreGlobalResolved {
+                    idx: store_idx,
+                    src,
+                }),
                 Some(Instr::Jump { target }),
             ) = (c.get(pos), c.get(pos + 1), c.get(pos + 2), c.get(pos + 3))
             {
@@ -547,8 +568,7 @@ fn recognize_in_probe_reduce(
                 break;
             }
 
-            let (after_key, key, modulus, scale, offset) =
-                periodic_in_key(c, pos, i_global)?;
+            let (after_key, key, modulus, scale, offset) = periodic_in_key(c, pos, i_global)?;
             let (obj, source) = match *c.get(after_key)? {
                 Instr::LoadGlobal { dst, idx } => (dst, idx),
                 _ => return None,
@@ -559,8 +579,12 @@ fn recognize_in_probe_reduce(
                 _ => {}
             }
             let cond = match *c.get(after_key + 1)? {
-                Instr::HasProp { dst, key: k, obj: o, brand: false }
-                    if k == key && o == obj => dst,
+                Instr::HasProp {
+                    dst,
+                    key: k,
+                    obj: o,
+                    brand: false,
+                } if k == key && o == obj => dst,
                 _ => return None,
             };
             let has_ip = after_key + 1;
@@ -666,11 +690,7 @@ fn recognize_array_copy_len(
                     return None;
                 }
             }
-            (
-                start,
-                ArrayCopyLenKind::Concat { arg_reg },
-                call_ip + 1,
-            )
+            (start, ArrayCopyLenKind::Concat { arg_reg }, call_ip + 1)
         }
         _ => return None,
     };
@@ -697,7 +717,10 @@ fn recognize_array_copy_len(
                 && proto
                     .string_constants
                     .get(name as usize)
-                    .is_some_and(|s| s == "length") => dst,
+                    .is_some_and(|s| s == "length") =>
+        {
+            dst
+        }
         _ => return None,
     };
     let added = match *c.get(after_call + 1)? {
@@ -790,7 +813,9 @@ fn recognize_forin_sum(proto: &crate::bytecode::FuncProto, ip: usize) -> Option<
         _ => return None,
     };
     let index = match c[start + 6] {
-        Instr::LoadInt { dst, val } if val as usize == crate::bytecode::FORIN_SNAPSHOT_PREFIX => dst,
+        Instr::LoadInt { dst, val } if val as usize == crate::bytecode::FORIN_SNAPSHOT_PREFIX => {
+            dst
+        }
         _ => return None,
     };
     if !matches!(c[start + 7], Instr::JumpIfNotLt { a, b, target }
@@ -815,7 +840,10 @@ fn recognize_forin_sum(proto: &crate::bytecode::FuncProto, ip: usize) -> Option<
         Instr::StoreGlobal { idx, src }
         | Instr::StoreGlobalStrict { idx, src }
         | Instr::StoreGlobalResolved { idx, src }
-            if src == key => idx,
+            if src == key =>
+        {
+            idx
+        }
         _ => return None,
     };
     let (sum, sum_global) = match c[start + 12] {
@@ -843,7 +871,12 @@ fn recognize_forin_sum(proto: &crate::bytecode::FuncProto, ip: usize) -> Option<
         _ => return None,
     };
     let reduced = match c[start + 18] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::Or } if a == added && b == zero => dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Or,
+        } if a == added && b == zero => dst,
         _ => return None,
     };
     if !matches!(c[start + 19], Instr::StoreGlobal { idx, src }
@@ -868,7 +901,13 @@ fn recognize_forin_sum(proto: &crate::bytecode::FuncProto, ip: usize) -> Option<
     {
         return None;
     }
-    let globals = [source_global, sum_global, key_global, i_global, limit_global];
+    let globals = [
+        source_global,
+        sum_global,
+        key_global,
+        i_global,
+        limit_global,
+    ];
     distinct(&globals).then_some(ForInSumPlan {
         source_global,
         sum_global,
@@ -918,7 +957,13 @@ fn recognize_object_keys_len(
     let len = match c[start + 6] {
         Instr::GetProp { dst, obj, name }
             if obj == keys
-                && proto.string_constants.get(name as usize).is_some_and(|s| s == "length") => dst,
+                && proto
+                    .string_constants
+                    .get(name as usize)
+                    .is_some_and(|s| s == "length") =>
+        {
+            dst
+        }
         _ => return None,
     };
     let added = match c[start + 7] {
@@ -930,7 +975,12 @@ fn recognize_object_keys_len(
         _ => return None,
     };
     let reduced = match c[start + 9] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::Or } if a == added && b == zero => dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Or,
+        } if a == added && b == zero => dst,
         _ => return None,
     };
     if !matches!(c[start + 10], Instr::StoreGlobal { idx, src }
@@ -1040,8 +1090,7 @@ impl<'p> Vm<'p> {
                         .is_some_and(|(name, kind, _)| name == method && kind == 0))
         });
         let constructor_ok = ap.pos("constructor").is_some_and(|slot| {
-            !ap.attrs[slot].accessor
-                && ap.vals[slot] == Value::heap(self.array_ctor)
+            !ap.attrs[slot].accessor && ap.vals[slot] == Value::heap(self.array_ctor)
         });
         if !method_ok || !constructor_ok {
             return None;
@@ -1274,15 +1323,14 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         let iterations = limit.as_int() as u32;
-        let final_sum = (sum.as_int() as u32)
-            .wrapping_add((result_len as u32).wrapping_mul(iterations));
+        let final_sum =
+            (sum.as_int() as u32).wrapping_add((result_len as u32).wrapping_mul(iterations));
         self.globals[plan.sum_global as usize] = Value::int(final_sum as i32);
         self.globals[plan.i_global as usize] = limit;
         if std::env::var_os("ZIPP_JITLOG").is_some() {
             eprintln!(
                 "[jit] array-copy-length committed {} {} iterations",
-                method,
-                iterations
+                method, iterations
             );
         }
         Some(plan.exit)
@@ -1453,16 +1501,15 @@ impl<'p> Vm<'p> {
         let (per_iteration, last_key) = match self.heap.get(snapshot.heap_index()) {
             HeapObj::Array(items) if items.len() >= crate::bytecode::FORIN_SNAPSHOT_PREFIX => (
                 items.len() - crate::bytecode::FORIN_SNAPSHOT_PREFIX,
-                items.last().copied().filter(|_| {
-                    items.len() > crate::bytecode::FORIN_SNAPSHOT_PREFIX
-                }),
+                items
+                    .last()
+                    .copied()
+                    .filter(|_| items.len() > crate::bytecode::FORIN_SNAPSHOT_PREFIX),
             ),
             _ => return None,
         };
         let iterations = limit.as_int() as i64;
-        let delta = i64::try_from(per_iteration)
-            .ok()?
-            .checked_mul(iterations)?;
+        let delta = i64::try_from(per_iteration).ok()?.checked_mul(iterations)?;
         // The bytecode increments one at a time and promotes to Double at i32
         // overflow. Restrict the fused lane to the exact Int-tagged outcome;
         // huge counters retain the ordinary promotion/rounding path.
@@ -1567,19 +1614,12 @@ impl<'p> Vm<'p> {
         self.globals[plan.sum_global as usize] = Value::int(result as i32);
         self.globals[plan.i_global as usize] = limit;
         if std::env::var_os("ZIPP_JITLOG").is_some() {
-            eprintln!(
-                "[jit] enum-forin-sum committed {} iterations",
-                remaining
-            );
+            eprintln!("[jit] enum-forin-sum committed {} iterations", remaining);
         }
         Some(plan.exit)
     }
 
-    pub(crate) fn try_object_keys_len_reduce(
-        &mut self,
-        func_id: u32,
-        ip: usize,
-    ) -> Option<usize> {
+    pub(crate) fn try_object_keys_len_reduce(&mut self, func_id: u32, ip: usize) -> Option<usize> {
         if !enum_loop_reduce_enabled() || !self.enum_loop_observation_free() {
             return None;
         }
@@ -1626,10 +1666,7 @@ impl<'p> Vm<'p> {
         self.globals[plan.sum_global as usize] = Value::int(result as i32);
         self.globals[plan.i_global as usize] = limit;
         if std::env::var_os("ZIPP_JITLOG").is_some() {
-            eprintln!(
-                "[jit] enum-object-keys committed {} iterations",
-                remaining
-            );
+            eprintln!("[jit] enum-object-keys committed {} iterations", remaining);
         }
         Some(plan.exit)
     }

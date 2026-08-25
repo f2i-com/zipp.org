@@ -121,9 +121,7 @@ pub(crate) fn interval_layout(items: &[Item]) -> Option<(usize, usize, usize)> {
             }
         }
     }
-    let repeated = |it: &Item| {
-        matches!(it, Item::Field(c, _) if class_of(*c).is_some_and(|k| count[k as usize] > 1))
-    };
+    let repeated = |it: &Item| matches!(it, Item::Field(c, _) if class_of(*c).is_some_and(|k| count[k as usize] > 1));
     // The SECOND occurrence of a repeated class opens the end endpoint.
     let mut seen = [false; 16];
     let mut second = None;
@@ -138,9 +136,13 @@ pub(crate) fn interval_layout(items: &[Item]) -> Option<(usize, usize, usize)> {
     }
     let second = second?;
     // The separator is the literal immediately before that second occurrence.
-    let sep = (0..second).rev().find(|i| matches!(items[*i], Item::Lit(_)))?;
+    let sep = (0..second)
+        .rev()
+        .find(|i| matches!(items[*i], Item::Lit(_)))?;
     let first_ranged = (0..sep).find(|i| repeated(&items[*i]))?;
-    let last_ranged = (sep + 1..items.len()).rev().find(|i| repeated(&items[*i]))?;
+    let last_ranged = (sep + 1..items.len())
+        .rev()
+        .find(|i| repeated(&items[*i]))?;
     Some((sep, first_ranged, last_ranged))
 }
 
@@ -205,7 +207,11 @@ impl Request {
 /// "May 1, 1886 at 2:12 PM" and "5/1/1886, 2:12 PM".
 fn glue_index(date_pattern: &str) -> usize {
     let f = pattern_fields(date_pattern);
-    let month = f.iter().find(|(k, ..)| *k == 3).map(|(_, _, n)| *n).unwrap_or(0);
+    let month = f
+        .iter()
+        .find(|(k, ..)| *k == 3)
+        .map(|(_, _, n)| *n)
+        .unwrap_or(0);
     let weekday = f.iter().any(|(k, ..)| *k == 6);
     match month {
         4.. if weekday => 0, // full
@@ -221,8 +227,11 @@ fn glue_index(date_pattern: &str) -> usize {
 /// change within the zone class. The one thing that is not rewritten is a field
 /// the request does not name — those stay as the locale wrote them.
 fn adjust_widths(pattern: &str, req: &Request) -> String {
-    let want: Vec<(u8, char, usize)> =
-        req.fields.iter().filter_map(|(c, n)| class_of(*c).map(|k| (k, *c, *n))).collect();
+    let want: Vec<(u8, char, usize)> = req
+        .fields
+        .iter()
+        .filter_map(|(c, n)| class_of(*c).map(|k| (k, *c, *n)))
+        .collect();
     let mut out = String::new();
     for item in parse_pattern(pattern) {
         match item {
@@ -251,8 +260,8 @@ fn adjust_widths(pattern: &str, req: &Request) -> String {
                         // A TEXT field takes the requested width outright — that
                         // IS the width option ("May" vs "May 1" vs "M").
                         let numeric = match k {
-                            0 | 6 | 7 | 12 => false,     // era, weekday, dayPeriod, zone
-                            3 => n <= 2 && *wn <= 2,     // month has both forms
+                            0 | 6 | 7 | 12 => false, // era, weekday, dayPeriod, zone
+                            3 => n <= 2 && *wn <= 2, // month has both forms
                             _ => true,
                         };
                         // The letter always comes from the request: it carries
@@ -367,13 +376,25 @@ fn best_half(want: &[(u8, char, usize)], hour12: bool) -> Option<String> {
 /// `best_pattern` without the join: the date pattern, the time pattern, and the
 /// index of the glue that would join them. `formatRange` needs the halves apart.
 pub(crate) fn best_pattern_halves(req: &Request, hour12: bool) -> (String, String, usize) {
-    let all: Vec<(u8, char, usize)> =
-        req.fields.iter().filter_map(|(c, n)| class_of(*c).map(|k| (k, *c, *n))).collect();
-    let date: Vec<_> = all.iter().copied().filter(|(k, ..)| is_date_class(*k)).collect();
-    let time: Vec<_> =
-        all.iter().copied().filter(|(k, ..)| !is_date_class(*k) && *k != 11).collect();
+    let all: Vec<(u8, char, usize)> = req
+        .fields
+        .iter()
+        .filter_map(|(c, n)| class_of(*c).map(|k| (k, *c, *n)))
+        .collect();
+    let date: Vec<_> = all
+        .iter()
+        .copied()
+        .filter(|(k, ..)| is_date_class(*k))
+        .collect();
+    let time: Vec<_> = all
+        .iter()
+        .copied()
+        .filter(|(k, ..)| !is_date_class(*k) && *k != 11)
+        .collect();
     let frac = all.iter().find(|(k, ..)| *k == 11).copied();
-    let dp = best_half(&date, hour12).map(|p| adjust_widths(&p, req)).unwrap_or_default();
+    let dp = best_half(&date, hour12)
+        .map(|p| adjust_widths(&p, req))
+        .unwrap_or_default();
     let tp = best_half(&time, hour12)
         .map(|p| adjust_widths(&p, req))
         .map(|p| match frac {
@@ -468,7 +489,9 @@ pub(crate) fn splice_glue(glue: &str, date: &[Item], time: &[Item]) -> Vec<Item>
 /// The `dateStyle`/`timeStyle` patterns, which bypass skeleton matching: CLDR
 /// stores those four date and four time patterns directly.
 pub(crate) fn style_index(s: &str) -> Option<usize> {
-    ["full", "long", "medium", "short"].iter().position(|x| *x == s)
+    ["full", "long", "medium", "short"]
+        .iter()
+        .position(|x| *x == s)
 }
 
 /// The `intervalFormats` pattern for `skeleton` at the greatest differing field,
@@ -489,7 +512,9 @@ pub(crate) fn interval_pattern(half: &[Item], hour12: bool, greatest: char) -> O
             _ => None,
         })
         .collect();
-    let req = Request { fields: want.iter().map(|(_, c, n)| (*c, *n)).collect() };
+    let req = Request {
+        fields: want.iter().map(|(_, c, n)| (*c, *n)).collect(),
+    };
     let req = &req;
     let gk = class_of(greatest)?;
     let mut best: Option<(u32, &str)> = None;
@@ -583,7 +608,11 @@ pub(crate) fn day_period_key(minutes: i32) -> &'static str {
             return key;
         }
     }
-    if minutes < 720 { "am" } else { "pm" }
+    if minutes < 720 {
+        "am"
+    } else {
+        "pm"
+    }
 }
 
 /// A day-period name at a CLDR width index (0 = wide, 1 = abbreviated,
@@ -594,5 +623,9 @@ pub(crate) fn day_period_name(key: &str, width: usize) -> &'static str {
             return [wide, abbr, narrow][width.min(2)];
         }
     }
-    if key == "pm" { "PM" } else { "AM" }
+    if key == "pm" {
+        "PM"
+    } else {
+        "AM"
+    }
 }

@@ -119,7 +119,14 @@ impl<'s> Parser<'s> {
                 params.push(Pattern::Rest(Box::new(self.expr_to_pattern(r)?)));
             }
             let simple = params.iter().all(|p| matches!(p, Pattern::Ident(_)));
-            return Ok(Some(self.finish_arrow(Params { items: params, simple }, is_async, start)?));
+            return Ok(Some(self.finish_arrow(
+                Params {
+                    items: params,
+                    simple,
+                },
+                is_async,
+                start,
+            )?));
         }
 
         // Not an arrow. If this was `async ( … )`, it is a CALL to `async`.
@@ -217,7 +224,12 @@ impl<'s> Parser<'s> {
             self.check_use_strict_with_non_simple_params(&params, b, start)?;
         }
         let span = Span::new(start, self.prev_end());
-        Ok(Expr::Arrow(Box::new(Arrow { params, body, is_async, span })))
+        Ok(Expr::Arrow(Box::new(Arrow {
+            params,
+            body,
+            is_async,
+            span,
+        })))
     }
 
     // ---- conversions -------------------------------------------------------
@@ -253,7 +265,10 @@ impl<'s> Parser<'s> {
                         pos,
                     ));
                 }
-                Target::Ident { name, covered: self.take_parenthesized() }
+                Target::Ident {
+                    name,
+                    covered: self.take_parenthesized(),
+                }
             }
             Expr::Member(m) => Target::Member(m),
             // Annex B: a call is a SIMPLE assignment target in sloppy code. It
@@ -304,7 +319,11 @@ impl<'s> Parser<'s> {
                         }
                         Some(ArrayElem::Expr(inner)) => {
                             let (target, default) = self.split_default(inner, pos)?;
-                            Some(TargetElem { target, default, rest: false })
+                            Some(TargetElem {
+                                target,
+                                default,
+                                rest: false,
+                            })
                         }
                     });
                 }
@@ -331,15 +350,27 @@ impl<'s> Parser<'s> {
                             }
                             rest = Some(Box::new(self.expr_to_target_at(inner, false, true, pos)?));
                         }
-                        ObjectMember::Prop { key, value, shorthand, init } => {
+                        ObjectMember::Prop {
+                            key,
+                            value,
+                            shorthand,
+                            init,
+                        } => {
                             // A CoverInitializedName is legal here and only
                             // here — this is the conversion that makes
                             // `({a = 1} = {})` work.
                             let (target, default) = match init {
-                                Some(d) => (self.expr_to_target_at(value, true, true, pos)?, Some(d)),
+                                Some(d) => {
+                                    (self.expr_to_target_at(value, true, true, pos)?, Some(d))
+                                }
                                 None => self.split_default(value, pos)?,
                             };
-                            props.push(TargetProp { key, target, default, shorthand });
+                            props.push(TargetProp {
+                                key,
+                                target,
+                                default,
+                                shorthand,
+                            });
                         }
                         _ => {
                             return Err(SyntaxError::new(
@@ -351,7 +382,12 @@ impl<'s> Parser<'s> {
                 }
                 Target::Object { props, rest }
             }
-            _ => return Err(SyntaxError::new("SyntaxError: invalid assignment target", pos)),
+            _ => {
+                return Err(SyntaxError::new(
+                    "SyntaxError: invalid assignment target",
+                    pos,
+                ))
+            }
         })
     }
 
@@ -364,14 +400,23 @@ impl<'s> Parser<'s> {
     /// ParenthesizedExpression's AssignmentTargetType is its contents', and an
     /// AssignmentExpression's is invalid.
     fn split_default(&mut self, e: Expr, pos: u32) -> PResult<(Target, Option<Expr>)> {
-        if let Expr::Assign { op: AssignOp::Assign, target, value, covered: false } = e {
+        if let Expr::Assign {
+            op: AssignOp::Assign,
+            target,
+            value,
+            covered: false,
+        } = e
+        {
             // The inner assignment was converted by `parse_assign`, which applies
             // the TOP-LEVEL rules — including Annex B's sloppy-mode allowance for
             // a CallExpression target. Nested in a pattern that allowance is gone
             // (see the `Expr::Call` arm), so re-check here: `[f() = 1] = []` is an
             // early SyntaxError in both modes.
             if matches!(target, Target::Call(_)) {
-                return Err(SyntaxError::new("SyntaxError: invalid assignment target", pos));
+                return Err(SyntaxError::new(
+                    "SyntaxError: invalid assignment target",
+                    pos,
+                ));
             }
             return Ok((target, Some(*value)));
         }
@@ -397,12 +442,15 @@ impl<'s> Parser<'s> {
             // Initializer` and `BindingElement : BindingPattern Initializer` both
             // take the initializer UNPARENTHESIZED, so `((a = 5)) => {}` and
             // `([(a = 5)]) => {}` are SyntaxErrors — the `_` arm below.
-            Expr::Assign { op: AssignOp::Assign, target, value, covered: false } => {
-                Pattern::Assign {
-                    left: Box::new(self.target_to_pattern(target)?),
-                    right: value,
-                }
-            }
+            Expr::Assign {
+                op: AssignOp::Assign,
+                target,
+                value,
+                covered: false,
+            } => Pattern::Assign {
+                left: Box::new(self.target_to_pattern(target)?),
+                right: value,
+            },
             // A BindingPattern is an ObjectLiteral/ArrayLiteral read directly;
             // `(({})) => 1` wraps one in parentheses, which no FormalParameter
             // production admits.
@@ -422,9 +470,7 @@ impl<'s> Parser<'s> {
                         None => None,
                         Some(ArrayElem::Spread(inner)) => {
                             if i + 1 != n {
-                                return Err(
-                                    self.err_here("SyntaxError: rest element must be last")
-                                );
+                                return Err(self.err_here("SyntaxError: rest element must be last"));
                             }
                             // `[...x = []]`: AssignmentRestElement is `...`
                             // DestructuringAssignmentTarget with no Initializer.
@@ -432,7 +478,13 @@ impl<'s> Parser<'s> {
                             // `var [...x = []]`) already reject it; only this one
                             // used to let `expr_to_pattern` fold the `=` into a
                             // Pattern::Assign and accept it.
-                            if matches!(inner, Expr::Assign { op: AssignOp::Assign, .. }) {
+                            if matches!(
+                                inner,
+                                Expr::Assign {
+                                    op: AssignOp::Assign,
+                                    ..
+                                }
+                            ) {
                                 return Err(self
                                     .err_here("SyntaxError: rest element may not have a default"));
                             }
@@ -440,9 +492,9 @@ impl<'s> Parser<'s> {
                                 pat: Pattern::Rest(Box::new(self.expr_to_pattern(inner)?)),
                             })
                         }
-                        Some(ArrayElem::Expr(inner)) => {
-                            Some(PatternElem { pat: self.expr_to_pattern(inner)? })
-                        }
+                        Some(ArrayElem::Expr(inner)) => Some(PatternElem {
+                            pat: self.expr_to_pattern(inner)?,
+                        }),
                     });
                 }
                 Pattern::Array(out)
@@ -452,8 +504,9 @@ impl<'s> Parser<'s> {
                     return Err(self.err_here("SyntaxError: invalid parameter"));
                 }
                 if f.rest_comma {
-                    return Err(self
-                        .err_here("SyntaxError: rest property may not be followed by a comma"));
+                    return Err(
+                        self.err_here("SyntaxError: rest property may not be followed by a comma")
+                    );
                 }
                 let mut props = Vec::new();
                 let mut rest = None;
@@ -462,23 +515,30 @@ impl<'s> Parser<'s> {
                     match m {
                         ObjectMember::Spread(inner) => {
                             if i + 1 != n {
-                                return Err(
-                                    self.err_here("SyntaxError: rest element must be last")
-                                );
+                                return Err(self.err_here("SyntaxError: rest element must be last"));
                             }
                             // AssignmentRestProperty takes no Initializer either.
-                            if matches!(inner, Expr::Assign { op: AssignOp::Assign, .. }) {
+                            if matches!(
+                                inner,
+                                Expr::Assign {
+                                    op: AssignOp::Assign,
+                                    ..
+                                }
+                            ) {
                                 return Err(self
                                     .err_here("SyntaxError: rest element may not have a default"));
                             }
                             rest = Some(Box::new(self.expr_to_pattern(inner)?));
                         }
-                        ObjectMember::Prop { key, value, init, .. } => {
+                        ObjectMember::Prop {
+                            key, value, init, ..
+                        } => {
                             let inner = self.expr_to_pattern(value)?;
                             let value = match init {
-                                Some(d) => {
-                                    Pattern::Assign { left: Box::new(inner), right: Box::new(d) }
-                                }
+                                Some(d) => Pattern::Assign {
+                                    left: Box::new(inner),
+                                    right: Box::new(d),
+                                },
                                 None => inner,
                             };
                             props.push(PatternProp { key, value });
@@ -514,7 +574,11 @@ impl<'s> Parser<'s> {
                                 None => inner,
                             };
                             Ok(Some(PatternElem {
-                                pat: if e.rest { Pattern::Rest(Box::new(pat)) } else { pat },
+                                pat: if e.rest {
+                                    Pattern::Rest(Box::new(pat))
+                                } else {
+                                    pat
+                                },
                             }))
                         }
                     })
@@ -525,7 +589,10 @@ impl<'s> Parser<'s> {
                 for p in props {
                     let inner = self.target_to_pattern(p.target)?;
                     let value = match p.default {
-                        Some(d) => Pattern::Assign { left: Box::new(inner), right: Box::new(d) },
+                        Some(d) => Pattern::Assign {
+                            left: Box::new(inner),
+                            right: Box::new(d),
+                        },
                         None => inner,
                     };
                     out.push(PatternProp { key: p.key, value });

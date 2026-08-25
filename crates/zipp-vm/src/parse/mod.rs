@@ -26,12 +26,12 @@
 //! corpus; the bridge and oxc were then deleted.
 
 pub mod ast;
-pub mod lexer;
 pub mod cover;
-pub mod stmt;
 pub mod expr;
 pub mod funcs;
+pub mod lexer;
 pub mod parser;
+pub mod stmt;
 pub mod token;
 
 #[cfg(test)]
@@ -76,9 +76,14 @@ mod tests {
     fn identifier_chars_follow_id_start_and_id_continue() {
         // ACCEPTED: Other_ID_Start, and the continue-only classes.
         for c in ['\u{2118}', '\u{212E}', '\u{309B}', '\u{309C}'] {
-            assert!(Lexer::id_start_for_test(c), "Other_ID_Start must start: {c:?}");
+            assert!(
+                Lexer::id_start_for_test(c),
+                "Other_ID_Start must start: {c:?}"
+            );
         }
-        for c in ['\u{0300}', '\u{0903}', '\u{203F}', '\u{2040}', '\u{FF3F}', '\u{0387}'] {
+        for c in [
+            '\u{0300}', '\u{0903}', '\u{203F}', '\u{2040}', '\u{FF3F}', '\u{0387}',
+        ] {
             assert!(Lexer::id_part_for_test(c), "must continue: {c:?}");
         }
         // ZWNJ/ZWJ are added by the spec on top of ID_Continue.
@@ -91,12 +96,24 @@ mod tests {
         for c in ['\u{05B0}', '\u{0345}', '\u{0903}', '\u{2E2F}'] {
             assert!(!Lexer::id_start_for_test(c), "must not start: {c:?}");
         }
-        assert!(!Lexer::id_part_for_test('\u{00B2}'), "No is not ID_Continue");
-        assert!(!Lexer::id_part_for_test('\u{2E2F}'), "Pattern_Syntax is excluded");
+        assert!(
+            !Lexer::id_part_for_test('\u{00B2}'),
+            "No is not ID_Continue"
+        );
+        assert!(
+            !Lexer::id_part_for_test('\u{2E2F}'),
+            "Pattern_Syntax is excluded"
+        );
 
         // And they really do lex, escaped and raw.
-        assert_eq!(names(r"var \u2118 = 1;"), vec!["var".to_string(), "\u{2118}".to_string()]);
-        assert_eq!(names("var a\u{0300} = 1;"), vec!["var".to_string(), "a\u{0300}".to_string()]);
+        assert_eq!(
+            names(r"var \u2118 = 1;"),
+            vec!["var".to_string(), "\u{2118}".to_string()]
+        );
+        assert_eq!(
+            names("var a\u{0300} = 1;"),
+            vec!["var".to_string(), "a\u{0300}".to_string()]
+        );
     }
 
     fn nums(src: &str) -> Vec<f64> {
@@ -118,12 +135,21 @@ mod tests {
         let plain = lex_all("await");
         assert!(matches!(
             &plain[0],
-            TokenKind::Ident { kw: Keyword::Await, had_escape: false, .. }
+            TokenKind::Ident {
+                kw: Keyword::Await,
+                had_escape: false,
+                ..
+            }
         ));
 
         let escaped = lex_all(r"\u0061wait");
         match &escaped[0] {
-            TokenKind::Ident { name, kw, had_escape, .. } => {
+            TokenKind::Ident {
+                name,
+                kw,
+                had_escape,
+                ..
+            } => {
                 assert_eq!(name, "await", "the escape resolves into the name");
                 assert_eq!(*kw, Keyword::None, "but it is NOT the keyword");
                 assert!(had_escape);
@@ -134,7 +160,10 @@ mod tests {
         assert_eq!(names(r"cl\u{61}ss"), vec!["class"]);
         assert!(matches!(
             &lex_all(r"cl\u{61}ss")[0],
-            TokenKind::Ident { kw: Keyword::None, .. }
+            TokenKind::Ident {
+                kw: Keyword::None,
+                ..
+            }
         ));
     }
 
@@ -176,7 +205,10 @@ mod tests {
     fn slash_is_division_or_regex_only_the_parser_knows() {
         // Same bytes, both readings, decided by the caller.
         let mut div = Lexer::new("/re/g");
-        assert!(matches!(div.next_token(false).unwrap().kind, TokenKind::Punct(Punct::Slash)));
+        assert!(matches!(
+            div.next_token(false).unwrap().kind,
+            TokenKind::Punct(Punct::Slash)
+        ));
 
         let mut rx = Lexer::new("/re/g");
         match rx.next_token(true).unwrap().kind {
@@ -207,7 +239,12 @@ mod tests {
     fn templates_report_their_pieces() {
         // No substitution: one chunk that is both head and tail.
         match &lex_all("`abc`")[0] {
-            TokenKind::Template { cooked, raw, head, tail } => {
+            TokenKind::Template {
+                cooked,
+                raw,
+                head,
+                tail,
+            } => {
                 assert_eq!(cooked.as_ref().unwrap().to_lossy_string(), "abc");
                 assert_eq!(raw, "abc");
                 assert!(*head && *tail);
@@ -217,7 +254,9 @@ mod tests {
         // With a substitution the lexer stops at `${` and hands back control.
         let mut lx = Lexer::new("`a${x}b`");
         match lx.next_token(false).unwrap().kind {
-            TokenKind::Template { head, tail, cooked, .. } => {
+            TokenKind::Template {
+                head, tail, cooked, ..
+            } => {
                 assert!(head && !tail);
                 assert_eq!(cooked.unwrap().to_lossy_string(), "a");
             }
@@ -227,7 +266,9 @@ mod tests {
         // The parser consumes the `}` by resuming the template AT it.
         let t = lx.read_template_continue().unwrap();
         match t.kind {
-            TokenKind::Template { head, tail, cooked, .. } => {
+            TokenKind::Template {
+                head, tail, cooked, ..
+            } => {
                 assert!(!head && tail);
                 assert_eq!(cooked.unwrap().to_lossy_string(), "b");
             }
@@ -262,7 +303,10 @@ mod tests {
         assert_eq!(nums("1_000_000 0x1_f"), vec![1000000.0, 31.0]);
         // ...but not leading, trailing, or doubled.
         for bad in ["1__0", "1_", "0x_1"] {
-            assert!(Lexer::new(bad).next_token(false).is_err(), "{bad} should fail");
+            assert!(
+                Lexer::new(bad).next_token(false).is_err(),
+                "{bad} should fail"
+            );
         }
         // The spelling is retained because strict mode rejects the legacy forms
         // and only the parser knows the strictness.
@@ -287,7 +331,10 @@ mod tests {
         assert!(matches!(&lex_all("0x10n")[0], TokenKind::BigInt(s) if s == "16"));
         // An identifier may not butt against a number.
         for bad in ["3in", "0x1g", "1e"] {
-            assert!(Lexer::new(bad).next_token(false).is_err(), "{bad} should fail");
+            assert!(
+                Lexer::new(bad).next_token(false).is_err(),
+                "{bad} should fail"
+            );
         }
     }
 
@@ -313,9 +360,14 @@ mod tests {
         assert_eq!(
             lex_all(">>>= >>> >> >= ** **= ??= ?? ..."),
             vec![
-                TokenKind::Punct(UShrEq), TokenKind::Punct(UShr), TokenKind::Punct(Shr),
-                TokenKind::Punct(GtEq), TokenKind::Punct(StarStar), TokenKind::Punct(StarStarEq),
-                TokenKind::Punct(QuestionQuestionEq), TokenKind::Punct(QuestionQuestion),
+                TokenKind::Punct(UShrEq),
+                TokenKind::Punct(UShr),
+                TokenKind::Punct(Shr),
+                TokenKind::Punct(GtEq),
+                TokenKind::Punct(StarStar),
+                TokenKind::Punct(StarStarEq),
+                TokenKind::Punct(QuestionQuestionEq),
+                TokenKind::Punct(QuestionQuestion),
                 TokenKind::Punct(DotDotDot),
             ]
         );
@@ -359,7 +411,10 @@ mod tests {
         for w in ["of", "async", "get", "set", "from", "as"] {
             let k = Keyword::classify(w);
             assert_ne!(k, Keyword::None, "{w} should classify");
-            assert!(!k.is_always_reserved() && !k.is_strict_reserved(), "{w} is contextual");
+            assert!(
+                !k.is_always_reserved() && !k.is_strict_reserved(),
+                "{w} is contextual"
+            );
         }
         assert_eq!(Keyword::classify("notakeyword"), Keyword::None);
     }
@@ -472,7 +527,11 @@ mod parser_tests {
         let _ = ok("if (c) function f() {}");
         let _ = ok("l: function f() {}");
         assert!(
-            parse("'use strict'; if (c) function f() {}", ParseOptions::script()).is_err(),
+            parse(
+                "'use strict'; if (c) function f() {}",
+                ParseOptions::script()
+            )
+            .is_err(),
             "strict keeps the error"
         );
         // A class is never legal there, in either mode.
@@ -483,14 +542,19 @@ mod parser_tests {
     fn asi_and_restricted_productions() {
         // A newline after `return` ends the statement.
         assert!(ok("function f() { return
-1; }").contains("Return"));
+1; }")
+        .contains("Return"));
         // A newline before `++` means ASI, not a postfix operator.
         let _ = ok("a
 ++b;");
         // `async` followed by a newline is NOT an async arrow — the production
         // has a [no LineTerminator here] restriction — so this reads as a call
         // to `async` followed by `=>`, which is a SyntaxError. node agrees.
-        assert!(parse("async
-() => {};", ParseOptions::script()).is_err());
+        assert!(parse(
+            "async
+() => {};",
+            ParseOptions::script()
+        )
+        .is_err());
     }
 }

@@ -32,7 +32,11 @@ fn run_guarded(src: &'static str) -> Vec<String> {
         .recv_timeout(Duration::from_secs(120))
         .expect("engine hung (B117 regression): runaway recursion did not throw")
         .expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 

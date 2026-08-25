@@ -3,14 +3,13 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
-use crate::vm::{cldr_en, dtf_pattern};
 use crate::vm::*;
+use crate::vm::{cldr_en, dtf_pattern};
 
 impl<'p> Vm<'p> {
-
     /// CreateSegmentsObject / CreateSegmentIterator — the two branded objects
     /// `Intl.Segmenter.prototype.segment` hands out. Both hold the same three
     /// slots ([[SegmentsString]] / [[IteratedString]], the granularity, and the
@@ -45,11 +44,11 @@ impl<'p> Vm<'p> {
         let resolved = self.heap.alloc(HeapObj::Object(Box::new(r)));
         let idx = self.heap.alloc(HeapObj::Intl { kind, resolved });
         if self.intl_protos[kind as usize] != 0 {
-            self.proto_of.insert(idx, Value::heap(self.intl_protos[kind as usize]));
+            self.proto_of
+                .insert(idx, Value::heap(self.intl_protos[kind as usize]));
         }
         Ok(Value::heap(idx))
     }
-
 
     /// CreateSegmentDataObject: an ordinary object whose own property NAMES are
     /// exactly `segment`, `index`, `input` — plus `isWordLike` at
@@ -78,5 +77,4 @@ impl<'p> Vm<'p> {
         }
         Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
     }
-
 }

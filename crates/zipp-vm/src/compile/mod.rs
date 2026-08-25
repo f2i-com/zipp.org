@@ -317,7 +317,6 @@ struct Compiler {
     obj_method_super: bool,
 }
 
-
 /// Resolve `name` to an `UpvalSource` for the INNERMOST function whose enclosing
 /// chain is `chain` (outermost → direct parent). The direct parent is
 /// `chain.last()`. If the variable is a cell-local of the direct parent, the
@@ -757,7 +756,6 @@ impl LoopCtx {
     }
 }
 
-
 /// The CLASS context a direct eval inherits from its caller (PerformEval: the
 /// eval's lexical environment is the caller's, so the caller's `super` binding,
 /// its derived-constructor `super()` right, and its class inner-name binding are
@@ -795,20 +793,20 @@ enum Binding {
 }
 
 // submodules (split out of the former monolithic compile.rs)
-mod compiler;
-mod scopes;
-mod decls;
-mod funcs;
-mod control_flow;
-mod exprs;
-mod with_stmt;
-mod bindings;
 mod assign;
+mod bindings;
 mod calls;
-mod string_accum;
+mod compiler;
+mod control_flow;
+mod decls;
 mod entry;
+mod exprs;
+mod funcs;
 mod helpers;
+mod scopes;
+mod string_accum;
+mod with_stmt;
 
-pub(crate) use string_accum::*;
 pub(crate) use entry::*;
 pub(crate) use helpers::*;
+pub(crate) use string_accum::*;

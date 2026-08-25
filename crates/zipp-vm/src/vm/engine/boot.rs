@@ -5,6 +5,21 @@
 #![allow(unused_imports)]
 use super::*;
 
+#[inline]
+fn module_func_range_contains(ranges: &[(u32, u32, u32)], func_id: u32) -> bool {
+    ranges
+        .binary_search_by(|&(start, end, _)| {
+            if func_id < start {
+                std::cmp::Ordering::Greater
+            } else if func_id >= end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
 impl<'p> Vm<'p> {
     /// Resolve a (unified) function id to its FuncProto: a compile-time program
     /// function for `id < main_func_count`, else a runtime `eval`/`new Function`
@@ -22,6 +37,40 @@ impl<'p> Vm<'p> {
         } else {
             self.eval_funcs[id - self.main_func_count]
         }
+    }
+
+    /// Whether `func_id` belongs to a loader-installed ES module rather than
+    /// to an ordinary `eval` / `new Function` program. Both kinds share the
+    /// runtime function table, so every optimization that accepts immutable
+    /// module code must use these exact loader-recorded ranges as its boundary.
+    #[inline]
+    pub(crate) fn loader_module_func(&self, func_id: u32) -> bool {
+        module_func_range_contains(&self.module_func_ranges, func_id)
+    }
+
+    /// Whether `func_id` belongs to immutable code the native tiers may compile.
+    ///
+    /// Main-program functions have always been eligible. Loader-installed ES
+    /// modules are eligible too: `prepare_eval_program` leaks their protos at
+    /// stable addresses and `module_func_ranges` records the exact half-open id
+    /// range for each module. Ordinary `eval`/`new Function` can be interleaved
+    /// in the same `eval_funcs` table, so accepting every id past
+    /// `main_func_count` would be unsound; only a recorded module range passes.
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[inline]
+    pub(crate) fn jit_func_eligible(&self, func_id: u32) -> bool {
+        if (func_id as usize) < self.main_func_count {
+            return true;
+        }
+        if !jit_module_functions_enabled() {
+            return false;
+        }
+
+        // Ranges are appended as the monotonically-growing runtime function
+        // table is installed. Failed eval/module preparations can leave gaps,
+        // but cannot reorder later ids, so binary search is valid and avoids a
+        // module-count-linear tax at every hot backedge.
+        self.loader_module_func(func_id)
     }
 
     /// Resolve a (unified) class id to its ClassDef: a compile-time program class
@@ -100,6 +149,9 @@ impl<'p> Vm<'p> {
             idx_key_scratch: String::new(),
             json_default_tj: None,
             site_ics: Vec::new(),
+            const_string_cache: rustc_hash::FxHashMap::default(),
+            const_string_cache_funcs: rustc_hash::FxHashMap::default(),
+            const_string_cache_enabled: std::env::var_os("ZIPP_NO_CONST_STRING_CACHE").is_none(),
             heap,
             globals,
             global_gens,
@@ -273,7 +325,7 @@ impl<'p> Vm<'p> {
             module_cache: std::collections::HashMap::new(),
             module_namespaces: std::collections::HashMap::new(),
             module_own: std::collections::HashMap::new(),
-            closure_home: std::collections::HashMap::new(),
+            closure_home: ClosureHomeTable::default(),
             closure_new_target: std::collections::HashMap::new(),
             from_async_fn: None,
             async_dispose_fn: None,
@@ -353,20 +405,18 @@ impl<'p> Vm<'p> {
             string_iter_proto: 0,
             global_this: 0,
             rng_state: 0x9E37_79B9_7F4A_7C15, // fixed seed (golden-ratio constant)
-            #[cfg(all(
-                feature = "jit",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ))]
+            #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             jit: crate::codegen::Jit::new(),
-            #[cfg(all(
-                feature = "jit",
-                any(target_arch = "x86_64", target_arch = "aarch64")
-            ))]
+            #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
             jit_enabled: std::env::var_os("ZIPP_NOJIT").is_none(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_recurse_depth: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_call_depth: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_tierc_closure: NO_CLOSURE,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            jit_tierc_callee: NO_CLOSURE,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             osr_deopt_exempt: false,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -416,10 +466,7 @@ impl<'p> Vm<'p> {
 
     /// Force the JIT on/off (overrides the `ZIPP_NOJIT` default). Used by the
     /// test suite to run a program both ways and assert the outputs match.
-    #[cfg(all(
-        feature = "jit",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[allow(dead_code)] // used by the differential test harness (run_nojit)
     pub(crate) fn set_jit_enabled(&mut self, on: bool) {
         // The first ARM64 tier has no native step-meter yet. Once a recorder or
@@ -458,7 +505,8 @@ impl<'p> Vm<'p> {
             // the VM pointer, which every compiled body is handed afresh on each
             // native entry, so it survives this `Vm` being moved.
             if let Some(off) = self.meter_offset() {
-                self.jit.set_meter(crate::codegen::meter::Meter { steps_off: off });
+                self.jit
+                    .set_meter(crate::codegen::meter::Meter { steps_off: off });
             }
         }
         #[cfg(all(feature = "jit", target_arch = "aarch64"))]
@@ -480,12 +528,35 @@ impl<'p> Vm<'p> {
     /// natively (it is a counter); a trace cannot.
     #[cfg(feature = "instrument")]
     pub(crate) fn enter_trace_mode(&mut self) {
-        #[cfg(all(
-            feature = "jit",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
+        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
             self.jit_enabled = false;
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "jit",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod module_jit_eligibility_tests {
+    use super::module_func_range_contains;
+
+    #[test]
+    fn only_recorded_half_open_module_ranges_accept_runtime_function_ids() {
+        // Model module A, two eval/new-Function gaps, module B, another gap,
+        // and module C. Dynamic functions interleaved in those gaps must never
+        // become eligible merely because a later module was installed.
+        let ranges = [(10, 13, 101), (17, 19, 102), (25, 30, 103)];
+        for id in [10, 11, 12, 17, 18, 25, 26, 27, 28, 29] {
+            assert!(module_func_range_contains(&ranges, id), "module fn{id}");
+        }
+        for id in [9, 13, 14, 15, 16, 19, 20, 24, 30, 31] {
+            assert!(
+                !module_func_range_contains(&ranges, id),
+                "eval/new-Function gap fn{id}"
+            );
         }
     }
 }

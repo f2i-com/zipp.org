@@ -1494,16 +1494,17 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // `Math.<fn>(args…)` → MathOp. Math has no real global object in the
-        // subset, so recognise the call shape (like console.log / Date.now).
+        // `Math.<fn>(args…)` → MathOp. These legacy intrinsics predate the
+        // first-class Math namespace object. Do not add `random` here: unlike a
+        // pure arithmetic shortcut, a syntactic `Math.random()` must observe an
+        // own-property replacement (`Math.random = seededRandom`). The former
+        // unconditional `Random` lowering silently ignored that replacement in
+        // both the interpreter and JIT because the decision was made at compile
+        // time. Let the ordinary member-call path resolve `random` dynamically.
         if let Expr::Member(m) = &c.callee {
             if let MemberProp::Ident(prop) = &m.prop {
                 if let Expr::Ident(obj) = &m.object {
                     if &**obj == "Math" {
-                        if &**prop == "random" {
-                            self.emit(Instr::Random { dst });
-                            return Ok(dst);
-                        }
                         if let Some(op) = crate::bytecode::MathFn::from_name(prop) {
                             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                             self.emit(Instr::MathOp {

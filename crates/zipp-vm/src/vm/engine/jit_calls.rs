@@ -280,8 +280,8 @@ impl<'p> Vm<'p> {
     /// * the resolved function has a live cross entry (Tier-C compiled — which
     ///   already excludes generators/async and rest/`arguments` bodies, and
     ///   never bakes a Tier A self-binding assumption);
-    /// * it is not an arrow (`lexical_this` — reg 0 must be the captured
-    ///   `this`, which only `setup_call` rebinds);
+    /// * an arrow is a real Closure and its captured `this` is copied into reg
+    ///   0 before entry (ordinary functions retain the strict/sloppy binding);
     /// * its direct global routes still validate (the `try_run_jit` entry
     ///   check, which this path would otherwise skip);
     /// * the caller's window is the TOP of the live register file (it always
@@ -304,20 +304,35 @@ impl<'p> Vm<'p> {
     /// cap the call deopts to the interpreter's flat frames, which enforce
     /// MAX_FRAMES → catchable RangeError.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn jit_cross_call_impl(
+    pub(crate) fn jit_cross_call_impl<const SAME_PROTO_ARROW2: bool>(
         &mut self,
         caller_base_ptr: *const u64,
         args: *const u64,
         packed: u64,
         callee_bits: u64,
+        method_this: Option<Value>,
     ) -> u64 {
         use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
-        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+        // Preserve the generic helper's historical early depth guard. The
+        // specialized instantiation instead resolves its immutable descriptor
+        // first, so a later different-fid value declines without even the
+        // internal `osr_deopt_exempt` mutation.
+        if !SAME_PROTO_ARROW2 && self.jit_call_depth >= JIT_REGION_CALL_MAX {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
-        let argc = (packed & 0xFFFF) as usize;
+        // The exact same-prototype arrow lane uses the otherwise-unused high
+        // half for its immutable FuncProto id and the low half for the baked
+        // callee window. The generic instantiation retains the historical
+        // `(caller_regs << 16) | argc` layout byte-for-byte.
+        let argc = if SAME_PROTO_ARROW2 {
+            2
+        } else {
+            (packed & 0xFFFF) as usize
+        };
         let caller_regs = ((packed >> 16) & 0xFFFF) as usize;
+        let expected_fid = (packed >> 32) as u32;
+        let expected_reg_count = (packed & 0xFFFF) as usize;
         let cv = Value::from_bits(callee_bits);
         if !cv.is_heap() {
             return SELF_CALL_DEOPT;
@@ -327,6 +342,26 @@ impl<'p> Vm<'p> {
             HeapObj::Closure { func, .. } => (*func, cv.heap_index()),
             _ => return SELF_CALL_DEOPT,
         };
+        // Same FuncProto does not make every dynamic activation equivalent: a
+        // closure created under direct eval carries a live EvalScope, and a
+        // realm-tagged closure needs OrdinaryCall's realm transition. These
+        // map checks are read-only and empty-map gated on the root-realm hot
+        // path, so every specialized decline remains a pure prefix.
+        if SAME_PROTO_ARROW2
+            && (fid != expected_fid
+                || closure == NO_CLOSURE
+                || expected_reg_count == 0
+                || (!self.realm_global_objs.is_empty() && self.current_realm_id().is_some())
+                || (!self.obj_realm.is_empty() && self.get_function_realm(cv) != 0)
+                || (!self.closure_eval_scope.is_empty()
+                    && self.closure_eval_scope.contains_key(&closure)))
+        {
+            return SELF_CALL_DEOPT;
+        }
+        if SAME_PROTO_ARROW2 && self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
         let (entry, uninit_mask, json_walk, markdown_inline) = match self.jit.cross_entry(fid) {
             Some(e) => e,
             None => return SELF_CALL_DEOPT,
@@ -358,7 +393,7 @@ impl<'p> Vm<'p> {
         // validates the complete graph and numeric globals, and commits no
         // effect on a decline, so falling through here re-runs instruction 0
         // exactly like any other guarded cross-call prefix.
-        if argc == 1 {
+        if !SAME_PROTO_ARROW2 && argc == 1 {
             if let Some(plan) = json_walk {
                 let root = Value::from_bits(unsafe { *args });
                 let reduced = {
@@ -390,15 +425,31 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        let proto = self.func(fid as usize);
-        if proto.lexical_this {
-            return SELF_CALL_DEOPT; // arrow: needs its captured `this` at reg 0
-        }
-        let reg_count = (proto.reg_count as usize).max(1);
-        let params = proto.param_count as usize;
+        let (lexical_this, is_strict, reg_count, params) = if SAME_PROTO_ARROW2 {
+            (true, true, expected_reg_count, 2)
+        } else {
+            let proto = self.func(fid as usize);
+            (
+                proto.lexical_this,
+                proto.is_strict,
+                (proto.reg_count as usize).max(1),
+                proto.param_count as usize,
+            )
+        };
         // OrdinaryCallBindThis for a plain `f()` (`this` = undefined): a strict
         // callee binds undefined; a sloppy one binds its realm's global object.
-        let this_v = if proto.is_strict {
+        let this_v = if lexical_this {
+            match self.heap.get(closure) {
+                HeapObj::Closure { func, this_val, .. } if *func == fid => *this_val,
+                _ => return SELF_CALL_DEOPT,
+            }
+        } else if let Some(recv) = method_this {
+            // The method-cross prefix admits only heap-object receivers. For an
+            // ordinary strict or sloppy function, OrdinaryCallBindThis therefore
+            // preserves that exact receiver (no primitive boxing/global
+            // substitution is needed). Arrows take the branch above instead.
+            recv
+        } else if is_strict {
             Value::UNDEFINED
         } else if self.global_this != 0 {
             Value::heap(self.callee_this_global(cv))
@@ -479,6 +530,8 @@ impl<'p> Vm<'p> {
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
         // SAFETY: `entry` is `fid`'s Tier-C win64 code (mmap'd, never moves);
         // the window has `reg_count` valid slots; vm is valid.
+        let prior_tierc_closure = std::mem::replace(&mut self.jit_tierc_closure, closure);
+        let prior_tierc_callee = std::mem::replace(&mut self.jit_tierc_callee, cv.heap_index());
         let (bits, bail) = {
             let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
             unsafe {
@@ -489,6 +542,8 @@ impl<'p> Vm<'p> {
                 (r, b)
             }
         };
+        self.jit_tierc_callee = prior_tierc_callee;
+        self.jit_tierc_closure = prior_tierc_closure;
         let out = if bail == crate::codegen::NO_BAIL {
             self.regs.truncate(new_base);
             bits
@@ -546,6 +601,210 @@ impl<'p> Vm<'p> {
         };
         self.jit_call_depth -= 1;
         out
+    }
+
+    /// Pure, allocation-free preflight for the direct own-data `CallMethod`
+    /// prefix. It returns `(cross-call packing, live callee bits, receiver bits)`
+    /// only when an existing IC OwnData way's hidden-class shape, exact slot/key
+    /// and descriptor still match and the LIVE slot value is a plain user
+    /// Func/Closure with a Tier-C entry. No IC fill, GC, allocation or user code
+    /// occurs here, so a panic/decline may safely replay the unchanged method op.
+    ///
+    /// Pointer validation deliberately uses integer bounds rather than
+    /// `offset_from`: malformed helper arguments fail closed instead of invoking
+    /// pointer-provenance UB. Generated code always supplies the pinned caller
+    /// window and its instruction-declared argument subwindow.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_cross_own_method_preflight(
+        &self,
+        caller_base_ptr: *const u64,
+        args: *const u64,
+        packed_fip: u64,
+    ) -> Option<(u64, u64, u64)> {
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = packed_fip as u32 as usize;
+        let proto = self.program.functions.get(func_id as usize).or_else(|| {
+            self.loader_module_func(func_id)
+                .then(|| self.func(func_id as usize))
+        })?;
+        let Instr::CallMethod {
+            obj,
+            name,
+            arg_base,
+            argc,
+            ..
+        } = *proto.code.get(ip)?
+        else {
+            return None;
+        };
+        let key = proto.string_constants.get(name as usize)?;
+        let caller_regs = proto.reg_count.max(1) as usize;
+        let obj = obj as usize;
+        let arg_base = arg_base as usize;
+        let argc = argc as usize;
+        if obj >= caller_regs
+            || arg_base > caller_regs
+            || argc > caller_regs.saturating_sub(arg_base)
+        {
+            return None;
+        }
+
+        let regs_start = self.regs.as_ptr() as usize;
+        let regs_bytes = self.regs.len().checked_mul(core::mem::size_of::<u64>())?;
+        let regs_end = regs_start.checked_add(regs_bytes)?;
+        let caller_addr = caller_base_ptr as usize;
+        if caller_addr < regs_start
+            || caller_addr > regs_end
+            || (caller_addr - regs_start) % core::mem::size_of::<u64>() != 0
+        {
+            return None;
+        }
+        let base = (caller_addr - regs_start) / core::mem::size_of::<u64>();
+        if caller_regs > self.regs.len().saturating_sub(base) {
+            return None;
+        }
+        let expected_args = caller_addr.checked_add(arg_base.checked_mul(8)?)?;
+        if args as usize != expected_args {
+            return None;
+        }
+
+        let recv = self.get(base, obj as u16);
+        let (fid, _closure, callee) =
+            self.ic_call_method_own_data_cached(func_id, ip, recv, key)?;
+        self.jit.cross_entry(fid)?;
+        let packed = argc as u64 | ((caller_regs as u64) << 16);
+        Some((packed, callee.bits(), recv.bits()))
+    }
+
+    /// Resolve a live `CallMethod` data property and, when its current value has
+    /// a Tier-C cross entry, dispatch it native-to-native with the receiver as
+    /// `this`. This is a pure prefix: accessors, proxies/exotics, primitives,
+    /// natives and non-callables decline before user code, after which generated
+    /// code runs the unchanged generic method helper.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_cross_method_call_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        args: *const u64,
+        packed_fip: u64,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+
+        let func_id = (packed_fip >> 32) as u32;
+        let ip = packed_fip as u32 as usize;
+        let (obj, name, arg_base, argc, caller_regs, key) = {
+            let proto = self.func(func_id as usize);
+            let Some(Instr::CallMethod {
+                obj,
+                name,
+                arg_base,
+                argc,
+                ..
+            }) = proto.code.get(ip).cloned()
+            else {
+                return SELF_CALL_DEOPT;
+            };
+            let Some(key) = proto.string_constants.get(name as usize) else {
+                return SELF_CALL_DEOPT;
+            };
+            (
+                obj,
+                name,
+                arg_base,
+                argc,
+                proto.reg_count.max(1),
+                key.clone(),
+            )
+        };
+
+        // The emitted helper owns both pointers and derives them from the same
+        // pinned frame window. Recheck their exact relationship before exposing
+        // a callee window; a malformed/stale call fails closed.
+        let expected_args = unsafe { caller_base_ptr.add(arg_base as usize) };
+        if args != expected_args {
+            return SELF_CALL_DEOPT;
+        }
+        let regs_base = self.regs.as_ptr() as *const u64;
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let recv = self.get(base, obj);
+        // A primitive method receiver needs strict/sloppy receiver conversion;
+        // leave that richer path to setup_call. The NanoID/ordinary-object lane
+        // and the common class/object method lane are heap receivers.
+        if !recv.is_heap() {
+            return SELF_CALL_DEOPT;
+        }
+        let Some((_fid, _closure, callee)) = self.ic_call_method(func_id, ip, recv, &key) else {
+            return SELF_CALL_DEOPT;
+        };
+        let packed = argc as u64 | ((caller_regs as u64) << 16);
+        let _ = name; // validated above through the live instruction/key lookup
+        self.jit_cross_call_impl::<false>(caller_base_ptr, args, packed, callee.bits(), Some(recv))
+    }
+
+    /// A semantics-guarded `CallMethodComputed` fast path for native MEMORY
+    /// regions. The guard is deliberately narrower than `get_index`: only a
+    /// canonical numeric key selecting an own, present dense-Array element can
+    /// pass, and that element must currently be a plain user Func/Closure.
+    /// Everything else returns before lookup/coercion/getter/prototype code can
+    /// run, so the interpreter may replay the instruction safely.
+    ///
+    /// The callee is re-read and resolved every invocation (array replacement
+    /// after warmup is observable), and `jit_frame_call` goes through
+    /// `setup_call`, which is load-bearing for an arrow's captured lexical
+    /// `this`. The array receiver is nevertheless supplied as the ordinary
+    /// method `this` for non-arrow functions.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn jit_region_call_computed_dense_impl(
+        &mut self,
+        caller_base_ptr: *const u64,
+        packed_fip: u64,
+        packed_args: u64,
+        argc: u16,
+    ) -> u64 {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            self.osr_deopt_exempt = true;
+            return SELF_CALL_DEOPT;
+        }
+
+        let ip = packed_fip as u32 as usize;
+        let obj_reg = (packed_args >> 32) as u16;
+        let key_reg = ((packed_args >> 16) & 0xFFFF) as u16;
+        let arg_base = (packed_args & 0xFFFF) as u16;
+        let regs_base = self.regs.as_ptr() as *const u64;
+        // SAFETY: the emitted region passes its pinned window base inside the
+        // non-reallocating register buffer, as every sibling call helper does.
+        let base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
+        let recv = self.get(base, obj_reg);
+        let key = self.get(base, key_reg);
+        if !recv.is_heap() {
+            return SELF_CALL_DEOPT;
+        }
+        let Some(index) = array_index(key) else {
+            return SELF_CALL_DEOPT;
+        };
+        let arr_idx = recv.heap_index();
+
+        // Arguments objects use an Array backing representation but a mapped
+        // index aliases the activation's formal register. Descriptor-backed or
+        // sparse indices in arr_props are authoritative over the dense slot.
+        // Both checks are read-only and precede every observable action.
+        if self.arguments_objs.contains_key(&arr_idx)
+            || self.array_index_override(arr_idx, index).is_some()
+        {
+            return SELF_CALL_DEOPT;
+        }
+        let callee = match self.heap.get(arr_idx) {
+            HeapObj::Array(items) => match items.get(index).copied() {
+                Some(v) if !v.is_hole() => v,
+                _ => return SELF_CALL_DEOPT,
+            },
+            _ => return SELF_CALL_DEOPT,
+        };
+        let Some((fid, closure)) = self.ic_plain_fn(callee) else {
+            return SELF_CALL_DEOPT;
+        };
+        self.jit_frame_call(fid, closure, recv, base, arg_base, argc, ip, callee)
     }
 
     /// The implementation behind the region call helpers `jit_call_method_ic` /
@@ -665,22 +924,55 @@ impl<'p> Vm<'p> {
             match self.ic_call(func_id, ip, cv) {
                 Some((fid, closure)) => (fid, closure, Value::UNDEFINED, cv),
                 None => {
-                    if jit_call_log() {
-                        eprintln!("[call] CALL MISS fn{func_id}@{ip}");
+                    // A site rotating through more than IC_WAYS plain
+                    // functions eventually disables its tiny identity cache.
+                    // Deopting the enclosing loop at that point made the same
+                    // call miss repeat until the whole region was evicted. A
+                    // direct discriminant read is the interpreter's ordinary
+                    // post-IC resolution for a live Func/Closure and is fully
+                    // dynamic: swapping in a native/proxy/bound/non-callable
+                    // value still takes the unchanged fallback below.
+                    if jit_poly_call_fallback_enabled() {
+                        if let Some((fid, closure)) = self.ic_plain_fn(cv) {
+                            (fid, closure, Value::UNDEFINED, cv)
+                        } else {
+                            if jit_call_log() {
+                                eprintln!("[call] CALL MISS fn{func_id}@{ip}");
+                            }
+                            // A plain NATIVE callee (parseInt, …): invoke via
+                            // call_value with this=undefined, exactly like the
+                            // interpreter's Call op. Everything else deopts.
+                            if cv.is_heap()
+                                && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
+                            {
+                                let argv: Vec<Value> =
+                                    (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                                return match self.call_value(cv, Value::UNDEFINED, &argv) {
+                                    Ok(v) => v.bits(),
+                                    Err(t) => self.jit_thrown_to_sentinel(t),
+                                };
+                            }
+                            return SELF_CALL_DEOPT;
+                        }
+                    } else {
+                        if jit_call_log() {
+                            eprintln!("[call] CALL MISS fn{func_id}@{ip}");
+                        }
+                        // A plain NATIVE callee (parseInt, …): invoke via
+                        // call_value with this=undefined, exactly like the
+                        // interpreter's Call op. Everything else deopts.
+                        if cv.is_heap()
+                            && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
+                        {
+                            let argv: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            return match self.call_value(cv, Value::UNDEFINED, &argv) {
+                                Ok(v) => v.bits(),
+                                Err(t) => self.jit_thrown_to_sentinel(t),
+                            };
+                        }
+                        return SELF_CALL_DEOPT;
                     }
-                    // A plain NATIVE callee (parseInt, …): invoke via
-                    // call_value with this=undefined, exactly like the
-                    // interpreter's Call op. Everything else deopts.
-                    if cv.is_heap() && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
-                    {
-                        let argv: Vec<Value> =
-                            (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                        return match self.call_value(cv, Value::UNDEFINED, &argv) {
-                            Ok(v) => v.bits(),
-                            Err(t) => self.jit_thrown_to_sentinel(t),
-                        };
-                    }
-                    return SELF_CALL_DEOPT;
                 }
             }
         };
@@ -961,6 +1253,14 @@ impl<'p> Vm<'p> {
     /// own-write correctly never reaches here.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn accessor_fast_get(&self, fid: u32, recv: Value) -> Option<u64> {
+        // This helper executes the getter's bytecode semantics without entering
+        // `run_loop`. Its callers do not own an exact nested-body charge, so a
+        // metered VM must fall through to method-inline/frame execution, both of
+        // which account for the getter body explicitly.
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return None;
+        }
         let field = self.simple_getter_field(fid)?;
         if !recv.is_heap() {
             return None;
@@ -1000,6 +1300,13 @@ impl<'p> Vm<'p> {
     /// (`own.is_none()`), which ran before this.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn accessor_fast_set(&mut self, fid: u32, recv: Value, val: Value) -> Option<u64> {
+        // As for the getter fast path, bypassing the setter frame would omit its
+        // body from the instruction budget. Decline before the write so the
+        // ordinary frame path performs and meters it exactly.
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return None;
+        }
         let (field, to_int32) = self.simple_setter_field(fid)?;
         if !recv.is_heap() {
             return None;
@@ -1056,4 +1363,109 @@ impl<'p> Vm<'p> {
     /// any heap allocation on the hot path.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) const MI_MAX_REGS: usize = 24;
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod own_method_preflight_tests {
+    use super::*;
+
+    fn fixture() -> (Vm<'static>, u32, usize, usize) {
+        let source = r#"
+            function random() { return 1; }
+            function call(o) { return o.random(); }
+            var result = call({ random: random });
+        "#;
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let program = Box::leak(Box::new(
+            crate::compile::compile_program(&ast, source).expect("source compiles"),
+        ));
+        let (fid, ip, arg_base) = program
+            .functions
+            .iter()
+            .enumerate()
+            .find_map(|(fid, proto)| {
+                proto
+                    .code
+                    .iter()
+                    .enumerate()
+                    .find_map(|(ip, instr)| match instr {
+                        Instr::CallMethod { arg_base, .. } => {
+                            Some((fid as u32, ip, *arg_base as usize))
+                        }
+                        _ => None,
+                    })
+            })
+            .expect("CallMethod site");
+        let reg_count = program.functions[fid as usize].reg_count.max(1) as usize;
+        let mut vm = Vm::new(program);
+        vm.regs = vec![Value::UNDEFINED; reg_count];
+        (vm, fid, ip, arg_base)
+    }
+
+    #[test]
+    fn malformed_helper_windows_and_sites_decline_without_dereference() {
+        let (vm, fid, ip, arg_base) = fixture();
+        let caller = vm.regs.as_ptr() as *const u64;
+        let args = caller.wrapping_add(arg_base);
+        let packed = ((fid as u64) << 32) | ip as u64;
+
+        assert_eq!(
+            vm.jit_cross_own_method_preflight(core::ptr::null(), args, packed),
+            None
+        );
+        assert_eq!(
+            vm.jit_cross_own_method_preflight(
+                caller,
+                (args as usize).wrapping_add(8) as *const u64,
+                packed,
+            ),
+            None
+        );
+        assert_eq!(
+            vm.jit_cross_own_method_preflight(caller, args, u64::MAX),
+            None
+        );
+        assert_eq!(
+            vm.jit_cross_own_method_preflight(
+                caller,
+                args,
+                ((fid as u64) << 32) | u32::MAX as u64,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_callmethod_registers_decline_before_reading_them() {
+        let source = "function call(o) { return o.random(); }";
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let mut program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let (fid, ip) = program
+            .functions
+            .iter()
+            .enumerate()
+            .find_map(|(fid, proto)| {
+                proto
+                    .code
+                    .iter()
+                    .position(|instr| matches!(instr, Instr::CallMethod { .. }))
+                    .map(|ip| (fid, ip))
+            })
+            .expect("CallMethod site");
+        let Instr::CallMethod { obj, .. } = &mut program.functions[fid].code[ip] else {
+            unreachable!()
+        };
+        *obj = u16::MAX;
+
+        let program = Box::leak(Box::new(program));
+        let reg_count = program.functions[fid].reg_count.max(1) as usize;
+        let mut vm = Vm::new(program);
+        vm.regs = vec![Value::UNDEFINED; reg_count];
+        let caller = vm.regs.as_ptr() as *const u64;
+        let packed = ((fid as u64) << 32) | ip as u64;
+        assert_eq!(
+            vm.jit_cross_own_method_preflight(caller, caller, packed),
+            None
+        );
+    }
 }

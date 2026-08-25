@@ -43,8 +43,11 @@
 //! an old-holder/young-value store, and every such store runs a write
 //! barrier (`Heap::write_barrier[_val]` at the enumerated VM chokepoints) or
 //! targets a registered scan root (`Heap::register_scan_root` — receivers
-//! JIT caches store into call-free), or lands in a VM side table, which the
-//! root walk re-scans wholesale each minor. W10 (B123) splits the barrier
+//! JIT caches store into call-free), or lands in a root-like VM side table,
+//! which the root walk re-scans wholesale each minor. Holder-keyed side tables
+//! such as `closure_home` and `closure_new_target` are directed edges instead:
+//! their record helpers run this same barrier and tracing visits the value only
+//! from a reachable holder. W10 (B123) splits the barrier
 //! disjunct in two: the value-tested form RECORDS Y' ITSELF (`Heap::vremset`,
 //! `GEN_VLOG`-deduped) and the minor marks it directly — no holder
 //! re-trace; the value-BLIND card form (`Heap::write_barrier` — batch
@@ -91,16 +94,15 @@ impl Vm<'_> {
     #[inline]
     pub(crate) fn gc_lock_guard(&mut self) -> GcGuard {
         self.gc_lock += 1;
-        GcGuard { lock: &mut self.gc_lock as *mut u32 }
+        GcGuard {
+            lock: &mut self.gc_lock as *mut u32,
+        }
     }
 
     /// Run a collection if one is due (or always, under stress) and it is safe.
     #[inline]
     pub(crate) fn maybe_gc(&mut self) {
-        if self.gc_lock == 0
-            && self.gc_floor != 0
-            && (self.heap.gc_requested() || self.gc_stress)
-        {
+        if self.gc_lock == 0 && self.gc_floor != 0 && (self.heap.gc_requested() || self.gc_stress) {
             self.gc();
         }
     }
@@ -130,6 +132,32 @@ impl Vm<'_> {
         if holder.is_heap() {
             self.store_barrier(site, holder.heap_index(), val);
         }
+    }
+
+    /// Record the internal `[[HomeObject]]` edge owned by an object-literal
+    /// function. The side table is storage only: liveness flows from a reachable
+    /// function KEY to its home VALUE, exactly as if the value were a field on
+    /// the function object. It is not a root in its own right.
+    #[inline]
+    pub(crate) fn record_closure_home(&mut self, closure: u32, home: Value) {
+        // The key may already be old when SetHomeObject runs (GC stress can
+        // collect between MakeFunc and the later SetHomeObject bytecode), while
+        // the home can still be young. Treat the side-table entry as a real
+        // holder edge so a minor cannot sweep the home out from under `super`.
+        self.store_barrier(crate::heap::gcoracle::CLOSURE_HOME, closure, home);
+        self.closure_home.insert(closure, home, self.heap.len());
+    }
+
+    /// Record an arrow closure's lexical `new.target`. Like `closure_home`, this
+    /// is a strong edge from the keyed closure, not an unconditional GC root.
+    #[inline]
+    pub(crate) fn record_closure_new_target(&mut self, closure: u32, new_target: Value) {
+        self.store_barrier(
+            crate::heap::gcoracle::CLOSURE_NEW_TARGET,
+            closure,
+            new_target,
+        );
+        self.closure_new_target.insert(closure, new_target);
     }
 
     fn gc(&mut self) {
@@ -213,12 +241,31 @@ impl Vm<'_> {
         for &v in &self.globals {
             root_val!(v);
         }
+        // Short interpreter string constants memoized by immutable
+        // (function, constant-slot). The cache is bounded and its Values are
+        // roots just like the region-embedded constant strings below.
+        for &v in self.const_string_cache.values() {
+            root_val!(v);
+        }
         // Strings interned at region-compile time whose bits are embedded in
         // native code (LoadConst immediates) — see `jit_const_strings`.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         for &v in &self.jit_const_strings {
             root_val!(v);
         }
+        // A frame-free Tier-C cross-call has no `Frame` entry for its closure.
+        // The caller's callee register normally roots it as well, but make the
+        // activation field an explicit root: helper re-entry may collect while
+        // native code is suspended, and captured-cell resolution must never see
+        // that live closure reclaimed/reused. `NO_CLOSURE` naturally fails the
+        // `i < n` check in `root_idx!`.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        root_idx!(self.jit_tierc_closure);
+        // The exact callable also carries the active realm and inherited
+        // EvalScope for a frame-free Tier-C activation. Keep it live across a
+        // helper safe point even though the caller register normally roots it.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        root_idx!(self.jit_tierc_callee);
         for v in self.class_values.iter().flatten() {
             root_val!(*v);
         }
@@ -262,12 +309,6 @@ impl Vm<'_> {
         }
         // Worker-side $262.agent.receiveBroadcast callback (invoked per broadcast).
         root_val!(self.broadcast_cb);
-        for v in self.closure_home.values() {
-            root_val!(*v);
-        }
-        for v in self.closure_new_target.values() {
-            root_val!(*v);
-        }
         for v in self.gen_callee.values() {
             root_val!(*v);
         }
@@ -299,7 +340,12 @@ impl Vm<'_> {
         }
         for mt in &self.microtasks {
             match mt {
-                Microtask::Reaction { callback, arg, dependent, .. } => {
+                Microtask::Reaction {
+                    callback,
+                    arg,
+                    dependent,
+                    ..
+                } => {
                     root_val!(*callback);
                     root_val!(*arg);
                     root_idx!(*dependent);
@@ -310,7 +356,17 @@ impl Vm<'_> {
                         Resume::Value(v) | Resume::Throw(v) | Resume::Return(v) => root_val!(*v),
                     }
                 }
-                Microtask::ThenableJob { thenable, then, promise } => {
+                Microtask::CombinatorStep {
+                    combinator, arg, ..
+                } => {
+                    root_idx!(*combinator);
+                    root_val!(*arg);
+                }
+                Microtask::ThenableJob {
+                    thenable,
+                    then,
+                    promise,
+                } => {
                     root_val!(*thenable);
                     root_val!(*then);
                     root_idx!(*promise);
@@ -631,7 +687,8 @@ impl Vm<'_> {
         // inherits the previous occupant's state (a fresh function would
         // report its name/length intrinsic deleted; a fresh array a frozen
         // length).
-        self.deleted_callable_intrinsics.retain(|&(k, _)| marks[k as usize]);
+        self.deleted_callable_intrinsics
+            .retain(|&(k, _)| marks[k as usize]);
         self.array_length_nonwritable.retain(|&k| marks[k as usize]);
         // Virtual lengths of sparse arrays (u32 values — nothing to trace; the
         // sparse ELEMENTS live in arr_props, rooted above).
@@ -658,13 +715,15 @@ impl Vm<'_> {
             for bs in self.instance_brand.values() {
                 live_brands.extend(bs.iter().copied());
             }
-            self.brand_private_names.retain(|b, _| live_brands.contains(b));
+            self.brand_private_names
+                .retain(|b, _| live_brands.contains(b));
         }
         self.shared_buffers.retain(|&k| marks[k as usize]);
         self.immutable_buffers.retain(|&k| marks[k as usize]);
         self.error_data.retain(|&k| marks[k as usize]);
         self.arguments_objs.retain(|&k, _| marks[k as usize]);
-        self.gen_args_obj.retain(|&k, &mut v| marks[k as usize] && marks[v as usize]);
+        self.gen_args_obj
+            .retain(|&k, &mut v| marks[k as usize] && marks[v as usize]);
         self.fn_name_cells.retain(|&k| marks[k as usize]);
         self.const_cells.retain(|&k| marks[k as usize]);
         self.gen_callee.retain(|&k, _| marks[k as usize]);
@@ -684,14 +743,28 @@ impl Vm<'_> {
         self.realm_globals.retain(|&k, _| marks[k as usize]);
 
         let free_after = self.heap.free_indices().len();
-        gcstats::record(stats, false, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
+        gcstats::record(
+            stats,
+            false,
+            n,
+            n - free_after,
+            swept,
+            t_start,
+            t_roots,
+            t_trace,
+            t_sweep,
+        );
         // Floated-swept estimate (stats only): what this major freed that was
         // NOT allocated in the current epoch — i.e. garbage the minors before
         // it had already been unable to reclaim. Read before `note_gc_done`
         // clears the young log.
         let swept_floated = if stats && self.heap.nursery_on() {
-            let swept_young =
-                self.heap.young_log().iter().filter(|&&i| !marks[i as usize]).count();
+            let swept_young = self
+                .heap
+                .young_log()
+                .iter()
+                .filter(|&&i| !marks[i as usize])
+                .count();
             (swept - swept_young) as u64
         } else {
             0
@@ -712,9 +785,11 @@ impl Vm<'_> {
     /// BOUNDARY nodes — pre-marked from the generation bytes, presumed live,
     /// never traced; the remembered set (this epoch's write-barrier hits) and
     /// the persistent scan roots (call-free JIT store targets) supply their
-    /// young referents, and the VM side tables are re-scanned wholesale by
-    /// the shared `mark_roots`. Cost is O(roots + young live + dirty edge
-    /// lists), independent of the old heap — the term the stage-1 full mark
+    /// young referents. Root-like VM side tables are re-scanned by the shared
+    /// `mark_roots`; keyed directed edges such as `closure_home` are traced
+    /// from their reachable holder instead. Cost is O(roots + young live +
+    /// dirty edge lists), independent of the old heap — the term the stage-1
+    /// full mark
     /// still paid on every minor (B120's refutation), and the whole
     /// economics flip of stage 3: regex-log-scan's ~128ms/run of 95.8%-old
     /// trace work simply stops happening at minors.
@@ -792,7 +867,17 @@ impl Vm<'_> {
         self.heap.remset_reset();
         self.heap.vremset_reset();
         let free_after = self.heap.free_indices().len();
-        gcstats::record(stats, true, n, n - free_after, swept, t_start, t_roots, t_trace, t_sweep);
+        gcstats::record(
+            stats,
+            true,
+            n,
+            n - free_after,
+            swept,
+            t_start,
+            t_roots,
+            t_trace,
+            t_sweep,
+        );
         gcstats::record_minor(swept as u64, dirty.len() as u64, n);
         gcstats::record_budget(self.heap.young_budget() as u64);
         self.heap.note_minor_done(n - free_after);
@@ -915,7 +1000,8 @@ impl Vm<'_> {
         // Tuple-keyed — cannot be removed by slot alone; the set holds at
         // most a few deleted name/length intrinsics, so scan it.
         if !self.deleted_callable_intrinsics.is_empty() {
-            self.deleted_callable_intrinsics.retain(|&(k, _)| !freed_bits[k as usize]);
+            self.deleted_callable_intrinsics
+                .retain(|&(k, _)| !freed_bits[k as usize]);
         }
         prune_set!(self.array_length_nonwritable);
         prune_slots!(self.array_js_len);
@@ -951,7 +1037,8 @@ impl Vm<'_> {
             for bs in self.instance_brand.values() {
                 live_brands.extend(bs.iter().copied());
             }
-            self.brand_private_names.retain(|b, _| live_brands.contains(b));
+            self.brand_private_names
+                .retain(|b, _| live_brands.contains(b));
         }
         prune_set!(self.shared_buffers);
         prune_set!(self.immutable_buffers);
@@ -968,7 +1055,7 @@ impl Vm<'_> {
         prune_map!(self.gen_callee);
         prune_set!(self.module_body_results);
         prune_map!(self.module_namespaces);
-        prune_map!(self.closure_home);
+        self.closure_home.prune_freed(freed, &freed_bits);
         prune_map!(self.closure_new_target);
         prune_map!(self.dispose_stacks);
         prune_map!(self.regexp_exact_source);
@@ -1239,6 +1326,286 @@ impl Vm<'_> {
                 }
             }
         }
+
+        // These side tables represent internal fields of the keyed function.
+        // Trace them only when that function is itself reachable. Rooting every
+        // value from `mark_roots` makes a dead object-literal method cycle
+        // immortal: home -> method (own property), method -> home (this table).
+        if let Some(&home) = self.closure_home.get(&idx) {
+            m_val!(home);
+        }
+        if let Some(&new_target) = self.closure_new_target.get(&idx) {
+            m_val!(new_target);
+        }
+    }
+}
+
+#[cfg(test)]
+mod closure_side_table_gc_tests {
+    use super::*;
+    use crate::heap::{HeapObj, ObjMap};
+    use crate::vm::ClosureHomeTable;
+
+    fn program_with_keep_global() -> crate::bytecode::Program {
+        let src = "var keep;";
+        let ast = crate::front::parse_script(src).expect("source parses");
+        crate::compile::compile_program(&ast, src).expect("source compiles")
+    }
+
+    fn keep_slot(program: &crate::bytecode::Program) -> usize {
+        program
+            .global_names
+            .iter()
+            .position(|name| name == "keep")
+            .expect("keep global")
+    }
+
+    fn object_owning(method: u32) -> HeapObj {
+        let mut map = ObjMap::with_capacity(1);
+        map.push_data("method".into(), Value::heap(method));
+        HeapObj::Object(Box::new(map))
+    }
+
+    fn home_tables() -> [(&'static str, ClosureHomeTable); 2] {
+        [
+            ("dense", ClosureHomeTable::dense_for_test()),
+            ("map", ClosureHomeTable::map_for_test()),
+        ]
+    }
+
+    #[test]
+    fn dense_home_presence_is_not_a_value_sentinel() {
+        let mut table = ClosureHomeTable::dense_for_test();
+
+        // `undefined` is a real stored edge. Presence, replacement and length
+        // must therefore not depend on any distinguished Value bit pattern.
+        assert_eq!(table.insert(1, Value::UNDEFINED, 130), None);
+        assert_eq!(table.get(&1), Some(&Value::UNDEFINED));
+        assert_eq!(table.len(), 1);
+
+        assert_eq!(table.insert(65, Value::int(7), 130), None);
+        assert_eq!(table.insert(65, Value::int(8), 130), Some(Value::int(7)));
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.remove(&1), Some(Value::UNDEFINED));
+        assert!(!table.contains_key(&1));
+        assert_eq!(table.len(), 1);
+
+        // Exercise a third bitmap word and both retain outcomes. Removed slots
+        // clear the bit and their stale bits; retained values remain mutable,
+        // matching HashMap::retain's contract used by major GC.
+        assert_eq!(table.insert(129, Value::int(9), 130), None);
+        table.retain(|&key, value| {
+            if key == 129 {
+                *value = Value::int(10);
+                true
+            } else {
+                false
+            }
+        });
+        assert!(!table.contains_key(&65));
+        assert_eq!(table.get(&129), Some(&Value::int(10)));
+        assert_eq!(table.len(), 1);
+
+        let ClosureHomeTable::Dense(dense) = table else {
+            unreachable!()
+        };
+        assert_eq!(dense.values[1], Value::UNDEFINED);
+        assert_eq!(dense.values[65], Value::UNDEFINED);
+        assert_ne!(dense.present[0] & (1 << 1), 1 << 1);
+        assert_ne!(dense.present[1] & (1 << 1), 1 << 1);
+        assert_eq!(dense.present[2] & (1 << 1), 1 << 1);
+    }
+
+    #[test]
+    fn dead_method_home_cycle_is_collected() {
+        for (label, table) in home_tables() {
+            let program = program_with_keep_global();
+            let mut vm = Vm::new(&program);
+            vm.run().expect("program runs");
+            vm.closure_home = table;
+            // Force a major so the assertion tests the complete graph,
+            // independent of the process-wide nursery environment.
+            vm.heap.set_nursery(false);
+
+            let method = vm.heap.alloc(HeapObj::Func(0));
+            let home = vm.heap.alloc(object_owning(method));
+            vm.record_closure_home(method, Value::heap(home));
+
+            vm.gc();
+
+            assert!(vm.heap.free_indices().contains(&method), "{label}");
+            assert!(vm.heap.free_indices().contains(&home), "{label}");
+            assert!(!vm.closure_home.contains_key(&method), "{label}");
+        }
+    }
+
+    #[test]
+    fn reachable_old_method_keeps_young_home_across_minor() {
+        for (label, table) in home_tables() {
+            let program = program_with_keep_global();
+            let slot = keep_slot(&program);
+            let mut vm = Vm::new(&program);
+            vm.run().expect("program runs");
+            vm.closure_home = table;
+            vm.heap.set_nursery(true);
+
+            let method = vm.heap.alloc(HeapObj::Func(0));
+            vm.globals[slot] = Value::heap(method);
+            vm.gc(); // rooted survivor is now old
+
+            let home = vm.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+            vm.record_closure_home(method, Value::heap(home));
+            vm.gc(); // must see the side-table write barrier
+
+            assert!(!vm.heap.free_indices().contains(&method), "{label}");
+            assert!(!vm.heap.free_indices().contains(&home), "{label}");
+            assert_eq!(
+                vm.closure_home.get(&method),
+                Some(&Value::heap(home)),
+                "{label}"
+            );
+
+            // Once the only true root disappears, the directed edge must not
+            // turn back into a root: a following major reclaims both endpoints.
+            vm.globals[slot] = Value::UNDEFINED;
+            vm.heap.set_nursery(false);
+            vm.gc();
+            assert!(vm.heap.free_indices().contains(&method), "{label}");
+            assert!(vm.heap.free_indices().contains(&home), "{label}");
+        }
+    }
+
+    #[test]
+    fn extracted_no_super_method_keeps_home_for_weak_observation_across_major() {
+        let src = r#"
+            var keep, observer, registry;
+            function build() { return { plain() { return 1; } }; }
+        "#;
+        let ast = crate::front::parse_script(src).expect("source parses");
+        let program = crate::compile::compile_program(&ast, src).expect("source compiles");
+        let slot = |name: &str| {
+            program
+                .global_names
+                .iter()
+                .position(|candidate| candidate == name)
+                .unwrap_or_else(|| panic!("global {name}"))
+        };
+        let method_func = program
+            .functions
+            .iter()
+            .position(|proto| proto.name == "plain")
+            .expect("plain method proto") as u32;
+
+        for (label, table) in home_tables() {
+            let mut vm = Vm::new(&program);
+            vm.run().expect("program runs");
+            vm.closure_home = table;
+            vm.heap.set_nursery(false);
+
+            let method = vm.heap.alloc(HeapObj::Func(method_func));
+            let home = vm.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+            vm.record_closure_home(method, Value::heap(home));
+            vm.globals[slot("keep")] = Value::heap(method);
+
+            // Registering is a weak-observer-style operation: the registry is
+            // rooted, but its target is deliberately not. The method's internal
+            // [[HomeObject]] edge must therefore keep `home` alive even though
+            // this method's bytecode contains no `super`.
+            let cleanup = vm.heap.alloc(HeapObj::Func(0));
+            let registry = vm.heap.alloc(HeapObj::FinalizationRegistry {
+                cleanup: Value::heap(cleanup),
+                tokens: Vec::new(),
+            });
+            vm.globals[slot("registry")] = Value::heap(registry);
+            vm.finreg_method(
+                Value::heap(registry),
+                "register",
+                &[Value::heap(home), Value::int(7)],
+            )
+            .expect("register accepts the home");
+
+            vm.gc();
+            assert!(!vm.heap.free_indices().contains(&home), "{label}");
+            assert_eq!(
+                vm.closure_home.get(&method),
+                Some(&Value::heap(home)),
+                "{label}"
+            );
+
+            // The current WeakRef implementation conservatively keeps its
+            // target strong. This second phase still pins the future contract:
+            // once WeakRef becomes truly weak, the already-rooted method edge
+            // above must continue to make deref observe `home` after a major.
+            let observer = vm.heap.alloc(HeapObj::WeakRef(Value::heap(home)));
+            vm.globals[slot("observer")] = Value::heap(observer);
+            vm.gc();
+            assert!(
+                matches!(
+                    vm.heap.get(observer),
+                    HeapObj::WeakRef(target) if *target == Value::heap(home)
+                ),
+                "{label}"
+            );
+            assert!(!vm.heap.free_indices().contains(&home), "{label}");
+        }
+    }
+
+    #[test]
+    fn reclaimed_method_slot_never_inherits_a_stale_home() {
+        for nursery in [false, true] {
+            for (label, table) in home_tables() {
+                let program = program_with_keep_global();
+                let mut vm = Vm::new(&program);
+                vm.run().expect("program runs");
+                vm.closure_home = table;
+                vm.heap.set_nursery(nursery);
+
+                let method = vm.heap.alloc(HeapObj::Func(0));
+                let home = vm.heap.alloc(object_owning(method));
+                vm.record_closure_home(method, Value::heap(home));
+                vm.gc();
+                assert!(
+                    vm.heap.free_indices().contains(&method),
+                    "{label}/{nursery}"
+                );
+                assert!(!vm.closure_home.contains_key(&method), "{label}/{nursery}");
+
+                let mut reused = false;
+                for _ in 0..4 {
+                    let fresh = vm.heap.alloc(HeapObj::Func(0));
+                    if fresh == method {
+                        reused = true;
+                        assert!(
+                            !vm.closure_home.contains_key(&fresh),
+                            "{label}/{nursery}: recycled slot inherited its old home"
+                        );
+                        break;
+                    }
+                }
+                assert!(
+                    reused,
+                    "{label}/{nursery}: fixture did not reuse method slot"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn closure_new_target_is_a_keyed_edge_not_a_root() {
+        let program = program_with_keep_global();
+        let mut vm = Vm::new(&program);
+        vm.run().expect("program runs");
+        vm.heap.set_nursery(false);
+
+        let arrow = vm.heap.alloc(HeapObj::Func(0));
+        let new_target = vm.heap.alloc(object_owning(arrow));
+        vm.record_closure_new_target(arrow, Value::heap(new_target));
+
+        vm.gc();
+
+        assert!(vm.heap.free_indices().contains(&arrow));
+        assert!(vm.heap.free_indices().contains(&new_target));
+        assert!(!vm.closure_new_target.contains_key(&arrow));
     }
 }
 
@@ -1253,7 +1620,7 @@ impl Vm<'_> {
 ///
 /// Off, this costs one relaxed atomic load per collection.
 mod gcstats {
-    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
     use std::time::Instant;
 
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -1507,6 +1874,6 @@ mod nursery_verify {
 }
 
 pub use gcstats::dump as gc_stats;
-pub use gcstats::dump_gen as gc_gen_stats;
 pub use gcstats::dump_budget as gc_young_budget_stats;
+pub use gcstats::dump_gen as gc_gen_stats;
 pub use gcstats::dump_nursery as gc_nursery_stats;

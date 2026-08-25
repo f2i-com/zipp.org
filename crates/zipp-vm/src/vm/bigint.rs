@@ -279,7 +279,12 @@ impl<'p> Vm<'p> {
     /// then BigInt math when both are BigInts, Number math when neither is,
     /// and the spec's mixing TypeError otherwise. This runs ToPrimitive at
     /// most ONCE per operand (the caller must not re-coerce).
-    pub(crate) fn numeric_binop(&mut self, op: BigOp, va: Value, vb: Value) -> Result<Value, Thrown> {
+    pub(crate) fn numeric_binop(
+        &mut self,
+        op: BigOp,
+        va: Value,
+        vb: Value,
+    ) -> Result<Value, Thrown> {
         // GC INVARIANT: `pa` (possibly a fresh primitive from va's valueOf) is
         // held in a Rust local — unrooted — while vb's coercion runs user code.
         let _gc = self.gc_lock_guard();
@@ -287,7 +292,9 @@ impl<'p> Vm<'p> {
         // ToNumeric(lval) COMPLETES (a Symbol is a TypeError) before rval's
         // observable coercion runs, per evaluation order.
         if pa.is_heap() && matches!(self.heap.get(pa.heap_index()), HeapObj::Symbol { .. }) {
-            return Err(Thrown("TypeError: Cannot convert a Symbol value to a number".into()));
+            return Err(Thrown(
+                "TypeError: Cannot convert a Symbol value to a number".into(),
+            ));
         }
         let pb = self.numeric_prim(vb)?;
         let ab = self.bigint_val(pa);
@@ -321,13 +328,9 @@ impl<'p> Vm<'p> {
                 };
                 Value::num(p)
             }
-            BigOp::And => {
-                Value::int(to_int32(self.to_number(pa)?) & to_int32(self.to_number(pb)?))
-            }
+            BigOp::And => Value::int(to_int32(self.to_number(pa)?) & to_int32(self.to_number(pb)?)),
             BigOp::Or => Value::int(to_int32(self.to_number(pa)?) | to_int32(self.to_number(pb)?)),
-            BigOp::Xor => {
-                Value::int(to_int32(self.to_number(pa)?) ^ to_int32(self.to_number(pb)?))
-            }
+            BigOp::Xor => Value::int(to_int32(self.to_number(pa)?) ^ to_int32(self.to_number(pb)?)),
             // Shift counts use the low 5 bits per the JS spec.
             BigOp::Shl => {
                 let x = to_int32(self.to_number(pa)?);

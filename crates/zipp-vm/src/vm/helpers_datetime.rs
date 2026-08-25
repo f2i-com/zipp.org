@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -245,7 +245,7 @@ pub(crate) fn ambiguous_with_date(s: &str) -> bool {
     match b.len() {
         4 if alld(b) => vmd(two(&b[0..2]), two(&b[2..4])), // MMDD
         5 if b[2] == b'-' && alld(&b[0..2]) && alld(&b[3..5]) => vmd(two(&b[0..2]), two(&b[3..5])), // MM-DD
-        6 if alld(b) => vm(two(&b[4..6])),                 // YYYYMM
+        6 if alld(b) => vm(two(&b[4..6])), // YYYYMM
         7 if b[4] == b'-' && alld(&b[0..4]) && alld(&b[5..7]) => vm(two(&b[5..7])), // YYYY-MM
         _ => false,
     }
@@ -356,8 +356,16 @@ pub(crate) fn parse_offset_ns(s: &str) -> Option<i128> {
         return None;
     }
     let h: i128 = digits[..2].parse().ok()?;
-    let mi: i128 = if digits.len() >= 4 { digits[2..4].parse().ok()? } else { 0 };
-    let sec: i128 = if digits.len() >= 6 { digits[4..6].parse().ok()? } else { 0 };
+    let mi: i128 = if digits.len() >= 4 {
+        digits[2..4].parse().ok()?
+    } else {
+        0
+    };
+    let sec: i128 = if digits.len() >= 6 {
+        digits[4..6].parse().ok()?
+    } else {
+        0
+    };
     let frac_digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
     if frac_digits.len() > 9 {
         return None;
@@ -598,10 +606,34 @@ fn exact_decimal(x: f64) -> (String, String) {
 /// their half- forms depend on the sign, the rest do not.
 fn fold_rounding_mode(mode: &str, neg: bool) -> &'static str {
     match mode {
-        "ceil" => if neg { "trunc" } else { "expand" },
-        "floor" => if neg { "expand" } else { "trunc" },
-        "halfCeil" => if neg { "halfTrunc" } else { "halfExpand" },
-        "halfFloor" => if neg { "halfExpand" } else { "halfTrunc" },
+        "ceil" => {
+            if neg {
+                "trunc"
+            } else {
+                "expand"
+            }
+        }
+        "floor" => {
+            if neg {
+                "expand"
+            } else {
+                "trunc"
+            }
+        }
+        "halfCeil" => {
+            if neg {
+                "halfTrunc"
+            } else {
+                "halfExpand"
+            }
+        }
+        "halfFloor" => {
+            if neg {
+                "halfExpand"
+            } else {
+                "halfTrunc"
+            }
+        }
         "expand" => "expand",
         "trunc" => "trunc",
         "halfTrunc" => "halfTrunc",
@@ -642,14 +674,22 @@ fn bump(digits: &mut Vec<u8>) {
 /// (negative k rounds the integer part to tens/hundreds/…), returning the digit
 /// string scaled to exactly `k` fraction places when k ≥ 0.
 fn round_decimal_at(int_s: &str, frac_s: &str, k: i64, mode: &str) -> (String, String) {
-    let all: Vec<u8> = int_s.bytes().chain(frac_s.bytes()).map(|b| b - b'0').collect();
+    let all: Vec<u8> = int_s
+        .bytes()
+        .chain(frac_s.bytes())
+        .map(|b| b - b'0')
+        .collect();
     let point = int_s.len() as i64;
     let keep = (point + k).max(0) as usize;
     let mut kept: Vec<u8> = all.iter().copied().take(keep).collect();
     while kept.len() < keep {
         kept.push(0);
     }
-    let rest = if keep < all.len() { &all[keep..] } else { &[][..] };
+    let rest = if keep < all.len() {
+        &all[keep..]
+    } else {
+        &[][..]
+    };
     let nonzero = rest.iter().any(|d| *d != 0);
     let cmp = match rest.first() {
         None => std::cmp::Ordering::Less,
@@ -686,7 +726,14 @@ fn round_decimal_at(int_s: &str, frac_s: &str, k: i64, mode: &str) -> (String, S
         s.insert(0, '0');
     }
     let (i, f) = s.split_at(ip.min(s.len()));
-    (if i.is_empty() { "0".to_string() } else { i.to_string() }, f.to_string())
+    (
+        if i.is_empty() {
+            "0".to_string()
+        } else {
+            i.to_string()
+        },
+        f.to_string(),
+    )
 }
 
 /// The decimal exponent of the most significant digit (1 for "1.5", 0 for
@@ -704,10 +751,20 @@ fn decimal_exponent(int_s: &str, frac_s: &str) -> i64 {
 /// Round to a multiple of `inc` at fraction position `k`. The scaled value is
 /// held in i128, which covers every roundingIncrement the spec allows against a
 /// realistic magnitude; anything wider falls back to plain rounding.
-fn round_to_increment(int_s: &str, frac_s: &str, k: i64, inc: i64, mode: &str) -> Option<(String, String)> {
+fn round_to_increment(
+    int_s: &str,
+    frac_s: &str,
+    k: i64,
+    inc: i64,
+    mode: &str,
+) -> Option<(String, String)> {
     let k = k.max(0) as usize;
     let mut scaled = String::from(int_s);
-    let f: String = frac_s.chars().chain(std::iter::repeat('0')).take(k).collect();
+    let f: String = frac_s
+        .chars()
+        .chain(std::iter::repeat('0'))
+        .take(k)
+        .collect();
     scaled.push_str(&f);
     let q: i128 = scaled.trim_start_matches('0').parse().unwrap_or(0);
     let rest = &frac_s[k.min(frac_s.len())..];
@@ -731,7 +788,11 @@ fn round_to_increment(int_s: &str, frac_s: &str, k: i64, inc: i64, mode: &str) -
         std::cmp::Ordering::Less
     } else if d == 0 {
         // Midpoint is exactly at digit position k: any dropped tail is above it.
-        if rest_nonzero { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
+        if rest_nonzero {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
     } else {
         // d == 1: the midpoint is `off` + 0.5, so compare the dropped tail
         // `0.rest` against one half.
@@ -745,7 +806,11 @@ fn round_to_increment(int_s: &str, frac_s: &str, k: i64, inc: i64, mode: &str) -
     };
     let nonzero = off != 0 || rest_nonzero;
     let last_odd = (lo / inc) % 2 == 1;
-    let v = if round_up(mode, nonzero, cmp, last_odd) { lo + inc } else { lo };
+    let v = if round_up(mode, nonzero, cmp, last_odd) {
+        lo + inc
+    } else {
+        lo
+    };
     let mut s = v.to_string();
     while s.len() <= k {
         s.insert(0, '0');
@@ -787,7 +852,11 @@ fn compact_exponent(magnitude: i64, display: &str) -> i64 {
             let zeros = pat.bytes().filter(|b| *b == b'0').count() as i64;
             // A row of bare "0" means the locale does not compact at that
             // magnitude at all.
-            if zeros == 0 { 0 } else { power as i64 - (zeros - 1) }
+            if zeros == 0 {
+                0
+            } else {
+                power as i64 - (zeros - 1)
+            }
         }
         None => 0,
     }
@@ -798,7 +867,9 @@ fn compact_exponent(magnitude: i64, display: &str) -> i64 {
 /// mantissa selects (`en`'s cardinal rule is `i = 1 and v = 0`).
 fn compact_affix(exponent: i64, int_s: &str, frac_s: &str, display: &str) -> &'static str {
     let magnitude = exponent + decimal_exponent(int_s, frac_s) - 1;
-    let Some((power, _)) = compact_row(magnitude, display) else { return "" };
+    let Some((power, _)) = compact_row(magnitude, display) else {
+        return "";
+    };
     let one = int_s.trim_start_matches('0') == "1" && frac_s.is_empty();
     let want = if one { "one" } else { "other" };
     let row = compact_table(display)
@@ -824,7 +895,11 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
         let sign = match p.sign_display {
             "never" => "",
             "always" => {
-                if neg { "-" } else { "+" }
+                if neg {
+                    "-"
+                } else {
+                    "+"
+                }
             }
             "exceptZero" => {
                 if zero || nan {
@@ -836,10 +911,18 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
                 }
             }
             "negative" => {
-                if neg && !zero && !nan { "-" } else { "" }
+                if neg && !zero && !nan {
+                    "-"
+                } else {
+                    ""
+                }
             }
             _ => {
-                if neg { "-" } else { "" }
+                if neg {
+                    "-"
+                } else {
+                    ""
+                }
             }
         };
         format!("{sign}{body}")
@@ -852,7 +935,11 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
         x *= 100.0;
     }
     if x.is_infinite() {
-        let body = if p.style == "percent" { "∞%".to_string() } else { "∞".to_string() };
+        let body = if p.style == "percent" {
+            "∞%".to_string()
+        } else {
+            "∞".to_string()
+        };
         return decorate(body, neg, false, false);
     }
     let mode = fold_rounding_mode(p.rounding_mode, neg);
@@ -864,7 +951,11 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
     let magnitude: Option<i64> = match p.notation {
         "scientific" | "engineering" | "compact" => {
             let is_zero_in = int_s.bytes().all(|b| b == b'0') && frac_s.bytes().all(|b| b == b'0');
-            Some(if is_zero_in { 0 } else { decimal_exponent(&int_s, &frac_s) - 1 })
+            Some(if is_zero_in {
+                0
+            } else {
+                decimal_exponent(&int_s, &frac_s) - 1
+            })
         }
         _ => None,
     };
@@ -911,7 +1002,11 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
         // `-k_sig ≤ -max_frac`, i.e. `k_sig ≥ max_frac`; morePrecision takes the
         // significant candidate then, lessPrecision takes the other one.
         (Some(kf), Some(ks)) => {
-            if p.rounding_priority == "lessPrecision" { ks < kf } else { ks >= kf }
+            if p.rounding_priority == "lessPrecision" {
+                ks < kf
+            } else {
+                ks >= kf
+            }
         }
         (None, Some(_)) => true,
         _ => false,
@@ -926,7 +1021,9 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
     // that won, so a morePrecision result rounded to significant digits pads to
     // `minimumSignificantDigits` and not to `minimumFractionDigits`.
     let min_frac = if use_sig {
-        p.min_sig.map(|sd| (sd - decimal_exponent(&ip, &fp)).max(0)).unwrap_or(0)
+        p.min_sig
+            .map(|sd| (sd - decimal_exponent(&ip, &fp)).max(0))
+            .unwrap_or(0)
     } else {
         p.min_frac.unwrap_or(0)
     };
@@ -968,8 +1065,11 @@ pub(crate) fn format_number_intl(n: f64, p: &NumFmtParams) -> String {
     // "10" and stays thousand, but 999.9 thousand rounds to "1000" and the
     // exponent recomputation above has already moved it), so capture it before
     // the integer part is consumed by grouping.
-    let compact_aff =
-        if compact { exponent.map(|e| compact_affix(e, &ip, &fp, p.compact_display)) } else { None };
+    let compact_aff = if compact {
+        exponent.map(|e| compact_affix(e, &ip, &fp, p.compact_display))
+    } else {
+        None
+    };
     // The scientific/engineering pattern has no grouping separators; the compact
     // one keeps them (its mantissa is an ordinary number).
     let min_group_len = if p.group_min2 { 5 } else { 4 };
@@ -1028,12 +1128,19 @@ fn shift_decimal(int_s: &str, frac_s: &str, e: i64) -> (String, String) {
         let pad = "0".repeat(point as usize - digits.len());
         (format!("{digits}{pad}"), String::new())
     } else {
-        (digits[..point as usize].to_string(), digits[point as usize..].to_string())
+        (
+            digits[..point as usize].to_string(),
+            digits[point as usize..].to_string(),
+        )
     };
     // "0.000345" shifted by -6 is "0000345"; the mantissa must read "345"
     // (minimumIntegerDigits re-pads afterwards if it asks for more).
     let trimmed = int.trim_start_matches('0');
-    let int = if trimmed.is_empty() { "0".to_string() } else { trimmed.to_string() };
+    let int = if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    };
     (int, frac)
 }
 
@@ -1060,7 +1167,10 @@ pub(crate) fn currency_symbol(code: &str) -> String {
 fn pattern_infix(p: &str) -> &str {
     let (pre, rest) = p.split_once("{0}").unwrap_or(("", p));
     let (mid, post) = rest.split_once("{1}").unwrap_or((rest, ""));
-    debug_assert!(pre.is_empty() && post.is_empty(), "list pattern with affixes: {p}");
+    debug_assert!(
+        pre.is_empty() && post.is_empty(),
+        "list pattern with affixes: {p}"
+    );
     mid
 }
 
@@ -1072,11 +1182,19 @@ fn pattern_infix(p: &str) -> &str {
 /// The widths were previously all collapsed onto `long` for want of data, which
 /// is why `en-US` `short` printed "foo and bar" where CLDR says "foo & bar"
 /// (`ListFormat/prototype/{format,formatToParts}/en-us-short.js`).
-pub(crate) fn list_parts_en(items: &[String], ty: &str, style: &str) -> Vec<(&'static str, String)> {
+pub(crate) fn list_parts_en(
+    items: &[String],
+    ty: &str,
+    style: &str,
+) -> Vec<(&'static str, String)> {
     let row = crate::vm::cldr_en::LIST_PATTERNS
         .iter()
         .find(|(t, s, ..)| *t == ty && *s == style)
-        .or_else(|| crate::vm::cldr_en::LIST_PATTERNS.iter().find(|(t, s, ..)| *t == ty && *s == "long"));
+        .or_else(|| {
+            crate::vm::cldr_en::LIST_PATTERNS
+                .iter()
+                .find(|(t, s, ..)| *t == ty && *s == "long")
+        });
     let (two, start, middle, end) = match row {
         Some((_, _, two, start, middle, end)) => (
             pattern_infix(two),
@@ -1185,7 +1303,11 @@ pub(crate) fn duration_fractional_decimal(d: &[f64; 10], exponent: u32) -> Optio
 /// Normalize a Temporal unit option: strip a trailing plural "s"; "auto"→`auto_to`.
 pub(crate) fn normalize_unit(u: &str, auto_to: &str) -> String {
     let base = u.strip_suffix('s').unwrap_or(u);
-    if base == "auto" { auto_to.to_string() } else { base.to_string() }
+    if base == "auto" {
+        auto_to.to_string()
+    } else {
+        base.to_string()
+    }
 }
 
 /// DifferenceISODate: the duration FROM date1 TO date2 as [years,months,weeks,days]
@@ -1225,7 +1347,12 @@ pub(crate) fn difference_datetime(dt1: [i64; 9], dt2: [i64; 9], largest: &str) -
         let day_diff = iso_to_epoch_days(date2.0, date2.1, date2.2) - e1;
         let total = (day_diff as i128) * DAY_NS + time_diff;
         let units = [
-            3_600_000_000_000i128, 60_000_000_000, 1_000_000_000, 1_000_000, 1_000, 1,
+            3_600_000_000_000i128,
+            60_000_000_000,
+            1_000_000_000,
+            1_000_000,
+            1_000,
+            1,
         ];
         let start = match largest {
             "hour" => 0,
@@ -1280,7 +1407,15 @@ pub(crate) fn format_time_part(t: &[i64; 6], digits: i32, omit_sec: bool) -> Str
 
 /// The ten Temporal duration units (singular), largest to smallest.
 pub(crate) const DURATION_UNITS: &[&str] = &[
-    "year", "month", "week", "day", "hour", "minute", "second", "millisecond", "microsecond",
+    "year",
+    "month",
+    "week",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+    "microsecond",
     "nanosecond",
 ];
 
@@ -1411,7 +1546,9 @@ pub(crate) fn balance_duration_ns(total_ns: i128, largest: &str) -> Result<[f64;
     // largest field can land exactly on the 2^53-seconds limit even when the
     // exact total was just below it.
     if !is_valid_duration(&f) {
-        return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+        return Err(Thrown(
+            "RangeError: Temporal.Duration value out of range".into(),
+        ));
     }
     Ok(f)
 }
@@ -1933,7 +2070,9 @@ mod rational_to_f64_tests {
         // gives deterministic coverage of the rounding/tie logic.
         let mut s: u64 = 0x9E3779B97F4A7C15;
         let mut next = || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (s >> 11) as i128 // 53 random-ish bits
         };
         for _ in 0..200_000 {
@@ -1962,13 +2101,18 @@ mod rational_to_f64_tests {
         // The exact rationals from the failing Duration.total precision tests; the
         // expected values are the single correctly-rounded doubles.
         // 4000 h + 1 ns, in hours.
-        assert_eq!(rational_to_f64(14_400_000_000_000_001, 3_600_000_000_000), 4000.000_000_000_000_5);
+        assert_eq!(
+            rational_to_f64(14_400_000_000_000_001, 3_600_000_000_000),
+            4000.000_000_000_000_5
+        );
         // (2^51 s + 200 ms) totalled in seconds → the .2 fraction vanishes at that
         // magnitude (ULP is 0.5, so it rounds down to even).
         let ns = (1i128 << 51) * 1_000_000_000 + 200_000_000;
         assert_eq!(rational_to_f64(ns, 1_000_000_000), 2_251_799_813_685_248.0);
         // A large numerator that the naive double-cast drops a ULP on.
-        assert_eq!(rational_to_f64(28_171_865_665_040_770, 3_600_000_000_000), 7825.518_240_289_103);
+        assert_eq!(
+            rational_to_f64(28_171_865_665_040_770, 3_600_000_000_000),
+            7825.518_240_289_103
+        );
     }
 }
-

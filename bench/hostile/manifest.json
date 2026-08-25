@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "description": "Deterministic Node-versus-Zipp workloads that measure graceful degradation under application-shaped JavaScript.",
+  "cases": [
+    {
+      "id": "calls-baseline",
+      "entry": "scope/calls-baseline.js",
+      "category": "scope",
+      "goal": "script",
+      "family": "call-shape",
+      "variant": "baseline",
+      "features": ["functions", "let", "const", "stable-call-site"],
+      "description": "Stable function-local bindings and a monomorphic leaf call provide the control for closure-heavy dispatch."
+    },
+    {
+      "id": "calls-closures",
+      "entry": "scope/calls-closures.js",
+      "category": "scope",
+      "goal": "script",
+      "family": "call-shape",
+      "variant": "closures",
+      "features": ["functions", "nested-functions", "let", "const", "closures", "mutable-captures", "arrows", "megamorphic-calls"],
+      "description": "Nested factories produce sixteen mutable closures selected at one rotating call site."
+    },
+    {
+      "id": "shapes-stable",
+      "entry": "objects/shapes-stable.js",
+      "category": "objects",
+      "goal": "script",
+      "family": "object-shape",
+      "variant": "baseline",
+      "features": ["objects", "stable-shapes", "property-access", "allocation", "medium-lived"],
+      "description": "Uniform object layouts and one shared property-access path provide the object-shape control."
+    },
+    {
+      "id": "shapes-megamorphic",
+      "entry": "objects/shapes-megamorphic.js",
+      "category": "objects",
+      "goal": "script",
+      "family": "object-shape",
+      "variant": "megamorphic",
+      "features": ["objects", "short-lived-shapes", "megamorphic-properties", "dictionary-mode", "allocation", "medium-lived"],
+      "description": "A shared property site sees sixteen layouts plus shape transitions and dictionary-mode objects."
+    },
+    {
+      "id": "types-stable",
+      "entry": "types/types-stable.js",
+      "category": "types",
+      "goal": "script",
+      "family": "local-types",
+      "variant": "baseline",
+      "features": ["functions", "stable-types", "integers", "long-loop"],
+      "description": "Integer-only locals provide the control for deliberately unstable local types."
+    },
+    {
+      "id": "types-churn",
+      "entry": "types/types-churn.js",
+      "category": "types",
+      "goal": "script",
+      "family": "local-types",
+      "variant": "mixed-values",
+      "features": ["functions", "mixed-types", "integers", "doubles", "strings", "objects", "arrays", "booleans", "null"],
+      "description": "The same local alternates among integer, double, string, object, array, boolean, and null values."
+    },
+    {
+      "id": "branch-control",
+      "entry": "errors/branch-control.js",
+      "category": "errors",
+      "goal": "script",
+      "family": "error-control-flow",
+      "variant": "baseline",
+      "features": ["functions", "branches", "long-loop"],
+      "description": "Branch-and-return error signalling provides the control for frequent thrown values."
+    },
+    {
+      "id": "throw-catch",
+      "entry": "errors/throw-catch.js",
+      "category": "errors",
+      "goal": "script",
+      "family": "error-control-flow",
+      "variant": "exceptions",
+      "features": ["functions", "exceptions", "throw", "catch", "mixed-thrown-values"],
+      "description": "The hot path frequently throws and catches both primitive and object values."
+    },
+    {
+      "id": "allocation-ephemeral",
+      "entry": "allocation/ephemeral.js",
+      "category": "allocation",
+      "goal": "script",
+      "family": "object-lifetime",
+      "variant": "baseline",
+      "features": ["objects", "arrays", "allocation", "short-lived"],
+      "description": "Rapidly discarded object/array pairs provide the short-lived baseline scenario."
+    },
+    {
+      "id": "allocation-survival",
+      "entry": "allocation/survival.js",
+      "category": "allocation",
+      "goal": "script",
+      "family": "object-lifetime",
+      "variant": "survivors",
+      "features": ["objects", "arrays", "methods", "allocation", "gc-pressure", "medium-lived"],
+      "description": "Objects survive several allocation epochs before old cohorts are discarded."
+    },
+    {
+      "id": "async-burst",
+      "entry": "async/burst.js",
+      "category": "async",
+      "goal": "script",
+      "family": "async-lifetime",
+      "variant": "baseline",
+      "features": ["promises", "microtasks", "short-lived"],
+      "description": "One linear Promise chain provides the short-lived async baseline scenario."
+    },
+    {
+      "id": "async-lived",
+      "entry": "async/lived.js",
+      "category": "async",
+      "goal": "script",
+      "family": "async-lifetime",
+      "variant": "sustained",
+      "features": ["async", "await", "promises", "promise-all", "closures", "mutable-captures", "medium-lived"],
+      "description": "Mutable async closures and repeated Promise.all batches keep the event workload alive."
+    },
+    {
+      "id": "reactish-reconcile",
+      "entry": "apps/reactish-reconcile.js",
+      "category": "applications",
+      "goal": "script",
+      "features": ["reactish", "function-components", "closures", "objects", "mixed-shapes", "allocation", "medium-lived"],
+      "description": "A host-free React-shaped reconciliation kernel exercises components, state, props, handlers, and patches."
+    },
+    {
+      "id": "warm-router",
+      "entry": "server/warm-router.js",
+      "category": "server",
+      "goal": "script",
+      "features": ["warm-server", "closures", "maps", "routing", "mixed-shapes", "allocation", "long-lived"],
+      "description": "A router, caches, sessions, and varied request shapes run warmup and sustained traffic in one process."
+    },
+    {
+      "id": "bytecode-vm",
+      "entry": "endurance/bytecode-vm.js",
+      "category": "endurance",
+      "goal": "script",
+      "features": ["long-loop", "switch", "typed-arrays", "computed-calls", "indirect-dispatch", "application-kernel"],
+      "description": "A JavaScript bytecode interpreter stresses branchy dispatch, typed state, and computed helper calls."
+    },
+    {
+      "id": "module-hot-graph",
+      "entry": "modules/entry.mjs",
+      "category": "modules",
+      "goal": "module",
+      "inputs": [
+        "modules/entry.mjs",
+        "modules/barrel.mjs",
+        "modules/constants.mjs",
+        "modules/kernel.mjs",
+        "modules/state.mjs"
+      ],
+      "features": ["modules", "esm", "imports", "re-exports", "live-bindings", "namespace-import", "long-loop"],
+      "description": "A multi-file ESM graph combines live bindings, re-exports, namespace access, and hot imported functions."
+    },
+    {
+      "id": "npm-nanoid",
+      "entry": "vendor/nanoid-non-secure.mjs",
+      "category": "npm",
+      "goal": "module",
+      "inputs": [
+        "vendor/nanoid-non-secure.mjs",
+        "vendor/nanoid-3.3.17/non-secure/index.mjs",
+        "vendor/nanoid-3.3.17/LICENSE",
+        "vendor/nanoid-3.3.17/PROVENANCE.json"
+      ],
+      "features": ["npm", "vendored-source", "modules", "esm", "dynamic-import", "top-level-await", "closures", "strings", "allocation", "math-random"],
+      "description": "The exact nanoid 3.3.17 non-secure ESM source runs behind a deterministic seeded Math.random boundary."
+    }
+  ]
+}

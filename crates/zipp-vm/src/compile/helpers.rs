@@ -16,12 +16,42 @@ pub(crate) fn compound_assign_instr(op: AssignOp, dst: Reg, a: Reg, b: Reg) -> O
         Op::Div => Instr::Div { dst, a, b },
         Op::Rem => Instr::Mod { dst, a, b },
         Op::Exp => Instr::Pow { dst, a, b },
-        Op::Shl => Instr::Bitwise { dst, a, b, op: BitwiseOp::Shl },
-        Op::Shr => Instr::Bitwise { dst, a, b, op: BitwiseOp::Shr },
-        Op::UShr => Instr::Bitwise { dst, a, b, op: BitwiseOp::Ushr },
-        Op::BitOr => Instr::Bitwise { dst, a, b, op: BitwiseOp::Or },
-        Op::BitXor => Instr::Bitwise { dst, a, b, op: BitwiseOp::Xor },
-        Op::BitAnd => Instr::Bitwise { dst, a, b, op: BitwiseOp::And },
+        Op::Shl => Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Shl,
+        },
+        Op::Shr => Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Shr,
+        },
+        Op::UShr => Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Ushr,
+        },
+        Op::BitOr => Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Or,
+        },
+        Op::BitXor => Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Xor,
+        },
+        Op::BitAnd => Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::And,
+        },
         // `=`, and `&&=`/`||=`/`??=` — the logical forms SHORT-CIRCUIT, so they
         // are not sugar for the arithmetic ones and are compiled separately.
         _ => return None,
@@ -104,9 +134,14 @@ pub(crate) fn class_key_name(key: &PropKey) -> R<String> {
                         }
                     }
                 }
-                Err("computed or private class member names are not in the zipp-vm subset yet".into())
+                Err(
+                    "computed or private class member names are not in the zipp-vm subset yet"
+                        .into(),
+                )
             }
-            _ => Err("computed or private class member names are not in the zipp-vm subset yet".into()),
+            _ => Err(
+                "computed or private class member names are not in the zipp-vm subset yet".into(),
+            ),
         },
     }
     // NOTE: a NON-computed BigInt key (`class C { 1n(){} }`) had an arm here and
@@ -180,7 +215,6 @@ pub(crate) fn sorted_name_vec(set: &std::collections::HashSet<String>) -> Vec<St
     v.sort_unstable();
     v
 }
-
 
 /// Add a block's DIRECT lexical declaration names (top-level `let`/`const`/
 /// `class` of the block) to `out` — the names that block Annex B B.3.3 for a
@@ -303,7 +337,11 @@ pub(crate) fn collect_b33_block_fns(
                 }
             }
         }
-        S::Try { block, handler, finalizer } => {
+        S::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
             {
                 let mut bk = blockers.clone();
                 for st in block {
@@ -368,9 +406,7 @@ pub(crate) fn expr_has_yield_or_await(e: &Expr, want_yield: bool, want_await: bo
         };
     }
     match e {
-        E::Yield { arg, .. } => {
-            want_yield || arg.as_ref().map_or(false, |a| r!(a))
-        }
+        E::Yield { arg, .. } => want_yield || arg.as_ref().map_or(false, |a| r!(a)),
         E::Await(a) => want_await || r!(a),
         E::Binary { left, right, .. } => r!(left) || r!(right),
         E::Logical { left, right, .. } => r!(left) || r!(right),
@@ -396,9 +432,7 @@ pub(crate) fn expr_has_yield_or_await(e: &Expr, want_yield: bool, want_await: bo
                 })
         }
         E::Template(t) => t.exprs.iter().any(|x| r!(x)),
-        E::TaggedTemplate { tag, quasi } => {
-            r!(tag) || quasi.exprs.iter().any(|x| r!(x))
-        }
+        E::TaggedTemplate { tag, quasi } => r!(tag) || quasi.exprs.iter().any(|x| r!(x)),
         E::Member(m) => match &m.prop {
             // StaticMemberExpression: the object only — the property is a name.
             MemberProp::Ident(_) => r!(&m.object),
@@ -448,7 +482,11 @@ pub(crate) fn check_params_yield_await(
 
 /// The [Yield]/[Await] early-error scan over a binding pattern's nested
 /// DEFAULT-VALUE expressions and computed keys (the FormalParameter space).
-pub(crate) fn pattern_has_yield_or_await(pat: &Pattern, want_yield: bool, want_await: bool) -> bool {
+pub(crate) fn pattern_has_yield_or_await(
+    pat: &Pattern,
+    want_yield: bool,
+    want_await: bool,
+) -> bool {
     use crate::parse::ast::Pattern as P;
     match pat {
         P::Ident(_) => false,
@@ -461,9 +499,9 @@ pub(crate) fn pattern_has_yield_or_await(pat: &Pattern, want_yield: bool, want_a
                 matches!(&prop.key, PropKey::Computed(ke)
                     if expr_has_yield_or_await(ke, want_yield, want_await))
                     || pattern_has_yield_or_await(&prop.value, want_yield, want_await)
-            }) || rest
-                .as_ref()
-                .map_or(false, |rest| pattern_has_yield_or_await(rest, want_yield, want_await))
+            }) || rest.as_ref().map_or(false, |rest| {
+                pattern_has_yield_or_await(rest, want_yield, want_await)
+            })
         }
         P::Array(elems) => elems
             .iter()
@@ -540,7 +578,11 @@ pub(crate) fn collect_hoisted_vars(s: &Stmt, out: &mut std::collections::HashSet
             }
             collect_hoisted_vars(body, out);
         }
-        S::Try { block, handler, finalizer } => {
+        S::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
             for s in block {
                 collect_hoisted_vars(s, out);
             }
@@ -660,7 +702,12 @@ pub(crate) fn fmt_key_num(n: f64) -> String {
 /// lone-surrogate literal is excluded — its bytes need the WTF-8-decoding
 /// constant slot, not a plain `string_constants` entry.
 pub(crate) fn concat_key_literal_prefix(key: &Expr) -> Option<(&str, &Expr)> {
-    if let Expr::Binary { op: BinaryOp::Add, left, right } = key {
+    if let Expr::Binary {
+        op: BinaryOp::Add,
+        left,
+        right,
+    } = key
+    {
         // `StrVal::Utf8` IS the not-`.lone_surrogates` case: a literal holding a
         // lone surrogate can only be `StrVal::Utf16`, and `StrVal::from_utf16`
         // collapses back to `Utf8` exactly when the text is well-formed.
@@ -734,7 +781,6 @@ pub(crate) fn expected_arg_count(params: &Params) -> u16 {
     n
 }
 
-
 pub(crate) fn param_slot_names(params: &Params) -> R<Vec<String>> {
     let mut out = Vec::new();
     for (i, item) in params.items.iter().enumerate() {
@@ -747,7 +793,11 @@ pub(crate) fn param_slot_names(params: &Params) -> R<Vec<String>> {
             Pattern::Assign { left, .. } => match &**left {
                 Pattern::Ident(id) => out.push(id.to_string()),
                 Pattern::Object { .. } | Pattern::Array(_) => out.push(format!("<arg{i}>")),
-                _ => return Err("a default on a destructuring parameter is not in the subset yet".into()),
+                _ => {
+                    return Err(
+                        "a default on a destructuring parameter is not in the subset yet".into(),
+                    )
+                }
             },
             Pattern::Object { .. } | Pattern::Array(_) => out.push(format!("<arg{i}>")),
             // The rest parameter is the last item now instead of a sibling

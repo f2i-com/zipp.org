@@ -91,7 +91,9 @@ fn mid_class(c: char) -> Option<Mid> {
 /// it an infix character with a matching operand on each side? A bridged infix
 /// takes no boundary on either side, so "3.14" and "can't" stay one segment.
 fn bridges(chars: &[char], j: usize) -> bool {
-    let Some(kind) = chars.get(j).copied().and_then(mid_class) else { return false };
+    let Some(kind) = chars.get(j).copied().and_then(mid_class) else {
+        return false;
+    };
     let (Some(&p), Some(&n)) = (chars.get(j.wrapping_sub(1)), chars.get(j + 1)) else {
         return false;
     };

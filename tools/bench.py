@@ -29,6 +29,7 @@ import math
 import os
 import platform
 import random
+import re
 import signal
 import shutil
 import statistics
@@ -45,6 +46,74 @@ DEFAULT_SEED = 0x5A17_2026
 BOOTSTRAP_SAMPLES = 10_000
 ROOT = Path(__file__).resolve().parent.parent
 BENCH_DIR = ROOT / "bench" / "real"
+
+_RECORDED_ENV_PREFIXES = (
+    "ZIPP_",
+    "RUST",
+    "MIMALLOC_",
+    "NODE_",
+    "DENO_",
+    "BUN_",
+)
+_PUBLIC_CONTROL_ENV_KEYS = frozenset(
+    {
+        "RUST_BACKTRACE",
+        "RUST_TEST_THREADS",
+        "ZIPP_ASYNCSTATS",
+        "ZIPP_BUILTINSTATS",
+        "ZIPP_CALLLOG",
+        "ZIPP_GC_STRESS",
+        "ZIPP_GCSTATS",
+        "ZIPP_ICSTATS",
+        "ZIPP_JIT_THRESHOLD",
+        "ZIPP_JITDECLINE",
+        "ZIPP_JITDUMP",
+        "ZIPP_JITLOG",
+        "ZIPP_NO_COMPUTED_CALL_DENSE",
+        "ZIPP_NO_MODULE_JIT",
+        "ZIPP_NO_NURSERY_ADAPT",
+        "ZIPP_NO_POLY_CALL_FALLBACK",
+        "ZIPP_NOJIT",
+        "ZIPP_NURSERY",
+        "ZIPP_NURSERY_MAX_MINORS",
+        "ZIPP_NURSERY_VERIFY",
+        "ZIPP_NURSERY_YOUNG_BUDGET",
+        "ZIPP_PROF",
+        "ZIPP_RX_JIT_THRESHOLD",
+        "ZIPP_RXSTATS",
+        "ZIPP_SHAPE_VERIFY",
+        "ZIPP_SHAPESTATS",
+        "ZIPP_TRACE_CALLS",
+        "ZIPP_VM_DUMP",
+    }
+)
+_SENSITIVE_ENV_COMPONENTS = frozenset(
+    {
+        "APIKEY",
+        "AUTH",
+        "AUTHORIZATION",
+        "COOKIE",
+        "COOKIES",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "KEY",
+        "PASSWORD",
+        "PASSWORDS",
+        "PASSWD",
+        "PRIVATE",
+        "SECRET",
+        "SECRETS",
+        "SESSION",
+        "SESSIONS",
+        "TOKEN",
+        "TOKENS",
+    }
+)
+_PUBLIC_CONTROL_VALUE = re.compile(
+    r"(?:[-+]?\d+(?:\.\d+)?|true|false|yes|no|on|off|auto|default|full|short)",
+    re.IGNORECASE,
+)
+_REDACTED_ENV_VALUE = "<redacted>"
 
 # The RETAINED TEN. This list is the historical series and must not change: every
 # geomean in README.md and PERF_ROADMAP.md is comparable only because these ten
@@ -474,12 +543,48 @@ def check_engine_provenance(
     return reasons
 
 
-def provenance_is_fatal(reasons: list[str], *, is_ab: bool, overridden: bool) -> bool:
+def provenance_is_fatal(reasons: list[str], *, is_ab: bool) -> bool:
     """Whether `reasons` should stop the run rather than just mark the artifact.
 
     Only a headline capture is stopped. See `check_engine_provenance`.
     """
-    return bool(reasons) and not is_ab and not overridden
+    return bool(reasons) and not is_ab
+
+
+def provenance_assessment(
+    engines_meta: list[dict[str, Any]],
+    workspace_commit: str | None,
+    *,
+    is_ab: bool,
+    allow_dirty: bool,
+    allow_nonhead: bool,
+    ab_sides_distinguished: bool = False,
+) -> tuple[list[str], list[str]]:
+    """Return ``(recorded violations, violations not covered by overrides)``.
+
+    An override permits a directional run; it must never erase the reason from
+    the artifact or make that artifact publishable. Keeping the two views
+    separate also prevents ``--allow-dirty-engine`` from accidentally covering
+    an unrelated non-HEAD binary (and vice versa).
+    """
+
+    recorded = check_engine_provenance(
+        engines_meta,
+        workspace_commit,
+        is_ab=is_ab,
+        allow_dirty=False,
+        allow_nonhead=False,
+        ab_sides_distinguished=ab_sides_distinguished,
+    )
+    uncovered = check_engine_provenance(
+        engines_meta,
+        workspace_commit,
+        is_ab=is_ab,
+        allow_dirty=allow_dirty,
+        allow_nonhead=allow_nonhead,
+        ab_sides_distinguished=ab_sides_distinguished,
+    )
+    return recorded, uncovered
 
 
 def engine_drift(
@@ -590,6 +695,82 @@ def git_revision() -> str | None:
         return None
 
 
+def git_paths_match_head(
+    paths: Iterable[Path], *, root: Path = ROOT
+) -> tuple[bool, str | None]:
+    """Require publication bytes to equal regular-file blobs stored in HEAD."""
+
+    resolved_root = root.resolve()
+    relative_paths: set[str] = set()
+    try:
+        for path in paths:
+            candidate = path if path.is_absolute() else resolved_root / path
+            absolute_path = Path(os.path.abspath(candidate))
+            relative_paths.add(
+                absolute_path.relative_to(resolved_root).as_posix()
+            )
+    except (OSError, ValueError):
+        return False, "publication source is outside the repository"
+    if not relative_paths:
+        return False, "publication source set is empty"
+
+    pathspec = sorted(relative_paths)
+    try:
+        tree_probe = subprocess.run(
+            ["git", "ls-tree", "-r", "-z", "HEAD", "--", *pathspec],
+            cwd=resolved_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        if tree_probe.returncode != 0:
+            return False, "could not verify publication sources against HEAD"
+        head_entries: dict[str, tuple[str, str, str]] = {}
+        for item in tree_probe.stdout.split(b"\0"):
+            if not item:
+                continue
+            try:
+                metadata, raw_path = item.split(b"\t", 1)
+                raw_mode, raw_kind, raw_oid = metadata.split(b" ", 2)
+            except ValueError:
+                return False, "could not parse publication sources from HEAD"
+            rel = raw_path.decode("utf-8", errors="surrogateescape")
+            head_entries[rel] = (
+                raw_mode.decode("ascii", errors="strict"),
+                raw_kind.decode("ascii", errors="strict"),
+                raw_oid.decode("ascii", errors="strict"),
+            )
+        if not relative_paths.issubset(head_entries):
+            return False, "publication sources include untracked files"
+
+        for rel in pathspec:
+            mode, kind, oid = head_entries[rel]
+            if kind != "blob" or mode not in {"100644", "100755"}:
+                return False, "publication source in HEAD is not a regular file"
+            working_path = resolved_root / Path(rel)
+            if working_path.is_symlink() or not working_path.is_file():
+                return False, "working publication source is not a regular file"
+            # Read and clean-filter the actual working file, independently of
+            # the index. This honors checked-out EOL/attribute normalization
+            # while defeating assume-unchanged and skip-worktree flags.
+            hash_probe = subprocess.run(
+                ["git", "hash-object", f"--path={rel}", "--", rel],
+                cwd=resolved_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+            if hash_probe.returncode != 0:
+                return False, "could not hash a working publication source"
+            if hash_probe.stdout.decode("ascii", errors="strict").strip() != oid:
+                return False, "manifest, harness, or declared inputs differ from HEAD"
+        return True, None
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        return False, "could not verify publication sources against HEAD"
+
+
 def power_mode() -> str | None:
     if os.name != "nt":
         governor = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
@@ -612,12 +793,38 @@ def power_mode() -> str | None:
 
 
 def relevant_environment() -> dict[str, str]:
-    prefixes = ("ZIPP_", "RUST", "MIMALLOC_", "NODE_", "DENO_", "BUN_")
-    return {
-        key: value
-        for key, value in sorted(os.environ.items())
-        if key.startswith(prefixes)
-    }
+    """Return benchmark controls without copying credentials into artifacts.
+
+    Only explicitly audited numeric/boolean controls are safe and useful to
+    retain. Every unknown key is represented only as redacted; broad runtime
+    prefixes must never serialize auth tokens, private paths, or arbitrary
+    option payloads into a potentially public JSON result.
+    """
+
+    recorded: dict[str, str] = {}
+    for key, value in sorted(os.environ.items()):
+        if not key.startswith(_RECORDED_ENV_PREFIXES):
+            continue
+        components = tuple(
+            component
+            for component in re.split(r"[^A-Z0-9]+", key.upper())
+            if component
+        )
+        sensitive_name = any(
+            component in _SENSITIVE_ENV_COMPONENTS
+            or component.endswith("TOKEN")
+            or component.endswith("SECRET")
+            or component.endswith("PASSWORD")
+            for component in components
+        )
+        public_control = (
+            key in _PUBLIC_CONTROL_ENV_KEYS
+            and _PUBLIC_CONTROL_VALUE.fullmatch(value) is not None
+        )
+        recorded[key] = (
+            value if public_control and not sensitive_name else _REDACTED_ENV_VALUE
+        )
+    return recorded
 
 
 def create_empty_script() -> Path:
@@ -1062,7 +1269,7 @@ def write_json_result(
     *,
     overwrite: bool,
 ) -> None:
-    """Durably create a result, atomically replacing only when requested."""
+    """Publish a fully written result atomically, never overwriting by default."""
     path.parent.mkdir(parents=True, exist_ok=True)
 
     def dump(handle: Any) -> None:
@@ -1070,11 +1277,6 @@ def write_json_result(
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
-
-    if not overwrite:
-        with path.open("x", encoding="utf-8", newline="\n") as handle:
-            dump(handle)
-        return
 
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
@@ -1091,7 +1293,13 @@ def write_json_result(
             newline="\n",
         ) as handle:
             dump(handle)
-        os.replace(temporary, path)
+        if overwrite:
+            os.replace(temporary, path)
+        else:
+            # Linking a fully fsynced temporary file publishes it under the
+            # final name without the overwrite race of exists()+replace().
+            # It also leaves no partial final artifact if serialization fails.
+            os.link(temporary, path)
     finally:
         try:
             temporary.unlink()
@@ -1761,7 +1969,7 @@ def main() -> int:
     ab_sides_distinguished = bool(args.allow_aa) or (
         args.ab_env is not None and args.ab_env[0] != args.ab_env[1]
     )
-    provenance_reasons = check_engine_provenance(
+    provenance_reasons, uncovered_provenance_reasons = provenance_assessment(
         engines_meta_before,
         workspace_commit,
         is_ab=bool(args.ab),
@@ -1773,11 +1981,9 @@ def main() -> int:
         print("engine provenance:", file=sys.stderr)
         for reason in provenance_reasons:
             print(f"  {reason}", file=sys.stderr)
-        overridden = getattr(args, "allow_dirty_engine", False) or getattr(
-            args, "allow_nonhead_engine", False
-        )
         if provenance_is_fatal(
-            provenance_reasons, is_ab=bool(args.ab), overridden=overridden
+            uncovered_provenance_reasons,
+            is_ab=bool(args.ab),
         ):
             raise SystemExit(
                 "refusing to measure: the engine cannot be attributed to a "

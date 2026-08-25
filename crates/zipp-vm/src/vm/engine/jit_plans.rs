@@ -5,6 +5,68 @@
 #![allow(unused_imports)]
 use super::*;
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn computed_drop_obj_is_observable(
+    code: &[Instr],
+    obj: u16,
+    def_ip: usize,
+    call_ip: usize,
+    region_start: usize,
+    region_end: usize,
+) -> bool {
+    let used_between = code[def_ip + 1..call_ip]
+        .iter()
+        .any(|ins| crate::codegen::instr_uses(ins).contains(&obj));
+    // Conservative by design: even a later def could make a narrower proof
+    // possible, but rejecting every post-call in-region use ensures the
+    // object-valued definition is never erased while the native success path
+    // can still observe its slot.
+    let used_after = code[call_ip + 1..=region_end]
+        .iter()
+        .any(|ins| crate::codegen::instr_uses(ins).contains(&obj));
+    let used_outside = code
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| *at < region_start || *at > region_end)
+        .any(|(_, ins)| crate::codegen::instr_uses(ins).contains(&obj));
+    used_between || used_after || used_outside
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod computed_drop_liveness_tests {
+    use super::*;
+
+    #[test]
+    fn post_call_receiver_use_prevents_dropping_its_definition() {
+        let code = vec![
+            Instr::LoadInt { dst: 1, val: 0 },
+            Instr::Move { dst: 9, src: 2 },
+            Instr::LoadInt { dst: 3, val: 0 },
+            Instr::CallMethodComputed {
+                dst: 4,
+                obj: 9,
+                key: 3,
+                arg_base: 5,
+                argc: 1,
+            },
+            Instr::Move { dst: 6, src: 9 },
+            Instr::Jump { target: 1 },
+        ];
+        assert!(computed_drop_obj_is_observable(&code, 9, 1, 3, 1, 5));
+
+        let mut no_post_use = code;
+        no_post_use[4] = Instr::Move { dst: 6, src: 4 };
+        assert!(!computed_drop_obj_is_observable(
+            &no_post_use,
+            9,
+            1,
+            3,
+            1,
+            5
+        ));
+    }
+}
+
 /// `ZIPP_JITDECLINE` names the constraint a nested-leaf splice failed on —
 /// B75's survey showed a bare "Call" (and then a bare "wrapper's inner call not
 /// inlinable") cannot choose between the possible generalisations.
@@ -163,7 +225,11 @@ fn span_code_unit_pred_plan(
         || call_obj != source_obj
         || arg_base != start2
         || call_argc != 1
-        || callee.string_constants.get(name as usize).map(String::as_str) != Some("charCodeAt")
+        || callee
+            .string_constants
+            .get(name as usize)
+            .map(String::as_str)
+            != Some("charCodeAt")
         || eq_a != unit
         || eq_b != 2
         || ret != ret_flag
@@ -272,8 +338,9 @@ impl<'p> Vm<'p> {
             Dv,
             Str,
             /// A `.length` read — resolves against whatever the receiver LIVES
-            /// as: a flat-ASCII string (pin `units`) or a dense Array (pin
-            /// `len`). Both snapshots already carry the length in the same slot.
+            /// as: a flat-ASCII string (pin `units`), a dense Array (pin `len`),
+            /// or a pristine TypedArray (a distinct length-only TA marker).
+            /// All snapshots carry the exact length in the same slot.
             Len,
         }
         for aip in s..=e {
@@ -382,6 +449,31 @@ impl<'p> Vm<'p> {
             }
             let kind = match (self.heap.get(live.heap_index()), &recv) {
                 (HeapObj::TypedArray { kind, .. }, Recv::Ta) if *kind < 9 => *kind,
+                // TypedArray `length` is an INHERITED accessor, unlike Array's
+                // own exotic `length`. A direct snapshot is legal only while
+                // the live instance/prototype chain still resolves to the
+                // pristine intrinsic getter. Recheck the same proof in
+                // `jit_ta_snapshot` at every region entry so an override after
+                // OSR planning becomes an exact-ip deopt, never a stale answer.
+                //
+                // A local RAB (fixed or length-tracking) is safe: the INT body
+                // contains no arbitrary call, and the snapshot is re-derived on
+                // every entry. A length-tracking GSAB can grow concurrently,
+                // however, so its length cannot be cached even for one native
+                // run and is declined both here and by the snapshot helper.
+                (HeapObj::TypedArray { buffer, kind, .. }, Recv::Len) => {
+                    let idx = live.heap_index();
+                    let Some(marker) = crate::codegen::ta_len_pin_kind(*kind) else {
+                        continue;
+                    };
+                    if !self.ta_length_is_intrinsic(idx)
+                        || self.ta_effective_len(idx).is_none()
+                        || (self.ta_tracking.contains(&idx) && self.shared_buffers.contains(buffer))
+                    {
+                        continue;
+                    }
+                    marker
+                }
                 // A dense Array pins for inline `arr[i]` / `i in arr`. Decline
                 // when it carries an `arr_props` overlay (defineProperty'd /
                 // sparse-overlay index) or is a mapped-`arguments` object — both
@@ -457,6 +549,337 @@ impl<'p> Vm<'p> {
         plan
     }
 
+    /// Build the bounded dense-array plan consumed only by the INTEGER splice.
+    /// This is intentionally narrower than the MEMORY computed-call helper:
+    /// every covered own element must be an exact capture-free, branch-free,
+    /// pure numeric leaf, and its typed lane must prove the caller arguments and
+    /// result can stay in integer homes. Richer keys/callees retain the existing
+    /// helper/interpreter path.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_dense_computed_leaf_plan(
+        &self,
+        func_id: u32,
+        start: u32,
+        end: u32,
+        base: usize,
+    ) -> rustc_hash::FxHashMap<usize, crate::codegen::DenseComputedLeafPlan> {
+        use crate::codegen::{DenseComputedLeafPlan, LeafInlinePlan, TaPinSrc};
+        use crate::heap::HeapObj;
+        use rustc_hash::FxHashMap;
+
+        const MAX_ARMS: usize = 4;
+        let mut plans = FxHashMap::default();
+        if !crate::codegen::int_computed_leaf_enabled()
+            || !crate::codegen::int_splice_enabled()
+            || !crate::codegen::typed_splice_enabled()
+        {
+            return plans;
+        }
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return plans;
+        }
+
+        // Exact subset `int_splice::map_body_instr` can flatten. Requiring every
+        // operand (including destinations) to be nonzero proves the body never
+        // observes or overwrites callee register 0 (`this`). That single rule
+        // makes ordinary-method and lexical-arrow binding differences irrelevant
+        // without pretending the receiver itself is `undefined`.
+        fn pure_int_body(body: &[Instr]) -> bool {
+            body.iter().all(|ins| match *ins {
+                Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } => dst != 0,
+                Instr::Move { dst, src } => dst != 0 && src != 0,
+                Instr::Add { dst, a, b }
+                | Instr::Sub { dst, a, b }
+                | Instr::Mul { dst, a, b }
+                | Instr::Mod { dst, a, b }
+                | Instr::Bitwise { dst, a, b, .. }
+                | Instr::Eq { dst, a, b }
+                | Instr::Ne { dst, a, b }
+                | Instr::Lt { dst, a, b }
+                | Instr::Le { dst, a, b }
+                | Instr::Gt { dst, a, b }
+                | Instr::Ge { dst, a, b } => dst != 0 && a != 0 && b != 0,
+                Instr::AddInt { dst, a, .. } | Instr::Neg { dst, a } => dst != 0 && a != 0,
+                Instr::MathOp {
+                    dst,
+                    op: crate::bytecode::MathFn::Imul,
+                    arg_base,
+                    argc: 2,
+                } => dst != 0 && arg_base != 0,
+                Instr::Return { src } => src != 0,
+                _ => false,
+            })
+        }
+
+        let caller = self.func(func_id as usize);
+        let (s, e) = (start as usize, end as usize);
+        if e <= s || e >= caller.code.len() {
+            return plans;
+        }
+        let log = std::env::var_os("ZIPP_JITLOG").is_some();
+        let stored_globals: rustc_hash::FxHashSet<u32> = caller.code[s..=e]
+            .iter()
+            .filter_map(|ins| match *ins {
+                Instr::StoreGlobal { idx, .. }
+                | Instr::StoreGlobalStrict { idx, .. }
+                | Instr::StoreGlobalResolved { idx, .. } => Some(idx),
+                _ => None,
+            })
+            .collect();
+
+        for ip in s..=e {
+            let Instr::CallMethodComputed {
+                obj,
+                arg_base,
+                argc,
+                ..
+            } = caller.code[ip]
+            else {
+                continue;
+            };
+
+            // Resolve the receiver copied into `obj` back to a source whose
+            // Value is invariant for the whole native region. Every in-region
+            // link must dominate the next one; a jump into its open gap would
+            // permit an old frame-slot value and therefore declines.
+            let mut reg = obj;
+            let mut cursor = ip;
+            let mut fallback_ip = ip;
+            let mut drop_obj_def = None;
+            let mut seen = rustc_hash::FxHashSet::default();
+            let recv_src = 'source: loop {
+                if !seen.insert(reg) {
+                    break 'source None;
+                }
+                let nearest = (s..cursor)
+                    .rev()
+                    .find(|&j| crate::codegen::writes_reg(&caller.code[j]) == Some(reg));
+                let Some(def_ip) = nearest else {
+                    // A true live-in is usable only when no later region op can
+                    // replace it before a subsequent loop iteration.
+                    if caller.code[s..=e]
+                        .iter()
+                        .any(|ins| crate::codegen::writes_reg(ins) == Some(reg))
+                    {
+                        break 'source None;
+                    }
+                    break 'source Some(TaPinSrc::Reg(reg));
+                };
+                if reg == obj && cursor == ip {
+                    drop_obj_def = Some(def_ip);
+                }
+                if caller.code.iter().any(|ins| {
+                    slot_guard_jump_target(ins)
+                        .is_some_and(|t| (def_ip + 1..=cursor).contains(&(t as usize)))
+                }) {
+                    break 'source None;
+                }
+                fallback_ip = fallback_ip.min(def_ip);
+                match caller.code[def_ip] {
+                    Instr::Move { dst, src } if dst == reg => {
+                        reg = src;
+                        cursor = def_ip;
+                    }
+                    Instr::LoadGlobal { dst, idx }
+                        if dst == reg && !stored_globals.contains(&idx) =>
+                    {
+                        break 'source Some(TaPinSrc::Global(idx));
+                    }
+                    _ => break 'source None,
+                }
+            };
+            let Some(recv_src) = recv_src else {
+                if log {
+                    eprintln!("[int-computed] fn{func_id}@{ip} DECLINE unstable receiver");
+                }
+                continue;
+            };
+            if let Some(def_ip) = drop_obj_def {
+                // The success path omits this object-valued def (integer homes
+                // cannot represent it). It must be a truly transient call temp:
+                // no intervening or out-of-region read may observe the slot.
+                if computed_drop_obj_is_observable(&caller.code, obj, def_ip, ip, s, e) {
+                    if log {
+                        eprintln!(
+                            "[int-computed] fn{func_id}@{ip} DECLINE receiver temp is observable"
+                        );
+                    }
+                    continue;
+                }
+            }
+            let recv = match recv_src {
+                TaPinSrc::Global(g) => self
+                    .globals
+                    .get(g as usize)
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED),
+                TaPinSrc::Reg(r) => self.get(base, r),
+            };
+            if !recv.is_heap()
+                || self.arguments_objs.contains_key(&recv.heap_index())
+                || self.array_elements_overlaid(recv.heap_index())
+            {
+                continue;
+            }
+            let items = match self.heap.get(recv.heap_index()) {
+                HeapObj::Array(items) if !items.is_empty() && items.len() <= MAX_ARMS => items,
+                _ => continue,
+            };
+            if items.iter().any(|v| v.is_hole()) {
+                continue;
+            }
+
+            let mut variants = Vec::with_capacity(items.len());
+            let mut failed = false;
+            for (index, &callee_value) in items.iter().enumerate() {
+                if self
+                    .array_index_override(recv.heap_index(), index)
+                    .is_some()
+                {
+                    failed = true;
+                    break;
+                }
+                let Some((fid, _closure)) = self.ic_plain_fn(callee_value) else {
+                    failed = true;
+                    break;
+                };
+                // Dynamic/foreign program ids can share an integer fid with a
+                // root function. Keep this first lane root-realm only.
+                if self.get_function_realm(callee_value) != 0
+                    || self.program.functions.get(fid as usize).is_none()
+                {
+                    failed = true;
+                    break;
+                }
+                let callee = self.func(fid as usize);
+                if !callee.upvalues.is_empty() || callee.param_count != argc {
+                    failed = true;
+                    break;
+                }
+                let Some((body, default_arg_mask)) =
+                    crate::codegen::callee_leaf_ok_for_call(callee, argc)
+                else {
+                    failed = true;
+                    break;
+                };
+                if default_arg_mask != 0
+                    || !matches!(body.last(), Some(Instr::Return { .. }))
+                    || !pure_int_body(&body)
+                    || body.iter().any(|ins| match *ins {
+                        Instr::LoadConst { idx, .. } => !callee
+                            .constants
+                            .get(idx as usize)
+                            .is_some_and(|v| v.is_int()),
+                        _ => false,
+                    })
+                {
+                    failed = true;
+                    break;
+                }
+                let mut consts = FxHashMap::default();
+                for ins in &body {
+                    if let Instr::LoadConst { idx, .. } = *ins {
+                        consts.insert(idx, callee.constants[idx as usize].bits());
+                    }
+                }
+                let uninit_mask = crate::codegen::splice_uninit_mask(
+                    &body,
+                    callee.reg_count as usize,
+                    callee.param_count as usize,
+                );
+                if uninit_mask != 0 {
+                    failed = true;
+                    break;
+                }
+                let Some(defs) = crate::codegen::splice_body_defs(&body) else {
+                    failed = true;
+                    break;
+                };
+                let mut alias_params = 0u64;
+                if crate::codegen::splice_alias_enabled() {
+                    for p in 0..argc.min(63) {
+                        if defs & (1u64 << (1 + p)) == 0 {
+                            alias_params |= 1u64 << p;
+                        }
+                    }
+                }
+                let empty_upvals = FxHashMap::default();
+                let empty_nested = FxHashMap::default();
+                let typed_lane = match crate::codegen::build_typed_lane_guarded(
+                    &body,
+                    callee.param_count,
+                    argc,
+                    arg_base,
+                    caller.reg_count,
+                    callee.reg_count,
+                    &empty_upvals,
+                    &consts,
+                    &empty_nested,
+                    None,
+                ) {
+                    Ok(lane) => lane,
+                    Err(reason) => {
+                        if log {
+                            eprintln!(
+                                "[int-computed] fn{func_id}@{ip} arm {index} DECLINE typed lane ({reason})"
+                            );
+                        }
+                        failed = true;
+                        break;
+                    }
+                };
+                variants.push(LeafInlinePlan {
+                    callee_bits: callee_value.bits(),
+                    callee_ver: self.heap.version_of(callee_value.heap_index()),
+                    same_proto_fid: None,
+                    same_proto_guard: crate::vm::helpers_misc::jit_leaf_same_func_proto as usize,
+                    reg_window: caller.reg_count,
+                    callee_reg_count: callee.reg_count,
+                    this_bits: Value::UNDEFINED.bits(), // body provably never reads r0
+                    param_count: callee.param_count,
+                    default_arg_mask: 0,
+                    body,
+                    consts,
+                    upvals: FxHashMap::default(),
+                    cell_get: crate::vm::helpers_misc::jit_cell_get as usize,
+                    cell_set: crate::vm::helpers_misc::jit_cell_set as usize,
+                    prop_get: crate::vm::helpers_misc::jit_get_prop_leaf as usize,
+                    callee_fid: fid,
+                    nested: FxHashMap::default(),
+                    uninit_mask,
+                    alias_params,
+                    slot_guard: None,
+                    direct_global_route_epoch: None,
+                    typed_lane: Some(typed_lane),
+                    span_code_unit_pred: None,
+                });
+            }
+            if failed || variants.len() != items.len() {
+                continue;
+            }
+            if log {
+                eprintln!(
+                    "[int-computed] fn{func_id}@{ip} ELIGIBLE arms={} fallback=@{fallback_ip}",
+                    variants.len()
+                );
+            }
+            plans.insert(
+                ip,
+                DenseComputedLeafPlan {
+                    recv_src,
+                    recv_bits: recv.bits(),
+                    recv_ver: self.heap.version_of(recv.heap_index()),
+                    fallback_ip: fallback_ip as u32,
+                    drop_obj_def: drop_obj_def.map(|v| v as u32),
+                    variants,
+                    guard_helper: crate::vm::helpers_misc::jit_dense_computed_leaf_guard as usize,
+                },
+            );
+        }
+        plans
+    }
+
     /// Q4 v1: build the leaf-call inline plan for a memory-path region — the set
     /// of `Call` sites in `[start, end]` whose monomorphic cached callee is a
     /// PLAIN LEAF (`callee_leaf_ok`) the region emitter can inline straight-line.
@@ -476,29 +899,57 @@ impl<'p> Vm<'p> {
     /// says the callee is a native/bound/exotic (or is still unfilled). Off
     /// switch: `ZIPP_NO_CROSSCALL=1` (empty plan ⇒ byte-identical Tier C code).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn build_cross_call_plan(&self, func_id: u32) -> rustc_hash::FxHashSet<usize> {
-        let mut plan = rustc_hash::FxHashSet::default();
+    pub(crate) fn build_cross_call_plan(&self, func_id: u32) -> crate::codegen::CrossCallPlan {
+        let mut plan = crate::codegen::CrossCallPlan::default();
         if std::env::var_os("ZIPP_NO_CROSSCALL").is_some() {
             return plan;
         }
         let caller = self.func(func_id as usize);
         for (ip, instr) in caller.code.iter().enumerate() {
-            let Instr::Call { .. } = instr else { continue };
-            // A filled plain-user-function way (mono) is the signal; the
-            // helper's own resolution is what correctness rests on.
-            let Some((_bits, _ver, fid, _closure)) = self.ic_call_mono(func_id, ip) else {
+            let Instr::Call { argc, .. } = *instr else {
+                continue;
+            };
+            // A filled plain-user-function way is the signal; the helper's own
+            // live resolution is what correctness rests on. The bounded
+            // polymorphic extension accepts only multiple identities sharing
+            // one FuncProto (the rotating-closure shape).
+            let (live, same_proto) = if let Some(live) = self.ic_call_mono(func_id, ip) {
+                (Some(live), false)
+            } else {
+                (
+                    crate::codegen::poly_crosscall_enabled()
+                        .then(|| self.ic_call_same_proto(func_id, ip))
+                        .flatten(),
+                    true,
+                )
+            };
+            let Some((_bits, _ver, fid, _closure)) = live else {
                 continue;
             };
             let callee = self.func(fid as usize);
             if callee.is_generator
                 || callee.is_async
-                || callee.lexical_this
                 || callee.rest_reg.is_some()
                 || callee.arguments_reg.is_some()
             {
                 continue; // could never hold a cross entry / needs setup_call
             }
-            plan.insert(ip);
+            let same_proto2 = (same_proto
+                && crate::codegen::same_proto_cross2_enabled()
+                && argc == 2
+                && callee.lexical_this
+                && callee.param_count == 2)
+                .then_some(crate::codegen::SameProtoCross2Plan {
+                    fid,
+                    callee_regs: callee.reg_count.max(1),
+                });
+            if same_proto2.is_some() && std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!(
+                    "[cross] fn{func_id}@{ip} SAME-PROTO-ARROW2 fn{fid} callee_regs={}",
+                    callee.reg_count.max(1)
+                );
+            }
+            plan.insert(ip, same_proto2);
         }
         plan
     }
@@ -597,8 +1048,7 @@ impl<'p> Vm<'p> {
             return None;
         };
         let Instr::JumpIfFalse {
-            cond: second_cond,
-            ..
+            cond: second_cond, ..
         } = &code[call_ip + 6]
         else {
             return None;
@@ -646,10 +1096,14 @@ impl<'p> Vm<'p> {
 
         // No control edge may enter after either of the first call's literal
         // setup ops; otherwise the baked first code unit need not be live.
-        if code.iter().filter_map(slot_guard_jump_target).any(|target| {
-            let target = target as usize;
-            target > call_ip - 3 && target <= call_ip
-        }) {
+        if code
+            .iter()
+            .filter_map(slot_guard_jump_target)
+            .any(|target| {
+                let target = target as usize;
+                target > call_ip - 3 && target <= call_ip
+            })
+        {
             return None;
         }
 
@@ -670,6 +1124,65 @@ impl<'p> Vm<'p> {
         })
     }
 
+    /// Resolve a call register whose nearest textual definition is an
+    /// `UpvalGet` from the currently compiling activation. This is only a
+    /// compile-time representative: the emitted same-proto guard validates the
+    /// live register on every call, so a different control path/cell value can
+    /// only miss to the normal helper, never run the selected body unchecked.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn leaf_upval_callee_representative(
+        &self,
+        func_id: u32,
+        start: usize,
+        call_ip: usize,
+        callee_reg: u16,
+    ) -> Option<(u64, u32, u32, u32)> {
+        let caller = self.func(func_id as usize);
+        let mut upval_idx = None;
+        for at in (start..call_ip).rev() {
+            match caller.code[at] {
+                Instr::UpvalGet { dst, idx } if dst == callee_reg => {
+                    upval_idx = Some(idx);
+                    break;
+                }
+                _ if crate::codegen::writes_reg(&caller.code[at]) == Some(callee_reg) => {
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        let idx = upval_idx?;
+        let closure = self
+            .frames
+            .last()
+            .filter(|frame| frame.func == func_id)
+            .map(|frame| frame.closure)?;
+        if closure == NO_CLOSURE || closure as usize >= self.heap.len() {
+            return None;
+        }
+        let cell = match self.heap.get(closure) {
+            crate::heap::HeapObj::Closure { upvalues, .. } => upvalues.get(idx as usize).copied(),
+            _ => None,
+        }?;
+        if cell as usize >= self.heap.len() {
+            return None;
+        }
+        let value = match self.heap.get(cell) {
+            crate::heap::HeapObj::Cell(value) if !value.is_uninitialized() => *value,
+            _ => return None,
+        };
+        if !value.is_heap() || value.heap_index() as usize >= self.heap.len() {
+            return None;
+        }
+        let (fid, callee_closure) = self.ic_plain_fn(value)?;
+        Some((
+            value.bits(),
+            self.heap.version_of(value.heap_index()),
+            fid,
+            callee_closure,
+        ))
+    }
+
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn build_leaf_inline_plan(
         &self,
@@ -677,25 +1190,89 @@ impl<'p> Vm<'p> {
         start: u32,
         end: u32,
     ) -> rustc_hash::FxHashMap<usize, crate::codegen::LeafInlinePlan> {
-        use crate::codegen::{callee_leaf_ok, callee_leaf_ok_one_call, LeafInlinePlan};
+        use crate::codegen::{callee_leaf_ok_for_call, callee_leaf_ok_one_call, LeafInlinePlan};
         let mut plan = rustc_hash::FxHashMap::default();
+        // A leaf splice executes callee bytecodes inside the caller's native
+        // block, while the meter's block map contains only caller bytecodes.
+        // Until a splice carries an exact callee charge map, decline every
+        // leaf plan for an instrumented VM. This also keeps specialized
+        // default-parameter prologues from becoming an uncharged path.
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return plan;
+        }
         let caller = self.func(func_id as usize);
         let reg_window = caller.reg_count;
         let log = std::env::var_os("ZIPP_JITLOG").is_some();
         for ip in start as usize..=end as usize {
-            let Instr::Call { argc, arg_base, .. } = caller.code[ip] else {
+            let Instr::Call {
+                argc,
+                arg_base,
+                callee: callee_reg,
+                ..
+            } = caller.code[ip]
+            else {
                 continue;
             };
-            // Monomorphic plain-callee from the live IC (with the cached slot
-            // version — the inline guard re-checks it to defeat GC slot-reuse ABA).
-            let Some((callee_bits, callee_ver, fid, closure)) = self.ic_call_mono(func_id, ip)
-            else {
+            // Prefer the exact monomorphic entry. A bounded extension accepts a
+            // polymorphic site only when every filled way names the same
+            // FuncProto; later gates require that proto to be capture-free and
+            // non-arrow, and emitted code re-checks the LIVE callee's proto.
+            let poly_on = std::env::var_os("ZIPP_NO_POLY_LEAF_INLINE").is_none();
+            let upval_rep = poly_on
+                .then(|| {
+                    self.leaf_upval_callee_representative(func_id, start as usize, ip, callee_reg)
+                })
+                .flatten()
+                .filter(|&(_, _, fid, _)| {
+                    let proto = self.func(fid as usize);
+                    !proto.lexical_this && proto.upvalues.is_empty()
+                });
+            let mono = self.ic_call_mono(func_id, ip);
+            let (resolved, same_proto) = if let Some(dynamic) = upval_rep {
+                (Some(dynamic), true)
+            } else if let Some(exact) = mono {
+                (Some(exact), false)
+            } else if poly_on {
+                (self.ic_call_same_proto(func_id, ip), true)
+            } else {
+                (None, false)
+            };
+            let Some((callee_bits, callee_ver, fid, closure)) = resolved else {
                 if log {
                     eprintln!("[leaf] fn{func_id}@{ip} NOT-MONO (no single Callee IC way)");
                 }
                 continue;
             };
             let callee = self.func(fid as usize);
+            if same_proto
+                && (self.get_function_realm(Value::from_bits(callee_bits)) != 0
+                    || self.program.functions.get(fid as usize).is_none())
+            {
+                // A sloppy ordinary call substitutes the CALLEE realm's global
+                // object for undefined `this`. The splice bakes main-realm
+                // `global_this`, so a child-realm representative is not an
+                // interchangeable instance even when its FuncProto matches.
+                // Eval/loader-only fids also stay on the real-call path because
+                // the tiny runtime guard intentionally indexes the root program
+                // table and fail-closes outside it.
+                if log {
+                    eprintln!(
+                        "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
+                         (same-proto representative is non-main-realm or dynamic)"
+                    );
+                }
+                continue;
+            }
+            if same_proto && (callee.lexical_this || !callee.upvalues.is_empty()) {
+                if log {
+                    eprintln!(
+                        "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
+                         (same-proto leaf has captures or lexical this)"
+                    );
+                }
+                continue;
+            }
             // A closure that captures upvalues is inlinable as long as its body
             // only READS them (`callee_leaf_ok` admits `UpvalGet` and nothing
             // else upvalue-shaped). Each cell is resolved HERE, from the exact
@@ -734,19 +1311,21 @@ impl<'p> Vm<'p> {
             // undefined for a STRICT callee, the realm's global object for a
             // SLOPPY one. Both are compile-time constants, so both inline.
             //
-            // An ARROW is the one shape that cannot: its `this` is captured
-            // lexically and lives in the Closure, so it is neither of those two
-            // values and there is nothing to bake.
-            if callee.lexical_this {
-                if log {
-                    eprintln!(
-                        "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (arrow — \
-                         lexical this)"
-                    );
+            // An exact-identity arrow is also bakeable: its Closure stores the
+            // immutable lexical-this Value and the bits+slot-version guard pins
+            // that exact closure instance. This is distinct from rotating-proto
+            // cross-calls, which load each live closure's this dynamically.
+            let this_bits = if callee.lexical_this {
+                if closure == NO_CLOSURE {
+                    continue;
                 }
-                continue;
-            }
-            let this_bits = if callee.is_strict {
+                match self.heap.get(closure) {
+                    crate::heap::HeapObj::Closure { func, this_val, .. } if *func == fid => {
+                        this_val.bits()
+                    }
+                    _ => continue,
+                }
+            } else if callee.is_strict {
                 Value::UNDEFINED.bits()
             } else if self.global_this != 0 {
                 Value::heap(self.global_this).bits()
@@ -772,9 +1351,25 @@ impl<'p> Vm<'p> {
                 rustc_hash::FxHashMap::default();
             let mut nested_consts: rustc_hash::FxHashMap<u32, u64> =
                 rustc_hash::FxHashMap::default();
-            let body = match callee_leaf_ok(callee) {
-                Some(b) => b,
+            let mut default_arg_mask = 0u64;
+            let body = match callee_leaf_ok_for_call(callee, argc) {
+                Some((b, mask)) => {
+                    default_arg_mask = mask;
+                    b
+                }
                 None => {
+                    // Same-proto inlining deliberately stops at a direct leaf:
+                    // a wrapper splice adds an independently identity-guarded
+                    // inner call and has no rotating-identity evidence yet.
+                    if same_proto {
+                        if log {
+                            eprintln!(
+                                "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
+                                 (same-proto target is not a direct leaf)"
+                            );
+                        }
+                        continue;
+                    }
                     let Some((outer, call_at)) = callee_leaf_ok_one_call(callee) else {
                         if log {
                             eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (not leaf-eligible)");
@@ -807,6 +1402,46 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
+            // A flattened wrapper owns no captures (enforced by
+            // `splice_nested_leaf`), so the nested callee's biased body indices
+            // exclusively address this returned map. Merge it before the write
+            // preflight below; checking only the outer map would classify every
+            // valid nested UpvalSet as "unresolved" and silently disable the
+            // long-standing typed splice for `ri(n) { return rnd() * n | 0; }`.
+            upvals.extend(nested_upvals);
+            // An inline UpvalSet commits through `jit_cell_set`, intentionally
+            // the unconditional declaring-scope primitive. Preflight every
+            // written capture here so an immutable / TDZ PutValue stays on the
+            // interpreter path instead of silently writing through it. The
+            // exact-identity + heap-version guard pins these cell identities for
+            // the lifetime of the plan; mutable contents are still loaded live.
+            let mut invalid_upval_write = false;
+            for instr in &body {
+                let Instr::UpvalSet { idx, .. } = *instr else {
+                    continue;
+                };
+                let Some(cell_bits) = upvals.get(&idx).copied() else {
+                    invalid_upval_write = true;
+                    break;
+                };
+                let cell = Value::from_bits(cell_bits).heap_index();
+                if (!self.const_cells.is_empty() && self.const_cells.contains(&cell))
+                    || (!self.fn_name_cells.is_empty() && self.fn_name_cells.contains(&cell))
+                    || self.heap.cell_get(cell).is_uninitialized()
+                {
+                    invalid_upval_write = true;
+                    break;
+                }
+            }
+            if invalid_upval_write {
+                if log {
+                    eprintln!(
+                        "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
+                         (captured write is immutable, TDZ, or unresolved)"
+                    );
+                }
+                continue;
+            }
             // ── globals that are NOT slot bindings ──
             // An UNINITIALIZED slot is not an empty binding: a script
             // GlobalDeclarationInstantiation ($262.evalScript, and the test262
@@ -832,7 +1467,9 @@ impl<'p> Vm<'p> {
                 }
                 Instr::StoreGlobal { idx, .. }
                 | Instr::StoreGlobalStrict { idx, .. }
-                | Instr::StoreGlobalResolved { idx, .. } => self.global_slot_directly_routable(idx),
+                | Instr::StoreGlobalResolved { idx, .. } => {
+                    self.global_store_slot_directly_routable(idx)
+                }
                 _ => true,
             }) {
                 if log {
@@ -862,7 +1499,6 @@ impl<'p> Vm<'p> {
                     body.len()
                 );
             }
-            upvals.extend(nested_upvals);
             consts.extend(nested_consts);
             // W11 (B124): the may-read-before-write fill mask over the FINAL
             // (possibly nested-flattened) body — the emitter zero-fills only
@@ -903,7 +1539,7 @@ impl<'p> Vm<'p> {
             // holds global slot g's value at the call and every write to g
             // bumps the generation (conditions (a)-(g), `slot_guard_key`).
             // `None` keeps today's per-execution bits+version guard.
-            let slot_guard = if !crate::codegen::splice_slotgen_enabled() {
+            let slot_guard = if same_proto || !crate::codegen::splice_slotgen_enabled() {
                 None
             } else {
                 match self.slot_guard_key(func_id, start as usize, ip, callee_bits, callee_ver) {
@@ -921,15 +1557,86 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
+            let body_has_direct_global = body.iter().any(|ins| {
+                matches!(
+                    ins,
+                    Instr::LoadGlobal { .. }
+                        | Instr::LoadGlobalOrUndefined { .. }
+                        | Instr::StoreGlobal { .. }
+                        | Instr::StoreGlobalStrict { .. }
+                        | Instr::StoreGlobalResolved { .. }
+                )
+            });
+            // A raw-global leaf body is shared by two emitters which do not
+            // execute the same schedule: the typed lane carries its own guard,
+            // while the generic MEM splice expands the bytecode directly and
+            // the INT splice hoists that expansion into a region. Keep their
+            // route authority independent of `typed_lane`: prove the exact
+            // slots/realm here once and carry only the VM-relative epoch.
+            //
+            // Epoch zero is intentionally the sole admitted value. A later
+            // delete/redefinition bumps it and both emitters fall back; even a
+            // saturated epoch can therefore never equal this baked proof.
+            // `StoreGlobalResolved` remains on the real-call path: its dynamic
+            // binding resolution is not equivalent to an unconditional r12
+            // store merely because its current slot happens to be routable.
+            let direct_global_route_epoch = if body_has_direct_global {
+                let callee_value = Value::from_bits(callee_bits);
+                let nested_routes_are_root = nested.values().all(|guard| {
+                    let value = Value::from_bits(guard.bits);
+                    value.is_heap()
+                        && self.get_function_realm(value) == 0
+                        && self.ic_plain_fn(value).is_some_and(|(nested_fid, _)| {
+                            self.jit_func_eligible(nested_fid)
+                                && !self.closure_eval_scope.contains_key(&value.heap_index())
+                        })
+                });
+                let route_is_exact = callee_value.is_heap()
+                    && self.global_route_epoch == 0
+                    && self.current_realm_id().is_none()
+                    && self.get_function_realm(callee_value) == 0
+                    && self.jit_func_eligible(fid)
+                    && !self
+                        .closure_eval_scope
+                        .contains_key(&callee_value.heap_index())
+                    && nested_routes_are_root
+                    && body.iter().all(|ins| match *ins {
+                        Instr::LoadGlobal { idx, .. }
+                        | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                            self.global_slot_directly_routable(idx)
+                        }
+                        Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } => {
+                            self.global_store_slot_directly_routable(idx)
+                        }
+                        Instr::StoreGlobalResolved { .. } => false,
+                        _ => true,
+                    });
+                if !route_is_exact {
+                    if log {
+                        eprintln!(
+                            "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
+                             (direct-global route is not exact)"
+                        );
+                    }
+                    continue;
+                }
+                Some(0)
+            } else {
+                None
+            };
             // Typed splice lane: schedule a register-resident emission for a
             // proven-numeric body (fail-closed — any Err keeps the generic
             // boxed loop, byte-identical). Computed over the FINAL (possibly
             // nested-flattened) body with the merged upvals/consts/nested
-            // maps, so the schedule sees exactly what the emitter would.
+            // maps, so the schedule sees exactly what the emitter would. A
+            // raw global access additionally gets the VM-wide route-epoch
+            // guard. Only epoch zero is admitted: after any observable global
+            // delete/redefinition, saturation cannot make a stale baked epoch
+            // look current and the real call remains authoritative.
             let typed_lane = if !crate::codegen::typed_splice_enabled() {
                 None
             } else {
-                match crate::codegen::build_typed_lane(
+                match crate::codegen::build_typed_lane_guarded(
                     &body,
                     callee.param_count,
                     argc,
@@ -939,6 +1646,7 @@ impl<'p> Vm<'p> {
                     &upvals,
                     &consts,
                     &nested,
+                    direct_global_route_epoch,
                 ) {
                     Ok(lane) => {
                         if log {
@@ -957,7 +1665,17 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
-            let mut span_code_unit_pred = span_code_unit_pred_plan(callee, &body, argc);
+            if log && same_proto {
+                eprintln!(
+                    "[leaf] fn{func_id}@{ip} callee fn{fid} SAME-PROTO-INLINE \
+                     (default_mask={default_arg_mask:#x})"
+                );
+            }
+            let mut span_code_unit_pred = if same_proto {
+                None
+            } else {
+                span_code_unit_pred_plan(callee, &body, argc)
+            };
             if let Some(pred) = span_code_unit_pred.as_mut() {
                 pred.pair = self.span_code_unit_pair_plan(
                     func_id,
@@ -971,13 +1689,9 @@ impl<'p> Vm<'p> {
                 );
             }
             if log && span_code_unit_pred.is_some() {
-                eprintln!(
-                    "[leaf] fn{func_id}@{ip} callee fn{fid} SPAN-CODEUNIT-PRED"
-                );
+                eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} SPAN-CODEUNIT-PRED");
                 if span_code_unit_pred.is_some_and(|p| p.pair.is_some()) {
-                    eprintln!(
-                        "[leaf] fn{func_id}@{ip} callee fn{fid} SPAN-CODEUNIT-PAIR"
-                    );
+                    eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} SPAN-CODEUNIT-PAIR");
                 }
             }
             if log {
@@ -992,10 +1706,13 @@ impl<'p> Vm<'p> {
                 LeafInlinePlan {
                     callee_bits,
                     callee_ver,
+                    same_proto_fid: same_proto.then_some(fid),
+                    same_proto_guard: crate::vm::helpers_misc::jit_leaf_same_func_proto as usize,
                     this_bits,
                     reg_window,
                     callee_reg_count: callee.reg_count + extra_regs,
                     param_count: callee.param_count,
+                    default_arg_mask,
                     body,
                     consts,
                     nested,
@@ -1007,6 +1724,7 @@ impl<'p> Vm<'p> {
                     uninit_mask,
                     alias_params,
                     slot_guard,
+                    direct_global_route_epoch,
                     typed_lane,
                     span_code_unit_pred,
                 },
@@ -1100,8 +1818,8 @@ impl<'p> Vm<'p> {
         {
             return Err("callee-version-stale");
         }
-        // Same absolute-VM-address pattern as `epoch_ptr` below: the Vm (and
-        // the never-reallocated gens table) is address-stable for the run.
+        // `global_gens` owns a separately allocated, never-reallocated buffer,
+        // so this element address remains stable even if an embedded Vm moves.
         // (d) bounds the index: gens was sized past global_count at boot.
         debug_assert!((g as usize) < self.global_gens.len());
         let addr = unsafe { self.global_gens.as_ptr().add(g as usize) } as u64;
@@ -1125,6 +1843,7 @@ impl<'p> Vm<'p> {
         start: u32,
         end: u32,
         base: usize,
+        allow_global_methods: bool,
     ) -> rustc_hash::FxHashMap<usize, crate::codegen::MethodInlinePlan> {
         use crate::codegen::MethodInlinePlan;
         use crate::heap::HeapObj;
@@ -1132,6 +1851,13 @@ impl<'p> Vm<'p> {
         let mut plan = rustc_hash::FxHashMap::default();
         if std::env::var_os("ZIPP_NO_METHOD_INLINE").is_some() {
             return plan; // kill-switch (live through all stages)
+        }
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            // A splice executes callee bytecodes inside a caller block. Until
+            // it carries an exact nested charge map, sandbox accounting keeps
+            // the real CallMethod activation.
+            return plan;
         }
         let log = std::env::var_os("ZIPP_JITLOG").is_some();
         let caller = self.func(func_id as usize);
@@ -1213,9 +1939,16 @@ impl<'p> Vm<'p> {
             let mut win_top = 0u16;
             for recv in cands {
                 let built = match kind {
-                    MiKind::Method => {
-                        self.build_method_shape(func_id, ip, recv, key, reg_window, arg_base, argc)
-                    }
+                    MiKind::Method => self.build_method_shape(
+                        func_id,
+                        ip,
+                        recv,
+                        key,
+                        reg_window,
+                        arg_base,
+                        argc,
+                        allow_global_methods,
+                    ),
                     MiKind::Getter => {
                         self.build_accessor_shape(func_id, ip, recv, key, reg_window, false)
                     }
@@ -1265,6 +1998,44 @@ impl<'p> Vm<'p> {
                 },
             );
         }
+        plan
+    }
+
+    /// Tier-C's transactional own-method lane. Reuse the ordinary method
+    /// planner, then retain only exact own-data arms whose body contains a
+    /// direct global access and scheduled successfully. Every retained lane is
+    /// register-only and therefore needs no scratch window.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_tierc_method_global_plan(
+        &self,
+        func_id: u32,
+        start: u32,
+        end: u32,
+        base: usize,
+    ) -> rustc_hash::FxHashMap<usize, crate::codegen::MethodInlinePlan> {
+        let mut plan = self.build_method_inline_plan(func_id, start, end, base, true);
+        plan.retain(|_, p| {
+            p.shapes.retain(|s| {
+                s.method_slot.is_some()
+                    && s.typed_lane.is_some()
+                    && s.body.iter().any(|i| {
+                        matches!(
+                            i,
+                            Instr::LoadGlobal { .. }
+                                | Instr::LoadGlobalOrUndefined { .. }
+                                | Instr::StoreGlobal { .. }
+                                | Instr::StoreGlobalStrict { .. }
+                        )
+                    })
+            });
+            if p.shapes.is_empty() {
+                false
+            } else {
+                // A typed lane holds no value in a carved callee window.
+                p.win_top = p.reg_window;
+                true
+            }
+        });
         plan
     }
 
@@ -1328,6 +2099,13 @@ impl<'p> Vm<'p> {
             nested_reject("inner-not-leaf");
             return None;
         };
+        // `splice_uninit_mask`, parameter aliasing and the typed-lane planner
+        // encode register sets in u64. The historical 32+32 leaf caps made
+        // this bound implicit; the guarded wider leaf cap needs it explicit.
+        if outer.reg_count.checked_add(inner.reg_count)? > 64 {
+            nested_reject("combined-register-window");
+            return None;
+        }
         if inner_body.iter().any(|i| {
             matches!(
                 i,
@@ -1454,6 +2232,7 @@ impl<'p> Vm<'p> {
         // needs the same `arg_base`/`argc` the emitter binds from.
         arg_base: u16,
         argc: u16,
+        allow_global_methods: bool,
     ) -> Option<(crate::codegen::MethodInlineShape, u16)> {
         use crate::heap::HeapObj;
         use crate::vm::ic::Walked;
@@ -1466,8 +2245,10 @@ impl<'p> Vm<'p> {
         // holding a function — `{ m() {…} }`, the module/callback/vtable shape,
         // which is everywhere in real JavaScript and previously never inlined
         // (measured 21ns/call against 3.8ns for the same method on a class).
-        let (recv_class, vals_ptr) = match self.heap.get(ridx) {
-            HeapObj::Object(m) if !m.is_ctor => (m.class, m.vals.as_ptr() as u64),
+        let (recv_class, vals_ptr, shape_guardable) = match self.heap.get(ridx) {
+            HeapObj::Object(m) if !m.is_ctor => {
+                (m.class, m.vals.as_ptr() as u64, m.shape_guardable())
+            }
             _ => return None,
         };
         // An own property named `key` shadows a CLASS method, so a class
@@ -1567,8 +2348,61 @@ impl<'p> Vm<'p> {
         };
         let callee = self.func(fid as usize);
         // Outer body admits `super.m()` (Stage 3); super targets do not.
-        let body_len = Self::method_inline_body_ok(callee, true, false)?;
+        let body_len = Self::method_inline_body_ok(
+            callee,
+            true,
+            false,
+            allow_global_methods && method_slot.is_some(),
+        )?;
         let body: Vec<Instr> = callee.code[..body_len].to_vec();
+        let has_direct_global = body.iter().any(|i| {
+            matches!(
+                i,
+                Instr::LoadGlobal { .. }
+                    | Instr::LoadGlobalOrUndefined { .. }
+                    | Instr::StoreGlobal { .. }
+                    | Instr::StoreGlobalStrict { .. }
+            )
+        });
+        if has_direct_global {
+            // Narrow v1: an exact own-data method in the root/main realm, with
+            // no inherited dynamic EvalScope. Its raw slots share the caller's
+            // r12 table. Any other realm/environment must perform a real call.
+            let (_, callee_bits) = method_slot?;
+            let callee_v = Value::from_bits(callee_bits);
+            if !shape_guardable
+                || self.current_realm_id().is_some()
+                || self.get_function_realm(callee_v) != 0
+                // Main-program and loader-recorded ES-module protos are the
+                // VM's exact immutable-JIT boundary. Ordinary eval/new Function
+                // ids share the runtime table but are deliberately excluded.
+                || !self.jit_func_eligible(fid)
+                || self.closure_eval_scope.contains_key(&callee_v.heap_index())
+                || self.global_route_epoch != 0
+                || body.iter().any(|i| {
+                    matches!(
+                        i,
+                        Instr::SuperMethod { .. }
+                            | Instr::SuperGet { .. }
+                            | Instr::SuperSet { .. }
+                            | Instr::SuperBase { .. }
+                    )
+                })
+            {
+                return None;
+            }
+            if !body.iter().all(|i| match *i {
+                Instr::LoadGlobal { idx, .. } | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                    self.global_slot_directly_routable(idx)
+                }
+                Instr::StoreGlobal { idx, .. } | Instr::StoreGlobalStrict { idx, .. } => {
+                    self.global_store_slot_directly_routable(idx)
+                }
+                _ => true,
+            }) {
+                return None;
+            }
+        }
         let field_slots = self.mi_bake_fields(ridx, &body, &callee.string_constants)?;
         let consts = Self::mi_bake_consts(&callee.constants, &body);
         // ── bake each `super.m()` in the body (Stage 3) ──
@@ -1592,7 +2426,7 @@ impl<'p> Vm<'p> {
                 let sr = self.ic_super_method_baked(fid, bi, home_class_id, skey)?;
                 let scallee = self.func(sr.fid as usize);
                 // Super target must be inlinable AND have NO nested super (v1).
-                let sblen = Self::method_inline_body_ok(scallee, false, false)?;
+                let sblen = Self::method_inline_body_ok(scallee, false, false, false)?;
                 let sbody: Vec<Instr> = scallee.code[..sblen].to_vec();
                 let sfields = self.mi_bake_fields(ridx, &sbody, &scallee.string_constants)?;
                 let sconsts = Self::mi_bake_consts(&scallee.constants, &sbody);
@@ -1603,9 +2437,6 @@ impl<'p> Vm<'p> {
                 supers.insert(
                     bi,
                     crate::codegen::SuperInline {
-                        // The VM `mi_class_epoch` scalar's address is stable for
-                        // the run (Vm is not moved); bake a pointer + the value.
-                        epoch_ptr: &self.mi_class_epoch as *const u32 as u64,
                         epoch_val: self.mi_class_epoch,
                         hops: sr.hops,
                         holder_vals_ptr: sr.holder_vals_ptr,
@@ -1642,6 +2473,12 @@ impl<'p> Vm<'p> {
             argc,
             arg_base,
         );
+        if has_direct_global && typed_lane.is_none() {
+            // The boxed method emitter performs writes in source order and may
+            // deopt later. Transactional global bodies are legal only when the
+            // typed scheduler proved and buffered the entire closed body.
+            return None;
+        }
         Some((
             crate::codegen::MethodInlineShape {
                 method_slot,
@@ -1697,6 +2534,16 @@ impl<'p> Vm<'p> {
                 return None;
             }
         };
+        let has_direct_global = body.iter().any(|i| {
+            matches!(
+                i,
+                Instr::LoadGlobal { .. }
+                    | Instr::LoadGlobalOrUndefined { .. }
+                    | Instr::StoreGlobal { .. }
+                    | Instr::StoreGlobalStrict { .. }
+            )
+        });
+        let global_route_guard = has_direct_global.then_some(self.global_route_epoch);
         match crate::codegen::build_mi_lane(
             body,
             supers,
@@ -1708,6 +2555,7 @@ impl<'p> Vm<'p> {
             param_count,
             argc,
             arg_base,
+            global_route_guard,
         ) {
             Ok(lane) => {
                 if log {
@@ -1835,7 +2683,7 @@ impl<'p> Vm<'p> {
         // per-op rules (the SuperSet is effectful, so last-op-only, and gated
         // on allow_setprop). A setter body may equally still end in its own
         // SetProp{obj:0} store (allow_setprop=is_setter).
-        let body_len = Self::method_inline_body_ok(callee, true, is_setter)?;
+        let body_len = Self::method_inline_body_ok(callee, true, is_setter, false)?;
         let body: Vec<Instr> = callee.code[..body_len].to_vec();
         let field_slots = self.mi_bake_fields(ridx, &body, &callee.string_constants)?;
         let consts = Self::mi_bake_consts(&callee.constants, &body);
@@ -1895,7 +2743,7 @@ impl<'p> Vm<'p> {
             if is_store && scallee.param_count != 1 {
                 return None;
             }
-            let sblen = Self::method_inline_body_ok(scallee, false, is_store)?;
+            let sblen = Self::method_inline_body_ok(scallee, false, is_store, false)?;
             let sbody: Vec<Instr> = scallee.code[..sblen].to_vec();
             let sfields = self.mi_bake_fields(ridx, &sbody, &scallee.string_constants)?;
             let sconsts = Self::mi_bake_consts(&scallee.constants, &sbody);
@@ -1906,7 +2754,6 @@ impl<'p> Vm<'p> {
             supers.insert(
                 bi,
                 crate::codegen::SuperInline {
-                    epoch_ptr: &self.mi_class_epoch as *const u32 as u64,
                     epoch_val: self.mi_class_epoch,
                     hops: sr.hops,
                     holder_vals_ptr: sr.holder_vals_ptr,
@@ -2116,6 +2963,7 @@ impl<'p> Vm<'p> {
         p: &crate::bytecode::FuncProto,
         allow_super: bool,
         allow_setprop: bool,
+        allow_globals: bool,
     ) -> Option<usize> {
         use crate::bytecode::Instr as I;
         if p.is_generator || p.is_async {
@@ -2139,6 +2987,8 @@ impl<'p> Vm<'p> {
                     Some(c) if c.is_number() => {}
                     _ => return None,
                 },
+                I::LoadGlobal { .. } | I::LoadGlobalOrUndefined { .. } if allow_globals => {}
+                I::StoreGlobal { .. } | I::StoreGlobalStrict { .. } if allow_globals => {}
                 I::GetProp { obj: 0, .. } => {}
                 I::Add { .. }
                 | I::Sub { .. }

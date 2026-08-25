@@ -33,7 +33,10 @@ pub struct LexError {
 
 impl LexError {
     fn new(msg: impl Into<String>, pos: usize) -> LexError {
-        LexError { msg: msg.into(), pos: pos as u32 }
+        LexError {
+            msg: msg.into(),
+            pos: pos as u32,
+        }
     }
 }
 
@@ -144,8 +147,8 @@ impl<'s> Lexer<'s> {
     fn is_ws(c: char) -> bool {
         matches!(
             c,
-            '\t' | '\u{0B}' | '\u{0C}' | ' ' | '\u{A0}' | '\u{FEFF}'
-                | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
+            '\t' | '\u{0B}' | '\u{0C}' | ' ' | '\u{A0}' | '\u{FEFF}' | '\u{1680}' | '\u{2000}'
+                ..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}'
         )
     }
 
@@ -375,14 +378,32 @@ impl<'s> Lexer<'s> {
                 if name.is_empty() {
                     return Err(LexError::new("expected a private name after '#'", start));
                 }
-                TokenKind::Ident { name, kw: Keyword::None, had_escape, private: true }
+                TokenKind::Ident {
+                    name,
+                    kw: Keyword::None,
+                    had_escape,
+                    private: true,
+                }
             }
             _ => {
-                let (c, _) = if b < 0x80 { (b as char, 1) } else { self.char_at(self.pos) };
+                let (c, _) = if b < 0x80 {
+                    (b as char, 1)
+                } else {
+                    self.char_at(self.pos)
+                };
                 if Self::is_id_start(c) || b == b'\\' {
                     let (name, had_escape) = self.read_ident_name()?;
-                    let kw = if had_escape { Keyword::None } else { Keyword::classify(&name) };
-                    TokenKind::Ident { name, kw, had_escape, private: false }
+                    let kw = if had_escape {
+                        Keyword::None
+                    } else {
+                        Keyword::classify(&name)
+                    };
+                    TokenKind::Ident {
+                        name,
+                        kw,
+                        had_escape,
+                        private: false,
+                    }
                 } else {
                     TokenKind::Punct(self.read_punct()?)
                 }
@@ -424,7 +445,11 @@ impl<'s> Lexer<'s> {
                 let cp = self.read_unicode_escape_value(esc_at)?;
                 let c = char::from_u32(cp)
                     .ok_or_else(|| LexError::new("invalid code point in identifier", esc_at))?;
-                let ok = if first { Self::is_id_start(c) } else { Self::is_id_part(c) };
+                let ok = if first {
+                    Self::is_id_start(c)
+                } else {
+                    Self::is_id_part(c)
+                };
                 if !ok {
                     return Err(LexError::new(
                         "escape does not encode a valid identifier character",
@@ -436,8 +461,16 @@ impl<'s> Lexer<'s> {
                 first = false;
                 continue;
             }
-            let (c, w) = if b < 0x80 { (b as char, 1) } else { self.char_at(self.pos) };
-            let ok = if first { Self::is_id_start(c) } else { Self::is_id_part(c) };
+            let (c, w) = if b < 0x80 {
+                (b as char, 1)
+            } else {
+                self.char_at(self.pos)
+            };
+            let ok = if first {
+                Self::is_id_start(c)
+            } else {
+                Self::is_id_part(c)
+            };
             if !ok {
                 break;
             }
@@ -460,8 +493,7 @@ impl<'s> Lexer<'s> {
                     self.pos += 1;
                     break;
                 }
-                let d = hex_val(b)
-                    .ok_or_else(|| LexError::new("invalid unicode escape", at))?;
+                let d = hex_val(b).ok_or_else(|| LexError::new("invalid unicode escape", at))?;
                 v = v.saturating_mul(16).saturating_add(d);
                 if v > 0x10FFFF {
                     return Err(LexError::new("unicode escape out of range", at));
@@ -537,12 +569,30 @@ impl<'s> Lexer<'s> {
         }
         let b = self.peek();
         match b {
-            b'n' => { out.push(0x0A); self.pos += 1; }
-            b't' => { out.push(0x09); self.pos += 1; }
-            b'r' => { out.push(0x0D); self.pos += 1; }
-            b'b' => { out.push(0x08); self.pos += 1; }
-            b'f' => { out.push(0x0C); self.pos += 1; }
-            b'v' => { out.push(0x0B); self.pos += 1; }
+            b'n' => {
+                out.push(0x0A);
+                self.pos += 1;
+            }
+            b't' => {
+                out.push(0x09);
+                self.pos += 1;
+            }
+            b'r' => {
+                out.push(0x0D);
+                self.pos += 1;
+            }
+            b'b' => {
+                out.push(0x08);
+                self.pos += 1;
+            }
+            b'f' => {
+                out.push(0x0C);
+                self.pos += 1;
+            }
+            b'v' => {
+                out.push(0x0B);
+                self.pos += 1;
+            }
             b'0'..=b'7' => {
                 // `\0` not followed by a digit is NUL and always legal. Any
                 // other octal escape is Annex B legacy, illegal in strict code
@@ -584,11 +634,11 @@ impl<'s> Lexer<'s> {
             }
             b'x' => {
                 self.pos += 1;
-                let hi = hex_val(self.peek())
-                    .ok_or_else(|| LexError::new("invalid hex escape", at))?;
+                let hi =
+                    hex_val(self.peek()).ok_or_else(|| LexError::new("invalid hex escape", at))?;
                 self.pos += 1;
-                let lo = hex_val(self.peek())
-                    .ok_or_else(|| LexError::new("invalid hex escape", at))?;
+                let lo =
+                    hex_val(self.peek()).ok_or_else(|| LexError::new("invalid hex escape", at))?;
                 self.pos += 1;
                 out.push((hi * 16 + lo) as u16);
             }
@@ -617,7 +667,11 @@ impl<'s> Lexer<'s> {
                 self.pos += 1;
             }
             _ => {
-                let (c, w) = if b < 0x80 { (b as char, 1) } else { self.char_at(self.pos) };
+                let (c, w) = if b < 0x80 {
+                    (b as char, 1)
+                } else {
+                    self.char_at(self.pos)
+                };
                 if Self::is_line_terminator(c) {
                     self.pos += w; // LineContinuation for U+2028/U+2029
                 } else {
@@ -692,9 +746,15 @@ impl<'s> Lexer<'s> {
         let raw_end = self.pos;
         // Consume the terminator: ` for a tail, ${ otherwise.
         self.pos += if tail { 1 } else { 2 };
-        let raw = String::from_utf8_lossy(&self.src[raw_start..raw_end]).replace("\r\n", "\n").replace('\r', "\n");
+        let raw = String::from_utf8_lossy(&self.src[raw_start..raw_end])
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
         Ok(TokenKind::Template {
-            cooked: if bad_escape { None } else { Some(StrVal::from_utf16(units)) },
+            cooked: if bad_escape {
+                None
+            } else {
+                Some(StrVal::from_utf16(units))
+            },
             raw,
             head,
             tail,
@@ -766,12 +826,16 @@ impl<'s> Lexer<'s> {
         }
         let body_end = self.pos;
         self.pos += 1; // closing /
-        // Flags are an IdentifierPart run; validating which letters are legal
-        // (and rejecting duplicates) is the parser's job.
+                       // Flags are an IdentifierPart run; validating which letters are legal
+                       // (and rejecting duplicates) is the parser's job.
         let flags_start = self.pos;
         while !self.at_end() {
             let b = self.peek();
-            let (c, w) = if b < 0x80 { (b as char, 1) } else { self.char_at(self.pos) };
+            let (c, w) = if b < 0x80 {
+                (b as char, 1)
+            } else {
+                self.char_at(self.pos)
+            };
             if !Self::is_id_part(c) {
                 break;
             }
@@ -812,7 +876,10 @@ impl<'s> Lexer<'s> {
             // this the digit reader saw `0`, `_`, `0` — each individually legal
             // — and quietly produced 0.
             if self.peek_at(1) == b'_' {
-                return Err(LexError::new("numeric separator after a leading zero", start));
+                return Err(LexError::new(
+                    "numeric separator after a leading zero",
+                    start,
+                ));
             }
             // Legacy forms: `0123` is octal (Annex B), `08`/`09` is decimal.
             let next = self.peek_at(1);
@@ -827,13 +894,17 @@ impl<'s> Lexer<'s> {
                 }
                 // A `.` or exponent after the digits makes it an ordinary
                 // decimal (`08.5`), not a legacy octal.
-                let followed_by_dec = p < self.src.len() && (self.src[p] == b'.' || (self.src[p] | 0x20) == b'e');
+                let followed_by_dec =
+                    p < self.src.len() && (self.src[p] == b'.' || (self.src[p] | 0x20) == b'e');
                 if all_octal && !followed_by_dec {
                     let text = std::str::from_utf8(&self.src[self.pos + 1..p]).unwrap_or("0");
                     let v = u64::from_str_radix(text, 8).unwrap_or(0) as f64;
                     self.pos = p;
                     self.reject_ident_after(start)?;
-                    return Ok(TokenKind::Num(NumLit { value: v, kind: NumKind::LegacyOctal }));
+                    return Ok(TokenKind::Num(NumLit {
+                        value: v,
+                        kind: NumKind::LegacyOctal,
+                    }));
                 }
                 // `NonOctalDecimalIntegerLiteral :: 0 NonOctalDecimalDigits`
                 // reads `DecimalDigits[~Sep]`, so a numeric separator anywhere
@@ -912,7 +983,10 @@ impl<'s> Lexer<'s> {
         for c in text.bytes() {
             v = v * radix as f64 + hex_val(c).unwrap_or(0) as f64;
         }
-        Ok(TokenKind::Num(NumLit { value: v, kind: NumKind::Prefixed }))
+        Ok(TokenKind::Num(NumLit {
+            value: v,
+            kind: NumKind::Prefixed,
+        }))
     }
 
     /// Read digits of `radix`, honouring `_` separators. A separator may not
@@ -959,9 +1033,16 @@ impl<'s> Lexer<'s> {
             return Ok(());
         }
         let b = self.peek();
-        let (c, _) = if b < 0x80 { (b as char, 1) } else { self.char_at(self.pos) };
+        let (c, _) = if b < 0x80 {
+            (b as char, 1)
+        } else {
+            self.char_at(self.pos)
+        };
         if Self::is_id_start(c) || c.is_ascii_digit() {
-            return Err(LexError::new("identifier starts immediately after a number", start));
+            return Err(LexError::new(
+                "identifier starts immediately after a number",
+                start,
+            ));
         }
         Ok(())
     }
@@ -1070,7 +1151,11 @@ impl<'s> Lexer<'s> {
                 _ => adv!(1, Caret),
             },
             _ => {
-                let (c, _) = if b < 0x80 { (b as char, 1) } else { self.char_at(self.pos) };
+                let (c, _) = if b < 0x80 {
+                    (b as char, 1)
+                } else {
+                    self.char_at(self.pos)
+                };
                 Err(LexError::new(format!("unexpected character {c:?}"), start))
             }
         }

@@ -212,11 +212,6 @@ mod wasm_instant {
         pub(crate) fn now() -> Self {
             Instant((super::now_mono_ms() * 1.0e6) as u64)
         }
-
-        #[inline]
-        pub(crate) fn elapsed(&self) -> Duration {
-            Instant::now() - *self
-        }
     }
 
     impl Add<Duration> for Instant {

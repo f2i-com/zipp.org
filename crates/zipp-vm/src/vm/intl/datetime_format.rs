@@ -3,14 +3,13 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
-use crate::vm::{cldr_en, dtf_pattern};
 use crate::vm::*;
+use crate::vm::{cldr_en, dtf_pattern};
 
 impl<'p> Vm<'p> {
-
     /// HandleDateTimeValue's argument classification: `None` for an ordinary time
     /// value (a Number, a Date, anything ToNumber-able), `Some(k)` for a
     /// `Temporal.*` argument (k = the HeapObj::Temporal kind). formatRange pairs
@@ -25,7 +24,6 @@ impl<'p> Vm<'p> {
         None
     }
 
-
     /// HandleDateTimeValue's calendar guard: a `Temporal.*` argument is rendered
     /// with the DateTimeFormat's own calendar, so its calendar must be either
     /// `iso8601` (which any calendar can render) or exactly the format's.
@@ -38,7 +36,10 @@ impl<'p> Vm<'p> {
         name: &str,
     ) -> Result<(), Thrown> {
         // Only the calendar-BEARING Temporal types carry a calendar to clash.
-        if !self.dt_arg_kind(v).is_some_and(|k| matches!(k, 1 | 3 | 5 | 6 | 7)) {
+        if !self
+            .dt_arg_kind(v)
+            .is_some_and(|k| matches!(k, 1 | 3 | 5 | 6 | 7))
+        {
             return Ok(());
         }
         let cal = self.cal_of(v.heap_index());
@@ -47,7 +48,10 @@ impl<'p> Vm<'p> {
         }
         let want = self.intl_slot(resolved, "calendar");
         let want = if want.is_heap() {
-            self.heap.str_cow(want.heap_index()).map(|s| s.into_owned()).unwrap_or_default()
+            self.heap
+                .str_cow(want.heap_index())
+                .map(|s| s.into_owned())
+                .unwrap_or_default()
         } else {
             String::new()
         };
@@ -83,7 +87,6 @@ impl<'p> Vm<'p> {
     const F_TIME: u16 =
         Self::F_DAYPERIOD | Self::F_HOUR | Self::F_MINUTE | Self::F_SECOND | Self::F_FRAC;
 
-
     /// (allowed, defaults) for a `dt_arg_kind` — the fields a value of that type
     /// can contribute, and the group ToDateTimeOptions fills in when the options
     /// named no component at all.
@@ -91,19 +94,24 @@ impl<'p> Vm<'p> {
         const YMD: u16 = Vm::F_YEAR | Vm::F_MONTH | Vm::F_DAY;
         const HMS: u16 = Vm::F_HOUR | Vm::F_MINUTE | Vm::F_SECOND;
         match kind {
-            1 => (Self::F_DATE, YMD),                     // PlainDate
-            2 => (Self::F_TIME, HMS),                     // PlainTime
+            1 => (Self::F_DATE, YMD),                      // PlainDate
+            2 => (Self::F_TIME, HMS),                      // PlainTime
             3 => (Self::F_DATE | Self::F_TIME, YMD | HMS), // PlainDateTime (no zone)
             // ZonedDateTime — reachable only from its own toLocaleString
             // (Intl.DateTimeFormat rejects the type outright), where the zone
             // name is part of the defaults group.
-            7 => (Self::F_DATE | Self::F_TIME | Self::F_ZONE, YMD | HMS | Self::F_ZONE),
-            5 => (Self::F_ERA | Self::F_YEAR | Self::F_MONTH, Self::F_YEAR | Self::F_MONTH),
+            7 => (
+                Self::F_DATE | Self::F_TIME | Self::F_ZONE,
+                YMD | HMS | Self::F_ZONE,
+            ),
+            5 => (
+                Self::F_ERA | Self::F_YEAR | Self::F_MONTH,
+                Self::F_YEAR | Self::F_MONTH,
+            ),
             6 => (Self::F_MONTH | Self::F_DAY, Self::F_MONTH | Self::F_DAY),
             _ => (Self::F_DATE | Self::F_TIME | Self::F_ZONE, YMD | HMS), // Instant
         }
     }
-
 
     /// The components `resolved` names. `dateStyle`/`timeStyle` stand for whole
     /// groups; `full`/`long` time styles also carry the zone name, which is why
@@ -149,7 +157,6 @@ impl<'p> Vm<'p> {
         m
     }
 
-
     /// HandleDateTimeValue's field resolution for one argument. Returns the
     /// components to print and whether the value is an ABSOLUTE time (a legacy
     /// Date/number or a Temporal.Instant, which renders in the formatter's time
@@ -166,13 +173,14 @@ impl<'p> Vm<'p> {
         name: &str,
     ) -> Result<(u16, bool), Thrown> {
         let requested = self.dtf_requested_fields(resolved);
-        let Some(kind) = self.dt_arg_kind(v) else { return Ok((requested, true)) };
+        let Some(kind) = self.dt_arg_kind(v) else {
+            return Ok((requested, true));
+        };
         if matches!(kind, 0 | 7) {
             return Ok((requested, true)); // Duration/ZonedDateTime: dtf_time_value rejects
         }
         self.dtf_fields_for_kind(resolved, kind, name)
     }
-
 
     /// `dtf_fields_for` with the Temporal kind supplied directly, so
     /// `Temporal.ZonedDateTime.prototype.toLocaleString` — the one caller for
@@ -209,7 +217,11 @@ impl<'p> Vm<'p> {
         // defaults, so an Instant formatted by that formatter still prints its
         // era — which is what makes it agree with `Date.prototype.toLocaleString`
         // under the same options (`format/temporal-objects-format-with-era.js`).
-        let effective = if need_defaults { requested | defaults } else { requested } & allowed;
+        let effective = if need_defaults {
+            requested | defaults
+        } else {
+            requested
+        } & allowed;
         if effective == 0 {
             return Err(Thrown(format!(
                 "TypeError: {name} options do not include any field this Temporal value has"
@@ -219,7 +231,6 @@ impl<'p> Vm<'p> {
         // formatter's zone. Every plain type carries its own wall clock instead.
         Ok((effective, matches!(kind, 4 | 7)))
     }
-
 
     /// HandleDateTimeValue: ToNumber + TimeClip for an ordinary time value (an
     /// out-of-range or non-finite one is a RangeError, and the result is an
@@ -280,7 +291,6 @@ impl<'p> Vm<'p> {
         Ok(if t == 0.0 { 0.0 } else { t })
     }
 
-
     /// PartitionDateTimeRangePattern: when the two times fall in the same pattern
     /// slot the range collapses to a single formatting with every part "shared";
     /// otherwise the two sides are joined by the en range separator.
@@ -295,7 +305,10 @@ impl<'p> Vm<'p> {
         let a = self.dtf_parts(resolved, x, fields, absolute);
         let b = self.dtf_parts(resolved, y, fields, absolute);
         if a == b {
-            return a.into_iter().map(|(t, v)| (t.to_string(), v, "shared")).collect();
+            return a
+                .into_iter()
+                .map(|(t, v)| (t.to_string(), v, "shared"))
+                .collect();
         }
         // PartitionDateTimeRangePattern: CLDR's `intervalFormats` give a pattern
         // per (skeleton, greatest differing field) that names each field twice,
@@ -305,9 +318,13 @@ impl<'p> Vm<'p> {
             return parts;
         }
         // `intervalFormatFallback` — format both endpoints whole and join.
-        let (pre, post) =
-            cldr_en::INTERVAL_FALLBACK.split_once("{0}").unwrap_or(("", cldr_en::INTERVAL_FALLBACK));
-        let sep = post.split_once("{1}").map(|(s, _)| s).unwrap_or(" \u{2013} ");
+        let (pre, post) = cldr_en::INTERVAL_FALLBACK
+            .split_once("{0}")
+            .unwrap_or(("", cldr_en::INTERVAL_FALLBACK));
+        let sep = post
+            .split_once("{1}")
+            .map(|(s, _)| s)
+            .unwrap_or(" \u{2013} ");
         let mut out: Vec<(String, String, &'static str)> = vec![];
         if !pre.is_empty() {
             out.push(("literal".to_string(), pre.to_string(), "shared"));
@@ -317,7 +334,6 @@ impl<'p> Vm<'p> {
         out.extend(b.into_iter().map(|(t, v)| (t.to_string(), v, "endRange")));
         out
     }
-
 
     /// The `intervalFormats` rendering of a range, or None when CLDR has no
     /// pattern for this skeleton and difference (the caller then falls back).
@@ -373,9 +389,12 @@ impl<'p> Vm<'p> {
             .into_iter()
             .map(|(t, v)| (t.to_string(), v, "shared"))
             .collect();
-        Some(dtf_pattern::splice_glue_parts(cldr_en::DATETIME_GLUE_AT[glue], &shared, &ranged))
+        Some(dtf_pattern::splice_glue_parts(
+            cldr_en::DATETIME_GLUE_AT[glue],
+            &shared,
+            &ranged,
+        ))
     }
-
 
     /// The most significant field in `items` whose rendering differs between the
     /// two instants — the `intervalFormats` key.
@@ -395,18 +414,21 @@ impl<'p> Vm<'p> {
         // `dtf_render` emits exactly one part per item, so the three align.
         let mut best: Option<(u8, char)> = None;
         for (i, item) in items.iter().enumerate() {
-            let dtf_pattern::Item::Field(c, _) = item else { continue };
+            let dtf_pattern::Item::Field(c, _) = item else {
+                continue;
+            };
             if a.get(i).map(|p| &p.1) == b.get(i).map(|p| &p.1) {
                 continue;
             }
-            let Some(k) = dtf_pattern::class_of_pub(*c) else { continue };
+            let Some(k) = dtf_pattern::class_of_pub(*c) else {
+                continue;
+            };
             if best.is_none_or(|(bk, _)| k < bk) {
                 best = Some((k, *c));
             }
         }
         best.map(|(_, c)| c)
     }
-
 
     /// The resolved components as CLDR pattern letters, plus the hour cycle.
     /// This is the request `dtf_pattern::best_pattern` matches against
@@ -426,40 +448,66 @@ impl<'p> Vm<'p> {
         // Table 7's widths, spelled as UTS #35 field counts: `MMMM` is a wide
         // month, `MMM` an abbreviated one, `MM` two digits, `M` numeric.
         if has(Self::F_ERA) {
-            req.push('G', match slot("era").as_deref() {
-                Some("long") => 4,
-                Some("narrow") => 5,
-                _ => 1,
-            });
+            req.push(
+                'G',
+                match slot("era").as_deref() {
+                    Some("long") => 4,
+                    Some("narrow") => 5,
+                    _ => 1,
+                },
+            );
         }
         if has(Self::F_YEAR) {
-            req.push('y', if slot("year").as_deref() == Some("2-digit") { 2 } else { 1 });
+            req.push(
+                'y',
+                if slot("year").as_deref() == Some("2-digit") {
+                    2
+                } else {
+                    1
+                },
+            );
         }
         if has(Self::F_MONTH) {
-            req.push('M', match slot("month").as_deref() {
-                Some("2-digit") => 2,
-                Some("short") => 3,
-                Some("long") => 4,
-                Some("narrow") => 5,
-                _ => 1,
-            });
+            req.push(
+                'M',
+                match slot("month").as_deref() {
+                    Some("2-digit") => 2,
+                    Some("short") => 3,
+                    Some("long") => 4,
+                    Some("narrow") => 5,
+                    _ => 1,
+                },
+            );
         }
         if has(Self::F_DAY) {
-            req.push('d', if slot("day").as_deref() == Some("2-digit") { 2 } else { 1 });
+            req.push(
+                'd',
+                if slot("day").as_deref() == Some("2-digit") {
+                    2
+                } else {
+                    1
+                },
+            );
         }
         if has(Self::F_WEEKDAY) {
-            req.push('E', match slot("weekday").as_deref() {
-                Some("long") => 4,
-                Some("narrow") => 5,
-                _ => 3,
-            });
+            req.push(
+                'E',
+                match slot("weekday").as_deref() {
+                    Some("long") => 4,
+                    Some("narrow") => 5,
+                    _ => 3,
+                },
+            );
         }
         if has(Self::F_DAYPERIOD) {
-            req.push('B', match slot("dayPeriod").as_deref() {
-                Some("long") => 4,
-                Some("narrow") => 5,
-                _ => 1,
-            });
+            req.push(
+                'B',
+                match slot("dayPeriod").as_deref() {
+                    Some("long") => 4,
+                    Some("narrow") => 5,
+                    _ => 1,
+                },
+            );
         }
         if has(Self::F_HOUR) {
             let letter = match hc.as_str() {
@@ -468,13 +516,34 @@ impl<'p> Vm<'p> {
                 "h24" => 'k',
                 _ => 'h',
             };
-            req.push(letter, if slot("hour").as_deref() == Some("2-digit") { 2 } else { 1 });
+            req.push(
+                letter,
+                if slot("hour").as_deref() == Some("2-digit") {
+                    2
+                } else {
+                    1
+                },
+            );
         }
         if has(Self::F_MINUTE) {
-            req.push('m', if slot("minute").as_deref() == Some("2-digit") { 2 } else { 1 });
+            req.push(
+                'm',
+                if slot("minute").as_deref() == Some("2-digit") {
+                    2
+                } else {
+                    1
+                },
+            );
         }
         if has(Self::F_SECOND) {
-            req.push('s', if slot("second").as_deref() == Some("2-digit") { 2 } else { 1 });
+            req.push(
+                's',
+                if slot("second").as_deref() == Some("2-digit") {
+                    2
+                } else {
+                    1
+                },
+            );
         }
         if has(Self::F_FRAC) {
             let n = slot("fractionalSecondDigits").and_then(|s| s.parse::<usize>().ok());
@@ -490,14 +559,16 @@ impl<'p> Vm<'p> {
                 // `timeStyle: "full"` carries `zzzz`, `"long"` carries `z`; with
                 // no timeZoneName option at all those are the only two shapes.
                 _ if slot("timeZoneName").is_none()
-                    && slot("timeStyle").as_deref() == Some("full") => ('z', 4),
+                    && slot("timeStyle").as_deref() == Some("full") =>
+                {
+                    ('z', 4)
+                }
                 _ => ('z', 1),
             };
             req.push(c, n);
         }
         (req, hour12)
     }
-
 
     /// Keep only the pattern items whose field this argument actually has, and
     /// drop the separators the removed fields owned.
@@ -516,11 +587,16 @@ impl<'p> Vm<'p> {
     /// becomes `14:12:47 Coordinated Universal Time`, not
     /// `14:12:47\u{202f}Coordinated Universal Time`
     /// (`format/timedatestyle-en.js`, which hard-codes the plain space).
-    fn dtf_filter(items: Vec<dtf_pattern::Item>, keep: &dyn Fn(char) -> bool) -> Vec<dtf_pattern::Item> {
+    fn dtf_filter(
+        items: Vec<dtf_pattern::Item>,
+        keep: &dyn Fn(char) -> bool,
+    ) -> Vec<dtf_pattern::Item> {
         let n = items.len();
         let mut drop = vec![false; n];
         for (i, it) in items.iter().enumerate() {
-            let dtf_pattern::Item::Field(c, _) = it else { continue };
+            let dtf_pattern::Item::Field(c, _) = it else {
+                continue;
+            };
             if keep(*c) {
                 continue;
             }
@@ -537,8 +613,8 @@ impl<'p> Vm<'p> {
                 .iter()
                 .any(|x| matches!(x, dtf_pattern::Item::Field(c, _) if keep(*c)));
             if later {
-                if let Some(j) = (i + 1..n)
-                    .find(|j| matches!(items[*j], dtf_pattern::Item::Lit(_)) && !drop[*j])
+                if let Some(j) =
+                    (i + 1..n).find(|j| matches!(items[*j], dtf_pattern::Item::Lit(_)) && !drop[*j])
                 {
                     if j == i + 1 {
                         drop[j] = true;
@@ -548,9 +624,13 @@ impl<'p> Vm<'p> {
                 drop[i - 1] = true;
             }
         }
-        items.into_iter().zip(drop).filter(|(_, d)| !d).map(|(it, _)| it).collect()
+        items
+            .into_iter()
+            .zip(drop)
+            .filter(|(_, d)| !d)
+            .map(|(it, _)| it)
+            .collect()
     }
-
 
     /// FormatDateTimePattern (ECMA-402 §11.5.6) over the CLDR `en` patterns in
     /// `cldr_en`, as a typed part list. `format` is this joined; `formatToParts`
@@ -576,7 +656,6 @@ impl<'p> Vm<'p> {
         };
         self.dtf_render(resolved, ms, absolute, &items)
     }
-
 
     /// The pattern for `fields`, split into literals and fields — and kept as
     /// two HALVES, because `formatRange` needs them apart: when only the time
@@ -664,7 +743,11 @@ impl<'p> Vm<'p> {
             // CLDR 42+ keeps a second "at time" glue for exactly this
             // combination; ICU uses it, so `dateStyle: "long"` +
             // `timeStyle: "short"` reads "May 1, 1886 at 2:12 PM".
-            return (d_items.unwrap_or_default(), t_items.unwrap_or_default(), ds.unwrap_or(3));
+            return (
+                d_items.unwrap_or_default(),
+                t_items.unwrap_or_default(),
+                ds.unwrap_or(3),
+            );
         }
         let (dpat, tpat, glue) = dtf_pattern::best_pattern_halves(&req, hour12);
         (
@@ -673,7 +756,6 @@ impl<'p> Vm<'p> {
             glue,
         )
     }
-
 
     /// Interpret a parsed pattern against one instant.
     fn dtf_render(
@@ -701,13 +783,17 @@ impl<'p> Vm<'p> {
             .as_deref()
             .and_then(|tz| time_zone_offset_minutes_at(tz, ms as i128))
             .unwrap_or(0);
-        let offset_ms = if absolute { tz_minutes as i128 * 60_000 } else { 0 };
+        let offset_ms = if absolute {
+            tz_minutes as i128 * 60_000
+        } else {
+            0
+        };
         let total_ms = ms as i128 + offset_ms;
         let days = total_ms.div_euclid(86_400_000) as i64;
         let (iso_y, iso_mo, iso_d) = epoch_days_to_iso(days);
         let rem_ns = total_ms.rem_euclid(86_400_000) * 1_000_000;
         let t = ns_to_time(rem_ns); // [h, mi, s, ms, us, ns]
-        // 1970-01-01 was a Thursday, index 4 in CLDR's Sunday-first week.
+                                    // 1970-01-01 was a Thursday, index 4 in CLDR's Sunday-first week.
         let weekday = (days.rem_euclid(7) + 4) as usize % 7;
         // ── the resolved calendar ────────────────────────────────────────────
         // `gregory` and `iso8601` ARE the proleptic Gregorian fields computed
@@ -758,10 +844,7 @@ impl<'p> Vm<'p> {
                         _ => 1,
                     };
                     match c {
-                        'G' => out.push((
-                            "era",
-                            cal_era_name(&cal_id, era_idx, text_width(n)),
-                        )),
+                        'G' => out.push(("era", cal_era_name(&cal_id, era_idx, text_width(n)))),
                         'y' | 'Y' | 'u' => {
                             let v = if *c == 'u' { y } else { era_year };
                             // `yy` is the last two digits, zero-padded; any other
@@ -841,7 +924,10 @@ impl<'p> Vm<'p> {
                             out.push(("fractionalSecond", s));
                         }
                         'z' | 'Z' | 'O' | 'v' | 'V' | 'X' | 'x' => {
-                            out.push(("timeZoneName", self.dtf_zone_name(resolved, *c, n, tz_minutes)));
+                            out.push((
+                                "timeZoneName",
+                                self.dtf_zone_name(resolved, *c, n, tz_minutes),
+                            ));
                         }
                         // A field this engine does not implement (quarter, week
                         // of year, …) is unreachable from ECMA-402's Table 7.
@@ -865,7 +951,8 @@ impl<'p> Vm<'p> {
             // pattern's ASCII "." — `en-US-u-nu-arab` prints ٠٦٫٧٨٩.
             if let Some((dec, _)) = numbering_separators(&ns) {
                 for i in 1..out.len() {
-                    if out[i].0 == "fractionalSecond" && out[i - 1] == ("literal", ".".to_string()) {
+                    if out[i].0 == "fractionalSecond" && out[i - 1] == ("literal", ".".to_string())
+                    {
                         out[i - 1].1 = dec.to_string();
                     }
                 }
@@ -873,7 +960,6 @@ impl<'p> Vm<'p> {
         }
         out
     }
-
 
     /// The zone name a `z`/`v`/`O` field prints.
     ///
@@ -899,22 +985,32 @@ impl<'p> Vm<'p> {
         let m = tz_minutes;
         let utc_named = slot("timeZone").as_deref() == Some("UTC") && c == 'z';
         if utc_named {
-            return if n >= 4 { "Coordinated Universal Time" } else { "UTC" }.to_string();
+            return if n >= 4 {
+                "Coordinated Universal Time"
+            } else {
+                "UTC"
+            }
+            .to_string();
         }
         if m == 0 {
             return "GMT".to_string();
         }
         let sign = if m < 0 { '-' } else { '+' };
         let (h, mi) = (m.abs() / 60, m.abs() % 60);
-        if mi != 0 { format!("GMT{sign}{h}:{mi:02}") } else { format!("GMT{sign}{h}") }
+        if mi != 0 {
+            format!("GMT{sign}{h}:{mi:02}")
+        } else {
+            format!("GMT{sign}{h}")
+        }
     }
-
 
     /// Intl.DateTimeFormat.prototype.format(date) — UTC, en-US conventions.
     pub(crate) fn dtf_format(&self, resolved: u32, ms: f64, fields: u16, absolute: bool) -> String {
-        self.dtf_parts(resolved, ms, fields, absolute).into_iter().map(|(_, v)| v).collect()
+        self.dtf_parts(resolved, ms, fields, absolute)
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect()
     }
-
 
     /// `Temporal.<Type>.prototype.toLocaleString(locales, options)` for every
     /// Temporal type (ECMA-402's Temporal integration). Each type builds an
@@ -961,7 +1057,10 @@ impl<'p> Vm<'p> {
                     ));
                 }
             }
-            Some(self.zdt_tz_id(this.heap_index()).unwrap_or_else(|| "UTC".to_string()))
+            Some(
+                self.zdt_tz_id(this.heap_index())
+                    .unwrap_or_else(|| "UTC".to_string()),
+            )
         } else {
             None
         };
@@ -986,7 +1085,6 @@ impl<'p> Vm<'p> {
         let s = self.dtf_format(resolved, ms, fields, absolute);
         Ok(self.alloc_str(s))
     }
-
 }
 
 // ── per-calendar CLDR name lookup ───────────────────────────────────────────

@@ -25,11 +25,7 @@ fn computed_key(k: &ast::PropKey) -> Option<&ast::Expr> {
 /// (`get b(){}` + `get ['b'](){}` — both statically nameable, or a user getter
 /// and an `accessor` of the same name) REPLACES the earlier definition (last
 /// wins) while keeping its original position in property order.
-fn put_member<'x>(
-    list: &mut Vec<(String, &'x ast::Function)>,
-    name: String,
-    f: &'x ast::Function,
-) {
+fn put_member<'x>(list: &mut Vec<(String, &'x ast::Function)>, name: String, f: &'x ast::Function) {
     if let Some(slot) = list.iter_mut().find(|(n, _)| *n == name) {
         slot.1 = f;
     } else {
@@ -64,7 +60,9 @@ impl<'a> FnCompiler<'a> {
         if !self.b33_names.contains(name) || self.block_fn_sync_conflicts(name) {
             return;
         }
-        let Some(b) = self.resolve_existing(name) else { return };
+        let Some(b) = self.resolve_existing(name) else {
+            return;
+        };
         let save = self.next_reg;
         let src = match b {
             Binding::Local(r) => r,
@@ -144,8 +142,10 @@ impl<'a> FnCompiler<'a> {
         // because it conflicts with an enclosing-block lexical binding
         // (conflict-skip) — then it binds locally like a nested-function block fn.
         let binding = name.as_deref().map(|n| self.resolve(n));
-        let is_block_local =
-            matches!(binding, Some(Binding::Local(_)) | Some(Binding::LocalCell(_)));
+        let is_block_local = matches!(
+            binding,
+            Some(Binding::Local(_)) | Some(Binding::LocalCell(_))
+        );
         // EvalDeclarationInstantiation step 15.d (sloppy fn-context direct eval):
         // a top-level function declaration whose name the CALLER's var scope
         // already binds performs SetMutableBinding on the caller's EXISTING
@@ -189,7 +189,10 @@ impl<'a> FnCompiler<'a> {
             if let Some(n) = &name {
                 let slot = self.cx.global_slot(n) as u32;
                 let tmp = self.temp();
-                self.emit(Instr::MakeClosure { dst: tmp, func_id: id });
+                self.emit(Instr::MakeClosure {
+                    dst: tmp,
+                    func_id: id,
+                });
                 // Dyn store in an eval program (the same gate `emit_b33_sync`
                 // uses): the eval's own var/function names live in the caller
                 // activation's EvalScope, and READS of them compile to
@@ -198,9 +201,15 @@ impl<'a> FnCompiler<'a> {
                 // `eval("function f(){ return outerLet; } typeof f")` answered
                 // "undefined" whenever f captured ANYTHING.
                 if self.box_all_locals || self.cx.dyn_global_zone {
-                    self.emit(Instr::StoreGlobalDyn { idx: slot, src: tmp });
+                    self.emit(Instr::StoreGlobalDyn {
+                        idx: slot,
+                        src: tmp,
+                    });
                 } else {
-                    self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                    self.emit(Instr::StoreGlobal {
+                        idx: slot,
+                        src: tmp,
+                    });
                 }
                 self.next_reg -= 1;
             }
@@ -251,9 +260,7 @@ impl<'a> FnCompiler<'a> {
                 _ => None,
             };
             let script_b33_slot = match name.as_deref() {
-                Some(n)
-                    if self.is_script && b33_applicable && caller_b33_upval.is_none() =>
-                {
+                Some(n) if self.is_script && b33_applicable && caller_b33_upval.is_none() => {
                     Some(self.cx.global_slot(n) as u32)
                 }
                 _ => None,
@@ -272,9 +279,15 @@ impl<'a> FnCompiler<'a> {
                     }
                     if let Some(slot) = script_b33_slot {
                         if self.box_all_locals || self.cx.dyn_global_zone {
-                            self.emit(Instr::StoreGlobalDyn { idx: slot, src: reg });
+                            self.emit(Instr::StoreGlobalDyn {
+                                idx: slot,
+                                src: reg,
+                            });
                         } else {
-                            self.emit(Instr::StoreGlobal { idx: slot, src: reg });
+                            self.emit(Instr::StoreGlobal {
+                                idx: slot,
+                                src: reg,
+                            });
                         }
                     }
                     if let Some(ui) = caller_b33_upval {
@@ -294,9 +307,15 @@ impl<'a> FnCompiler<'a> {
                     }
                     if let Some(slot) = script_b33_slot {
                         if self.box_all_locals || self.cx.dyn_global_zone {
-                            self.emit(Instr::StoreGlobalDyn { idx: slot, src: tmp });
+                            self.emit(Instr::StoreGlobalDyn {
+                                idx: slot,
+                                src: tmp,
+                            });
                         } else {
-                            self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                            self.emit(Instr::StoreGlobal {
+                                idx: slot,
+                                src: tmp,
+                            });
                         }
                     }
                     if let Some(ui) = caller_b33_upval {
@@ -356,11 +375,17 @@ impl<'a> FnCompiler<'a> {
         match &dest {
             Dest::Reg(_) => {}
             Dest::Cell(cell, t) => {
-                self.emit(Instr::CellSet { cell: *cell, src: *t });
+                self.emit(Instr::CellSet {
+                    cell: *cell,
+                    src: *t,
+                });
                 self.next_reg -= 1; // reclaim the temp
             }
             Dest::Global(slot, t) => {
-                self.emit(Instr::StoreGlobal { idx: *slot, src: *t });
+                self.emit(Instr::StoreGlobal {
+                    idx: *slot,
+                    src: *t,
+                });
                 self.next_reg -= 1;
             }
         }
@@ -370,7 +395,12 @@ impl<'a> FnCompiler<'a> {
     /// Compile a class body and emit its runtime materialization into register
     /// `cls`: evaluate `extends`, `MakeClass`, then install static fields and
     /// computed-key members. Shared by class declarations and class expressions.
-    pub(crate) fn build_class_into(&mut self, class: &ast::Class, cls: Reg, name: Option<&str>) -> R<()> {
+    pub(crate) fn build_class_into(
+        &mut self,
+        class: &ast::Class,
+        cls: Reg,
+        name: Option<&str>,
+    ) -> R<()> {
         let CompiledClass {
             class_id,
             static_fields,
@@ -431,7 +461,11 @@ impl<'a> FnCompiler<'a> {
         } else {
             None
         };
-        self.emit(Instr::MakeClass { dst: cls, class_id, parent: parent_reg });
+        self.emit(Instr::MakeClass {
+            dst: cls,
+            class_id,
+            parent: parent_reg,
+        });
         if parent_reg.is_some() {
             self.next_reg -= 1; // reclaim the parent temp
         }
@@ -495,7 +529,12 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::Move { dst: kt, src: v });
                     }
                     if let Some(elem) = step.dec_elem {
-                        self.emit(Instr::DecKey { class: cls, elem, key: kt, class_id });
+                        self.emit(Instr::DecKey {
+                            class: cls,
+                            elem,
+                            key: kt,
+                            class_id,
+                        });
                     }
                     self.emit(Instr::ClassAddMember {
                         class: cls,
@@ -523,7 +562,12 @@ impl<'a> FnCompiler<'a> {
                             self.emit(Instr::Move { dst: kr, src: v });
                         }
                         if let Some(elem) = step.dec_elem {
-                            self.emit(Instr::DecKey { class: cls, elem, key: kr, class_id });
+                            self.emit(Instr::DecKey {
+                                class: cls,
+                                elem,
+                                key: kr,
+                                class_id,
+                            });
                         }
                         parked[i] = Some(kr);
                     } else {
@@ -537,12 +581,20 @@ impl<'a> FnCompiler<'a> {
                                 if v != kt {
                                     self.emit(Instr::Move { dst: kt, src: v });
                                 }
-                                self.emit(Instr::DecKey { class: cls, elem, key: kt, class_id });
+                                self.emit(Instr::DecKey {
+                                    class: cls,
+                                    elem,
+                                    key: kt,
+                                    class_id,
+                                });
                                 kt
                             }
                             None => self.expr(key)?,
                         };
-                        self.emit(Instr::PushFieldKey { class: cls, key: kr });
+                        self.emit(Instr::PushFieldKey {
+                            class: cls,
+                            key: kr,
+                        });
                         self.next_reg = save;
                     }
                 }
@@ -562,7 +614,13 @@ impl<'a> FnCompiler<'a> {
         // Babel's 2023-11 transform and TypeScript's __esDecorate both produce.
         elem_decs.sort_by_key(|&(group, ..)| group);
         for (_, elem, dbase, dn) in elem_decs {
-            self.emit(Instr::DecElem { class: cls, elem, arg_base: dbase, argc: dn, class_id });
+            self.emit(Instr::DecElem {
+                class: cls,
+                elem,
+                arg_base: dbase,
+                argc: dn,
+                class_id,
+            });
         }
         // PHASE 1c — the CLASS decorators, then the static `addInitializer`
         // callbacks. Both precede the static field initializers: a class
@@ -574,7 +632,12 @@ impl<'a> FnCompiler<'a> {
                 arg_base: class_decs.0,
                 argc: class_decs.1,
             });
-            self.emit(Instr::DecInits { class_id, which: 1, elem: 0, recv: cls });
+            self.emit(Instr::DecInits {
+                class_id,
+                which: 1,
+                elem: 0,
+                recv: cls,
+            });
         }
         // PHASE 2 — run the STATIC field initializers and `static {}` blocks in
         // SOURCE order (spec ClassDefinitionEvaluation: one interleaved list; an
@@ -629,7 +692,11 @@ impl<'a> FnCompiler<'a> {
                         let kr = self.temp();
                         let cidx = self.add_string_const(fname);
                         self.emit(Instr::LoadConst { dst: kr, idx: cidx });
-                        self.emit(Instr::SetFnNameFromKey { func: v, key: kr, prefix: 0 });
+                        self.emit(Instr::SetFnNameFromKey {
+                            func: v,
+                            key: kr,
+                            prefix: 0,
+                        });
                     }
                     // A decorated static field's value goes through the
                     // initializer chain its decorators returned, with `this` =
@@ -638,19 +705,34 @@ impl<'a> FnCompiler<'a> {
                         Some(elem) => {
                             let t = self.temp();
                             self.emit(Instr::Move { dst: t, src: v });
-                            self.emit(Instr::DecField { class_id, elem, val: t, recv: cls });
+                            self.emit(Instr::DecField {
+                                class_id,
+                                elem,
+                                val: t,
+                                recv: cls,
+                            });
                             t
                         }
                         None => v,
                     };
                     let name_idx = self.string_name(fname);
-                    self.emit(Instr::SetProp { obj: cls, name: name_idx, val: v, strict: false });
+                    self.emit(Instr::SetProp {
+                        obj: cls,
+                        name: name_idx,
+                        val: v,
+                        strict: false,
+                    });
                     // InitializeFieldOrAccessor: this element's OWN
                     // `addInitializer` callbacks run once it is defined and
                     // before the next static element, so `this[name]` is already
                     // set and the following static field is not.
                     if let Some(elem) = dec_static_named.get(idx).copied().flatten() {
-                        self.emit(Instr::DecInits { class_id, which: 3, elem, recv: cls });
+                        self.emit(Instr::DecInits {
+                            class_id,
+                            which: 3,
+                            elem,
+                            recv: cls,
+                        });
                     }
                     self.next_reg = save;
                 }
@@ -691,16 +773,30 @@ impl<'a> FnCompiler<'a> {
                         Some(elem) => {
                             let t = self.temp();
                             self.emit(Instr::Move { dst: t, src: vr });
-                            self.emit(Instr::DecField { class_id, elem, val: t, recv: cls });
+                            self.emit(Instr::DecField {
+                                class_id,
+                                elem,
+                                val: t,
+                                recv: cls,
+                            });
                             t
                         }
                         None => vr,
                     };
                     // A static field may not be named `prototype` (TypeError); the
                     // op ToPropertyKeys the (already-evaluated) key and checks it.
-                    self.emit(Instr::ClassStaticField { class: cls, key: kr, val: vr });
+                    self.emit(Instr::ClassStaticField {
+                        class: cls,
+                        key: kr,
+                        val: vr,
+                    });
                     if let Some(elem) = dec_computed.get(idx).copied().flatten() {
-                        self.emit(Instr::DecInits { class_id, which: 3, elem, recv: cls });
+                        self.emit(Instr::DecInits {
+                            class_id,
+                            which: 3,
+                            elem,
+                            recv: cls,
+                        });
                     }
                     self.next_reg = save;
                 }
@@ -708,9 +804,15 @@ impl<'a> FnCompiler<'a> {
                     let fid = static_block_fns[idx];
                     let save = self.next_reg;
                     let f = self.temp();
-                    self.emit(Instr::MakeFunc { dst: f, func_id: fid });
+                    self.emit(Instr::MakeFunc {
+                        dst: f,
+                        func_id: fid,
+                    });
                     let argb = self.temp();
-                    self.emit(Instr::Move { dst: argb, src: cls });
+                    self.emit(Instr::Move {
+                        dst: argb,
+                        src: cls,
+                    });
                     let trash = self.temp();
                     let call_idx = self.string_name("call");
                     self.emit(Instr::CallMethod {
@@ -729,7 +831,12 @@ impl<'a> FnCompiler<'a> {
         // defined (decorated, with its static elements initialized), which is
         // exactly the guarantee the proposal gives them.
         if has_dec {
-            self.emit(Instr::DecInits { class_id, which: 2, elem: 0, recv: cls });
+            self.emit(Instr::DecInits {
+                class_id,
+                which: 2,
+                elem: 0,
+                recv: cls,
+            });
         }
         self.cx.private_names_stack.pop();
         Ok(())
@@ -767,9 +874,7 @@ impl<'a> FnCompiler<'a> {
             // can appear in the Decorator grammar, and `super`'s receiver is not
             // its object expression.
             let bound = match d {
-                ast::Expr::Member(m)
-                    if !m.optional && !matches!(m.object, ast::Expr::Super) =>
-                {
+                ast::Expr::Member(m) if !m.optional && !matches!(m.object, ast::Expr::Super) => {
                     let o = self.expr_into(&m.object, recv)?;
                     if o != recv {
                         self.emit(Instr::Move { dst: recv, src: o });
@@ -777,17 +882,29 @@ impl<'a> FnCompiler<'a> {
                     match &m.prop {
                         ast::MemberProp::Ident(p) => {
                             let name = self.string_name(p);
-                            self.emit(Instr::GetProp { dst, obj: recv, name });
+                            self.emit(Instr::GetProp {
+                                dst,
+                                obj: recv,
+                                name,
+                            });
                         }
                         ast::MemberProp::Private(p) => {
                             self.check_private_declared(p)?;
                             let name = self.string_name(&private_key(p));
-                            self.emit(Instr::GetProp { dst, obj: recv, name });
+                            self.emit(Instr::GetProp {
+                                dst,
+                                obj: recv,
+                                name,
+                            });
                         }
                         ast::MemberProp::Computed(k) => {
                             let save = self.next_reg;
                             let kr = self.expr(k)?;
-                            self.emit(Instr::GetIndex { dst, obj: recv, key: kr });
+                            self.emit(Instr::GetIndex {
+                                dst,
+                                obj: recv,
+                                key: kr,
+                            });
                             self.next_reg = save;
                         }
                     }
@@ -809,7 +926,12 @@ impl<'a> FnCompiler<'a> {
 
     /// A class expression (`let C = class { … }`, `x = class extends B {}`):
     /// materialize the class value into `dst` and return it.
-    pub(crate) fn class_expr(&mut self, class: &ast::Class, dst: Reg, name: Option<&str>) -> R<Reg> {
+    pub(crate) fn class_expr(
+        &mut self,
+        class: &ast::Class,
+        dst: Reg,
+        name: Option<&str>,
+    ) -> R<Reg> {
         self.build_class_into(class, dst, name)?;
         Ok(dst)
     }
@@ -906,11 +1028,8 @@ impl<'a> FnCompiler<'a> {
         // run per-instance in the ctor — `instance_computed_inits` (index i ↔ the
         // i-th instance computed key) feeds the ctor's `FieldInit` ops.
         #[allow(clippy::type_complexity)]
-        let mut computed_fields_ordered: Vec<(
-            &'b ast::Expr,
-            Option<&'b ast::Expr>,
-            bool,
-        )> = Vec::new();
+        let mut computed_fields_ordered: Vec<(&'b ast::Expr, Option<&'b ast::Expr>, bool)> =
+            Vec::new();
         // Source order of STATIC elements: (0=named field, 1=computed field,
         // 2=static block) -> index into its vec; drives phase-2 evaluation.
         let mut static_order: Vec<(u8, usize)> = Vec::new();
@@ -922,8 +1041,12 @@ impl<'a> FnCompiler<'a> {
         // getter's entry: `accessor [k] = v` must evaluate `k` exactly ONCE and
         // install two members from it, which two independent entries could not
         // do.
-        let mut computed: Vec<(&'b ast::Expr, &'b ast::Function, u8, Option<&'b ast::Function>)> =
-            Vec::new();
+        let mut computed: Vec<(
+            &'b ast::Expr,
+            &'b ast::Function,
+            u8,
+            Option<&'b ast::Function>,
+        )> = Vec::new();
         // ── decorators ──
         // `plan` collects one DecElemDef per decorated element, in document
         // order; `steps` records for each element what class-definition-time work
@@ -960,8 +1083,7 @@ impl<'a> FnCompiler<'a> {
                     plan.elements.push(crate::bytecode::DecElemDef {
                         kind: $kind,
                         is_static: $is_static,
-                        is_private: nm.starts_with('#')
-                            || matches!($key, ast::PropKey::Private(_)),
+                        is_private: nm.starts_with('#') || matches!($key, ast::PropKey::Private(_)),
                         name: nm,
                         computed,
                         sym_key: false,
@@ -1026,8 +1148,7 @@ impl<'a> FnCompiler<'a> {
                         ast::MethodKind::Set => crate::vm::decorators::DK_SETTER,
                         _ => crate::vm::decorators::DK_METHOD,
                     };
-                    let de =
-                        dec_elem!(dkind, m.is_static, &m.key, m.decorators, String::new());
+                    let de = dec_elem!(dkind, m.is_static, &m.key, m.decorators, String::new());
                     let computed_before = computed.len();
                     match class_key_name(&m.key) {
                         Ok(name) => {
@@ -1041,40 +1162,42 @@ impl<'a> FnCompiler<'a> {
                                 proto_order.push(name.clone());
                             }
                             match (m.is_static, m.kind) {
-                            (true, ast::MethodKind::Method) => {
-                                drop_member(&mut static_getters, &name);
-                                drop_member(&mut static_setters, &name);
-                                put_member(&mut statics, name, &*m.func)
-                            }
-                            (true, ast::MethodKind::Get) => {
-                                drop_member(&mut statics, &name);
-                                put_member(&mut static_getters, name, &*m.func)
-                            }
-                            (true, ast::MethodKind::Set) => {
-                                drop_member(&mut statics, &name);
-                                put_member(&mut static_setters, name, &*m.func)
-                            }
-                            (true, ast::MethodKind::Constructor) => unreachable!(),
-                            (false, ast::MethodKind::Method) => {
-                                drop_member(&mut getters, &name);
-                                drop_member(&mut setters, &name);
-                                put_member(&mut methods, name, &*m.func)
-                            }
-                            (false, ast::MethodKind::Get) => {
-                                drop_member(&mut methods, &name);
-                                put_member(&mut getters, name, &*m.func)
-                            }
-                            (false, ast::MethodKind::Set) => {
-                                drop_member(&mut methods, &name);
-                                put_member(&mut setters, name, &*m.func)
-                            }
-                            (false, ast::MethodKind::Constructor) => unreachable!(),
+                                (true, ast::MethodKind::Method) => {
+                                    drop_member(&mut static_getters, &name);
+                                    drop_member(&mut static_setters, &name);
+                                    put_member(&mut statics, name, &*m.func)
+                                }
+                                (true, ast::MethodKind::Get) => {
+                                    drop_member(&mut statics, &name);
+                                    put_member(&mut static_getters, name, &*m.func)
+                                }
+                                (true, ast::MethodKind::Set) => {
+                                    drop_member(&mut statics, &name);
+                                    put_member(&mut static_setters, name, &*m.func)
+                                }
+                                (true, ast::MethodKind::Constructor) => unreachable!(),
+                                (false, ast::MethodKind::Method) => {
+                                    drop_member(&mut getters, &name);
+                                    drop_member(&mut setters, &name);
+                                    put_member(&mut methods, name, &*m.func)
+                                }
+                                (false, ast::MethodKind::Get) => {
+                                    drop_member(&mut methods, &name);
+                                    put_member(&mut getters, name, &*m.func)
+                                }
+                                (false, ast::MethodKind::Set) => {
+                                    drop_member(&mut methods, &name);
+                                    put_member(&mut setters, name, &*m.func)
+                                }
+                                (false, ast::MethodKind::Constructor) => unreachable!(),
                             }
                         }
                         // Not statically nameable. A COMPUTED key is a
                         // runtime-keyed member; anything else is the error.
                         Err(e) => {
-                            let Some(key) = computed_key(&m.key) else { return Err(e) };
+                            let Some(key) = computed_key(&m.key) else {
+                                return Err(e);
+                            };
                             // A member with a runtime-computed key keeps its
                             // SOURCE position in the owner's property order:
                             // park a placeholder entry here; `ClassAddMember`
@@ -1172,7 +1295,9 @@ impl<'a> FnCompiler<'a> {
                             put_member(sl, name, &*acc.setter);
                         }
                         Err(e) => {
-                            let Some(key) = computed_key(&p.key) else { return Err(e) };
+                            let Some(key) = computed_key(&p.key) else {
+                                return Err(e);
+                            };
                             // Both sides keep their source position via a parked
                             // placeholder, exactly as a computed accessor does.
                             let i = computed.len();
@@ -1233,8 +1358,7 @@ impl<'a> FnCompiler<'a> {
                             } else {
                                 instance_computed_inits.push(p.value.as_ref());
                                 dec_instance_computed.push(de);
-                                instance_order
-                                    .push((1, instance_computed_inits.len() - 1));
+                                instance_order.push((1, instance_computed_inits.len() - 1));
                             }
                         }
                         // A COMPUTED static key whose literal folds to "prototype" is
@@ -1267,7 +1391,9 @@ impl<'a> FnCompiler<'a> {
                         }
                         // Computed key `[expr] = v` — evaluated once at class def.
                         Err(e) => {
-                            let Some(key) = computed_key(&p.key) else { return Err(e) };
+                            let Some(key) = computed_key(&p.key) else {
+                                return Err(e);
+                            };
                             computed_fields_ordered.push((key, p.value.as_ref(), p.is_static));
                             dec_computed.push(de);
                             if p.is_static {
@@ -1275,8 +1401,7 @@ impl<'a> FnCompiler<'a> {
                             } else {
                                 instance_computed_inits.push(p.value.as_ref());
                                 dec_instance_computed.push(de);
-                                instance_order
-                                    .push((1, instance_computed_inits.len() - 1));
+                                instance_order.push((1, instance_computed_inits.len() - 1));
                             }
                         }
                     }
@@ -1306,7 +1431,11 @@ impl<'a> FnCompiler<'a> {
         // blocks, nested evals). Pushed here; build_class_into pops when the
         // class-creation emission (incl. static-element phases) completes.
         let mut declared_privates: Vec<String> = Vec::new();
-        for n in fields.iter().map(|(n, _)| n).chain(static_fields.iter().map(|(n, _)| n)) {
+        for n in fields
+            .iter()
+            .map(|(n, _)| n)
+            .chain(static_fields.iter().map(|(n, _)| n))
+        {
             if n.starts_with('#') {
                 declared_privates.push(n.clone());
             }
@@ -1432,8 +1561,7 @@ impl<'a> FnCompiler<'a> {
                 func.is_async,
                 None,
             )?;
-            proto.source =
-                method_source(self.cx.src_slice(func.span.start, func.span.end), true);
+            proto.source = method_source(self.cx.src_slice(func.span.start, func.span.end), true);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_defs.push((sname.clone(), fid));
@@ -1461,8 +1589,7 @@ impl<'a> FnCompiler<'a> {
                 false,
                 None,
             )?;
-            proto.source =
-                method_source(self.cx.src_slice(func.span.start, func.span.end), true);
+            proto.source = method_source(self.cx.src_slice(func.span.start, func.span.end), true);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_getter_defs.push((gname.clone(), fid));
@@ -1489,8 +1616,7 @@ impl<'a> FnCompiler<'a> {
                 false,
                 None,
             )?;
-            proto.source =
-                method_source(self.cx.src_slice(func.span.start, func.span.end), true);
+            proto.source = method_source(self.cx.src_slice(func.span.start, func.span.end), true);
             let fid = self.cx.functions.len() as u32;
             self.cx.functions.push(proto);
             static_setter_defs.push((sname.clone(), fid));
@@ -1545,7 +1671,11 @@ impl<'a> FnCompiler<'a> {
         });
         // With an explicit ctor the fields moved to the thunk, and so did the
         // extra-initializer run — the thunk IS InitializeInstanceElements there.
-        let ctor_dec = if defer_fields { None } else { dec_plan_fields.as_ref() };
+        let ctor_dec = if defer_fields {
+            None
+        } else {
+            dec_plan_fields.as_ref()
+        };
         let ctor = if has_explicit_ctor
             || !fields.is_empty()
             || !instance_computed_inits.is_empty()
@@ -1669,8 +1799,11 @@ impl<'a> FnCompiler<'a> {
             }
             if let Some(sf) = pair_fid {
                 let old = format!("\u{1}cs{i}");
-                let list =
-                    if *kind == 4 { &mut static_setter_defs } else { &mut setter_defs };
+                let list = if *kind == 4 {
+                    &mut static_setter_defs
+                } else {
+                    &mut setter_defs
+                };
                 if let Some(slot) = list.iter_mut().find(|(n, _)| *n == old) {
                     slot.0 = format!("\u{1}cm{sf}");
                 }
@@ -1802,7 +1935,11 @@ impl<'a> FnCompiler<'a> {
     /// Compile a function expression, returning `(func_id, has_upvalues)`. The
     /// name (if any) is not hoisted — the value is produced explicitly by a
     /// `MakeFunc`/`MakeClosure` at the use site.
-    pub(crate) fn compile_func_expr(&mut self, name: Option<String>, f: &ast::Function) -> R<(u32, bool)> {
+    pub(crate) fn compile_func_expr(
+        &mut self,
+        name: Option<String>,
+        f: &ast::Function,
+    ) -> R<(u32, bool)> {
         // Strict mode: a named function expression may not be named `eval`/`arguments`.
         // Use the SYNTACTIC name (`f.name`), not the inferred NamedEvaluation name.
         if let Some(id) = &f.name {
@@ -1860,8 +1997,18 @@ impl<'a> FnCompiler<'a> {
         let captured = capture::captured_locals_arrow(&names, &a.body);
         self.stash_arrow_child_with_shadows(&names, &a.body);
         let enclosing = self.child_enclosing();
-        let mut proto =
-            self.cx.compile_arrow_body(&params, rest.as_deref(), a, captured, enclosing, self.super_class, self.super_static, self.super_home_obj, self.derived_class, self.in_derived_ctor)?;
+        let mut proto = self.cx.compile_arrow_body(
+            &params,
+            rest.as_deref(),
+            a,
+            captured,
+            enclosing,
+            self.super_class,
+            self.super_static,
+            self.super_home_obj,
+            self.derived_class,
+            self.in_derived_ctor,
+        )?;
         proto.name = name.to_string();
         proto.source = self.cx.src_slice(a.span.start, a.span.end);
         let has_upvalues = !proto.upvalues.is_empty();
@@ -1911,7 +2058,10 @@ impl<'a> FnCompiler<'a> {
     /// (`this_override` when inside a static field initializer, else reg 0).
     pub(crate) fn emit_make_arrow(&mut self, dst: Reg, id: u32) {
         let this_reg = self.this_override.unwrap_or(0);
-        self.emit(Instr::MakeArrow { dst, func_id: id, this_reg });
+        self.emit(Instr::MakeArrow {
+            dst,
+            func_id: id,
+            this_reg,
+        });
     }
-
 }

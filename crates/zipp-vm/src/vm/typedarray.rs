@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -33,8 +33,7 @@ impl<'p> Vm<'p> {
     /// length follows the buffer. For a non-resizable buffer this returns the
     /// fixed length unchanged (the ta_tracking set is empty in the common case).
     /// Whether `key` on this TypedArray instance still resolves, along its REAL
-    /// prototype chain, to the built-in %TypedArray%.prototype accessor (or, for
-    /// `BYTES_PER_ELEMENT`, the intrinsic data property on the type prototype),
+    /// prototype chain, to the built-in %TypedArray%.prototype accessor,
     /// so the instance path may answer it directly instead of walking.
     ///
     /// Deliberately NOT an identity check against this realm's `ta_protos`: a
@@ -42,7 +41,6 @@ impl<'p> Vm<'p> {
     /// is just as intrinsic. What must be rejected is a chain a user re-pointed
     /// or shadowed (`Object.setPrototypeOf(ta, {length: 7})`), where the spec
     /// requires the ordinary lookup to win.
-    #[allow(dead_code)] // retained until cross-realm TypedArray prototypes carry the intrinsic accessors
     pub(crate) fn ta_named_is_intrinsic(&self, ta_idx: u32, key: &str) -> bool {
         let want = match key {
             "length" => crate::vm::native::TA_GET_LENGTH,
@@ -50,11 +48,6 @@ impl<'p> Vm<'p> {
             "byteOffset" => crate::vm::native::TA_GET_BYTEOFFSET,
             "buffer" => crate::vm::native::TA_GET_BUFFER,
             "@@toStringTag" => crate::vm::native::TA_GET_TOSTRINGTAG,
-            // A data property on the type prototype, not an accessor: accept the
-            // direct answer only while some level still carries it.
-            "BYTES_PER_ELEMENT" => {
-                return self.ta_chain_has_own(ta_idx, key).is_some();
-            }
             _ => return false,
         };
         let Some(owner) = self.ta_chain_has_own(ta_idx, key) else {
@@ -74,7 +67,6 @@ impl<'p> Vm<'p> {
 
     /// The nearest object on `ta_idx`'s prototype chain with an own `key`
     /// (the instance's own side-table props are checked by the caller first).
-    #[allow(dead_code)] // support for the deliberately staged ta_named_is_intrinsic path above
     fn ta_chain_has_own(&self, ta_idx: u32, key: &str) -> Option<u32> {
         let mut cur = match self.proto_of.get(&ta_idx) {
             Some(p) if p.is_heap() => p.heap_index(),
@@ -84,10 +76,30 @@ impl<'p> Vm<'p> {
                 _ => return None,
             },
         };
-        for _ in 0..8 {
+        // A prototype chain may be arbitrarily deep, and `Object.setPrototypeOf`
+        // can also manufacture a cycle in malformed/host-created state.  There
+        // can be at most `heap.len()` distinct heap objects in a valid chain, so
+        // that cardinality is both a complete finite walk and a cycle-safe,
+        // fail-closed bound.  A small fixed cap would incorrectly jump over a
+        // perfectly legal deep shadow (notably a `length` getter).
+        for _ in 0..self.heap.len() {
+            // JS-created prototype edges are range-valid by construction, but
+            // embedders can inject malformed state.  Never let a proof helper
+            // turn such an edge into a host panic; an invalid edge simply
+            // means the intrinsic chain cannot be proven.
+            if cur as usize >= self.heap.len() {
+                return None;
+            }
             match self.heap.get(cur) {
                 HeapObj::Object(m) if m.pos(key).is_some() => return Some(cur),
-                _ => {}
+                HeapObj::Object(_) => {}
+                // This helper is a proof that the nearest property is the
+                // intrinsic accessor, not a replacement for [[Get]].  Exotic
+                // chain nodes can have virtual/side-table own properties (an
+                // Array's `length`, a TypedArray's named properties, or a
+                // Proxy trap), none of which an ObjMap-only walk can exclude.
+                // Fail closed and let the ordinary property path resolve them.
+                _ => return None,
             }
             cur = match self.proto_of.get(&cur) {
                 Some(p) if p.is_heap() => p.heap_index(),
@@ -115,7 +127,11 @@ impl<'p> Vm<'p> {
         };
         // An extra NAMED own property (`ta.length = …` / defineProperty) lives
         // in the side table and wins over the inherited accessor.
-        if self.arr_props.get(&ta_idx).is_some_and(|m| m.pos("length").is_some()) {
+        if self
+            .arr_props
+            .get(&ta_idx)
+            .is_some_and(|m| m.pos("length").is_some())
+        {
             return false;
         }
         let want_proto = match self.ta_protos.get(kind) {
@@ -135,10 +151,18 @@ impl<'p> Vm<'p> {
         } else {
             return false;
         }
-        // … and the base prototype's slot must still be the built-in getter.
+        // …its [[Prototype]] must still be the intrinsic base. A user can
+        // re-point `Uint8Array.prototype` itself without putting an own
+        // `length` on it; skipping this link proof would jump over a getter on
+        // the replacement chain and return the internal slot directly.
         if self.ta_base_proto == 0 {
             return false;
         }
+        match self.proto_of.get(&want_proto) {
+            Some(v) if v.is_heap() && v.heap_index() == self.ta_base_proto => {}
+            _ => return false,
+        }
+        // … and the base prototype's slot must still be the built-in getter.
         match self.heap.get(self.ta_base_proto) {
             HeapObj::Object(m) => match m.pos("length") {
                 Some(s) if m.attrs[s].accessor && m.vals[s].is_heap() => matches!(
@@ -167,9 +191,12 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn ta_effective_len(&self, ta_idx: u32) -> Option<usize> {
         let (buffer, kind, byte_offset, length) = match self.heap.get(ta_idx) {
-            HeapObj::TypedArray { buffer, kind, byte_offset, length } => {
-                (*buffer, *kind, *byte_offset, *length)
-            }
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                length,
+            } => (*buffer, *kind, *byte_offset, *length),
             _ => return None,
         };
         let buf_len = match self.heap.get(buffer) {
@@ -190,7 +217,10 @@ impl<'p> Vm<'p> {
         }
     }
     pub(crate) fn alloc_array_buffer(&mut self, byte_len: usize) -> u32 {
-        let idx = self.heap.alloc(HeapObj::ArrayBuffer { data: vec![0u8; byte_len].into(), detached: false });
+        let idx = self.heap.alloc(HeapObj::ArrayBuffer {
+            data: vec![0u8; byte_len].into(),
+            detached: false,
+        });
         if self.arraybuffer_proto != 0 {
             // AllocateArrayBuffer does OrdinaryCreateFromConstructor(%ArrayBuffer%,
             // "%ArrayBuffer.prototype%") against the CURRENT realm — so the buffer a
@@ -226,8 +256,19 @@ impl<'p> Vm<'p> {
         idx
     }
     /// Allocate a TypedArray view over `buffer`, linked to that kind's prototype.
-    pub(crate) fn alloc_typed_array(&mut self, buffer: u32, kind: u8, byte_offset: usize, length: usize) -> Value {
-        let idx = self.heap.alloc(HeapObj::TypedArray { buffer, kind, byte_offset, length });
+    pub(crate) fn alloc_typed_array(
+        &mut self,
+        buffer: u32,
+        kind: u8,
+        byte_offset: usize,
+        length: usize,
+    ) -> Value {
+        let idx = self.heap.alloc(HeapObj::TypedArray {
+            buffer,
+            kind,
+            byte_offset,
+            length,
+        });
         let p = self.ta_protos[kind as usize];
         if p != 0 {
             self.proto_of.insert(idx, Value::heap(p));
@@ -287,7 +328,9 @@ impl<'p> Vm<'p> {
                 }
             }
         } else {
-            return Err(Thrown("TypeError: lastChunkHandling must be a string".into()));
+            return Err(Thrown(
+                "TypeError: lastChunkHandling must be a string".into(),
+            ));
         };
         Ok((url, lch))
     }
@@ -300,7 +343,9 @@ impl<'p> Vm<'p> {
                 return Ok(this.heap_index());
             }
         }
-        Err(Thrown("TypeError: method requires a Uint8Array receiver".into()))
+        Err(Thrown(
+            "TypeError: method requires a Uint8Array receiver".into(),
+        ))
     }
 
     /// The live bytes of a Uint8Array view (`None` if its buffer is detached or
@@ -308,7 +353,11 @@ impl<'p> Vm<'p> {
     pub(crate) fn u8_bytes(&self, idx: u32) -> Option<Vec<u8>> {
         let len = self.ta_effective_len(idx)?;
         let (buffer, off) = match self.heap.get(idx) {
-            HeapObj::TypedArray { buffer, byte_offset, .. } => (*buffer, *byte_offset),
+            HeapObj::TypedArray {
+                buffer,
+                byte_offset,
+                ..
+            } => (*buffer, *byte_offset),
             _ => return None,
         };
         match self.heap.get(buffer) {
@@ -323,7 +372,11 @@ impl<'p> Vm<'p> {
     /// view are ignored; the caller bounds the slice to the view length).
     pub(crate) fn u8_write(&mut self, idx: u32, bytes: &[u8]) {
         let (buffer, off) = match self.heap.get(idx) {
-            HeapObj::TypedArray { buffer, byte_offset, .. } => (*buffer, *byte_offset),
+            HeapObj::TypedArray {
+                buffer,
+                byte_offset,
+                ..
+            } => (*buffer, *byte_offset),
             _ => return,
         };
         if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buffer) {
@@ -359,11 +412,21 @@ impl<'p> Vm<'p> {
             return true;
         }
         let (sbuf, skind, soff) = match self.heap.get(src) {
-            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => (*buffer, *kind, *byte_offset),
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => (*buffer, *kind, *byte_offset),
             _ => return false,
         };
         let (dbuf, dkind, doff) = match self.heap.get(dst) {
-            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => (*buffer, *kind, *byte_offset),
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => (*buffer, *kind, *byte_offset),
             _ => return false,
         };
         if skind != dkind || sbuf == dbuf {
@@ -396,9 +459,12 @@ impl<'p> Vm<'p> {
     pub(crate) fn ta_element_get(&mut self, ta_idx: u32, i: usize) -> Value {
         let (kind, bytes) = {
             let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
-                HeapObj::TypedArray { buffer, kind, byte_offset, .. } => {
-                    (*buffer, *kind, *byte_offset)
-                }
+                HeapObj::TypedArray {
+                    buffer,
+                    kind,
+                    byte_offset,
+                    ..
+                } => (*buffer, *kind, *byte_offset),
                 _ => return Value::UNDEFINED,
             };
             if i >= self.ta_effective_len(ta_idx).unwrap_or(0) {
@@ -427,9 +493,9 @@ impl<'p> Vm<'p> {
             7 => Value::num(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f64),
             8 => Value::num(f64::from_le_bytes(bytes)),
             9 => self.make_bigint(i64::from_le_bytes(bytes) as i128),
-            11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes([
-                bytes[0], bytes[1],
-            ]))),
+            11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(
+                u16::from_le_bytes([bytes[0], bytes[1]]),
+            )),
             _ => self.make_bigint(u64::from_le_bytes(bytes) as i128),
         }
     }
@@ -438,9 +504,12 @@ impl<'p> Vm<'p> {
     /// for `display`/`inspect` (ToString of a TypedArray is the comma-join).
     pub(crate) fn ta_elem_string(&self, ta_idx: u32, i: usize) -> String {
         let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
-            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => {
-                (*buffer, *kind, *byte_offset)
-            }
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => (*buffer, *kind, *byte_offset),
             _ => return String::new(),
         };
         // Bound by the EFFECTIVE length: the raw stored `length` is stale for a
@@ -468,9 +537,9 @@ impl<'p> Vm<'p> {
             7 => fmt_f64(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
             8 => fmt_f64(f64::from_le_bytes(b.try_into().unwrap())),
             9 => i64::from_le_bytes(b.try_into().unwrap()).to_string(),
-            11 => fmt_f64(crate::vm::helpers_num2::f16_bits_to_f64(u16::from_le_bytes([
-                b[0], b[1],
-            ]))),
+            11 => fmt_f64(crate::vm::helpers_num2::f16_bits_to_f64(
+                u16::from_le_bytes([b[0], b[1]]),
+            )),
             _ => u64::from_le_bytes(b.try_into().unwrap()).to_string(),
         }
     }
@@ -500,7 +569,9 @@ impl<'p> Vm<'p> {
                     HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
                 )
             {
-                return Err(Thrown("TypeError: cannot convert a BigInt to a number".into()));
+                return Err(Thrown(
+                    "TypeError: cannot convert a BigInt to a number".into(),
+                ));
             }
             self.to_number_coerce(v)?;
         }
@@ -509,7 +580,12 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn ta_element_set(&mut self, ta_idx: u32, i: usize, v: Value) -> Result<(), Thrown> {
         let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
-            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => (*buffer, *kind, *byte_offset),
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => (*buffer, *kind, *byte_offset),
             _ => return Ok(()),
         };
         let size = native::TA_KINDS[kind as usize].1;
@@ -538,7 +614,9 @@ impl<'p> Vm<'p> {
                     HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
                 )
             {
-                return Err(Thrown("TypeError: cannot convert a BigInt to a number".into()));
+                return Err(Thrown(
+                    "TypeError: cannot convert a BigInt to a number".into(),
+                ));
             }
             // ToNumber(value) per SetTypedArrayElement: an object element runs
             // valueOf/@@toPrimitive (which a test may use to resize/detach the buffer
@@ -614,7 +692,8 @@ impl<'p> Vm<'p> {
                 if waitable {
                     if !matches!(*kind, 5 | 9) {
                         return Err(Thrown(
-                            "TypeError: Atomics operation requires an Int32Array or BigInt64Array".into(),
+                            "TypeError: Atomics operation requires an Int32Array or BigInt64Array"
+                                .into(),
                         ));
                     }
                 } else if matches!(*kind, 2 | 7 | 8 | 11) {
@@ -638,10 +717,12 @@ impl<'p> Vm<'p> {
                 HeapObj::TypedArray { buffer, .. } => *buffer,
                 _ => 0,
             };
-            if matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. }) {
+            if matches!(
+                self.heap.get(buffer),
+                HeapObj::ArrayBuffer { detached: true, .. }
+            ) {
                 return Err(Thrown(
-                    "TypeError: Cannot perform Atomics operation on a detached ArrayBuffer"
-                        .into(),
+                    "TypeError: Cannot perform Atomics operation on a detached ArrayBuffer".into(),
                 ));
             }
         }
@@ -688,10 +769,12 @@ impl<'p> Vm<'p> {
                 HeapObj::TypedArray { buffer, .. } => *buffer,
                 _ => 0,
             };
-            if matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. }) {
+            if matches!(
+                self.heap.get(buffer),
+                HeapObj::ArrayBuffer { detached: true, .. }
+            ) {
                 return Err(Thrown(
-                    "TypeError: Cannot perform Atomics operation on a detached ArrayBuffer"
-                        .into(),
+                    "TypeError: Cannot perform Atomics operation on a detached ArrayBuffer".into(),
                 ));
             }
             let cur = self.ta_effective_len(ti).unwrap_or(0);
@@ -706,7 +789,12 @@ impl<'p> Vm<'p> {
     /// keys its waiter-list entry by.
     fn ta_wait_addr(&self, ti: u32, i: usize) -> (u32, usize) {
         match self.heap.get(ti) {
-            HeapObj::TypedArray { buffer, kind, byte_offset, .. } => {
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => {
                 let size = native::TA_KINDS[*kind as usize].1 as usize;
                 (*buffer, byte_offset + i * size)
             }
@@ -774,7 +862,11 @@ impl<'p> Vm<'p> {
             };
             // ToNumber(timeout): NaN/absent -> +Infinity; clamp to >= 0.
             let t_raw = self.to_number_coerce(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
-            let timeout = if t_raw.is_nan() { f64::INFINITY } else { t_raw.max(0.0) };
+            let timeout = if t_raw.is_nan() {
+                f64::INFINITY
+            } else {
+                t_raw.max(0.0)
+            };
             let (buf, addr) = self.ta_wait_addr(ti, i);
             let mem = match self.heap.get(buf) {
                 HeapObj::ArrayBuffer { data, .. } => data.shared().cloned(),
@@ -796,8 +888,13 @@ impl<'p> Vm<'p> {
                     }
                     agents::AsyncWaitDecision::Registered(id) => {
                         let p = self.alloc_promise();
-                        self.async_waiters
-                            .push((buf, addr, p, agents::finite_deadline(timeout), id));
+                        self.async_waiters.push((
+                            buf,
+                            addr,
+                            p,
+                            agents::finite_deadline(timeout),
+                            id,
+                        ));
                         (true, Value::heap(p))
                     }
                 }
@@ -845,8 +942,8 @@ impl<'p> Vm<'p> {
                 };
                 // ToNumber(timeout) runs next (DoWait step 6) — a Symbol is a
                 // TypeError, a poisoned valueOf throws.
-                let t_raw = self
-                    .to_number_coerce(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
+                let t_raw =
+                    self.to_number_coerce(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
                 // DoWait step: a sync wait in an agent that cannot suspend is a
                 // TypeError — AFTER the value/timeout coercions, per spec order.
                 if !self.can_block {
@@ -855,7 +952,11 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 // NaN timeout -> +Infinity; clamp to >= 0.
-                let timeout = if t_raw.is_nan() { f64::INFINITY } else { t_raw.max(0.0) };
+                let timeout = if t_raw.is_nan() {
+                    f64::INFINITY
+                } else {
+                    t_raw.max(0.0)
+                };
                 let (buf, addr) = self.ta_wait_addr(ti, i);
                 let mem = match self.heap.get(buf) {
                     HeapObj::ArrayBuffer { data, .. } => data.shared().cloned(),
@@ -888,7 +989,11 @@ impl<'p> Vm<'p> {
                 f64::INFINITY
             } else {
                 let n = self.to_number_strict(a2)?;
-                if n.is_nan() { 0.0 } else { n.trunc().max(0.0) }
+                if n.is_nan() {
+                    0.0
+                } else {
+                    n.trunc().max(0.0)
+                }
             };
             let (buf, addr) = self.ta_wait_addr(ti, i);
             let mem = match self.heap.get(buf) {
@@ -946,19 +1051,23 @@ impl<'p> Vm<'p> {
         // stay valid across the value coercions below (shared storage never
         // moves), and the observable coercion order is identical on both paths.
         let elem_size = native::TA_KINDS[kind as usize].1;
-        let sab_target: Option<(std::sync::Arc<crate::heap::SharedMem>, usize)> =
-            match self.heap.get(ti) {
-                HeapObj::TypedArray { buffer, byte_offset, .. } => {
-                    let off = byte_offset + i * elem_size;
-                    match self.heap.get(*buffer) {
-                        HeapObj::ArrayBuffer { data, .. } => {
-                            data.shared().map(|m| (m.clone(), off))
-                        }
-                        _ => None,
-                    }
+        let sab_target: Option<(std::sync::Arc<crate::heap::SharedMem>, usize)> = match self
+            .heap
+            .get(ti)
+        {
+            HeapObj::TypedArray {
+                buffer,
+                byte_offset,
+                ..
+            } => {
+                let off = byte_offset + i * elem_size;
+                match self.heap.get(*buffer) {
+                    HeapObj::ArrayBuffer { data, .. } => data.shared().map(|m| (m.clone(), off)),
+                    _ => None,
                 }
-                _ => None,
-            };
+            }
+            _ => None,
+        };
         if is_bigint {
             let v_b = if op == "load" {
                 BigVal::Small(0)
@@ -978,7 +1087,11 @@ impl<'p> Vm<'p> {
                         0
                     };
                     let old = sab_atomic_op(&mem, kind, off, op, v64, repl);
-                    let old_b: i128 = if kind == 9 { old as i128 } else { (old as u64) as i128 };
+                    let old_b: i128 = if kind == 9 {
+                        old as i128
+                    } else {
+                        (old as u64) as i128
+                    };
                     return Ok(if op == "store" {
                         self.make_bigint_val(v_b)
                     } else {
@@ -1030,7 +1143,11 @@ impl<'p> Vm<'p> {
                 }
             }
         } else {
-            let v_in = if op == "load" { 0 } else { self.to_integer_or_zero(a2)? };
+            let v_in = if op == "load" {
+                0
+            } else {
+                self.to_integer_or_zero(a2)?
+            };
             if let Some((mem, off)) = sab_target {
                 if off + elem_size <= mem.capacity() {
                     let repl = if op == "compareExchange" {
@@ -1112,13 +1229,18 @@ impl<'p> Vm<'p> {
             // ToIndex valueOf above) precedes the byte-length RangeErrors --
             // detaching clears the data, which would otherwise mask it.
             if byte_offset % size != 0 {
-                return Err(Thrown("RangeError: invalid TypedArray length/offset".into()));
+                return Err(Thrown(
+                    "RangeError: invalid TypedArray length/offset".into(),
+                ));
             }
             let explicit: Option<usize> = match args.get(2) {
                 Some(&v) if v != Value::UNDEFINED => Some(self.to_index(v)?),
                 _ => None,
             };
-            if matches!(self.heap.get(buf), HeapObj::ArrayBuffer { detached: true, .. }) {
+            if matches!(
+                self.heap.get(buf),
+                HeapObj::ArrayBuffer { detached: true, .. }
+            ) {
                 return Err(Thrown(
                     "TypeError: Cannot construct a TypedArray on a detached ArrayBuffer".into(),
                 ));
@@ -1133,13 +1255,17 @@ impl<'p> Vm<'p> {
                     // follows resizes), so only a fixed auto-length view requires
                     // the remaining bytes to divide evenly.
                     if buf_len < byte_offset || (!tracking && (buf_len - byte_offset) % size != 0) {
-                        return Err(Thrown("RangeError: byte length not a multiple of element size".into()));
+                        return Err(Thrown(
+                            "RangeError: byte length not a multiple of element size".into(),
+                        ));
                     }
                     (buf_len - byte_offset) / size
                 }
             };
             if byte_offset + length * size > buf_len {
-                return Err(Thrown("RangeError: invalid TypedArray length/offset".into()));
+                return Err(Thrown(
+                    "RangeError: invalid TypedArray length/offset".into(),
+                ));
             }
             let ta = self.alloc_typed_array(buf, kind, byte_offset, length);
             if tracking {
@@ -1181,7 +1307,8 @@ impl<'p> Vm<'p> {
                 // undefined/null take the array-like path.
                 if it != Value::UNDEFINED && it != Value::NULL && !self.is_callable(it) {
                     return Err(Thrown(
-                        "TypeError: object is not iterable ([Symbol.iterator] is not a function)".into(),
+                        "TypeError: object is not iterable ([Symbol.iterator] is not a function)"
+                            .into(),
                     ));
                 }
                 if self.is_callable(it) {
@@ -1215,9 +1342,15 @@ impl<'p> Vm<'p> {
         }
         // new TA(length): ToIndex (undefined/NaN -> 0, fractional truncates,
         // negative/too-large -> RangeError, Symbol/BigInt -> TypeError).
-        let length = if a0 == Value::UNDEFINED { 0 } else { self.to_index(a0)? };
+        let length = if a0 == Value::UNDEFINED {
+            0
+        } else {
+            self.to_index(a0)?
+        };
         if length > (MAX_ARRAY_BUFFER_LEN / size as i64) as usize {
-            return Err(Thrown("RangeError: typed array length exceeds the maximum".into()));
+            return Err(Thrown(
+                "RangeError: typed array length exceeds the maximum".into(),
+            ));
         }
         let buf = self.alloc_array_buffer(length * size);
         Ok(self.alloc_typed_array(buf, kind, 0, length))
@@ -1268,7 +1401,10 @@ impl<'p> Vm<'p> {
         };
         // ToIndex(byteOffset) precedes the detached check (its valueOf runs
         // exactly once, and may itself detach), which precedes the bounds checks.
-        if matches!(self.heap.get(buf), HeapObj::ArrayBuffer { detached: true, .. }) {
+        if matches!(
+            self.heap.get(buf),
+            HeapObj::ArrayBuffer { detached: true, .. }
+        ) {
             return Err(Thrown(
                 "TypeError: Cannot construct a DataView on a detached ArrayBuffer".into(),
             ));
@@ -1285,7 +1421,11 @@ impl<'p> Vm<'p> {
         if byte_offset + byte_length > buf_len {
             return Err(Thrown("RangeError: invalid DataView offset/length".into()));
         }
-        let idx = self.heap.alloc(HeapObj::DataView { buffer: buf, byte_offset, byte_length });
+        let idx = self.heap.alloc(HeapObj::DataView {
+            buffer: buf,
+            byte_offset,
+            byte_length,
+        });
         if self.dataview_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.dataview_proto));
         }
@@ -1297,8 +1437,6 @@ impl<'p> Vm<'p> {
         }
         Ok(Value::heap(idx))
     }
-
-
 }
 
 /// One `Atomics.<op>` data access on a truly-shared (SAB-backed) element,

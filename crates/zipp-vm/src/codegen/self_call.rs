@@ -172,4 +172,3 @@ pub(crate) fn emit_self_call(
 //             `snapshot` (the driver shifts the base past any seed element).
 // `window` is the callback register frame: reg 0 = this, reg 1 = element (map)
 // or accumulator (reduce), reg 2 = index (map) or element (reduce).
-

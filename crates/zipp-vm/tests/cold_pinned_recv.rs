@@ -42,7 +42,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -54,7 +58,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -273,7 +281,12 @@ fn pinned_recvs(log: &str) -> Vec<PinnedRecv> {
                 .split(',')
                 .filter_map(|t| t.trim().parse::<usize>().ok())
                 .collect();
-            Some(PinnedRecv { tier, span, reg, lg })
+            Some(PinnedRecv {
+                tier,
+                span,
+                reg,
+                lg,
+            })
         })
         .collect()
 }
@@ -329,7 +342,9 @@ fn assert_pinned_recv_mechanism(test: &str, want_tier: &str) {
     );
     let mut covered = None;
     for pr in &recvs {
-        let Some(&first_lg) = pr.lg.first() else { continue };
+        let Some(&first_lg) = pr.lg.first() else {
+            continue;
+        };
         let ips = deopt_ips(&log, &pr.span);
         if ips.iter().any(|&ip| ip > first_lg) {
             covered = Some((pr, first_lg, ips));
@@ -340,7 +355,10 @@ fn assert_pinned_recv_mechanism(test: &str, want_tier: &str) {
         panic!(
             "no native exit landed after a pinned receiver's LoadGlobal — the \
              stale-receiver-slot hazard is unpinned. receivers={:?}\n{log}",
-            recvs.iter().map(|p| (&p.tier, &p.span, p.reg, &p.lg)).collect::<Vec<_>>()
+            recvs
+                .iter()
+                .map(|p| (&p.tier, &p.span, p.reg, &p.lg))
+                .collect::<Vec<_>>()
         )
     });
     assert_eq!(

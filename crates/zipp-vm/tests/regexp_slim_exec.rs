@@ -21,7 +21,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -211,7 +215,10 @@ fn slimexec_parity_zero_length_matches_and_indices() {
         console.log("g=" + out.join(",") + "|" + di.join(";"));
         "#
     ));
-    assert_eq!(out[0], "g=0:aaa,3:|[[0,1],[0,1]];[[2,3],[2,3]];[[4,6],[4,6]]");
+    assert_eq!(
+        out[0],
+        "g=0:aaa,3:|[[0,1],[0,1]];[[2,3],[2,3]];[[4,6],[4,6]]"
+    );
 }
 
 #[test]
@@ -226,7 +233,10 @@ fn slimexec_parity_results_escape_json_and_spread() {
         console.log("h=" + kept.map(function (m) {{ return m[1] + m[2] + "@" + m.index + "#" + m.input; }}).join(",") + "|" + JSON.stringify(kept[1]) + "|" + spread.join("") + "|" + kept[0].length);
         "##
     ));
-    assert_eq!(out[0], r#"h=r1@0#r1s2t3,s2@2#r1s2t3,t3@4#r1s2t3|["s2","s","2"]|t3t3|3"#);
+    assert_eq!(
+        out[0],
+        r#"h=r1@0#r1s2t3,s2@2#r1s2t3,t3@4#r1s2t3|["s2","s","2"]|t3t3|3"#
+    );
 }
 
 #[test]
@@ -279,7 +289,10 @@ fn slimexec_parity_test_statics_ordering_and_exec_indices() {
         console.log("j=" + t + "|" + afterTest + "|" + JSON.stringify(m.indices) + "|" + JSON.stringify(m.indices.groups) + "|" + m.groups.a + "|" + m.index);
         "#,
     );
-    assert_eq!(out[0], r#"j=true|x,1,x1,w, x2z,3|[[4,6],[4,5],[5,6]]|{"a":[4,5]}|x|4"#);
+    assert_eq!(
+        out[0],
+        r#"j=true|x,1,x1,w, x2z,3|[[4,6],[4,5],[5,6]]|{"a":[4,5]}|x|4"#
+    );
 }
 
 #[test]

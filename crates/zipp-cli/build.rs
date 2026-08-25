@@ -85,15 +85,27 @@ fn main() {
     emit("ZIPP_BUILD_DIRTY", if dirty { "true" } else { "false" });
     emit("ZIPP_BUILD_DIFF_DIGEST", &diff_digest);
     emit("ZIPP_BUILD_RUSTC", &rustc_version);
-    emit("ZIPP_BUILD_TARGET", &std::env::var("TARGET").unwrap_or_else(|_| "unknown".into()));
-    emit("ZIPP_BUILD_PROFILE", &std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into()));
-    emit("ZIPP_BUILD_OPT_LEVEL", &std::env::var("OPT_LEVEL").unwrap_or_else(|_| "unknown".into()));
+    emit(
+        "ZIPP_BUILD_TARGET",
+        &std::env::var("TARGET").unwrap_or_else(|_| "unknown".into()),
+    );
+    emit(
+        "ZIPP_BUILD_PROFILE",
+        &std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into()),
+    );
+    emit(
+        "ZIPP_BUILD_OPT_LEVEL",
+        &std::env::var("OPT_LEVEL").unwrap_or_else(|_| "unknown".into()),
+    );
     // CARGO_CFG_FEATURE is the cfg-visible feature set of THIS crate.
     emit(
         "ZIPP_BUILD_FEATURES",
         &std::env::var("CARGO_CFG_FEATURE").unwrap_or_else(|_| String::new()),
     );
-    emit("ZIPP_BUILD_RUSTFLAGS", &std::env::var("RUSTFLAGS").unwrap_or_else(|_| String::new()));
+    emit(
+        "ZIPP_BUILD_RUSTFLAGS",
+        &std::env::var("RUSTFLAGS").unwrap_or_else(|_| String::new()),
+    );
 }
 
 fn emit(key: &str, val: &str) {

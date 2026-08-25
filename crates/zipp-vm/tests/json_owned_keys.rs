@@ -14,7 +14,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -89,7 +93,11 @@ fn parse_with_source_reports_the_last_duplicate() {
         }
         "#,
     );
-    assert!(out[0] == "b=4" || out[0] == "skip", "unexpected: {:?}", out[0]);
+    assert!(
+        out[0] == "b=4" || out[0] == "skip",
+        "unexpected: {:?}",
+        out[0]
+    );
 }
 
 #[test]

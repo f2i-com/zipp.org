@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -196,7 +196,11 @@ pub(crate) fn parse_float(s: &str) -> f64 {
         end += 1;
     }
     if t[end..].starts_with("Infinity") {
-        return if t.starts_with('-') { f64::NEG_INFINITY } else { f64::INFINITY };
+        return if t.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        };
     }
     let mut saw_digit = false;
     while end < b.len() && b[end].is_ascii_digit() {
@@ -326,4 +330,3 @@ pub(crate) fn array_index(key: Value) -> Option<usize> {
         None
     }
 }
-

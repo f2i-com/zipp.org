@@ -158,7 +158,10 @@ impl<'p> Vm<'p> {
     /// immediately enters a blocking wait cannot deadlock this).
     pub(crate) fn agent_broadcast(&mut self, sab: Value, id: f64) -> Result<(), Thrown> {
         let mem = match sab.is_heap().then(|| self.heap.get(sab.heap_index())) {
-            Some(HeapObj::ArrayBuffer { data: AbData::Shared(m), .. }) => Arc::clone(m),
+            Some(HeapObj::ArrayBuffer {
+                data: AbData::Shared(m),
+                ..
+            }) => Arc::clone(m),
             _ => {
                 return Err(Thrown(
                     "TypeError: $262.agent.broadcast requires a SharedArrayBuffer".into(),
@@ -175,7 +178,14 @@ impl<'p> Vm<'p> {
             let agents = shared.agents.lock().unwrap();
             for h in agents.iter() {
                 let (ack_tx, ack_rx) = mpsc::channel();
-                if h.tx.send(BroadcastMsg { mem: Arc::clone(&mem), id, ack: ack_tx }).is_ok() {
+                if h.tx
+                    .send(BroadcastMsg {
+                        mem: Arc::clone(&mem),
+                        id,
+                        ack: ack_tx,
+                    })
+                    .is_ok()
+                {
                     acks.push(ack_rx);
                 }
             }
@@ -206,9 +216,10 @@ impl<'p> Vm<'p> {
     /// Vm's heap: same `Arc<SharedMem>` (aliasing the broadcaster's memory),
     /// registered + proto-linked exactly like `alloc_shared_array_buffer`.
     pub(crate) fn adopt_shared_buffer(&mut self, mem: Arc<SharedMem>) -> u32 {
-        let idx = self
-            .heap
-            .alloc(HeapObj::ArrayBuffer { data: AbData::Shared(mem), detached: false });
+        let idx = self.heap.alloc(HeapObj::ArrayBuffer {
+            data: AbData::Shared(mem),
+            detached: false,
+        });
         self.shared_buffers.insert(idx);
         if self.sab_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.sab_proto));
@@ -307,7 +318,10 @@ pub(crate) fn sync_wait(
     timeout_ms: f64,
     still_equal: impl FnOnce() -> bool,
 ) -> WaitOutcome {
-    let cell = Arc::new(WaitCell { state: Mutex::new(0), cv: Condvar::new() });
+    let cell = Arc::new(WaitCell {
+        state: Mutex::new(0),
+        cv: Condvar::new(),
+    });
     {
         let mut reg = waiters().lock().unwrap();
         if !still_equal() {
@@ -316,7 +330,9 @@ pub(crate) fn sync_wait(
         if timeout_ms == 0.0 {
             return WaitOutcome::TimedOut;
         }
-        reg.entry(key).or_default().push_back(WaiterEntry::Sync(Arc::clone(&cell)));
+        reg.entry(key)
+            .or_default()
+            .push_back(WaiterEntry::Sync(Arc::clone(&cell)));
     }
     let deadline = finite_deadline(timeout_ms);
     let mut st = cell.state.lock().unwrap();
@@ -383,9 +399,10 @@ pub(crate) fn register_async_waiter(
         return AsyncWaitDecision::TimedOut;
     }
     let id = next_waiter_id();
-    reg.entry(key)
-        .or_default()
-        .push_back(WaiterEntry::Async { mailbox: Arc::clone(mailbox), id });
+    reg.entry(key).or_default().push_back(WaiterEntry::Async {
+        mailbox: Arc::clone(mailbox),
+        id,
+    });
     AsyncWaitDecision::Registered(id)
 }
 
@@ -437,7 +454,9 @@ pub(crate) fn notify_waiters(
 /// see [`notify_waiters`]).
 pub(crate) fn take_async_waiter(key: WaiterKey, id: u64) -> bool {
     let mut reg = waiters().lock().unwrap();
-    let Some(q) = reg.get_mut(&key) else { return false };
+    let Some(q) = reg.get_mut(&key) else {
+        return false;
+    };
     let before = q.len();
     q.retain(|e| !matches!(e, WaiterEntry::Async { id: i, .. } if *i == id));
     let removed = q.len() != before;

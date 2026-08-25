@@ -146,6 +146,25 @@ fn async_settled_trampoline_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_PROMISE_ALL_DIRECT=1` restores the heap-allocated
+/// `CombinatorResolver` callback for every intrinsic `Promise.all` element.
+/// Keeping a one-binary switch makes the allocation and wall-time result
+/// independently measurable without a fat-LTO layout comparison.
+#[inline]
+fn promise_all_direct_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PROMISE_ALL_DIRECT").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// The pristine-%Promise.prototype% proof, resolved to SLOT INDICES. The full
 /// proof (`promise_proto_pristine_uncached`) re-found `then`/`constructor`/
 /// `@@species` with 2-4 linear `pos()` scans plus 3-4 `heap.get`s on EVERY
@@ -750,7 +769,36 @@ impl<'p> Vm<'p> {
             ReactionKind::Reject
         };
         for r in reactions {
-            if r.is_async {
+            if r.is_combinator_all {
+                debug_assert!(r.on_fulfilled.is_int() && r.on_fulfilled.as_int() >= 0);
+                debug_assert!(matches!(self.heap.get(r.dependent), HeapObj::Combinator(_)));
+                match kind {
+                    ReactionKind::Fulfill => {
+                        self.microtasks.push_back(Microtask::CombinatorStep {
+                            combinator: r.dependent,
+                            index: r.on_fulfilled.as_int() as u32,
+                            kind,
+                            arg: val,
+                        });
+                    }
+                    ReactionKind::Reject => {
+                        // Admission proves `on_rejected` is the intrinsic
+                        // capability resolver. Keep the ordinary Reaction job
+                        // shape and result-promise dependent for exact ordering.
+                        let dependent = match self.heap.get(r.dependent) {
+                            HeapObj::Combinator(c) => c.result,
+                            _ => r.dependent,
+                        };
+                        self.microtasks.push_back(Microtask::Reaction {
+                            callback: r.on_rejected,
+                            arg: val,
+                            dependent,
+                            kind,
+                            finally: false,
+                        });
+                    }
+                }
+            } else if r.is_async {
                 // `dependent` is a suspended async activation; resume it with the
                 // value (fulfill) or by throwing the reason in (reject).
                 let input = match kind {
@@ -1166,6 +1214,7 @@ impl<'p> Vm<'p> {
                         dependent: dep,
                         finally: false,
                         is_async: false,
+                        is_combinator_all: false,
                     });
                     if !on_r.is_undefined() {
                         *handled = true;
@@ -2074,6 +2123,7 @@ impl<'p> Vm<'p> {
                         dependent: activation,
                         finally: false,
                         is_async: true,
+                        is_combinator_all: false,
                     });
                     *handled = true; // an `await` consumes the rejection
                 }
@@ -2089,6 +2139,72 @@ impl<'p> Vm<'p> {
                 self.microtasks.push_back(Microtask::AsyncResume {
                     activation,
                     input: Resume::Throw(result),
+                });
+            }
+        }
+    }
+
+    /// Register the resolve-element reaction for the already-proven intrinsic
+    /// `Promise.all` dense-Array lane without allocating a
+    /// `HeapObj::CombinatorResolver`. The admission proof lives in
+    /// `promise_combine`: constructor/resolve/prototype and iterator are
+    /// pristine, and `p` is a plain native promise. Pending and already-settled
+    /// inputs both retain the ordinary path's one-job-per-element FIFO shape.
+    fn then_combinator_all_direct(
+        &mut self,
+        p: u32,
+        combinator: u32,
+        index: u32,
+        cap_reject: Value,
+        result: u32,
+    ) {
+        debug_assert!(index <= i32::MAX as u32);
+        self.store_barrier(
+            crate::heap::gcoracle::PROMISE_REACT,
+            p,
+            Value::heap(combinator),
+        );
+        self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, cap_reject);
+        let (state, value) = match self.heap.get(p) {
+            HeapObj::Promise { state, result, .. } => (*state, *result),
+            _ => return,
+        };
+        match state {
+            PromiseState::Pending => {
+                if let HeapObj::Promise {
+                    reactions, handled, ..
+                } = self.heap.get_mut(p)
+                {
+                    asyncstats::subscribe(reactions.is_empty());
+                    reactions.push(ReactionPair {
+                        on_fulfilled: Value::int(index as i32),
+                        on_rejected: cap_reject,
+                        dependent: combinator,
+                        finally: false,
+                        is_async: false,
+                        is_combinator_all: true,
+                    });
+                    *handled = true;
+                }
+            }
+            PromiseState::Fulfilled => {
+                self.microtasks.push_back(Microtask::CombinatorStep {
+                    combinator,
+                    index,
+                    kind: ReactionKind::Fulfill,
+                    arg: value,
+                });
+            }
+            PromiseState::Rejected => {
+                if let HeapObj::Promise { handled, .. } = self.heap.get_mut(p) {
+                    *handled = true;
+                }
+                self.microtasks.push_back(Microtask::Reaction {
+                    callback: cap_reject,
+                    arg: value,
+                    dependent: result,
+                    kind: ReactionKind::Reject,
+                    finally: false,
                 });
             }
         }
@@ -2172,6 +2288,12 @@ impl<'p> Vm<'p> {
         ctor: Value,
     ) -> Result<Value, Thrown> {
         use crate::heap::CombKind;
+        // The iterator, per-element value, capability functions and freshly
+        // returned Promise are held in Rust locals across re-entrant iterator
+        // getters/calls. This mirrors the other callback-driven collection
+        // builtins: defer collection until the synchronous combinator setup
+        // has installed every value in a Promise reaction or heap object.
+        let _gc = self.gc_lock_guard();
         // NewPromiseCapability(C) — the result is a C-typed promise (a subclass
         // instance when `this` is a Promise subclass). A throwing/invalid capability
         // (executor not called / called twice / non-callable resolve-reject) throws
@@ -2284,14 +2406,27 @@ impl<'p> Vm<'p> {
         };
         // FAST ITERATION lane: a REAL Array whose @@iterator Get yielded the
         // PRISTINE intrinsic (and %ArrayIteratorPrototype%.next is untouched)
-        // is stepped INLINE — mirroring the intrinsic live-array iterator
-        // exactly (length re-read per step, holes skipped) with no iterator /
-        // iterator-result allocations. While inline, NO user code can run
+        // is stepped INLINE while dense, with the live length re-read per step.
+        // A hole demotes at its current index so inherited values/accessors and
+        // ordinary `undefined` holes remain observable. While inline, NO user
+        // code can run
         // between steps (any per-element path that could call out DEMOTES to
         // a real iterator object first), so these gates can't be invalidated
         // mid-iteration. `fast_pos = None` ⇒ `iter` drives via the protocol.
         let arr_fast = iterable.is_heap()
             && matches!(self.heap.get(iterable.heap_index()), HeapObj::Array(_))
+            // `defineProperty` can leave the old dense slot in place while an
+            // arr_props data/accessor descriptor becomes authoritative. Sloppy
+            // mapped arguments likewise route indexed reads through the live
+            // formal cell rather than the Array snapshot. Both must use the
+            // ordinary iterator before ANY dense slot is read.
+            && !self.array_elements_overlaid(iterable.heap_index())
+            && !self.arguments_objs.contains_key(&iterable.heap_index())
+            // Very large/sparse Arrays keep their JS length in this side table
+            // while the dense Vec contains only a prefix (possibly nothing).
+            // Stepping that Vec would stop early instead of observing holes,
+            // inherited indexed accessors, and the full live Array length.
+            && !self.array_js_len.contains_key(&iterable.heap_index())
             && iter_method.bits() == self.default_array_iter.bits()
             && match self.heap.get(self.array_iter_proto) {
                 HeapObj::Object(p) => p.get("next") == Some(self.default_array_iter_next),
@@ -2339,28 +2474,35 @@ impl<'p> Vm<'p> {
                 keys: comb_keys,
             })));
         loop {
+            // Array iteration does NOT skip holes: it performs Get(array,
+            // index), so an inherited numeric property or accessor may supply
+            // the value (and an otherwise-empty hole yields `undefined`). The
+            // dense inline lane cannot perform that observable lookup. Demote
+            // at the hole's CURRENT position so the ordinary live iterator
+            // handles it exactly once.
+            if let Some(pos) = fast_pos {
+                let hole = matches!(
+                    self.heap.get(iterable.heap_index()),
+                    HeapObj::Array(items) if pos < items.len() && items[pos].is_hole()
+                );
+                if hole {
+                    iter = Value::heap(self.heap.alloc(HeapObj::Iterator {
+                        items: Vec::new(),
+                        index: pos,
+                        proto: self.array_iter_proto,
+                        live: Some((iterable.heap_index(), 1)),
+                    }));
+                    fast_pos = None;
+                }
+            }
             // IteratorStep; a throwing next() leaves the iterator done → no close.
             let val = if let Some(pos) = fast_pos {
-                // Inline intrinsic array-iterator step (live length, holes
-                // skipped) — exactly ITER_NEXT's live-array kind=1 walk.
-                let mut ai = pos;
-                let stepped = loop {
-                    match self.heap.get(iterable.heap_index()) {
-                        HeapObj::Array(items) => {
-                            if ai >= items.len() {
-                                break None;
-                            }
-                            let v = items[ai];
-                            ai += 1;
-                            if v.is_hole() {
-                                continue;
-                            }
-                            break Some(v);
-                        }
-                        _ => break None,
-                    }
+                // Inline intrinsic array-iterator step for the dense case.
+                let stepped = match self.heap.get(iterable.heap_index()) {
+                    HeapObj::Array(items) if pos < items.len() => Some(items[pos]),
+                    _ => None,
                 };
-                fast_pos = Some(ai);
+                fast_pos = Some(pos + usize::from(stepped.is_some()));
                 match stepped {
                     Some(v) => v,
                     None => break,
@@ -2447,6 +2589,14 @@ impl<'p> Vm<'p> {
                     None => Value::heap(self.to_promise(val)),
                 }
             };
+            if fast_pos.is_some()
+                && matches!(kind, CombKind::All)
+                && index <= i32::MAX as u32
+                && promise_all_direct_enabled()
+            {
+                self.then_combinator_all_direct(next.heap_index(), comb, index, cap_reject, result);
+                continue;
+            }
             // onFulfilled / onRejected per PerformPromise{All,AllSettled,Race,Any}: a
             // per-index "resolveElement"/"rejectElement" (CombinatorResolver) is used
             // only where the algorithm collects a per-input outcome; otherwise the
@@ -3008,6 +3158,12 @@ impl<'p> Vm<'p> {
                     self.drive_async_resumed(activation, input);
                 }
             }
+            Microtask::CombinatorStep {
+                combinator,
+                index,
+                kind,
+                arg,
+            } => self.combinator_step(combinator, index, kind, arg),
             // PromiseResolveThenableJob: run then.call(thenable, resolveFn, rejectFn).
             // The resolving functions settle `promise` (one-shot via settle's Pending
             // guard, so a thenable that calls both / twice is handled). A throwing

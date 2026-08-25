@@ -27,9 +27,17 @@ fn stream_drain(re: &Regex, text: &str, start: usize, cap: usize) -> Stream {
         if exhausted {
             return out;
         }
-        assert_eq!(out.len() - before, cap, "a non-exhausted drain fills its cap");
+        assert_eq!(
+            out.len() - before,
+            cap,
+            "a non-exhausted drain fills its cap"
+        );
         let (last, _) = out.last().expect("cap >= 1");
-        from = if last.start == last.end { last.end + 1 } else { last.end };
+        from = if last.start == last.end {
+            last.end + 1
+        } else {
+            last.end
+        };
     }
 }
 
@@ -37,7 +45,12 @@ fn stream_drain(re: &Regex, text: &str, start: usize, cap: usize) -> Stream {
 /// mixes with unset groups, empty matches, and skip-hint-shaped patterns.
 const CASES: &[(&str, &str, &str, usize)] = &[
     // ByteSet/Bracket prefixes + captures (the kv shape; skip-hint pattern).
-    (r"([a-z]+)=(\d+)", "", "a=1 bb=22 ccc=333 dddd=4444 x= =5 e=6 q", 0),
+    (
+        r"([a-z]+)=(\d+)",
+        "",
+        "a=1 bb=22 ccc=333 dddd=4444 x= =5 e=6 q",
+        0,
+    ),
     (r"([a-z]+)=(\d+)", "", "a=1 bb=22 ccc=333", 4),
     // Always-empty pattern: one match at every position.
     (r"(?:)", "", "abc", 0),
@@ -49,7 +62,12 @@ const CASES: &[(&str, &str, &str, usize)] = &[
     // Optional group unset on some matches.
     (r"ab(\d)?", "", "ab1 ab ab2 ab", 0),
     // ByteSeq literal prefix.
-    (r"foobar(\d)", "", "xx foobar1 yy foobar2 foobar3zz foobar", 0),
+    (
+        r"foobar(\d)",
+        "",
+        "xx foobar1 yy foobar2 foobar3zz foobar",
+        0,
+    ),
     // Anchored (StartAnchored predicate): only start-adjacent matches.
     (r"^\d+", "", "123abc", 0),
     (r"^\d+", "", "abc123", 0),
@@ -103,8 +121,9 @@ fn exhausted_reports_end_of_subject_not_cap() {
 fn byteseq_optimized_twin_streams_match_too() {
     // `from_unicode_byteopt` is the compile the VM's ascii twin uses; the
     // drain must agree with the iterator on it as well.
-    let re = Regex::from_unicode_byteopt("([a-z]+)-(\\d+)".chars().map(u32::from), Flags::default())
-        .expect("pattern compiles");
+    let re =
+        Regex::from_unicode_byteopt("([a-z]+)-(\\d+)".chars().map(u32::from), Flags::default())
+            .expect("pattern compiles");
     let text = "aq-0 bq-1 cq-2 dq-3 eq-4 fq-5 gq-6 hq-7 iq-8 jq-9 kq-10";
     let want = stream_iter(&re, text, 0);
     for cap in [1usize, 4, 16] {

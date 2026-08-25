@@ -3,13 +3,11 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
-use crate::vm::{cldr_en, dtf_pattern};
 use crate::vm::*;
-
-
+use crate::vm::{cldr_en, dtf_pattern};
 
 /// CreateDateTimeFormat's `required`/`defaults` pair. `required` decides which
 /// options clear needDefaults (and which style is outright rejected); `defaults`
@@ -33,7 +31,6 @@ pub(crate) enum DtfDefaults {
     Zoned,
 }
 
-
 impl DtfDefaults {
     /// (date half required, time half required) — which component groups clear
     /// needDefaults, and which style the formatter accepts at all.
@@ -56,7 +53,6 @@ impl DtfDefaults {
     }
 }
 
-
 /// The calendars and numbering systems this engine actually has data for. The
 /// list is the SAME one `Intl.supportedValuesOf` reports, and DateTimeFormat /
 /// NumberFormat resolve an option against it — a well-formed but unsupported
@@ -69,7 +65,20 @@ pub(crate) const AVAILABLE_CALENDARS: &[&str] = &[
     // Each one formats through vm/temporal's arithmetic with CLDR `en` names
     // (cldr_en::CAL_MONTHS / CAL_ERAS) — advertising one it cannot format would
     // be worse than a short list.
-    "buddhist", "chinese", "coptic", "dangi", "ethioaa", "ethiopic", "gregory",
-    "hebrew", "indian", "islamic-civil", "islamic-tbla", "islamic-umalqura",
-    "iso8601", "japanese", "persian", "roc",
+    "buddhist",
+    "chinese",
+    "coptic",
+    "dangi",
+    "ethioaa",
+    "ethiopic",
+    "gregory",
+    "hebrew",
+    "indian",
+    "islamic-civil",
+    "islamic-tbla",
+    "islamic-umalqura",
+    "iso8601",
+    "japanese",
+    "persian",
+    "roc",
 ];

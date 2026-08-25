@@ -164,7 +164,10 @@ impl<'s> Parser<'s> {
                 }
                 self.cover.pattern_only = outer_po;
                 self.bump_before_operand()?; // `=>`
-                let params = Params { items: vec![Pattern::Ident(name)], simple: true };
+                let params = Params {
+                    items: vec![Pattern::Ident(name)],
+                    simple: true,
+                };
                 return self.finish_arrow(params, false, start);
             }
         }
@@ -199,27 +202,44 @@ impl<'s> Parser<'s> {
                 AssignOp::LogicalAnd | AssignOp::LogicalOr | AssignOp::LogicalCoalesce
             )
         {
-            return Err(SyntaxError::new("SyntaxError: invalid assignment target", start));
+            return Err(SyntaxError::new(
+                "SyntaxError: invalid assignment target",
+                start,
+            ));
         }
         let value = self.parse_assign()?;
-        Ok(Expr::Assign { op, target, value: Box::new(value), covered: false })
+        Ok(Expr::Assign {
+            op,
+            target,
+            value: Box::new(value),
+            covered: false,
+        })
     }
 
     fn parse_yield(&mut self) -> PResult<Expr> {
         self.bump_before_operand()?; // `yield`
-        // `yield` and `yield *` are restricted productions: a LineTerminator
-        // ends the expression, so `yield \n x` yields undefined.
+                                     // `yield` and `yield *` are restricted productions: a LineTerminator
+                                     // ends the expression, so `yield \n x` yields undefined.
         if self.cur().newline_before {
-            return Ok(Expr::Yield { arg: None, delegate: false });
+            return Ok(Expr::Yield {
+                arg: None,
+                delegate: false,
+            });
         }
         let delegate = self.eat(Punct::Star, true)?;
         // With no operand and no `*`, `yield` alone is legal wherever an
         // expression ends.
         if !delegate && self.at_expr_end() {
-            return Ok(Expr::Yield { arg: None, delegate: false });
+            return Ok(Expr::Yield {
+                arg: None,
+                delegate: false,
+            });
         }
         let arg = self.parse_assign()?;
-        Ok(Expr::Yield { arg: Some(Box::new(arg)), delegate })
+        Ok(Expr::Yield {
+            arg: Some(Box::new(arg)),
+            delegate,
+        })
     }
 
     /// Does the current token terminate an expression? Used by the operand-less
@@ -234,14 +254,13 @@ impl<'s> Parser<'s> {
             || self.at(Punct::Colon)
     }
 
-
     /// Everything `async` can begin. Returns `None` if it is just an identifier.
     fn try_async_prefixed(&mut self) -> PResult<Option<Expr>> {
         let save = self.save();
         let start = self.cur().span.start;
         self.bump_after_operand()?; // `async`
-        // A LineTerminator after `async` ends it: `async \n () => {}` is the
-        // identifier `async` followed by a separate expression.
+                                    // A LineTerminator after `async` ends it: `async \n () => {}` is the
+                                    // identifier `async` followed by a separate expression.
         if self.cur().newline_before {
             self.restore(save);
             return Ok(None);
@@ -258,7 +277,9 @@ impl<'s> Parser<'s> {
         // is only a binding once the `=>` is confirmed.
         if self.is_binding_ident() {
             let tok = self.bump_after_operand()?;
-            let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
+            let TokenKind::Ident { name, .. } = tok.kind else {
+                unreachable!()
+            };
             if self.at(Punct::Arrow) && !self.cur().newline_before {
                 if self.ctx.strict && (name == "eval" || name == "arguments") {
                     return Err(SyntaxError::new(
@@ -277,8 +298,10 @@ impl<'s> Parser<'s> {
                     ));
                 }
                 self.bump_before_operand()?;
-                let params =
-                    Params { items: vec![Pattern::Ident(name.into_boxed_str())], simple: true };
+                let params = Params {
+                    items: vec![Pattern::Ident(name.into_boxed_str())],
+                    simple: true,
+                };
                 return Ok(Some(self.finish_arrow(params, true, start)?));
             }
             self.restore(save);
@@ -313,7 +336,11 @@ impl<'s> Parser<'s> {
         self.ctx.in_ = saved_in;
         self.expect(Punct::Colon, true)?;
         let alt = self.parse_assign()?;
-        Ok(Expr::Cond { test: Box::new(test), cons: Box::new(cons), alt: Box::new(alt) })
+        Ok(Expr::Cond {
+            test: Box::new(test),
+            cons: Box::new(cons),
+            alt: Box::new(alt),
+        })
     }
 
     /// ShortCircuitExpression: either a `??` chain or a `||`/`&&` chain — the
@@ -359,8 +386,11 @@ impl<'s> Parser<'s> {
             saw = true;
             self.bump_before_operand()?;
             let (right, _) = self.parse_and_chain()?;
-            left =
-                Expr::Logical { op: LogicalOp::Or, left: Box::new(left), right: Box::new(right) };
+            left = Expr::Logical {
+                op: LogicalOp::Or,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok((left, saw))
     }
@@ -372,8 +402,11 @@ impl<'s> Parser<'s> {
             saw = true;
             self.bump_before_operand()?;
             let right = self.parse_binary(4)?;
-            left =
-                Expr::Logical { op: LogicalOp::And, left: Box::new(left), right: Box::new(right) };
+            left = Expr::Logical {
+                op: LogicalOp::And,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok((left, saw))
     }
@@ -402,7 +435,12 @@ impl<'s> Parser<'s> {
             } else if self.at_kw(Keyword::Instanceof) {
                 (9, BinaryOp::Instanceof)
             } else {
-                match self.cur().kind.as_punct().and_then(|p| binary_prec(p, &self.ctx)) {
+                match self
+                    .cur()
+                    .kind
+                    .as_punct()
+                    .and_then(|p| binary_prec(p, &self.ctx))
+                {
                     Some(v) => v,
                     None => break,
                 }
@@ -415,7 +453,11 @@ impl<'s> Parser<'s> {
             // precedence rather than one higher.
             let next_min = if op == BinaryOp::Exp { prec } else { prec + 1 };
             let right = self.parse_binary(next_min)?;
-            left = Expr::Binary { op, left: Box::new(left), right: Box::new(right) };
+            left = Expr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
         }
         Ok(left)
     }
@@ -431,9 +473,14 @@ impl<'s> Parser<'s> {
         }
         let start = self.cur().span.start;
         let tok = self.bump_after_operand()?;
-        let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
+        let TokenKind::Ident { name, .. } = tok.kind else {
+            unreachable!()
+        };
         if !self.at_kw(Keyword::In) {
-            return Err(SyntaxError::new("SyntaxError: unexpected private name", start));
+            return Err(SyntaxError::new(
+                "SyntaxError: unexpected private name",
+                start,
+            ));
         }
         self.bump_before_operand()?;
         // A ShiftExpression: `#f in #f in o` (RelationalExpression) and
@@ -452,7 +499,10 @@ impl<'s> Parser<'s> {
                 ));
             }
         }
-        Ok(Some(Expr::PrivateIn { name: name.into_boxed_str(), object: Box::new(object) }))
+        Ok(Some(Expr::PrivateIn {
+            name: name.into_boxed_str(),
+            object: Box::new(object),
+        }))
     }
 
     // ---- unary / update ----------------------------------------------------
@@ -472,11 +522,14 @@ impl<'s> Parser<'s> {
             // `-a ** b` is a SyntaxError: the operand of `**` may not be an
             // unparenthesized unary expression.
             if self.at(Punct::StarStar) {
-                return Err(self.err_here(
-                    "SyntaxError: unary operator before '**' requires parentheses",
-                ));
+                return Err(
+                    self.err_here("SyntaxError: unary operator before '**' requires parentheses")
+                );
             }
-            return Ok(Expr::Unary { op, arg: Box::new(arg) });
+            return Ok(Expr::Unary {
+                op,
+                arg: Box::new(arg),
+            });
         }
         for (kw, op) in [
             (Keyword::Typeof, UnaryOp::Typeof),
@@ -488,9 +541,8 @@ impl<'s> Parser<'s> {
                 self.bump_before_operand()?;
                 let arg = self.parse_unary()?;
                 if self.at(Punct::StarStar) {
-                    return Err(self.err_here(
-                        "SyntaxError: unary operator before '**' requires parentheses",
-                    ));
+                    return Err(self
+                        .err_here("SyntaxError: unary operator before '**' requires parentheses"));
                 }
                 if op == UnaryOp::Delete && self.ctx.strict {
                     // Strict mode: `delete x` on an unqualified identifier is an
@@ -511,7 +563,10 @@ impl<'s> Parser<'s> {
                         }
                     }
                 }
-                return Ok(Expr::Unary { op, arg: Box::new(arg) });
+                return Ok(Expr::Unary {
+                    op,
+                    arg: Box::new(arg),
+                });
             }
         }
         if self.ctx.await_ && self.at_kw(Keyword::Await) {
@@ -522,25 +577,33 @@ impl<'s> Parser<'s> {
             // AwaitExpression is a UnaryExpression, so it is no more legal as an
             // unparenthesized `**` base than `-a ** b` is.
             if self.at(Punct::StarStar) {
-                return Err(self.err_here(
-                    "SyntaxError: unary operator before '**' requires parentheses",
-                ));
+                return Err(
+                    self.err_here("SyntaxError: unary operator before '**' requires parentheses")
+                );
             }
             // Legal here, but illegal in the arrow parameters this region might
             // still turn out to be — so record it rather than deciding now.
-            self.cover
-                .yield_await
-                .push(SyntaxError::new("SyntaxError: 'await' in formal parameters", pos));
+            self.cover.yield_await.push(SyntaxError::new(
+                "SyntaxError: 'await' in formal parameters",
+                pos,
+            ));
             return Ok(Expr::Await(Box::new(arg)));
         }
         // Prefix `++`/`--`.
-        for (p, op) in [(Punct::PlusPlus, UpdateOp::Inc), (Punct::MinusMinus, UpdateOp::Dec)] {
+        for (p, op) in [
+            (Punct::PlusPlus, UpdateOp::Inc),
+            (Punct::MinusMinus, UpdateOp::Dec),
+        ] {
             if self.at(p) {
                 let pos = self.cur().span.start;
                 self.bump_before_operand()?;
                 let arg = self.parse_unary()?;
                 let target = self.expr_to_target(arg, false, pos)?;
-                return Ok(Expr::Update { op, prefix: true, target });
+                return Ok(Expr::Update {
+                    op,
+                    prefix: true,
+                    target,
+                });
             }
         }
         self.parse_postfix()
@@ -549,13 +612,20 @@ impl<'s> Parser<'s> {
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let start = self.cur().span.start;
         let e = self.parse_lhs()?;
-        for (p, op) in [(Punct::PlusPlus, UpdateOp::Inc), (Punct::MinusMinus, UpdateOp::Dec)] {
+        for (p, op) in [
+            (Punct::PlusPlus, UpdateOp::Inc),
+            (Punct::MinusMinus, UpdateOp::Dec),
+        ] {
             // Restricted production: a LineTerminator before `++` means ASI, not
             // a postfix operator.
             if self.at(p) && !self.cur().newline_before {
                 self.bump_after_operand()?;
                 let target = self.expr_to_target(e, false, start)?;
-                return Ok(Expr::Update { op, prefix: false, target });
+                return Ok(Expr::Update {
+                    op,
+                    prefix: false,
+                    target,
+                });
             }
         }
         Ok(e)
@@ -614,7 +684,11 @@ impl<'s> Parser<'s> {
             if self.at(Punct::Dot) {
                 self.bump_after_operand()?;
                 let prop = self.member_prop()?;
-                e = Expr::Member(Box::new(Member { object: e, prop, optional: false }));
+                e = Expr::Member(Box::new(Member {
+                    object: e,
+                    prop,
+                    optional: false,
+                }));
             } else if self.at(Punct::QuestionDot) {
                 // `super?.x` / `super?.[x]` are early SyntaxErrors: `super` is
                 // not a valid optional-chain base.
@@ -627,7 +701,11 @@ impl<'s> Parser<'s> {
                 self.bump_after_operand()?;
                 if self.at(Punct::LParen) {
                     let args = self.parse_args()?;
-                    e = Expr::Call(Box::new(CallExpr { callee: e, args, optional: true }));
+                    e = Expr::Call(Box::new(CallExpr {
+                        callee: e,
+                        args,
+                        optional: true,
+                    }));
                 } else if self.at(Punct::LBracket) {
                     self.bump_before_operand()?;
                     let saved_in = self.ctx.in_;
@@ -642,7 +720,11 @@ impl<'s> Parser<'s> {
                     }));
                 } else {
                     let prop = self.member_prop()?;
-                    e = Expr::Member(Box::new(Member { object: e, prop, optional: true }));
+                    e = Expr::Member(Box::new(Member {
+                        object: e,
+                        prop,
+                        optional: true,
+                    }));
                 }
             } else if self.at(Punct::LBracket) {
                 self.bump_before_operand()?;
@@ -658,16 +740,22 @@ impl<'s> Parser<'s> {
                 }));
             } else if self.at(Punct::LParen) {
                 let args = self.parse_args()?;
-                e = Expr::Call(Box::new(CallExpr { callee: e, args, optional: false }));
+                e = Expr::Call(Box::new(CallExpr {
+                    callee: e,
+                    args,
+                    optional: false,
+                }));
             } else if matches!(self.cur().kind, TokenKind::Template { .. }) {
                 // A tagged template. `` a?.b`x` `` is a SyntaxError: an optional
                 // chain may not be tagged.
                 if saw_optional {
-                    return Err(self
-                        .err_here("SyntaxError: tagged template in an optional chain"));
+                    return Err(self.err_here("SyntaxError: tagged template in an optional chain"));
                 }
                 let quasi = self.parse_template()?;
-                e = Expr::TaggedTemplate { tag: Box::new(e), quasi: Box::new(quasi) };
+                e = Expr::TaggedTemplate {
+                    tag: Box::new(e),
+                    quasi: Box::new(quasi),
+                };
             } else {
                 break;
             }
@@ -694,7 +782,9 @@ impl<'s> Parser<'s> {
     fn member_prop(&mut self) -> PResult<MemberProp> {
         if let TokenKind::Ident { private: true, .. } = &self.cur().kind {
             let tok = self.bump_after_operand()?;
-            let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
+            let TokenKind::Ident { name, .. } = tok.kind else {
+                unreachable!()
+            };
             return Ok(MemberProp::Private(name.into_boxed_str()));
         }
         Ok(MemberProp::Ident(self.ident_name()?))
@@ -705,7 +795,7 @@ impl<'s> Parser<'s> {
         // `new` is followed by a MemberExpression — an OPERAND — so `new /re/`
         // is a regex literal (a runtime TypeError, not a syntax error).
         self.bump_before_operand()?; // `new`
-        // `new.target`
+                                     // `new.target`
         if self.at(Punct::Dot) {
             self.bump_after_operand()?;
             // `target` is a bolded terminal of `NewTarget : new . target`, so it
@@ -735,8 +825,11 @@ impl<'s> Parser<'s> {
         let bare_import = self.at_kw(Keyword::Import);
         // The callee is a MemberExpression — it takes member accesses but NOT
         // calls, so `new a.b()` applies `new` to `a.b`, not to `a.b()`.
-        let mut callee =
-            if self.at_kw(Keyword::New) { self.parse_new()? } else { self.parse_primary()? };
+        let mut callee = if self.at_kw(Keyword::New) {
+            self.parse_new()?
+        } else {
+            self.parse_primary()?
+        };
         // `new import(…)` / `new import.defer(…)`: an ImportCall is a
         // CallExpression, and `new` takes a MemberExpression, so it can never be
         // the callee. Checked BEFORE the member loop so `new import('m').p` is
@@ -752,7 +845,11 @@ impl<'s> Parser<'s> {
             if self.at(Punct::Dot) {
                 self.bump_after_operand()?;
                 let prop = self.member_prop()?;
-                callee = Expr::Member(Box::new(Member { object: callee, prop, optional: false }));
+                callee = Expr::Member(Box::new(Member {
+                    object: callee,
+                    prop,
+                    optional: false,
+                }));
             } else if self.at(Punct::LBracket) {
                 self.bump_before_operand()?;
                 let idx = self.parse_expr()?;
@@ -767,7 +864,10 @@ impl<'s> Parser<'s> {
                 // tagged template is itself a MemberExpression, so ``new tag`t` ``
                 // constructs the TAG'S RESULT, not the tag.
                 let quasi = self.parse_template()?;
-                callee = Expr::TaggedTemplate { tag: Box::new(callee), quasi: Box::new(quasi) };
+                callee = Expr::TaggedTemplate {
+                    tag: Box::new(callee),
+                    quasi: Box::new(quasi),
+                };
             } else {
                 break;
             }
@@ -777,8 +877,15 @@ impl<'s> Parser<'s> {
         if self.at(Punct::QuestionDot) {
             return Err(self.err_here("SyntaxError: 'new' cannot be applied to an optional chain"));
         }
-        let args = if self.at(Punct::LParen) { self.parse_args()? } else { Vec::new() };
-        Ok(Expr::New { callee: Box::new(callee), args })
+        let args = if self.at(Punct::LParen) {
+            self.parse_args()?
+        } else {
+            Vec::new()
+        };
+        Ok(Expr::New {
+            callee: Box::new(callee),
+            args,
+        })
     }
 
     /// An ImportCall's argument list, from the `(` on.
@@ -808,7 +915,11 @@ impl<'s> Parser<'s> {
         };
         self.ctx.in_ = saved_in;
         self.expect(Punct::RParen, false)?;
-        Ok(Expr::ImportCall { spec: Box::new(spec), options, phase })
+        Ok(Expr::ImportCall {
+            spec: Box::new(spec),
+            options,
+            phase,
+        })
     }
 
     fn parse_args(&mut self) -> PResult<Vec<Arg>> {
@@ -879,19 +990,25 @@ impl<'s> Parser<'s> {
             }
             TokenKind::BigInt(_) => {
                 let tok = self.bump_after_operand()?;
-                let TokenKind::BigInt(d) = tok.kind else { unreachable!() };
+                let TokenKind::BigInt(d) = tok.kind else {
+                    unreachable!()
+                };
                 Ok(Expr::BigInt(d.into_boxed_str()))
             }
             TokenKind::Str(_) => {
                 self.check_legacy_escape()?;
                 let tok = self.bump_after_operand()?;
-                let TokenKind::Str(v) = tok.kind else { unreachable!() };
+                let TokenKind::Str(v) = tok.kind else {
+                    unreachable!()
+                };
                 Ok(Expr::Str(v))
             }
             TokenKind::Regex { .. } => {
                 let start = self.cur().span.start;
                 let tok = self.bump_after_operand()?;
-                let TokenKind::Regex { pattern, flags } = tok.kind else { unreachable!() };
+                let TokenKind::Regex { pattern, flags } = tok.kind else {
+                    unreachable!()
+                };
                 // EARLY ERROR (12.9.5): the FlagText of a RegularExpressionLiteral
                 // may hold no code point outside `dgimsuvy` and none of them
                 // twice, and `u`/`v` select mutually exclusive grammars. This is
@@ -925,7 +1042,10 @@ impl<'s> Parser<'s> {
                 // order, and `toString` goes through it), and the engine
                 // stores what it reports.
                 let canon: String = "dgimsuvy".chars().filter(|c| seen.contains(*c)).collect();
-                Ok(Expr::Regex { pattern, flags: canon.into_boxed_str() })
+                Ok(Expr::Regex {
+                    pattern,
+                    flags: canon.into_boxed_str(),
+                })
             }
             TokenKind::Template { .. } => {
                 let pos = self.cur().span.start;
@@ -956,7 +1076,10 @@ impl<'s> Parser<'s> {
                 // ShiftExpression`, handled in `parse_binary`. Reaching here
                 // means the private name sits somewhere that production cannot
                 // cover (`!#x`, `(#x) in o`, `typeof #x in o`, …).
-                Err(SyntaxError::new("SyntaxError: unexpected private name", start))
+                Err(SyntaxError::new(
+                    "SyntaxError: unexpected private name",
+                    start,
+                ))
             }
             TokenKind::Ident { kw, had_escape, .. } => {
                 // Escaped spellings are identifiers, never keywords, so they
@@ -1033,19 +1156,22 @@ impl<'s> Parser<'s> {
                             // `None` = the meta-property; `Some(p)` = a phased
                             // ImportCall, which still requires its `(`.
                             let phase: Option<ImportPhase> = match &self.cur().kind {
-                                TokenKind::Ident { name, had_escape: false, private: false, .. } => {
-                                    match name.as_str() {
-                                        "meta" => None,
-                                        "defer" => Some(ImportPhase::Defer),
-                                        "source" => Some(ImportPhase::Source),
-                                        _ => {
-                                            return Err(SyntaxError::new(
-                                                "SyntaxError: expected 'import.meta'",
-                                                start,
-                                            ))
-                                        }
+                                TokenKind::Ident {
+                                    name,
+                                    had_escape: false,
+                                    private: false,
+                                    ..
+                                } => match name.as_str() {
+                                    "meta" => None,
+                                    "defer" => Some(ImportPhase::Defer),
+                                    "source" => Some(ImportPhase::Source),
+                                    _ => {
+                                        return Err(SyntaxError::new(
+                                            "SyntaxError: expected 'import.meta'",
+                                            start,
+                                        ))
                                     }
-                                }
+                                },
                                 _ => {
                                     return Err(SyntaxError::new(
                                         "SyntaxError: expected 'import.meta'",
@@ -1054,7 +1180,9 @@ impl<'s> Parser<'s> {
                                 }
                             };
                             self.bump_after_operand()?;
-                            let Some(phase) = phase else { return Ok(Expr::ImportMeta) };
+                            let Some(phase) = phase else {
+                                return Ok(Expr::ImportMeta);
+                            };
                             return self.parse_import_call(phase);
                         }
                         self.parse_import_call(ImportPhase::Evaluation)
@@ -1090,7 +1218,13 @@ impl<'s> Parser<'s> {
     /// An IdentifierReference. Looser than a binding: `eval`/`arguments` may be
     /// READ in strict mode, only bound-to is an error.
     pub(crate) fn binding_ident_or_reference(&mut self) -> PResult<(Name, u32)> {
-        let TokenKind::Ident { kw, had_escape, private: false, name } = &self.cur().kind else {
+        let TokenKind::Ident {
+            kw,
+            had_escape,
+            private: false,
+            name,
+        } = &self.cur().kind
+        else {
             return Err(self.err_here("SyntaxError: expected an identifier"));
         };
         // A ReservedWord is matched by STRING VALUE, so an escaped spelling is
@@ -1099,7 +1233,11 @@ impl<'s> Parser<'s> {
         // `if` being an `if` statement), so re-classify from the name;
         // skipping the checks for escaped spellings is what let every reserved
         // word through in every identifier position.
-        let kw = if *had_escape { Keyword::classify(name) } else { *kw };
+        let kw = if *had_escape {
+            Keyword::classify(name)
+        } else {
+            *kw
+        };
         if kw.is_always_reserved() {
             return Err(self.err_here("SyntaxError: unexpected reserved word"));
         }
@@ -1134,9 +1272,8 @@ impl<'s> Parser<'s> {
         // `await` is never an Identifier, not even inside a nested non-async
         // `function` (which clears `ctx.await_`).
         if (self.ctx.await_ || self.goal == Goal::Module) && kw == Keyword::Await {
-            return Err(self.err_here(
-                "SyntaxError: 'await' is reserved inside an async function or module",
-            ));
+            return Err(self
+                .err_here("SyntaxError: 'await' is reserved inside an async function or module"));
         }
         let pos = self.cur().span.start;
         // Legal HERE (a sloppy Script's `await` is an ordinary name), but the
@@ -1150,7 +1287,9 @@ impl<'s> Parser<'s> {
             ));
         }
         let tok = self.bump_after_operand()?;
-        let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
+        let TokenKind::Ident { name, .. } = tok.kind else {
+            unreachable!()
+        };
         Ok((name.into_boxed_str(), pos))
     }
 
@@ -1159,10 +1298,16 @@ impl<'s> Parser<'s> {
     fn parse_template(&mut self) -> PResult<TemplateLit> {
         let mut quasis = Vec::new();
         let mut exprs = Vec::new();
-        let TokenKind::Template { cooked, raw, tail, .. } = self.cur().kind.clone() else {
+        let TokenKind::Template {
+            cooked, raw, tail, ..
+        } = self.cur().kind.clone()
+        else {
             return Err(self.err_here("SyntaxError: expected a template literal"));
         };
-        quasis.push(TemplateElement { cooked, raw: raw.into_boxed_str() });
+        quasis.push(TemplateElement {
+            cooked,
+            raw: raw.into_boxed_str(),
+        });
         let mut done = tail;
         // A head chunk ending in `${` is followed by an Expression, so a `/`
         // there is a regex; a TemplateTail is an operand, so it is division.
@@ -1179,10 +1324,16 @@ impl<'s> Parser<'s> {
                 return Err(self.err_here("SyntaxError: expected '}' in template literal"));
             }
             let tok = self.resume_template()?;
-            let TokenKind::Template { cooked, raw, tail, .. } = tok.kind else {
+            let TokenKind::Template {
+                cooked, raw, tail, ..
+            } = tok.kind
+            else {
                 return Err(self.err_here("SyntaxError: malformed template literal"));
             };
-            quasis.push(TemplateElement { cooked, raw: raw.into_boxed_str() });
+            quasis.push(TemplateElement {
+                cooked,
+                raw: raw.into_boxed_str(),
+            });
             done = tail;
         }
         self.ctx.in_ = saved_in;
@@ -1225,13 +1376,20 @@ impl<'s> Parser<'s> {
             // `[...x,]` — a comma directly after the final spread, with the
             // bracket next. Recorded, not rejected: only the pattern reading
             // forbids it.
-            if self.at(Punct::RBracket) && matches!(items.last(), Some(Some(ArrayElem::Spread(_)))) {
+            if self.at(Punct::RBracket) && matches!(items.last(), Some(Some(ArrayElem::Spread(_))))
+            {
                 rest_comma = true;
             }
         }
         self.ctx.in_ = saved_in;
         self.expect(Punct::RBracket, false)?;
-        Ok(Expr::Array(items, LiteralFlags { rest_comma, parenthesized: false }))
+        Ok(Expr::Array(
+            items,
+            LiteralFlags {
+                rest_comma,
+                parenthesized: false,
+            },
+        ))
     }
 
     fn parse_object_literal(&mut self) -> PResult<Expr> {
@@ -1279,7 +1437,13 @@ impl<'s> Parser<'s> {
                 proto_pos,
             ));
         }
-        Ok(Expr::Object(members, LiteralFlags { rest_comma, parenthesized: false }))
+        Ok(Expr::Object(
+            members,
+            LiteralFlags {
+                rest_comma,
+                parenthesized: false,
+            },
+        ))
     }
 
     /// Returns the member, whether it is a plain `__proto__: v`, and its position.
@@ -1296,9 +1460,15 @@ impl<'s> Parser<'s> {
                     let func = self.parse_method_rest(false, false, start)?;
                     self.check_accessor_arity(is_get, &func.params)?;
                     let m = if is_get {
-                        ObjectMember::Get { key, func: Box::new(func) }
+                        ObjectMember::Get {
+                            key,
+                            func: Box::new(func),
+                        }
                     } else {
-                        ObjectMember::Set { key, func: Box::new(func) }
+                        ObjectMember::Set {
+                            key,
+                            func: Box::new(func),
+                        }
                     };
                     return Ok((m, false, start));
                 }
@@ -1315,7 +1485,14 @@ impl<'s> Parser<'s> {
                 let gen = self.eat(Punct::Star, false)?;
                 let key = self.parse_prop_key()?;
                 let func = self.parse_method_rest(true, gen, start)?;
-                return Ok((ObjectMember::Method { key, func: Box::new(func) }, false, start));
+                return Ok((
+                    ObjectMember::Method {
+                        key,
+                        func: Box::new(func),
+                    },
+                    false,
+                    start,
+                ));
             }
             self.restore(save);
         }
@@ -1324,7 +1501,14 @@ impl<'s> Parser<'s> {
             self.bump_after_operand()?;
             let key = self.parse_prop_key()?;
             let func = self.parse_method_rest(false, true, start)?;
-            return Ok((ObjectMember::Method { key, func: Box::new(func) }, false, start));
+            return Ok((
+                ObjectMember::Method {
+                    key,
+                    func: Box::new(func),
+                },
+                false,
+                start,
+            ));
         }
 
         // A PropertyName is unrestricted — `{ break: 1 }`, `{ if: 1 }`,
@@ -1339,7 +1523,14 @@ impl<'s> Parser<'s> {
         // `m() {}`
         if self.at(Punct::LParen) {
             let func = self.parse_method_rest(false, false, start)?;
-            return Ok((ObjectMember::Method { key, func: Box::new(func) }, false, start));
+            return Ok((
+                ObjectMember::Method {
+                    key,
+                    func: Box::new(func),
+                },
+                false,
+                start,
+            ));
         }
         // `k: v`
         if self.eat(Punct::Colon, true)? {
@@ -1347,7 +1538,12 @@ impl<'s> Parser<'s> {
             let is_proto = matches!(&key, PropKey::Ident(n) if &**n == "__proto__")
                 || matches!(&key, PropKey::Str(s) if s.to_lossy_string() == "__proto__");
             return Ok((
-                ObjectMember::Prop { key, value, shorthand: false, init: None },
+                ObjectMember::Prop {
+                    key,
+                    value,
+                    shorthand: false,
+                    init: None,
+                },
                 is_proto,
                 start,
             ));
@@ -1386,7 +1582,12 @@ impl<'s> Parser<'s> {
             ));
         }
         Ok((
-            ObjectMember::Prop { key, value: Expr::Ident(name), shorthand: true, init },
+            ObjectMember::Prop {
+                key,
+                value: Expr::Ident(name),
+                shorthand: true,
+                init,
+            },
             false,
             start,
         ))
@@ -1434,7 +1635,11 @@ impl<'s> Parser<'s> {
                     Ok(PropKey::Str(StrVal::Utf8(digits)))
                 }
             }
-            TokenKind::Ident { private: true, name, .. } => {
+            TokenKind::Ident {
+                private: true,
+                name,
+                ..
+            } => {
                 self.bump_after_operand()?;
                 Ok(PropKey::Private(name.into_boxed_str()))
             }

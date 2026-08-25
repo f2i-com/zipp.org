@@ -134,7 +134,12 @@ impl CollIndex {
     fn with_capacity(n: usize) -> CollIndex {
         // Capacity for `n` entries at < 3/4 load, minimum 128, power of two.
         let cap = (n * 4 / 3 + 1).next_power_of_two().max(128);
-        CollIndex { table: vec![(0, META_EMPTY); cap], mask: cap - 1, live: 0, used: 0 }
+        CollIndex {
+            table: vec![(0, META_EMPTY); cap],
+            mask: cap - 1,
+            live: 0,
+            used: 0,
+        }
     }
 
     /// Index every LIVE (non-tombstoned) slot of `keys`.
@@ -224,8 +229,11 @@ impl CollIndex {
     /// (a delete-heavy phase purges them without growing the table). The
     /// stored tags re-index directly (bucket = `tag & mask`) — no key reads.
     fn grow(&mut self) {
-        let cap =
-            if self.live * 2 >= self.table.len() { self.table.len() * 2 } else { self.table.len() };
+        let cap = if self.live * 2 >= self.table.len() {
+            self.table.len() * 2
+        } else {
+            self.table.len()
+        };
         let old = std::mem::replace(&mut self.table, vec![(0, META_EMPTY); cap]);
         self.mask = cap - 1;
         self.used = 0;
@@ -295,7 +303,10 @@ impl LocalFinder {
             }
             self.index = Some(CollIndex::build(heap, keys));
         }
-        self.index.as_ref().unwrap().find(heap, keys, key, svz_repr(heap, key))
+        self.index
+            .as_ref()
+            .unwrap()
+            .find(heap, keys, key, svz_repr(heap, key))
     }
 
     /// Report `key` about to be pushed at `keys.len()` (call BEFORE the push).
@@ -356,7 +367,11 @@ impl<'p> Vm<'p> {
         if key.is_heap() {
             self.heap.flatten(key.heap_index()); // usually a no-op: coll_find ran first
         }
-        let Vm { heap, collection_index, .. } = self;
+        let Vm {
+            heap,
+            collection_index,
+            ..
+        } = self;
         if let Some(ix) = collection_index.get_mut(&idx) {
             ix.insert(svz_repr(heap, key), pos as u32);
         }
@@ -368,7 +383,11 @@ impl<'p> Vm<'p> {
         if key.is_heap() {
             self.heap.flatten(key.heap_index()); // usually a no-op: coll_find ran first
         }
-        let Vm { heap, collection_index, .. } = self;
+        let Vm {
+            heap,
+            collection_index,
+            ..
+        } = self;
         if let Some(ix) = collection_index.get_mut(&idx) {
             ix.remove(svz_repr(heap, key), pos as u32);
         }

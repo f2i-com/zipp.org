@@ -56,7 +56,11 @@ impl<'s> Parser<'s> {
                 // there the relaxation does not apply.
                 self.ctx.await_ = is_async || self.goal == Goal::Module;
             }
-            let n = if self.is_binding_ident() { Some(self.binding_ident()) } else { None };
+            let n = if self.is_binding_ident() {
+                Some(self.binding_ident())
+            } else {
+                None
+            };
             (self.ctx.yield_, self.ctx.await_) = saved;
             match n {
                 Some(r) => Some(r?.0),
@@ -64,7 +68,14 @@ impl<'s> Parser<'s> {
             }
         };
         let (params, body) = self.parse_fn_tail(is_async, is_generator, false)?;
-        Ok(Function { name, params, body, is_async, is_generator, span: Span::new(start, self.prev_end()) })
+        Ok(Function {
+            name,
+            params,
+            body,
+            is_async,
+            is_generator,
+            span: Span::new(start, self.prev_end()),
+        })
     }
 
     /// Parameters + body, with the context switched to the function's own.
@@ -141,12 +152,12 @@ impl<'s> Parser<'s> {
     pub(crate) fn check_accessor_arity(&self, is_get: bool, params: &Params) -> PResult<()> {
         if is_get {
             if !params.items.is_empty() {
-                return Err(self.err_here("SyntaxError: getter must not have any formal parameters"));
+                return Err(
+                    self.err_here("SyntaxError: getter must not have any formal parameters")
+                );
             }
         } else if params.items.len() != 1 {
-            return Err(
-                self.err_here("SyntaxError: setter must have exactly one formal parameter")
-            );
+            return Err(self.err_here("SyntaxError: setter must have exactly one formal parameter"));
         } else if matches!(params.items[0], Pattern::Rest(_)) {
             return Err(self.err_here("SyntaxError: setter parameter may not be a rest parameter"));
         }
@@ -232,7 +243,10 @@ impl<'s> Parser<'s> {
             }
             let pat = self.parse_binding_pattern()?;
             items.push(if self.eat(Punct::Eq, true)? {
-                Pattern::Assign { left: Box::new(pat), right: Box::new(self.parse_assign_full()?) }
+                Pattern::Assign {
+                    left: Box::new(pat),
+                    right: Box::new(self.parse_assign_full()?),
+                }
             } else {
                 pat
             });
@@ -256,10 +270,7 @@ impl<'s> Parser<'s> {
     /// with its `VarDeclaredNames` (`function f(a){ var a; }` is fine, and so is
     /// a body-level `function a(){}`). Recording them in `Scope::var` is exactly
     /// that asymmetry, and it is why they are recorded as var-like bindings.
-    pub(crate) fn parse_fn_body_with_params(
-        &mut self,
-        params: Option<&Params>,
-    ) -> PResult<FnBody> {
+    pub(crate) fn parse_fn_body_with_params(&mut self, params: Option<&Params>) -> PResult<FnBody> {
         self.expect(Punct::LBrace, true)?;
         let saved_strict = self.ctx.strict;
         let (directives, strict) = self.directive_prologue()?;
@@ -313,13 +324,19 @@ impl<'s> Parser<'s> {
                 self.bump_before_operand()?;
                 let inner = self.parse_binding_pattern()?;
                 if self.at(Punct::Comma) {
-                    return Err(SyntaxError::new("SyntaxError: rest element must be last", pos));
+                    return Err(SyntaxError::new(
+                        "SyntaxError: rest element must be last",
+                        pos,
+                    ));
                 }
                 Pattern::Rest(Box::new(inner))
             } else {
                 let p = self.parse_binding_pattern()?;
                 if self.eat(Punct::Eq, true)? {
-                    Pattern::Assign { left: Box::new(p), right: Box::new(self.parse_assign_full()?) }
+                    Pattern::Assign {
+                        left: Box::new(p),
+                        right: Box::new(self.parse_assign_full()?),
+                    }
                 } else {
                     p
                 }
@@ -344,7 +361,10 @@ impl<'s> Parser<'s> {
                 // An object rest binding must be a plain identifier.
                 rest = Some(Box::new(Pattern::Ident(self.binding_ident()?.0)));
                 if self.at(Punct::Comma) {
-                    return Err(SyntaxError::new("SyntaxError: rest element must be last", pos));
+                    return Err(SyntaxError::new(
+                        "SyntaxError: rest element must be last",
+                        pos,
+                    ));
                 }
                 break;
             }
@@ -385,7 +405,10 @@ impl<'s> Parser<'s> {
                 Pattern::Ident(n.clone())
             };
             let value = if self.eat(Punct::Eq, true)? {
-                Pattern::Assign { left: Box::new(value), right: Box::new(self.parse_assign_full()?) }
+                Pattern::Assign {
+                    left: Box::new(value),
+                    right: Box::new(self.parse_assign_full()?),
+                }
             } else {
                 value
             };
@@ -456,13 +479,21 @@ impl<'s> Parser<'s> {
         while self.at(Punct::Dot) {
             self.bump_after_operand()?;
             let prop = self.member_prop_public()?;
-            e = Expr::Member(Box::new(Member { object: e, prop, optional: false }));
+            e = Expr::Member(Box::new(Member {
+                object: e,
+                prop,
+                optional: false,
+            }));
         }
         // …optionally ONE argument list, and nothing after it: `@a.b(1)` is a
         // DecoratorCallExpression, `@a(1).b` and `@a(1)(2)` are not.
         if self.at(Punct::LParen) {
             let args = self.parse_args_public()?;
-            e = Expr::Call(Box::new(CallExpr { callee: e, args, optional: false }));
+            e = Expr::Call(Box::new(CallExpr {
+                callee: e,
+                args,
+                optional: false,
+            }));
         }
         Ok(e)
     }
@@ -486,7 +517,11 @@ impl<'s> Parser<'s> {
         let saved_strict = self.ctx.strict;
         self.ctx.strict = true;
 
-        let name = if self.is_binding_ident() { Some(self.binding_ident()?.0) } else { None };
+        let name = if self.is_binding_ident() {
+            Some(self.binding_ident()?.0)
+        } else {
+            None
+        };
         let superclass = if self.eat_kw(Keyword::Extends, true)? {
             let sup = self.parse_lhs_public()?;
             // `ClassHeritage : extends LeftHandSideExpression`. An ArrowFunction
@@ -526,9 +561,9 @@ impl<'s> Parser<'s> {
             if let ClassMember::Method(cm) = &m {
                 if cm.kind == MethodKind::Constructor {
                     if saw_ctor {
-                        return Err(self.err_here(
-                            "SyntaxError: a class may only have one constructor",
-                        ));
+                        return Err(
+                            self.err_here("SyntaxError: a class may only have one constructor")
+                        );
                     }
                     saw_ctor = true;
                 }
@@ -590,18 +625,20 @@ impl<'s> Parser<'s> {
 
             if let PropKey::Private(n) = key {
                 if &**n == "constructor" {
-                    return err(
-                        "SyntaxError: '#constructor' is not a valid private name".into()
-                    );
+                    return err("SyntaxError: '#constructor' is not a valid private name".into());
                 }
-                privates.push((n, is_static, if is_field { MethodKind::Method } else { kind }));
+                privates.push((
+                    n,
+                    is_static,
+                    if is_field { MethodKind::Method } else { kind },
+                ));
                 continue;
             }
 
             let Some(name) = prop_name(key) else { continue };
             if is_static && name == "prototype" {
                 return err(
-                    "SyntaxError: a class may not have a static member named 'prototype'".into()
+                    "SyntaxError: a class may not have a static member named 'prototype'".into(),
                 );
             }
             if is_field {
@@ -609,9 +646,7 @@ impl<'s> Parser<'s> {
                 // STATIC field additionally may not be named `prototype` (caught
                 // above, which covers methods too).
                 if name == "constructor" {
-                    return err(
-                        "SyntaxError: a class field may not be named 'constructor'".into()
-                    );
+                    return err("SyntaxError: a class field may not be named 'constructor'".into());
                 }
                 continue;
             }
@@ -619,7 +654,8 @@ impl<'s> Parser<'s> {
                 if special {
                     return err(
                         "SyntaxError: the class constructor may not be a getter, setter, \
-                         generator or async method".into()
+                         generator or async method"
+                            .into(),
                     );
                 }
                 ctor_count += 1;
@@ -636,7 +672,9 @@ impl<'s> Parser<'s> {
                 .enumerate()
                 .filter(|(j, (m, _, _))| *j != i && m == n)
                 .map(|(_, e)| e);
-            let Some((_, ost, ok)) = others.next() else { continue };
+            let Some((_, ost, ok)) = others.next() else {
+                continue;
+            };
             // More than two entries, or a second entry that does not complete a
             // same-staticness accessor pair.
             let paired = others.next().is_none()
@@ -702,11 +740,7 @@ impl<'s> Parser<'s> {
         Ok(m)
     }
 
-    fn parse_class_member_inner(
-        &mut self,
-        derived: bool,
-        start: u32,
-    ) -> PResult<ClassMember> {
+    fn parse_class_member_inner(&mut self, derived: bool, start: u32) -> PResult<ClassMember> {
         let is_static = if self.at_kw(Keyword::Static) {
             let save = self.save();
             self.bump_after_operand()?;
@@ -779,7 +813,10 @@ impl<'s> Parser<'s> {
         }
 
         // Accessors and modifiers, each of which may instead be a plain name.
-        for (kw, kind) in [(Keyword::Get, MethodKind::Get), (Keyword::Set, MethodKind::Set)] {
+        for (kw, kind) in [
+            (Keyword::Get, MethodKind::Get),
+            (Keyword::Set, MethodKind::Set),
+        ] {
             if self.at_kw(kw) {
                 let save = self.save();
                 self.bump_after_operand()?;
@@ -817,10 +854,8 @@ impl<'s> Parser<'s> {
             // PropName, not spelling: `class C { 'constructor'(){} }` defines the
             // constructor exactly as the bare identifier does, so `super()` is
             // legal in it and a second `constructor` beside it is a duplicate.
-            let is_ctor = !is_static
-                && !is_async
-                && !is_generator
-                && prop_name(&key) == Some("constructor");
+            let is_ctor =
+                !is_static && !is_async && !is_generator && prop_name(&key) == Some("constructor");
             let saved_call = self.ctx.super_call;
             if is_ctor {
                 // `super()` is legal only in a DERIVED constructor.
@@ -830,7 +865,11 @@ impl<'s> Parser<'s> {
             self.ctx.super_call = saved_call;
             return Ok(ClassMember::Method(ClassMethod {
                 key,
-                kind: if is_ctor { MethodKind::Constructor } else { MethodKind::Method },
+                kind: if is_ctor {
+                    MethodKind::Constructor
+                } else {
+                    MethodKind::Method
+                },
                 func: Box::new(func),
                 is_static,
                 decorators: Vec::new(),
@@ -855,7 +894,13 @@ impl<'s> Parser<'s> {
             None
         };
         self.semicolon()?;
-        Ok(ClassMember::Field(ClassField { key, value, is_static, accessor: None, decorators: Vec::new() }))
+        Ok(ClassMember::Field(ClassField {
+            key,
+            value,
+            is_static,
+            accessor: None,
+            decorators: Vec::new(),
+        }))
     }
 
     /// The `[Await]` parameter for a FieldDefinition's Initializer.
@@ -909,10 +954,16 @@ impl<'s> Parser<'s> {
                 optional: false,
             }))
         };
-        let body = |stmts: Vec<Stmt>| FnBody { directives: Vec::new(), stmts };
+        let body = |stmts: Vec<Stmt>| FnBody {
+            directives: Vec::new(),
+            stmts,
+        };
         let getter = Function {
             name: None,
-            params: Params { items: Vec::new(), simple: true },
+            params: Params {
+                items: Vec::new(),
+                simple: true,
+            },
             body: body(vec![Stmt::Return(Some(slot(&storage)))]),
             is_async: false,
             is_generator: false,
@@ -921,7 +972,10 @@ impl<'s> Parser<'s> {
         let setter_param: Name = "value".into();
         let setter = Function {
             name: None,
-            params: Params { items: vec![Pattern::Ident(setter_param.clone())], simple: true },
+            params: Params {
+                items: vec![Pattern::Ident(setter_param.clone())],
+                simple: true,
+            },
             body: body(vec![Stmt::Expr(Expr::Assign {
                 op: AssignOp::Assign,
                 target: Target::Member(Box::new(Member {
@@ -978,18 +1032,16 @@ impl<'s> Parser<'s> {
             // inner `f` is block-scoped, and Annex B simply skips the
             // var-hoisting when it would collide — which is exactly what the
             // `*-skip-early-err*` test family asserts), and it was rejected.
-            BindKind::Function | BindKind::GenFunction
-                if self.scopes.fn_decl_is_var_scoped() =>
-            {
+            BindKind::Function | BindKind::GenFunction if self.scopes.fn_decl_is_var_scoped() => {
                 self.scopes.declare_var(name, pos)
             }
             // Annex B.3.2.4/B.3.2.5: in a Block or CaseBlock, two
             // FunctionDeclarations of the same name are legal in SLOPPY code and
             // an error under strict. A generator/async declaration is not a
             // FunctionDeclaration, so it never opts in.
-            BindKind::Function => {
-                self.scopes.declare_lexical(name, kind, pos, !self.ctx.strict)
-            }
+            BindKind::Function => self
+                .scopes
+                .declare_lexical(name, kind, pos, !self.ctx.strict),
             _ => self.scopes.declare_lexical(name, kind, pos, false),
         }
     }

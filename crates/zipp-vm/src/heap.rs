@@ -1573,6 +1573,11 @@ impl JsStr {
         self.units += 1;
     }
 
+    #[cfg(test)]
+    pub(crate) fn byte_capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
     /// Append a well-formed string, updating the cached metadata. No seam
     /// canonicalization is needed: a `&str` can never START with a low
     /// surrogate, so a trailing high surrogate in `self` stays lone.
@@ -1787,6 +1792,11 @@ pub struct ReactionPair {
     /// heap index, resumed (value or thrown rejection) instead of running a
     /// callback.
     pub is_async: bool,
+    /// Allocation-free intrinsic `Promise.all` fulfilment target. `dependent`
+    /// is the `Combinator`, `on_fulfilled` is its non-negative element index
+    /// encoded as an Int, and `on_rejected` remains the native result
+    /// capability's reject function. Settlement still queues one FIFO job.
+    pub is_combinator_all: bool,
 }
 
 /// A pending promise's subscriber list.
@@ -3836,8 +3846,10 @@ pub(crate) mod gcoracle {
     pub(crate) const PROMISE_REACT: usize = 6;
     pub(crate) const DEFINE_PROP: usize = 7;
     pub(crate) const COLL_INSERT: usize = 8;
+    pub(crate) const CLOSURE_HOME: usize = 9;
+    pub(crate) const CLOSURE_NEW_TARGET: usize = 10;
 
-    const NAMES: [&str; 9] = [
+    const NAMES: [&str; 11] = [
         "set_prop",
         "set_index",
         "jit_set_prop",
@@ -3847,8 +3859,10 @@ pub(crate) mod gcoracle {
         "promise_react",
         "define_prop",
         "coll_insert",
+        "closure_home",
+        "closure_new_target",
     ];
-    static COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    static COUNTS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
     #[inline]
     pub(crate) fn hit(site: usize) {
@@ -4572,7 +4586,10 @@ mod tests {
         h.note_minor_done(0);
         assert!(h.minor_due(false));
         h.note_minor_done(0);
-        assert!(!h.minor_due(false), "the configured backstop must force a major");
+        assert!(
+            !h.minor_due(false),
+            "the configured backstop must force a major"
+        );
 
         h.note_gc_done(0);
         h.nursery_max_minors = NURSERY_MAX_MINORS_LIMIT;

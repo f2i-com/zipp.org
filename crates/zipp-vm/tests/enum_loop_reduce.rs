@@ -145,10 +145,7 @@ fn periodic_in_probe_reduction_declines_observable_chains_and_promotions() {
         console.log(huge + ":" + hi);
         "#,
     );
-    assert_eq!(
-        out,
-        ["256:1024:1024", "1029:1024:1", "2147484666:1024"]
-    );
+    assert_eq!(out, ["256:1024:1024", "1029:1024:1", "2147484666:1024"]);
 }
 
 #[test]
@@ -207,10 +204,7 @@ fn array_copy_length_reduction_declines_observable_protocols() {
 
 #[test]
 fn sparse_forin_fold_reduction_preserves_numeric_key_order_and_values() {
-    assert_eq!(
-        run_ok(SPARSE_FOLD_MATRIX),
-        ["1003:975006838:49950000"]
-    );
+    assert_eq!(run_ok(SPARSE_FOLD_MATRIX), ["1003:975006838:49950000"]);
 }
 
 #[test]
@@ -289,11 +283,7 @@ fn count_reduction_fails_closed_for_observable_or_non_int_cases() {
     );
     assert_eq!(
         out,
-        [
-            "2048:1024:b:2048:2048",
-            "2048:1024:1",
-            "2147549136:1024:63"
-        ]
+        ["2048:1024:b:2048:2048", "2048:1024:1", "2147549136:1024:63"]
     );
 }
 
@@ -322,10 +312,7 @@ fn getters_and_custom_prototypes_fail_closed() {
         console.log(count + ":" + keyGets + ":" + z);
         "#,
     );
-    assert_eq!(
-        out,
-        ["2003000:2000:b:2000", "10000:p:2000", "4000:0:2000"]
-    );
+    assert_eq!(out, ["2003000:2000:b:2000", "10000:p:2000", "4000:0:2000"]);
 }
 
 #[test]
@@ -348,10 +335,7 @@ fn proxy_enumeration_stays_on_the_observable_path() {
         console.log(count + ":" + own + ":" + desc + ":" + reads + ":" + j);
         "#,
     );
-    assert_eq!(
-        out,
-        ["10000:4000:4000:4000:b", "4000:6000:8000:4000:2000"]
-    );
+    assert_eq!(out, ["10000:4000:4000:4000:b", "4000:6000:8000:4000:2000"]);
 }
 
 #[test]
@@ -368,10 +352,7 @@ fn zz_off_switch_and_gc_stress_agree() {
             "array-copy-off",
             vec![("ZIPP_NO_ARRAY_COPY_LEN_REDUCE", "1")],
         ),
-        (
-            "sparse-fold-off",
-            vec![("ZIPP_NO_SPARSE_FORIN_FOLD", "1")],
-        ),
+        ("sparse-fold-off", vec![("ZIPP_NO_SPARSE_FORIN_FOLD", "1")]),
         ("gc", vec![("ZIPP_GC_STRESS", "1")]),
         ("nojit", vec![("ZIPP_NOJIT", "1")]),
     ] {

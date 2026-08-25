@@ -51,5 +51,8 @@ fn shape_stats_report_the_worker_thread_table() {
     // DICT and EMPTY are the two sentinels a never-touched table already holds.
     assert!(field("nodes=") > 2, "reported an untouched table: {line:?}");
     assert!(field("edges=") > 0, "reported an untouched table: {line:?}");
-    assert!(field("max_fanout=") > 0, "reported an untouched table: {line:?}");
+    assert!(
+        field("max_fanout=") > 0,
+        "reported an untouched table: {line:?}"
+    );
 }

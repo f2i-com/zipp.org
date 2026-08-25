@@ -359,7 +359,10 @@ fn scalar_counts_child() {
             );
         }
         "array_off" => {
-            assert!(success > 0 && materialized > 0 && elided > 0, "vacuous: {scalar:?}");
+            assert!(
+                success > 0 && materialized > 0 && elided > 0,
+                "vacuous: {scalar:?}"
+            );
             assert_eq!(capture, success);
             assert_eq!(success, materialized + elided);
             assert!(

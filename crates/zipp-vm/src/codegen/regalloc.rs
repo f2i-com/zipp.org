@@ -114,12 +114,19 @@ fn field_mask_read_stream_shape(proto: &FuncProto, start: usize, end: usize) -> 
     };
     let (mask_reg, mask) = match &c[start + 6] {
         Instr::LoadInt { dst, val }
-            if *val >= 0 && ((*val as u32).wrapping_add(1)).is_power_of_two() => (*dst, *val),
+            if *val >= 0 && ((*val as u32).wrapping_add(1)).is_power_of_two() =>
+        {
+            (*dst, *val)
+        }
         _ => return false,
     };
     let index = match &c[start + 7] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::And }
-            if *a == i_index && *b == mask_reg => *dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::And,
+        } if *a == i_index && *b == mask_reg => *dst,
         _ => return false,
     };
     let receiver = match &c[start + 8] {
@@ -139,7 +146,12 @@ fn field_mask_read_stream_shape(proto: &FuncProto, start: usize, end: usize) -> 
         _ => return false,
     };
     let reduced = match &c[start + 12] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::Or } if *a == add && *b == zero => *dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Or,
+        } if *a == add && *b == zero => *dst,
         _ => return false,
     };
     if !matches!(&c[start + 13],
@@ -219,7 +231,12 @@ fn global_field_sum_stream_shape(proto: &FuncProto, start: usize, end: usize) ->
         _ => return false,
     };
     let reduced = match &c[cursor + 1] {
-        Instr::Bitwise { dst, a, b, op: BitwiseOp::Or } if *a == acc && *b == zero => *dst,
+        Instr::Bitwise {
+            dst,
+            a,
+            b,
+            op: BitwiseOp::Or,
+        } if *a == acc && *b == zero => *dst,
         _ => return false,
     };
     if !matches!(&c[cursor + 2],
@@ -400,6 +417,54 @@ fn emit_regalloc_ic_probe(
     dynasm!(ops ; => got);
 }
 
+/// Register-tier direct-miss sibling of [`emit_regalloc_ic_probe`]. The stable
+/// site has already proved that receiver-identity ways thrash while its shape
+/// memo hits, so omit the probe loop and enter the same safe helper directly.
+/// The spill/restore and sentinel protocol are byte-for-byte equivalent to the
+/// ordinary probe's miss tail.
+#[allow(clippy::too_many_arguments)]
+fn emit_regalloc_ic_direct(
+    ops: &mut dynasmrt::x64::Assembler,
+    heap: &HeapHelpers,
+    ic_site: u32,
+    obj: u16,
+    name: u32,
+    probe_off: i32,
+    spill_off: i32,
+    deopt: dynasmrt::DynamicLabel,
+) {
+    let packed = ((heap.func_id as u64) << 32) | name as u64;
+    let restore_deopt = ops.new_dynamic_label();
+    let got = ops.new_dynamic_label();
+    emit_probe_spill(ops, spill_off, true);
+    dynasm!(ops
+        ; mov rcx, rdi                     // vm
+        ; mov rdx, [rbx + dreg(obj)]       // receiver bits
+        ; mov r8d, ic_site as i32          // site_idx
+        ; mov r9, QWORD packed as i64      // (func_id<<32)|name_idx
+        ; mov rax, QWORD heap.get_prop_miss as i64
+        ; call rax
+        ; mov rcx, QWORD SELF_CALL_DEOPT as i64
+        ; cmp rax, rcx
+        ; je => restore_deopt
+        ; mov rcx, QWORD PROP_VIA_IC as i64
+        ; cmp rax, rcx                     // accessor/class ⇒ interpreter
+        ; je => restore_deopt
+        ; mov [rsp + probe_off], rax
+    );
+    emit_probe_spill(ops, spill_off, false);
+    dynasm!(ops
+        ; mov rax, [rsp + probe_off]
+        ; jmp => got
+        ; => restore_deopt
+    );
+    emit_probe_spill(ops, spill_off, false);
+    dynasm!(ops
+        ; jmp => deopt
+        ; => got
+    );
+}
+
 /// Spill (`save`) or reload the volatile register homes around the register
 /// tier's one permitted call. `xmm2..xmm5` are the volatile half of the numeric
 /// home pool ([`HOME_XMM_FIRST`] is 2; xmm6..15 are saved by the prologue AND
@@ -496,7 +561,7 @@ pub(crate) fn compile_region_regalloc(
     method_plan: Option<&FxHashMap<usize, MethodInlinePlan>>,
     // Per-site accessor-arm flags, in the same order `register_ic_sites` built
     // them (the k-th GetProp/SetProp of the region).
-    acc_emit: &[bool],
+    ic_emit: &[IcSiteEmit],
     // Cleared by `Jit::compile_region` for a region whose BOXREF compile has
     // already evicted once — see `region_boxref_blacklist`.
     boxref_ok: bool,
@@ -516,7 +581,7 @@ pub(crate) fn compile_region_regalloc(
     // helper answers `PROP_VIA_IC`, the arm deopts, and the region falls back —
     // so this gate is about not emitting a probe that is known to be useless,
     // not about soundness.
-    let boxref = if heap.is_some() && boxref_ok && !acc_emit.iter().any(|&b| b) {
+    let boxref = if heap.is_some() && boxref_ok && !ic_emit.iter().any(|s| s.acc) {
         BoxRefAdmit {
             elems: box_home_enabled(),
             ro_recv: regalloc_getprop_enabled(),
@@ -1529,9 +1594,18 @@ pub(crate) fn compile_region_regalloc(
                         }
                     }
                 }
-                emit_regalloc_ic_probe(
-                    &mut ops, h, ic_site, obj, name, probe_off, spill_off, deopt,
-                );
+                let direct_miss = ic_emit
+                    .get((ic_site - h.ic_base_idx) as usize)
+                    .is_some_and(|s| s.direct_miss);
+                if direct_miss {
+                    emit_regalloc_ic_direct(
+                        &mut ops, h, ic_site, obj, name, probe_off, spill_off, deopt,
+                    );
+                } else {
+                    emit_regalloc_ic_probe(
+                        &mut ops, h, ic_site, obj, name, probe_off, spill_off, deopt,
+                    );
+                }
                 // rax = the property's Value bits. Int → cvtsi2sd, double → movq,
                 // anything else (a string, an object, undefined, a bool) DEOPTs:
                 // the dst is an f64 home and cannot hold it. Nothing has been

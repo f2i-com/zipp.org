@@ -380,15 +380,25 @@ pub(crate) enum NumVal {
 /// only when one-home-per-value would overflow the pool (e.g. object SROA loops);
 /// reusing a register can cost ILP, so simpler loops keep distinct homes.
 pub(crate) struct XmmAlloc {
-    pub(crate) next: u8,                 // next never-used xmm index
+    pub(crate) next: u8, // next never-used xmm index
+    // Inclusive symbolic-home ceiling. Ordinary plans keep this at xmm15;
+    // the computed-splice GPR-only retry may use a small, explicitly bounded
+    // virtual range which is never consumed by an XMM emitter.
+    pub(crate) last: u8,
     pub(crate) active: Vec<(usize, u8)>, // (interval_end, xmm) currently live
     pub(crate) free: Vec<u8>,            // homes freed by expired intervals, available to reuse
 }
 
 impl XmmAlloc {
     pub(crate) fn new() -> XmmAlloc {
+        Self::with_last(HOME_XMM_LAST)
+    }
+
+    pub(crate) fn with_last(last: u8) -> XmmAlloc {
+        debug_assert!(last >= HOME_XMM_FIRST);
         XmmAlloc {
             next: HOME_XMM_FIRST,
+            last,
             active: Vec::new(),
             free: Vec::new(),
         }
@@ -408,7 +418,7 @@ impl XmmAlloc {
         }
         let x = if let Some(x) = self.free.pop() {
             x
-        } else if self.next <= HOME_XMM_LAST {
+        } else if self.next <= self.last {
             let x = self.next;
             self.next += 1;
             x
@@ -438,7 +448,21 @@ impl XmmAlloc {
 /// exactly as an `XmmAlloc` exhaustion. Deterministic: fixed value order,
 /// fixed home order, fixed budget.
 pub(crate) fn alloc_value_homes(values: &[(Vec<(usize, usize)>, NumVal)]) -> Option<Vec<u8>> {
-    const POOL: usize = (HOME_XMM_LAST - HOME_XMM_FIRST + 1) as usize;
+    alloc_value_homes_with_last(values, HOME_XMM_LAST)
+}
+
+/// The segmented allocator with an explicit inclusive symbolic-home ceiling.
+/// `last > HOME_XMM_LAST` is valid only for a plan that is immediately routed
+/// to the GPR mapper, where the numeric home ids are abstract colours rather
+/// than hardware XMM register numbers.
+pub(crate) fn alloc_value_homes_with_last(
+    values: &[(Vec<(usize, usize)>, NumVal)],
+    last: u8,
+) -> Option<Vec<u8>> {
+    if last < HOME_XMM_FIRST {
+        return None;
+    }
+    let pool = (last - HOME_XMM_FIRST + 1) as usize;
     debug_assert!(values.windows(2).all(|w| w[0].0[0].0 <= w[1].0[0].0));
     // Lower bound: the max number of values simultaneously live at one ip.
     let mut events: Vec<(usize, i32)> = Vec::new();
@@ -499,7 +523,7 @@ pub(crate) fn alloc_value_homes(values: &[(Vec<(usize, usize)>, NumVal)]) -> Opt
         }
         false
     }
-    for k in (lb.max(1) as usize)..=POOL {
+    for k in (lb.max(1) as usize)..=pool {
         let mut homes: Vec<Vec<(usize, usize)>> = vec![Vec::new(); k];
         let mut choice: Vec<usize> = Vec::with_capacity(values.len());
         let mut budget = 200_000u32; // per pool size; spent ⇒ try a bigger pool

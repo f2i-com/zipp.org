@@ -30,10 +30,7 @@ mod codegen;
 // on native x86-64 builds; ARM64's baseline backend keeps the interpreter paths
 // enabled too. Interpreter-only hosts (including wasm) have no JIT comparator,
 // so keep the production paths enabled without pulling in dynasm.
-#[cfg(not(all(
-    feature = "jit",
-    any(target_arch = "x86_64", target_arch = "aarch64")
-)))]
+#[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
 mod codegen {
     #[inline]
     pub(crate) const fn hole_absent_fast_enabled() -> bool {
@@ -238,6 +235,16 @@ pub fn pad2_conditional_stats() -> (u64, u64) {
 /// first two to zero.
 pub fn call_inline_stats() -> (u64, u64, u64) {
     vm::call_inline_stats()
+}
+
+/// `ZIPP_ICSTATS=1` guarded computed-call counters: `(served, declined)`.
+/// `served` is a compiled `array[index](...)` whose live own dense element was
+/// a plain Func/Closure and ran through the frame-call helper. `declined` means
+/// the pure prefix rejected the shape before any effect and replayed it in the
+/// interpreter. `ZIPP_NO_COMPUTED_CALL_DENSE=1` prevents emission, so both stay
+/// zero in a fresh process.
+pub fn computed_call_stats() -> (u64, u64) {
+    vm::computed_call_stats()
 }
 
 /// `ZIPP_ICSTATS=1` region-`IterNext` counters: `(native_steps, deopts)` —
@@ -952,16 +959,120 @@ mod tests {
         );
     }
 
+    #[test]
+    fn math_random_call_observes_replacement() {
+        // `Math.random()` used to compile directly to `Instr::Random`, so the
+        // own-property write was visible through `Math.random.call(...)` but
+        // silently ignored by the ordinary call spelling. Real packages replace
+        // it for deterministic tests, making this an observable compatibility
+        // bug independent of the JIT.
+        assert_jit_matches(
+            "let n=0; Math.random=function(){ n++; return n/10; }; console.log(Math.random(),Math.random(),n)",
+            &["0.1 0.2 2"],
+        );
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[test]
+    fn megamorphic_plain_closure_calls_preserve_the_region() {
+        // Sixteen mutable closures exceed the eight-way identity IC at one hot
+        // Call site. The native memory region must resolve each live plain
+        // callee instead of repeatedly deopting and eventually evicting itself.
+        assert_jit_matches(
+            "var fns=[]; for(let k=0;k<16;k++){ let n=k; fns.push(function(x){ n=(n+x)&255; return n; }); } let s=0; for(let i=0;i<200000;i++) s=(s+fns[i&15](i&7))|0; console.log(s+'|'+fns.map(fn=>fn(0)).join(','));",
+            &["22327888|0,213,170,127,84,41,254,211,8,221,178,135,92,49,6,219"],
+        );
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[test]
+    fn megamorphic_plain_call_fallback_observes_exotic_replacements() {
+        // Saturate the plain-function identity cache first, then replace four
+        // live entries with a native, bound function, lexical-this arrow, and
+        // non-callable. Only a current Func/Closure may take the direct fallback;
+        // every exotic/non-callable value must retain ordinary call semantics.
+        assert_jit_matches(
+            "function ordinary(x){return this.bias+x} \
+             function make(k){let n=k;return function(x){n=(n+x)&255;return n}} \
+             function Maker(){this.bias=30;this.arrow=(x)=>this.bias+x} \
+             const m=new Maker(),fns=[];for(let k=0;k<16;k++)fns.push(make(k)); \
+             let s=0,caught=0;for(let i=0;i<160000;i++){ \
+               if(i===80000){fns[0]=Math.abs;fns[1]=ordinary.bind({bias:20});fns[2]=m.arrow;fns[3]=17} \
+               try{s=(s+fns[i&15](-3))|0}catch(e){if(!(e instanceof TypeError))throw e;caught++;s=(s+99)|0}} \
+             console.log(s+'|'+caught)",
+            &["18603280|5000"],
+        );
+    }
+
+    #[test]
+    fn dense_computed_calls_observe_live_callee_and_arrow_lexical_this() {
+        // The selected dense element is re-read on every native iteration: a
+        // replacement after OSR warmup must take effect immediately. The second
+        // loop calls an arrow as an Array method; its lexical `this` remains the
+        // Maker instance, not the Array receiver supplied to ordinary methods.
+        assert_jit_matches(
+            "function plus1(x){return x+1} function plus5(x){return x+5} \
+             var fs=[plus1], total=0; \
+             for(var i=0;i<40000;i++){if(i===20000)fs[0]=plus5;total+=fs[0](1);} \
+             function Maker(){this.bias=40;this.fs=[(x)=>this.bias+x];} \
+             var m=new Maker(), last=0; \
+             for(var j=0;j<30000;j++)last=m.fs[0](j&1); \
+             console.log(total+'|'+last);",
+            &["160000|41"],
+        );
+    }
+
+    #[test]
+    fn dense_computed_call_hole_uses_live_prototype_after_length_truncate() {
+        // Shrinking length after the native helper warmed removes the dense own
+        // slot. A hole/absent slot is a guard miss, so the interpreter performs
+        // the live prototype lookup (including its method `this` binding).
+        assert_jit_matches(
+            "function own(x){return x+2} function inherited(x){return x+9} \
+             Array.prototype[0]=inherited; var a=[own], s=0; \
+             for(var i=0;i<40000;i++){if(i===20000)a.length=0;s+=a[0](1);} \
+             delete Array.prototype[0]; console.log(s);",
+            &["260000"],
+        );
+    }
+
+    #[test]
+    fn dense_computed_call_declines_mapped_arguments_and_index_overrides() {
+        // A sloppy Arguments index aliases the live formal and cannot be read
+        // from its Array backing slot. A defineProperty'd index is likewise
+        // authoritative over the dense placeholder; its getter must run once
+        // per call rather than being bypassed by the helper.
+        assert_jit_matches(
+            "function first(x){return x+1} function second(x){return x+7} \
+             function mapped(fn){var s=0;for(var i=0;i<30000;i++){ \
+               if(i===20000)fn=second;s+=arguments[0](1);}return s;} \
+             var gets=0,a=[first];Object.defineProperty(a,'0',{configurable:true,get:function(){gets++;return second;}}); \
+             var t=0;for(var j=0;j<20000;j++)t+=a[0](1); \
+             console.log(mapped(first)+'|'+t+'|'+gets);",
+            &["120000|160000|20000"],
+        );
+    }
+
+    #[test]
+    fn dense_computed_call_non_callable_deopts_before_throw() {
+        // The live slot becomes non-callable after the region is hot. The pure
+        // guard must decline before any effect; replay then produces the normal
+        // catchable TypeError exactly once, without duplicating prior calls.
+        assert_jit_matches(
+            "function f(x){return x+1} var a=[f],s=0,caught=false; \
+             try{for(var i=0;i<40000;i++){if(i===20000)a[0]=17;s+=a[0](1);}} \
+             catch(e){caught=e instanceof TypeError;} console.log(s+'|'+caught);",
+            &["40000|true"],
+        );
+    }
+
     /// Run a program with the JIT forced OFF (pure interpreter), for differential
     /// checks against the default JIT-on `run`.
     fn run_nojit(src: &str) -> Vec<String> {
         let ast = front::parse_auto(src).expect("parse");
         let program = compile::compile_program(&ast, src).expect("compile");
         let mut vm = vm::Vm::new(&program);
-        #[cfg(all(
-            feature = "jit",
-            any(target_arch = "x86_64", target_arch = "aarch64")
-        ))]
+        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
         vm.set_jit_enabled(false);
         vm.run().expect("run");
         vm.output
@@ -4238,8 +4349,8 @@ mod tests {
         );
         assert_eq!(run_ok("function* g(){yield 1;yield 2;yield 3} let [a,...r]=g(); console.log(a,r.join(','))"), vec!["1 2,3"]);
         assert_eq!(run_ok("let it={[Symbol.iterator](){let i=0;return{next:()=>({value:i++,done:false})}}}; let [a,b,c]=it; console.log(a,b,c)"), vec!["0 1 2"]); // infinite iterator, bounded pull (no hang)
-        // GetIterator reads @@iterator exactly once. The retired CheckIterable
-        // prefix used to perform a second observable property access here.
+                                                                                                                                                                  // GetIterator reads @@iterator exactly once. The retired CheckIterable
+                                                                                                                                                                  // prefix used to perform a second observable property access here.
         assert_eq!(
             run_ok("let gets=0,i=0,it={}; Object.defineProperty(it,Symbol.iterator,{get(){gets++;return function(){return{next(){return{value:i++,done:false}}}}}}); let [a,b]=it; console.log(a,b,gets)"),
             vec!["0 1 1"]
@@ -4991,14 +5102,46 @@ mod tests {
              let s=0; for(let i=0;i<200;i++) s+=t.length; console.log(s)",
             &["19800"],
         );
-        // A re-pointed prototype. Both tiers currently report the TypedArray's
-        // own length (8), not the shadowing `{length: 7}` — the KNOWN DEVIATION
-        // documented in vm/props/member.rs. What this case pins is that the JIT
-        // and the interpreter AGREE, so fixing the deviation moves both.
+        // A re-pointed prototype shadows the inherited intrinsic accessor.
         assert_jit_matches(
             "const t=new Float64Array(8); Object.setPrototypeOf(t,{length:7}); \
              let s=0; for(let i=0;i<200;i++) s+=t.length; console.log(s)",
-            &["1600"],
+            &["1400"],
+        );
+        // Explicit null ends the chain; exotic and Proxy prototypes still use
+        // their real [[Get]] semantics instead of being skipped by the
+        // intrinsic-accessor proof.
+        assert_jit_matches(
+            "const t=new Float64Array(8); Object.setPrototypeOf(t,null); \
+             let s=0; for(let i=0;i<200;i++) s+=t.length===undefined; console.log(s)",
+            &["200"],
+        );
+        assert_jit_matches(
+            "const t=new Float64Array(8),p=[1,2,3]; Object.setPrototypeOf(t,p); \
+             let s=0; for(let i=0;i<200;i++) s+=t.length; console.log(s)",
+            &["600"],
+        );
+        assert_jit_matches(
+            "const t=new Float64Array(8),p=new Uint8Array(1); \
+             Object.defineProperty(p,'length',{value:5}); Object.setPrototypeOf(t,p); \
+             let s=0; for(let i=0;i<200;i++) s+=t.length; console.log(s)",
+            &["1000"],
+        );
+        assert_jit_matches(
+            "const t=new Float64Array(8); let hits=0; \
+             const p=new Proxy({length:6},{get(o,k,r){hits++;return Reflect.get(o,k,r)}}); \
+             Object.setPrototypeOf(t,p); let s=0; \
+             for(let i=0;i<200;i++) s+=t.length; console.log(s,hits)",
+            &["1200 200"],
+        );
+        // The intrinsic getter validates the receiver's TypedArray slot rather
+        // than requiring it to be the object where lookup began.
+        assert_jit_matches(
+            "const a=new Uint8Array(8),b=new Uint16Array(3); \
+             let s=0; for(let i=0;i<200;i++) s+=Reflect.get(a,'length',b); \
+             let threw=false; try{Reflect.get(a,'length',{})}catch(e){threw=e instanceof TypeError} \
+             console.log(s,threw)",
+            &["600 true"],
         );
         // A detached buffer reports 0.
         assert_jit_matches(

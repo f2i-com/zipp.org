@@ -52,6 +52,16 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+#[cfg(unix)]
+fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
 #[test]
 fn dedicated_help_describes_the_boundary() {
     let output = sandbox(&["--help"]);
@@ -118,6 +128,63 @@ fn instruction_budget_stops_an_infinite_loop() {
         stderr(&output).contains("instruction budget"),
         "{}",
         stderr(&output)
+    );
+}
+
+#[test]
+fn wall_clock_supervisor_stops_a_blocking_native_wait() {
+    let scratch = Scratch::new("wall-clock");
+    let script = scratch.write(
+        "blocking.js",
+        "const word = new Int32Array(new SharedArrayBuffer(4)); Atomics.wait(word, 0, 0, 60000); console.log('escaped-wait');",
+    );
+    let output = sandbox(&[
+        "--timeout-ms",
+        "3000",
+        "--max-steps",
+        "50000000",
+        script.to_str().expect("utf-8 test path"),
+    ]);
+
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("wall-clock timeout"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("escaped-wait"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn heap_budget_stops_a_retained_allocation_loop() {
+    let scratch = Scratch::new("heap");
+    let script = scratch.write(
+        "heap.js",
+        "const keep = []; for (;;) keep.push({ payload: keep.length }); console.log('escaped-heap');",
+    );
+    let output = sandbox(&[
+        "--timeout-ms",
+        "10000",
+        "--max-steps",
+        "50000000",
+        "--max-heap-mb",
+        "1",
+        script.to_str().expect("utf-8 test path"),
+    ]);
+
+    assert!(!output.status.success());
+    let error = stderr(&output);
+    assert!(error.contains("memory budget"), "{error}");
+    assert!(!error.contains("wall-clock timeout"), "{error}");
+    assert!(!error.contains("instruction budget"), "{error}");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("escaped-heap"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 
@@ -237,6 +304,43 @@ fn imports_are_opt_in_and_cannot_escape_the_canonical_root() {
     assert!(!stdout.contains("DO-NOT-PRINT"), "{stdout}");
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn import_symlinks_cannot_escape_the_canonical_root() {
+    let scratch = Scratch::new("import-symlink");
+    let root = scratch.path().join("allowed");
+    std::fs::create_dir(&root).expect("create import root");
+    let secret = scratch.write("secret.mjs", "export const secret = 'DO-NOT-PRINT';");
+    let link = root.join("escape.mjs");
+    if let Err(error) = create_file_symlink(&secret, &link) {
+        #[cfg(windows)]
+        if error.kind() == std::io::ErrorKind::PermissionDenied
+            || error.kind() == std::io::ErrorKind::Unsupported
+            || error.raw_os_error() == Some(1314)
+        {
+            eprintln!("skipping symlink escape test: {error}");
+            return;
+        }
+        panic!("create module symlink: {error}");
+    }
+    let entry = scratch.write(
+        "allowed/entry.js",
+        "import('./escape.mjs').then(m => console.log(m.secret)).catch(e => console.log(String(e)));",
+    );
+    let output = sandbox(&[
+        "--timeout-ms",
+        "3000",
+        "--allow-imports",
+        root.to_str().expect("utf-8 test path"),
+        entry.to_str().expect("utf-8 test path"),
+    ]);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout, "TypeError: module not found\n");
+    assert!(!stdout.contains("DO-NOT-PRINT"), "{stdout}");
+}
+
 #[test]
 fn relative_imports_remain_script_relative_with_trusted_child_cwd() {
     let scratch = Scratch::new("relative-import-cwd");
@@ -293,4 +397,26 @@ fn oversized_import_is_rejected_before_its_contents_are_loaded() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("sandbox size limit"), "{stdout}");
     assert!(!stdout.contains("DO-NOT-PRINT"), "{stdout}");
+}
+
+#[test]
+fn oversized_entry_source_is_rejected_before_the_child_starts() {
+    let scratch = Scratch::new("large-entry");
+    let script = scratch.write("large.js", "console.log('DO-NOT-PRINT');");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script)
+        .expect("open oversized entry")
+        .set_len((16 << 20) + 1)
+        .expect("extend oversized entry");
+    let output = sandbox(&[
+        "--timeout-ms",
+        "3000",
+        script.to_str().expect("utf-8 test path"),
+    ]);
+
+    assert!(!output.status.success());
+    let error = stderr(&output);
+    assert!(error.contains("limit is 16777216"), "{error}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("DO-NOT-PRINT"));
 }

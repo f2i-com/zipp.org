@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -43,7 +43,9 @@ impl<'p> Vm<'p> {
     /// target is constructed (spec step 12.b runs per-k against the target).
     fn ta_from_source(&mut self, src: Value) -> Result<(usize, Option<Vec<Value>>), Thrown> {
         if src == Value::UNDEFINED || src == Value::NULL {
-            return Err(Thrown("TypeError: TypedArray.from source is null or undefined".into()));
+            return Err(Thrown(
+                "TypeError: TypedArray.from source is null or undefined".into(),
+            ));
         }
         let method = self.get_prop(src, "@@iterator")?;
         if method != Value::UNDEFINED && method != Value::NULL && !self.is_callable(method) {
@@ -59,7 +61,9 @@ impl<'p> Vm<'p> {
         let n = if nf.is_nan() || nf <= 0.0 {
             0
         } else if nf > super::typedarray::MAX_ARRAY_BUFFER_LEN as f64 {
-            return Err(Thrown("RangeError: typed array length exceeds the maximum".into()));
+            return Err(Thrown(
+                "RangeError: typed array length exceeds the maximum".into(),
+            ));
         } else {
             nf as usize
         };
@@ -90,276 +94,282 @@ impl<'p> Vm<'p> {
         value: Value,
         receiver: Value,
     ) -> Result<bool, Thrown> {
-            let key = self.key_of(kv);
-            // Module Namespace exotic [[Set]]: always false.
-            if self.module_namespaces.contains_key(&a0.heap_index()) {
-                return Ok(false);
-            }
-            // A Proxy's [[Set]] is its `set` trap: Reflect.set reports the trap's
-            // boolean (an assignment swallows a falsish result). With NO trap,
-            // [[Set]] forwards to the target with the SAME receiver — the
-            // receiver-aware forward also reports the [[Set]] boolean (a
-            // rejected exotic write — RegExp flags, fn length, a frozen
-            // target — must read false, not true).
-            if let Some(b) = self.proxy_set_bool(a0, &key, value, receiver)? {
-                return Ok(b);
-            }
-            if let Some((t, _, _)) = self.proxy_parts(a0.heap_index()) {
-                let b = self.ordinary_set_with_proxy_receiver(t, receiver, &key, value, false)?;
-                return Ok(b);
-            }
-            self.materialize_regexp_result_prop_for_key(a0.heap_index(), &key);
-            // TypedArray [[Set]] (10.4.5.5) step 1, for any canonical numeric
-            // key: SameValue(O, Receiver) runs TypedArraySetElement (coerce the
-            // value — observable — then bounds-checked write or silent drop) and
-            // returns true; an altered Receiver with an INVALID index returns
-            // true with NO coercion; a valid index continues OrdinarySet on the
-            // RECEIVER with the RAW value (the element is a writable data prop).
-            if matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. })
-                && self.is_canonical_numeric_index(&key)
-            {
-                if self.same_value(a0, receiver) {
-                    match self.ta_valid_index(a0.heap_index(), &key) {
-                        Some(i) => self.ta_element_set(a0.heap_index(), i, value)?,
-                        None => self.ta_coerce_for_set(a0.heap_index(), value)?,
-                    }
-                    return Ok(true);
+        let key = self.key_of(kv);
+        // Module Namespace exotic [[Set]]: always false.
+        if self.module_namespaces.contains_key(&a0.heap_index()) {
+            return Ok(false);
+        }
+        // A Proxy's [[Set]] is its `set` trap: Reflect.set reports the trap's
+        // boolean (an assignment swallows a falsish result). With NO trap,
+        // [[Set]] forwards to the target with the SAME receiver — the
+        // receiver-aware forward also reports the [[Set]] boolean (a
+        // rejected exotic write — RegExp flags, fn length, a frozen
+        // target — must read false, not true).
+        if let Some(b) = self.proxy_set_bool(a0, &key, value, receiver)? {
+            return Ok(b);
+        }
+        if let Some((t, _, _)) = self.proxy_parts(a0.heap_index()) {
+            let b = self.ordinary_set_with_proxy_receiver(t, receiver, &key, value, false)?;
+            return Ok(b);
+        }
+        self.materialize_regexp_result_prop_for_key(a0.heap_index(), &key);
+        // TypedArray [[Set]] (10.4.5.5) step 1, for any canonical numeric
+        // key: SameValue(O, Receiver) runs TypedArraySetElement (coerce the
+        // value — observable — then bounds-checked write or silent drop) and
+        // returns true; an altered Receiver with an INVALID index returns
+        // true with NO coercion; a valid index continues OrdinarySet on the
+        // RECEIVER with the RAW value (the element is a writable data prop).
+        if matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. })
+            && self.is_canonical_numeric_index(&key)
+        {
+            if self.same_value(a0, receiver) {
+                match self.ta_valid_index(a0.heap_index(), &key) {
+                    Some(i) => self.ta_element_set(a0.heap_index(), i, value)?,
+                    None => self.ta_coerce_for_set(a0.heap_index(), value)?,
                 }
-                if self.ta_valid_index(a0.heap_index(), &key).is_none() {
-                    return Ok(true);
-                }
-                let b = self.reflect_set_on_receiver(receiver, kv, value)?;
-                return Ok(b);
-            }
-            // ArraySetLength via Reflect.set: ToUint32 + ToNumber BOTH run
-            // (valueOf twice), non-uint32 is a RangeError, and a non-writable
-            // `length` (made so even DURING the coercion) reports FALSE — the
-            // ordinary assignment path can only no-op or throw.
-            //
-            // ONLY when the receiver is the array itself. `length` is an ordinary
-            // (writable) own data property as far as OrdinarySet is concerned, so
-            // a DIFFERENT receiver takes the generic path: the value is defined on
-            // the RECEIVER and the array is untouched. Running ArraySetLength
-            // regardless truncated the array and skipped the receiver's
-            // [[GetOwnProperty]]/[[DefineOwnProperty]] — which is exactly the pair
-            // of trap calls sm/Array/{pop,shift}-no-has-trap.js counts, since
-            // Array.prototype.pop's `Set(O,"length",…)` goes through the proxy.
-            if key == "length"
-                && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_))
-                && self.same_value(a0, receiver)
-            {
-                let nu = self.to_number_coerce(value)?;
-                let u = if nu.is_finite() { (nu.trunc() as i64 as u32) as f64 } else { 0.0 };
-                let number_len = self.to_number_coerce(value)?;
-                if u != number_len {
-                    return Err(Thrown("RangeError: Invalid array length".into()));
-                }
-                let aidx = a0.heap_index();
-                if self.array_length_nonwritable.contains(&aidx)
-                    || self.arr_props.get(&aidx).is_some_and(|m| m.frozen)
-                {
-                    return Ok(false);
-                }
-                // Mirror the ordinary `arr.length = n` path: stop the shrink
-                // at a non-configurable index, sweep the doomed arr_props
-                // entries, and keep the virtual (sparse) length consistent.
-                let mut final_len = u as usize;
-                if let Some(ki) = self.array_shrink_blocker(aidx, final_len) {
-                    final_len = ki + 1;
-                }
-                self.array_apply_length(aidx, final_len);
                 return Ok(true);
             }
-            // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
-            // (target's own, then up the prototype chain). Only ordinary Object
-            // links carry inline descriptors here; a class-instance/exotic link
-            // falls back to the simpler target-write below.
-            let mut governing: Option<(bool, bool, Value)> = None; // (accessor, writable, setter)
-            let mut fell_back = false;
-            let mut ta_chain_node: Option<u32> = None;
-            let mut proxy_chain_node: Option<Value> = None;
-            let mut cur = a0;
-            loop {
-                match self.heap.get(cur.heap_index()) {
-                    HeapObj::Object(m) => {
-                        if let Some(i) = m.pos(&key) {
-                            governing =
-                                Some((m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter));
-                            break;
-                        }
-                        if m.class.is_some() {
-                            fell_back = true; // class-chain members aren't inline attrs
-                            break;
-                        }
-                    }
-                    // A TypedArray on the prototype chain ABSORBS canonical
-                    // numeric keys (its [[Set]] governs); handled below.
-                    HeapObj::TypedArray { .. } if self.is_canonical_numeric_index(&key) => {
-                        ta_chain_node = Some(cur.heap_index());
+            if self.ta_valid_index(a0.heap_index(), &key).is_none() {
+                return Ok(true);
+            }
+            let b = self.reflect_set_on_receiver(receiver, kv, value)?;
+            return Ok(b);
+        }
+        // ArraySetLength via Reflect.set: ToUint32 + ToNumber BOTH run
+        // (valueOf twice), non-uint32 is a RangeError, and a non-writable
+        // `length` (made so even DURING the coercion) reports FALSE — the
+        // ordinary assignment path can only no-op or throw.
+        //
+        // ONLY when the receiver is the array itself. `length` is an ordinary
+        // (writable) own data property as far as OrdinarySet is concerned, so
+        // a DIFFERENT receiver takes the generic path: the value is defined on
+        // the RECEIVER and the array is untouched. Running ArraySetLength
+        // regardless truncated the array and skipped the receiver's
+        // [[GetOwnProperty]]/[[DefineOwnProperty]] — which is exactly the pair
+        // of trap calls sm/Array/{pop,shift}-no-has-trap.js counts, since
+        // Array.prototype.pop's `Set(O,"length",…)` goes through the proxy.
+        if key == "length"
+            && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_))
+            && self.same_value(a0, receiver)
+        {
+            let nu = self.to_number_coerce(value)?;
+            let u = if nu.is_finite() {
+                (nu.trunc() as i64 as u32) as f64
+            } else {
+                0.0
+            };
+            let number_len = self.to_number_coerce(value)?;
+            if u != number_len {
+                return Err(Thrown("RangeError: Invalid array length".into()));
+            }
+            let aidx = a0.heap_index();
+            if self.array_length_nonwritable.contains(&aidx)
+                || self.arr_props.get(&aidx).is_some_and(|m| m.frozen)
+            {
+                return Ok(false);
+            }
+            // Mirror the ordinary `arr.length = n` path: stop the shrink
+            // at a non-configurable index, sweep the doomed arr_props
+            // entries, and keep the virtual (sparse) length consistent.
+            let mut final_len = u as usize;
+            if let Some(ki) = self.array_shrink_blocker(aidx, final_len) {
+                final_len = ki + 1;
+            }
+            self.array_apply_length(aidx, final_len);
+            return Ok(true);
+        }
+        // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
+        // (target's own, then up the prototype chain). Only ordinary Object
+        // links carry inline descriptors here; a class-instance/exotic link
+        // falls back to the simpler target-write below.
+        let mut governing: Option<(bool, bool, Value)> = None; // (accessor, writable, setter)
+        let mut fell_back = false;
+        let mut ta_chain_node: Option<u32> = None;
+        let mut proxy_chain_node: Option<Value> = None;
+        let mut cur = a0;
+        loop {
+            match self.heap.get(cur.heap_index()) {
+                HeapObj::Object(m) => {
+                    if let Some(i) = m.pos(&key) {
+                        governing =
+                            Some((m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter));
                         break;
                     }
-                    // A PROXY on the prototype chain GOVERNS the write: OrdinarySet
-                    // recurses as parent.[[Set]](P, V, Receiver), so the `set` trap
-                    // runs with the ORIGINAL receiver. Falling through to the generic
-                    // arm below skipped the trap entirely, which is what
-                    // `super.prop = v` reaching a proxied prototype hit
-                    // (staging/sm/class/superPropProxies.js line 23).
-                    HeapObj::Proxy { .. } => {
-                        proxy_chain_node = Some(cur);
-                        break;
-                    }
-                    _ => {
-                        fell_back = true;
+                    if m.class.is_some() {
+                        fell_back = true; // class-chain members aren't inline attrs
                         break;
                     }
                 }
-                let p = self.object_get_prototype_of(cur);
-                if !p.is_heap() {
+                // A TypedArray on the prototype chain ABSORBS canonical
+                // numeric keys (its [[Set]] governs); handled below.
+                HeapObj::TypedArray { .. } if self.is_canonical_numeric_index(&key) => {
+                    ta_chain_node = Some(cur.heap_index());
                     break;
                 }
-                cur = p;
+                // A PROXY on the prototype chain GOVERNS the write: OrdinarySet
+                // recurses as parent.[[Set]](P, V, Receiver), so the `set` trap
+                // runs with the ORIGINAL receiver. Falling through to the generic
+                // arm below skipped the trap entirely, which is what
+                // `super.prop = v` reaching a proxied prototype hit
+                // (staging/sm/class/superPropProxies.js line 23).
+                HeapObj::Proxy { .. } => {
+                    proxy_chain_node = Some(cur);
+                    break;
+                }
+                _ => {
+                    fell_back = true;
+                    break;
+                }
             }
-            if let Some(p) = proxy_chain_node {
-                // Same two steps the `a0`-is-a-Proxy case above takes: the trap's
-                // boolean, or (no trap) a receiver-aware forward to the target.
-                if let Some(b) = self.proxy_set_bool(p, &key, value, receiver)? {
-                    return Ok(b);
-                }
-                if let Some((t, _, _)) = self.proxy_parts(p.heap_index()) {
-                    return self.ordinary_set_with_proxy_receiver(t, receiver, &key, value, false);
-                }
+            let p = self.object_get_prototype_of(cur);
+            if !p.is_heap() {
+                break;
             }
-            if let Some(c) = ta_chain_node {
-                // parent.[[Set]](P, V, Receiver) reached the TypedArray: same
-                // TA [[Set]] step 1 as above, with the ORIGINAL receiver.
-                if self.same_value(Value::heap(c), receiver) {
-                    match self.ta_valid_index(c, &key) {
-                        Some(i) => self.ta_element_set(c, i, value)?,
-                        None => self.ta_coerce_for_set(c, value)?,
-                    }
-                    return Ok(true);
-                }
-                if self.ta_valid_index(c, &key).is_none() {
-                    return Ok(true);
-                }
-                let b = self.reflect_set_on_receiver(receiver, kv, value)?;
+            cur = p;
+        }
+        if let Some(p) = proxy_chain_node {
+            // Same two steps the `a0`-is-a-Proxy case above takes: the trap's
+            // boolean, or (no trap) a receiver-aware forward to the target.
+            if let Some(b) = self.proxy_set_bool(p, &key, value, receiver)? {
                 return Ok(b);
             }
-            // A String exotic object's `length` and in-range char indices are
-            // NON-WRITABLE own data properties, so [[Set]] rejects them. They
-            // live in neither the ObjMap nor `arr_props`, so the fell-back
-            // descriptor probe below saw "absent + extensible" and reported TRUE
-            // for `Reflect.set(new String("hello"), "0", "y")` — the write
-            // no-opped, but the boolean was wrong (sm/Reflect/set.js).
-            if let Some((_, len)) = self.string_exotic_chars(a0) {
-                if key == "length" || canonical_index_str(&key).is_some_and(|i| i < len) {
-                    return Ok(false);
-                }
+            if let Some((t, _, _)) = self.proxy_parts(p.heap_index()) {
+                return self.ordinary_set_with_proxy_receiver(t, receiver, &key, value, false);
             }
-            // Does the target's OWN descriptor for `key` (the one the fell-back
-            // arm consults) name an accessor? An accessor's setter runs against
-            // the target here; anything else is a data/absent case whose write
-            // belongs on the RECEIVER when the two differ.
-            let target_own_accessor = match self.heap.get(a0.heap_index()) {
-                HeapObj::Object(m) => m.pos(&key).is_some_and(|i| m.attrs[i].accessor),
+        }
+        if let Some(c) = ta_chain_node {
+            // parent.[[Set]](P, V, Receiver) reached the TypedArray: same
+            // TA [[Set]] step 1 as above, with the ORIGINAL receiver.
+            if self.same_value(Value::heap(c), receiver) {
+                match self.ta_valid_index(c, &key) {
+                    Some(i) => self.ta_element_set(c, i, value)?,
+                    None => self.ta_coerce_for_set(c, value)?,
+                }
+                return Ok(true);
+            }
+            if self.ta_valid_index(c, &key).is_none() {
+                return Ok(true);
+            }
+            let b = self.reflect_set_on_receiver(receiver, kv, value)?;
+            return Ok(b);
+        }
+        // A String exotic object's `length` and in-range char indices are
+        // NON-WRITABLE own data properties, so [[Set]] rejects them. They
+        // live in neither the ObjMap nor `arr_props`, so the fell-back
+        // descriptor probe below saw "absent + extensible" and reported TRUE
+        // for `Reflect.set(new String("hello"), "0", "y")` — the write
+        // no-opped, but the boolean was wrong (sm/Reflect/set.js).
+        if let Some((_, len)) = self.string_exotic_chars(a0) {
+            if key == "length" || canonical_index_str(&key).is_some_and(|i| i < len) {
+                return Ok(false);
+            }
+        }
+        // Does the target's OWN descriptor for `key` (the one the fell-back
+        // arm consults) name an accessor? An accessor's setter runs against
+        // the target here; anything else is a data/absent case whose write
+        // belongs on the RECEIVER when the two differ.
+        let target_own_accessor = match self.heap.get(a0.heap_index()) {
+            HeapObj::Object(m) => m.pos(&key).is_some_and(|i| m.attrs[i].accessor),
+            _ => {
+                let h = a0.heap_index();
+                let side = match self.heap.get(h) {
+                    HeapObj::Func(_)
+                    | HeapObj::Closure { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
+                    _ => self.arr_props.get(&h),
+                };
+                side.and_then(|m| m.pos(&key).map(|i| m.attrs[i].accessor))
+                    .unwrap_or(false)
+            }
+        };
+        let result = if fell_back {
+            let ok = match self.heap.get(a0.heap_index()) {
+                HeapObj::Object(m) => match m.pos(&key) {
+                    Some(i) => {
+                        if m.attrs[i].accessor {
+                            m.attrs[i].setter != Value::UNDEFINED
+                        } else {
+                            m.attrs[i].writable
+                        }
+                    }
+                    None => m.extensible,
+                },
+                // Exotic/callable targets keep defineProperty'd descriptors
+                // in the arr_props/fn_props side tables — honour them:
+                // accessor-without-setter and non-writable data reject, a
+                // NEW named prop on a non-extensible target rejects.
                 _ => {
                     let h = a0.heap_index();
                     let side = match self.heap.get(h) {
                         HeapObj::Func(_)
                         | HeapObj::Closure { .. }
                         | HeapObj::Bound { .. }
-                        | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
+                        | HeapObj::Native(_)
+                        | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
                         _ => self.arr_props.get(&h),
                     };
-                    side.and_then(|m| m.pos(&key).map(|i| m.attrs[i].accessor)).unwrap_or(false)
-                }
-            };
-            let result = if fell_back {
-                let ok = match self.heap.get(a0.heap_index()) {
-                    HeapObj::Object(m) => match m.pos(&key) {
-                        Some(i) => {
-                            if m.attrs[i].accessor {
-                                m.attrs[i].setter != Value::UNDEFINED
+                    match side.and_then(|m| {
+                        m.pos(&key)
+                            .map(|i| (m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter))
+                    }) {
+                        Some((true, _, setter)) => setter != Value::UNDEFINED,
+                        Some((_, w, _)) => w,
+                        None => {
+                            if canonical_index_str(&key).is_some() {
+                                true
                             } else {
-                                m.attrs[i].writable
-                            }
-                        }
-                        None => m.extensible,
-                    },
-                    // Exotic/callable targets keep defineProperty'd descriptors
-                    // in the arr_props/fn_props side tables — honour them:
-                    // accessor-without-setter and non-writable data reject, a
-                    // NEW named prop on a non-extensible target rejects.
-                    _ => {
-                        let h = a0.heap_index();
-                        let side = match self.heap.get(h) {
-                            HeapObj::Func(_)
-                            | HeapObj::Closure { .. }
-                            | HeapObj::Bound { .. }
-                            | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self.fn_props.get(&h),
-                            _ => self.arr_props.get(&h),
-                        };
-                        match side.and_then(|m| {
-                            m.pos(&key).map(|i| {
-                                (m.attrs[i].accessor, m.attrs[i].writable, m.attrs[i].setter)
-                            })
-                        }) {
-                            Some((true, _, setter)) => setter != Value::UNDEFINED,
-                            Some((_, w, _)) => w,
-                            None => {
-                                if canonical_index_str(&key).is_some() {
-                                    true
-                                } else {
-                                    side.map_or(true, |m| m.extensible)
-                                }
+                                side.map_or(true, |m| m.extensible)
                             }
                         }
                     }
-                };
-                if ok {
-                    // OrdinarySetWithOwnDescriptor: only an ACCESSOR ownDesc
-                    // writes through the target. A data (or absent) ownDesc with
-                    // a DIFFERENT Receiver defines on the receiver and leaves the
-                    // target untouched — `Reflect.set([1,2,3], "length", 0, {})`
-                    // must give the plain object a `length` of 0 and keep the
-                    // array at 3, which is the [[GetOwnProperty]]/
-                    // [[DefineOwnProperty]] pair `Array.prototype.pop`'s
-                    // `Set(O,"length",…)` shows on a proxy receiver
-                    // (sm/Array/{pop,shift}-no-has-trap.js).
-                    if target_own_accessor || self.same_value(a0, receiver) {
-                        self.set_index(a0, kv, value, false)?;
-                    } else {
-                        return self.reflect_set_on_receiver(receiver, kv, value);
-                    }
-                }
-                ok
-            } else {
-                match governing {
-                    // Accessor: invoke its setter with the RECEIVER as `this`.
-                    Some((true, _, setter)) => {
-                        if setter == Value::UNDEFINED {
-                            false
-                        } else {
-                            self.call_value(setter, receiver, &[value])?;
-                            true
-                        }
-                    }
-                    // Non-writable data property: rejected.
-                    Some((false, false, _)) => false,
-                    // Writable data property, or a new property: write to the
-                    // RECEIVER (CreateDataProperty / overwrite its data prop),
-                    // rejecting a non-object receiver or a conflicting own prop.
-                    // Receiver.[[GetOwnProperty]] → reject an own accessor or
-                    // non-writable data prop, else DefineOwnProperty. (Inlining
-                    // only the plain-Object case here reported TRUE for every
-                    // rejected write on an exotic receiver — a frozen array's
-                    // element, a frozen function's new prop — and for a NEW prop
-                    // on ANY non-extensible receiver, where CreateDataProperty
-                    // returns false.)
-                    _ => self.reflect_set_on_receiver(receiver, kv, value)?,
                 }
             };
-            Ok(result)
+            if ok {
+                // OrdinarySetWithOwnDescriptor: only an ACCESSOR ownDesc
+                // writes through the target. A data (or absent) ownDesc with
+                // a DIFFERENT Receiver defines on the receiver and leaves the
+                // target untouched — `Reflect.set([1,2,3], "length", 0, {})`
+                // must give the plain object a `length` of 0 and keep the
+                // array at 3, which is the [[GetOwnProperty]]/
+                // [[DefineOwnProperty]] pair `Array.prototype.pop`'s
+                // `Set(O,"length",…)` shows on a proxy receiver
+                // (sm/Array/{pop,shift}-no-has-trap.js).
+                if target_own_accessor || self.same_value(a0, receiver) {
+                    self.set_index(a0, kv, value, false)?;
+                } else {
+                    return self.reflect_set_on_receiver(receiver, kv, value);
+                }
+            }
+            ok
+        } else {
+            match governing {
+                // Accessor: invoke its setter with the RECEIVER as `this`.
+                Some((true, _, setter)) => {
+                    if setter == Value::UNDEFINED {
+                        false
+                    } else {
+                        self.call_value(setter, receiver, &[value])?;
+                        true
+                    }
+                }
+                // Non-writable data property: rejected.
+                Some((false, false, _)) => false,
+                // Writable data property, or a new property: write to the
+                // RECEIVER (CreateDataProperty / overwrite its data prop),
+                // rejecting a non-object receiver or a conflicting own prop.
+                // Receiver.[[GetOwnProperty]] → reject an own accessor or
+                // non-writable data prop, else DefineOwnProperty. (Inlining
+                // only the plain-Object case here reported TRUE for every
+                // rejected write on an exotic receiver — a frozen array's
+                // element, a frozen function's new prop — and for a NEW prop
+                // on ANY non-extensible receiver, where CreateDataProperty
+                // returns false.)
+                _ => self.reflect_set_on_receiver(receiver, kv, value)?,
+            }
+        };
+        Ok(result)
     }
 
     pub(crate) fn reflect_set_on_receiver(
@@ -410,9 +420,8 @@ impl<'p> Vm<'p> {
                 // completion still propagates — the same message discrimination
                 // Reflect.defineProperty uses.
                 Err(e)
-                    if e.0.starts_with(
-                        "TypeError: proxy 'defineProperty' trap returned falsish",
-                    ) =>
+                    if e.0
+                        .starts_with("TypeError: proxy 'defineProperty' trap returned falsish") =>
                 {
                     Ok(false)
                 }
@@ -432,18 +441,22 @@ impl<'p> Vm<'p> {
             };
         }
         let own = match self.heap.get(ridx) {
-            HeapObj::Object(m) => {
-                m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable))
-            }
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
-                self.fn_props
-                    .get(&ridx)
-                    .and_then(|m| m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable)))
-            }
-            _ => self
-                .arr_props
-                .get(&ridx)
-                .and_then(|m| m.pos(&key).map(|i| (m.attrs[i].accessor, m.attrs[i].writable))),
+            HeapObj::Object(m) => m
+                .pos(&key)
+                .map(|i| (m.attrs[i].accessor, m.attrs[i].writable)),
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => self.fn_props.get(&ridx).and_then(|m| {
+                m.pos(&key)
+                    .map(|i| (m.attrs[i].accessor, m.attrs[i].writable))
+            }),
+            _ => self.arr_props.get(&ridx).and_then(|m| {
+                m.pos(&key)
+                    .map(|i| (m.attrs[i].accessor, m.attrs[i].writable))
+            }),
         };
         // An Array's dense elements are not in `arr_props`, so an in-range index
         // looks "absent" above and would then be rejected by the extensibility
@@ -457,9 +470,7 @@ impl<'p> Vm<'p> {
             None => match self.heap.get(ridx) {
                 HeapObj::Array(items) => canonical_index_str(&key)
                     .filter(|i| items.get(*i).is_some_and(|v| !v.is_hole()))
-                    .map(|_| {
-                        (false, !self.arr_props.get(&ridx).is_some_and(|m| m.frozen))
-                    }),
+                    .map(|_| (false, !self.arr_props.get(&ridx).is_some_and(|m| m.frozen))),
                 _ => None,
             },
         };
@@ -574,9 +585,27 @@ impl<'p> Vm<'p> {
     /// foreign `newTarget` for `Reflect.construct`/`super` (the dominant
     /// cross-realm test shape); they are not yet independently functional.
     pub(crate) fn create_realm(&mut self) -> Value {
-        let ne = PropAttr { writable: false, enumerable: false, configurable: true, accessor: false, setter: Value::UNDEFINED };
-        let ctor_attr = PropAttr { writable: true, enumerable: false, configurable: true, accessor: false, setter: Value::UNDEFINED };
-        let proto_attr = PropAttr { writable: false, enumerable: false, configurable: false, accessor: false, setter: Value::UNDEFINED };
+        let ne = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let ctor_attr = PropAttr {
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        let proto_attr = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
         let data = PropAttr::data();
         // A fresh realm id; realms[r] maps each MAIN-realm intrinsic prototype to
         // this realm's corresponding prototype (for GetPrototypeFromConstructor's
@@ -585,19 +614,36 @@ impl<'p> Vm<'p> {
         self.realms.push(std::collections::HashMap::new());
         // (constructor name, its MAIN-realm prototype heap index — 0 = no mapping)
         let mut ctors: Vec<(&str, u32)> = vec![
-            ("Object", self.obj_proto), ("Array", self.arr_proto), ("Function", self.fn_proto),
-            ("String", self.str_proto), ("Number", self.num_proto), ("Boolean", self.bool_proto),
-            ("Symbol", self.symbol_proto), ("BigInt", self.bigint_proto),
-            ("Error", self.error_protos[0]), ("TypeError", self.error_protos[1]),
-            ("RangeError", self.error_protos[2]), ("SyntaxError", self.error_protos[3]),
-            ("ReferenceError", self.error_protos[4]), ("EvalError", self.error_protos[5]),
-            ("URIError", self.error_protos[6]), ("AggregateError", self.error_protos[7]),
-            ("Map", self.map_proto), ("Set", self.set_proto), ("WeakMap", self.weakmap_proto),
-            ("WeakSet", self.weakset_proto), ("WeakRef", self.weakref_proto),
-            ("FinalizationRegistry", self.finreg_proto), ("RegExp", self.regexp_proto),
-            ("Promise", self.promise_proto), ("Date", self.date_proto), ("Proxy", 0),
-            ("ArrayBuffer", self.arraybuffer_proto), ("SharedArrayBuffer", self.sab_proto),
-            ("DataView", self.dataview_proto), ("Iterator", self.iterator_proto_root),
+            ("Object", self.obj_proto),
+            ("Array", self.arr_proto),
+            ("Function", self.fn_proto),
+            ("String", self.str_proto),
+            ("Number", self.num_proto),
+            ("Boolean", self.bool_proto),
+            ("Symbol", self.symbol_proto),
+            ("BigInt", self.bigint_proto),
+            ("Error", self.error_protos[0]),
+            ("TypeError", self.error_protos[1]),
+            ("RangeError", self.error_protos[2]),
+            ("SyntaxError", self.error_protos[3]),
+            ("ReferenceError", self.error_protos[4]),
+            ("EvalError", self.error_protos[5]),
+            ("URIError", self.error_protos[6]),
+            ("AggregateError", self.error_protos[7]),
+            ("Map", self.map_proto),
+            ("Set", self.set_proto),
+            ("WeakMap", self.weakmap_proto),
+            ("WeakSet", self.weakset_proto),
+            ("WeakRef", self.weakref_proto),
+            ("FinalizationRegistry", self.finreg_proto),
+            ("RegExp", self.regexp_proto),
+            ("Promise", self.promise_proto),
+            ("Date", self.date_proto),
+            ("Proxy", 0),
+            ("ArrayBuffer", self.arraybuffer_proto),
+            ("SharedArrayBuffer", self.sab_proto),
+            ("DataView", self.dataview_proto),
+            ("Iterator", self.iterator_proto_root),
             ("DisposableStack", self.disposablestack_proto),
             ("AsyncDisposableStack", self.asyncdisposablestack_proto),
             ("SuppressedError", self.suppressederror_proto),
@@ -639,7 +685,9 @@ impl<'p> Vm<'p> {
                         .zip(mm.vals.iter())
                         .zip(mm.attrs.iter())
                         .filter(|((k, _), _)| {
-                            k.as_str() != "prototype" && k.as_str() != "name" && k.as_str() != "length"
+                            k.as_str() != "prototype"
+                                && k.as_str() != "name"
+                                && k.as_str() != "length"
                         })
                         .map(|((k, v), a)| (k.clone(), *v, *a))
                         .collect(),
@@ -739,9 +787,10 @@ impl<'p> Vm<'p> {
                 pm.define("constructor", Value::heap(ta_ctor_idx), ne);
             }
             // Same own-property copy the named pairs get.
-            for (src, dst, skip_ctor) in
-                [(self.ta_base_proto, ta_proto_idx, true), (self.ta_base_ctor, ta_ctor_idx, false)]
-            {
+            for (src, dst, skip_ctor) in [
+                (self.ta_base_proto, ta_proto_idx, true),
+                (self.ta_base_ctor, ta_ctor_idx, false),
+            ] {
                 if src == 0 {
                     continue;
                 }
@@ -796,7 +845,8 @@ impl<'p> Vm<'p> {
                 }
                 if let Some(cv) = g.get(kind.0) {
                     if cv.is_heap() {
-                        self.proto_of.insert(cv.heap_index(), Value::heap(ta_ctor_idx));
+                        self.proto_of
+                            .insert(cv.heap_index(), Value::heap(ta_ctor_idx));
                     }
                 }
             }
@@ -817,8 +867,9 @@ impl<'p> Vm<'p> {
         {
             let realm_obj_proto = self.realms[r as usize].get(&self.obj_proto).copied();
             let realm_fn_proto = self.realms[r as usize].get(&self.fn_proto).copied();
-            let realm_iter_proto =
-                self.realms[r as usize].get(&self.iterator_proto_root).copied();
+            let realm_iter_proto = self.realms[r as usize]
+                .get(&self.iterator_proto_root)
+                .copied();
             let async_iter_root = self
                 .proto_of
                 .get(&self.asyncgen_proto)
@@ -832,7 +883,14 @@ impl<'p> Vm<'p> {
                     realm_iter_proto.or(realm_obj_proto),
                     None,
                 ),
-                ("AsyncFunction", self.async_fn_ctor, self.async_fn_proto, 0, None, None),
+                (
+                    "AsyncFunction",
+                    self.async_fn_ctor,
+                    self.async_fn_proto,
+                    0,
+                    None,
+                    None,
+                ),
                 (
                     "AsyncGeneratorFunction",
                     self.asyncgen_fn_ctor,
@@ -979,9 +1037,17 @@ impl<'p> Vm<'p> {
         // Bare global functions (`other.parseInt`, …) as fresh same-id Natives,
         // and the global value properties (non-writable, non-configurable).
         for name in [
-            "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURI",
-            "encodeURIComponent", "decodeURI", "decodeURIComponent", "escape",
-            "unescape", "print",
+            "parseInt",
+            "parseFloat",
+            "isNaN",
+            "isFinite",
+            "encodeURI",
+            "encodeURIComponent",
+            "decodeURI",
+            "decodeURIComponent",
+            "escape",
+            "unescape",
+            "print",
         ] {
             if let Some(&main_fn) = self.builtin_globals.get(name) {
                 let copy = self.realm_copy_value(Value::heap(main_fn), r);
@@ -989,7 +1055,13 @@ impl<'p> Vm<'p> {
                 g.define(name, copy, data);
             }
         }
-        let frozen = PropAttr { writable: false, enumerable: false, configurable: false, accessor: false, setter: Value::UNDEFINED };
+        let frozen = PropAttr {
+            writable: false,
+            enumerable: false,
+            configurable: false,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
         g.define("undefined", Value::UNDEFINED, frozen);
         g.define("NaN", Value::num(f64::NAN), frozen);
         g.define("Infinity", Value::num(f64::INFINITY), frozen);
@@ -1030,7 +1102,9 @@ impl<'p> Vm<'p> {
                 realm.define(&k, copy, a);
             }
         }
-        let script_idx = self.heap.alloc(HeapObj::Native(native::DOLLAR262_EVAL_SCRIPT));
+        let script_idx = self
+            .heap
+            .alloc(HeapObj::Native(native::DOLLAR262_EVAL_SCRIPT));
         self.obj_realm.insert(script_idx, r);
         self.realm_fns.insert(script_idx, (g_idx, 1));
         realm.define("evalScript", Value::heap(script_idx), PropAttr::data());
@@ -1063,8 +1137,13 @@ impl<'p> Vm<'p> {
     /// new function's globals bind in the realm's own table.
     pub(crate) fn realm_main_ctor_is_fn_like(&self, main: u32) -> bool {
         main != 0
-            && [self.function_ctor, self.gen_fn_ctor, self.async_fn_ctor, self.asyncgen_fn_ctor]
-                .contains(&main)
+            && [
+                self.function_ctor,
+                self.gen_fn_ctor,
+                self.async_fn_ctor,
+                self.asyncgen_fn_ctor,
+            ]
+            .contains(&main)
     }
 
     /// The createRealm child whose code is CURRENTLY running: the `active_realm`
@@ -1097,7 +1176,9 @@ impl<'p> Vm<'p> {
         if let Some(&i) = self.realm_throw_type_errors.get(&r) {
             return Value::heap(i);
         }
-        let idx = self.heap.alloc(HeapObj::Native(native::FN_THROW_TYPE_ERROR));
+        let idx = self
+            .heap
+            .alloc(HeapObj::Native(native::FN_THROW_TYPE_ERROR));
         self.obj_realm.insert(idx, r);
         self.realm_throw_type_errors.insert(r, idx);
         Value::heap(idx)
@@ -1203,7 +1284,9 @@ impl<'p> Vm<'p> {
         if self.realm_global_objs.is_empty() || !err.is_heap() {
             return;
         }
-        let Some(r) = self.current_realm_id() else { return };
+        let Some(r) = self.current_realm_id() else {
+            return;
+        };
         self.realm_adopt_error_to(err, r);
     }
 
@@ -1217,7 +1300,11 @@ impl<'p> Vm<'p> {
     /// throw `other.TypeError` — staging/sm/extensions/dataview.js line 1568).
     pub(crate) fn realm_thrown_from_proto(&mut self, obj_idx: u32, msg: String) -> Thrown {
         if !self.realm_global_objs.is_empty() && self.pending_throw.is_none() {
-            let proto = self.proto_of.get(&obj_idx).copied().unwrap_or(Value::UNDEFINED);
+            let proto = self
+                .proto_of
+                .get(&obj_idx)
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
             let r = self.get_function_realm(proto);
             if r != 0 {
                 let e = self.alloc_error_from_message(&msg);
@@ -1304,7 +1391,10 @@ impl<'p> Vm<'p> {
     ) -> Result<Value, Thrown> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let is_str = a0.is_heap()
-            && matches!(self.heap.get(a0.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. });
+            && matches!(
+                self.heap.get(a0.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            );
         if !is_str {
             // eval(x): a non-String x is returned unchanged (spec 19.2.1).
             return Ok(a0);
@@ -1322,7 +1412,23 @@ impl<'p> Vm<'p> {
         // so its ThisBinding is the CHILD's global object — `other.eval("this")`
         // (and `eval = other.eval; eval("this")`) must not answer the caller's.
         let this_realm_global = Some(Value::heap(gidx));
-        let evaled = self.do_eval(&code, false, false, this_realm_global, None, false, false, Value::UNDEFINED, None, true, None, Vec::new(), None, None, exact.as_deref());
+        let evaled = self.do_eval(
+            &code,
+            false,
+            false,
+            this_realm_global,
+            None,
+            false,
+            false,
+            Value::UNDEFINED,
+            None,
+            true,
+            None,
+            Vec::new(),
+            None,
+            None,
+            exact.as_deref(),
+        );
         self.active_realm = prev_realm;
         let v = evaled?;
         // The completion value (typically a function/class the caller will use)
@@ -1370,7 +1476,6 @@ impl<'p> Vm<'p> {
         }
     }
 
-
     /// One step of a LIVE array-like `%ArrayIteratorPrototype%` iterator, WITHOUT
     /// materialising the `{value, done}` result object. `None` means "not that
     /// kind of iterator" and the caller falls through to the general path.
@@ -1397,7 +1502,9 @@ impl<'p> Vm<'p> {
     /// exhaustion LATCHES via `usize::MAX` so a later grow is not iterated.
     pub(crate) fn array_iter_step(&mut self, it_idx: u32) -> Option<Result<(Value, bool), Thrown>> {
         let (live, index, proto) = match self.heap.get(it_idx) {
-            HeapObj::Iterator { live, index, proto, .. } => (*live, *index, *proto),
+            HeapObj::Iterator {
+                live, index, proto, ..
+            } => (*live, *index, *proto),
             _ => return None,
         };
         let (coll, kind) = live?;
@@ -1420,7 +1527,10 @@ impl<'p> Vm<'p> {
             (Value::UNDEFINED, true)
         } else {
             let n = match self.heap.get(coll) {
-                HeapObj::Array(items) => items.len(),
+                // Sparse/very large Arrays keep their live JS length outside
+                // the dense prefix. Re-read that authoritative length every
+                // step just like the ordinary object `length` path below.
+                HeapObj::Array(_) => self.js_array_len(coll),
                 _ => {
                     let lv = self.get_prop(Value::heap(coll), "length")?;
                     let lf = self.to_number_coerce(lv)?;
@@ -1440,7 +1550,8 @@ impl<'p> Vm<'p> {
                     _ => {
                         let e = self.get_index(Value::heap(coll), Value::num(index as f64))?;
                         Value::heap(
-                            self.heap.alloc(HeapObj::Array(vec![Value::num(index as f64), e])),
+                            self.heap
+                                .alloc(HeapObj::Array(vec![Value::num(index as f64), e])),
                         )
                     }
                 };
@@ -1454,7 +1565,6 @@ impl<'p> Vm<'p> {
         }
         Ok(result)
     }
-
 
     /// One step of a live Map/Set iterator, or of a snapshot iterator, WITHOUT
     /// materialising the `{value, done}` result object.
@@ -1523,7 +1633,9 @@ impl<'p> Vm<'p> {
             result
         } else {
             match self.heap.get_mut(it_idx) {
-                HeapObj::Iterator { items, index: i, .. } => {
+                HeapObj::Iterator {
+                    items, index: i, ..
+                } => {
                     if *i < items.len() {
                         let v = items[*i];
                         *i += 1;
@@ -1538,7 +1650,12 @@ impl<'p> Vm<'p> {
         Some(out)
     }
 
-    pub(crate) fn call_native(&mut self, id: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+    pub(crate) fn call_native(
+        &mut self,
+        id: u16,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
         use native::*;
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         let a1 = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -1556,13 +1673,18 @@ impl<'p> Vm<'p> {
                     "TypeError: Temporal field getter called on a non-Temporal receiver".into(),
                 ));
             }
-            let field = native::TEMPORAL_GETTER_FIELDS[(id - native::TEMPORAL_GETTER_BASE) as usize];
+            let field =
+                native::TEMPORAL_GETTER_FIELDS[(id - native::TEMPORAL_GETTER_BASE) as usize];
             return self.get_prop(this, field);
         }
         Ok(match id {
             OBJ_DEFINE_PROPERTY => {
                 let key = self.to_property_key(a1)?;
-                self.object_define_property(a0, &key, args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+                self.object_define_property(
+                    a0,
+                    &key,
+                    args.get(2).copied().unwrap_or(Value::UNDEFINED),
+                )?;
                 a0
             }
             OBJ_DEFINE_PROPERTIES => {
@@ -1671,10 +1793,17 @@ impl<'p> Vm<'p> {
                 // `name` (default "Error") + ": " + `message` (default ""), dropping
                 // the separator when either part is empty.
                 let nv = self.get_prop(this, "name")?;
-                let name =
-                    if nv == Value::UNDEFINED { "Error".to_string() } else { self.to_js_string(nv)? };
+                let name = if nv == Value::UNDEFINED {
+                    "Error".to_string()
+                } else {
+                    self.to_js_string(nv)?
+                };
                 let mv = self.get_prop(this, "message")?;
-                let msg = if mv == Value::UNDEFINED { String::new() } else { self.to_js_string(mv)? };
+                let msg = if mv == Value::UNDEFINED {
+                    String::new()
+                } else {
+                    self.to_js_string(mv)?
+                };
                 let s = if name.is_empty() {
                     msg
                 } else if msg.is_empty() {
@@ -1691,7 +1820,11 @@ impl<'p> Vm<'p> {
                     HeapObj::Symbol { desc, .. } => *desc,
                     _ => Value::UNDEFINED,
                 };
-                let d = if desc == Value::UNDEFINED { String::new() } else { self.display(desc) };
+                let d = if desc == Value::UNDEFINED {
+                    String::new()
+                } else {
+                    self.display(desc)
+                };
                 self.alloc_str(format!("Symbol({d})"))
             }
             SYMBOL_VALUE_OF => {
@@ -1710,7 +1843,8 @@ impl<'p> Vm<'p> {
                 // %ThrowTypeError%: the restricted caller/arguments accessor — read
                 // OR write of Function.prototype.caller/arguments throws here.
                 return Err(Thrown(
-                    "TypeError: 'caller' and 'arguments' may not be accessed on this function".into(),
+                    "TypeError: 'caller' and 'arguments' may not be accessed on this function"
+                        .into(),
                 ));
             }
             FINALLY_THEN | FINALLY_CATCH => {
@@ -1727,7 +1861,11 @@ impl<'p> Vm<'p> {
                 let _gc = self.gc_lock_guard();
                 let result = self.call_value(on_finally, Value::UNDEFINED, &[])?;
                 let promise = self.call_native(PROMISE_RESOLVE, ctor, &[result])?;
-                let thunk_id = if id == FINALLY_THEN { FINALLY_VALUE_THUNK } else { FINALLY_THROWER };
+                let thunk_id = if id == FINALLY_THEN {
+                    FINALLY_VALUE_THUNK
+                } else {
+                    FINALLY_THROWER
+                };
                 let thunk_fn = Value::heap(self.heap.alloc(HeapObj::Native(thunk_id)));
                 let thunk = Value::heap(self.heap.alloc(HeapObj::Bound {
                     target: thunk_fn,
@@ -1755,7 +1893,8 @@ impl<'p> Vm<'p> {
                 // by exact string value (no coercion), per spec.
                 if !self.is_object_value(this) {
                     return Err(Thrown(
-                        "TypeError: Date.prototype[Symbol.toPrimitive] called on a non-object".into(),
+                        "TypeError: Date.prototype[Symbol.toPrimitive] called on a non-object"
+                            .into(),
                     ));
                 }
                 let hint = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -1767,12 +1906,10 @@ impl<'p> Vm<'p> {
                 let order: [&str; 2] = match hint_s.as_str() {
                     "string" | "default" => ["toString", "valueOf"],
                     "number" => ["valueOf", "toString"],
-                    _ => {
-                        return Err(Thrown(
-                            "TypeError: Date.prototype[Symbol.toPrimitive] called with an invalid hint"
-                                .into(),
-                        ))
-                    }
+                    _ => return Err(Thrown(
+                        "TypeError: Date.prototype[Symbol.toPrimitive] called with an invalid hint"
+                            .into(),
+                    )),
                 };
                 self.ordinary_to_primitive(this, order)?
             }
@@ -1853,28 +1990,37 @@ impl<'p> Vm<'p> {
                         "TypeError: Symbol.keyFor requires that the argument be a Symbol".into(),
                     ));
                 }
-                let key =
-                    self.symbol_registry.iter().find(|(_, v)| v.bits() == a0.bits()).map(|(k, _)| k.clone());
+                let key = self
+                    .symbol_registry
+                    .iter()
+                    .find(|(_, v)| v.bits() == a0.bits())
+                    .map(|(k, _)| k.clone());
                 match key {
                     Some(k) => self.alloc_str(k),
                     None => Value::UNDEFINED,
                 }
             }
             BIGINT_TO_STRING => {
-                let n = match self.this_bigint_val(this) {
-                    Some(n) => n,
-                    None => {
-                        return Err(Thrown(
-                            "TypeError: BigInt.prototype.toString requires that 'this' be a BigInt".into(),
-                        ))
-                    }
-                };
+                let n =
+                    match self.this_bigint_val(this) {
+                        Some(n) => n,
+                        None => return Err(Thrown(
+                            "TypeError: BigInt.prototype.toString requires that 'this' be a BigInt"
+                                .into(),
+                        )),
+                    };
                 // radix = ToIntegerOrInfinity(arg): ToNumber first, so a BigInt or
                 // Symbol radix is a TypeError (the lenient `to_number` would accept a
                 // BigInt). The this-value's brand check above still comes first.
-                let radix = if a0 == Value::UNDEFINED { 10 } else { self.to_number_strict(a0)? as i64 };
+                let radix = if a0 == Value::UNDEFINED {
+                    10
+                } else {
+                    self.to_number_strict(a0)? as i64
+                };
                 if !(2..=36).contains(&radix) {
-                    return Err(Thrown("RangeError: toString() radix must be between 2 and 36".into()));
+                    return Err(Thrown(
+                        "RangeError: toString() radix must be between 2 and 36".into(),
+                    ));
                 }
                 self.alloc_str(n.to_radix_string(radix as u32))
             }
@@ -1897,16 +2043,15 @@ impl<'p> Vm<'p> {
                 let prim = self.make_bigint_val(n);
                 self.intl_number_format(resolved, prim)?
             }
-            BIGINT_VALUE_OF => {
-                match self.this_bigint_val(this) {
-                    Some(n) => self.make_bigint_val(n),
-                    None => {
-                        return Err(Thrown(
-                            "TypeError: BigInt.prototype.valueOf requires that 'this' be a BigInt".into(),
-                        ))
-                    }
+            BIGINT_VALUE_OF => match self.this_bigint_val(this) {
+                Some(n) => self.make_bigint_val(n),
+                None => {
+                    return Err(Thrown(
+                        "TypeError: BigInt.prototype.valueOf requires that 'this' be a BigInt"
+                            .into(),
+                    ))
                 }
-            }
+            },
             BIGINT_AS_INTN | BIGINT_AS_UINTN => {
                 // bits = ToIndex(bits) (RangeError if negative / > 2^53-1) FIRST,
                 // then x = ToBigInt(value) — STRICT: a Number value is a TypeError
@@ -1956,9 +2101,7 @@ impl<'p> Vm<'p> {
                 // before RegExpExec reads `exec`. Primitive coercion cannot run
                 // user code; an object can patch `exec`, so it takes the full
                 // protocol below and performs the Get after coercion.
-                if is_re
-                    && !self.is_object_value(a0)
-                    && self.regexp_exec_fast_ok(this.heap_index())
+                if is_re && !self.is_object_value(a0) && self.regexp_exec_fast_ok(this.heap_index())
                 {
                     let r = self.regexp_exec_impl(this.heap_index(), a0, false)?;
                     return Ok(Value::bool(r != Value::NULL));
@@ -2002,19 +2145,16 @@ impl<'p> Vm<'p> {
                     && self.get_function_realm(this) != self.native_callee_realm.unwrap_or(0)
                 {
                     return Err(Thrown(
-                        "TypeError: RegExp.prototype.compile: receiver belongs to another realm".into(),
+                        "TypeError: RegExp.prototype.compile: receiver belongs to another realm"
+                            .into(),
                     ));
                 }
                 // RegExp SUBCLASS (its [[Prototype]] is not %RegExp.prototype% —
                 // the COMPILE function's own realm's) throws TypeError rather
                 // than recompiling.
-                if self
-                    .proto_of
-                    .get(&this.heap_index())
-                    .map_or(false, |p| {
-                        !p.is_heap() || p.heap_index() != self.native_home(self.regexp_proto)
-                    })
-                {
+                if self.proto_of.get(&this.heap_index()).map_or(false, |p| {
+                    !p.is_heap() || p.heap_index() != self.native_home(self.regexp_proto)
+                }) {
                     return Err(Thrown(
                         "TypeError: RegExp.prototype.compile may not be used on a subclass instance".into(),
                     ));
@@ -2067,12 +2207,20 @@ impl<'p> Vm<'p> {
                         &source.encode_utf16().collect::<Vec<u16>>(),
                     ),
                 };
-                let regex = regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
-                    .map_err(|e| {
-                        Thrown(format!("SyntaxError: Invalid regular expression: /{source}/: {e}"))
-                    })?;
-                if let HeapObj::RegExp { regex: r, source: s, flags: fl, ascii_twin, .. } =
-                    self.heap.get_mut(this.heap_index())
+                let regex =
+                    regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
+                        .map_err(|e| {
+                            Thrown(format!(
+                                "SyntaxError: Invalid regular expression: /{source}/: {e}"
+                            ))
+                        })?;
+                if let HeapObj::RegExp {
+                    regex: r,
+                    source: s,
+                    flags: fl,
+                    ascii_twin,
+                    ..
+                } = self.heap.get_mut(this.heap_index())
                 {
                     *r = std::sync::Arc::new(regex);
                     *s = source;
@@ -2108,8 +2256,11 @@ impl<'p> Vm<'p> {
                 // EXACT code points (the argument is a string by the check
                 // above): a lone surrogate must escape as \uNNNN, which the
                 // lossy &str view could never carry.
-                let bytes: Vec<u8> =
-                    self.heap.str_wtf8_cow(a0.heap_index()).unwrap().into_owned();
+                let bytes: Vec<u8> = self
+                    .heap
+                    .str_wtf8_cow(a0.heap_index())
+                    .unwrap()
+                    .into_owned();
                 // EncodeForRegExpEscape's "other punctuators" / WhiteSpace /
                 // LineTerminator / lone-surrogate set: hex-escaped (\xNN if <=0xFF,
                 // else \uNNNN per UTF-16 code unit). Tab/VT/FF/LF/CR use the control
@@ -2145,8 +2296,8 @@ impl<'p> Vm<'p> {
                         continue;
                     }
                     match c {
-                        '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']'
-                        | '{' | '}' | '|' | '/' => {
+                        '^' | '$' | '\\' | '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{'
+                        | '}' | '|' | '/' => {
                             out.push('\\');
                             out.push(c);
                         }
@@ -2182,8 +2333,7 @@ impl<'p> Vm<'p> {
                     Some(HeapObj::RegExp { source, flags, .. }) => {
                         // Spec reads the `flags` getter, which assembles the
                         // canonical `dgimsuvy` order regardless of storage order.
-                        let (s, f) =
-                            (source.clone(), super::proxy_regexp::canonical_flags(flags));
+                        let (s, f) = (source.clone(), super::proxy_regexp::canonical_flags(flags));
                         // Lone-surrogate pattern (exact-source side table):
                         // assemble `/src/flags` over the exact WTF-8 bytes so
                         // toString round-trips the surrogates too.
@@ -2242,9 +2392,7 @@ impl<'p> Vm<'p> {
                             | HeapObj::Symbol { .. }
                     );
                 if !is_obj {
-                    return Err(Thrown(
-                        "TypeError: get flags called on a non-object".into(),
-                    ));
+                    return Err(Thrown("TypeError: get flags called on a non-object".into()));
                 }
                 let mut out = String::new();
                 for (prop, ch) in [
@@ -2313,7 +2461,8 @@ impl<'p> Vm<'p> {
                 // "lastIndex")). Eagerly computed over the (real-RegExp) clone.
                 if !self.is_object_value(this) {
                     return Err(Thrown(
-                        "TypeError: RegExp.prototype[Symbol.matchAll] called on a non-object".into(),
+                        "TypeError: RegExp.prototype[Symbol.matchAll] called on a non-object"
+                            .into(),
                     ));
                 }
                 // A custom @@species Construct re-enters the interpreter; hold the
@@ -2340,7 +2489,13 @@ impl<'p> Vm<'p> {
                     );
                     if li_number && self.regexp_matchall_fast_ok_cached(re_idx) {
                         let (regex, source, flags, li_raw, twin) = match self.heap.get(re_idx) {
-                            HeapObj::RegExp { regex, source, flags, last_index, ascii_twin } => (
+                            HeapObj::RegExp {
+                                regex,
+                                source,
+                                flags,
+                                last_index,
+                                ascii_twin,
+                            } => (
                                 regex.clone(),
                                 source.clone(),
                                 flags.clone(),
@@ -2436,7 +2591,8 @@ impl<'p> Vm<'p> {
                                 self.regexp_exact_source.insert(matcher_idx, b);
                             }
                         }
-                        self.proto_of.insert(matcher_idx, Value::heap(self.regexp_proto));
+                        self.proto_of
+                            .insert(matcher_idx, Value::heap(self.regexp_proto));
                         let proto = self.regexp_string_iter_proto;
                         let it = self.heap.alloc(HeapObj::Iterator {
                             items: Vec::new(),
@@ -2444,8 +2600,7 @@ impl<'p> Vm<'p> {
                             proto,
                             live: None,
                         });
-                        let fbits =
-                            (global as u8) | ((full_unicode as u8) << 1) | extra_bits;
+                        let fbits = (global as u8) | ((full_unicode as u8) << 1) | extra_bits;
                         // O(1): stored units on a Str, stored len on a Cons —
                         // no flatten needed for the length alone.
                         let subj_units = if s_val.is_heap() {
@@ -2510,8 +2665,12 @@ impl<'p> Vm<'p> {
                 // `next()` runs one RegExpExec (honouring a user `exec`) at a time —
                 // exec/lastIndex side effects are observable per step, not up front.
                 let proto = self.regexp_string_iter_proto;
-                let it =
-                    self.heap.alloc(HeapObj::Iterator { items: Vec::new(), index: 0, proto, live: None });
+                let it = self.heap.alloc(HeapObj::Iterator {
+                    items: Vec::new(),
+                    index: 0,
+                    proto,
+                    live: None,
+                });
                 let fbits = (global as u8) | ((full_unicode as u8) << 1);
                 // O(1) whatever the subject's shape (Str or Cons); the field
                 // is only load-bearing on the `ITFB_FUSED` path, which this
@@ -2613,8 +2772,16 @@ impl<'p> Vm<'p> {
                     length_get = Some(self.get_prop(this, "length")?);
                 }
                 let name_get = self.get_prop(this, "name")?;
-                let bound: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
-                let idx = self.heap.alloc(HeapObj::Bound { target: this, this: a0, args: bound });
+                let bound: Vec<Value> = if args.len() > 1 {
+                    args[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                let idx = self.heap.alloc(HeapObj::Bound {
+                    target: this,
+                    this: a0,
+                    args: bound,
+                });
                 self.proto_of.insert(idx, bound_proto);
                 // A PROXY target's name/length do not resolve through the lazy
                 // effective-name machinery (the trap results belong to the
@@ -2630,15 +2797,20 @@ impl<'p> Vm<'p> {
                         Some(v) if v.is_int() => (v.as_int() as f64 - nbound).max(0.0),
                         Some(v) if v.is_double() => {
                             let d = v.as_f64();
-                            if d.is_nan() { 0.0 } else { (d.trunc() - nbound).max(0.0) }
+                            if d.is_nan() {
+                                0.0
+                            } else {
+                                (d.trunc() - nbound).max(0.0)
+                            }
                         }
                         _ => 0.0,
                     };
-                    let tname = if name_get.is_heap() && self.heap.is_str_like(name_get.heap_index()) {
-                        self.display(name_get)
-                    } else {
-                        String::new()
-                    };
+                    let tname =
+                        if name_get.is_heap() && self.heap.is_str_like(name_get.heap_index()) {
+                            self.display(name_get)
+                        } else {
+                            String::new()
+                        };
                     let attr = PropAttr {
                         writable: false,
                         enumerable: false,
@@ -2647,12 +2819,19 @@ impl<'p> Vm<'p> {
                         setter: Value::UNDEFINED,
                     };
                     let nv = self.alloc_str(format!("bound {tname}"));
-                    let lv = if len.is_finite() && len >= 0.0 && len <= i32::MAX as f64 && len.fract() == 0.0 {
+                    let lv = if len.is_finite()
+                        && len >= 0.0
+                        && len <= i32::MAX as f64
+                        && len.fract() == 0.0
+                    {
                         Value::int(len as i32)
                     } else {
                         Value::num(len)
                     };
-                    let m = self.fn_props.entry(idx).or_insert_with(ObjMap::new_side_table);
+                    let m = self
+                        .fn_props
+                        .entry(idx)
+                        .or_insert_with(ObjMap::new_side_table);
                     m.define("name", nv, attr);
                     m.define("length", lv, attr);
                     // The explicit pair IS the bound function's name/length —
@@ -2683,7 +2862,10 @@ impl<'p> Vm<'p> {
                     }
                     // A class value renders as its whole `class … { … }` source.
                     HeapObj::Class(c) => (!c.source.is_empty()).then(|| c.source.clone()),
-                    HeapObj::Native(_) | HeapObj::NativeClosure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } => None,
+                    HeapObj::Native(_)
+                    | HeapObj::NativeClosure { .. }
+                    | HeapObj::Bound { .. }
+                    | HeapObj::Wrapped { .. } => None,
                     // A constructor global (Array, Date, Temporal.Instant, …) is stored
                     // as an is_ctor Object — it is callable and `typeof` "function", so it
                     // renders in the `[native code]` form rather than throwing. So does
@@ -2696,17 +2878,13 @@ impl<'p> Vm<'p> {
                     }
                     // A callable Proxy (its target is callable) is a function for
                     // toString purposes — render the `[native code]` form, not throw.
-                    HeapObj::Proxy { target, revoked, .. }
-                        if !*revoked && self.is_callable(*target) =>
-                    {
-                        None
-                    }
-                    _ => {
-                        return Err(Thrown(
-                            "TypeError: Function.prototype.toString requires that 'this' be a Function"
-                                .into(),
-                        ))
-                    }
+                    HeapObj::Proxy {
+                        target, revoked, ..
+                    } if !*revoked && self.is_callable(*target) => None,
+                    _ => return Err(Thrown(
+                        "TypeError: Function.prototype.toString requires that 'this' be a Function"
+                            .into(),
+                    )),
                 };
                 let out = match stored {
                     Some(s) => s,
@@ -2718,7 +2896,12 @@ impl<'p> Vm<'p> {
                 self.alloc_str(out)
             }
             ARR_IS_ARRAY => Value::bool(self.value_is_array_throwing(a0)?),
-            ARR_FROM => self.array_from(this, a0, a1, args.get(2).copied().unwrap_or(Value::UNDEFINED))?,
+            ARR_FROM => self.array_from(
+                this,
+                a0,
+                a1,
+                args.get(2).copied().unwrap_or(Value::UNDEFINED),
+            )?,
             ARR_FROM_ASYNC => {
                 // Delegate to a lazily-compiled JS polyfill (an async function),
                 // invoked with `this` = the receiver constructor C. It returns a
@@ -2784,7 +2967,8 @@ impl<'p> Vm<'p> {
                                 )?;
                             }
                             return Err(Thrown(
-                                "TypeError: Abstract class TypedArray not directly constructable".into(),
+                                "TypeError: Abstract class TypedArray not directly constructable"
+                                    .into(),
                             ));
                         }
                         // A user-defined constructor as `this`: %TypedArray%.from/of
@@ -2848,11 +3032,7 @@ impl<'p> Vm<'p> {
                                     None => self.get_index(a0, Value::int(i as i32))?,
                                 };
                                 let mv = if mapfn != Value::UNDEFINED {
-                                    self.call_value(
-                                        mapfn,
-                                        this_arg,
-                                        &[v, Value::num(i as f64)],
-                                    )?
+                                    self.call_value(mapfn, this_arg, &[v, Value::num(i as f64)])?
                                 } else {
                                     v
                                 };
@@ -2906,9 +3086,12 @@ impl<'p> Vm<'p> {
             TA_GET_BUFFER | TA_GET_BYTELENGTH | TA_GET_BYTEOFFSET | TA_GET_LENGTH => {
                 let (buffer, kind, byte_offset, length) =
                     match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                        Some(HeapObj::TypedArray { buffer, kind, byte_offset, length }) => {
-                            (*buffer, *kind, *byte_offset, *length)
-                        }
+                        Some(HeapObj::TypedArray {
+                            buffer,
+                            kind,
+                            byte_offset,
+                            length,
+                        }) => (*buffer, *kind, *byte_offset, *length),
                         _ => {
                             return Err(Thrown(
                                 "TypeError: TypedArray accessor called on a non-TypedArray".into(),
@@ -2929,9 +3112,11 @@ impl<'p> Vm<'p> {
                 match id {
                     TA_GET_BUFFER => Value::heap(buffer),
                     TA_GET_BYTELENGTH => Value::num((eff.unwrap_or(0) * size) as f64),
-                    TA_GET_BYTEOFFSET => {
-                        Value::num(if eff.is_none() { 0.0 } else { byte_offset as f64 })
-                    }
+                    TA_GET_BYTEOFFSET => Value::num(if eff.is_none() {
+                        0.0
+                    } else {
+                        byte_offset as f64
+                    }),
                     _ => Value::num(eff.unwrap_or(0) as f64), // TA_GET_LENGTH
                 }
             }
@@ -2984,8 +3169,7 @@ impl<'p> Vm<'p> {
             AGENT_START => {
                 // Spawn a concurrent worker agent (its own thread + Vm/realm)
                 // and BLOCK until it signals it is running (INTERPRETING.md).
-                let src =
-                    self.to_js_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                let src = self.to_js_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 self.agent_start(src);
                 Value::UNDEFINED
             }
@@ -3093,12 +3277,7 @@ impl<'p> Vm<'p> {
                                     this: ns,
                                     args: Vec::new(),
                                 }));
-                                self.then_internal(
-                                    bp.heap_index(),
-                                    cb,
-                                    Value::UNDEFINED,
-                                    Some(p),
-                                );
+                                self.then_internal(bp.heap_index(), cb, Value::UNDEFINED, Some(p));
                             }
                             _ => self.resolve(p, ns),
                         }
@@ -3107,40 +3286,42 @@ impl<'p> Vm<'p> {
                 }
                 Value::UNDEFINED
             }
-            TA_GET_TOSTRINGTAG => {
-                match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                    Some(HeapObj::TypedArray { kind, .. }) => {
-                        let name = native::TA_KINDS[*kind as usize].0.to_string();
-                        self.alloc_str(name)
-                    }
-                    _ => Value::UNDEFINED,
+            TA_GET_TOSTRINGTAG => match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                Some(HeapObj::TypedArray { kind, .. }) => {
+                    let name = native::TA_KINDS[*kind as usize].0.to_string();
+                    self.alloc_str(name)
                 }
-            }
+                _ => Value::UNDEFINED,
+            },
             // `Array.prototype.{join,push}` as values: `this` is the receiver array.
             // join is generic over array-likes (array_method materializes a
             // non-array receiver); push mutates, so it still requires a real array.
             ARR_JOIN => {
                 if this.is_heap() {
-                    self.array_method(this.heap_index(), "join", args)?.unwrap_or(Value::UNDEFINED)
+                    self.array_method(this.heap_index(), "join", args)?
+                        .unwrap_or(Value::UNDEFINED)
                 } else {
                     // Generic over a primitive `this`: ToObject (null/undefined throw),
                     // then join the boxed array-like (a Boolean/Number wrapper has
                     // length 0, so the result is "").
                     self.require_object_coercible(this)?;
                     let obj = self.to_object(this)?;
-                    self.array_method(obj.heap_index(), "join", args)?.unwrap_or(Value::UNDEFINED)
+                    self.array_method(obj.heap_index(), "join", args)?
+                        .unwrap_or(Value::UNDEFINED)
                 }
             }
             ARR_PUSH => {
                 if this.is_heap() && matches!(self.heap.get(this.heap_index()), HeapObj::Array(_)) {
-                    self.array_method(this.heap_index(), "push", args)?.unwrap_or(Value::UNDEFINED)
+                    self.array_method(this.heap_index(), "push", args)?
+                        .unwrap_or(Value::UNDEFINED)
                 } else {
                     // Generic over an array-like `this`
                     // (`Array.prototype.push.call({length, 0:…}, …)`): ToObject then
                     // the abstract Get/Set/ToLength protocol.
                     self.require_object_coercible(this)?;
                     let obj = self.to_object(this)?;
-                    self.array_like_mutate(obj, "push", args)?.unwrap_or(Value::UNDEFINED)
+                    self.array_like_mutate(obj, "push", args)?
+                        .unwrap_or(Value::UNDEFINED)
                 }
             }
             // More Object statics as values.
@@ -3179,8 +3360,8 @@ impl<'p> Vm<'p> {
                 let _a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
                 self.defer_check_all(_a0)?;
                 self.require_object_coercible(a0)?; // ToObject(O): null/undefined throw
-                // Own symbol-keyed properties: the `@@`-prefixed own keys, mapped
-                // back to their Symbol values via the prop_key registry.
+                                                    // Own symbol-keyed properties: the `@@`-prefixed own keys, mapped
+                                                    // back to their Symbol values via the prop_key registry.
                 let mut syms: Vec<Value> = Vec::new();
                 if a0.is_heap() && self.proxy_parts(a0.heap_index()).is_some() {
                     // A Proxy: drive [[OwnPropertyKeys]] (the ownKeys trap and its
@@ -3196,8 +3377,12 @@ impl<'p> Vm<'p> {
                     }
                 } else if a0.is_heap() {
                     if let HeapObj::Object(m) = self.heap.get(a0.heap_index()) {
-                        let keys: Vec<String> =
-                            m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect();
+                        let keys: Vec<String> = m
+                            .keys
+                            .iter()
+                            .filter(|k| k.starts_with("@@"))
+                            .cloned()
+                            .collect();
                         for k in keys {
                             if let Some(&sym) = self.symbol_keys.get(&k) {
                                 syms.push(sym);
@@ -3226,12 +3411,16 @@ impl<'p> Vm<'p> {
                         }
                         // Symbol keys assigned directly onto the class value
                         // (`C[sym] = v`) land in the arr_props side table.
-                        let extra: Vec<String> = self
-                            .arr_props
-                            .get(&a0.heap_index())
-                            .map_or(Vec::new(), |m| {
-                                m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect()
-                            });
+                        let extra: Vec<String> =
+                            self.arr_props
+                                .get(&a0.heap_index())
+                                .map_or(Vec::new(), |m| {
+                                    m.keys
+                                        .iter()
+                                        .filter(|k| k.starts_with("@@"))
+                                        .cloned()
+                                        .collect()
+                                });
                         for k in extra {
                             if let Some(&sym) = self.symbol_keys.get(&k) {
                                 syms.push(sym);
@@ -3246,14 +3435,19 @@ impl<'p> Vm<'p> {
                             HeapObj::Func(_)
                                 | HeapObj::Closure { .. }
                                 | HeapObj::Bound { .. }
-                                | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+                                | HeapObj::Native(_)
+                                | HeapObj::NativeClosure { .. }
                         ) {
                             self.fn_props.get(&a0.heap_index())
                         } else {
                             self.arr_props.get(&a0.heap_index())
                         };
                         let keys: Vec<String> = table.map_or(Vec::new(), |m| {
-                            m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect()
+                            m.keys
+                                .iter()
+                                .filter(|k| k.starts_with("@@"))
+                                .cloned()
+                                .collect()
                         });
                         for k in keys {
                             if let Some(&sym) = self.symbol_keys.get(&k) {
@@ -3418,7 +3612,10 @@ impl<'p> Vm<'p> {
                             )));
                         }
                         _ => {
-                            let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table);
+                            let m = self
+                                .arr_props
+                                .entry(idx)
+                                .or_insert_with(ObjMap::new_side_table);
                             match id {
                                 OBJ_FREEZE => m.freeze(),
                                 OBJ_SEAL => m.seal(),
@@ -3426,9 +3623,7 @@ impl<'p> Vm<'p> {
                             }
                             // Freezing an Array also makes `length` non-writable (its
                             // descriptor + assignment honour array_length_nonwritable).
-                            if id == OBJ_FREEZE
-                                && matches!(self.heap.get(idx), HeapObj::Array(_))
-                            {
+                            if id == OBJ_FREEZE && matches!(self.heap.get(idx), HeapObj::Array(_)) {
                                 self.array_length_nonwritable.insert(idx);
                             }
                             // A callable's own properties live in the fn_props
@@ -3440,7 +3635,8 @@ impl<'p> Vm<'p> {
                                     | HeapObj::Closure { .. }
                                     | HeapObj::Bound { .. }
                                     | HeapObj::Wrapped { .. }
-                                    | HeapObj::Native(_) | HeapObj::NativeClosure { .. }
+                                    | HeapObj::Native(_)
+                                    | HeapObj::NativeClosure { .. }
                             ) {
                                 if let Some(fm) = self.fn_props.get_mut(&idx) {
                                     match id {
@@ -3463,7 +3659,9 @@ impl<'p> Vm<'p> {
                     }
                 } else if o.is_heap() && self.proxy_parts(o.heap_index()).is_some() {
                     // isFrozen/isSealed on a Proxy: TestIntegrityLevel via the traps.
-                    return Ok(Value::bool(self.proxy_test_integrity(o, id == OBJ_IS_FROZEN)?));
+                    return Ok(Value::bool(
+                        self.proxy_test_integrity(o, id == OBJ_IS_FROZEN)?,
+                    ));
                 }
                 // A non-object (primitive, incl. heap string/symbol/bigint) is
                 // non-extensible and vacuously frozen/sealed. An exotic object's
@@ -3490,24 +3688,24 @@ impl<'p> Vm<'p> {
                         // (staging/sm/TypedArray/test-integrity-level{,-detached}.js).
                         HeapObj::TypedArray { .. } => {
                             let has_elems = self.ta_effective_len(o.heap_index()).unwrap_or(0) > 0;
-                            self.arr_props.get(&o.heap_index()).map_or(
-                                (false, false, true),
-                                |m| {
+                            self.arr_props
+                                .get(&o.heap_index())
+                                .map_or((false, false, true), |m| {
                                     if has_elems {
                                         (false, false, m.extensible)
                                     } else {
                                         (m.is_frozen(), m.is_sealed(), m.extensible)
                                     }
-                                },
-                            )
+                                })
                         }
                         // An exotic object (Array / Map / Set / …) whose elements
                         // live outside arr_props: the explicit seal/freeze markers
                         // are authoritative (the vacuous attrs-based check can't see
                         // the dense elements).
-                        _ => self.arr_props.get(&o.heap_index()).map_or((false, false, true), |m| {
-                            (m.frozen, m.sealed, m.extensible)
-                        }),
+                        _ => self
+                            .arr_props
+                            .get(&o.heap_index())
+                            .map_or((false, false, true), |m| (m.frozen, m.sealed, m.extensible)),
                     }
                 } else {
                     (true, true, false)
@@ -3537,7 +3735,8 @@ impl<'p> Vm<'p> {
                 if id == OBJ_GROUP_BY {
                     let mut map = ObjMap::new();
                     for (i, item) in items.into_iter().enumerate() {
-                        let key = self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
+                        let key =
+                            self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
                         // ToPropertyKey(key) — runs ToPrimitive, so a key whose
                         // toString/@@toPrimitive throws propagates (and a Symbol key
                         // groups under its symbol key), unlike the non-throwing display().
@@ -3564,7 +3763,8 @@ impl<'p> Vm<'p> {
                     // (linear for few groups, hash-indexed past the threshold).
                     let mut finder = super::collections::LocalFinder::new();
                     for (i, item) in items.into_iter().enumerate() {
-                        let mut key = self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
+                        let mut key =
+                            self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
                         if key.is_number() && key.as_f64() == 0.0 {
                             key = Value::int(0); // Map normalizes -0 to +0
                         }
@@ -3577,7 +3777,8 @@ impl<'p> Vm<'p> {
                                 // between iterations, so a group array built
                                 // earlier in THIS call can already be old.
                                 self.heap.write_barrier_val(vals[pos].heap_index(), item);
-                                if let HeapObj::Array(a) = self.heap.get_mut(vals[pos].heap_index()) {
+                                if let HeapObj::Array(a) = self.heap.get_mut(vals[pos].heap_index())
+                                {
                                     a.push(item);
                                 }
                             }
@@ -3605,12 +3806,16 @@ impl<'p> Vm<'p> {
                 let (promise, resolve, reject) = if this == self.promise_ctor_value() {
                     let p = self.alloc_promise();
                     let pair = self.new_resolver_pair();
-                    let res = Value::heap(
-                        self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: false, pair }),
-                    );
-                    let rej = Value::heap(
-                        self.heap.alloc(HeapObj::BoundResolver { promise: p, is_reject: true, pair }),
-                    );
+                    let res = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                        promise: p,
+                        is_reject: false,
+                        pair,
+                    }));
+                    let rej = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                        promise: p,
+                        is_reject: true,
+                        pair,
+                    }));
                     (Value::heap(p), res, rej)
                 } else {
                     self.new_promise_capability(this)?
@@ -3623,9 +3828,15 @@ impl<'p> Vm<'p> {
             }
             PROMISE_TRY => {
                 if !self.is_constructor(this) {
-                    return Err(Thrown("TypeError: Promise.try called on a non-constructor".into()));
+                    return Err(Thrown(
+                        "TypeError: Promise.try called on a non-constructor".into(),
+                    ));
                 }
-                let rest: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { Vec::new() };
+                let rest: Vec<Value> = if args.len() > 1 {
+                    args[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
                 if this == self.promise_ctor_value() {
                     let p = self.alloc_promise();
                     match self.call_value(a0, Value::UNDEFINED, &rest) {
@@ -3671,7 +3882,9 @@ impl<'p> Vm<'p> {
                 // getter on the argument object surfaced instead of the
                 // TypeError the non-callable target owes.
                 if !self.is_callable(target) {
-                    return Err(Thrown("TypeError: Reflect.apply target is not a function".into()));
+                    return Err(Thrown(
+                        "TypeError: Reflect.apply target is not a function".into(),
+                    ));
                 }
                 // Reflect.apply requires an array-like argumentsList (CreateListFromArrayLike).
                 let arg_vec = self.create_list_from_array_like(args_list)?;
@@ -3680,7 +3893,9 @@ impl<'p> Vm<'p> {
             REFLECT_CONSTRUCT => {
                 let target = a0;
                 if !self.is_constructor(target) {
-                    return Err(Thrown("TypeError: Reflect.construct target is not a constructor".into()));
+                    return Err(Thrown(
+                        "TypeError: Reflect.construct target is not a constructor".into(),
+                    ));
                 }
                 // An explicit newTarget (3rd arg) must also be a constructor. We
                 // don't model newTarget-driven prototype selection, but the throw is
@@ -3737,7 +3952,9 @@ impl<'p> Vm<'p> {
             }
             REFLECT_DELETE => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: Reflect.deleteProperty called on non-object".into()));
+                    return Err(Thrown(
+                        "TypeError: Reflect.deleteProperty called on non-object".into(),
+                    ));
                 }
                 let key = self.to_property_key(a1)?;
                 // delete_property (not delete_prop) so a Proxy target's
@@ -3746,30 +3963,39 @@ impl<'p> Vm<'p> {
             }
             REFLECT_OWN_KEYS => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: Reflect.ownKeys called on non-object".into()));
+                    return Err(Thrown(
+                        "TypeError: Reflect.ownKeys called on non-object".into(),
+                    ));
                 }
                 self.object_own_keys(a0)?
             }
             REFLECT_GET_PROTO => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: Reflect.getPrototypeOf called on non-object".into()));
+                    return Err(Thrown(
+                        "TypeError: Reflect.getPrototypeOf called on non-object".into(),
+                    ));
                 }
                 self.get_prototype_of_checked(a0)?
             }
             REFLECT_SET_PROTO => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: Reflect.setPrototypeOf called on non-object".into()));
+                    return Err(Thrown(
+                        "TypeError: Reflect.setPrototypeOf called on non-object".into(),
+                    ));
                 }
                 if a1 != Value::NULL && !self.is_object_value(a1) {
                     return Err(Thrown(
-                        "TypeError: Reflect.setPrototypeOf prototype must be an object or null".into(),
+                        "TypeError: Reflect.setPrototypeOf prototype must be an object or null"
+                            .into(),
                     ));
                 }
                 Value::bool(self.ordinary_set_prototype_of(a0, a1)?)
             }
             REFLECT_DEFINE => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: Reflect.defineProperty called on non-object".into()));
+                    return Err(Thrown(
+                        "TypeError: Reflect.defineProperty called on non-object".into(),
+                    ));
                 }
                 // ToPropertyKey(propertyKey) is step 2 — BEFORE ToPropertyDescriptor
                 // (step 3) — so a throwing key coercion propagates ahead of the
@@ -3777,7 +4003,9 @@ impl<'p> Vm<'p> {
                 let key = self.to_property_key(a1)?;
                 let desc = args.get(2).copied().unwrap_or(Value::UNDEFINED);
                 if !self.is_object_value(desc) {
-                    return Err(Thrown("TypeError: Property description must be an object".into()));
+                    return Err(Thrown(
+                        "TypeError: Property description must be an object".into(),
+                    ));
                 }
                 // ToPropertyDescriptor(desc) is validated FIRST: an invalid
                 // descriptor (a non-callable get/set, or mixed accessor+data) is a
@@ -3832,20 +4060,27 @@ impl<'p> Vm<'p> {
             }
             REFLECT_IS_EXT => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: Reflect.isExtensible called on non-object".into()));
+                    return Err(Thrown(
+                        "TypeError: Reflect.isExtensible called on non-object".into(),
+                    ));
                 }
                 if let Some(b) = self.proxy_is_extensible(a0)? {
                     return Ok(Value::bool(b));
                 }
                 let ext = match self.heap.get(a0.heap_index()) {
                     HeapObj::Object(m) => m.extensible,
-                    _ => self.arr_props.get(&a0.heap_index()).map_or(true, |m| m.extensible),
+                    _ => self
+                        .arr_props
+                        .get(&a0.heap_index())
+                        .map_or(true, |m| m.extensible),
                 };
                 Value::bool(ext)
             }
             REFLECT_PREVENT_EXT => {
                 if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: Reflect.preventExtensions called on non-object".into()));
+                    return Err(Thrown(
+                        "TypeError: Reflect.preventExtensions called on non-object".into(),
+                    ));
                 }
                 if let Some(b) = self.proxy_prevent_extensions(a0)? {
                     return Ok(Value::bool(b));
@@ -3869,7 +4104,10 @@ impl<'p> Vm<'p> {
                     // native IcEntry guards only on the heap version).
                     self.heap.bump_version(idx);
                 } else {
-                    self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).extensible = false;
+                    self.arr_props
+                        .entry(idx)
+                        .or_insert_with(ObjMap::new_side_table)
+                        .extensible = false;
                 }
                 Value::bool(true)
             }
@@ -3882,7 +4120,10 @@ impl<'p> Vm<'p> {
                 // preserved in the parsed value). Non-strings ToString-coerce
                 // (observable, may throw).
                 let s: Vec<u8> = if a0.is_heap() && self.heap.is_str_like(a0.heap_index()) {
-                    self.heap.str_wtf8_cow(a0.heap_index()).unwrap().into_owned()
+                    self.heap
+                        .str_wtf8_cow(a0.heap_index())
+                        .unwrap()
+                        .into_owned()
                 } else {
                     self.to_js_string(a0)?.into_bytes()
                 };
@@ -3912,10 +4153,7 @@ impl<'p> Vm<'p> {
                 let (replacer_fn, allowlist) = self.json_resolve_replacer(replacer)?;
                 // Hold un-rooted Values across toJSON/replacer re-entry; suspend GC.
                 let _gc = self.gc_lock_guard();
-                if indent.is_empty()
-                    && replacer_fn.is_undefined()
-                    && allowlist.is_none()
-                {
+                if indent.is_empty() && replacer_fn.is_undefined() && allowlist.is_none() {
                     if let Some(s) = self.json_plain_stringify(a0) {
                         return Ok(self.alloc_str(s));
                     }
@@ -3980,7 +4218,9 @@ impl<'p> Vm<'p> {
                     && matches!(self.heap.get(v.heap_index()), HeapObj::Object(m) if m.is_raw_json);
                 Value::bool(is)
             }
-            // `Math.random` as a value (the call form uses the Random op). xorshift64*.
+            // `Math.random` as a first-class namespace method. Direct calls use
+            // ordinary dynamic property dispatch too, so replacing this own
+            // property is observable exactly like any other Math method.
             MATH_RANDOM => {
                 let mut x = self.rng_state;
                 x ^= x >> 12;
@@ -4088,7 +4328,8 @@ impl<'p> Vm<'p> {
                     Some(HeapObj::WeakRef(t)) => *t, // no GC → target always live
                     _ => {
                         return Err(Thrown(
-                            "TypeError: WeakRef.prototype.deref called on incompatible receiver".into(),
+                            "TypeError: WeakRef.prototype.deref called on incompatible receiver"
+                                .into(),
                         ))
                     }
                 }
@@ -4097,14 +4338,14 @@ impl<'p> Vm<'p> {
             FR_UNREGISTER => self.finreg_method(this, "unregister", args)?,
             ITER_NEXT => {
                 let it_idx = this.heap_index();
-                let (live, mut index) = match this.is_heap().then(|| self.heap.get(it_idx)) {
-                    Some(HeapObj::Iterator { live, index, .. }) => (*live, *index),
-                    _ => {
-                        return Err(Thrown(
-                            "TypeError: Iterator.prototype.next called on incompatible receiver".into(),
-                        ))
-                    }
-                };
+                let (live, mut index) =
+                    match this.is_heap().then(|| self.heap.get(it_idx)) {
+                        Some(HeapObj::Iterator { live, index, .. }) => (*live, *index),
+                        _ => return Err(Thrown(
+                            "TypeError: Iterator.prototype.next called on incompatible receiver"
+                                .into(),
+                        )),
+                    };
                 // A lazy %RegExpStringIterator%: one RegExpExec per next().
                 if let Some(step) = self.regexp_string_iter_step(it_idx) {
                     let (value, ret_done) = step?;
@@ -4191,7 +4432,9 @@ impl<'p> Vm<'p> {
                 let ret = self.get_prop(this, "return")?;
                 if !ret.is_nullish() {
                     if !self.is_callable(ret) {
-                        return Err(Thrown("TypeError: iterator return is not a function".into()));
+                        return Err(Thrown(
+                            "TypeError: iterator return is not a function".into(),
+                        ));
                     }
                     self.call_value(ret, this, &[])?;
                 }
@@ -4203,14 +4446,14 @@ impl<'p> Vm<'p> {
                 self.iter_helper_method(id, this, args)?
             }
             ITER_HELPER_NEXT => {
-                let kind = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                    Some(HeapObj::IterHelper { kind, .. }) => *kind,
-                    _ => {
-                        return Err(Thrown(
-                            "TypeError: Iterator Helper next called on an incompatible receiver".into(),
-                        ))
-                    }
-                };
+                let kind =
+                    match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                        Some(HeapObj::IterHelper { kind, .. }) => *kind,
+                        _ => return Err(Thrown(
+                            "TypeError: Iterator Helper next called on an incompatible receiver"
+                                .into(),
+                        )),
+                    };
                 // kind 7 = a zip/zipKeyed helper (multi-iterator, lockstep).
                 if kind == 7 {
                     self.iter_zip_next(this.heap_index())?
@@ -4224,7 +4467,15 @@ impl<'p> Vm<'p> {
                         .is_heap()
                         .then(|| self.heap.get(this.heap_index()))
                     {
-                        Some(HeapObj::IterHelper { kind, source, inner, done, running, idx, .. }) => {
+                        Some(HeapObj::IterHelper {
+                            kind,
+                            source,
+                            inner,
+                            done,
+                            running,
+                            idx,
+                            ..
+                        }) => {
                             // Re-entrant return() while a step is executing is a TypeError
                             // (GeneratorValidate), the same as a re-entrant next().
                             if *running {
@@ -4238,12 +4489,10 @@ impl<'p> Vm<'p> {
                             // re-entrant next()/return() during its close does not throw.
                             (*kind, *source, *inner, *done, *idx > 0)
                         }
-                        _ => {
-                            return Err(Thrown(
-                                "TypeError: Iterator Helper return called on an incompatible receiver"
-                                    .into(),
-                            ))
-                        }
+                        _ => return Err(Thrown(
+                            "TypeError: Iterator Helper return called on an incompatible receiver"
+                                .into(),
+                        )),
                     };
                     // kind 5 = the WrapForValidIterator (Iterator.from): its return()
                     // DELEGATES — GetMethod(iterator, "return") and, if present, returns
@@ -4255,7 +4504,9 @@ impl<'p> Vm<'p> {
                             return Ok(self.iter_result(Value::UNDEFINED, true));
                         }
                         if !self.is_callable(ret) {
-                            return Err(Thrown("TypeError: iterator return is not a function".into()));
+                            return Err(Thrown(
+                                "TypeError: iterator return is not a function".into(),
+                            ));
                         }
                         return self.call_value(ret, source, &[]);
                     }
@@ -4363,12 +4614,20 @@ impl<'p> Vm<'p> {
                 self.require_object_coercible(this)?;
                 if !self.is_callable(a1) {
                     return Err(Thrown(
-                        "TypeError: Object.prototype.__define[GS]etter__: expecting a function".into(),
+                        "TypeError: Object.prototype.__define[GS]etter__: expecting a function"
+                            .into(),
                     ));
                 }
                 let key = self.to_property_key(a0)?;
                 let mut d = ObjMap::new();
-                d.set(if id == OBJPROTO_DEFINE_GETTER { "get" } else { "set" }, a1);
+                d.set(
+                    if id == OBJPROTO_DEFINE_GETTER {
+                        "get"
+                    } else {
+                        "set"
+                    },
+                    a1,
+                );
                 d.set("enumerable", Value::bool(true));
                 d.set("configurable", Value::bool(true));
                 let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(d))));
@@ -4400,7 +4659,8 @@ impl<'p> Vm<'p> {
                 // shared guards: non-extensible / cycle / immutable prototype / a
                 // Proxy trap returning falsish).
                 self.require_object_coercible(this)?;
-                if (self.is_object_value(a0) || a0 == Value::NULL) && self.is_object_value(this)
+                if (self.is_object_value(a0) || a0 == Value::NULL)
+                    && self.is_object_value(this)
                     && !self.ordinary_set_prototype_of(this, a0)?
                 {
                     return Err(Thrown(
@@ -4453,7 +4713,10 @@ impl<'p> Vm<'p> {
                 if this.is_heap() && !self.realm_global_objs.is_empty() {
                     let ti = this.heap_index();
                     if let Some(&r) = self.obj_realm.get(&ti) {
-                        if self.realms.get(r as usize).and_then(|m| m.get(&self.error_protos[0]))
+                        if self
+                            .realms
+                            .get(r as usize)
+                            .and_then(|m| m.get(&self.error_protos[0]))
                             == Some(&ti)
                         {
                             let msg = "TypeError: Cannot assign to read only property 'stack'";
@@ -4473,7 +4736,8 @@ impl<'p> Vm<'p> {
                 // check; the assigned value becomes the statics' input slot.
                 if !(this.is_heap() && this.heap_index() == self.regexp_ctor) {
                     return Err(Thrown(
-                        "TypeError: RegExp legacy static setter called on a non-%RegExp% receiver".into(),
+                        "TypeError: RegExp legacy static setter called on a non-%RegExp% receiver"
+                            .into(),
                     ));
                 }
                 if self.regexp_last.is_empty() {
@@ -4670,19 +4934,22 @@ impl<'p> Vm<'p> {
                         match self.to_js_string(a)?.as_str() {
                             "base64" => false,
                             "base64url" => true,
-                            _ => {
-                                return Err(Thrown(
-                                    "TypeError: toBase64 alphabet must be \"base64\" or \"base64url\"".into(),
-                                ))
-                            }
+                            _ => return Err(Thrown(
+                                "TypeError: toBase64 alphabet must be \"base64\" or \"base64url\""
+                                    .into(),
+                            )),
                         }
                     } else {
-                        return Err(Thrown("TypeError: toBase64 alphabet must be a string".into()));
+                        return Err(Thrown(
+                            "TypeError: toBase64 alphabet must be a string".into(),
+                        ));
                     };
                     let op = self.get_prop(opts, "omitPadding")?;
                     (url, self.truthy(op))
                 } else {
-                    return Err(Thrown("TypeError: toBase64 options must be an object".into()));
+                    return Err(Thrown(
+                        "TypeError: toBase64 options must be an object".into(),
+                    ));
                 };
                 let bytes = self
                     .u8_bytes(idx)
@@ -4715,7 +4982,8 @@ impl<'p> Vm<'p> {
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                 if !self.is_string_value(arg) {
                     return Err(Thrown(
-                        "TypeError: Uint8Array.prototype.setFromBase64 argument must be a string".into(),
+                        "TypeError: Uint8Array.prototype.setFromBase64 argument must be a string"
+                            .into(),
                     ));
                 }
                 // Writing into an immutable-backed view is a TypeError — verified
@@ -4774,7 +5042,8 @@ impl<'p> Vm<'p> {
                 let arg = args.first().copied().unwrap_or(Value::UNDEFINED);
                 if !self.is_string_value(arg) {
                     return Err(Thrown(
-                        "TypeError: Uint8Array.prototype.setFromHex argument must be a string".into(),
+                        "TypeError: Uint8Array.prototype.setFromHex argument must be a string"
+                            .into(),
                     ));
                 }
                 // Writing into a TypedArray backed by an immutable ArrayBuffer is a
@@ -4840,7 +5109,10 @@ impl<'p> Vm<'p> {
             GLOBAL_EVAL => {
                 // eval(x): if x is not a String, return it unchanged (spec 19.2.1).
                 let is_str = a0.is_heap()
-                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. });
+                    && matches!(
+                        self.heap.get(a0.heap_index()),
+                        HeapObj::Str(_) | HeapObj::Cons { .. }
+                    );
                 if !is_str {
                     a0
                 } else {
@@ -4851,7 +5123,23 @@ impl<'p> Vm<'p> {
                     // 3 bytes), letting regex literals recover their exact
                     // pattern text. None (O(1)) for well-formed sources.
                     let exact = self.heap.str_exact_if_not_wellformed(a0.heap_index());
-                    return self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, true, None, Vec::new(), None, None, exact.as_deref());
+                    return self.do_eval(
+                        &code,
+                        false,
+                        false,
+                        None,
+                        None,
+                        false,
+                        false,
+                        Value::UNDEFINED,
+                        None,
+                        true,
+                        None,
+                        Vec::new(),
+                        None,
+                        None,
+                        exact.as_deref(),
+                    );
                 }
             }
             // String static methods.
@@ -4891,7 +5179,11 @@ impl<'p> Vm<'p> {
                 let raw = self.to_object(raw0)?;
                 let len_v = self.get_prop(raw, "length")?;
                 let n = self.to_number(len_v)?;
-                let raw_len = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
+                let raw_len = if n.is_finite() && n > 0.0 {
+                    n as usize
+                } else {
+                    0
+                };
                 let subs = args.get(1..).unwrap_or(&[]);
                 let mut out = String::new();
                 for i in 0..raw_len {
@@ -4924,8 +5216,14 @@ impl<'p> Vm<'p> {
                 Value::num(self.eval_math_args(op, args)?)
             }
             // Promise static methods invoked as values (`Promise.resolve`, …).
-            PROMISE_RESOLVE | PROMISE_REJECT | PROMISE_ALL | PROMISE_ALLSETTLED | PROMISE_RACE
-            | PROMISE_ANY | PROMISE_ALLKEYED | PROMISE_ALLSETTLEDKEYED => {
+            PROMISE_RESOLVE
+            | PROMISE_REJECT
+            | PROMISE_ALL
+            | PROMISE_ALLSETTLED
+            | PROMISE_RACE
+            | PROMISE_ANY
+            | PROMISE_ALLKEYED
+            | PROMISE_ALLSETTLEDKEYED => {
                 // These static methods read `this` as the constructor C (for the
                 // result's NewPromiseCapability); a non-constructor `this` is a
                 // TypeError. (The single-offset model still builds a native Promise.)
@@ -4997,42 +5295,66 @@ impl<'p> Vm<'p> {
             // `%TypedArray%.prototype.<m>` invoked as a value (`.map.call(ta, …)`).
             _ if (TA_METHOD_BASE..TA_METHOD_BASE + TA_PROTO_METHODS.len() as u16).contains(&id) => {
                 let m = TA_PROTO_METHODS[(id - TA_METHOD_BASE) as usize];
-                if !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::TypedArray { .. })) {
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::TypedArray { .. })
+                ) {
                     return Err(Thrown(format!(
                         "TypeError: TypedArray.prototype.{m} called on incompatible receiver"
                     )));
                 }
-                self.typed_array_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                self.typed_array_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             _ if (DV_METHOD_BASE..DV_METHOD_BASE + DV_PROTO_METHODS.len() as u16).contains(&id) => {
                 let m = DV_PROTO_METHODS[(id - DV_METHOD_BASE) as usize];
-                if !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::DataView { .. })) {
+                if !matches!(
+                    this.is_heap().then(|| self.heap.get(this.heap_index())),
+                    Some(HeapObj::DataView { .. })
+                ) {
                     return Err(Thrown(format!(
                         "TypeError: DataView.prototype.{m} called on incompatible receiver"
                     )));
                 }
-                self.dataview_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                self.dataview_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             ARRAYBUFFER_SLICE => {
                 // slice requires a non-shared ArrayBuffer receiver.
                 let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
-                if shared || !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::ArrayBuffer { .. })) {
+                if shared
+                    || !matches!(
+                        this.is_heap().then(|| self.heap.get(this.heap_index())),
+                        Some(HeapObj::ArrayBuffer { .. })
+                    )
+                {
                     return Err(Thrown(
-                        "TypeError: ArrayBuffer.prototype.slice called on incompatible receiver".into(),
+                        "TypeError: ArrayBuffer.prototype.slice called on incompatible receiver"
+                            .into(),
                     ));
                 }
-                self.arraybuffer_method(this.heap_index(), "slice", args)?.unwrap_or(Value::UNDEFINED)
+                self.arraybuffer_method(this.heap_index(), "slice", args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             ARRAYBUFFER_RESIZE => {
                 let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
-                if shared || !matches!(this.is_heap().then(|| self.heap.get(this.heap_index())), Some(HeapObj::ArrayBuffer { .. })) {
+                if shared
+                    || !matches!(
+                        this.is_heap().then(|| self.heap.get(this.heap_index())),
+                        Some(HeapObj::ArrayBuffer { .. })
+                    )
+                {
                     return Err(Thrown(
-                        "TypeError: ArrayBuffer.prototype.resize called on incompatible receiver".into(),
+                        "TypeError: ArrayBuffer.prototype.resize called on incompatible receiver"
+                            .into(),
                     ));
                 }
-                self.arraybuffer_method(this.heap_index(), "resize", args)?.unwrap_or(Value::UNDEFINED)
+                self.arraybuffer_method(this.heap_index(), "resize", args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
-            ARRAYBUFFER_TRANSFER_IMMUTABLE | ARRAYBUFFER_SLICE_IMMUTABLE | ARRAYBUFFER_TRANSFER
+            ARRAYBUFFER_TRANSFER_IMMUTABLE
+            | ARRAYBUFFER_SLICE_IMMUTABLE
+            | ARRAYBUFFER_TRANSFER
             | ARRAYBUFFER_TRANSFER_FIXED => {
                 let shared = this.is_heap() && self.shared_buffers.contains(&this.heap_index());
                 if shared
@@ -5042,7 +5364,8 @@ impl<'p> Vm<'p> {
                     )
                 {
                     return Err(Thrown(
-                        "TypeError: ArrayBuffer transfer method called on incompatible receiver".into(),
+                        "TypeError: ArrayBuffer transfer method called on incompatible receiver"
+                            .into(),
                     ));
                 }
                 let name = match id {
@@ -5051,7 +5374,8 @@ impl<'p> Vm<'p> {
                     ARRAYBUFFER_TRANSFER => "transfer",
                     _ => "transferToFixedLength",
                 };
-                self.arraybuffer_method(this.heap_index(), name, args)?.unwrap_or(Value::UNDEFINED)
+                self.arraybuffer_method(this.heap_index(), name, args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             ARRAYBUFFER_ISVIEW => Value::bool(
                 a0.is_heap()
@@ -5092,7 +5416,8 @@ impl<'p> Vm<'p> {
                         "TypeError: SharedArrayBuffer.prototype.grow called on incompatible receiver".into(),
                     ));
                 }
-                self.arraybuffer_method(this.heap_index(), "grow", args)?.unwrap_or(Value::UNDEFINED)
+                self.arraybuffer_method(this.heap_index(), "grow", args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             SAB_SLICE => {
                 // Brand check: a SharedArrayBuffer receiver only (a plain
@@ -5102,18 +5427,24 @@ impl<'p> Vm<'p> {
                         "TypeError: SharedArrayBuffer.prototype.slice called on incompatible receiver".into(),
                     ));
                 }
-                self.arraybuffer_method(this.heap_index(), "slice", args)?.unwrap_or(Value::UNDEFINED)
+                self.arraybuffer_method(this.heap_index(), "slice", args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             _ if (ATOMICS_BASE..ATOMICS_BASE + ATOMICS_METHODS.len() as u16).contains(&id) => {
                 let (name, _) = ATOMICS_METHODS[(id - ATOMICS_BASE) as usize];
                 self.atomics_op(name, args)?
             }
-            DISPOSABLE_USE | DISPOSABLE_ADOPT | DISPOSABLE_DEFER | DISPOSABLE_DISPOSE
-            | DISPOSABLE_DISPOSE_ASYNC | DISPOSABLE_MOVE | DISPOSABLE_DISPOSED_GET
-            | ASYNC_DISPOSABLE_USE | ASYNC_DISPOSABLE_ADOPT | ASYNC_DISPOSABLE_DEFER
-            | ASYNC_DISPOSABLE_MOVE => {
-                self.disposable_op(id, this, args)?
-            }
+            DISPOSABLE_USE
+            | DISPOSABLE_ADOPT
+            | DISPOSABLE_DEFER
+            | DISPOSABLE_DISPOSE
+            | DISPOSABLE_DISPOSE_ASYNC
+            | DISPOSABLE_MOVE
+            | DISPOSABLE_DISPOSED_GET
+            | ASYNC_DISPOSABLE_USE
+            | ASYNC_DISPOSABLE_ADOPT
+            | ASYNC_DISPOSABLE_DEFER
+            | ASYNC_DISPOSABLE_MOVE => self.disposable_op(id, this, args)?,
             GEN_NEXT | GEN_RETURN | GEN_THROW => {
                 let name = match id {
                     GEN_NEXT => "next",
@@ -5199,7 +5530,8 @@ impl<'p> Vm<'p> {
                         "TypeError: Temporal.Duration.prototype.{m} called on incompatible receiver"
                     )));
                 }
-                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             TEMPORAL_DURATION_FROM => {
                 // The EXACT f64 record: from() must store ℝ(𝔽(field)) untouched
@@ -5223,7 +5555,8 @@ impl<'p> Vm<'p> {
                         "TypeError: Temporal.PlainDate.prototype.{m} called on incompatible receiver"
                     )));
                 }
-                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             PLAINDATE_FROM => {
                 // Per ToTemporalDate, the item is validated before the overflow
@@ -5247,7 +5580,13 @@ impl<'p> Vm<'p> {
                 let b = self.to_plain_date(a1)?;
                 let ea = iso_to_epoch_days(a.0, a.1, a.2);
                 let eb = iso_to_epoch_days(b.0, b.1, b.2);
-                Value::num(if ea < eb { -1.0 } else if ea > eb { 1.0 } else { 0.0 })
+                Value::num(if ea < eb {
+                    -1.0
+                } else if ea > eb {
+                    1.0
+                } else {
+                    0.0
+                })
             }
             _ if (PT_M_BASE..PT_M_BASE + PLAINTIME_METHODS.len() as u16).contains(&id) => {
                 let m = PLAINTIME_METHODS[(id - PT_M_BASE) as usize];
@@ -5259,7 +5598,8 @@ impl<'p> Vm<'p> {
                         "TypeError: Temporal.PlainTime.prototype.{m} called on incompatible receiver"
                     )));
                 }
-                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             PLAINTIME_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
@@ -5277,7 +5617,13 @@ impl<'p> Vm<'p> {
                 let a = self.to_plain_time(a0)?;
                 let b = self.to_plain_time(a1)?;
                 let (ta, tb) = (time_to_ns(&a), time_to_ns(&b));
-                Value::num(if ta < tb { -1.0 } else if ta > tb { 1.0 } else { 0.0 })
+                Value::num(if ta < tb {
+                    -1.0
+                } else if ta > tb {
+                    1.0
+                } else {
+                    0.0
+                })
             }
             _ if (PDT_M_BASE..PDT_M_BASE + PLAINDATETIME_METHODS.len() as u16).contains(&id) => {
                 let m = PLAINDATETIME_METHODS[(id - PDT_M_BASE) as usize];
@@ -5289,7 +5635,8 @@ impl<'p> Vm<'p> {
                         "TypeError: Temporal.PlainDateTime.prototype.{m} called on incompatible receiver"
                     )));
                 }
-                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             PLAINDATETIME_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
@@ -5317,7 +5664,13 @@ impl<'p> Vm<'p> {
                     + time_to_ns(&[a[3], a[4], a[5], a[6], a[7], a[8]]);
                 let bn = iso_to_epoch_days(b[0], b[1], b[2]) as i128 * 86_400_000_000_000
                     + time_to_ns(&[b[3], b[4], b[5], b[6], b[7], b[8]]);
-                Value::num(if an < bn { -1.0 } else if an > bn { 1.0 } else { 0.0 })
+                Value::num(if an < bn {
+                    -1.0
+                } else if an > bn {
+                    1.0
+                } else {
+                    0.0
+                })
             }
             _ if (INST_M_BASE..INST_M_BASE + INSTANT_METHODS.len() as u16).contains(&id) => {
                 let m = INSTANT_METHODS[(id - INST_M_BASE) as usize];
@@ -5329,7 +5682,8 @@ impl<'p> Vm<'p> {
                         "TypeError: Temporal.Instant.prototype.{m} called on incompatible receiver"
                     )));
                 }
-                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             INST_FROM => {
                 let ns = self.to_instant_ns(a0)?;
@@ -5340,7 +5694,9 @@ impl<'p> Vm<'p> {
                 // non-integral / non-finite Number → RangeError).
                 let n = self.to_number_strict(a0)?;
                 if !n.is_finite() || n.fract() != 0.0 {
-                    return Err(Thrown("RangeError: epochMilliseconds must be an integer".into()));
+                    return Err(Thrown(
+                        "RangeError: epochMilliseconds must be an integer".into(),
+                    ));
                 }
                 self.make_instant((n as i128) * 1_000_000)?
             }
@@ -5364,7 +5720,13 @@ impl<'p> Vm<'p> {
             INST_COMPARE => {
                 let a = self.to_instant_ns(a0)?;
                 let b = self.to_instant_ns(a1)?;
-                Value::num(if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 })
+                Value::num(if a < b {
+                    -1.0
+                } else if a > b {
+                    1.0
+                } else {
+                    0.0
+                })
             }
             _ if (PYM_M_BASE..PYM_M_BASE + PLAINYEARMONTH_METHODS.len() as u16).contains(&id) => {
                 let m = PLAINYEARMONTH_METHODS[(id - PYM_M_BASE) as usize];
@@ -5376,7 +5738,8 @@ impl<'p> Vm<'p> {
                         "TypeError: Temporal.PlainYearMonth.prototype.{m} called on incompatible receiver"
                     )));
                 }
-                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             PLAINYEARMONTH_FROM => {
                 // Validate the item before observing overflow (see PLAINDATE_FROM).
@@ -5397,7 +5760,13 @@ impl<'p> Vm<'p> {
                 // Compare the full ISO reference date (year, month, then reference day).
                 let ka = (a.0, a.1, a.2);
                 let kb = (b.0, b.1, b.2);
-                Value::num(if ka < kb { -1.0 } else if ka > kb { 1.0 } else { 0.0 })
+                Value::num(if ka < kb {
+                    -1.0
+                } else if ka > kb {
+                    1.0
+                } else {
+                    0.0
+                })
             }
             _ if (PMD_M_BASE..PMD_M_BASE + PLAINMONTHDAY_METHODS.len() as u16).contains(&id) => {
                 let m = PLAINMONTHDAY_METHODS[(id - PMD_M_BASE) as usize];
@@ -5409,7 +5778,8 @@ impl<'p> Vm<'p> {
                         "TypeError: Temporal.PlainMonthDay.prototype.{m} called on incompatible receiver"
                     )));
                 }
-                self.temporal_method(this.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                self.temporal_method(this.heap_index(), m, args)?
+                    .unwrap_or(Value::UNDEFINED)
             }
             _ if (ZDT_M_BASE..ZDT_M_BASE + ZONEDDATETIME_METHODS.len() as u16).contains(&id) => {
                 let m = ZONEDDATETIME_METHODS[(id - ZDT_M_BASE) as usize];
@@ -5505,7 +5875,10 @@ impl<'p> Vm<'p> {
             }
             ZDT_GET_TZ_TRANSITION => {
                 if !this.is_heap()
-                    || !matches!(self.heap.get(this.heap_index()), HeapObj::Temporal { kind: 7, .. })
+                    || !matches!(
+                        self.heap.get(this.heap_index()),
+                        HeapObj::Temporal { kind: 7, .. }
+                    )
                 {
                     return Err(Thrown(
                         "TypeError: getTimeZoneTransition called on a non-ZonedDateTime".into(),
@@ -5525,7 +5898,10 @@ impl<'p> Vm<'p> {
             }
             PDT_WITH_PLAIN_TIME => {
                 if !this.is_heap()
-                    || !matches!(self.heap.get(this.heap_index()), HeapObj::Temporal { kind: 3, .. })
+                    || !matches!(
+                        self.heap.get(this.heap_index()),
+                        HeapObj::Temporal { kind: 3, .. }
+                    )
                 {
                     return Err(Thrown(
                         "TypeError: withPlainTime called on a non-PlainDateTime".into(),
@@ -5593,7 +5969,12 @@ impl<'p> Vm<'p> {
                     self.require_object_coercible(a1)?;
                     self.to_object(a1)?
                 };
-                self.opt_string(options, "localeMatcher", "best fit", &["lookup", "best fit"])?;
+                self.opt_string(
+                    options,
+                    "localeMatcher",
+                    "best fit",
+                    &["lookup", "best fit"],
+                )?;
                 // LookupSupportedLocales: keep a requested tag only when
                 // BestAvailableLocale finds a match for its no-extension form.
                 // Returning the whole list unfiltered claimed support for every
@@ -5646,7 +6027,11 @@ impl<'p> Vm<'p> {
                 self.intl_parts_array(&parts)
             }
             INTL_NF_FORMAT_RANGE | INTL_NF_FORMAT_RANGE_TO_PARTS => {
-                let name = if id == INTL_NF_FORMAT_RANGE { "formatRange" } else { "formatRangeToParts" };
+                let name = if id == INTL_NF_FORMAT_RANGE {
+                    "formatRange"
+                } else {
+                    "formatRangeToParts"
+                };
                 let resolved = self.intl_this(this, INTL_NUMBERFORMAT, name)?;
                 // FormatNumericRange step 3: an undefined endpoint is a TypeError
                 // BEFORE either is coerced; a NaN endpoint is a RangeError after.
@@ -5703,8 +6088,11 @@ impl<'p> Vm<'p> {
                 self.intl_parts_array(&parts)
             }
             INTL_DTF_FORMAT_RANGE | INTL_DTF_FORMAT_RANGE_TO_PARTS => {
-                let name =
-                    if id == INTL_DTF_FORMAT_RANGE { "formatRange" } else { "formatRangeToParts" };
+                let name = if id == INTL_DTF_FORMAT_RANGE {
+                    "formatRange"
+                } else {
+                    "formatRangeToParts"
+                };
                 let resolved = self.intl_this(this, INTL_DATETIMEFORMAT, name)?;
                 if a0 == Value::UNDEFINED || a1 == Value::UNDEFINED {
                     return Err(Thrown(format!("TypeError: {name} requires two dates")));
@@ -5768,7 +6156,9 @@ impl<'p> Vm<'p> {
                 let x = self.to_number_coerce(a0)?;
                 let y = self.to_number_coerce(a1)?;
                 if x.is_nan() || y.is_nan() {
-                    return Err(Thrown("RangeError: selectRange endpoints must not be NaN".into()));
+                    return Err(Thrown(
+                        "RangeError: selectRange endpoints must not be NaN".into(),
+                    ));
                 }
                 self.alloc_str("other".to_string())
             }
@@ -5783,8 +6173,10 @@ impl<'p> Vm<'p> {
                 // format string, so both entry points derive from one splitter.
                 let parts = list_parts_en(&strs, &t, &st);
                 if to_parts {
-                    let ps: Vec<(String, String, &str)> =
-                        parts.into_iter().map(|(t, v)| (t.to_string(), v, "")).collect();
+                    let ps: Vec<(String, String, &str)> = parts
+                        .into_iter()
+                        .map(|(t, v)| (t.to_string(), v, ""))
+                        .collect();
                     self.intl_parts_array(&ps)
                 } else {
                     let s: String = parts.into_iter().map(|(_, v)| v).collect();
@@ -5799,7 +6191,9 @@ impl<'p> Vm<'p> {
                 // PartitionRelativeTimePattern step 2: a non-finite value is a
                 // RangeError (it was formatted as "in NaN days" before).
                 if !v.is_finite() {
-                    return Err(Thrown("RangeError: relative time value must be finite".into()));
+                    return Err(Thrown(
+                        "RangeError: relative time value must be finite".into(),
+                    ));
                 }
                 // SingularRelativeTimeUnit: ToString first (so a Symbol is a
                 // TypeError), then the eight allowed units in either number —
@@ -5807,8 +6201,10 @@ impl<'p> Vm<'p> {
                 // RangeError.
                 let unit_raw = self.to_js_string(a1)?;
                 let unit = unit_raw.strip_suffix('s').unwrap_or(&unit_raw).to_string();
-                if !["second", "minute", "hour", "day", "week", "month", "quarter", "year"]
-                    .contains(&unit.as_str())
+                if ![
+                    "second", "minute", "hour", "day", "week", "month", "quarter", "year",
+                ]
+                .contains(&unit.as_str())
                 {
                     return Err(Thrown(format!("RangeError: invalid unit: {unit_raw}")));
                 }
@@ -5932,7 +6328,11 @@ impl<'p> Vm<'p> {
                 // row covers is its own maximum AND its own minimum — `xtg`
                 // must not expand to the root's `en-Latn-US`
                 // (Locale/likely-subtags-grandfathered.js).
-                let name = if id == INTL_LOCALE_MAXIMIZE { "maximize" } else { "minimize" };
+                let name = if id == INTL_LOCALE_MAXIMIZE {
+                    "maximize"
+                } else {
+                    "minimize"
+                };
                 let resolved = self.intl_this(this, INTL_LOCALE, name)?;
                 let tag = self.display(self.intl_slot(resolved, "@@tag"));
                 match crate::vm::locale_tag::parse_lang_tag(&tag) {
@@ -5955,7 +6355,8 @@ impl<'p> Vm<'p> {
                 let resolved = self.intl_this(this, INTL_LOCALE, "firstDayOfWeek")?;
                 self.intl_slot(resolved, "firstDayOfWeek")
             }
-            _ if (INTL_LOCALE_INFO_BASE..INTL_LOCALE_INFO_BASE + LOCALE_INFO_METHODS.len() as u16)
+            _ if (INTL_LOCALE_INFO_BASE
+                ..INTL_LOCALE_INFO_BASE + LOCALE_INFO_METHODS.len() as u16)
                 .contains(&id) =>
             {
                 let which = LOCALE_INFO_METHODS[(id - INTL_LOCALE_INFO_BASE) as usize];
@@ -6148,7 +6549,8 @@ impl<'p> Vm<'p> {
                 }
                 // Number/Boolean receivers are primitive values; the rest are heap.
                 if kind == 2 {
-                    self.number_method(this, m, args)?.unwrap_or(Value::UNDEFINED)
+                    self.number_method(this, m, args)?
+                        .unwrap_or(Value::UNDEFINED)
                 } else if kind == 5 {
                     self.boolean_method(this, m)?
                 } else if kind == 1 && matches!(m, "toString" | "valueOf") {
@@ -6157,7 +6559,10 @@ impl<'p> Vm<'p> {
                     // unwrapped above), else TypeError — unlike the coercing methods below.
                     if this.is_heap() && self.heap.is_str_like(this.heap_index()) {
                         this
-                    } else if this.is_heap() && self.str_proto != 0 && this.heap_index() == self.str_proto {
+                    } else if this.is_heap()
+                        && self.str_proto != 0
+                        && this.heap_index() == self.str_proto
+                    {
                         // %String.prototype% is itself a String exotic whose
                         // [[StringData]] is the empty string.
                         self.alloc_str(String::new())
@@ -6167,7 +6572,10 @@ impl<'p> Vm<'p> {
                         )));
                     }
                 } else if kind == 1
-                    && matches!(m, "replace" | "replaceAll" | "split" | "match" | "search" | "matchAll")
+                    && matches!(
+                        m,
+                        "replace" | "replaceAll" | "split" | "match" | "search" | "matchAll"
+                    )
                 {
                     // These methods must observe the ARGUMENT's well-known Symbol
                     // method (IsRegExp/flags + GetMethod(@@replace/@@split/@@match/…))
@@ -6189,7 +6597,8 @@ impl<'p> Vm<'p> {
                         let s = self.to_js_string(this)?;
                         self.alloc_str(s).heap_index()
                     };
-                    self.string_method(s_idx, m, args)?.unwrap_or(Value::UNDEFINED)
+                    self.string_method(s_idx, m, args)?
+                        .unwrap_or(Value::UNDEFINED)
                 } else if !this.is_heap() {
                     // Array.prototype methods are generic: a primitive `this` is
                     // ToObject-coerced (a Number/Boolean wrapper has length 0, so
@@ -6197,7 +6606,8 @@ impl<'p> Vm<'p> {
                     // primitive receivers for the non-generic kinds.
                     if kind == 0 && this != Value::NULL && this != Value::UNDEFINED {
                         let boxed = self.to_object(this)?;
-                        self.array_method(boxed.heap_index(), m, args)?.unwrap_or(Value::UNDEFINED)
+                        self.array_method(boxed.heap_index(), m, args)?
+                            .unwrap_or(Value::UNDEFINED)
                     } else {
                         return Err(Thrown(format!(
                             "TypeError: prototype method {m} called on {}",
@@ -6227,7 +6637,6 @@ impl<'p> Vm<'p> {
             _ => Value::UNDEFINED,
         })
     }
-
 }
 
 /// The always-unescaped set for the Encode operation: uriAlpha + DecimalDigit +
@@ -6381,7 +6790,7 @@ fn from_base64(s: &str, url: bool, lch: u8, max_len: usize) -> (usize, Vec<u8>, 
             }
             // Partial chunk at end (no padding).
             match lch {
-                2 => return (read, bytes, None), // stop-before-partial
+                2 => return (read, bytes, None),     // stop-before-partial
                 1 => return (read, bytes, synerr()), // strict
                 _ => {
                     // loose
@@ -6476,10 +6885,8 @@ fn from_base64(s: &str, url: bool, lch: u8, max_len: usize) -> (usize, Vec<u8>, 
 /// Encode bytes as base64 (Uint8Array.prototype.toBase64). `url` selects the
 /// base64url alphabet (`-_` for `+/`); `omit_padding` drops trailing `=`.
 fn to_base64(bytes: &[u8], url: bool, omit_padding: bool) -> String {
-    const STD: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const URL: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let t = if url { URL } else { STD };
     let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
     let mut i = 0;
@@ -6520,8 +6927,7 @@ fn to_base64(bytes: &[u8], url: bool, omit_padding: bool) -> String {
 /// units (not chars) so an astral char yields its two surrogate `%uXXXX`s.
 fn escape_str(s: &str) -> String {
     // A-Za-z0-9 and @ * _ + - . /
-    const KEEP: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
+    const KEEP: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
     let mut out = String::new();
     for u in s.encode_utf16() {
         if u < 0x80 && KEEP.contains(&(u as u8)) {
@@ -6565,9 +6971,12 @@ fn unescape_str(s: &str) -> String {
         let c = u[i];
         if c == b'%' as u16 {
             if i + 5 < n && u[i + 1] == b'u' as u16 {
-                if let (Some(a), Some(b), Some(d), Some(e)) =
-                    (hexv(u[i + 2]), hexv(u[i + 3]), hexv(u[i + 4]), hexv(u[i + 5]))
-                {
+                if let (Some(a), Some(b), Some(d), Some(e)) = (
+                    hexv(u[i + 2]),
+                    hexv(u[i + 3]),
+                    hexv(u[i + 4]),
+                    hexv(u[i + 5]),
+                ) {
                     out.push((a << 12) | (b << 8) | (d << 4) | e);
                     i += 6;
                     continue;

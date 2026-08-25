@@ -32,7 +32,11 @@ use super::*;
 /// and rely on every caller loading its bool homes LAST; that hand-maintained
 /// ordering is what the W16 audit removed, so the twins here, in
 /// `emit_int_entry_load_gpr` and in `emit_bool_entry_load` now all agree.
-pub(crate) fn emit_int_entry_load(ops: &mut dynasmrt::x64::Assembler, home: u8, entry_bail: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_int_entry_load(
+    ops: &mut dynasmrt::x64::Assembler,
+    home: u8,
+    entry_bail: dynasmrt::DynamicLabel,
+) {
     let as_double = ops.new_dynamic_label();
     let store = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -76,7 +80,11 @@ pub(crate) fn emit_int_entry_load(ops: &mut dynasmrt::x64::Assembler, home: u8, 
 /// (else `bail`), then put the 0/1 payload in the home. Scratch is `rdx`, NOT
 /// `r10` — `r10` is itself one of `BOOL_GPRS`, so using it here would clobber an
 /// already-loaded bool home on the next iteration of the load loop.
-pub(crate) fn emit_bool_entry_load(ops: &mut dynasmrt::x64::Assembler, home: u8, bail: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_bool_entry_load(
+    ops: &mut dynasmrt::x64::Assembler,
+    home: u8,
+    bail: dynasmrt::DynamicLabel,
+) {
     dynasm!(ops
         ; mov rdx, rax
         ; shr rdx, 48
@@ -90,7 +98,12 @@ pub(crate) fn emit_bool_entry_load(ops: &mut dynasmrt::x64::Assembler, home: u8,
 /// Materialise an integer constant (`LoadInt`/`LoadConst`-Int) into its i64 home:
 /// the FULL sign-extended i64 immediate, then `movq` (NOT cvtsi2sd — we want the
 /// integer bit pattern, not its f64 form).
-pub(crate) fn emit_int_const(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, instr: &Instr, proto: &FuncProto) {
+pub(crate) fn emit_int_const(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: &RegionPlan,
+    instr: &Instr,
+    proto: &FuncProto,
+) {
     let (h, v) = match *instr {
         Instr::LoadInt { dst, val } => (xh(plan, dst), val as i64),
         Instr::LoadConst { dst, idx } => {
@@ -108,7 +121,12 @@ pub(crate) fn emit_int_const(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPl
 /// op for an ordinary region (the overflowed value flushes via cvtsi2sd to
 /// exactly JS's rounded result, so ip+1 is sound), or the caller's replay point
 /// when this op came from a spliced body.
-pub(crate) fn emit_i53_guard(ops: &mut dynasmrt::x64::Assembler, h: u8, resume_ip: i32, flush_exit: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_i53_guard(
+    ops: &mut dynasmrt::x64::Assembler,
+    h: u8,
+    resume_ip: i32,
+    flush_exit: dynasmrt::DynamicLabel,
+) {
     // Range trick: x ∈ [-2^53, 2^53] ⟺ (x + 2^53) ≤ 2^54 as UNSIGNED (a value
     // below -2^53 wraps to a huge unsigned and fails too). The two constants are
     // pre-loaded once in the prologue (r13 = 2^53, r14 = 2^54) — avoiding two
@@ -156,7 +174,18 @@ pub(crate) fn copy_clobber(lc: &mut LastCopy, h: u8) {
 /// and a 2^53 guard (skipped when the interval analysis proved the result is
 /// always in range). `add = true` ⇒ paddq (commutative); else psubq.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_ibin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, ip: usize, resume_ip: i32, flush_exit: dynasmrt::DynamicLabel, dst: u16, a: u16, b: u16, add: bool, lc: &mut LastCopy) {
+pub(crate) fn emit_ibin(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: &RegionPlan,
+    ip: usize,
+    resume_ip: i32,
+    flush_exit: dynasmrt::DynamicLabel,
+    dst: u16,
+    a: u16,
+    b: u16,
+    add: bool,
+    lc: &mut LastCopy,
+) {
     let (d, ax, bx) = (xh(plan, dst), xh(plan, a), xh(plan, b));
     if add {
         if d == ax || copy_is_noop(*lc, d, ax) {
@@ -253,7 +282,12 @@ pub(crate) fn emit_int_wt(
 /// Set the integer flags for `home[a] <cmp> home[b]` (SIGNED). Reads `b` from
 /// its prologue-filled gpr mirror when it is a hoisted constant (one `movq`
 /// fewer in the loop body); symmetric for a constant `a`.
-pub(crate) fn emit_icmp_flags(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, a: u16, b: u16) {
+pub(crate) fn emit_icmp_flags(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: &RegionPlan,
+    a: u16,
+    b: u16,
+) {
     if let Some(&(g, _)) = plan.gpr_const.get(&b) {
         let ax = xh(plan, a);
         dynasm!(ops ; movq rax, Rx(ax) ; cmp rax, Rq(g));
@@ -267,7 +301,14 @@ pub(crate) fn emit_icmp_flags(ops: &mut dynasmrt::x64::Assembler, plan: &RegionP
 }
 
 /// `bool_home[dst] = (home[a] <cmp> home[b])` as SIGNED i64 comparison.
-pub(crate) fn emit_icmp(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, dst: u16, a: u16, b: u16, cmp: Cmp) {
+pub(crate) fn emit_icmp(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: &RegionPlan,
+    dst: u16,
+    a: u16,
+    b: u16,
+    cmp: Cmp,
+) {
     let d = gh(plan, dst);
     emit_icmp_flags(ops, plan, a, b);
     match cmp {
@@ -328,7 +369,12 @@ pub(crate) fn emit_region_restore_n(ops: &mut dynasmrt::x64::Assembler, xmm_off:
 
 /// Materialise a numeric constant (a `LoadInt`/`LoadConst` op) into a value's
 /// xmm home. Shared by the prologue (for hoisted loop-invariants) and the body.
-pub(crate) fn emit_load_const(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, instr: &Instr, proto: &FuncProto) {
+pub(crate) fn emit_load_const(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: &RegionPlan,
+    instr: &Instr,
+    proto: &FuncProto,
+) {
     match *instr {
         Instr::LoadInt { dst, val } => {
             let h = xh(plan, dst);
@@ -361,7 +407,11 @@ pub(crate) fn emit_load_const(ops: &mut dynasmrt::x64::Assembler, plan: &RegionP
 /// regalloc twin of the W14 defect, which was fixed in `region_int.rs` only.)
 /// rdx is dead at all three call sites: the two prologue loads take their Value
 /// from rax, and the body's element load has already consumed the pinned base.
-pub(crate) fn emit_box_to_home(ops: &mut dynasmrt::x64::Assembler, home: u8, bail: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_box_to_home(
+    ops: &mut dynasmrt::x64::Assembler,
+    home: u8,
+    bail: dynasmrt::DynamicLabel,
+) {
     let int_path = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
@@ -411,7 +461,15 @@ pub(crate) fn home(plan: &RegionPlan, r: u16) -> Home {
 }
 
 /// Emit a register-to-register f64 binop into the dst home, handling aliasing.
-pub(crate) fn emit_dbin(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, dst: u16, a: u16, b: u16, op: DOp, lc: &mut LastCopy) {
+pub(crate) fn emit_dbin(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: &RegionPlan,
+    dst: u16,
+    a: u16,
+    b: u16,
+    op: DOp,
+    lc: &mut LastCopy,
+) {
     let (d, ax, bx) = (xh(plan, dst), xh(plan, a), xh(plan, b));
     let commutative = matches!(op, DOp::Add | DOp::Mul);
     // Arrange operands so the accumulator is `d`. For non-commutative ops where
@@ -454,7 +512,14 @@ pub(crate) fn emit_dop_xmm0(ops: &mut dynasmrt::x64::Assembler, src: u8, op: DOp
 }
 
 /// Emit `bool_home[dst] = (a <cmp> b)` using f64 ordered comparison.
-pub(crate) fn emit_dcmp(ops: &mut dynasmrt::x64::Assembler, plan: &RegionPlan, dst: u16, a: u16, b: u16, cmp: Cmp) {
+pub(crate) fn emit_dcmp(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: &RegionPlan,
+    dst: u16,
+    a: u16,
+    b: u16,
+    cmp: Cmp,
+) {
     let (ax, bx) = (xh(plan, a), xh(plan, b));
     let d = gh(plan, dst);
     match cmp {
@@ -529,7 +594,17 @@ pub(crate) fn emit_ic_probe(
     ic_off: i32,
     cont: dynasmrt::DynamicLabel,
     acc: Option<dynasmrt::DynamicLabel>,
+    direct_miss: bool,
 ) {
+    if direct_miss {
+        // The stable site has proved identity-thrashing while its guarded
+        // shape-slot memo hits. Enter the unchanged miss-helper sequence with
+        // its expected receiver-bits contract, omitting every identity way.
+        // Accessors have no tagged-way consumer in this form.
+        debug_assert!(acc.is_none());
+        dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
+        return;
+    }
     let probe = ops.new_dynamic_label();
     let next = ops.new_dynamic_label();
     let hit = ops.new_dynamic_label();
@@ -750,7 +825,11 @@ pub(crate) fn ta_slot_off(j: usize) -> i32 {
 /// Emitted in the prologue and AFTER every helper that can run user code
 /// (which may detach/resize a buffer or reassign the source) — the same
 /// discipline as the r13/r14 re-fetch. Clobbers only volatile registers.
-pub(crate) fn emit_refetch_ta(ops: &mut dynasmrt::x64::Assembler, snapshot_helper: usize, plan: &TaPinPlan) {
+pub(crate) fn emit_refetch_ta(
+    ops: &mut dynasmrt::x64::Assembler,
+    snapshot_helper: usize,
+    plan: &TaPinPlan,
+) {
     for (j, pin) in plan.pins.iter().enumerate() {
         match pin.src {
             TaPinSrc::Global(g) => dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]),
@@ -773,7 +852,11 @@ pub(crate) fn emit_refetch_ta(ops: &mut dynasmrt::x64::Assembler, snapshot_helpe
 /// huge index survives here and is caught by the caller's unsigned bounds
 /// check (len < 2^31, so any negative i64 compares above it).
 /// Clobbers rcx/r10/xmm0/xmm1.
-pub(crate) fn emit_ta_key(ops: &mut dynasmrt::x64::Assembler, key: u16, bail: dynasmrt::DynamicLabel) {
+pub(crate) fn emit_ta_key(
+    ops: &mut dynasmrt::x64::Assembler,
+    key: u16,
+    bail: dynasmrt::DynamicLabel,
+) {
     let key_dbl = ops.new_dynamic_label();
     let key_ok = ops.new_dynamic_label();
     dynasm!(ops
@@ -884,4 +967,3 @@ pub(crate) fn emit_box_f64_canon(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
         ; mov [rbx + dreg(dst)], rax
     );
 }
-

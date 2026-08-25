@@ -661,6 +661,15 @@ pub(crate) fn region_can_compile(
             // megamorphic / native callee → deopt to the interpreter at this
             // op; repeated deopts evict the region).
             Instr::CallMethod { .. } => {}
+            // Computed calls are MEMORY-only. The helper is deliberately a
+            // pure prefix: it claims only a plain callable stored in a present
+            // own dense-Array slot, preserving `this = receiver`; every exotic
+            // or observable lookup returns to the interpreter untouched.
+            Instr::CallMethodComputed { .. } => {
+                if !crate::codegen::computed_call_dense_enabled() {
+                    reject!("[decline] CallMethodComputed (dense helper disabled) at region [{start},{end}]");
+                }
+            }
             // Plain calls `f(…)` — same protocol via `jit_call_ic`.
             Instr::Call { .. } => {}
             // Logical `!` — MEM path (Bool flips natively; anything else goes
@@ -738,14 +747,13 @@ pub(crate) fn region_can_compile(
             // PER-OP (never hoisted across a Call/CallMethod), so a value an inner
             // closure mutated via a call in the SAME region is re-read on the next
             // execution. The helpers allocate nothing and run no user code, so no
-            // pinned-pointer (r13/r14/TA) re-fetch is needed. Writes (`CellSet`,
-            // `CellSetChecked`, `UpvalSet`) are NOT admitted — they keep declining.
+            // pinned-pointer (r13/r14/TA) re-fetch is needed.
             Instr::CellGet { .. } | Instr::UpvalGet { .. } => {}
-            // Closure-cell / upvalue WRITES — same shape as the reads: one heap
-            // store, no TDZ check (that is CellSetChecked, still declined), no
-            // alloc, no user code. These used to decline, and one captured-local
-            // assignment took the whole enclosing region down with it — they are
-            // markdown-render's only region declines.
+            // Closure-cell / upvalue WRITES. `CellSet` is the declaring scope's
+            // unconditional store. `UpvalSet` is different: its helper first
+            // declines captured const / named-function / TDZ cells, so the
+            // interpreter replays the op and applies PutValue's throw/no-op
+            // semantics. Both hit paths are allocation- and user-code-free.
             Instr::CellSet { .. } | Instr::UpvalSet { .. } => {}
             // `+x` — a NUMBER passes straight through (the interpreter returns
             // the Value verbatim); anything else needs observable ToNumber
@@ -897,6 +905,20 @@ pub(crate) fn region_can_compile(
 /// real window at host entry, so this compile-time cap only bounds the window).
 pub(crate) const LEAF_MAX_REGS: u16 = 32;
 
+/// A modestly wider scratch window admits compiler-expanded numeric kernels
+/// whose live set is still tiny but whose SSA-style temporary numbering crosses
+/// the legacy 32-register cutoff. Runtime headroom remains guarded by
+/// `jit_regs_fits`; nested splices separately cap their combined window at the
+/// 64-bit analysis-mask limit.
+const WIDE_LEAF_MAX_REGS: u16 = 40;
+
+env_off_switch! {
+    /// `ZIPP_NO_WIDE_LEAF=1` restores the legacy 32-register leaf-inline cap.
+    /// Default-on widening is plan-time only and does not alter the emitted
+    /// fallback: every identity/type/headroom miss still performs the real call.
+    fn wide_leaf_enabled() = "ZIPP_NO_WIDE_LEAF"
+}
+
 /// Q4 leaf-call inlining eligibility: is `callee`'s body a leaf the region/Tier-C
 /// emitter can inline over a scratch window? Returns the body ops to inline, or
 /// `None` to decline (the Call keeps the per-call helper). v2 admits FORWARD
@@ -919,6 +941,90 @@ pub(crate) const LEAF_MAX_REGS: u16 = 32;
 ///   admitted is `StoreGlobal*`; `SetProp`/`SetIndex` are NOT in the subset.)
 pub fn callee_leaf_ok(callee: &FuncProto) -> Option<Vec<Instr>> {
     leaf_ok_impl(callee, false).map(|(body, _)| body)
+}
+
+/// Call-site specialization for ordinary default parameters. A non-simple
+/// parameter list is accepted only when its bytecode starts with the compiler's
+/// exact default prologue and this call supplies every guarded parameter. The
+/// emitter checks those live caller arguments are not `undefined`; a miss runs
+/// the unchanged call, which evaluates the default initializer normally.
+///
+/// This deliberately does not generalize destructuring/rest parameters. Any
+/// residual binding opcode remains in the specialized suffix and is rejected by
+/// `leaf_ok_impl`, while rest/`arguments` are rejected before the scan.
+pub fn callee_leaf_ok_for_call(callee: &FuncProto, argc: u16) -> Option<(Vec<Instr>, u64)> {
+    if callee.simple_params {
+        return callee_leaf_ok(callee).map(|body| (body, 0));
+    }
+    if callee.rest_reg.is_some() || callee.arguments_reg.is_some() {
+        return None;
+    }
+
+    let mut at = 0usize;
+    let mut arg_mask = 0u64;
+    loop {
+        let Some(
+            [Instr::LoadUndefined { dst: undef }, Instr::Eq {
+                dst: cond,
+                a: eq_a,
+                b: eq_b,
+            }, Instr::JumpIfFalse {
+                cond: branch_cond,
+                target,
+            }, ..],
+        ) = callee.code.get(at..)
+        else {
+            break;
+        };
+        if branch_cond != cond {
+            break;
+        }
+        let param = if eq_a == undef {
+            *eq_b
+        } else if eq_b == undef {
+            *eq_a
+        } else {
+            break;
+        };
+        if param == 0
+            || param > callee.param_count
+            || param > argc
+            || param > 64
+            || (arg_mask & (1u64 << (param - 1))) != 0
+        {
+            break;
+        }
+        let target = *target as usize;
+        if target <= at + 3 || target > callee.code.len() {
+            break;
+        }
+        arg_mask |= 1u64 << (param - 1);
+        at = target;
+    }
+    if arg_mask == 0 || at >= callee.code.len() {
+        return None;
+    }
+
+    let mut specialized = callee.clone();
+    specialized.simple_params = true;
+    specialized.code = callee.code[at..].to_vec();
+    // Inline-body labels are local to the returned suffix. A branch back into a
+    // removed default initializer would make the specialization invalid.
+    for instr in &mut specialized.code {
+        let target = match instr {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => target,
+            _ => continue,
+        };
+        if (*target as usize) < at {
+            return None;
+        }
+        *target -= at as u32;
+    }
+    leaf_ok_impl(&specialized, false).map(|(body, _)| (body, arg_mask))
 }
 
 /// Like `callee_leaf_ok`, but admits ONE `Call` in the body and reports its
@@ -964,7 +1070,12 @@ fn leaf_ok_impl(callee: &FuncProto, allow_one_call: bool) -> Option<(Vec<Instr>,
     // `jit_regs_fits` validates `reg_window + callee_reg_count` at host entry (a
     // tight window → fallback), so a generous compile-time cap is sound. 32 covers
     // a CFG-ish leaf like `tokIs` (22 regs) plus headroom.
-    if callee.reg_count > LEAF_MAX_REGS {
+    let max_regs = if wide_leaf_enabled() {
+        WIDE_LEAF_MAX_REGS
+    } else {
+        LEAF_MAX_REGS
+    };
+    if callee.reg_count > max_regs {
         return None;
     }
     let full = &callee.code;
@@ -1336,6 +1447,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) str_append_index: usize,
     /// Helper for a generic `obj.m(args…)` via the interpreter's per-site IC.
     pub(crate) call_method_ic: usize,
+    /// Guarded dense-Array helper for `obj[key](args...)`.
+    pub(crate) call_method_computed_dense: usize,
     /// Guarded direct `RegExp.prototype.test` / `exec` CallMethod helper.
     pub(crate) regexp_call_direct: usize,
     /// Guarded primitive-string `matchAll` / regex `replace` helper.
@@ -1346,6 +1459,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) call_ic: usize,
     /// Tier C native→native cross-call fast path (B83); falls back to `call_ic`.
     pub(crate) cross_call: usize,
+    /// Same-prototype lexical-arrow/two-argument cross-call specialization.
+    pub(crate) cross_call_same_proto2: usize,
     /// `PROP_VIA_IC` continuation for GetProp (accessor / class receiver).
     pub(crate) get_prop_slow: usize,
     /// `PROP_VIA_IC` continuation for SetProp.
@@ -1376,10 +1491,20 @@ pub(crate) struct HeapHelpers {
     pub(crate) str_substring: usize,
     /// `jit_coll_lookup` intrinsic (Map.get/has, Set.has).
     pub(crate) coll_lookup: usize,
+    /// Guarded Tier-C `Map.set`/`Map.clear` helper.
+    pub(crate) coll_mutate: usize,
+    /// Guarded primitive-string `toUpperCase()` helper.
+    pub(crate) str_upper_case: usize,
     /// `UpvalGet` helper (upvalue idx → inner Value bits / TDZ-deopt sentinel).
     pub(crate) upval_get: usize,
     pub(crate) cell_set: usize,
     pub(crate) upval_set: usize,
+    /// Tier-C-only captured accessors; these use the frame-free activation's
+    /// explicitly installed closure rather than the interpreter frame stack.
+    pub(crate) tierc_upval_get: usize,
+    pub(crate) tierc_upval_set: usize,
+    /// Exact captured `x = (x + 1) | 0` Int fast prefix (Tier C only).
+    pub(crate) tierc_upval_inc_i32: usize,
     pub(crate) get_index_concat: usize,
     /// `ForInLive` helper (obj bits, key bits → Bool Value bits).
     pub(crate) forin_live: usize,
@@ -1531,8 +1656,8 @@ pub(crate) fn compile_region(
     ta_plan: &TaPinPlan,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
     method_plan: &FxHashMap<usize, MethodInlinePlan>,
-    cross_plan: &FxHashSet<usize>,
-    acc_emit: &[bool],
+    cross_plan: &CrossCallPlan,
+    ic_emit: &[IcSiteEmit],
     // W20: may the register path admit the boxed heap arms here? Cleared for a
     // region whose BOXREF compile already evicted once.
     boxref_ok: bool,
@@ -1584,7 +1709,7 @@ pub(crate) fn compile_region(
         heap.ta_snapshot,
         Some(&heap),
         Some(method_plan),
-        acc_emit,
+        ic_emit,
         boxref_ok,
         meter,
     ) {
@@ -1601,7 +1726,7 @@ pub(crate) fn compile_region(
         leaf_plan,
         method_plan,
         cross_plan,
-        acc_emit,
+        ic_emit,
         meter,
     )
     .map(|f| (f, true, false))

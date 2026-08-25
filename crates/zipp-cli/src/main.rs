@@ -181,6 +181,8 @@ fn main() -> ExitCode {
         eprintln!(
             "[ic] call/apply target inlines  call {cih}  apply {aih}  hasOwn-intrinsic {hoh}"
         );
+        let (ccs, ccd) = zipp_vm::computed_call_stats();
+        eprintln!("[ic] dense computed calls  served {ccs}  declined {ccd}");
         let (ins, ide) = zipp_vm::iter_region_stats();
         eprintln!("[ic] region iter-next  native steps {ins}  deopts {ide}");
         let (cff, cfl) = zipp_vm::cross_fill_stats();

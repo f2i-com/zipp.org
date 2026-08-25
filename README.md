@@ -143,6 +143,59 @@ shape-metadata parity is complete. The next performance work should generalise
 those paths and improve startup-adjusted compute without giving the cold result
 back.
 
+### Hostile application diagnostics
+
+The retained series is intentionally stable and historically useful, but it is
+also unusually friendly to Zipp: mostly top-level `var`, fixed shapes, and hot
+paths already covered by exact reducers. The separate 17-case
+[`bench/hostile`](bench/hostile/README.md) corpus deliberately attacks those
+assumptions with nested functions, `let`/`const`, mutable closures, megamorphic
+properties, mixed local types, allocation/GC pressure, exceptions, sustained
+async work, modules, a React-shaped kernel, a warm router, and exact vendored npm
+source.
+
+Hostile results are never folded into the retained-ten headline. They are the
+generalisation gate, and Zipp does **not** yet claim Node parity on that corpus.
+The harness reports cold and startup-adjusted ratios, category-balanced results,
+and baseline/stressor degradation while requiring deterministic, exact output.
+The historical
+[Wave 30 diagnostic](bench/hostile/w30_combined_dirty_2026-08-25.json) measured
+**3.1023× category-balanced / 2.7173× ordinary geomean**. The latest
+[Wave 39 development checkpoint](bench/hostile/w39_final_cleanenv_dirty_2026-08-25.json)
+uses the full corpus, 15 counterbalanced repetitions and 10,000 bootstrap
+samples. It is exact on all 17 rows, healthy and drift-free, and measures
+**1.3564× cold category-balanced / 1.2866× ordinary geomean**. The artifact
+correctly remains `publishable:false` because it measures dirty/untracked
+sources rather than a clean release.
+
+That gain is broad but not parity. Bytecode VM 0.895×, modules 0.396×,
+ephemeral allocation 0.368×, stable numeric locals 0.464×, throw/catch 0.527×,
+and async burst 0.635× beat Node. The remaining cold gaps are surviving
+allocation 4.623×, stable/megamorphic object shapes 3.871×/3.848×, the warm
+router 3.792×, React-shaped reconciliation 3.272×, exact vendored NanoID
+2.566×, mutable closures 1.976×, and mixed locals 1.686×. Object-shape
+degradation is now Node-like (0.984× relative), while survivor lifetime
+degradation remains 12.539×; the per-row/category gate therefore still fails.
+
+A native shape-way experiment measured about 10.6% faster on the stable-shape
+row, then independent security review found exotic-shape collisions and stale
+raw-metadata paths. It was fully reverted and zero-symbol audited; no
+experimental unsafe shape-way code ships. Later work added guarded closure and
+local-allocation paths without reviving that design. The next targets are safe
+ordinary-object storage/creation, survivor tracing, closure/frame dispatch, and
+mixed local representation.
+
+Two focused improvements landed after the Wave 39 full-corpus artifact and are
+therefore not folded into its ratios: direct, semantics-preserving
+`[[HomeObject]]` side-table storage made `allocation-survival` **14.1% faster**
+in a 15-pair same-binary A/B, and an integer-only live-guarded rotating-arrow
+cross-call descriptor made `calls-closures` about **5.1% faster** across 30
+pairs. A separate pointer-free literal-transition cache was still about 1.9x
+slower on both object-shape rows and was fully reverted. Exact mechanisms,
+confidence intervals, safety invariants and negative evidence are recorded as
+B162-B164 in [`PERF_ROADMAP.md`](PERF_ROADMAP.md); no new full-corpus parity
+claim is made from the focused runs.
+
 ---
 
 ## Correctness
@@ -223,14 +276,26 @@ back in ([`DOC.md`](DOC.md#embedding)).
 ```sh
 bash tools/pgo.sh                                    # the measured binary
 python tools/bench.py --engines node,bun,deno,zipp --reps 21
+python tools/bench_hostile.py --reps 15              # separate generalisation gate
 ```
 
-The harness exactly counterbalances two-engine A/B order and deterministically
-shuffles engine and benchmark order for multi-engine captures. It pairs an empty
+The harness counterbalances two-engine A/B order exactly for even repetition
+counts and within one run for odd counts, and deterministically shuffles engine
+and benchmark order for multi-engine captures. It pairs an empty
 launch with every full launch, reports paired medians with bootstrap intervals,
 and compares output as exact bytes. By default it refuses dirty or non-HEAD
-engines; explicit override flags exist for diagnostics, so publication requires
-auditing the recorded provenance rather than trusting `publishable` alone.
+engines. Diagnostic overrides preserve every provenance reason and force
+`publishable:false`; source, harness, input, engine, process-health, and output
+drift also fail publication closed. For the hostile corpus, publication also
+requires the canonical unfiltered manifest, at least 15 repetitions, and at
+least 10,000 bootstrap samples; the manifest, both harnesses, and every declared
+input must be tracked and clean against `HEAD`. Captured environment values are
+restricted to an explicit allowlist of safe numeric/boolean controls;
+credentials, unknown keys, paths, and arbitrary runtime values are redacted. A
+hostile run with any inherited engine/runtime control is diagnostic-only. Source
+content is compared directly with its `HEAD` blob before and after measurement,
+so Git index hints cannot hide local corpus or harness edits. A clean artifact
+should still be audited before its numbers become a public claim.
 
 Use at least 15 pairs for a change expected under 10%, and 21 for a marginal
 decision. A same-binary A/A check once reversed a row from −0.4% to +1.1% while

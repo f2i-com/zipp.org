@@ -100,13 +100,31 @@ fn field_mixed_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool
         && matches!(&c[start + 2], Instr::JumpIfNotLt { target, .. }
             if *target as usize == end + 1)
         && matches!(&c[start + 3], Instr::LoadGlobal { .. })
-        && matches!(&c[start + 6], Instr::Bitwise { op: BitwiseOp::And, .. })
+        && matches!(
+            &c[start + 6],
+            Instr::Bitwise {
+                op: BitwiseOp::And,
+                ..
+            }
+        )
         && matches!(&c[start + 7], Instr::GetIndex { .. })
         && matches!(&c[start + 8], Instr::StoreGlobal { .. })
-        && matches!(&c[start + 12], Instr::Bitwise { op: BitwiseOp::And, .. })
+        && matches!(
+            &c[start + 12],
+            Instr::Bitwise {
+                op: BitwiseOp::And,
+                ..
+            }
+        )
         && matches!(&c[start + 15], Instr::SetProp { strict: false, .. })
         && matches!(&c[start + 18], Instr::GetProp { .. })
-        && matches!(&c[start + 21], Instr::Bitwise { op: BitwiseOp::Or, .. })
+        && matches!(
+            &c[start + 21],
+            Instr::Bitwise {
+                op: BitwiseOp::Or,
+                ..
+            }
+        )
         && matches!(&c[start + 26], Instr::Jump { target } if *target as usize == start)
 }
 
@@ -128,12 +146,12 @@ pub(crate) fn compile_region_mem(
     method_plan: &FxHashMap<usize, MethodInlinePlan>,
     // Tier-C cross-call plan (B83): `Call` ips that get the native→native
     // cross-call attempt (fallback: the unchanged `call_ic` helper).
-    cross_plan: &FxHashSet<usize>,
+    cross_plan: &CrossCallPlan,
     // Per-site accessor-arm emission flags (the SITE GATE — indexed by the
     // local site number, `ic_site - heap.ic_base_idx`); built by
     // `Jit::register_ic_sites` from the ops that have actually filled an
     // accessor way. `ZIPP_ACC_ALWAYS_EMIT=1` sets every flag (wave-2's shape).
-    acc_emit: &[bool],
+    ic_emit: &[IcSiteEmit],
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     if !region_can_compile(proto, start, end, Some(const_strs)) {
@@ -1119,7 +1137,10 @@ pub(crate) fn compile_region_mem(
             }
             Instr::UpvalSet { idx, src } => {
                 // Per-op upvalue write; resolves the running closure from the TOP
-                // frame exactly as UpvalGet does. Bails on a malformed closure.
+                // frame exactly as UpvalGet does. A malformed closure, captured
+                // const / named-function binding, or TDZ cell bails BEFORE the
+                // store so the interpreter replays the op with full PutValue
+                // semantics.
                 dynasm!(ops
                     ; mov rcx, rdi                       // vm
                     ; mov edx, idx as i32                // upvalue index
@@ -1450,10 +1471,11 @@ pub(crate) fn compile_region_mem(
                 // arms — `acc_emit` carries the per-site decision, and the
                 // fill helper (`Jit::acc_way_fill_ok`) refuses to tag a way
                 // under an arm-less probe (it evicts for a recompile instead).
-                let acc = acc_emit
+                let site_emit = ic_emit
                     .get((ic_site - heap.ic_base_idx) as usize)
-                    .is_some_and(|&b| b)
-                    .then(|| ops.new_dynamic_label());
+                    .copied()
+                    .unwrap_or_default();
+                let acc = site_emit.acc.then(|| ops.new_dynamic_label());
                 // Stage 5: inline a trivial class GETTER for this `o.v` site as a
                 // per-receiver guard tree (a pure prefix). A hit writes `dst` and
                 // jumps to `cont`; all-miss falls through to the IC probe below
@@ -1471,7 +1493,15 @@ pub(crate) fn compile_region_mem(
                         cont,
                     );
                 }
-                emit_ic_probe(&mut ops, IcProbe::Get { dst }, obj, off, cont, acc);
+                emit_ic_probe(
+                    &mut ops,
+                    IcProbe::Get { dst },
+                    obj,
+                    off,
+                    cont,
+                    acc,
+                    site_emit.direct_miss,
+                );
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rax                        // obj_bits (rax survives the probe)
@@ -1561,10 +1591,11 @@ pub(crate) fn compile_region_mem(
                 // B114: as in the GetProp arm — `Some` adds the accessor-way
                 // dispatch target, `None` keeps the prior byte stream.
                 // SITE-GATED as in the GetProp arm above.
-                let acc = acc_emit
+                let site_emit = ic_emit
                     .get((ic_site - heap.ic_base_idx) as usize)
-                    .is_some_and(|&b| b)
-                    .then(|| ops.new_dynamic_label());
+                    .copied()
+                    .unwrap_or_default();
+                let acc = site_emit.acc.then(|| ops.new_dynamic_label());
                 // Stage 5: inline a trivial class SETTER for this `o.v = x` site as
                 // a per-receiver guard tree (a pure prefix). A hit does the baked
                 // store and jumps to `cont`; all-miss falls through to the IC probe
@@ -1582,7 +1613,15 @@ pub(crate) fn compile_region_mem(
                         cont,
                     );
                 }
-                emit_ic_probe(&mut ops, IcProbe::Set { val }, obj, off, cont, acc);
+                emit_ic_probe(
+                    &mut ops,
+                    IcProbe::Set { val },
+                    obj,
+                    off,
+                    cont,
+                    acc,
+                    site_emit.direct_miss,
+                );
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rax                        // obj_bits
@@ -2004,6 +2043,38 @@ pub(crate) fn compile_region_mem(
                     dynasm!(ops ; => ta_done);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::CallMethodComputed {
+                dst,
+                obj,
+                key,
+                arg_base,
+                argc,
+            } => {
+                // Narrow, semantics-first `array[index](args...)` support. The
+                // helper re-reads every live operand, accepts only a present own
+                // dense slot containing a plain Func/Closure, and frame-calls it
+                // with the receiver as `this`. A miss is a PURE prefix, so the
+                // interpreter can replay the complete computed lookup (getters,
+                // prototypes, proxies, natives, non-callables) unchanged.
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!("[jit] MEM dense CallMethodComputed helper emitted at ip {ip}");
+                }
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let packed_args = ((obj as u64) << 32) | ((key as u64) << 16) | arg_base as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    heap.call_method_computed_dense,
+                    packed_fip,
+                    packed_args,
+                    argc,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
             }
             Instr::CallMethod {
                 dst,
@@ -2660,10 +2731,24 @@ pub(crate) fn compile_region_mem(
                 // helper. The region runs over the WHOLE function's frame, so
                 // the caller window size is `proto.reg_count` — the same
                 // contiguity invariant `setup_call` maintains.
-                let cross = cross_plan.contains(&ip) && leaf_plan.get(&ip).is_none();
+                let cross_site = cross_plan.get(&ip).copied();
+                let cross = cross_site.is_some() && leaf_plan.get(&ip).is_none();
                 let cross_done = ops.new_dynamic_label();
                 if cross {
-                    let packed_cross: u64 = (argc as u64) | ((proto.reg_count.max(1) as u64) << 16);
+                    let same_proto2 = cross_site.flatten();
+                    let packed_cross: u64 = match same_proto2 {
+                        Some(plan) => {
+                            ((plan.fid as u64) << 32)
+                                | ((proto.reg_count.max(1) as u64) << 16)
+                                | u64::from(plan.callee_regs)
+                        }
+                        None => (argc as u64) | ((proto.reg_count.max(1) as u64) << 16),
+                    };
+                    let cross_helper = if same_proto2.is_some() {
+                        heap.cross_call_same_proto2
+                    } else {
+                        heap.cross_call
+                    };
                     let cross_fallback = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
@@ -2672,7 +2757,7 @@ pub(crate) fn compile_region_mem(
                         ; mov r9, QWORD packed_cross as i64   // (caller_regs<<16)|argc
                         ; mov rax, [rbx + dreg(callee)]
                         ; mov [rsp + 32], rax                 // 5th arg: callee bits
-                        ; mov rax, QWORD heap.cross_call as i64
+                        ; mov rax, QWORD cross_helper as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10

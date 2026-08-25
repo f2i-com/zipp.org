@@ -83,7 +83,11 @@ pub(crate) struct SlotTable<V> {
 
 impl<V> Default for SlotTable<V> {
     fn default() -> Self {
-        SlotTable { pages: Vec::new(), vals: Vec::new(), keys: Vec::new() }
+        SlotTable {
+            pages: Vec::new(),
+            vals: Vec::new(),
+            keys: Vec::new(),
+        }
     }
 }
 
@@ -107,8 +111,10 @@ impl<V> SlotTable<V> {
         if pi >= self.pages.len() {
             self.pages.resize_with(pi + 1, || None);
         }
-        let page = self.pages[pi]
-            .get_or_insert_with(|| Page { pos: vec![EMPTY; PAGE_LEN].into_boxed_slice(), used: 0 });
+        let page = self.pages[pi].get_or_insert_with(|| Page {
+            pos: vec![EMPTY; PAGE_LEN].into_boxed_slice(),
+            used: 0,
+        });
         let cell = &mut page.pos[(k & PAGE_MASK) as usize];
         if *cell == EMPTY {
             page.used += 1;
@@ -118,7 +124,9 @@ impl<V> SlotTable<V> {
 
     fn clear_pos(&mut self, k: u32) {
         let pi = (k >> PAGE_BITS) as usize;
-        let Some(slot) = self.pages.get_mut(pi) else { return };
+        let Some(slot) = self.pages.get_mut(pi) else {
+            return;
+        };
         let Some(page) = slot.as_mut() else { return };
         let cell = &mut page.pos[(k & PAGE_MASK) as usize];
         if *cell != EMPTY {
@@ -198,7 +206,11 @@ impl<V> SlotTable<V> {
     #[inline]
     pub(crate) fn entry(&mut self, k: u32) -> Entry<'_, V> {
         let pos = self.pos(k);
-        Entry { table: self, key: k, pos }
+        Entry {
+            table: self,
+            key: k,
+            pos,
+        }
     }
 
     /// Dense walk of the live values. Order is unspecified (see the module note).
@@ -346,7 +358,11 @@ mod tests {
         for step in 0..40_000u64 {
             let r = next();
             // Keys clustered like heap slots: mostly a low dense run, sometimes far away.
-            let k = if r % 8 == 0 { (r >> 8) as u32 % 100_000 } else { (r >> 8) as u32 % 300 };
+            let k = if r % 8 == 0 {
+                (r >> 8) as u32 % 100_000
+            } else {
+                (r >> 8) as u32 % 300
+            };
             match r % 5 {
                 0 | 1 => {
                     assert_eq!(t.insert(k, step), h.insert(k, step), "insert {k} @{step}");

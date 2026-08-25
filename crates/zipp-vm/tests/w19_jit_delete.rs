@@ -26,7 +26,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -60,7 +64,7 @@ const CHURN: &str = r#"
 
 #[test]
 fn hot_delete_and_rebuild_reads_back_every_slot() {
-    assert_eq!(run_ok(CHURN), ["0,1116000,24000"]);  // node v24.12.0
+    assert_eq!(run_ok(CHURN), ["0,1116000,24000"]); // node v24.12.0
 }
 
 /// Strict-mode `delete` of a NON-CONFIGURABLE property throws — and does so
@@ -249,7 +253,8 @@ fn rerun_with(env: &[(&str, &str)]) {
     }
     let exe = std::env::current_exe().expect("test binary path");
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["--skip", "zz_"]).env("ZIPP_W19_DELETE_CHILD", "1");
+    cmd.args(["--skip", "zz_"])
+        .env("ZIPP_W19_DELETE_CHILD", "1");
     for (k, v) in env {
         cmd.env(k, v);
     }

@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 use crate::vm::{cldr_en, dtf_pattern};
@@ -28,12 +28,15 @@ pub(crate) use segment::*;
 pub(crate) use shared::*;
 
 impl<'p> Vm<'p> {
-
     /// `new Intl.<service>(locales, options)` → build resolved options + instance.
-    pub(crate) fn make_intl(&mut self, kind: u8, locales: Value, options: Value) -> Result<Value, Thrown> {
+    pub(crate) fn make_intl(
+        &mut self,
+        kind: u8,
+        locales: Value,
+        options: Value,
+    ) -> Result<Value, Thrown> {
         self.make_intl_dtf(kind, locales, options, DtfDefaults::Standard)
     }
-
 
     /// As `make_intl`, but with CreateDateTimeFormat's `required`/`defaults`
     /// arguments chosen by the caller. `Intl.DateTimeFormat` itself is
@@ -51,7 +54,9 @@ impl<'p> Vm<'p> {
         use native::*;
         if kind == INTL_LOCALE {
             if options != Value::UNDEFINED && !self.is_object_value(options) {
-                return Err(Thrown("TypeError: Options must be an object or undefined".into()));
+                return Err(Thrown(
+                    "TypeError: Options must be an object or undefined".into(),
+                ));
             }
             return self.make_locale(locales, options);
         }
@@ -76,7 +81,9 @@ impl<'p> Vm<'p> {
             }
             _ => {
                 if options != Value::UNDEFINED && !self.is_object_value(options) {
-                    return Err(Thrown("TypeError: Options must be an object or undefined".into()));
+                    return Err(Thrown(
+                        "TypeError: Options must be an object or undefined".into(),
+                    ));
                 }
                 options
             }
@@ -90,7 +97,12 @@ impl<'p> Vm<'p> {
         } else {
             None
         };
-        self.opt_string(options, "localeMatcher", "best fit", &["lookup", "best fit"])?;
+        self.opt_string(
+            options,
+            "localeMatcher",
+            "best fit",
+            &["lookup", "best fit"],
+        )?;
         let locale = lookup_matcher(&requested);
         let loc = self.alloc_str(locale.clone());
         let mut r = ObjMap::new();
@@ -133,8 +145,12 @@ impl<'p> Vm<'p> {
                     "symbol",
                     &["code", "symbol", "narrowSymbol", "name"],
                 )?;
-                let currency_sign =
-                    self.opt_string(options, "currencySign", "standard", &["standard", "accounting"])?;
+                let currency_sign = self.opt_string(
+                    options,
+                    "currencySign",
+                    "standard",
+                    &["standard", "accounting"],
+                )?;
                 let unit = self.opt_string_opt(options, "unit", &[])?;
                 if let Some(ref u) = unit {
                     if !is_well_formed_unit(u) {
@@ -142,10 +158,16 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if style == "unit" && unit.is_none() {
-                    return Err(Thrown("TypeError: unit must be provided for style 'unit'".into()));
+                    return Err(Thrown(
+                        "TypeError: unit must be provided for style 'unit'".into(),
+                    ));
                 }
-                let unit_display =
-                    self.opt_string(options, "unitDisplay", "short", &["short", "narrow", "long"])?;
+                let unit_display = self.opt_string(
+                    options,
+                    "unitDisplay",
+                    "short",
+                    &["short", "narrow", "long"],
+                )?;
                 let notation = self.opt_string(
                     options,
                     "notation",
@@ -173,7 +195,11 @@ impl<'p> Vm<'p> {
                     self.read_number_format_digit_options(options, mnfd_def, mxfd_def, &notation)?;
                 let compact_display =
                     self.opt_string(options, "compactDisplay", "short", &["short", "long"])?;
-                let default_grouping = if notation == "compact" { "min2" } else { "auto" };
+                let default_grouping = if notation == "compact" {
+                    "min2"
+                } else {
+                    "auto"
+                };
                 let use_grouping = self.read_use_grouping(options, default_grouping)?;
                 let sign_display = self.opt_string(
                     options,
@@ -229,7 +255,10 @@ impl<'p> Vm<'p> {
                 let sdv = self.alloc_str(sign_display);
                 r.set("signDisplay", sdv);
                 let rounding = self.alloc_str(digits.rounding_mode.clone());
-                r.set("roundingIncrement", Value::num(digits.rounding_increment as f64));
+                r.set(
+                    "roundingIncrement",
+                    Value::num(digits.rounding_increment as f64),
+                );
                 r.set("roundingMode", rounding);
                 let rp = self.alloc_str(digits.rounding_priority.clone());
                 r.set("roundingPriority", rp);
@@ -256,7 +285,11 @@ impl<'p> Vm<'p> {
                 let hour_cycle_opt =
                     self.opt_string_opt(options, "hourCycle", &["h11", "h12", "h23", "h24"])?;
                 // A PRESENT hour12 overrides any hourCycle (step 14), even `false`.
-                let hour_cycle_opt = if hour12.is_some() { None } else { hour_cycle_opt };
+                let hour_cycle_opt = if hour12.is_some() {
+                    None
+                } else {
+                    hour_cycle_opt
+                };
                 let tz_v = if options == Value::UNDEFINED {
                     Value::UNDEFINED
                 } else {
@@ -268,9 +301,7 @@ impl<'p> Vm<'p> {
                     let s = self.to_js_string(tz_v)?;
                     match canonicalize_time_zone(&s) {
                         Some(c) => c,
-                        None => {
-                            return Err(Thrown(format!("RangeError: invalid time zone: {s}")))
-                        }
+                        None => return Err(Thrown(format!("RangeError: invalid time zone: {s}"))),
                     }
                 };
                 let comps: [(&str, &[&str]); 10] = [
@@ -283,10 +314,17 @@ impl<'p> Vm<'p> {
                     ("hour", &["2-digit", "numeric"]),
                     ("minute", &["2-digit", "numeric"]),
                     ("second", &["2-digit", "numeric"]),
-                    ("timeZoneName", &[
-                        "short", "long", "shortOffset", "longOffset", "shortGeneric",
-                        "longGeneric",
-                    ]),
+                    (
+                        "timeZoneName",
+                        &[
+                            "short",
+                            "long",
+                            "shortOffset",
+                            "longOffset",
+                            "shortGeneric",
+                            "longGeneric",
+                        ],
+                    ),
                 ];
                 let mut vals: Vec<(&str, String)> = vec![];
                 let mut frac_digits: Option<i64> = None;
@@ -300,11 +338,18 @@ impl<'p> Vm<'p> {
                         vals.push((name, v));
                     }
                 }
-                let _ = self.opt_string(options, "formatMatcher", "best fit", &["basic", "best fit"])?;
-                let date_style =
-                    self.opt_string_opt(options, "dateStyle", &["full", "long", "medium", "short"])?;
-                let time_style =
-                    self.opt_string_opt(options, "timeStyle", &["full", "long", "medium", "short"])?;
+                let _ =
+                    self.opt_string(options, "formatMatcher", "best fit", &["basic", "best fit"])?;
+                let date_style = self.opt_string_opt(
+                    options,
+                    "dateStyle",
+                    &["full", "long", "medium", "short"],
+                )?;
+                let time_style = self.opt_string_opt(
+                    options,
+                    "timeStyle",
+                    &["full", "long", "medium", "short"],
+                )?;
                 // Step 41: a style and an explicit component cannot be combined.
                 if (date_style.is_some() || time_style.is_some())
                     && (!vals.is_empty() || frac_digits.is_some())
@@ -351,16 +396,20 @@ impl<'p> Vm<'p> {
                 if !clears && date_style.is_none() && time_style.is_none() {
                     let (def_date, def_time, def_zone) = dtf_mode.defaults();
                     if def_date {
-                        for (name, v) in
-                            [("year", "numeric"), ("month", "numeric"), ("day", "numeric")]
-                        {
+                        for (name, v) in [
+                            ("year", "numeric"),
+                            ("month", "numeric"),
+                            ("day", "numeric"),
+                        ] {
                             vals.push((name, v.to_string()));
                         }
                     }
                     if def_time {
-                        for (name, v) in
-                            [("hour", "numeric"), ("minute", "numeric"), ("second", "numeric")]
-                        {
+                        for (name, v) in [
+                            ("hour", "numeric"),
+                            ("minute", "numeric"),
+                            ("second", "numeric"),
+                        ] {
                             vals.push((name, v.to_string()));
                         }
                     }
@@ -387,7 +436,10 @@ impl<'p> Vm<'p> {
                     // after the appends (era must precede year, timeZoneName
                     // follow day).
                     let order = |n: &str| {
-                        comps.iter().position(|(c, _)| *c == n).unwrap_or(usize::MAX)
+                        comps
+                            .iter()
+                            .position(|(c, _)| *c == n)
+                            .unwrap_or(usize::MAX)
                     };
                     vals.sort_by_key(|(n, _)| order(n));
                 }
@@ -502,7 +554,10 @@ impl<'p> Vm<'p> {
                 r.set("sensitivity", sv);
                 // No CLDR ignorePunctuation defaults (Thai/Lao want `true`), so
                 // an unset option resolves to `false` — the root behaviour.
-                r.set("ignorePunctuation", Value::bool(ignore_punct.unwrap_or(false)));
+                r.set(
+                    "ignorePunctuation",
+                    Value::bool(ignore_punct.unwrap_or(false)),
+                );
                 // Only the root collation is implemented, so a requested `-u-co-`
                 // / `collation` value that is not it resolves to "default"
                 // rather than being echoed back as if it were honoured.
@@ -528,7 +583,14 @@ impl<'p> Vm<'p> {
                 );
                 if keep_kn {
                     // The canonical spelling of `-u-kn-true` is the bare key.
-                    ext_used.push(("kn", if kn_s == "true" { String::new() } else { kn_s.clone() }));
+                    ext_used.push((
+                        "kn",
+                        if kn_s == "true" {
+                            String::new()
+                        } else {
+                            kn_s.clone()
+                        },
+                    ));
                 }
                 r.set("numeric", Value::bool(kn_s == "true"));
                 let (kf, keep_kf) = resolve_ext_key(
@@ -575,7 +637,10 @@ impl<'p> Vm<'p> {
                 let arr = Value::heap(self.heap.alloc(HeapObj::Array(cats)));
                 r.set("pluralCategories", arr);
                 let rm = self.alloc_str(digits.rounding_mode.clone());
-                r.set("roundingIncrement", Value::num(digits.rounding_increment as f64));
+                r.set(
+                    "roundingIncrement",
+                    Value::num(digits.rounding_increment as f64),
+                );
                 r.set("roundingMode", rm);
                 let rp = self.alloc_str(digits.rounding_priority.clone());
                 r.set("roundingPriority", rp);
@@ -583,12 +648,15 @@ impl<'p> Vm<'p> {
                 r.set("trailingZeroDisplay", tzd);
             }
             INTL_LISTFORMAT => {
-                let t =
-                    self.opt_string(options, "type", "conjunction", &["conjunction", "disjunction", "unit"])?;
+                let t = self.opt_string(
+                    options,
+                    "type",
+                    "conjunction",
+                    &["conjunction", "disjunction", "unit"],
+                )?;
                 let tv = self.alloc_str(t);
                 r.set("type", tv);
-                let st =
-                    self.opt_string(options, "style", "long", &["long", "short", "narrow"])?;
+                let st = self.opt_string(options, "style", "long", &["long", "short", "narrow"])?;
                 let sv = self.alloc_str(st);
                 r.set("style", sv);
             }
@@ -622,8 +690,12 @@ impl<'p> Vm<'p> {
                 r.set("numberingSystem", ns);
             }
             INTL_SEGMENTER => {
-                let g =
-                    self.opt_string(options, "granularity", "grapheme", &["grapheme", "word", "sentence"])?;
+                let g = self.opt_string(
+                    options,
+                    "granularity",
+                    "grapheme",
+                    &["grapheme", "word", "sentence"],
+                )?;
                 let gv = self.alloc_str(g);
                 r.set("granularity", gv);
             }
@@ -635,14 +707,25 @@ impl<'p> Vm<'p> {
                 let t = self.opt_string_opt(
                     options,
                     "type",
-                    &["language", "region", "script", "currency", "calendar", "dateTimeField"],
+                    &[
+                        "language",
+                        "region",
+                        "script",
+                        "currency",
+                        "calendar",
+                        "dateTimeField",
+                    ],
                 )?;
                 let t = t.ok_or_else(|| {
                     Thrown("TypeError: Intl.DisplayNames type option is required".into())
                 })?;
                 let fb = self.opt_string(options, "fallback", "code", &["code", "none"])?;
-                let ld =
-                    self.opt_string(options, "languageDisplay", "dialect", &["dialect", "standard"])?;
+                let ld = self.opt_string(
+                    options,
+                    "languageDisplay",
+                    "dialect",
+                    &["dialect", "standard"],
+                )?;
                 // resolvedOptions table order: locale, style, type, fallback,
                 // languageDisplay (the last only for type "language").
                 let sv = self.alloc_str(st);
@@ -667,8 +750,12 @@ impl<'p> Vm<'p> {
                         return Err(Thrown(format!("RangeError: invalid numberingSystem: {n}")));
                     }
                 }
-                let st =
-                    self.opt_string(options, "style", "short", &["long", "short", "narrow", "digital"])?;
+                let st = self.opt_string(
+                    options,
+                    "style",
+                    "short",
+                    &["long", "short", "narrow", "digital"],
+                )?;
                 // GetUnitOptions (ECMA-402 Table 1). `values` widens for the time
                 // units, and `digital_base` is the style a "digital" duration
                 // gives that unit.
@@ -718,9 +805,17 @@ impl<'p> Vm<'p> {
                             if !is_digital_core {
                                 display_default = "auto";
                             }
-                            if numeric_ok { "numeric".to_string() } else { "short".to_string() }
+                            if numeric_ok {
+                                "numeric".to_string()
+                            } else {
+                                "short".to_string()
+                            }
                         }
-                        None if matches!(prev_style.as_str(), "fractional" | "numeric" | "2-digit") => {
+                        None if matches!(
+                            prev_style.as_str(),
+                            "fractional" | "numeric" | "2-digit"
+                        ) =>
+                        {
                             // Step 3.b.i: after a numeric-like unit every later
                             // time unit is numeric too, and only minutes/seconds
                             // stay "always".
@@ -731,7 +826,11 @@ impl<'p> Vm<'p> {
                         }
                         None => {
                             display_default = "auto";
-                            if st == "long" || st == "narrow" { st.clone() } else { "short".to_string() }
+                            if st == "long" || st == "narrow" {
+                                st.clone()
+                            } else {
+                                "short".to_string()
+                            }
                         }
                     };
                     // Step 8.b: minutes/seconds following a numeric-like unit
@@ -792,9 +891,9 @@ impl<'p> Vm<'p> {
         let resolved = self.heap.alloc(HeapObj::Object(Box::new(r)));
         let idx = self.heap.alloc(HeapObj::Intl { kind, resolved });
         if self.intl_protos[kind as usize] != 0 {
-            self.proto_of.insert(idx, Value::heap(self.intl_protos[kind as usize]));
+            self.proto_of
+                .insert(idx, Value::heap(self.intl_protos[kind as usize]));
         }
         Ok(Value::heap(idx))
     }
-
 }

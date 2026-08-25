@@ -46,13 +46,19 @@ pub struct SyntaxError {
 
 impl SyntaxError {
     pub(crate) fn new(msg: impl Into<String>, pos: u32) -> SyntaxError {
-        SyntaxError { msg: msg.into(), pos }
+        SyntaxError {
+            msg: msg.into(),
+            pos,
+        }
     }
 }
 
 impl From<LexError> for SyntaxError {
     fn from(e: LexError) -> SyntaxError {
-        SyntaxError { msg: e.msg, pos: e.pos }
+        SyntaxError {
+            msg: e.msg,
+            pos: e.pos,
+        }
     }
 }
 
@@ -226,7 +232,10 @@ impl ScopeStack {
     pub(crate) fn push(&mut self, kind: ScopeKind) {
         let var_boundary = matches!(
             kind,
-            ScopeKind::Script | ScopeKind::Module | ScopeKind::Function | ScopeKind::ClassStaticBlock
+            ScopeKind::Script
+                | ScopeKind::Module
+                | ScopeKind::Function
+                | ScopeKind::ClassStaticBlock
         );
         self.scopes.push(Scope {
             kind,
@@ -241,7 +250,9 @@ impl ScopeStack {
     /// is what makes `{ var x; }` a function-scoped declaration, and it is where
     /// `let x; { var x; }` is finally caught.
     pub(crate) fn pop(&mut self) -> PResult<()> {
-        let Some(scope) = self.scopes.pop() else { return Ok(()) };
+        let Some(scope) = self.scopes.pop() else {
+            return Ok(());
+        };
         if scope.var_boundary {
             return Ok(());
         }
@@ -269,10 +280,13 @@ impl ScopeStack {
         pos: u32,
         annexb_dup_ok: bool,
     ) -> PResult<()> {
-        let Some(scope) = self.scopes.last_mut() else { return Ok(()) };
-        let dup_lex = scope.lex.iter().any(|(n, k, _)| {
-            &**n == name && !(annexb_dup_ok && *k == BindKind::Function)
-        });
+        let Some(scope) = self.scopes.last_mut() else {
+            return Ok(());
+        };
+        let dup_lex = scope
+            .lex
+            .iter()
+            .any(|(n, k, _)| &**n == name && !(annexb_dup_ok && *k == BindKind::Function));
         if dup_lex || scope.var.iter().any(|(n, _)| &**n == name) {
             return Err(SyntaxError::new(
                 format!("SyntaxError: Identifier '{name}' has already been declared"),
@@ -301,8 +315,7 @@ impl ScopeStack {
     /// `var`)? An `export { x }` must resolve to such a binding.
     pub(crate) fn module_binds(&self, name: &str) -> bool {
         self.scopes.iter().any(|s| {
-            s.lex.iter().any(|(n, _, _)| &**n == name)
-                || s.var.iter().any(|(n, _)| &**n == name)
+            s.lex.iter().any(|(n, _, _)| &**n == name) || s.var.iter().any(|(n, _)| &**n == name)
         })
     }
 
@@ -414,7 +427,12 @@ impl ParseOptions {
     }
 
     pub fn module() -> ParseOptions {
-        ParseOptions { goal: Goal::Module, force_strict: true, allow_await_expr: true, ..Default::default() }
+        ParseOptions {
+            goal: Goal::Module,
+            force_strict: true,
+            allow_await_expr: true,
+            ..Default::default()
+        }
     }
 }
 
@@ -719,7 +737,13 @@ impl<'s> Parser<'s> {
     /// keywords. An escaped spelling (`await`) is an identifier, never a
     /// keyword — which is why the lexer records that.
     pub(crate) fn is_binding_ident(&self) -> bool {
-        let TokenKind::Ident { kw, private, had_escape, name } = &self.tok.kind else {
+        let TokenKind::Ident {
+            kw,
+            private,
+            had_escape,
+            name,
+        } = &self.tok.kind
+        else {
             return false;
         };
         if *private {
@@ -734,7 +758,11 @@ impl<'s> Parser<'s> {
         // and it is asserted by a test. So the classification has to be redone
         // HERE from the name, or every check below is structurally unreachable
         // for exactly the inputs it exists to reject (which is what it was).
-        let kw = if *had_escape { Keyword::classify(name) } else { *kw };
+        let kw = if *had_escape {
+            Keyword::classify(name)
+        } else {
+            *kw
+        };
         if kw.is_always_reserved() {
             return false;
         }
@@ -764,7 +792,9 @@ impl<'s> Parser<'s> {
         }
         let pos = self.tok.span.start;
         let tok = self.bump_after_operand()?;
-        let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
+        let TokenKind::Ident { name, .. } = tok.kind else {
+            unreachable!()
+        };
         if self.ctx.strict && (name == "eval" || name == "arguments") {
             return Err(SyntaxError::new(
                 format!("SyntaxError: '{name}' cannot be used as a binding in strict mode"),
@@ -781,7 +811,9 @@ impl<'s> Parser<'s> {
             return Err(self.err_here("SyntaxError: expected a property name"));
         };
         let tok = self.bump_after_operand()?;
-        let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
+        let TokenKind::Ident { name, .. } = tok.kind else {
+            unreachable!()
+        };
         Ok(name.into_boxed_str())
     }
 
@@ -842,7 +874,9 @@ impl<'s> Parser<'s> {
         // and judge them once the prologue is closed.
         let mut legacy_at: Option<u32> = None;
         loop {
-            let TokenKind::Str(_) = &self.tok.kind else { break };
+            let TokenKind::Str(_) = &self.tok.kind else {
+                break;
+            };
             if legacy_at.is_none() && self.tok.legacy_escape {
                 legacy_at = Some(self.tok.span.start);
             }
@@ -854,7 +888,9 @@ impl<'s> Parser<'s> {
             // Peek: the next token must end the statement.
             let save = self.tok.clone();
             let save_pos = self.lx.pos();
-            let TokenKind::Str(value) = save.kind.clone() else { unreachable!() };
+            let TokenKind::Str(value) = save.kind.clone() else {
+                unreachable!()
+            };
             self.bump_after_operand()?;
             // A newline is ASI's PRECONDITION, not its test: 11.9.1 inserts a
             // semicolon only before a token that cannot be parsed as part of
@@ -877,7 +913,10 @@ impl<'s> Parser<'s> {
             if inner == "use strict" {
                 strict = true;
             }
-            out.push(Directive { raw: inner.into(), value });
+            out.push(Directive {
+                raw: inner.into(),
+                value,
+            });
             let _ = self.eat(Punct::Semi, true)?;
         }
         if let Some(pos) = legacy_at {
@@ -929,7 +968,10 @@ mod tests {
         assert!(!p("class").is_binding_ident());
         assert!(!p("if").is_binding_ident());
         // Reserved only in strict mode.
-        assert!(p("let").is_binding_ident(), "sloppy: `let` is a valid binding");
+        assert!(
+            p("let").is_binding_ident(),
+            "sloppy: `let` is a valid binding"
+        );
         let mut strict = p("let");
         strict.ctx.strict = true;
         assert!(!strict.is_binding_ident(), "strict: `let` is reserved");

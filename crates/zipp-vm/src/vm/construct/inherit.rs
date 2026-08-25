@@ -13,7 +13,11 @@ impl<'p> Vm<'p> {
         if ups.is_empty() {
             Value::heap(self.heap.alloc(HeapObj::Func(fid)))
         } else {
-            Value::heap(self.heap.alloc(HeapObj::Closure { func: fid, upvalues: ups.to_vec(), this_val: Value::UNDEFINED }))
+            Value::heap(self.heap.alloc(HeapObj::Closure {
+                func: fid,
+                upvalues: ups.to_vec(),
+                this_val: Value::UNDEFINED,
+            }))
         }
     }
 
@@ -196,9 +200,12 @@ impl<'p> Vm<'p> {
     pub(crate) fn super_ctor_fetch(&mut self, home_class_id: u32) -> Value {
         // The RUNNING ctor's own class evaluation, not merely the latest one
         // bound to this class_id — see `running_class_value`.
-        let home = self
-            .running_class_value()
-            .or_else(|| self.class_values.get(home_class_id as usize).copied().flatten());
+        let home = self.running_class_value().or_else(|| {
+            self.class_values
+                .get(home_class_id as usize)
+                .copied()
+                .flatten()
+        });
         if let Some(h) = home.filter(|h| h.is_heap()) {
             if let Some(&p) = self.proto_of.get(&h.heap_index()) {
                 return p;
@@ -214,7 +221,12 @@ impl<'p> Vm<'p> {
     /// UNDEFINED if unresolvable. (Unlike `super_parent`, this does not require a
     /// parent class, so `super.x` works in base-class methods.)
     pub(crate) fn super_base(&mut self, home_class_id: u32, is_static: bool) -> Value {
-        let home = match self.class_values.get(home_class_id as usize).copied().flatten() {
+        let home = match self
+            .class_values
+            .get(home_class_id as usize)
+            .copied()
+            .flatten()
+        {
             Some(c) => c,
             None => return Value::UNDEFINED,
         };
@@ -241,7 +253,10 @@ impl<'p> Vm<'p> {
     /// RequireObjectCoercible throws — shouldn't happen for well-formed object super).
     pub(crate) fn obj_super_base(&mut self, callee: Value) -> Value {
         let home = if callee.is_heap() {
-            self.closure_home.get(&callee.heap_index()).copied().unwrap_or(Value::UNDEFINED)
+            self.closure_home
+                .get(&callee.heap_index())
+                .copied()
+                .unwrap_or(Value::UNDEFINED)
         } else {
             Value::UNDEFINED
         };
@@ -348,9 +363,12 @@ impl<'p> Vm<'p> {
         // Same evaluation the `super()` above resolved against, so a chain built
         // by re-evaluating one class expression initializes each level's OWN
         // fields rather than the newest evaluation's.
-        let cls_v = self
-            .running_class_value()
-            .or_else(|| self.class_values.get(home_class_id as usize).copied().flatten());
+        let cls_v = self.running_class_value().or_else(|| {
+            self.class_values
+                .get(home_class_id as usize)
+                .copied()
+                .flatten()
+        });
         if let Some(cv) = cls_v {
             // Checked PrivateBrandAdd: a return-override that already carries
             // this class's private elements, or a non-extensible instance,
@@ -391,119 +409,138 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
-    pub(crate) fn run_class_ctor(&mut self, cval: Value, obj: Value, args: &[Value], new_target: Value) -> Result<Value, Thrown> {
+    pub(crate) fn run_class_ctor(
+        &mut self,
+        cval: Value,
+        obj: Value,
+        args: &[Value],
+        new_target: Value,
+    ) -> Result<Value, Thrown> {
         if !cval.is_heap() {
             return Ok(obj);
         }
-        let (ctor, ctor_ups, has_explicit, parent, extends_null) = match self.heap.get(cval.heap_index()) {
-            HeapObj::Class(c) => {
-                (c.ctor, c.ctor_upvalues.clone(), c.has_explicit_ctor, c.parent, c.extends_null)
-            }
-            // `super(...)` to a BUILT-IN parent (`class X extends Error`). We model
-            // the Error family: set `message` on the instance from the argument
-            // (AggregateError takes it as the 2nd arg). The instance's prototype
-            // chain already reaches the error prototype (so name/toString/
-            // instanceof resolve), so nothing else is needed here.
-            _ => {
-                // `super(...)` to a BUILT-IN EXOTIC parent (`class X extends Set/…`):
-                // brand the plain-Object instance with the builtin's internal
-                // representation so its methods work and it is a real instanceof. The
-                // instance keeps its own (subclass) prototype, recorded in proto_of.
-                if self.brand_builtin_subclass(cval, obj, args)? {
-                    return Ok(obj);
-                }
-                // `class X extends SuppressedError`: super(error, suppressed, msg)
-                // installs the three own props on the instance and brands the
-                // [[ErrorData]] slot (so Error.isError is true).
-                if cval.heap_index() == self.suppressederror_ctor
-                    && self.suppressederror_ctor != 0
-                {
-                    let error = args.first().copied().unwrap_or(Value::UNDEFINED);
-                    let suppressed = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                    let message = args.get(2).copied().unwrap_or(Value::UNDEFINED);
-                    let msg_val = if message != Value::UNDEFINED {
-                        Some(self.to_str_value(message)?)
-                    } else {
-                        None
-                    };
-                    let attr = PropAttr {
-                        writable: true,
-                        enumerable: false,
-                        configurable: true,
-                        accessor: false,
-                        setter: Value::UNDEFINED,
-                    };
-                    if let HeapObj::Object(map) = self.heap.get_mut(obj.heap_index()) {
-                        if let Some(mv) = msg_val {
-                            map.define("message", mv, attr);
-                        }
-                        map.define("error", error, attr);
-                        map.define("suppressed", suppressed, attr);
+        let (ctor, ctor_ups, has_explicit, parent, extends_null) =
+            match self.heap.get(cval.heap_index()) {
+                HeapObj::Class(c) => (
+                    c.ctor,
+                    c.ctor_upvalues.clone(),
+                    c.has_explicit_ctor,
+                    c.parent,
+                    c.extends_null,
+                ),
+                // `super(...)` to a BUILT-IN parent (`class X extends Error`). We model
+                // the Error family: set `message` on the instance from the argument
+                // (AggregateError takes it as the 2nd arg). The instance's prototype
+                // chain already reaches the error prototype (so name/toString/
+                // instanceof resolve), so nothing else is needed here.
+                _ => {
+                    // `super(...)` to a BUILT-IN EXOTIC parent (`class X extends Set/…`):
+                    // brand the plain-Object instance with the builtin's internal
+                    // representation so its methods work and it is a real instanceof. The
+                    // instance keeps its own (subclass) prototype, recorded in proto_of.
+                    if self.brand_builtin_subclass(cval, obj, args)? {
+                        return Ok(obj);
                     }
-                    self.error_data.insert(obj.heap_index());
-                    return Ok(obj);
-                }
-                if let Some(k) = self.error_ctors.iter().position(|&c| c == cval.heap_index()) {
-                    // `class X extends Error` instance: it has the [[ErrorData]] slot.
-                    self.error_data.insert(obj.heap_index());
-                    let msg = if k == 7 { args.get(1).copied() } else { args.first().copied() };
-                    if let Some(m) = msg.filter(|m| *m != Value::UNDEFINED) {
-                        let mi = self.to_str_idx(m);
+                    // `class X extends SuppressedError`: super(error, suppressed, msg)
+                    // installs the three own props on the instance and brands the
+                    // [[ErrorData]] slot (so Error.isError is true).
+                    if cval.heap_index() == self.suppressederror_ctor
+                        && self.suppressederror_ctor != 0
+                    {
+                        let error = args.first().copied().unwrap_or(Value::UNDEFINED);
+                        let suppressed = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+                        let message = args.get(2).copied().unwrap_or(Value::UNDEFINED);
+                        let msg_val = if message != Value::UNDEFINED {
+                            Some(self.to_str_value(message)?)
+                        } else {
+                            None
+                        };
+                        let attr = PropAttr {
+                            writable: true,
+                            enumerable: false,
+                            configurable: true,
+                            accessor: false,
+                            setter: Value::UNDEFINED,
+                        };
                         if let HeapObj::Object(map) = self.heap.get_mut(obj.heap_index()) {
-                            // `message` is a non-enumerable own data property.
-                            map.define(
-                                "message",
-                                Value::heap(mi),
-                                PropAttr {
-                                    writable: true,
-                                    enumerable: false,
-                                    configurable: true,
-                                    accessor: false,
-                                    setter: Value::UNDEFINED,
-                                },
-                            );
+                            if let Some(mv) = msg_val {
+                                map.define("message", mv, attr);
+                            }
+                            map.define("error", error, attr);
+                            map.define("suppressed", suppressed, attr);
+                        }
+                        self.error_data.insert(obj.heap_index());
+                        return Ok(obj);
+                    }
+                    if let Some(k) = self
+                        .error_ctors
+                        .iter()
+                        .position(|&c| c == cval.heap_index())
+                    {
+                        // `class X extends Error` instance: it has the [[ErrorData]] slot.
+                        self.error_data.insert(obj.heap_index());
+                        let msg = if k == 7 {
+                            args.get(1).copied()
+                        } else {
+                            args.first().copied()
+                        };
+                        if let Some(m) = msg.filter(|m| *m != Value::UNDEFINED) {
+                            let mi = self.to_str_idx(m);
+                            if let HeapObj::Object(map) = self.heap.get_mut(obj.heap_index()) {
+                                // `message` is a non-enumerable own data property.
+                                map.define(
+                                    "message",
+                                    Value::heap(mi),
+                                    PropAttr {
+                                        writable: true,
+                                        enumerable: false,
+                                        configurable: true,
+                                        accessor: false,
+                                        setter: Value::UNDEFINED,
+                                    },
+                                );
+                            }
                         }
                     }
-                }
-                // `class X extends someProxy`: SuperCall is
-                // `Construct(parent, args, newTarget)`, so the PROXY's
-                // [[Construct]] runs — its `construct` trap, or (trap-less) the
-                // forward to its target. The result IS the instance: with
-                // newTarget still the derived class, OrdinaryCreateFromConstructor
-                // gives it the derived prototype, and `super_ctor_complete`
-                // rebinds `this` to it. Without this arm the parent constructor
-                // never ran at all and `this` kept the pre-made empty object
-                // (staging/sm/class/superCall{BaseInvoked,ProperBase}.js).
-                if self.proxy_parts(cval.heap_index()).is_some() {
-                    if !self.is_constructor(cval) {
-                        return Err(Thrown(
-                            "TypeError: the superclass is not a constructor".into(),
-                        ));
+                    // `class X extends someProxy`: SuperCall is
+                    // `Construct(parent, args, newTarget)`, so the PROXY's
+                    // [[Construct]] runs — its `construct` trap, or (trap-less) the
+                    // forward to its target. The result IS the instance: with
+                    // newTarget still the derived class, OrdinaryCreateFromConstructor
+                    // gives it the derived prototype, and `super_ctor_complete`
+                    // rebinds `this` to it. Without this arm the parent constructor
+                    // never ran at all and `this` kept the pre-made empty object
+                    // (staging/sm/class/superCall{BaseInvoked,ProperBase}.js).
+                    if self.proxy_parts(cval.heap_index()).is_some() {
+                        if !self.is_constructor(cval) {
+                            return Err(Thrown(
+                                "TypeError: the superclass is not a constructor".into(),
+                            ));
+                        }
+                        return self.construct_with_newtarget(cval, args, new_target);
                     }
-                    return self.construct_with_newtarget(cval, args, new_target);
-                }
-                // `class X extends f` where f is a PLAIN user function: super(...)
-                // must actually INVOKE the parent with this = the instance and the
-                // subclass new.target (a non-constructor parent is a TypeError; an
-                // object return is the return-override instance).
-                if matches!(
-                    self.heap.get(cval.heap_index()),
-                    HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. }
-                ) {
-                    if !self.is_constructor(cval) {
-                        return Err(Thrown(
-                            "TypeError: the superclass is not a constructor".into(),
-                        ));
+                    // `class X extends f` where f is a PLAIN user function: super(...)
+                    // must actually INVOKE the parent with this = the instance and the
+                    // subclass new.target (a non-constructor parent is a TypeError; an
+                    // object return is the return-override instance).
+                    if matches!(
+                        self.heap.get(cval.heap_index()),
+                        HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. }
+                    ) {
+                        if !self.is_constructor(cval) {
+                            return Err(Thrown(
+                                "TypeError: the superclass is not a constructor".into(),
+                            ));
+                        }
+                        self.pending_new_target = new_target;
+                        let r = self.call_value(cval, obj, args)?;
+                        if self.is_object_value(r) {
+                            return Ok(r);
+                        }
                     }
-                    self.pending_new_target = new_target;
-                    let r = self.call_value(cval, obj, args)?;
-                    if self.is_object_value(r) {
-                        return Ok(r);
-                    }
+                    return Ok(obj);
                 }
-                return Ok(obj);
-            }
-        };
+            };
         if has_explicit {
             // An explicit ctor produces `this`: its object-return (return-override)
             // becomes the effective instance; a non-object/undefined return keeps obj.
@@ -565,7 +602,11 @@ impl<'p> Vm<'p> {
             let mut eff = obj;
             if parent.is_some() {
                 let live = self.object_get_prototype_of(cval);
-                let target = if live.is_heap() { live } else { Value::heap(parent.unwrap()) };
+                let target = if live.is_heap() {
+                    live
+                } else {
+                    Value::heap(parent.unwrap())
+                };
                 eff = self.run_class_ctor(target, eff, args, new_target)?;
             }
             // PrivateBrandAdd before this class's field initializers run.
@@ -586,5 +627,4 @@ impl<'p> Vm<'p> {
             Ok(eff)
         }
     }
-
 }

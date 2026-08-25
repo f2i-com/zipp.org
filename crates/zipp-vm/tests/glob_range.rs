@@ -29,7 +29,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -41,7 +45,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node v24 on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -368,7 +376,10 @@ fn globrange_mechanism_narrows_and_engages() {
     let narrowed_two = planned
         .iter()
         .find(|l| {
-            let list = l.split("narrowed=[").nth(1).and_then(|t| t.split(']').next());
+            let list = l
+                .split("narrowed=[")
+                .nth(1)
+                .and_then(|t| t.split(']').next());
             list.is_some_and(|t| t.split(',').count() == 2 && !t.is_empty())
         })
         .unwrap_or_else(|| panic!("no glob-range plan narrowed exactly {{le, v}}:\n{log}"));
@@ -452,9 +463,18 @@ fn glob_range_plans(log: &str) -> Vec<GrPlan> {
                 .split(',')
                 .filter_map(|t| t.trim().parse::<u32>().ok())
                 .collect();
-            let slotc =
-                l.split("slotc=").nth(1)?.split_whitespace().next()?.parse::<usize>().ok()?;
-            Some(GrPlan { span, narrowed, slotc })
+            let slotc = l
+                .split("slotc=")
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse::<usize>()
+                .ok()?;
+            Some(GrPlan {
+                span,
+                narrowed,
+                slotc,
+            })
         })
         .collect()
 }
@@ -465,9 +485,7 @@ fn glob_range_plans(log: &str) -> Vec<GrPlan> {
 fn engaged_plan(log: &str, pick: impl Fn(&GrPlan) -> bool) -> GrPlan {
     glob_range_plans(log)
         .into_iter()
-        .find(|p| {
-            pick(p) && log.contains(&format!("INT region [{}] GPR homes engaged", p.span))
-        })
+        .find(|p| pick(p) && log.contains(&format!("INT region [{}] GPR homes engaged", p.span)))
         .unwrap_or_else(|| panic!("no ENGAGED glob-range plan matched in:\n{log}"))
 }
 
@@ -546,7 +564,9 @@ fn globrange_mechanism_midexit_inside_window() {
     );
     let mut inside: Vec<(u32, usize, (usize, usize))> = Vec::new();
     for &g in &plan.narrowed {
-        let Some((a, b)) = narrowed_window(&log, &plan.span, g) else { continue };
+        let Some((a, b)) = narrowed_window(&log, &plan.span, g) else {
+            continue;
+        };
         for &ip in &ips {
             if a < ip && ip < b {
                 inside.push((g, ip, (a, b)));

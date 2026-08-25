@@ -21,9 +21,13 @@ impl<'p> Vm<'p> {
         {
             return Err(Thrown("RangeError: invalid PlainDateTime value".into()));
         }
-        let idx = self.heap.alloc(HeapObj::Temporal { kind: 3, fields: f.to_vec() });
+        let idx = self.heap.alloc(HeapObj::Temporal {
+            kind: 3,
+            fields: f.to_vec(),
+        });
         if self.plaindatetime_proto != 0 {
-            self.proto_of.insert(idx, Value::heap(self.plaindatetime_proto));
+            self.proto_of
+                .insert(idx, Value::heap(self.plaindatetime_proto));
         }
         Ok(Value::heap(idx))
     }
@@ -49,10 +53,7 @@ impl<'p> Vm<'p> {
     /// mirrors `to_plain_date_time_overflow` rather than wrapping it, because a
     /// property bag must be read in ONE PrepareCalendarFields pass — probing
     /// `calendar` separately would double every observable Get.
-    pub(crate) fn to_plain_date_time_cal(
-        &mut self,
-        v: Value,
-    ) -> Result<([i64; 9], Cal), Thrown> {
+    pub(crate) fn to_plain_date_time_cal(&mut self, v: Value) -> Result<([i64; 9], Cal), Thrown> {
         if v.is_heap() {
             if let Some(f) = self.pdt_fields(v.heap_index()) {
                 return Ok((f, self.cal_of(v.heap_index())));
@@ -76,7 +77,9 @@ impl<'p> Vm<'p> {
                 return Ok((self.finish_pdt_fields(&bag, false)?, cal));
             }
         }
-        Err(Thrown("TypeError: cannot convert value to a Temporal.PlainDateTime".into()))
+        Err(Thrown(
+            "TypeError: cannot convert value to a Temporal.PlainDateTime".into(),
+        ))
     }
 
     /// Like `to_plain_date_time` but enforces ISODateTimeWithinLimits on the
@@ -120,7 +123,9 @@ impl<'p> Vm<'p> {
                 return self.finish_pdt_fields(&bag, reject);
             }
         }
-        Err(Thrown("TypeError: cannot convert value to a Temporal.PlainDateTime".into()))
+        Err(Thrown(
+            "TypeError: cannot convert value to a Temporal.PlainDateTime".into(),
+        ))
     }
 
     /// PrepareTemporalFields/PrepareCalendarFields for a PlainDateTime-like
@@ -134,7 +139,11 @@ impl<'p> Vm<'p> {
     /// live in [`Self::finish_pdt_fields`] so callers can read their options
     /// bag in between (order-of-operations).
     /// Slots: 0=year 1=month 2=day 3=hour 4=minute 5=second 6=ms 7=us 8=ns.
-    pub(crate) fn read_pdt_bag(&mut self, v: Value, with_offset_tz: bool) -> Result<PdtBag, Thrown> {
+    pub(crate) fn read_pdt_bag(
+        &mut self,
+        v: Value,
+        with_offset_tz: bool,
+    ) -> Result<PdtBag, Thrown> {
         let cal = self.validate_iso_calendar_field(v)?;
         let mut f = [0i64; 9];
         let mut have_date = [false; 3];
@@ -172,11 +181,19 @@ impl<'p> Vm<'p> {
         if let Some(x) = self.opt_int_field(v, "nanosecond")? {
             f[8] = x;
         }
-        let bag_off = if with_offset_tz { self.validate_bag_offset_field(v)? } else { None };
+        let bag_off = if with_offset_tz {
+            self.validate_bag_offset_field(v)?
+        } else {
+            None
+        };
         if let Some(x) = self.opt_int_field(v, "second")? {
             f[5] = x;
         }
-        let tz = if with_offset_tz { self.get_prop(v, "timeZone")? } else { Value::UNDEFINED };
+        let tz = if with_offset_tz {
+            self.get_prop(v, "timeZone")?
+        } else {
+            Value::UNDEFINED
+        };
         if let Some(x) = self.opt_int_field(v, "year")? {
             f[0] = x;
             have_date[0] = true;
@@ -185,10 +202,14 @@ impl<'p> Vm<'p> {
         // required-field check accepts either.
         if !have_date[1] || !have_date[2] || (!have_date[0] && era.is_none() && era_year.is_none())
         {
-            return Err(Thrown("TypeError: PlainDateTime-like requires year, month, day".into()));
+            return Err(Thrown(
+                "TypeError: PlainDateTime-like requires year, month, day".into(),
+            ));
         }
         if era.is_some() != era_year.is_some() {
-            return Err(Thrown("TypeError: era and eraYear must be given together".into()));
+            return Err(Thrown(
+                "TypeError: era and eraYear must be given together".into(),
+            ));
         }
         let year = if have_date[0] { Some(f[0]) } else { None };
         Ok(PdtBag {
@@ -250,7 +271,12 @@ impl<'p> Vm<'p> {
         Ok(f)
     }
 
-    pub(crate) fn plain_date_time_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn plain_date_time_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
         let f = match self.pdt_fields(idx) {
             Some(f) => f,
             None => return Ok(None),
@@ -299,9 +325,9 @@ impl<'p> Vm<'p> {
                 );
                 Ok(Some(self.alloc_str(s)))
             }
-            "valueOf" => {
-                Err(Thrown("TypeError: Called Temporal.PlainDateTime.prototype.valueOf".into()))
-            }
+            "valueOf" => Err(Thrown(
+                "TypeError: Called Temporal.PlainDateTime.prototype.valueOf".into(),
+            )),
             "equals" => {
                 let (o, ocal) = self.to_plain_date_time_cal(a0)?;
                 if !iso_datetime_ns_in_range(o) {
@@ -320,15 +346,17 @@ impl<'p> Vm<'p> {
                 let (cy, cm, _) = cal_from_iso(cal, date[0], date[1], date[2]);
                 Ok(Some(self.make_plain_year_month_cal(cal, cy, cm, false)?))
             }
-            "toPlainMonthDay" => {
-                Ok(Some(self.make_plain_month_day_cal(cal, (date[0], date[1], date[2]))?))
-            }
+            "toPlainMonthDay" => Ok(Some(
+                self.make_plain_month_day_cal(cal, (date[0], date[1], date[2]))?,
+            )),
             "withCalendar" => {
                 // ToTemporalCalendarIdentifier(undefined) is a TypeError — the
                 // argument is required (validate_calendar_value allows undefined for
                 // an optional field-bag calendar, so guard here, not there).
                 if a0 == Value::UNDEFINED {
-                    return Err(Thrown("TypeError: withCalendar requires a calendar argument".into()));
+                    return Err(Thrown(
+                        "TypeError: withCalendar requires a calendar argument".into(),
+                    ));
                 }
                 let ncal = self.validate_calendar_value(a0)?;
                 let r = self.make_plain_date_time(f)?;
@@ -339,14 +367,17 @@ impl<'p> Vm<'p> {
                 // ISO (ConsolidateCalendars).
                 let (nd, ncal) = self.to_plain_date_cal(a0, None)?;
                 let out = if cal == Cal::Iso { ncal } else { cal };
-                let r = self.make_plain_date_time([
-                    nd.0, nd.1, nd.2, f[3], f[4], f[5], f[6], f[7], f[8],
-                ])?;
+                let r = self
+                    .make_plain_date_time([nd.0, nd.1, nd.2, f[3], f[4], f[5], f[6], f[7], f[8]])?;
                 Ok(Some(self.tag_cal(r, out)))
             }
             "withPlainTime" => {
                 // Keep the date, replace the time (ToTemporalTime; default midnight).
-                let nt = if a0 == Value::UNDEFINED { [0i64; 6] } else { self.to_plain_time(a0)? };
+                let nt = if a0 == Value::UNDEFINED {
+                    [0i64; 6]
+                } else {
+                    self.to_plain_time(a0)?
+                };
                 let r = self.make_plain_date_time([
                     date[0], date[1], date[2], nt[0], nt[1], nt[2], nt[3], nt[4], nt[5],
                 ])?;
@@ -357,7 +388,9 @@ impl<'p> Vm<'p> {
                 // reads only options.disambiguation per spec) before building.
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if opts != Value::UNDEFINED && !self.is_object_value(opts) {
-                    return Err(Thrown("TypeError: options must be an object or undefined".into()));
+                    return Err(Thrown(
+                        "TypeError: options must be an object or undefined".into(),
+                    ));
                 }
                 let disamb = self.opt_string(
                     opts,
@@ -407,12 +440,13 @@ impl<'p> Vm<'p> {
                         era_year = ey;
                     }
                     let v = if key == "month" {
-                        self.read_month_field_raw(a0, cal)?.map(|(mm, valid, conflict)| {
-                            month_valid = valid;
-                            month_conflict = conflict;
-                            month_ref = Some(mm);
-                            mm.floor()
-                        })
+                        self.read_month_field_raw(a0, cal)?
+                            .map(|(mm, valid, conflict)| {
+                                month_valid = valid;
+                                month_conflict = conflict;
+                                month_ref = Some(mm);
+                                mm.floor()
+                            })
                     } else {
                         self.opt_int_field(a0, key)?
                     };
@@ -425,7 +459,9 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("TypeError: with() requires a partial object".into()));
                 }
                 if era.is_some() != era_year.is_some() {
-                    return Err(Thrown("TypeError: era and eraYear must be given together".into()));
+                    return Err(Thrown(
+                        "TypeError: era and eraYear must be given together".into(),
+                    ));
                 }
                 let mut nf = f;
                 for (i, slot) in raw.iter().enumerate().skip(3) {
@@ -450,7 +486,8 @@ impl<'p> Vm<'p> {
                 if nm.floor() < 1 || nd < 1 {
                     return Err(Thrown("RangeError: invalid date fields".into()));
                 }
-                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let reject =
+                    self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 // A month/monthCode conflict, or a well-formed-but-calendar-invalid
                 // monthCode ("M08L", "M13"), is rejected only after the options bag.
                 if !month_valid {
@@ -480,7 +517,8 @@ impl<'p> Vm<'p> {
             }
             "add" | "subtract" => {
                 let dur = self.to_duration(a0)?;
-                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let reject =
+                    self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let sign: i64 = if name == "add" { 1 } else { -1 };
                 // Time part with day carry.
                 let tns = time_to_ns(&time)
@@ -503,9 +541,8 @@ impl<'p> Vm<'p> {
                         })?;
                 let ed = cal_to_epoch_days(cal, ay, am, ad) + (dur[2] * 7 + dur[3]) * sign + carry;
                 let (ny, nm, nd) = epoch_days_to_iso(ed);
-                let r = self.make_plain_date_time([
-                    ny, nm, nd, nt[0], nt[1], nt[2], nt[3], nt[4], nt[5],
-                ])?;
+                let r = self
+                    .make_plain_date_time([ny, nm, nd, nt[0], nt[1], nt[2], nt[3], nt[4], nt[5]])?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
             "until" | "since" => {
@@ -523,12 +560,32 @@ impl<'p> Vm<'p> {
                 }
                 let opts = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                 if opts != Value::UNDEFINED && !self.is_object_value(opts) {
-                    return Err(Thrown("TypeError: options must be an object or undefined".into()));
+                    return Err(Thrown(
+                        "TypeError: options must be an object or undefined".into(),
+                    ));
                 }
                 let all_units = &[
-                    "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
-                    "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
-                    "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
+                    "auto",
+                    "year",
+                    "years",
+                    "month",
+                    "months",
+                    "week",
+                    "weeks",
+                    "day",
+                    "days",
+                    "hour",
+                    "hours",
+                    "minute",
+                    "minutes",
+                    "second",
+                    "seconds",
+                    "millisecond",
+                    "milliseconds",
+                    "microsecond",
+                    "microseconds",
+                    "nanosecond",
+                    "nanoseconds",
                 ];
                 // GetDifferenceSettings order-of-operations: read+cast all options
                 // (largestUnit, roundingIncrement, roundingMode, smallestUnit) before
@@ -543,12 +600,24 @@ impl<'p> Vm<'p> {
                 let smallest = normalize_unit(&smallest_str, "nanosecond");
                 let largest_raw = normalize_unit(&largest_str, "auto");
                 let order = [
-                    "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
-                    "microsecond", "nanosecond",
+                    "year",
+                    "month",
+                    "week",
+                    "day",
+                    "hour",
+                    "minute",
+                    "second",
+                    "millisecond",
+                    "microsecond",
+                    "nanosecond",
                 ];
                 let rank = |u: &str| order.iter().position(|&x| x == u).unwrap_or(9);
                 let largest = if largest_raw == "auto" {
-                    if rank(&smallest) < rank("day") { smallest.clone() } else { "day".to_string() }
+                    if rank(&smallest) < rank("day") {
+                        smallest.clone()
+                    } else {
+                        "day".to_string()
+                    }
                 } else {
                     largest_raw
                 };
@@ -569,7 +638,11 @@ impl<'p> Vm<'p> {
                 // since = negate(until): forward (this → other) difference with a
                 // sign-negated rounding mode, then negate the result.
                 let (dt1, dt2) = (f, o);
-                let eff = if name == "since" { negate_mode(&mode) } else { mode.clone() };
+                let eff = if name == "since" {
+                    negate_mode(&mode)
+                } else {
+                    mode.clone()
+                };
                 let df = difference_datetime_cal(cal, dt1, dt2, &largest);
                 // With no calendar units (largestUnit ≤ day) the difference is an
                 // exact nanosecond span: round it and re-balance. Calendar-unit
@@ -596,7 +669,12 @@ impl<'p> Vm<'p> {
                 let (su, inc, mode) = self.read_round_options(
                     a0,
                     &[
-                        "day", "hour", "minute", "second", "millisecond", "microsecond",
+                        "day",
+                        "hour",
+                        "minute",
+                        "second",
+                        "millisecond",
+                        "microsecond",
                         "nanosecond",
                     ],
                     true,
@@ -608,9 +686,8 @@ impl<'p> Vm<'p> {
                 let nt = ns_to_time(rounded.rem_euclid(DAY_NS));
                 let ed = iso_to_epoch_days(date[0], date[1], date[2]) + day_carry;
                 let (ny, nm, nd) = epoch_days_to_iso(ed);
-                let r = self.make_plain_date_time([
-                    ny, nm, nd, nt[0], nt[1], nt[2], nt[3], nt[4], nt[5],
-                ])?;
+                let r = self
+                    .make_plain_date_time([ny, nm, nd, nt[0], nt[1], nt[2], nt[3], nt[4], nt[5]])?;
                 Ok(Some(self.tag_cal(r, cal)))
             }
             "getISOFields" => {
@@ -631,12 +708,13 @@ impl<'p> Vm<'p> {
                     o.set(nm, Value::num(f[i] as f64));
                 }
                 o.set("calendar", cal);
-                Ok(Some(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))))
+                Ok(Some(Value::heap(
+                    self.heap.alloc(HeapObj::Object(Box::new(o))),
+                )))
             }
             _ => Ok(None),
         }
     }
 
     // ── Temporal.Instant ──
-
 }

@@ -5,6 +5,677 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Admit numeric remainder into Tier C.  The emitted prefix handles only
+/// integer-valued Number operands; zero divisors, fractional values, BigInts,
+/// and observable ToNumeric coercions decline before doing any work and resume
+/// at the original bytecode.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_mod_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_MOD").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Admit RequireObjectCoercible into Tier C.  It is a no-op for every value
+/// except null/undefined; those two exact bit patterns exit before effects so
+/// the interpreter remains responsible for constructing and throwing the
+/// TypeError.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_check_coercible_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_CHECK_COERCIBLE").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Admit the two non-callback Map mutations used by warm application code.
+/// Generated code still proves the live receiver resolves to the main-realm
+/// intrinsic before the helper performs any mutation.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_coll_mutate_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_COLL_MUTATE").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Admit guarded primitive-string `toUpperCase()` into Tier C.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_string_upper_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_STRING_UPPER").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Admit the dynamically-resolved zero-argument `random` method into Tier C.
+/// This deliberately remains a `CallMethod`: the helper re-reads the live
+/// property on every IC miss, so replacing `Math.random` is still observable.
+/// The same-binary switch isolates the whole-function-entry benefit from the
+/// arrow-local/string changes used by the NanoID workload.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_random_method_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_RANDOM_METHOD").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Native-to-native prefix for an admitted Tier-C `CallMethod`. The helper
+/// resolves the live data property through the interpreter IC and declines to
+/// the unchanged generic call helper unless the current callee has a Tier-C
+/// entry. Kept separately switchable from admission for direct A/B evidence.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_method_crosscall_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_METHOD_CROSSCALL").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Bounded own-data `CallMethod` prefix: consume an already-filled guardable
+/// `OwnData { shape, slot }` IC way without cloning/hashing the property name.
+/// The runtime helper revalidates exact shape/slot/key/descriptor and re-reads
+/// the live callee before delegating to the unchanged Tier-C cross-call.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_method_own_slot_direct_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_METHOD_OWN_SLOT_DIRECT").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+env_off_switch! {
+    /// Inline a root-realm own-data method whose closed numeric body accesses
+    /// directly-routable globals through the transactional typed lane.
+    /// `ZIPP_NO_TIERC_METHOD_GLOBAL_INLINE=1` restores the unchanged live
+    /// method-cross-call path for same-binary mechanism measurements.
+    fn tierc_method_global_inline_enabled() = "ZIPP_NO_TIERC_METHOD_GLOBAL_INLINE"
+}
+
+/// Admit unary numeric negation into Tier C. The emitted path flips the f64
+/// sign bit (preserving JavaScript's `-(+0) === -0`) and side-effectlessly
+/// declines non-numeric operands to the exact interpreter instruction.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_neg_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_NEG").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Admit a statically named property delete as a deliberately cold exact-ip
+/// exit from Tier C.  The common path keeps the surrounding function native;
+/// if execution reaches the delete, generated code performs no part of the
+/// operation and resumes the interpreter at that bytecode.  This preserves
+/// ToObject, configurability, strict-mode throwing and proxy semantics without
+/// duplicating any of them in native code.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_cold_delete_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_COLD_DELETE").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Forward an immediately preceding captured read/write into the next read of
+/// the same upvalue. There is no call, allocation, branch target, or other VM
+/// action between the two bytecodes, so the source register and the cell must
+/// still contain identical `Value` bits. This removes one win64 helper crossing
+/// per hostile-pipeline activation while retaining an exact-ip TDZ guard.
+/// `ZIPP_NO_TIERC_UPVAL_FORWARD=1` restores the helper call for A/B evidence.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_upval_forward_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_FORWARD").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Fuse the compiler's exact captured-counter lowering
+/// `get; 1; add; 0; or; set` through one resolved-cell helper. Disabled for a
+/// metered VM by the planner below: skipping five bytecodes must never reduce a
+/// sandbox's instruction charge. `ZIPP_NO_TIERC_UPVAL_INC_I32=1` restores the
+/// unfused sequence for a same-binary A/B.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_upval_inc_i32_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_INC_I32").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Fuse a bounded straight-line chain of captured i32 xorshift assignments.
+/// This is deliberately a bytecode-shape optimization, not a PRNG intrinsic:
+/// every accepted step may use an arbitrary constant count and any of `<<`,
+/// `>>`, or `>>>` in the generic expression `x ^= x SHIFT count`.
+///
+/// The planner declines under instruction metering because one helper replaces
+/// several bytecodes. `ZIPP_NO_TIERC_UPVAL_XORSHIFT=1` keeps a same-binary
+/// unfused route for performance and semantic differential testing.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_upval_xorshift_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_XORSHIFT").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Direct-slot counterpart used by module/top-level lexical bindings. It has a
+/// distinct switch because a real workload may exercise the global shape while
+/// a closure microbenchmark exercises only the captured-cell helper.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_global_xorshift_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_GLOBAL_XORSHIFT").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct TiercUpvalIncI32 {
+    idx: u16,
+    old_dst: u16,
+    one_dst: u16,
+    add_dst: u16,
+    zero_dst: u16,
+    new_dst: u16,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn tierc_upval_inc_i32_at(code: &[Instr], ip: usize) -> Option<TiercUpvalIncI32> {
+    let [Instr::UpvalGet { dst: old_dst, idx }, Instr::LoadInt {
+        dst: one_dst,
+        val: 1,
+    }, Instr::Add {
+        dst: add_dst,
+        a: add_a,
+        b: add_b,
+    }, Instr::LoadInt {
+        dst: zero_dst,
+        val: 0,
+    }, Instr::Bitwise {
+        dst: new_dst,
+        a: or_a,
+        b: or_b,
+        op: crate::bytecode::BitwiseOp::Or,
+    }, Instr::UpvalSet { idx: set_idx, src }] = code.get(ip..ip.checked_add(6)?)?
+    else {
+        return None;
+    };
+    if old_dst == one_dst
+        || add_dst == zero_dst
+        || !((*add_a == *old_dst && *add_b == *one_dst)
+            || (*add_b == *old_dst && *add_a == *one_dst))
+        || !((*or_a == *add_dst && *or_b == *zero_dst) || (*or_b == *add_dst && *or_a == *zero_dst))
+        || set_idx != idx
+        || src != new_dst
+    {
+        return None;
+    }
+    Some(TiercUpvalIncI32 {
+        idx: *idx,
+        old_dst: *old_dst,
+        one_dst: *one_dst,
+        add_dst: *add_dst,
+        zero_dst: *zero_dst,
+        new_dst: *new_dst,
+    })
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const TIER_C_XORSHIFT_MAX_STEPS: usize = 8;
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct TiercUpvalXorShiftStep {
+    first_dst: u16,
+    second_dst: u16,
+    amount_dst: u16,
+    shifted_dst: u16,
+    result_dst: u16,
+    /// 0 = Shl, 1 = Shr, 2 = Ushr. Kept compact for the helper plan word.
+    kind: u8,
+    amount_value: i32,
+    amount: u8,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const EMPTY_TIER_C_XORSHIFT_STEP: TiercUpvalXorShiftStep = TiercUpvalXorShiftStep {
+    first_dst: 0,
+    second_dst: 0,
+    amount_dst: 0,
+    shifted_dst: 0,
+    result_dst: 0,
+    kind: 0,
+    amount_value: 0,
+    amount: 0,
+};
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct TiercUpvalXorShift {
+    idx: u16,
+    count: u8,
+    /// Low nibble is the count; each following seven-bit instruction is
+    /// `(amount << 2) | kind`. This fits eight generic steps in one u64 arg.
+    packed: u64,
+    steps: [TiercUpvalXorShiftStep; TIER_C_XORSHIFT_MAX_STEPS],
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn tierc_upval_xorshift_step_at(
+    code: &[Instr],
+    ip: usize,
+) -> Option<(u16, TiercUpvalXorShiftStep)> {
+    use crate::bytecode::BitwiseOp as B;
+    let [Instr::UpvalGet {
+        dst: first_dst,
+        idx,
+    }, Instr::UpvalGet {
+        dst: second_dst,
+        idx: second_idx,
+    }, Instr::LoadInt {
+        dst: amount_dst,
+        val: amount,
+    }, Instr::Bitwise {
+        dst: shifted_dst,
+        a: shift_a,
+        b: shift_b,
+        op: shift_op,
+    }, Instr::Bitwise {
+        dst: result_dst,
+        a: xor_a,
+        b: xor_b,
+        op: B::Xor,
+    }, Instr::UpvalSet {
+        idx: set_idx,
+        src: set_src,
+    }] = code.get(ip..ip.checked_add(6)?)?
+    else {
+        return None;
+    };
+    let kind = match shift_op {
+        B::Shl => 0,
+        B::Shr => 1,
+        B::Ushr => 2,
+        _ => return None,
+    };
+    // These exclusions prove that the generic algebraic value used by the
+    // helper is also the value the register machine would read after its
+    // preceding destination writes. Other aliases are harmless and are
+    // materialized in exact bytecode order by the emitter.
+    if second_idx != idx
+        || set_idx != idx
+        || set_src != result_dst
+        || shift_a != second_dst
+        || shift_b != amount_dst
+        || !((*xor_a == *first_dst && *xor_b == *shifted_dst)
+            || (*xor_b == *first_dst && *xor_a == *shifted_dst))
+        || second_dst == amount_dst
+        || first_dst == amount_dst
+        || first_dst == shifted_dst
+    {
+        return None;
+    }
+    Some((
+        *idx,
+        TiercUpvalXorShiftStep {
+            first_dst: *first_dst,
+            second_dst: *second_dst,
+            amount_dst: *amount_dst,
+            shifted_dst: *shifted_dst,
+            result_dst: *result_dst,
+            kind,
+            amount_value: *amount,
+            amount: (*amount as u32 & 31) as u8,
+        },
+    ))
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn tierc_upval_xorshift_at(
+    code: &[Instr],
+    targeted: &[bool],
+    ip: usize,
+) -> Option<TiercUpvalXorShift> {
+    let mut plan = TiercUpvalXorShift {
+        idx: 0,
+        count: 0,
+        packed: 0,
+        steps: [EMPTY_TIER_C_XORSHIFT_STEP; TIER_C_XORSHIFT_MAX_STEPS],
+    };
+    for slot in 0..TIER_C_XORSHIFT_MAX_STEPS {
+        let at = ip.checked_add(slot.checked_mul(6)?)?;
+        let Some((idx, step)) = tierc_upval_xorshift_step_at(code, at) else {
+            break;
+        };
+        if slot != 0 && idx != plan.idx {
+            break;
+        }
+        let end = at.checked_add(6)?;
+        // The first label remains a legal entry into the fused plan. Every
+        // other skipped label, including a later chained step's first read,
+        // must be unreachable from an internal edge.
+        let check_from = at + usize::from(slot == 0);
+        if targeted.get(check_from..end)?.iter().any(|&target| target) {
+            break;
+        }
+        if slot == 0 {
+            plan.idx = idx;
+        }
+        plan.steps[slot] = step;
+        plan.count += 1;
+        plan.packed |= ((step.kind as u64) | ((step.amount as u64) << 2)) << (4 + slot * 7);
+    }
+    if plan.count == 0 {
+        None
+    } else {
+        plan.packed |= plan.count as u64;
+        Some(plan)
+    }
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct TiercGlobalXorShift {
+    idx: u32,
+    count: u8,
+    steps: [TiercUpvalXorShiftStep; TIER_C_XORSHIFT_MAX_STEPS],
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn tierc_global_xorshift_step_at(
+    code: &[Instr],
+    ip: usize,
+) -> Option<(u32, TiercUpvalXorShiftStep)> {
+    use crate::bytecode::BitwiseOp as B;
+    let [Instr::LoadGlobal {
+        dst: first_dst,
+        idx,
+    }, Instr::LoadGlobal {
+        dst: second_dst,
+        idx: second_idx,
+    }, Instr::LoadInt {
+        dst: amount_dst,
+        val: amount,
+    }, Instr::Bitwise {
+        dst: shifted_dst,
+        a: shift_a,
+        b: shift_b,
+        op: shift_op,
+    }, Instr::Bitwise {
+        dst: result_dst,
+        a: xor_a,
+        b: xor_b,
+        op: B::Xor,
+    }, Instr::StoreGlobal {
+        idx: set_idx,
+        src: set_src,
+    }
+    | Instr::StoreGlobalStrict {
+        idx: set_idx,
+        src: set_src,
+    }
+    | Instr::StoreGlobalResolved {
+        idx: set_idx,
+        src: set_src,
+    }] = code.get(ip..ip.checked_add(6)?)?
+    else {
+        return None;
+    };
+    let kind = match shift_op {
+        B::Shl => 0,
+        B::Shr => 1,
+        B::Ushr => 2,
+        _ => return None,
+    };
+    if second_idx != idx
+        || set_idx != idx
+        || set_src != result_dst
+        || shift_a != second_dst
+        || shift_b != amount_dst
+        || !((*xor_a == *first_dst && *xor_b == *shifted_dst)
+            || (*xor_b == *first_dst && *xor_a == *shifted_dst))
+        || second_dst == amount_dst
+        || first_dst == amount_dst
+        || first_dst == shifted_dst
+    {
+        return None;
+    }
+    Some((
+        *idx,
+        TiercUpvalXorShiftStep {
+            first_dst: *first_dst,
+            second_dst: *second_dst,
+            amount_dst: *amount_dst,
+            shifted_dst: *shifted_dst,
+            result_dst: *result_dst,
+            kind,
+            amount_value: *amount,
+            amount: (*amount as u32 & 31) as u8,
+        },
+    ))
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn tierc_global_xorshift_at(
+    code: &[Instr],
+    targeted: &[bool],
+    ip: usize,
+) -> Option<TiercGlobalXorShift> {
+    let mut plan = TiercGlobalXorShift {
+        idx: 0,
+        count: 0,
+        steps: [EMPTY_TIER_C_XORSHIFT_STEP; TIER_C_XORSHIFT_MAX_STEPS],
+    };
+    for slot in 0..TIER_C_XORSHIFT_MAX_STEPS {
+        let at = ip.checked_add(slot.checked_mul(6)?)?;
+        let Some((idx, step)) = tierc_global_xorshift_step_at(code, at) else {
+            break;
+        };
+        if slot != 0 && idx != plan.idx {
+            break;
+        }
+        let end = at.checked_add(6)?;
+        let check_from = at + usize::from(slot == 0);
+        if targeted.get(check_from..end)?.iter().any(|&target| target) {
+            break;
+        }
+        if slot == 0 {
+            plan.idx = idx;
+        }
+        plan.steps[slot] = step;
+        plan.count += 1;
+    }
+    (plan.count != 0).then_some(plan)
+}
+
+/// Starting with a tagged Int in RAX, reconstruct every destination written by
+/// a recognized xorshift chain in exact bytecode order. The raw current i32 is
+/// kept in R11D. The final boxed result remains in RAX for a direct global-slot
+/// commit (the captured-cell helper has already committed its copy).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn emit_tierc_xorshift_registers(
+    ops: &mut dynasmrt::x64::Assembler,
+    steps: &[TiercUpvalXorShiftStep],
+) {
+    dynasm!(ops ; mov r11d, eax);
+    for (step_no, &step) in steps.iter().enumerate() {
+        if step_no == 0 {
+            dynasm!(ops
+                ; mov [rbx + dreg(step.first_dst)], rax
+                ; mov [rbx + dreg(step.second_dst)], rax
+            );
+        } else {
+            dynasm!(ops ; mov eax, r11d);
+            box_eax(ops, step.first_dst);
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(step.first_dst)]
+                ; mov [rbx + dreg(step.second_dst)], rax
+            );
+        }
+        let amount_bits = Value::int(step.amount_value).bits();
+        dynasm!(ops
+            ; mov rax, QWORD amount_bits as i64
+            ; mov [rbx + dreg(step.amount_dst)], rax
+            ; mov eax, r11d
+            ; mov ecx, step.amount as i32
+        );
+        match step.kind {
+            0 => dynasm!(ops ; shl eax, cl),
+            1 => dynasm!(ops ; sar eax, cl),
+            2 => dynasm!(ops ; shr eax, cl),
+            _ => unreachable!("validated Tier-C xorshift kind"),
+        }
+        dynasm!(ops ; mov r10d, eax);
+        if step.kind == 2 {
+            let as_dbl = ops.new_dynamic_label();
+            let done_u = ops.new_dynamic_label();
+            dynasm!(ops
+                ; test eax, eax
+                ; js => as_dbl
+            );
+            box_eax(ops, step.shifted_dst);
+            dynasm!(ops
+                ; jmp => done_u
+                ; => as_dbl
+                ; mov eax, eax
+                ; cvtsi2sd xmm0, rax
+                ; movq rax, xmm0
+                ; mov [rbx + dreg(step.shifted_dst)], rax
+                ; => done_u
+            );
+        } else {
+            box_eax(ops, step.shifted_dst);
+        }
+        dynasm!(ops
+            ; xor r11d, r10d
+            ; mov eax, r11d
+        );
+        box_eax(ops, step.result_dst);
+    }
+}
+
 /// Tier C eligibility: is every op of `proto` in the v1 whole-function mem-path
 /// subset? Stricter than `region_can_compile` (no GetProp/SetProp/StrConcat/
 /// MathOp/Bitwise/Cell/etc. yet — those are later increments). Rejects
@@ -30,6 +701,19 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         }
         return false;
     }
+    // B50 established that crossing the helper boundary for a tiny closure
+    // whose body is mostly one captured read/write is slower than interpreting
+    // it. Keep this lane deliberately bounded to medium bodies: at least twelve
+    // OTHER ops must be rescued from dispatch. The hostile closure body has 34;
+    // the old one/two-op probes remain blacklisted.
+    let upval_ops = proto
+        .code
+        .iter()
+        .filter(|ins| matches!(ins, Instr::UpvalGet { .. } | Instr::UpvalSet { .. }))
+        .count();
+    let tierc_upval_ok = upval_ops != 0
+        && crate::codegen::tierc_upval_enabled()
+        && proto.code.len().saturating_sub(upval_ops) >= 12;
     // Under `ZIPP_JITDUMP` the scan runs to completion and reports EVERY op this
     // tier has no arm for, instead of stopping at the first. Reporting only the
     // first is actively misleading when prioritising: admitting `UpvalGet` here
@@ -50,7 +734,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             }
         }};
     }
-    for instr in &proto.code {
+    for (ip, instr) in proto.code.iter().enumerate() {
         match *instr {
             Instr::LoadInt { .. }
             | Instr::LoadBool { .. }
@@ -128,28 +812,87 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             // (markdown-render's span()/block builders), so rejecting the op
             // would un-compile them — the exact B56 regression mode.
             | Instr::StrConcatChain { .. } => {}
-            // NOT admitted here, though the emitters exist below and the REGION
-            // path (Tier B) has carried them since B10.3: `CellGet`/`UpvalGet`/
-            // `CellSet`/`UpvalSet`. Admitting them MEASURED SLOWER — see B50.
+            Instr::Mod { .. } => {
+                if !tierc_mod_enabled() {
+                    reject!("[tierC-reject] op Mod (disabled)");
+                }
+            }
+            Instr::CheckCoercible { .. } => {
+                if !tierc_check_coercible_enabled() {
+                    reject!("[tierC-reject] op CheckCoercible (disabled)");
+                }
+            }
+            // Static object literals: allocate a fresh ordinary object and
+            // append only compiler-proved-new data properties.  The helpers
+            // preserve current-realm provenance and decline exotic/malformed
+            // inputs before mutation.  Kept independently ablatable because
+            // each append crosses the helper ABI.
+            Instr::NewObject { .. } | Instr::AppendDataProp { .. } => {
+                if !crate::vm::tierc_object_literal_enabled() {
+                    reject!("[tierC-reject] object literal op (disabled)");
+                }
+            }
+            Instr::NewArray { .. } => {
+                if !crate::vm::tierc_new_array_enabled() {
+                    reject!("[tierC-reject] op NewArray (disabled)");
+                }
+            }
+            // Capture-free ordinary function literals and their method-home
+            // side-table write.  Runtime helpers revalidate the immutable
+            // MakeFunc site plus the exact active callee before any effect;
+            // MakeClosure/MakeArrow stay interpreter-only because their
+            // lexical/capture state needs a different construction protocol.
+            Instr::MakeFunc { .. } | Instr::SetHomeObject { .. } => {
+                if !crate::vm::tierc_makefunc_home_enabled() {
+                    reject!("[tierC-reject] MakeFunc/SetHomeObject (disabled)");
+                }
+            }
+            Instr::GlobalFn {
+                op: crate::bytecode::GlobalFn::String,
+                argc: 1,
+                ..
+            } => {
+                if !crate::vm::tierc_int_string_enabled() {
+                    reject!("[tierC-reject] GlobalFn String (disabled)");
+                }
+            }
+            Instr::LooseEq { a, b, .. } => {
+                // Profitability guard: admit only the compiler's adjacent
+                // `LoadNull/Undefined; LooseEq` lowering (for `x == null`).
+                // The helper rechecks the LIVE operands, so even an unusual
+                // internal edge that skips the prefix still deopts safely.
+                let null_prefix = ip.checked_sub(1).is_some_and(|previous| {
+                    matches!(
+                        proto.code[previous],
+                        Instr::LoadNull { dst } | Instr::LoadUndefined { dst }
+                            if dst == a || dst == b
+                    )
+                });
+                if !crate::vm::tierc_loose_null_eq_enabled() || !null_prefix {
+                    reject!("[tierC-reject] op LooseEq (not adjacent nullish comparison)");
+                }
+            }
+            Instr::DeleteProp { .. } => {
+                if !tierc_cold_delete_enabled() {
+                    reject!("[tierC-reject] op DeleteProp (disabled)");
+                }
+            }
+            Instr::Neg { .. } => {
+                if !tierc_neg_enabled() {
+                    reject!("[tierC-reject] op Neg (disabled)");
+                }
+            }
+            // Captured accesses use Tier-C-specific helpers. A frame-free native
+            // cross-call installs its live closure explicitly; using the region
+            // helper here would read `frames.last()` (the CALLER) and silently
+            // select the wrong cells. Writes preserve const / named-function /
+            // TDZ semantics by declining before the store. The former blanket
+            // rejection was right for tiny one-op closures (B50), but wrong for
+            // medium bodies where blacklisting the other 30+ ops dominates.
+            Instr::UpvalGet { .. } | Instr::UpvalSet { .. } if tierc_upval_ok => {}
+            // `CellGet`/`CellSet` remain rejected: MakeCell functions are setup
+            // heavy and need a separate profitability/activation design.
             //
-            // Each is a win64 CALL per op (`jit_upval_get` resolves the closure
-            // from `frames.last()`, then a heap get and a match), which is the
-            // same work the interpreter's arm does inline and without an FFI
-            // boundary. In a Tier B loop region the surrounding ops are compiled
-            // and it nets out positive; in Tier C the shape is a SMALL function
-            // whose body is mostly the upvalue access, so the call overhead plus
-            // the native entry/exit is all there is, and it loses:
-            //
-            //   in-file control, ratio against a Tier-C-compiled control arm
-            //   (so machine load cancels), median of 3 interleaved rounds:
-            //     one UpvalGet        4.16 -> 6.00   (+44%)
-            //     UpvalGet + UpvalSet 6.10 -> 6.71   (+10%)
-            //   against, in the same probe:
-            //     MathOp + Div        8.23 -> 5.67   (-31%)
-            //     SetProp            11.42 -> 9.42   (-18%)
-            //
-            // Reaching a tier is not the same as being faster in it. Do not
-            // re-admit these without a per-op probe of that shape.
             // `Math.<op>(…)` — the shared `emit_math_op`, gated by the same
             // predicate the region path uses.
             Instr::MathOp { op, argc, .. } => {
@@ -192,9 +935,17 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                         | (Some("has"), 1)
                         | (Some("substring"), 2)
                         | (Some("slice"), 2)
-                ) || (argc == 1
-                    && substring1_intrinsic_enabled()
-                    && matches!(key, Some("substring") | Some("slice")));
+                ) || (argc == 0
+                    && tierc_random_method_enabled()
+                    && matches!(key, Some("random")))
+                    || (tierc_coll_mutate_enabled()
+                        && matches!((key, argc), (Some("set"), 2) | (Some("clear"), 0)))
+                    || (argc == 0
+                        && tierc_string_upper_enabled()
+                        && matches!(key, Some("toUpperCase")))
+                    || (argc == 1
+                        && substring1_intrinsic_enabled()
+                        && matches!(key, Some("substring") | Some("slice")));
                 if !ok {
                     reject!("[tierC-reject] CallMethod {key:?} argc={argc}");
                 }
@@ -347,8 +1098,12 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             | Instr::LoadUndefined { dst }
             | Instr::LoadNull { dst }
             | Instr::LoadBool { dst, .. }
-            | Instr::LoadGlobal { dst, .. } => (u0(), Some(dst)),
+            | Instr::LoadGlobal { dst, .. }
+            | Instr::NewObject { dst, .. }
+            | Instr::MakeFunc { dst, .. } => (u0(), Some(dst)),
             Instr::Move { dst, src } => (u1(src), Some(dst)),
+            Instr::UpvalGet { dst, .. } => (u0(), Some(dst)),
+            Instr::UpvalSet { src, .. } => (u1(src), None),
             Instr::StoreGlobal { src, .. }
             | Instr::StoreGlobalStrict { src, .. }
             | Instr::StoreGlobalResolved { src, .. } => (u1(src), None),
@@ -356,6 +1111,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             | Instr::Sub { dst, a, b }
             | Instr::Mul { dst, a, b }
             | Instr::Div { dst, a, b }
+            | Instr::Mod { dst, a, b }
             | Instr::Bitwise { dst, a, b, .. }
             | Instr::StrAppendInPlace { dst, a, b }
             | Instr::Lt { dst, a, b }
@@ -371,7 +1127,8 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::Pad2Concat { dst, src, .. } => (u1(src), Some(dst)),
             Instr::Pad2Conditional { dst, src } => (u1(src), Some(dst)),
             Instr::AddInt { dst, a, .. } => (u1(a), Some(dst)),
-            Instr::Not { dst, a }
+            Instr::Neg { dst, a }
+            | Instr::Not { dst, a }
             | Instr::TypeOf { dst, a }
             | Instr::TypeOfIs { dst, a, .. }
             | Instr::IsArray { dst, a } => (u1(a), Some(dst)),
@@ -380,7 +1137,22 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::GetIndex { dst, obj, key } => (u2(obj, key), Some(dst)),
             Instr::GetProp { dst, obj, .. } => (u1(obj), Some(dst)),
             Instr::SetProp { obj, val, .. } => (u2(obj, val), None),
+            Instr::AppendDataProp { obj, val, .. } => (u2(obj, val), None),
+            Instr::SetHomeObject { method, home } => (u2(method, home), None),
+            Instr::DeleteProp { dst, obj, .. } => (u1(obj), Some(dst)),
+            Instr::NewArray {
+                dst,
+                arg_base,
+                argc,
+            } => (Uses::range(arg_base, argc), Some(dst)),
+            Instr::LooseEq { dst, a, b } => (u2(a, b), Some(dst)),
             Instr::MathOp {
+                dst,
+                arg_base,
+                argc,
+                ..
+            } => (Uses::range(arg_base, argc), Some(dst)),
+            Instr::GlobalFn {
                 dst,
                 arg_base,
                 argc,
@@ -409,6 +1181,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::Jump { .. } | Instr::ReturnUndefined => (u0(), None),
             Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => (u1(cond), None),
             Instr::JumpIfNotLt { a, b, .. } | Instr::JumpIfNotLe { a, b, .. } => (u2(a, b), None),
+            Instr::CheckCoercible { src } => (u1(src), None),
             Instr::Return { src } => (u1(src), None),
             _ => return None,
         })
@@ -566,19 +1339,183 @@ pub(crate) fn compile_proto_mem(
     heap: HeapHelpers,
     const_strs: &FxHashMap<u32, u64>,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+    // Tier-C transactional own-method/global plans. Kept distinct from the
+    // ordinary region method plans because these bodies execute without a
+    // callee scratch window and buffer every global write until all guards pass.
+    method_plan: &FxHashMap<usize, MethodInlinePlan>,
     // Tier-C cross-call plan (B83): `Call` ips that get the native→native
     // cross-call attempt (fallback: the unchanged `call_ic` helper).
-    cross_plan: &FxHashSet<usize>,
+    cross_plan: &CrossCallPlan,
     // Per-site accessor-arm emission flags (the SITE GATE), indexed by the
     // local site number — see `compile_region_mem`'s twin parameter.
-    acc_emit: &[bool],
+    ic_emit: &[IcSiteEmit],
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
     }
+    // These arms can exit before executing their bytecode (or their helper can
+    // defensively decline). A metered basic block charges its full native
+    // length at entry, so interpreter replay could charge one of those
+    // bytecodes twice.
+    // Sandboxed/metered VMs therefore keep the exact interpreter route.
+    if meter.is_some()
+        && proto.code.iter().any(|instr| match instr {
+            Instr::DeleteProp { .. }
+            | Instr::LooseEq { .. }
+            | Instr::Mod { .. }
+            | Instr::CheckCoercible { .. }
+            | Instr::MakeFunc { .. }
+            | Instr::SetHomeObject { .. }
+            | Instr::GlobalFn {
+                op: crate::bytecode::GlobalFn::String,
+                argc: 1,
+                ..
+            } => true,
+            Instr::CallMethod { name, argc, .. } => proto
+                .string_constants
+                .get(*name as usize)
+                .is_some_and(|key| {
+                    matches!(
+                        (key.as_str(), *argc),
+                        ("clear" | "toUpperCase", 0) | ("set", 2)
+                    )
+                }),
+            _ => false,
+        })
+    {
+        return None;
+    }
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let n = proto.code.len();
+    let method_own_slot_direct = meter.is_none() && tierc_method_own_slot_direct_enabled();
+    if method_own_slot_direct && std::env::var_os("ZIPP_JITLOG").is_some() {
+        let sites = proto
+            .code
+            .iter()
+            .filter(|instr| {
+                matches!(
+                    instr,
+                    Instr::CallMethod { name, argc: 0, .. }
+                        if proto.string_constants.get(*name as usize).is_some_and(|key| key == "random")
+                )
+            })
+            .count();
+        if sites != 0 {
+            eprintln!("[jit] fn{func_id} Tier-C own-slot-direct method sites={sites}");
+        }
+    }
+    // The only forwarded shape is bytecode-adjacent, and a targetable second
+    // ip is excluded: an internal edge could otherwise enter the UpvalGet
+    // without executing its textual predecessor. Tier C admits no handler ops,
+    // so ordinary jump targets are the complete non-fallthrough entry set.
+    let mut targeted = vec![false; n];
+    for instr in &proto.code {
+        let target = match *instr {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => Some(target as usize),
+            _ => None,
+        };
+        if let Some(target) = target.filter(|&target| target < n) {
+            targeted[target] = true;
+        }
+    }
+    let mut upval_forward = vec![None; n];
+    if tierc_upval_forward_enabled() {
+        for ip in 1..n {
+            let Instr::UpvalGet { idx, .. } = proto.code[ip] else {
+                continue;
+            };
+            if targeted[ip] {
+                continue;
+            }
+            upval_forward[ip] = match proto.code[ip - 1] {
+                Instr::UpvalGet { dst, idx: previous }
+                | Instr::UpvalSet {
+                    src: dst,
+                    idx: previous,
+                } if previous == idx => Some(dst),
+                _ => None,
+            };
+        }
+    }
+    let n_upval_forwards = upval_forward.iter().flatten().count();
+    if n_upval_forwards != 0 && std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!("[jit] fn{func_id} Tier-C upval-forward sites={n_upval_forwards}");
+    }
+    let mut upval_inc = vec![None; n];
+    let mut upval_inc_covered = vec![false; n];
+    if meter.is_none() && tierc_upval_inc_i32_enabled() {
+        for ip in 0..n.saturating_sub(5) {
+            if upval_inc_covered[ip] || targeted[ip + 1..ip + 6].iter().any(|&target| target) {
+                continue;
+            }
+            let Some(plan) = tierc_upval_inc_i32_at(&proto.code, ip) else {
+                continue;
+            };
+            upval_inc[ip] = Some(plan);
+            upval_inc_covered[ip + 1..ip + 6].fill(true);
+        }
+    }
+    let n_upval_incs = upval_inc.iter().flatten().count();
+    if n_upval_incs != 0 && std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!("[jit] fn{func_id} Tier-C upval-inc-i32 sites={n_upval_incs}");
+    }
+    let mut upval_xorshift = vec![None; n];
+    let mut upval_xorshift_covered = vec![false; n];
+    if meter.is_none() && tierc_upval_xorshift_enabled() {
+        for ip in 0..n {
+            if upval_xorshift_covered[ip] {
+                continue;
+            }
+            let Some(plan) = tierc_upval_xorshift_at(&proto.code, &targeted, ip) else {
+                continue;
+            };
+            let end = ip + usize::from(plan.count) * 6;
+            upval_xorshift[ip] = Some(plan);
+            upval_xorshift_covered[ip + 1..end].fill(true);
+        }
+    }
+    let n_upval_xorshift_chains = upval_xorshift.iter().flatten().count();
+    let n_upval_xorshift_steps: usize = upval_xorshift
+        .iter()
+        .flatten()
+        .map(|plan| usize::from(plan.count))
+        .sum();
+    if n_upval_xorshift_chains != 0 && std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!(
+            "[jit] fn{func_id} Tier-C upval-xorshift chains={n_upval_xorshift_chains} steps={n_upval_xorshift_steps}"
+        );
+    }
+    let mut global_xorshift = vec![None; n];
+    let mut global_xorshift_covered = vec![false; n];
+    if meter.is_none() && tierc_global_xorshift_enabled() {
+        for ip in 0..n {
+            if global_xorshift_covered[ip] {
+                continue;
+            }
+            let Some(plan) = tierc_global_xorshift_at(&proto.code, &targeted, ip) else {
+                continue;
+            };
+            let end = ip + usize::from(plan.count) * 6;
+            global_xorshift[ip] = Some(plan);
+            global_xorshift_covered[ip + 1..end].fill(true);
+        }
+    }
+    let n_global_xorshift_chains = global_xorshift.iter().flatten().count();
+    let n_global_xorshift_steps: usize = global_xorshift
+        .iter()
+        .flatten()
+        .map(|plan| usize::from(plan.count))
+        .sum();
+    if n_global_xorshift_chains != 0 && std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!(
+            "[jit] fn{func_id} Tier-C global-xorshift chains={n_global_xorshift_chains} steps={n_global_xorshift_steps}"
+        );
+    }
     // A label per ip; `labels[n]` is the fall-off-the-end (ReturnUndefined). All
     // jump targets are in-function, so they resolve directly (no exit stubs).
     let labels: Vec<_> = (0..=n).map(|_| ops.new_dynamic_label()).collect();
@@ -587,21 +1524,30 @@ pub(crate) fn compile_proto_mem(
     // ── Q4 leaf-call inlining (Tier C) ── inline a monomorphic plain-leaf callee
     // at a Call site over a scratch window carved above the whole-function frame.
     let do_leaf = !leaf_plan.is_empty();
+    let do_method = !method_plan.is_empty();
+    let method_needs_headroom = method_plan.values().any(|p| p.win_top > p.reg_window);
     let max_scratch_top: u64 = leaf_plan
         .values()
         .map(|p| p.reg_window as u64 + p.callee_reg_count as u64)
+        .chain(method_plan.values().map(|p| p.win_top as u64))
         .max()
         .unwrap_or(0);
     // 32B shadow + 8B 5th-arg slot = 40; + a 16B leaf-headroom-flag slot when
     // inlining (keeps the frame's 16-alignment after the 6 pushes).
-    let frame: i32 = 40 + if do_leaf { 16 } else { 0 };
+    let frame: i32 = 40
+        + if do_leaf || method_needs_headroom {
+            16
+        } else {
+            0
+        };
     // Byte offset of the headroom flag (1 = the carved window fits → inline; 0 =
     // fall back to the per-call helper). MUST equal the prologue store offset.
     let leaf_flag_off = frame - 8;
 
     // r13 (heap versions base) and r14 (JIT IC table base) are READ by the GetProp
-    // inline-cache probe AND the leaf-inline identity version guard. Pin + post-
-    // call/alloc refetch them iff this function has a GetProp OR inlines a leaf.
+    // inline-cache probe and by exact-identity leaf guards. A same-prototype
+    // guard calls its read-only VM helper instead, while a slot-generation guard
+    // reads its own stable counter address; neither needs these two pins.
     // INVARIANT (the refetch obligation): r13 moves on EVERY heap allocation
     // (versions Vec push), r14 on a nested region compile (during user code); so
     // EVERY op that allocates or runs user code (Call, Add-concat, TypeOf,
@@ -613,8 +1559,47 @@ pub(crate) fn compile_proto_mem(
         .code
         .iter()
         .any(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }));
-    let refetch_pinned = has_prop || do_leaf;
+    let precise_entry_pins = std::env::var_os("ZIPP_NO_TIERC_PRECISE_PINS").is_none();
+    let leaf_needs_version_pins = leaf_plan
+        .values()
+        .any(|p| (p.same_proto_fid.is_none() && p.slot_guard.is_none()) || !p.nested.is_empty());
+    let refetch_pinned = has_prop
+        || do_method
+        || if precise_entry_pins {
+            leaf_needs_version_pins
+        } else {
+            do_leaf
+        };
     let refetch = refetch_pinned.then_some((heap.versions_base, heap.ic_base));
+
+    // r12 is only read by direct global bytecodes, including a body spliced by
+    // the leaf inliner. `globals` never reallocates, but obtaining its pointer
+    // through an FFI helper on every whole-function entry is material for tiny
+    // captureful callees. Keep the pre-change unconditional pin behind the
+    // off-switch for a same-binary mechanism A/B.
+    let direct_global = |i: &Instr| {
+        matches!(
+            i,
+            Instr::LoadGlobal { .. }
+                | Instr::LoadGlobalOrUndefined { .. }
+                | Instr::StoreGlobal { .. }
+                | Instr::StoreGlobalStrict { .. }
+                | Instr::StoreGlobalResolved { .. }
+        )
+    };
+    let needs_globals = !precise_entry_pins
+        || proto.code.iter().any(direct_global)
+        || leaf_plan.values().any(|p| p.body.iter().any(direct_global))
+        || do_method;
+    if precise_entry_pins && std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!(
+            "[jit] fn{func_id} Tier-C entry-pins globals={} version-ic={} headroom={} method-global={}",
+            needs_globals as u8,
+            refetch_pinned as u8,
+            (do_leaf || method_needs_headroom) as u8,
+            do_method as u8,
+        );
+    }
 
     // ── prologue ── save callee-saved regs, stash inputs, pin r12 = globals base.
     // Mirrors `compile_region_mem` (6 pushes + frame) so the region emitters and
@@ -631,11 +1616,15 @@ pub(crate) fn compile_proto_mem(
         ; mov rbx, rcx                    // regs base
         ; mov rsi, rdx                    // bail_ip out-pointer
         ; mov rdi, r8                     // vm
-        ; mov rcx, rdi                    // arg0 = vm
-        ; mov rax, QWORD globals_base_helper as i64
-        ; call rax
-        ; mov r12, rax                    // pinned globals base pointer
     );
+    if needs_globals {
+        dynasm!(ops
+            ; mov rcx, rdi                    // arg0 = vm
+            ; mov rax, QWORD globals_base_helper as i64
+            ; call rax
+            ; mov r12, rax                    // pinned globals base pointer
+        );
+    }
     if refetch_pinned {
         // Pin the heap version-array base (r13) and the IC table base (r14) —
         // copied from the region prologue. Read by the GetProp IC probe and the
@@ -655,7 +1644,7 @@ pub(crate) fn compile_proto_mem(
     // every carved scratch window lies inside the pinned register file. Each
     // inlined Call site reads the flag and falls back to the helper on 0. rbx is
     // callee-saved; rcx/rdx/r8 are volatile scratch here.
-    if do_leaf {
+    if do_leaf || method_needs_headroom {
         dynasm!(ops
             ; mov rcx, rdi                            // vm
             ; mov rdx, rbx                            // caller window base
@@ -670,8 +1659,8 @@ pub(crate) fn compile_proto_mem(
     // GetProp arm). Reserved contiguously by `Jit::compile` via reserve_ic_sites.
     let mut ic_site = heap.ic_base_idx;
     let int_hint = true; // v1 admits no double-constant feeds.
-    // Step metering (a metered VM only) — a Tier C body can loop just as a Tier
-    // A one can, so it needs the same charge. See codegen::meter.
+                         // Step metering (a metered VM only) — a Tier C body can loop just as a Tier
+                         // A one can, so it needs the same charge. See codegen::meter.
     let blocks = crate::codegen::meter::block_map(meter, &proto.code, 0, n - 1);
     let mut meter_stubs: Vec<(dynasmrt::DynamicLabel, usize)> = Vec::new();
     // B118 fused compare→branch (the region rule, Tier-C shape): `cmp {dst} ;
@@ -700,6 +1689,13 @@ pub(crate) fn compile_proto_mem(
                 crate::codegen::meter::emit_charge(&mut ops, m, len, stub);
                 meter_stubs.push((stub, ip));
             }
+        }
+        // These bytecodes were materialized exactly by the fused captured-int
+        // helper at their only predecessor. No internal jump may target them
+        // (the plan checked `targeted`), and metered compilation never creates
+        // a plan, so sharing their labels with the next live op is safe.
+        if upval_inc_covered[ip] || upval_xorshift_covered[ip] || global_xorshift_covered[ip] {
+            continue;
         }
         // Each op gets its OWN dedicated bail label (records THIS ip); a guard
         // miss resumes the interpreter exactly here, side-effect-free.
@@ -750,11 +1746,283 @@ pub(crate) fn compile_proto_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
             }
-            Instr::LoadGlobal { dst, idx } => {
+            Instr::MakeFunc { dst, .. } => {
+                // The helper re-reads this immutable site and validates the
+                // active callable's exact function id before allocating.  A
+                // decline is therefore a pure prefix and resumes MakeFunc;
+                // any panic after allocation is fail-stop in the helper.
+                let helper = crate::vm::jit_make_func as usize;
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 dynasm!(ops
-                    ; mov rax, [r12 + (idx as i32) * 8]
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD packed_fip as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
                     ; mov [rbx + dreg(dst)], rax
                 );
+                // The allocation can move all backing Vec storage even though
+                // heap indices themselves are stable.
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::NewObject { dst, hint } => {
+                // Allocation is a GC safe point.  The native frame's Values
+                // live in vm.regs, and the helper reproduces realm_born before
+                // returning the new object's bits.  A defensive decline is
+                // still a pure prefix: the unreachable fresh allocation has
+                // not escaped and the interpreter may replay NewObject.
+                let helper = crate::vm::jit_new_object as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov edx, hint as i32
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                // Heap::alloc can reallocate the version vector.  Functions
+                // with property ICs or leaf guards pin r13/r14 and must refresh
+                // them before the next emitted op.
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::NewArray {
+                dst,
+                arg_base,
+                argc,
+            } => {
+                // Fixed-block literal only.  The helper validates that this
+                // entire window lies inside vm.regs, collects before copying
+                // the rooted Values, allocates, and applies current-realm
+                // Array provenance.
+                let helper = crate::vm::jit_new_array as usize;
+                let packed =
+                    ((proto.reg_count as u64) << 32) | ((arg_base as u64) << 16) | argc as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, rbx
+                    ; mov r8, QWORD packed as i64
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::AppendDataProp { obj, name, val } => {
+                // Pack the immutable unified function id with its static
+                // name slot. The helper verifies exact Object kind before
+                // its barrier and interpreter-equivalent push_data.
+                let helper = crate::vm::jit_append_data_prop as usize;
+                let packed_name = ((func_id as u64) << 32) | name as u64;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(obj)]
+                    ; mov r8, QWORD packed_name as i64
+                    ; mov r9, [rbx + dreg(val)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::SetHomeObject { method, home } => {
+                // The interpreter deliberately ignores a non-heap method.
+                // The helper duplicates that no-op, validates heap indices
+                // before mutation, then publishes the barrier-backed home
+                // edge.  A post-commit panic aborts instead of replaying it.
+                let helper = crate::vm::jit_set_home_object as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(method)]
+                    ; mov r8, [rbx + dreg(home)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::LooseEq { dst, a, b } => {
+                // Admission restricts this to the compiler's adjacent nullish
+                // comparison.  The helper still checks live values and handles
+                // [[IsHTMLDDA]] exactly; a non-nullish edge is a pure bail.
+                let helper = crate::vm::jit_loose_null_eq as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(a)]
+                    ; mov r8, [rbx + dreg(b)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::DeleteProp { .. } => {
+                // Intentional cold exit.  Do not even read the receiver here:
+                // interpreter replay at this exact ip owns all observable
+                // coercion/proxy/strict-delete behaviour and writes `dst`.
+                dynasm!(ops ; jmp => bail);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::LoadGlobal { dst, idx } => {
+                if let Some(plan) = global_xorshift[ip] {
+                    // The normal Tier-C global route has already proved this
+                    // is a live, direct slot. One Int guard at the first read
+                    // replaces the twelve generic ToInt32 checks in a three-
+                    // step chain. A miss is a pure exact-ip interpreter replay.
+                    dynasm!(ops
+                        ; mov rax, [r12 + (plan.idx as i32) * 8]
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, INT_TAG_HI as i32
+                        ; jne => bail
+                    );
+                    emit_tierc_xorshift_registers(&mut ops, &plan.steps[..usize::from(plan.count)]);
+                    dynasm!(ops
+                        ; mov [r12 + (plan.idx as i32) * 8], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    let resume = ip + usize::from(plan.count) * 6;
+                    dynasm!(ops ; jmp => labels[resume]);
+                } else {
+                    dynasm!(ops
+                        ; mov rax, [r12 + (idx as i32) * 8]
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                }
+            }
+            Instr::UpvalGet { dst, idx } => {
+                if let Some(plan) = upval_inc[ip] {
+                    // One cell resolution replaces the exact six-op captured
+                    // counter sequence. Failure is a pure prefix and resumes at
+                    // this UpvalGet. Success returns OLD Int bits; materialize
+                    // every skipped destination in bytecode order so a later
+                    // unrelated bail observes the same register file.
+                    let add_overflow = ops.new_dynamic_label();
+                    let add_done = ops.new_dynamic_label();
+                    let one = Value::int(1).bits();
+                    let zero = Value::int(0).bits();
+                    let overflow_sum = Value::num(i32::MAX as f64 + 1.0).bits();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov edx, plan.idx as i32
+                        ; mov rax, QWORD heap.tierc_upval_inc_i32 as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov r11, rax
+                        ; mov [rbx + dreg(plan.old_dst)], rax
+                        ; mov rax, QWORD one as i64
+                        ; mov [rbx + dreg(plan.one_dst)], rax
+                        ; mov eax, r11d
+                        ; cmp eax, i32::MAX
+                        ; je => add_overflow
+                        ; add eax, 1
+                    );
+                    box_eax(&mut ops, plan.add_dst);
+                    dynasm!(ops
+                        ; jmp => add_done
+                        ; => add_overflow
+                        ; mov rax, QWORD overflow_sum as i64
+                        ; mov [rbx + dreg(plan.add_dst)], rax
+                        ; => add_done
+                        ; mov rax, QWORD zero as i64
+                        ; mov [rbx + dreg(plan.zero_dst)], rax
+                        ; mov eax, r11d
+                        ; add eax, 1
+                    );
+                    box_eax(&mut ops, plan.new_dst);
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    dynasm!(ops ; jmp => labels[ip + 6]);
+                } else if let Some(plan) = upval_xorshift[ip] {
+                    // Resolve the exact live cell once, require an Int before
+                    // any mutation, and commit the bounded generic transform.
+                    // The helper returns the old Int bits. The emitted straight
+                    // line then reconstructs every skipped register write in
+                    // bytecode order; no guard remains after the commit.
+                    let xorshift_helper = crate::vm::jit_tierc_upval_xorshift_i32 as usize;
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov edx, plan.idx as i32
+                        ; mov r8, QWORD plan.packed as i64
+                        ; mov rax, QWORD xorshift_helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                    );
+                    emit_tierc_xorshift_registers(&mut ops, &plan.steps[..usize::from(plan.count)]);
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    let resume = ip + usize::from(plan.count) * 6;
+                    dynasm!(ops ; jmp => labels[resume]);
+                } else if let Some(src) = upval_forward[ip] {
+                    // The preceding helper successfully loaded/stored these
+                    // exact bits. Guard the internal UNINITIALIZED sentinel so
+                    // even malformed bytecode that stored it still replays this
+                    // UpvalGet and throws instead of exposing the sentinel.
+                    let uninit = Value::UNINITIALIZED.bits();
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(src)]
+                        ; mov r10, QWORD uninit as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else {
+                    // Tier-C's activation may be frame-free (native cross-call),
+                    // so this helper resolves the explicitly installed closure
+                    // rather than the interpreter frame stack. TDZ/malformed →
+                    // exact-ip bail and interpreter replay.
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov edx, idx as i32
+                        ; mov rax, QWORD heap.tierc_upval_get as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                }
+            }
+            Instr::UpvalSet { idx, src } => {
+                // Pure-prefix failure for immutable/TDZ cells; the interpreter
+                // resumes at this op and supplies the exact PutValue semantics.
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov edx, idx as i32
+                    ; mov r8, [rbx + dreg(src)]
+                    ; mov rax, QWORD heap.tierc_upval_set as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::StoreGlobal { idx, src }
             | Instr::StoreGlobalStrict { idx, src }
@@ -788,6 +2056,19 @@ pub(crate) fn compile_proto_mem(
                 );
                 store_xmm(&mut ops, dst);
                 dynasm!(ops ; => done_ai);
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::Neg { dst, a } => {
+                // JS unary minus flips the IEEE-754 sign bit. Subtracting from
+                // +0 would incorrectly turn `-(+0)` into +0, so share the exact
+                // region-memory sequence and bail before effects on non-number.
+                load_num_xmm(&mut ops, a, 1, bail);
+                dynasm!(ops
+                    ; mov rax, QWORD (1u64 << 63) as i64
+                    ; movq xmm0, rax
+                    ; xorpd xmm0, xmm1
+                );
+                store_xmm(&mut ops, dst);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::Bitwise { dst, a, b, op } => {
@@ -886,6 +2167,73 @@ pub(crate) fn compile_proto_mem(
                 // and the interpreter).
                 dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Div, false)
             }
+            Instr::Mod { dst, a, b } => {
+                // Integer-valued Number remainder, copied from the MEM-region
+                // path.  Every unsupported case exits at this exact ip before
+                // observable coercion: the interpreter owns fractional/zero,
+                // BigInt and object-ToNumeric semantics.
+                load_num_xmm(&mut ops, a, 0, bail);
+                load_num_xmm(&mut ops, b, 1, bail);
+                let as_dbl = ops.new_dynamic_label();
+                let mod_done = ops.new_dynamic_label();
+                let rem_signed = ops.new_dynamic_label();
+                dynasm!(ops
+                    ; cvttsd2si rax, xmm0
+                    ; cvttsd2si rcx, xmm1
+                    ; test rcx, rcx
+                    ; jz => bail
+                    // Avoid the sole signed-idiv overflow (#DE): MIN / -1.
+                    // Bailing for every divisor -1 also preserves ±0 exactly.
+                    ; cmp rcx, -1
+                    ; je => bail
+                    ; cvtsi2sd xmm2, rax
+                    ; ucomisd xmm2, xmm0
+                    ; jp => bail
+                    ; jne => bail
+                    ; cvtsi2sd xmm2, rcx
+                    ; ucomisd xmm2, xmm1
+                    ; jp => bail
+                    ; jne => bail
+                    ; cqo
+                    ; idiv rcx
+                    // A zero remainder inherits the dividend's sign in JS.
+                    ; test rdx, rdx
+                    ; jnz => rem_signed
+                    ; movq rax, xmm0
+                    ; test rax, rax
+                    ; js => bail
+                    ; => rem_signed
+                    ; movsxd r8, edx
+                    ; cmp r8, rdx
+                    ; jne => as_dbl
+                    ; mov r8, QWORD INT_TAG as i64
+                    ; mov eax, edx
+                    ; or rax, r8
+                    ; mov [rbx + dreg(dst)], rax
+                    ; jmp => mod_done
+                    ; => as_dbl
+                    ; cvtsi2sd xmm0, rdx
+                    ; movq rax, xmm0
+                    ; mov [rbx + dreg(dst)], rax
+                    ; => mod_done
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
+            Instr::CheckCoercible { src } => {
+                // RequireObjectCoercible is a no-op except for null/undefined.
+                // Exit before effects for those two values; the interpreter
+                // constructs the exact TypeError at this bytecode.
+                dynasm!(ops
+                    ; mov rax, [rbx + dreg(src)]
+                    ; mov r10, QWORD Value::NULL.bits() as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov r10, QWORD Value::UNDEFINED.bits() as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                );
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::MathOp {
                 dst,
                 op,
@@ -903,6 +2251,43 @@ pub(crate) fn compile_proto_mem(
                 heap.math_unary,
                 heap.math_two,
             ),
+            Instr::GlobalFn {
+                dst,
+                op: crate::bytecode::GlobalFn::String,
+                arg_base,
+                argc,
+            } => {
+                debug_assert_eq!(argc, 1);
+                // The helper implements exactly primitive tagged-Int ToString.
+                // Any other live value declines before effects and resumes the
+                // interpreter at this GlobalFn bytecode, preserving Symbol and
+                // observable object-coercion semantics.
+                let helper = crate::vm::jit_int_string as usize;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(arg_base)]
+                    ; mov rax, QWORD helper as i64
+                    ; call rax
+                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                    ; cmp rax, r10
+                    ; je => bail
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                if let Some((vb, icb)) = refetch {
+                    // 0..9 and 10..99 return permanently pinned single-char /
+                    // pad2 strings without a safe point or allocation. Every
+                    // allocated result has an index above the pinned prefix,
+                    // so only that branch can have moved the version/IC bases.
+                    let no_alloc = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; cmp eax, crate::heap::INTERN_PINNED_END as i32
+                        ; jbe => no_alloc
+                    );
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                    dynasm!(ops ; => no_alloc);
+                }
+                emit_region_bail(&mut ops, ip, bail, epilogue);
+            }
             Instr::Add { dst, a, b } => {
                 // Int+Int fast path, then f64, then the `jit_concat` fallback
                 // (string concat / coercion — the interpreter's `add_values`),
@@ -1190,11 +2575,20 @@ pub(crate) fn compile_proto_mem(
                 let cont = ops.new_dynamic_label();
                 // B114: accessor-way dispatch target (as the region arm),
                 // SITE-GATED exactly as there.
-                let acc = acc_emit
+                let site_emit = ic_emit
                     .get((ic_site - heap.ic_base_idx) as usize)
-                    .is_some_and(|&b| b)
-                    .then(|| ops.new_dynamic_label());
-                emit_ic_probe(&mut ops, IcProbe::Get { dst }, obj, off, cont, acc);
+                    .copied()
+                    .unwrap_or_default();
+                let acc = site_emit.acc.then(|| ops.new_dynamic_label());
+                emit_ic_probe(
+                    &mut ops,
+                    IcProbe::Get { dst },
+                    obj,
+                    off,
+                    cont,
+                    acc,
+                    site_emit.direct_miss,
+                );
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rax                        // obj_bits (rax survives the probe)
@@ -1277,11 +2671,20 @@ pub(crate) fn compile_proto_mem(
                 let cont = ops.new_dynamic_label();
                 // B114: accessor-way dispatch target (as the region arm),
                 // SITE-GATED exactly as there.
-                let acc = acc_emit
+                let site_emit = ic_emit
                     .get((ic_site - heap.ic_base_idx) as usize)
-                    .is_some_and(|&b| b)
-                    .then(|| ops.new_dynamic_label());
-                emit_ic_probe(&mut ops, IcProbe::Set { val }, obj, off, cont, acc);
+                    .copied()
+                    .unwrap_or_default();
+                let acc = site_emit.acc.then(|| ops.new_dynamic_label());
+                emit_ic_probe(
+                    &mut ops,
+                    IcProbe::Set { val },
+                    obj,
+                    off,
+                    cont,
+                    acc,
+                    site_emit.direct_miss,
+                );
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rax                        // obj_bits
@@ -1353,7 +2756,158 @@ pub(crate) fn compile_proto_mem(
                 // re-fetches the versions pointer explicitly below.
                 let key = proto.string_constants[name as usize].as_str();
                 let substring_arity_ok = argc == 2 || (argc == 1 && substring1_intrinsic_enabled());
-                if substring_arity_ok && matches!(key, "substring" | "slice") {
+                if key == "random" && argc == 0 && tierc_random_method_enabled() {
+                    // Unlike arithmetic Math intrinsics, `Math.random()` must
+                    // observe an own-property replacement. Route through the
+                    // interpreter's live method IC and generic call protocol;
+                    // a user function/native runs to completion, while an
+                    // accessor/proxy/exotic receiver deopts before effects.
+                    let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                    let packed_args =
+                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
+                    if let Some(plan) = method_plan.get(&ip) {
+                        // Exact own-data receiver/callee guards precede a
+                        // closed typed schedule. Global writes stay buffered
+                        // until every live tag/range/route/depth guard passes;
+                        // the terminal stores cannot deopt or call a helper.
+                        emit_inline_method_call(
+                            &mut ops,
+                            ip,
+                            epilogue,
+                            leaf_flag_off,
+                            plan,
+                            obj,
+                            arg_base,
+                            argc,
+                            dst,
+                            heap.call_method_ic,
+                            packed_fip,
+                            packed_args,
+                            refetch,
+                            None,
+                        );
+                    } else {
+                        // A metered region deliberately skips this prefix: its
+                        // native callee entry has not yet proved byte-for-byte
+                        // charge equivalence with the interpreter CallMethod.
+                        let own_slot_direct = method_own_slot_direct;
+                        let method_cross = tierc_method_crosscall_enabled();
+                        let method_done = ops.new_dynamic_label();
+                        if own_slot_direct {
+                            let direct_helper = crate::vm::jit_cross_own_method_call as usize;
+                            let direct_fallback = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; mov rcx, rdi                        // vm
+                                ; mov rdx, rbx                        // caller window base
+                                ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+                                ; mov r9, QWORD packed_fip as i64
+                                ; mov rax, QWORD direct_helper as i64
+                                ; call rax
+                                ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                                ; cmp rax, r10
+                                ; je => direct_fallback               // pure decline -> existing path
+                                ; mov r10, QWORD CALL_THREW as i64
+                                ; cmp rax, r10
+                                ; je => bail                          // committed throw
+                                ; mov [rbx + dreg(dst)], rax
+                            );
+                            if let Some((vb, icb)) = refetch {
+                                emit_refetch_pinned(&mut ops, vb, Some(icb));
+                            }
+                            dynasm!(ops
+                                ; jmp => method_done
+                                ; => direct_fallback
+                            );
+                        }
+                        if method_cross {
+                            let method_cross_helper = crate::vm::jit_cross_method_call as usize;
+                            let method_fallback = ops.new_dynamic_label();
+                            dynasm!(ops
+                                ; mov rcx, rdi                        // vm
+                                ; mov rdx, rbx                        // caller window base
+                                ; lea r8, [rbx + dreg(arg_base)]      // &args[0..argc]
+                                ; mov r9, QWORD packed_fip as i64
+                                ; mov rax, QWORD method_cross_helper as i64
+                                ; call rax
+                                ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                                ; cmp rax, r10
+                                ; je => method_fallback               // pure decline → generic helper
+                                ; mov r10, QWORD CALL_THREW as i64
+                                ; cmp rax, r10
+                                ; je => bail                          // committed throw
+                                ; mov [rbx + dreg(dst)], rax
+                            );
+                            if let Some((vb, icb)) = refetch {
+                                emit_refetch_pinned(&mut ops, vb, Some(icb));
+                            }
+                            dynasm!(ops
+                                ; jmp => method_done
+                                ; => method_fallback
+                            );
+                        }
+                        emit_region_call_ic(
+                            &mut ops,
+                            ip,
+                            bail,
+                            epilogue,
+                            heap.call_method_ic,
+                            packed_fip,
+                            packed_args,
+                            argc,
+                            dst,
+                            refetch,
+                            None,
+                        );
+                        if own_slot_direct || method_cross {
+                            dynasm!(ops ; => method_done);
+                        }
+                    }
+                } else if key == "toUpperCase" && argc == 0 && tierc_string_upper_enabled() {
+                    dynasm!(ops
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // primitive-string receiver bits
+                        ; mov rax, QWORD heap.str_upper_case as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail                          // live prototype/realm mismatch
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    // Case mapping allocates the result and can grow the heap's
+                    // parallel versions table. It cannot run user code or grow
+                    // the IC table, so only r13 needs re-deriving.
+                    if refetch_pinned {
+                        emit_refetch_pinned(&mut ops, heap.versions_base, None);
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else if tierc_coll_mutate_enabled()
+                    && matches!((key, argc), ("set", 2) | ("clear", 0))
+                {
+                    let op = i32::from(key == "clear");
+                    if argc == 2 {
+                        dynasm!(ops
+                            ; mov r8, [rbx + dreg(arg_base)]
+                            ; mov r9, [rbx + dreg(arg_base + 1)]
+                        );
+                    } else {
+                        dynasm!(ops
+                            ; xor r8d, r8d
+                            ; xor r9d, r9d
+                        );
+                    }
+                    dynasm!(ops
+                        ; mov QWORD [rsp + 32], op
+                        ; mov rcx, rdi                        // vm
+                        ; mov rdx, [rbx + dreg(obj)]          // Map receiver bits
+                        ; mov rax, QWORD heap.coll_mutate as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail                          // own/proto/realm override
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else if substring_arity_ok && matches!(key, "substring" | "slice") {
                     // substring/slice: args read from the contiguous window;
                     // mode bit 1 tells the helper the end argument is absent.
                     let mode = (key == "slice") as i32 | (((argc == 1) as i32) << 1);
@@ -1461,10 +3015,24 @@ pub(crate) fn compile_proto_mem(
                 // through to the unchanged `call_ic` helper — a pure prefix.
                 // `CALL_THREW` bails so the interpreter unwinds (never re-runs).
                 // Skipped when the site is leaf-inlined (strictly cheaper).
-                let cross = cross_plan.contains(&ip) && leaf_plan.get(&ip).is_none();
+                let cross_site = cross_plan.get(&ip).copied();
+                let cross = cross_site.is_some() && leaf_plan.get(&ip).is_none();
                 let cross_done = ops.new_dynamic_label();
                 if cross {
-                    let packed_cross: u64 = (argc as u64) | ((proto.reg_count.max(1) as u64) << 16);
+                    let same_proto2 = cross_site.flatten();
+                    let packed_cross: u64 = match same_proto2 {
+                        Some(plan) => {
+                            ((plan.fid as u64) << 32)
+                                | ((proto.reg_count.max(1) as u64) << 16)
+                                | u64::from(plan.callee_regs)
+                        }
+                        None => (argc as u64) | ((proto.reg_count.max(1) as u64) << 16),
+                    };
+                    let cross_helper = if same_proto2.is_some() {
+                        heap.cross_call_same_proto2
+                    } else {
+                        heap.cross_call
+                    };
                     let cross_fallback = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
@@ -1473,7 +3041,7 @@ pub(crate) fn compile_proto_mem(
                         ; mov r9, QWORD packed_cross as i64   // (caller_regs<<16)|argc
                         ; mov rax, [rbx + dreg(callee)]
                         ; mov [rsp + 32], rax                 // 5th arg: callee bits
-                        ; mov rax, QWORD heap.cross_call as i64
+                        ; mov rax, QWORD cross_helper as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
@@ -1589,6 +3157,12 @@ pub(crate) fn compile_proto_mem(
                     ; je => bail
                     ; mov [rbx + dreg(dst)], rax
                 );
+                // The first append may replace an interned seed with a freshly
+                // allocated mutable builder; preserve the usual post-allocation
+                // versions/IC pin invariant before continuing the native loop.
+                if let Some((vb, icb)) = refetch {
+                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::AddRightPair {

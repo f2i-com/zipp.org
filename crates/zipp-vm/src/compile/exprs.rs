@@ -103,7 +103,12 @@ pub(crate) fn fused_cmp_jump_enabled() -> bool {
 /// a different pairwise coercion order and stays a single leaf here (its own
 /// `binary()` call may fuse it independently). (W11 B124 chain fusion.)
 fn add_spine<'e>(e: &'e ast::Expr, leaves: &mut Vec<&'e ast::Expr>) {
-    if let ast::Expr::Binary { op: ast::BinaryOp::Add, left, right } = e {
+    if let ast::Expr::Binary {
+        op: ast::BinaryOp::Add,
+        left,
+        right,
+    } = e
+    {
         add_spine(left, leaves);
         leaves.push(right);
     } else {
@@ -182,7 +187,12 @@ impl<'a> FnCompiler<'a> {
     /// the byte-identical `while (i < n) { …; ++i; }` — 3.9x, for the choice of
     /// `i++` over `++i` in a position where the two cannot be told apart.
     pub(crate) fn expr_discarded(&mut self, e: &ast::Expr) -> R<Reg> {
-        if let ast::Expr::Update { op, prefix: false, target } = e {
+        if let ast::Expr::Update {
+            op,
+            prefix: false,
+            target,
+        } = e
+        {
             let dst = self.temp();
             return self.update(*op, true, target, dst);
         }
@@ -277,7 +287,12 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::LoadConst { dst: pt, idx: pat });
                 let ft = self.temp();
                 self.emit(Instr::LoadConst { dst: ft, idx: flg });
-                self.emit(Instr::NewRegExp { dst, pattern: pt, flags: ft, is_construct: true });
+                self.emit(Instr::NewRegExp {
+                    dst,
+                    pattern: pt,
+                    flags: ft,
+                    is_construct: true,
+                });
                 self.next_reg -= 2;
                 Ok(dst)
             }
@@ -336,9 +351,17 @@ impl<'a> FnCompiler<'a> {
                         let rs = self.temp();
                         self.emit(Instr::ToStr { dst: rs, a: r });
                         if started {
-                            self.emit(Instr::StrConcatChain { dst: acc, a: acc, b: rs });
+                            self.emit(Instr::StrConcatChain {
+                                dst: acc,
+                                a: acc,
+                                b: rs,
+                            });
                         } else {
-                            self.emit(Instr::Add { dst: acc, a: q0r, b: rs });
+                            self.emit(Instr::Add {
+                                dst: acc,
+                                a: q0r,
+                                b: rs,
+                            });
                             started = true;
                         }
                         self.next_reg = save;
@@ -347,7 +370,11 @@ impl<'a> FnCompiler<'a> {
                                 let qidx = self.str_const(q);
                                 let qr = self.temp();
                                 self.emit(Instr::LoadConst { dst: qr, idx: qidx });
-                                self.emit(Instr::StrConcatChain { dst: acc, a: acc, b: qr });
+                                self.emit(Instr::StrConcatChain {
+                                    dst: acc,
+                                    a: acc,
+                                    b: qr,
+                                });
                                 self.next_reg = save;
                             }
                         }
@@ -388,7 +415,9 @@ impl<'a> FnCompiler<'a> {
                 // reference (property keys / member names are different AST nodes,
                 // so `obj.public` / `{public:1}` are unaffected).
                 if self.cx.in_strict && is_strict_reserved_word(n) {
-                    return Err(format!("SyntaxError: '{n}' is a reserved word in strict mode"));
+                    return Err(format!(
+                        "SyntaxError: '{n}' is a reserved word in strict mode"
+                    ));
                 }
                 // Special global value identifiers that are not user bindings.
                 // Inside a `with`, an own property of a with-object SHADOWS the
@@ -431,7 +460,13 @@ impl<'a> FnCompiler<'a> {
                 }
                 if self.param_tdz.contains(n) {
                     let e = self.alloc_reg();
-                    self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
+                    self.emit(Instr::NewError {
+                        dst: e,
+                        kind: 4,
+                        arg: None,
+                        opts: None,
+                        errors: None,
+                    });
                     self.emit(Instr::Throw { src: e });
                     return Ok(dst);
                 }
@@ -454,7 +489,11 @@ impl<'a> FnCompiler<'a> {
                         if !self.cx.in_strict && self.box_all_locals {
                             let name = self.upvalues.borrow()[idx as usize].0.clone();
                             let slot = self.cx.global_slot(&name) as u32;
-                            self.emit(Instr::LoadUpvalDyn { dst, idx, name: slot });
+                            self.emit(Instr::LoadUpvalDyn {
+                                dst,
+                                idx,
+                                name: slot,
+                            });
                         } else {
                             self.emit(Instr::UpvalGet { dst, idx });
                         }
@@ -486,7 +525,9 @@ impl<'a> FnCompiler<'a> {
             E::Logical { op, left, right } => self.logical(*op, left, right, dst),
             E::Unary { op, arg } => self.unary(*op, arg, dst),
             E::Update { op, prefix, target } => self.update(*op, *prefix, target, dst),
-            E::Assign { op, target, value, .. } => self.assign(*op, target, value, dst),
+            E::Assign {
+                op, target, value, ..
+            } => self.assign(*op, target, value, dst),
             E::Cond { test, cons, alt } => self.conditional(test, cons, alt, dst),
             E::Yield { arg, delegate } => self.yield_expr(arg.as_deref(), *delegate, dst),
             E::Await(a) => self.await_expr(a, dst),
@@ -517,7 +558,11 @@ impl<'a> FnCompiler<'a> {
                     // `new Array(…)` / `new Object()` builtins (no real global).
                     if id == "Array" {
                         let (arg_base, argc) = self.eval_args_contiguous(args)?;
-                        self.emit(Instr::ArrayCtor { dst, arg_base, argc });
+                        self.emit(Instr::ArrayCtor {
+                            dst,
+                            arg_base,
+                            argc,
+                        });
                         return Ok(dst);
                     }
                     if id == "Object" {
@@ -613,7 +658,10 @@ impl<'a> FnCompiler<'a> {
                             Some(e) => {
                                 let v = self.expr_into(e, target)?;
                                 if v != target {
-                                    self.emit(Instr::Move { dst: target, src: v });
+                                    self.emit(Instr::Move {
+                                        dst: target,
+                                        src: v,
+                                    });
                                 }
                             }
                             None => self.emit(Instr::LoadUndefined { dst: target }),
@@ -629,7 +677,10 @@ impl<'a> FnCompiler<'a> {
                             Some(e) => {
                                 let v = self.expr_into(e, cleanup)?;
                                 if v != cleanup {
-                                    self.emit(Instr::Move { dst: cleanup, src: v });
+                                    self.emit(Instr::Move {
+                                        dst: cleanup,
+                                        src: v,
+                                    });
                                 }
                             }
                             None => self.emit(Instr::LoadUndefined { dst: cleanup }),
@@ -641,7 +692,11 @@ impl<'a> FnCompiler<'a> {
                     // `new Date(...)`.
                     if id == "Date" {
                         let (arg_base, argc) = self.eval_args_contiguous(args)?;
-                        self.emit(Instr::DateNew { dst, arg_base, argc });
+                        self.emit(Instr::DateNew {
+                            dst,
+                            arg_base,
+                            argc,
+                        });
                         return Ok(dst);
                     }
                 }
@@ -656,16 +711,28 @@ impl<'a> FnCompiler<'a> {
                 let save = self.next_reg;
                 let callee_reg = self.temp();
                 if cv != callee_reg {
-                    self.emit(Instr::Move { dst: callee_reg, src: cv });
+                    self.emit(Instr::Move {
+                        dst: callee_reg,
+                        src: cv,
+                    });
                 }
                 if has_spread {
                     let args_arr = self.build_spread_args(args)?;
-                    self.emit(Instr::NewSpread { dst, callee: callee_reg, args: args_arr });
+                    self.emit(Instr::NewSpread {
+                        dst,
+                        callee: callee_reg,
+                        args: args_arr,
+                    });
                     self.next_reg = save; // reclaim the callee temp (+ arg scratch)
                     return Ok(dst);
                 }
                 let (arg_base, argc) = self.eval_args_contiguous(args)?;
-                self.emit(Instr::New { dst, callee: callee_reg, arg_base, argc });
+                self.emit(Instr::New {
+                    dst,
+                    callee: callee_reg,
+                    arg_base,
+                    argc,
+                });
                 self.next_reg = save; // reclaim the callee temp + args
                 Ok(dst)
             }
@@ -694,7 +761,12 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::LoadConst { dst: kr, idx });
                 let obj = self.expr(object)?;
                 // Ergonomic brand check: bypass the private-key reflection filter.
-                self.emit(Instr::HasProp { dst, key: kr, obj, brand: true });
+                self.emit(Instr::HasProp {
+                    dst,
+                    key: kr,
+                    obj,
+                    brand: true,
+                });
                 Ok(dst)
             }
             E::Chain(inner) => self.chain_expr(inner, dst),
@@ -723,7 +795,11 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::LoadNewTarget { dst });
                 Ok(dst)
             }
-            E::ImportCall { spec, options, phase } => {
+            E::ImportCall {
+                spec,
+                options,
+                phase,
+            } => {
                 // Dynamic `import(specifier [, options])` / `import.defer` /
                 // `import.source`. Evaluate the specifier (and options, if any);
                 // ImportCall does ToString, the options/phase checks, and the load.
@@ -737,7 +813,12 @@ impl<'a> FnCompiler<'a> {
                     ast::ImportPhase::Defer => 1,
                     ast::ImportPhase::Evaluation => 0,
                 };
-                self.emit(Instr::ImportCall { dst, spec, phase, opts });
+                self.emit(Instr::ImportCall {
+                    dst,
+                    spec,
+                    phase,
+                    opts,
+                });
                 Ok(dst)
             }
             E::ImportMeta => {
@@ -801,7 +882,11 @@ impl<'a> FnCompiler<'a> {
             self.this_check();
             let name = self.string_name(prop);
             if let Some(pid) = self.super_class {
-                self.emit(Instr::SuperGet { dst, home_class_id: pid, name });
+                self.emit(Instr::SuperGet {
+                    dst,
+                    home_class_id: pid,
+                    name,
+                });
             } else if self.super_home_obj {
                 self.emit(Instr::SuperGetObj { dst, name });
             } else {
@@ -818,14 +903,23 @@ impl<'a> FnCompiler<'a> {
         Ok(dst)
     }
 
-    pub(crate) fn computed_member(&mut self, m: &ast::Member, key_expr: &ast::Expr, dst: Reg) -> R<Reg> {
+    pub(crate) fn computed_member(
+        &mut self,
+        m: &ast::Member,
+        key_expr: &ast::Expr,
+        dst: Reg,
+    ) -> R<Reg> {
         // `super[expr]` — computed inherited-property read.
         if matches!(&m.object, ast::Expr::Super) {
             // GetThisBinding() throws BEFORE the key expression is evaluated.
             self.this_check();
             if let Some(pid) = self.super_class {
                 let key = self.expr(key_expr)?;
-                self.emit(Instr::SuperGetComputed { dst, home_class_id: pid, key });
+                self.emit(Instr::SuperGetComputed {
+                    dst,
+                    home_class_id: pid,
+                    key,
+                });
             } else if self.super_home_obj {
                 let key = self.expr(key_expr)?;
                 self.emit(Instr::SuperGetObjComputed { dst, key });
@@ -845,7 +939,12 @@ impl<'a> FnCompiler<'a> {
         if let Some((name, rhs)) = concat_key_literal_prefix(key_expr) {
             let nidx = self.string_name(name);
             let key = self.expr(rhs)?;
-            self.emit(Instr::GetIndexConcat { dst, obj, name: nidx, key });
+            self.emit(Instr::GetIndexConcat {
+                dst,
+                obj,
+                name: nidx,
+                key,
+            });
             return Ok(dst);
         }
         let key = self.expr(key_expr)?;
@@ -873,11 +972,19 @@ impl<'a> FnCompiler<'a> {
     /// object, which `??` / `??=` / `?.` must NOT treat as nullish.)
     pub(crate) fn emit_is_nullish(&mut self, v: Reg, cond: Reg, scratch: Reg) {
         self.emit(Instr::LoadUndefined { dst: scratch });
-        self.emit(Instr::Eq { dst: cond, a: v, b: scratch });
+        self.emit(Instr::Eq {
+            dst: cond,
+            a: v,
+            b: scratch,
+        });
         let j = self.here();
         self.emit(Instr::JumpIfTrue { cond, target: 0 });
         self.emit(Instr::LoadNull { dst: scratch });
-        self.emit(Instr::Eq { dst: cond, a: v, b: scratch });
+        self.emit(Instr::Eq {
+            dst: cond,
+            a: v,
+            b: scratch,
+        });
         let end = self.here();
         self.patch_jump(j, end);
     }
@@ -931,11 +1038,19 @@ impl<'a> FnCompiler<'a> {
             match &kind {
                 Kind::Static(p) => {
                     let name = self.string_name(p);
-                    self.emit(Instr::GetProp { dst: callee, obj, name });
+                    self.emit(Instr::GetProp {
+                        dst: callee,
+                        obj,
+                        name,
+                    });
                 }
                 Kind::Computed(k) => {
                     let key = self.expr(k)?;
-                    self.emit(Instr::GetIndex { dst: callee, obj, key });
+                    self.emit(Instr::GetIndex {
+                        dst: callee,
+                        obj,
+                        key,
+                    });
                 }
             }
             Ok((callee, obj))
@@ -1049,7 +1164,10 @@ impl<'a> FnCompiler<'a> {
                 let obj = self.expr(object)?;
                 let obj_reg = self.alloc_reg();
                 if obj != obj_reg {
-                    self.emit(Instr::Move { dst: obj_reg, src: obj });
+                    self.emit(Instr::Move {
+                        dst: obj_reg,
+                        src: obj,
+                    });
                 }
                 let name = self.string_name(prop);
                 Tag::Method(obj_reg, name)
@@ -1058,7 +1176,10 @@ impl<'a> FnCompiler<'a> {
                 let callee = self.expr(tag_expr)?;
                 let callee_reg = self.alloc_reg();
                 if callee != callee_reg {
-                    self.emit(Instr::Move { dst: callee_reg, src: callee });
+                    self.emit(Instr::Move {
+                        dst: callee_reg,
+                        src: callee,
+                    });
                 }
                 Tag::Plain(callee_reg)
             }
@@ -1069,11 +1190,20 @@ impl<'a> FnCompiler<'a> {
         let strings_reg = self.alloc_reg();
         let site = self.template_site_count;
         self.template_site_count += 1;
-        self.emit(Instr::TemplateGetCached { dst: strings_reg, site });
+        self.emit(Instr::TemplateGetCached {
+            dst: strings_reg,
+            site,
+        });
         let skip = self.here();
-        self.emit(Instr::JumpIfTrue { cond: strings_reg, target: 0 }); // patched: cache hit
+        self.emit(Instr::JumpIfTrue {
+            cond: strings_reg,
+            target: 0,
+        }); // patched: cache hit
         self.build_template_strings(quasi, strings_reg)?;
-        self.emit(Instr::TemplateSetCached { site, src: strings_reg });
+        self.emit(Instr::TemplateSetCached {
+            site,
+            src: strings_reg,
+        });
         let after = self.here();
         self.patch_jump(skip, after);
         // Contiguous argument block: [strings, e0, e1, …].
@@ -1082,7 +1212,10 @@ impl<'a> FnCompiler<'a> {
             self.alloc_reg();
         }
         let block_top = self.next_reg;
-        self.emit(Instr::Move { dst: arg_base, src: strings_reg });
+        self.emit(Instr::Move {
+            dst: arg_base,
+            src: strings_reg,
+        });
         for (i, e) in quasi.exprs.iter().enumerate() {
             let slot = arg_base + 1 + i as Reg;
             let v = self.expr_into(e, slot)?;
@@ -1097,13 +1230,26 @@ impl<'a> FnCompiler<'a> {
                 if tail {
                     // Proper tail call (`return f`…``): reuse the frame for a
                     // plain function tag; others fall through to the Call.
-                    self.emit(Instr::TailCall { callee, arg_base, argc });
+                    self.emit(Instr::TailCall {
+                        callee,
+                        arg_base,
+                        argc,
+                    });
                 }
-                self.emit(Instr::Call { dst, callee, arg_base, argc })
+                self.emit(Instr::Call {
+                    dst,
+                    callee,
+                    arg_base,
+                    argc,
+                })
             }
-            Tag::Method(obj, name) => {
-                self.emit(Instr::CallMethod { dst, obj, name, arg_base, argc })
-            }
+            Tag::Method(obj, name) => self.emit(Instr::CallMethod {
+                dst,
+                obj,
+                name,
+                arg_base,
+                argc,
+            }),
         }
         Ok(dst)
     }
@@ -1131,7 +1277,11 @@ impl<'a> FnCompiler<'a> {
                 None => self.emit(Instr::LoadUndefined { dst: r }),
             }
         }
-        self.emit(Instr::NewArray { dst, arg_base: cooked_base, argc: nq });
+        self.emit(Instr::NewArray {
+            dst,
+            arg_base: cooked_base,
+            argc: nq,
+        });
         self.next_reg = save;
         // Raw array → a temp, then dst.raw = it.
         let raw_reg = self.alloc_reg();
@@ -1141,8 +1291,15 @@ impl<'a> FnCompiler<'a> {
             let idx = self.add_string_const(&q.raw);
             self.emit(Instr::LoadConst { dst: r, idx });
         }
-        self.emit(Instr::NewArray { dst: raw_reg, arg_base: raw_base, argc: nq });
-        self.emit(Instr::SetRaw { arr: dst, raw: raw_reg });
+        self.emit(Instr::NewArray {
+            dst: raw_reg,
+            arg_base: raw_base,
+            argc: nq,
+        });
+        self.emit(Instr::SetRaw {
+            arr: dst,
+            raw: raw_reg,
+        });
         self.next_reg = save;
         Ok(())
     }
@@ -1185,11 +1342,17 @@ impl<'a> FnCompiler<'a> {
         let block_fits = self.next_reg as usize + n_elems <= Reg::MAX as usize;
         let incremental = n_elems > NEWARRAY_MAX_ELEMS
             || !block_fits
-            || elems.iter().any(|e| matches!(e, Some(ast::ArrayElem::Spread(_))));
+            || elems
+                .iter()
+                .any(|e| matches!(e, Some(ast::ArrayElem::Spread(_))));
         // With a `...spread` element the final length is dynamic, so build the
         // array incrementally via ArrayAppend instead of the fixed-block NewArray.
         if incremental {
-            self.emit(Instr::NewArray { dst, arg_base: self.next_reg, argc: 0 }); // []
+            self.emit(Instr::NewArray {
+                dst,
+                arg_base: self.next_reg,
+                argc: 0,
+            }); // []
             for el in elems {
                 let save = self.next_reg;
                 match el {
@@ -1197,15 +1360,27 @@ impl<'a> FnCompiler<'a> {
                     None => {
                         let v = self.temp();
                         self.emit(Instr::LoadHole { dst: v });
-                        self.emit(Instr::ArrayAppend { arr: dst, val: v, spread: false });
+                        self.emit(Instr::ArrayAppend {
+                            arr: dst,
+                            val: v,
+                            spread: false,
+                        });
                     }
                     Some(ast::ArrayElem::Spread(s)) => {
                         let v = self.expr(s)?;
-                        self.emit(Instr::ArrayAppend { arr: dst, val: v, spread: true });
+                        self.emit(Instr::ArrayAppend {
+                            arr: dst,
+                            val: v,
+                            spread: true,
+                        });
                     }
                     Some(ast::ArrayElem::Expr(e)) => {
                         let v = self.expr(e)?;
-                        self.emit(Instr::ArrayAppend { arr: dst, val: v, spread: false });
+                        self.emit(Instr::ArrayAppend {
+                            arr: dst,
+                            val: v,
+                            spread: false,
+                        });
                     }
                 }
                 self.next_reg = save;
@@ -1239,7 +1414,11 @@ impl<'a> FnCompiler<'a> {
             }
             self.next_reg = block_top;
         }
-        self.emit(Instr::NewArray { dst, arg_base: base, argc: count });
+        self.emit(Instr::NewArray {
+            dst,
+            arg_base: base,
+            argc: count,
+        });
         Ok(dst)
     }
 
@@ -1308,7 +1487,12 @@ impl<'a> FnCompiler<'a> {
                 // is either consumed by the target reinterpretation or raised as
                 // an error by the parser, which is the only place that knows
                 // which of the two this literal resolved as.
-                ast::ObjectMember::Prop { key, value, shorthand, .. } => self.object_data_prop(
+                ast::ObjectMember::Prop {
+                    key,
+                    value,
+                    shorthand,
+                    ..
+                } => self.object_data_prop(
                     dst,
                     key,
                     PropVal::Expr(value),
@@ -1386,8 +1570,16 @@ impl<'a> FnCompiler<'a> {
         // this is a bridge-side fidelity gap, not a compiler one.)
         let fid = self.cx.functions.len() - 1;
         self.cx.functions[fid].non_constructable = true; // accessor = method
-        self.emit(Instr::DefineAccessor { obj, key, func, is_setter });
-        self.emit(Instr::SetHomeObject { method: func, home: obj });
+        self.emit(Instr::DefineAccessor {
+            obj,
+            key,
+            func,
+            is_setter,
+        });
+        self.emit(Instr::SetHomeObject {
+            method: func,
+            home: obj,
+        });
         // SetFunctionName: a getter/setter is named "get k"/"set k"
         // (a Symbol key → "get [desc]"), at runtime so a computed key
         // is handled too.
@@ -1424,7 +1616,11 @@ impl<'a> FnCompiler<'a> {
             // property (only the textual colon form sets the proto).
             let raw = self.expr(ke)?;
             let key = self.alloc_reg();
-            self.emit(Instr::ToPropKey { dst: key, obj, src: raw });
+            self.emit(Instr::ToPropKey {
+                dst: key,
+                obj,
+                src: raw,
+            });
             // A computed concise method gets a [[HomeObject]] (for super).
             if is_method {
                 self.cx.obj_method_super = true;
@@ -1443,11 +1639,18 @@ impl<'a> FnCompiler<'a> {
             // takes the (runtime) computed key as its name — a Symbol key
             // becomes "[description]".
             if anonymous {
-                self.emit(Instr::SetFnNameFromKey { func: v, key, prefix: 0 });
+                self.emit(Instr::SetFnNameFromKey {
+                    func: v,
+                    key,
+                    prefix: 0,
+                });
             }
             self.emit(Instr::InitDataPropDyn { obj, key, val: v });
             if is_method {
-                self.emit(Instr::SetHomeObject { method: v, home: obj });
+                self.emit(Instr::SetHomeObject {
+                    method: v,
+                    home: obj,
+                });
             }
             return Ok(());
         }
@@ -1504,7 +1707,10 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::InitDataProp { obj, name, val: v });
         }
         if is_method {
-            self.emit(Instr::SetHomeObject { method: v, home: obj });
+            self.emit(Instr::SetHomeObject {
+                method: v,
+                home: obj,
+            });
         }
         Ok(())
     }
@@ -1612,7 +1818,11 @@ impl<'a> FnCompiler<'a> {
         self.next_reg = save;
         for leaf in &leaves[2..] {
             let r = self.expr(leaf)?;
-            self.emit(Instr::StrConcatChain { dst: acc, a: acc, b: r });
+            self.emit(Instr::StrConcatChain {
+                dst: acc,
+                a: acc,
+                b: r,
+            });
             // Per-link rollback keeps the live-temp footprint flat (~2 above
             // `acc`) however long the chain — never below `acc` while the
             // chain is live (the in-place licence depends on `acc`'s slot
@@ -1647,8 +1857,20 @@ impl<'a> FnCompiler<'a> {
         // special constant slot, so it keeps the generic path.
         if matches!(op, Op::StrictEq | Op::StrictNotEq | Op::Eq | Op::NotEq) {
             let fused = match (left, right) {
-                (ast::Expr::Unary { op: ast::UnaryOp::Typeof, arg }, ast::Expr::Str(StrVal::Utf8(lit))) => Some((arg, lit)),
-                (ast::Expr::Str(StrVal::Utf8(lit)), ast::Expr::Unary { op: ast::UnaryOp::Typeof, arg }) => Some((arg, lit)),
+                (
+                    ast::Expr::Unary {
+                        op: ast::UnaryOp::Typeof,
+                        arg,
+                    },
+                    ast::Expr::Str(StrVal::Utf8(lit)),
+                ) => Some((arg, lit)),
+                (
+                    ast::Expr::Str(StrVal::Utf8(lit)),
+                    ast::Expr::Unary {
+                        op: ast::UnaryOp::Typeof,
+                        arg,
+                    },
+                ) => Some((arg, lit)),
                 _ => None,
             };
             if let Some((arg, lit)) = fused {
@@ -1680,7 +1902,12 @@ impl<'a> FnCompiler<'a> {
         if matches!(op, Op::In) {
             let key = self.expr(left)?;
             let obj = self.expr(right)?;
-            self.emit(Instr::HasProp { dst, key, obj, brand: false });
+            self.emit(Instr::HasProp {
+                dst,
+                key,
+                obj,
+                brand: false,
+            });
             return Ok(dst);
         }
         // `a - <int literal>` and `a + <int literal>` → AddInt fast path, but
@@ -1704,7 +1931,12 @@ impl<'a> FnCompiler<'a> {
                 if matches!(op, Op::Sub) {
                     imm = -imm;
                 }
-                self.emit(Instr::AddInt { dst, a, imm, upd: false });
+                self.emit(Instr::AddInt {
+                    dst,
+                    a,
+                    imm,
+                    upd: false,
+                });
                 return Ok(dst);
             }
         }
@@ -1761,12 +1993,42 @@ impl<'a> FnCompiler<'a> {
             Op::StrictNotEq => Instr::Ne { dst, a, b: r },
             Op::Eq => Instr::LooseEq { dst, a, b: r },
             Op::NotEq => Instr::LooseNe { dst, a, b: r },
-            Op::BitAnd => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::And },
-            Op::BitOr => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Or },
-            Op::BitXor => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Xor },
-            Op::Shl => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Shl },
-            Op::Shr => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Shr },
-            Op::UShr => Instr::Bitwise { dst, a, b: r, op: BitwiseOp::Ushr },
+            Op::BitAnd => Instr::Bitwise {
+                dst,
+                a,
+                b: r,
+                op: BitwiseOp::And,
+            },
+            Op::BitOr => Instr::Bitwise {
+                dst,
+                a,
+                b: r,
+                op: BitwiseOp::Or,
+            },
+            Op::BitXor => Instr::Bitwise {
+                dst,
+                a,
+                b: r,
+                op: BitwiseOp::Xor,
+            },
+            Op::Shl => Instr::Bitwise {
+                dst,
+                a,
+                b: r,
+                op: BitwiseOp::Shl,
+            },
+            Op::Shr => Instr::Bitwise {
+                dst,
+                a,
+                b: r,
+                op: BitwiseOp::Shr,
+            },
+            Op::UShr => Instr::Bitwise {
+                dst,
+                a,
+                b: r,
+                op: BitwiseOp::Ushr,
+            },
             Op::Exp => Instr::Pow { dst, a, b: r },
             // Both are handled above; kept explicit so a new operator breaks the
             // build instead of falling into a catch-all.
@@ -1794,7 +2056,10 @@ impl<'a> FnCompiler<'a> {
         match op {
             Op::And => {
                 let j = self.here();
-                self.emit(Instr::JumpIfFalse { cond: dst, target: 0 });
+                self.emit(Instr::JumpIfFalse {
+                    cond: dst,
+                    target: 0,
+                });
                 let b = self.expr_into(right, dst)?;
                 if b != dst {
                     self.emit(Instr::Move { dst, src: b });
@@ -1804,7 +2069,10 @@ impl<'a> FnCompiler<'a> {
             }
             Op::Or => {
                 let j = self.here();
-                self.emit(Instr::JumpIfTrue { cond: dst, target: 0 });
+                self.emit(Instr::JumpIfTrue {
+                    cond: dst,
+                    target: 0,
+                });
                 let b = self.expr_into(right, dst)?;
                 if b != dst {
                     self.emit(Instr::Move { dst, src: b });
@@ -1819,7 +2087,10 @@ impl<'a> FnCompiler<'a> {
                 let isnull = self.alloc_reg();
                 self.emit_is_nullish(dst, isnull, undef);
                 let j = self.here();
-                self.emit(Instr::JumpIfFalse { cond: isnull, target: 0 }); // non-nullish → keep dst
+                self.emit(Instr::JumpIfFalse {
+                    cond: isnull,
+                    target: 0,
+                }); // non-nullish → keep dst
                 self.next_reg = save; // the nullish-test temps are dead now
                 let b = self.expr_into(right, dst)?;
                 if b != dst {
@@ -1881,14 +2152,25 @@ impl<'a> FnCompiler<'a> {
                     // no [[Delete]]). Not a SyntaxError, so it's thrown when evaluated.
                     if matches!(&m.object, ast::Expr::Super) {
                         let e = self.alloc_reg();
-                        self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
+                        self.emit(Instr::NewError {
+                            dst: e,
+                            kind: 4,
+                            arg: None,
+                            opts: None,
+                            errors: None,
+                        });
                         self.emit(Instr::Throw { src: e });
                         return Ok(dst);
                     }
                     let obj = self.expr(&m.object)?;
                     let name = self.string_name(prop);
                     let strict = self.cx.in_strict;
-                    self.emit(Instr::DeleteProp { dst, obj, name, strict });
+                    self.emit(Instr::DeleteProp {
+                        dst,
+                        obj,
+                        name,
+                        strict,
+                    });
                     Ok(dst)
                 }
                 ast::MemberProp::Computed(ke) => {
@@ -1902,7 +2184,13 @@ impl<'a> FnCompiler<'a> {
                         self.this_check();
                         let _ = self.expr(ke)?;
                         let e = self.alloc_reg();
-                        self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
+                        self.emit(Instr::NewError {
+                            dst: e,
+                            kind: 4,
+                            arg: None,
+                            opts: None,
+                            errors: None,
+                        });
                         self.emit(Instr::Throw { src: e });
                         return Ok(dst);
                     }
@@ -1913,11 +2201,22 @@ impl<'a> FnCompiler<'a> {
                     if let Some((name, rhs)) = concat_key_literal_prefix(ke) {
                         let nidx = self.string_name(name);
                         let key = self.expr(rhs)?;
-                        self.emit(Instr::DeleteIndexConcat { dst, obj, name: nidx, key, strict });
+                        self.emit(Instr::DeleteIndexConcat {
+                            dst,
+                            obj,
+                            name: nidx,
+                            key,
+                            strict,
+                        });
                         return Ok(dst);
                     }
                     let key = self.expr(ke)?;
-                    self.emit(Instr::DeleteIndex { dst, obj, key, strict });
+                    self.emit(Instr::DeleteIndex {
+                        dst,
+                        obj,
+                        key,
+                        strict,
+                    });
                     Ok(dst)
                 }
                 // `delete obj.#x` is a SyntaxError the parser rejects; if one ever
@@ -1954,11 +2253,21 @@ impl<'a> FnCompiler<'a> {
                         match &m.prop {
                             ast::MemberProp::Ident(p) => {
                                 let name = self.string_name(p);
-                                self.emit(Instr::DeleteProp { dst, obj, name, strict });
+                                self.emit(Instr::DeleteProp {
+                                    dst,
+                                    obj,
+                                    name,
+                                    strict,
+                                });
                             }
                             ast::MemberProp::Computed(k) => {
                                 let key = self.expr(k)?;
-                                self.emit(Instr::DeleteIndex { dst, obj, key, strict });
+                                self.emit(Instr::DeleteIndex {
+                                    dst,
+                                    obj,
+                                    key,
+                                    strict,
+                                });
                             }
                             ast::MemberProp::Private(_) => unreachable!(),
                         }
@@ -2050,22 +2359,47 @@ impl<'a> FnCompiler<'a> {
                     let name = self.string_name(prop);
                     let cur = self.temp();
                     match pid {
-                        Some(p) => self.emit(Instr::SuperGet { dst: cur, home_class_id: p, name }),
+                        Some(p) => self.emit(Instr::SuperGet {
+                            dst: cur,
+                            home_class_id: p,
+                            name,
+                        }),
                         None => self.emit(Instr::SuperGetObj { dst: cur, name }),
                     }
                     let oldnum = self.temp();
-                    self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
+                    self.emit(Instr::AddInt {
+                        dst: oldnum,
+                        a: cur,
+                        imm: 0,
+                        upd: true,
+                    });
                     let nw = self.temp();
-                    self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
+                    self.emit(Instr::AddInt {
+                        dst: nw,
+                        a: oldnum,
+                        imm: delta,
+                        upd: true,
+                    });
                     match pid {
                         Some(p) => {
                             let b = self.temp();
-                            self.emit(Instr::SuperBase { dst: b, home_class_id: p });
-                            self.emit(Instr::SuperSet { base: b, home_class_id: p, name, val: nw })
+                            self.emit(Instr::SuperBase {
+                                dst: b,
+                                home_class_id: p,
+                            });
+                            self.emit(Instr::SuperSet {
+                                base: b,
+                                home_class_id: p,
+                                name,
+                                val: nw,
+                            })
                         }
                         None => self.emit(Instr::SuperSetObj { name, val: nw }),
                     }
-                    self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
+                    self.emit(Instr::Move {
+                        dst,
+                        src: if prefix { nw } else { oldnum },
+                    });
                     return Ok(dst);
                 }
                 // `super[k]++` / `--super[k]` — SuperProperty evaluation checks the
@@ -2081,42 +2415,98 @@ impl<'a> FnCompiler<'a> {
                     let key = self.expr(ke)?;
                     let key_reg = self.alloc_reg();
                     if key != key_reg {
-                        self.emit(Instr::Move { dst: key_reg, src: key });
+                        self.emit(Instr::Move {
+                            dst: key_reg,
+                            src: key,
+                        });
                     }
                     let cur = self.temp();
                     match pid {
-                        Some(p) => self.emit(Instr::SuperGetComputed { dst: cur, home_class_id: p, key: key_reg }),
-                        None => self.emit(Instr::SuperGetObjComputed { dst: cur, key: key_reg }),
+                        Some(p) => self.emit(Instr::SuperGetComputed {
+                            dst: cur,
+                            home_class_id: p,
+                            key: key_reg,
+                        }),
+                        None => self.emit(Instr::SuperGetObjComputed {
+                            dst: cur,
+                            key: key_reg,
+                        }),
                     }
                     let oldnum = self.temp();
-                    self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
+                    self.emit(Instr::AddInt {
+                        dst: oldnum,
+                        a: cur,
+                        imm: 0,
+                        upd: true,
+                    });
                     let nw = self.temp();
-                    self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
+                    self.emit(Instr::AddInt {
+                        dst: nw,
+                        a: oldnum,
+                        imm: delta,
+                        upd: true,
+                    });
                     match pid {
                         Some(p) => {
                             let b = self.temp();
-                            self.emit(Instr::SuperBase { dst: b, home_class_id: p });
-                            self.emit(Instr::SuperSetComputed { base: b, home_class_id: p, key: key_reg, val: nw })
+                            self.emit(Instr::SuperBase {
+                                dst: b,
+                                home_class_id: p,
+                            });
+                            self.emit(Instr::SuperSetComputed {
+                                base: b,
+                                home_class_id: p,
+                                key: key_reg,
+                                val: nw,
+                            })
                         }
-                        None => self.emit(Instr::SuperSetObjComputed { key: key_reg, val: nw }),
+                        None => self.emit(Instr::SuperSetObjComputed {
+                            key: key_reg,
+                            val: nw,
+                        }),
                     }
-                    self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
+                    self.emit(Instr::Move {
+                        dst,
+                        src: if prefix { nw } else { oldnum },
+                    });
                     return Ok(dst);
                 }
                 (_, ast::MemberProp::Ident(prop)) => {
                     let obj = self.expr(&m.object)?;
                     let name = self.string_name(prop);
                     let cur = self.temp();
-                    self.emit(Instr::GetProp { dst: cur, obj, name });
+                    self.emit(Instr::GetProp {
+                        dst: cur,
+                        obj,
+                        name,
+                    });
                     // ToNumeric(old) ONCE (AddInt imm:0), derive the new value from it,
                     // and yield the COERCED old (postfix) — `x++` returns a number, not
                     // the raw operand. Single coercion = one valueOf for an object operand.
                     let oldnum = self.temp();
-                    self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
+                    self.emit(Instr::AddInt {
+                        dst: oldnum,
+                        a: cur,
+                        imm: 0,
+                        upd: true,
+                    });
                     let nw = self.temp();
-                    self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
-                    self.emit(Instr::SetProp { obj, name, val: nw, strict: self.cx.strict_expr_region > 0 });
-                    self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
+                    self.emit(Instr::AddInt {
+                        dst: nw,
+                        a: oldnum,
+                        imm: delta,
+                        upd: true,
+                    });
+                    self.emit(Instr::SetProp {
+                        obj,
+                        name,
+                        val: nw,
+                        strict: self.cx.strict_expr_region > 0,
+                    });
+                    self.emit(Instr::Move {
+                        dst,
+                        src: if prefix { nw } else { oldnum },
+                    });
                     return Ok(dst);
                 }
                 (_, ast::MemberProp::Computed(ke)) => {
@@ -2125,15 +2515,40 @@ impl<'a> FnCompiler<'a> {
                     // `o[k]++` reads then writes `o[k]` — coerce the key ToPropertyKey
                     // ONCE and reuse it (its toString/valueOf must not run twice).
                     let keyk = self.temp();
-                    self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
+                    self.emit(Instr::ToPropKey {
+                        dst: keyk,
+                        obj,
+                        src: key,
+                    });
                     let cur = self.temp();
-                    self.emit(Instr::GetIndex { dst: cur, obj, key: keyk });
+                    self.emit(Instr::GetIndex {
+                        dst: cur,
+                        obj,
+                        key: keyk,
+                    });
                     let oldnum = self.temp();
-                    self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
+                    self.emit(Instr::AddInt {
+                        dst: oldnum,
+                        a: cur,
+                        imm: 0,
+                        upd: true,
+                    });
                     let nw = self.temp();
-                    self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
-                    self.emit(Instr::SetIndex { obj, key: keyk, val: nw });
-                    self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
+                    self.emit(Instr::AddInt {
+                        dst: nw,
+                        a: oldnum,
+                        imm: delta,
+                        upd: true,
+                    });
+                    self.emit(Instr::SetIndex {
+                        obj,
+                        key: keyk,
+                        val: nw,
+                    });
+                    self.emit(Instr::Move {
+                        dst,
+                        src: if prefix { nw } else { oldnum },
+                    });
                     return Ok(dst);
                 }
                 // `obj.#x++` — like a static member, keyed "#x".
@@ -2142,13 +2557,35 @@ impl<'a> FnCompiler<'a> {
                     let obj = self.expr(&m.object)?;
                     let name = self.string_name(&private_key(prop));
                     let cur = self.temp();
-                    self.emit(Instr::GetProp { dst: cur, obj, name });
+                    self.emit(Instr::GetProp {
+                        dst: cur,
+                        obj,
+                        name,
+                    });
                     let oldnum = self.temp();
-                    self.emit(Instr::AddInt { dst: oldnum, a: cur, imm: 0, upd: true });
+                    self.emit(Instr::AddInt {
+                        dst: oldnum,
+                        a: cur,
+                        imm: 0,
+                        upd: true,
+                    });
                     let nw = self.temp();
-                    self.emit(Instr::AddInt { dst: nw, a: oldnum, imm: delta, upd: true });
-                    self.emit(Instr::SetProp { obj, name, val: nw, strict: self.cx.strict_expr_region > 0 });
-                    self.emit(Instr::Move { dst, src: if prefix { nw } else { oldnum } });
+                    self.emit(Instr::AddInt {
+                        dst: nw,
+                        a: oldnum,
+                        imm: delta,
+                        upd: true,
+                    });
+                    self.emit(Instr::SetProp {
+                        obj,
+                        name,
+                        val: nw,
+                        strict: self.cx.strict_expr_region > 0,
+                    });
+                    self.emit(Instr::Move {
+                        dst,
+                        src: if prefix { nw } else { oldnum },
+                    });
                     return Ok(dst);
                 }
             }
@@ -2164,7 +2601,13 @@ impl<'a> FnCompiler<'a> {
                 let t = self.temp();
                 let _ = self.call(c, t)?;
                 let e = self.alloc_reg();
-                self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
+                self.emit(Instr::NewError {
+                    dst: e,
+                    kind: 4,
+                    arg: None,
+                    opts: None,
+                    errors: None,
+                });
                 self.emit(Instr::Throw { src: e });
                 return Ok(dst);
             }
@@ -2186,15 +2629,30 @@ impl<'a> FnCompiler<'a> {
             let (found, tgt) = self.emit_with_probe(&name, &with_objs);
             self.emit_with_rmw_read(&name, found, tgt, dst);
             if prefix {
-                self.emit(Instr::AddInt { dst, a: dst, imm: delta, upd: true });
+                self.emit(Instr::AddInt {
+                    dst,
+                    a: dst,
+                    imm: delta,
+                    upd: true,
+                });
                 self.emit_with_rmw_write(&name, found, tgt, dst);
                 return Ok(dst); // dst holds the new value
             }
             // Postfix: ToNumeric(old) in place, derive the new value, store it,
             // return the COERCED old.
-            self.emit(Instr::AddInt { dst, a: dst, imm: 0, upd: true });
+            self.emit(Instr::AddInt {
+                dst,
+                a: dst,
+                imm: 0,
+                upd: true,
+            });
             let tmp = self.temp();
-            self.emit(Instr::AddInt { dst: tmp, a: dst, imm: delta, upd: true });
+            self.emit(Instr::AddInt {
+                dst: tmp,
+                a: dst,
+                imm: delta,
+                upd: true,
+            });
             self.emit_with_rmw_write(&name, found, tgt, tmp);
             self.next_reg -= 1; // reclaim tmp
             return Ok(dst); // dst still holds the (coerced) old value
@@ -2204,14 +2662,29 @@ impl<'a> FnCompiler<'a> {
             if !self.const_regs.contains(&r) {
                 // Plain mutable register local: mutate in place.
                 if prefix {
-                    self.emit(Instr::AddInt { dst: r, a: r, imm: delta, upd: true });
+                    self.emit(Instr::AddInt {
+                        dst: r,
+                        a: r,
+                        imm: delta,
+                        upd: true,
+                    });
                     if r != dst {
                         self.emit(Instr::Move { dst, src: r });
                     }
                 } else {
                     // Yield ToNumeric(old) (one coercion), then increment from it.
-                    self.emit(Instr::AddInt { dst, a: r, imm: 0, upd: true });
-                    self.emit(Instr::AddInt { dst: r, a: dst, imm: delta, upd: true });
+                    self.emit(Instr::AddInt {
+                        dst,
+                        a: r,
+                        imm: 0,
+                        upd: true,
+                    });
+                    self.emit(Instr::AddInt {
+                        dst: r,
+                        a: dst,
+                        imm: delta,
+                        upd: true,
+                    });
                 }
                 return Ok(dst);
             }
@@ -2220,20 +2693,34 @@ impl<'a> FnCompiler<'a> {
         // back (store_binding throws for a const after the read + increment).
         let cur = self.load_binding(&binding, dst); // == dst
         if prefix {
-            self.emit(Instr::AddInt { dst: cur, a: cur, imm: delta, upd: true });
+            self.emit(Instr::AddInt {
+                dst: cur,
+                a: cur,
+                imm: delta,
+                upd: true,
+            });
             // read-first: `load_binding` above resolved the reference.
             self.store_binding_read_first(&binding, cur);
             Ok(dst) // dst holds the new value
         } else {
             // Coerce the old value in place (cur == dst), compute the new value in a
             // temp, store it, and return the COERCED old.
-            self.emit(Instr::AddInt { dst: cur, a: cur, imm: 0, upd: true });
+            self.emit(Instr::AddInt {
+                dst: cur,
+                a: cur,
+                imm: 0,
+                upd: true,
+            });
             let tmp = self.temp();
-            self.emit(Instr::AddInt { dst: tmp, a: cur, imm: delta, upd: true });
+            self.emit(Instr::AddInt {
+                dst: tmp,
+                a: cur,
+                imm: delta,
+                upd: true,
+            });
             self.store_binding_read_first(&binding, tmp);
             self.next_reg -= 1; // reclaim tmp
             Ok(dst) // dst still holds the (coerced) old value
         }
     }
-
 }

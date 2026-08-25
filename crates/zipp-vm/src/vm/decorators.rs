@@ -304,12 +304,26 @@ impl<'p> Vm<'p> {
                     find(&c.methods)
                 }
             }
-            DK_GETTER => find(if is_static { &c.static_getters } else { &c.getters }),
-            DK_SETTER => find(if is_static { &c.static_setters } else { &c.setters }),
-            DK_ACCESSOR if want_get => {
-                find(if is_static { &c.static_getters } else { &c.getters })
-            }
-            DK_ACCESSOR => find(if is_static { &c.static_setters } else { &c.setters }),
+            DK_GETTER => find(if is_static {
+                &c.static_getters
+            } else {
+                &c.getters
+            }),
+            DK_SETTER => find(if is_static {
+                &c.static_setters
+            } else {
+                &c.setters
+            }),
+            DK_ACCESSOR if want_get => find(if is_static {
+                &c.static_getters
+            } else {
+                &c.getters
+            }),
+            DK_ACCESSOR => find(if is_static {
+                &c.static_setters
+            } else {
+                &c.setters
+            }),
             _ => None,
         }
     }
@@ -350,14 +364,26 @@ impl<'p> Vm<'p> {
                     put(&mut c.methods);
                 }
             }
-            DK_GETTER => put(if is_static { &mut c.static_getters } else { &mut c.getters }),
-            DK_SETTER => put(if is_static { &mut c.static_setters } else { &mut c.setters }),
-            DK_ACCESSOR if set_get => {
-                put(if is_static { &mut c.static_getters } else { &mut c.getters })
-            }
-            DK_ACCESSOR => {
-                put(if is_static { &mut c.static_setters } else { &mut c.setters })
-            }
+            DK_GETTER => put(if is_static {
+                &mut c.static_getters
+            } else {
+                &mut c.getters
+            }),
+            DK_SETTER => put(if is_static {
+                &mut c.static_setters
+            } else {
+                &mut c.setters
+            }),
+            DK_ACCESSOR if set_get => put(if is_static {
+                &mut c.static_getters
+            } else {
+                &mut c.getters
+            }),
+            DK_ACCESSOR => put(if is_static {
+                &mut c.static_setters
+            } else {
+                &mut c.setters
+            }),
             _ => {}
         }
     }
@@ -435,7 +461,11 @@ impl<'p> Vm<'p> {
         // than %Object.prototype% and an inherited-key probe cannot see through.
         self.proto_of.insert(
             meta_idx,
-            if parent_meta.is_heap() { parent_meta } else { Value::NULL },
+            if parent_meta.is_heap() {
+                parent_meta
+            } else {
+                Value::NULL
+            },
         );
         let mut st = DecState::new(n_elems);
         st.metadata = Value::heap(meta_idx);
@@ -452,7 +482,12 @@ impl<'p> Vm<'p> {
     /// `class C { @d [1+1] = 1 }` would otherwise hand the decorator the number
     /// `2` where every other engine hands it the string `"2"`.
     pub(crate) fn dec_record_key(&mut self, class: Value, elem: usize, key: Value) {
-        let key = if key.is_heap() { key } else { let s = self.key_of(key); self.alloc_str(s) };
+        let key = if key.is_heap() {
+            key
+        } else {
+            let s = self.key_of(key);
+            self.alloc_str(s)
+        };
         if let Some(d) = self.dec_of_mut(class) {
             if elem < d.keys.len() {
                 d.keys[elem] = key;
@@ -469,16 +504,19 @@ impl<'p> Vm<'p> {
         name: &'static str,
         length: u8,
     ) -> Value {
-        Value::heap(self.heap.alloc(HeapObj::NativeClosure { id, state, name, length }))
+        Value::heap(self.heap.alloc(HeapObj::NativeClosure {
+            id,
+            state,
+            name,
+            length,
+        }))
     }
 
     /// CreateDecoratorAccessObject: `{ has, get?, set? }`. `get` is present for a
     /// field/method/accessor/getter, `set` for a field/setter/accessor; `has`
     /// always. `key` is the element's resolved ClassElementName.
     fn dec_access_object(&mut self, class: Value, e: &DecElemDef, key: Value) -> Value {
-        let flags = (e.is_private as u32)
-            | ((e.is_static as u32) << 1)
-            | ((e.kind as u32) << 2);
+        let flags = (e.is_private as u32) | ((e.is_static as u32) << 1) | ((e.kind as u32) << 2);
         let storage = if e.storage.is_empty() {
             Value::UNDEFINED
         } else {
@@ -539,7 +577,10 @@ impl<'p> Vm<'p> {
             "addInitializer",
             1,
         );
-        let metadata = self.dec_of(class).map(|d| d.metadata).unwrap_or(Value::UNDEFINED);
+        let metadata = self
+            .dec_of(class)
+            .map(|d| d.metadata)
+            .unwrap_or(Value::UNDEFINED);
         let attr = data_attr();
         let mut m = ObjMap::new();
         m.define("kind", kind, attr);
@@ -569,11 +610,19 @@ impl<'p> Vm<'p> {
         let gen = self.dec_of(class).map(|d| d.gen).unwrap_or(0);
         let add_init = self.native_closure(
             native::DEC_ADD_INITIALIZER,
-            vec![class, Value::num(2.0), Value::num(0.0), Value::num(gen as f64)],
+            vec![
+                class,
+                Value::num(2.0),
+                Value::num(0.0),
+                Value::num(gen as f64),
+            ],
             "addInitializer",
             1,
         );
-        let metadata = self.dec_of(class).map(|d| d.metadata).unwrap_or(Value::UNDEFINED);
+        let metadata = self
+            .dec_of(class)
+            .map(|d| d.metadata)
+            .unwrap_or(Value::UNDEFINED);
         let attr = data_attr();
         let mut m = ObjMap::new();
         m.define("kind", kind, attr);
@@ -595,14 +644,22 @@ impl<'p> Vm<'p> {
     ) -> Result<(), Thrown> {
         let e: DecElemDef = {
             let def = self.class_def(class_id as usize);
-            let Some(plan) = def.dec_plan.as_ref() else { return Ok(()) };
+            let Some(plan) = def.dec_plan.as_ref() else {
+                return Ok(());
+            };
             plan.elements[elem].clone()
         };
         // The key: a static name is compile-time, a computed one was recorded by
         // the `DecKey` op when its expression was evaluated.
         let key = if e.computed {
-            self.dec_of(class).map(|d| d.keys[elem]).unwrap_or(Value::UNDEFINED)
-        } else if let Some(sym) = e.sym_key.then(|| self.well_known_symbol_value(&e.name)).flatten() {
+            self.dec_of(class)
+                .map(|d| d.keys[elem])
+                .unwrap_or(Value::UNDEFINED)
+        } else if let Some(sym) = e
+            .sym_key
+            .then(|| self.well_known_symbol_value(&e.name))
+            .flatten()
+        {
             // `[Symbol.iterator]` and friends CONSTANT-FOLD to the engine's
             // "@@iterator" key string at compile time, so the element takes the
             // static-name path and never gets a `DecKey`. `context.name` is still
@@ -797,7 +854,10 @@ impl<'p> Vm<'p> {
         }
         // `C[Symbol.metadata]` — non-enumerable, writable, configurable. Defined
         // on the value the decorators produced, which is the class user code sees.
-        let meta = self.dec_of(class).map(|d| d.metadata).unwrap_or(Value::UNDEFINED);
+        let meta = self
+            .dec_of(class)
+            .map(|d| d.metadata)
+            .unwrap_or(Value::UNDEFINED);
         if meta.is_heap() {
             let mut desc = ObjMap::new();
             desc.set("value", meta);
@@ -820,7 +880,9 @@ impl<'p> Vm<'p> {
         elem: usize,
         recv: Value,
     ) -> Result<(), Thrown> {
-        let Some(class) = self.dec_class_of_id(class_id) else { return Ok(()) };
+        let Some(class) = self.dec_class_of_id(class_id) else {
+            return Ok(());
+        };
         let list: Vec<Value> = match self.dec_of(class) {
             Some(d) => match which {
                 0 => d.instance_extra.clone(),
@@ -861,7 +923,9 @@ impl<'p> Vm<'p> {
     /// own entries need no such care — they stay rooted in the class's
     /// `DecState` for as long as the class lives.
     pub(crate) fn dec_field_inits(&self, class_id: u32, elem: usize) -> Vec<Value> {
-        let Some(class) = self.dec_class_of_id(class_id) else { return Vec::new() };
+        let Some(class) = self.dec_class_of_id(class_id) else {
+            return Vec::new();
+        };
         match self.dec_of(class) {
             Some(d) if elem < d.field_inits.len() => d.field_inits[elem].clone(),
             _ => Vec::new(),

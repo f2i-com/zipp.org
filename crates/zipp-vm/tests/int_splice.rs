@@ -30,7 +30,11 @@ var N = 20000;
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -47,9 +51,18 @@ fn node_output(src: &str) -> Vec<String> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("node v24 on PATH (expected values come from node)");
-    child.stdin.take().expect("stdin piped").write_all(src.as_bytes()).expect("write to node");
+    child
+        .stdin
+        .take()
+        .expect("stdin piped")
+        .write_all(src.as_bytes())
+        .expect("write to node");
     let out = child.wait_with_output().expect("node exits");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -81,7 +94,8 @@ var h = 0;
 function mix(x) { h = Math.imul(h ^ x, 16777619) >>> 0; }
 function f(n) {
   for (var ti = 0; ti < n; ti++) {
-    mix(kinds[ti]); mix(ends[ti] - starts[ti]); mix(src.charCodeAt(starts[ti]));
+    var ch = src.charCodeAt(starts[ti]);
+    mix(kinds[ti]); mix(ends[ti] - starts[ti]); mix(ch);
   }
 }
 for (var r = 0; r < 5; r++) { h = 2166136261; f(N); }
@@ -180,6 +194,26 @@ for (var r = 0; r < 5; r++) { h = 0; f(N); }
 console.log("div h=" + h);
 "#,
     ));
+}
+
+/// A sloppy unresolved assignment compiles as `StoreGlobalResolved`, whose
+/// dynamic binding route is deliberately not licensed by the raw r12 proof.
+/// The leaf and INT splice must both retain the real-call fallback.
+#[test]
+fn intsplice_parity_resolved_global_store_stays_on_the_real_call() {
+    assert_matches_node(
+        r#"var N = 20000;
+var a = [];
+for (var i = 0; i < N; i++) a.push(i % 13);
+var h = 0;
+function step(x) { implicitRoute = x; return (x + 1) | 0; }
+function f(n) {
+  for (var ti = 0; ti < n; ti++) h = (h + step(a[ti])) | 0;
+}
+for (var r = 0; r < 5; r++) { h = 0; f(N); }
+console.log("resolved h=" + h + " implicit=" + implicitRoute);
+"#,
+    );
 }
 
 /// Fewer arguments than formals: the missing parameter is `undefined`, which
@@ -369,8 +403,9 @@ console.log("rebind " + out.join(","));
 /// them instead.
 ///
 /// It is a `parity_` case on purpose: the mode sweep below then re-runs the
-/// whole enumeration under the off-switch, `ZIPP_NO_MULTI_SPLIT=1`,
-/// `ZIPP_JIT_THRESHOLD=1`, GC stress and the interpreter.
+/// whole enumeration under the splice and typed-lane off-switches,
+/// `ZIPP_NO_MULTI_SPLIT=1`, `ZIPP_JIT_THRESHOLD=1`, GC stress and the
+/// interpreter.
 ///
 /// Every reported value passes through `| 0`, so no answer can depend on
 /// Number→String formatting and `node -e` is an exact oracle.
@@ -379,7 +414,9 @@ fn generated_kernels(count: u32) -> String {
     // or a failure is not reproducible.
     let mut state: u64 = 0x2F6B_1D07_C41A_9E5B;
     let mut next = |n: u64| -> u64 {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) % n
     };
     let mut src = String::from("var OUT = [];\n");
@@ -471,7 +508,11 @@ fn intsplice_mechanism_generated_kernels_reach_the_flatten() {
         flattened >= 8,
         "only {flattened} of the generated kernels flattened — the enumeration \
          has drifted off the mechanism:\n{}",
-        log.lines().filter(|l| l.starts_with("[int-splice]")).take(20).collect::<Vec<_>>().join("\n")
+        log.lines()
+            .filter(|l| l.starts_with("[int-splice]"))
+            .take(20)
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 
@@ -479,8 +520,9 @@ fn intsplice_mechanism_generated_kernels_reach_the_flatten() {
 #[test]
 fn intsplice_all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");
-    let modes: [&[(&str, &str)]; 6] = [
+    let modes: [&[(&str, &str)]; 7] = [
         &[("ZIPP_NO_INT_SPLICE", "1")],
+        &[("ZIPP_NO_TYPED_SPLICE", "1")],
         &[("ZIPP_NO_MULTI_SPLIT", "1")],
         &[("ZIPP_NO_INT_SPLICE", "1"), ("ZIPP_NO_MULTI_SPLIT", "1")],
         &[("ZIPP_JIT_THRESHOLD", "1")],
@@ -556,7 +598,8 @@ fn intsplice_mechanism_the_mix_loop_reaches_the_int_tier() {
             "{name}: ZIPP_NO_INT_SPLICE=1 still flattened a region:\n{off}"
         );
         assert!(
-            off.lines().any(|l| l.starts_with("[int-reject]") && l.contains("Call {")),
+            off.lines()
+                .any(|l| l.starts_with("[int-reject]") && l.contains("Call {")),
             "{name}: with the switch off the region should be rejected on its \
              Call:\n{off}"
         );
@@ -589,14 +632,24 @@ fn intsplice_mechanism_one_entry_guard_per_callee() {
 #[test]
 fn intsplice_mechanism_declines_are_named_and_fall_back() {
     for (name, reason) in [
-        ("intsplice_parity_callee_with_an_upvalue", "callee reads upvalues"),
+        (
+            "intsplice_parity_callee_with_an_upvalue",
+            "callee reads upvalues",
+        ),
         ("intsplice_parity_callee_with_a_div", "is not flattenable"),
-        ("intsplice_parity_argc_below_param_count", "argc 1 != param_count 2"),
-        ("intsplice_parity_callee_slot_is_bytecode_stored", "no slot_guard"),
+        (
+            "intsplice_parity_argc_below_param_count",
+            "argc 1 != param_count 2",
+        ),
+        (
+            "intsplice_parity_callee_slot_is_bytecode_stored",
+            "no slot_guard",
+        ),
     ] {
         let log = jitlog_of(name, &[]);
         assert!(
-            log.lines().any(|l| l.starts_with("[int-splice]") && l.contains(reason)),
+            log.lines()
+                .any(|l| l.starts_with("[int-splice]") && l.contains(reason)),
             "{name}: expected the decline `{reason}`:\n{log}"
         );
         assert!(
@@ -604,6 +657,20 @@ fn intsplice_mechanism_declines_are_named_and_fall_back() {
             "{name}: a declined flatten must leave the region on MEM:\n{log}"
         );
     }
+
+    let resolved = jitlog_of(
+        "intsplice_parity_resolved_global_store_stays_on_the_real_call",
+        &[],
+    );
+    assert!(
+        resolved.contains("DECLINE (not leaf-eligible)")
+            && resolved.contains("no leaf plan (not monomorphic / not inline-eligible)"),
+        "StoreGlobalResolved must be rejected before a raw leaf plan exists:\n{resolved}"
+    );
+    assert!(
+        resolved.contains("MEM region fn"),
+        "the resolved-store control must retain the real-call MEM path:\n{resolved}"
+    );
 }
 
 /// The entry guard actually fires: the region compiles INT for the first phase
@@ -612,7 +679,10 @@ fn intsplice_mechanism_declines_are_named_and_fall_back() {
 /// tier was reached at all — otherwise the guard would be untested.
 #[test]
 fn intsplice_mechanism_rebinding_is_caught_by_the_entry_guard() {
-    let log = jitlog_of("intsplice_parity_callee_rebound_through_the_global_object", &[]);
+    let log = jitlog_of(
+        "intsplice_parity_callee_rebound_through_the_global_object",
+        &[],
+    );
     assert!(
         log.contains("INT splice [") && log.contains("INT region fn"),
         "the rebinding case never reached the flattened tier, so its guard was \

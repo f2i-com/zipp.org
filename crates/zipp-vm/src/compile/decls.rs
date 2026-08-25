@@ -149,11 +149,21 @@ impl<'a> FnCompiler<'a> {
                 self.reset_loop_completion();
                 self.do_while_statement(body, test)?
             }
-            S::For { init, test, update, body } => {
+            S::For {
+                init,
+                test,
+                update,
+                body,
+            } => {
                 self.reset_loop_completion();
                 self.for_stmt(init.as_ref(), test.as_ref(), update.as_ref(), body)?
             }
-            S::ForOf { left, right, body, is_await } => {
+            S::ForOf {
+                left,
+                right,
+                body,
+                is_await,
+            } => {
                 self.reset_loop_completion();
                 self.for_of_statement(left, right, body, *is_await)?
             }
@@ -167,14 +177,19 @@ impl<'a> FnCompiler<'a> {
                 // `if`/`try`/block frame is skipped, since `break` with no label
                 // inside one is a SyntaxError, not a jump to its end.
                 let idx = match label {
-                    Some(lbl) => {
-                        self.loop_ctx.iter().rposition(|c| c.label.as_deref() == Some(&**lbl))
-                    }
+                    Some(lbl) => self
+                        .loop_ctx
+                        .iter()
+                        .rposition(|c| c.label.as_deref() == Some(&**lbl)),
                     None => self.loop_ctx.iter().rposition(|c| c.bare_breakable),
                 };
                 let idx = match idx {
                     Some(i) => i,
-                    None => return Err("`break` target not found (outside a loop / unknown label)".into()),
+                    None => {
+                        return Err(
+                            "`break` target not found (outside a loop / unknown label)".into()
+                        )
+                    }
                 };
                 // Iterators of for-of frames BETWEEN here and the target close
                 // (innermost first); the target loop's own exit path closes its.
@@ -200,7 +215,11 @@ impl<'a> FnCompiler<'a> {
                 };
                 let idx = match idx {
                     Some(i) => i,
-                    None => return Err("`continue` target not found (outside a loop / unknown label)".into()),
+                    None => {
+                        return Err(
+                            "`continue` target not found (outside a loop / unknown label)".into(),
+                        )
+                    }
                 };
                 let iters: Vec<Reg> = self.loop_ctx[idx + 1..]
                     .iter()
@@ -228,7 +247,8 @@ impl<'a> FnCompiler<'a> {
                     // (the case this replaced a compile error) `L: try { return
                     // 42; } finally { break L; }`. The frame is NOT
                     // bare-breakable, so an unlabelled `break` inside still fails.
-                    self.loop_ctx.push(LoopCtx::label_frame(label.to_string(), self.handler_depth));
+                    self.loop_ctx
+                        .push(LoopCtx::label_frame(label.to_string(), self.handler_depth));
                     if let S::Block(stmts) = &**body {
                         // A labelled block keeps its own lexical scope.
                         self.push_scope();
@@ -316,9 +336,11 @@ impl<'a> FnCompiler<'a> {
                 let v = self.expr(argument)?;
                 self.emit(Instr::Throw { src: v });
             }
-            S::Try { block, handler, finalizer } => {
-                self.try_statement(block, handler.as_ref(), finalizer.as_deref())?
-            }
+            S::Try {
+                block,
+                handler,
+                finalizer,
+            } => self.try_statement(block, handler.as_ref(), finalizer.as_deref())?,
             S::ClassDecl(c) => self.class_decl(c)?,
             S::Empty => {}
             S::Debugger => {} // `debugger;` is a no-op (no attached debugger)
@@ -326,7 +348,9 @@ impl<'a> FnCompiler<'a> {
                 // `with` is a SyntaxError in strict mode (early error) — preserve
                 // that so strict negative tests keep passing.
                 if self.cx.in_strict {
-                    return Err("SyntaxError: 'with' statements are not allowed in strict mode".into());
+                    return Err(
+                        "SyntaxError: 'with' statements are not allowed in strict mode".into(),
+                    );
                 }
                 // Completion: UpdateEmpty(C, undefined) — an empty/abrupt body
                 // yields undefined for eval, not the previous statement's value.
@@ -347,7 +371,10 @@ impl<'a> FnCompiler<'a> {
                 let wname = format!(" with-object-{}", self.cx.with_name_counter);
                 self.cx.with_name_counter += 1;
                 let obj_reg = self.declare_local_no_box(&wname);
-                self.emit(Instr::ToObject { dst: obj_reg, src: raw });
+                self.emit(Instr::ToObject {
+                    dst: obj_reg,
+                    src: raw,
+                });
                 self.emit(Instr::MakeCell { reg: obj_reg });
                 self.cell_regs.insert(obj_reg);
                 let floor = self.scopes.len();
@@ -370,12 +397,18 @@ impl<'a> FnCompiler<'a> {
                 // `export {imported as exported} from './m'` (re-export): record the
                 // (exported, imported, specifier) triples so the loader can resolve
                 // them against the dependency module. No local binding is created.
-                ast::ExportDecl::Named { specifiers, source: Some(source), .. } => {
+                ast::ExportDecl::Named {
+                    specifiers,
+                    source: Some(source),
+                    ..
+                } => {
                     let spec = source.to_lossy_string();
                     for spec_item in specifiers {
                         let exported = module_export_name(&spec_item.exported);
                         let imported = module_export_name(&spec_item.local);
-                        self.cx.module_reexports.push((exported, imported, spec.clone()));
+                        self.cx
+                            .module_reexports
+                            .push((exported, imported, spec.clone()));
                     }
                     return Ok(());
                 }
@@ -465,7 +498,11 @@ impl<'a> FnCompiler<'a> {
                             let r = self.class_expr(
                                 c,
                                 tmp,
-                                if c.name.is_none() { Some("default") } else { None },
+                                if c.name.is_none() {
+                                    Some("default")
+                                } else {
+                                    None
+                                },
                             )?;
                             if r != tmp {
                                 self.emit(Instr::Move { dst: tmp, src: r });
@@ -482,11 +519,17 @@ impl<'a> FnCompiler<'a> {
                             }
                         }
                     }
-                    self.emit(Instr::StoreGlobal { idx: slot, src: tmp });
+                    self.emit(Instr::StoreGlobal {
+                        idx: slot,
+                        src: tmp,
+                    });
                     if let Some(name) = bind_name {
                         let nslot = self.cx.global_slot(&name) as u32;
                         self.cx.decl_globals.insert(nslot); // module-declared → per-module slot
-                        self.emit(Instr::StoreGlobal { idx: nslot, src: tmp });
+                        self.emit(Instr::StoreGlobal {
+                            idx: nslot,
+                            src: tmp,
+                        });
                     }
                     self.next_reg -= 1;
                     self.cx
@@ -591,7 +634,10 @@ impl<'a> FnCompiler<'a> {
                         // (NOT const_globals: the extraction itself stores
                         // through store_binding, which throws for a known
                         // const — initialization must stay writable.)
-                        self.emit(Instr::StoreGlobal { idx: slot, src: undef });
+                        self.emit(Instr::StoreGlobal {
+                            idx: slot,
+                            src: undef,
+                        });
                     }
                 }
                 let src = self.alloc_reg();
@@ -601,7 +647,10 @@ impl<'a> FnCompiler<'a> {
                 let tdz_leaves: Vec<String> = if d.kind.is_lexical() {
                     let mut names = std::collections::HashSet::new();
                     capture::collect_pattern_names(&decl.id, &mut names);
-                    names.into_iter().filter(|n| self.param_tdz.insert(n.clone())).collect()
+                    names
+                        .into_iter()
+                        .filter(|n| self.param_tdz.insert(n.clone()))
+                        .collect()
                 } else {
                     Vec::new()
                 };
@@ -810,8 +859,7 @@ impl<'a> FnCompiler<'a> {
                 } else {
                     let target = self.with_resolve_target(name, &with_objs);
                     let tmp = self.temp();
-                    let v =
-                        self.compile_named_init(tmp, decl.init.as_ref().unwrap(), name)?;
+                    let v = self.compile_named_init(tmp, decl.init.as_ref().unwrap(), name)?;
                     self.with_store_resolved(name, target, v);
                 }
                 self.next_reg = save;
@@ -824,8 +872,11 @@ impl<'a> FnCompiler<'a> {
             // rather than duplicating. A nested closure over it boxes the slot (the
             // var name is in the capture set). A bare `var x;` never resets `x`.
             if !d.kind.is_lexical() {
-                let existing =
-                    self.scopes[0].iter().rev().find(|(n, _)| n == name).map(|(_, r)| *r);
+                let existing = self.scopes[0]
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, r)| *r);
                 let reg = match existing {
                     Some(r) => r,
                     None => {
@@ -877,8 +928,7 @@ impl<'a> FnCompiler<'a> {
             // rather than shadowed, so the closure and this declaration share one
             // cell; otherwise a fresh binding is allocated.
             let reg = if self.scopes.len() == 1 && self.entry_lexicals.contains(name) {
-                let r = self
-                    .scopes[0]
+                let r = self.scopes[0]
                     .iter()
                     .find(|(n, _)| n == name)
                     .map(|(_, r)| *r)
@@ -975,9 +1025,15 @@ impl<'a> FnCompiler<'a> {
                     reg
                 };
                 if is_async_using {
-                    self.emit(Instr::RegisterAsyncDisposable { scope: scope_reg, val: src });
+                    self.emit(Instr::RegisterAsyncDisposable {
+                        scope: scope_reg,
+                        val: src,
+                    });
                 } else {
-                    self.emit(Instr::RegisterDisposable { scope: scope_reg, val: src });
+                    self.emit(Instr::RegisterDisposable {
+                        scope: scope_reg,
+                        val: src,
+                    });
                 }
                 if is_cell {
                     self.next_reg -= 1;
@@ -1059,8 +1115,10 @@ impl<'a> FnCompiler<'a> {
                     // Its TDZ ends here: the extraction that follows writes
                     // through `store_binding`, and a checked store would throw on
                     // the very cell it is initializing (`const {z} = {z:9}`).
-                    if let Some(r) =
-                        self.scopes[0].iter().find(|(n, _)| n == &**id).map(|(_, r)| *r)
+                    if let Some(r) = self.scopes[0]
+                        .iter()
+                        .find(|(n, _)| n == &**id)
+                        .map(|(_, r)| *r)
                     {
                         self.entry_tdz_cells.remove(&r);
                     }
@@ -1150,7 +1208,9 @@ impl<'a> FnCompiler<'a> {
                 // isn't known until runtime: evaluate each sibling key once into a
                 // contiguous block (reused for extraction + ObjectRestDyn).
                 if rest.is_some()
-                    && props.iter().any(|p| matches!(p.key, ast::PropKey::Computed(_)))
+                    && props
+                        .iter()
+                        .any(|p| matches!(p.key, ast::PropKey::Computed(_)))
                 {
                     let block_save = self.next_reg;
                     let keys_base = self.next_reg;
@@ -1175,14 +1235,23 @@ impl<'a> FnCompiler<'a> {
                         let save = self.next_reg;
                         let kreg = keys_base + i as Reg;
                         let val = self.alloc_reg();
-                        self.emit(Instr::GetIndex { dst: val, obj: src, key: kreg });
+                        self.emit(Instr::GetIndex {
+                            dst: val,
+                            obj: src,
+                            key: kreg,
+                        });
                         self.extract_pattern(&prop.value, val)?;
                         self.next_reg = save;
                     }
                     let rest = rest.as_ref().unwrap();
                     let save = self.next_reg;
                     let val = self.alloc_reg();
-                    self.emit(Instr::ObjectRestDyn { dst: val, src, keys_base, n });
+                    self.emit(Instr::ObjectRestDyn {
+                        dst: val,
+                        src,
+                        keys_base,
+                        n,
+                    });
                     self.extract_pattern(rest, val)?;
                     self.next_reg = save;
                     self.next_reg = block_save;
@@ -1218,10 +1287,18 @@ impl<'a> FnCompiler<'a> {
                                 if v != kreg {
                                     self.emit(Instr::Move { dst: kreg, src: v });
                                 }
-                                self.emit(Instr::ToPropKey { dst: kreg, obj: src, src: kreg });
+                                self.emit(Instr::ToPropKey {
+                                    dst: kreg,
+                                    obj: src,
+                                    src: kreg,
+                                });
                                 let target = self.with_resolve_target(&name, &with_objs);
                                 let val = self.alloc_reg();
-                                self.emit(Instr::GetIndex { dst: val, obj: src, key: kreg });
+                                self.emit(Instr::GetIndex {
+                                    dst: val,
+                                    obj: src,
+                                    key: kreg,
+                                });
                                 if let Some(d) = default {
                                     self.apply_default_in_place_named(val, d, Some(&name))?;
                                 }
@@ -1252,14 +1329,20 @@ impl<'a> FnCompiler<'a> {
                     let exclude_start = self.string_constants.len() as u32;
                     let mut exclude_count = 0u16;
                     for prop in props {
-                        let key = class_key_name(&prop.key)
-                            .map_err(|_| "object-rest with a computed sibling key is not in the subset")?;
+                        let key = class_key_name(&prop.key).map_err(|_| {
+                            "object-rest with a computed sibling key is not in the subset"
+                        })?;
                         self.string_name(&key);
                         exclude_count += 1;
                     }
                     let save = self.next_reg;
                     let val = self.alloc_reg();
-                    self.emit(Instr::ObjectRest { dst: val, src, exclude_start, exclude_count });
+                    self.emit(Instr::ObjectRest {
+                        dst: val,
+                        src,
+                        exclude_start,
+                        exclude_count,
+                    });
                     self.extract_pattern(rest, val)?;
                     self.next_reg = save;
                 }
@@ -1272,9 +1355,12 @@ impl<'a> FnCompiler<'a> {
                 // its original `start` — the emitted code is unchanged.
                 let (fixed, rest): (&[Option<ast::PatternElem>], Option<&ast::Pattern>) =
                     match elems.split_last() {
-                        Some((Some(ast::PatternElem { pat: P::Rest(inner) }), head)) => {
-                            (head, Some(&**inner))
-                        }
+                        Some((
+                            Some(ast::PatternElem {
+                                pat: P::Rest(inner),
+                            }),
+                            head,
+                        )) => (head, Some(&**inner)),
                         _ => (&elems[..], None),
                     };
                 // JS array destructuring uses the iterator protocol; positional
@@ -1284,8 +1370,16 @@ impl<'a> FnCompiler<'a> {
                     let norm = self.alloc_reg();
                     // Pull only as many as the fixed elements need (unbounded with
                     // a `...rest`), so destructuring an infinite iterator is fine.
-                    let count = if rest.is_some() { u32::MAX } else { fixed.len() as u32 };
-                    self.emit(Instr::IterToArray { dst: norm, src, count });
+                    let count = if rest.is_some() {
+                        u32::MAX
+                    } else {
+                        fixed.len() as u32
+                    };
+                    self.emit(Instr::IterToArray {
+                        dst: norm,
+                        src,
+                        count,
+                    });
                     norm
                 };
                 for (i, el) in fixed.iter().enumerate() {
@@ -1293,8 +1387,15 @@ impl<'a> FnCompiler<'a> {
                         let save = self.next_reg;
                         let val = self.alloc_reg();
                         let idx = self.alloc_reg();
-                        self.emit(Instr::LoadInt { dst: idx, val: i as i32 });
-                        self.emit(Instr::GetIndex { dst: val, obj: src, key: idx });
+                        self.emit(Instr::LoadInt {
+                            dst: idx,
+                            val: i as i32,
+                        });
+                        self.emit(Instr::GetIndex {
+                            dst: val,
+                            obj: src,
+                            key: idx,
+                        });
                         self.extract_pattern(&p.pat, val)?;
                         self.next_reg = save;
                     }
@@ -1303,7 +1404,11 @@ impl<'a> FnCompiler<'a> {
                 if let Some(rest) = rest {
                     let save = self.next_reg;
                     let val = self.alloc_reg();
-                    self.emit(Instr::ArrayRest { dst: val, src, start: fixed.len() as u32 });
+                    self.emit(Instr::ArrayRest {
+                        dst: val,
+                        src,
+                        start: fixed.len() as u32,
+                    });
                     self.extract_pattern(rest, val)?;
                     self.next_reg = save;
                 }
@@ -1325,12 +1430,7 @@ impl<'a> FnCompiler<'a> {
     /// NOTE: the `computed: bool` parameter is gone — computedness is a variant
     /// of `PropKey`, not a sibling flag, so it can no longer disagree with the
     /// key it describes.
-    pub(crate) fn extract_member(
-        &mut self,
-        obj: Reg,
-        key: &ast::PropKey,
-        dst: Reg,
-    ) -> R<()> {
+    pub(crate) fn extract_member(&mut self, obj: Reg, key: &ast::PropKey, dst: Reg) -> R<()> {
         if let ast::PropKey::Computed(e) = key {
             let save = self.next_reg; // `dst` was allocated below this
             let k = self.expr(e)?;
@@ -1350,7 +1450,11 @@ impl<'a> FnCompiler<'a> {
             _ => return Err("unsupported destructuring property key".into()),
         };
         let nidx = self.string_name(&name);
-        self.emit(Instr::GetProp { dst, obj, name: nidx });
+        self.emit(Instr::GetProp {
+            dst,
+            obj,
+            name: nidx,
+        });
         Ok(())
     }
 
@@ -1373,7 +1477,11 @@ impl<'a> FnCompiler<'a> {
         let undef = self.alloc_reg();
         self.emit(Instr::LoadUndefined { dst: undef });
         let cond = self.alloc_reg();
-        self.emit(Instr::Eq { dst: cond, a: reg, b: undef });
+        self.emit(Instr::Eq {
+            dst: cond,
+            a: reg,
+            b: undef,
+        });
         let jf = self.here();
         self.emit(Instr::JumpIfFalse { cond, target: 0 }); // skip default when defined
         let dv = match name {
@@ -1388,5 +1496,4 @@ impl<'a> FnCompiler<'a> {
         self.next_reg = save;
         Ok(())
     }
-
 }

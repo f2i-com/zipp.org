@@ -67,7 +67,11 @@ use std::process::Command;
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -79,7 +83,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -106,16 +114,48 @@ struct Op {
 /// The DOUBLE-tier ops. The kernel's accumulator is an f64, so the region
 /// declines INT (`region_is_int=false`) and lands on `regalloc.rs`.
 const DOUBLE_OPS: &[Op] = &[
-    Op { tag: "none", prelude: "", stmt: "t = h + 1;" },
+    Op {
+        tag: "none",
+        prelude: "",
+        stmt: "t = h + 1;",
+    },
     // Every Bitwise operator: the arm whose INT64_MIN sentinel lived in r10.
-    Op { tag: "or", prelude: "", stmt: "t = (h | 0);" },
-    Op { tag: "and", prelude: "", stmt: "t = (h | 0) & 63;" },
-    Op { tag: "xor", prelude: "", stmt: "t = (h | 0) ^ 5;" },
-    Op { tag: "shl", prelude: "", stmt: "t = (h | 0) << 1;" },
-    Op { tag: "shr", prelude: "", stmt: "t = (h | 0) >> 1;" },
-    Op { tag: "ushr", prelude: "", stmt: "t = (h | 0) >>> 1;" },
+    Op {
+        tag: "or",
+        prelude: "",
+        stmt: "t = (h | 0);",
+    },
+    Op {
+        tag: "and",
+        prelude: "",
+        stmt: "t = (h | 0) & 63;",
+    },
+    Op {
+        tag: "xor",
+        prelude: "",
+        stmt: "t = (h | 0) ^ 5;",
+    },
+    Op {
+        tag: "shl",
+        prelude: "",
+        stmt: "t = (h | 0) << 1;",
+    },
+    Op {
+        tag: "shr",
+        prelude: "",
+        stmt: "t = (h | 0) >> 1;",
+    },
+    Op {
+        tag: "ushr",
+        prelude: "",
+        stmt: "t = (h | 0) >>> 1;",
+    },
     // Dense ordinary Array: the `GetIndex` arm that calls `emit_box_to_home`.
-    Op { tag: "denseint", prelude: "var KI = [0, 3, 6, 2, 5, 1, 4, 7];", stmt: "t = KI[i & 7];" },
+    Op {
+        tag: "denseint",
+        prelude: "var KI = [0, 3, 6, 2, 5, 1, 4, 7];",
+        stmt: "t = KI[i & 7];",
+    },
     Op {
         tag: "densedbl",
         prelude: "var KD = [0.5, 3.25, 6.5, 2.25, 5.5, 1.25, 4.5, 7.75];",
@@ -145,20 +185,56 @@ const DOUBLE_OPS: &[Op] = &[
         stmt: "t = TF[i & 7];",
     },
     // `%` on the DOUBLE path (B113's arm — it documents rax/rcx/rdx/xmm0 too).
-    Op { tag: "mod", prelude: "", stmt: "t = (h * 4) % 7;" },
+    Op {
+        tag: "mod",
+        prelude: "",
+        stmt: "t = (h * 4) % 7;",
+    },
 ];
 
 /// The INT-tier ops. Everything stays int32 so `region_is_int` holds and the
 /// region goes to `region_int.rs` / `region_int_gpr.rs` — the tier W14 fixed.
 const INT_OPS: &[Op] = &[
-    Op { tag: "none", prelude: "", stmt: "t = (h + 1) | 0;" },
-    Op { tag: "or", prelude: "", stmt: "t = (h | 0);" },
-    Op { tag: "and", prelude: "", stmt: "t = h & 63;" },
-    Op { tag: "xor", prelude: "", stmt: "t = h ^ 5;" },
-    Op { tag: "shl", prelude: "", stmt: "t = (h << 1) | 0;" },
-    Op { tag: "shr", prelude: "", stmt: "t = h >> 1;" },
-    Op { tag: "ushr", prelude: "", stmt: "t = (h >>> 1) | 0;" },
-    Op { tag: "denseint", prelude: "var KI = [0, 3, 6, 2, 5, 1, 4, 7];", stmt: "t = KI[i & 7] | 0;" },
+    Op {
+        tag: "none",
+        prelude: "",
+        stmt: "t = (h + 1) | 0;",
+    },
+    Op {
+        tag: "or",
+        prelude: "",
+        stmt: "t = (h | 0);",
+    },
+    Op {
+        tag: "and",
+        prelude: "",
+        stmt: "t = h & 63;",
+    },
+    Op {
+        tag: "xor",
+        prelude: "",
+        stmt: "t = h ^ 5;",
+    },
+    Op {
+        tag: "shl",
+        prelude: "",
+        stmt: "t = (h << 1) | 0;",
+    },
+    Op {
+        tag: "shr",
+        prelude: "",
+        stmt: "t = h >> 1;",
+    },
+    Op {
+        tag: "ushr",
+        prelude: "",
+        stmt: "t = (h >>> 1) | 0;",
+    },
+    Op {
+        tag: "denseint",
+        prelude: "var KI = [0, 3, 6, 2, 5, 1, 4, 7];",
+        stmt: "t = KI[i & 7] | 0;",
+    },
     Op {
         tag: "i32arr",
         prelude: "var TI = new Int32Array(8); for (var q = 0; q < 8; q++) TI[q] = (q * 3) & 7;",
@@ -173,7 +249,12 @@ const INT_OPS: &[Op] = &[
 ///
 /// Two spellings because the compare constant decides the tier: `t > 2.5` makes
 /// `region_is_int` false, which would quietly move the INT matrix onto DOUBLE.
-const BOOL_DEFS: [&str; 4] = ["b0 = i >= 4;", "b1 = i < 4;", "b2 = t > 2.5;", "b3 = t < 2.5;"];
+const BOOL_DEFS: [&str; 4] = [
+    "b0 = i >= 4;",
+    "b1 = i < 4;",
+    "b2 = t > 2.5;",
+    "b3 = t < 2.5;",
+];
 const BOOL_DEFS_INT: [&str; 4] = ["b0 = i >= 4;", "b1 = i < 4;", "b2 = t > 2;", "b3 = t < 2;"];
 
 /// A kernel with `k` live-out bools around one body op.
@@ -184,10 +265,19 @@ const BOOL_DEFS_INT: [&str; 4] = ["b0 = i >= 4;", "b1 = i < 4;", "b2 = t > 2;", 
 /// two faces of this defect differ — a corrupted home reads back as the wrong
 /// boolean in one and as a `Number` (NaN) in the other.
 fn kernel(op: &Op, k: usize, dbl: bool, tag: &str) -> String {
-    let init = (0..k).map(|j| format!("var b{j} = false;\n  ")).collect::<String>();
+    let init = (0..k)
+        .map(|j| format!("var b{j} = false;\n  "))
+        .collect::<String>();
     let table = if dbl { &BOOL_DEFS } else { &BOOL_DEFS_INT };
-    let defs = table[..k].iter().map(|d| format!("    {d}\n")).collect::<String>();
-    let acc = if dbl { "h = h * 0.5 + t;" } else { "h = (h + t) | 0;" };
+    let defs = table[..k]
+        .iter()
+        .map(|d| format!("    {d}\n"))
+        .collect::<String>();
+    let acc = if dbl {
+        "h = h * 0.5 + t;"
+    } else {
+        "h = (h + t) | 0;"
+    };
     let h0 = if dbl { "1.5" } else { "1" };
     let out = (0..k)
         .map(|j| format!(r#" + " " + (typeof b{j}) + ":" + b{j}"#))
@@ -385,7 +475,9 @@ fn jitlog_of(src: &str) -> String {
 #[test]
 #[ignore = "worker: spawned by jitlog_of with ZIPP_BOOLHOME_SRC set"]
 fn boolhome_jitlog_child() {
-    let Some(src) = std::env::var_os("ZIPP_BOOLHOME_SRC") else { return };
+    let Some(src) = std::env::var_os("ZIPP_BOOLHOME_SRC") else {
+        return;
+    };
     let _ = run_ok(&src.to_string_lossy());
 }
 

@@ -181,9 +181,9 @@ fn follow_insn(re: &CompiledRegex, mut j: usize) -> Option<usize> {
     while j < re.insns.len() && budget > 0 {
         budget -= 1;
         match &re.insns[j] {
-            Insn::BeginCaptureGroup(_)
-            | Insn::EndCaptureGroup(_)
-            | Insn::ResetCaptureGroup(_) => j += 1,
+            Insn::BeginCaptureGroup(_) | Insn::EndCaptureGroup(_) | Insn::ResetCaptureGroup(_) => {
+                j += 1
+            }
             &Insn::Jump { target } => j = target as usize,
             _ => return Some(j),
         }
@@ -320,14 +320,20 @@ mod tests {
     fn marks_disjoint_loops_and_first_atom_hint() {
         let re = compiled(r"([a-z]+)=(\d+)");
         assert_eq!(possessive_loops(&re), [true, true]);
-        assert!(re.skip_hint_ip.is_some(), "unbounded first atom gets the hint");
+        assert!(
+            re.skip_hint_ip.is_some(),
+            "unbounded first atom gets the hint"
+        );
     }
 
     #[test]
     fn bounded_first_atom_gets_no_hint() {
         let re = compiled(r"(\d{1,3})\.");
         assert_eq!(possessive_loops(&re), [true]);
-        assert_eq!(re.skip_hint_ip, None, "bounded loops must never get the skip");
+        assert_eq!(
+            re.skip_hint_ip, None,
+            "bounded loops must never get the skip"
+        );
     }
 
     #[test]

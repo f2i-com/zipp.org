@@ -90,21 +90,58 @@ pub enum Stmt {
     Empty,
     Expr(Expr),
     /// `if (test) cons else alt`
-    If { test: Expr, cons: Box<Stmt>, alt: Option<Box<Stmt>> },
-    While { test: Expr, body: Box<Stmt> },
-    DoWhile { body: Box<Stmt>, test: Expr },
-    For { init: Option<ForInit>, test: Option<Expr>, update: Option<Expr>, body: Box<Stmt> },
-    ForIn { left: ForTarget, right: Expr, body: Box<Stmt> },
+    If {
+        test: Expr,
+        cons: Box<Stmt>,
+        alt: Option<Box<Stmt>>,
+    },
+    While {
+        test: Expr,
+        body: Box<Stmt>,
+    },
+    DoWhile {
+        body: Box<Stmt>,
+        test: Expr,
+    },
+    For {
+        init: Option<ForInit>,
+        test: Option<Expr>,
+        update: Option<Expr>,
+        body: Box<Stmt>,
+    },
+    ForIn {
+        left: ForTarget,
+        right: Expr,
+        body: Box<Stmt>,
+    },
     /// `await` is set for `for await (… of …)`.
-    ForOf { left: ForTarget, right: Expr, body: Box<Stmt>, is_await: bool },
-    Switch { disc: Expr, cases: Vec<SwitchCase> },
+    ForOf {
+        left: ForTarget,
+        right: Expr,
+        body: Box<Stmt>,
+        is_await: bool,
+    },
+    Switch {
+        disc: Expr,
+        cases: Vec<SwitchCase>,
+    },
     Return(Option<Expr>),
     Throw(Expr),
-    Try { block: Vec<Stmt>, handler: Option<CatchClause>, finalizer: Option<Vec<Stmt>> },
+    Try {
+        block: Vec<Stmt>,
+        handler: Option<CatchClause>,
+        finalizer: Option<Vec<Stmt>>,
+    },
     Break(Option<Name>),
     Continue(Option<Name>),
-    Labeled { label: Name, body: Box<Stmt> },
-    With { object: Expr, body: Box<Stmt> },
+    Labeled {
+        label: Name,
+        body: Box<Stmt>,
+    },
+    With {
+        object: Expr,
+        body: Box<Stmt>,
+    },
     Debugger,
     VarDecl(VarDecl),
     FnDecl(Box<Function>),
@@ -207,16 +244,37 @@ pub enum Expr {
     Num(f64),
     BigInt(Box<str>),
     Str(StrVal),
-    Regex { pattern: StrVal, flags: Box<str> },
+    Regex {
+        pattern: StrVal,
+        flags: Box<str>,
+    },
     /// A hole in `[1, , 3]` is `None`; a spread element is `Spread`.
     Array(Vec<Option<ArrayElem>>, LiteralFlags),
     Object(Vec<ObjectMember>, LiteralFlags),
     Template(Box<TemplateLit>),
-    TaggedTemplate { tag: Box<Expr>, quasi: Box<TemplateLit> },
-    Unary { op: UnaryOp, arg: Box<Expr> },
-    Update { op: UpdateOp, prefix: bool, target: Target },
-    Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
-    Logical { op: LogicalOp, left: Box<Expr>, right: Box<Expr> },
+    TaggedTemplate {
+        tag: Box<Expr>,
+        quasi: Box<TemplateLit>,
+    },
+    Unary {
+        op: UnaryOp,
+        arg: Box<Expr>,
+    },
+    Update {
+        op: UpdateOp,
+        prefix: bool,
+        target: Target,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Logical {
+        op: LogicalOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
     /// `covered`: the whole assignment was written inside parentheses — the third
     /// place parenthesization has to be recorded (see [`LiteralFlags`]). An
     /// AssignmentElement is `DestructuringAssignmentTarget Initializer_opt`, and
@@ -226,10 +284,22 @@ pub enum Expr {
     /// invalid, so 13.15.5.1 rejects it. Without the bit both spell the same
     /// `Expr::Assign` and the second was silently accepted
     /// (staging/sm/expressions/destructuring-pattern-parenthesized.js).
-    Assign { op: AssignOp, target: Target, value: Box<Expr>, covered: bool },
-    Cond { test: Box<Expr>, cons: Box<Expr>, alt: Box<Expr> },
+    Assign {
+        op: AssignOp,
+        target: Target,
+        value: Box<Expr>,
+        covered: bool,
+    },
+    Cond {
+        test: Box<Expr>,
+        cons: Box<Expr>,
+        alt: Box<Expr>,
+    },
     Call(Box<CallExpr>),
-    New { callee: Box<Expr>, args: Vec<Arg> },
+    New {
+        callee: Box<Expr>,
+        args: Vec<Arg>,
+    },
     Member(Box<Member>),
     /// An optional chain `a?.b.c` — the whole chain, so short-circuiting is
     /// scoped correctly. `Member`/`Call` nodes inside carry `optional`.
@@ -238,7 +308,10 @@ pub enum Expr {
     Arrow(Box<Arrow>),
     Function(Box<Function>),
     Class(Box<Class>),
-    Yield { arg: Option<Box<Expr>>, delegate: bool },
+    Yield {
+        arg: Option<Box<Expr>>,
+        delegate: bool,
+    },
     Await(Box<Expr>),
     /// `#brand in obj` — a private brand check.
     ///
@@ -246,13 +319,20 @@ pub enum Expr {
     /// LEFT operand of `in`. Giving it its own variant rather than bending
     /// `MemberProp::Private` keeps `in`'s two operand shapes from being
     /// confusable, and the compiler already emits a distinct opcode for it.
-    PrivateIn { name: Name, object: Box<Expr> },
+    PrivateIn {
+        name: Name,
+        object: Box<Expr>,
+    },
     /// `new.target`
     NewTarget,
     /// `import.meta`
     ImportMeta,
     /// `import(spec, options)` — a call, not a reference to `import`.
-    ImportCall { spec: Box<Expr>, options: Option<Box<Expr>>, phase: ImportPhase },
+    ImportCall {
+        spec: Box<Expr>,
+        options: Option<Box<Expr>>,
+        phase: ImportPhase,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -334,7 +414,10 @@ pub enum Target {
     /// has to re-check.
     Call(Box<CallExpr>),
     Array(Vec<Option<TargetElem>>),
-    Object { props: Vec<TargetProp>, rest: Option<Box<Target>> },
+    Object {
+        props: Vec<TargetProp>,
+        rest: Option<Box<Target>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -365,9 +448,15 @@ pub struct TargetProp {
 pub enum Pattern {
     Ident(Name),
     Array(Vec<Option<PatternElem>>),
-    Object { props: Vec<PatternProp>, rest: Option<Box<Pattern>> },
+    Object {
+        props: Vec<PatternProp>,
+        rest: Option<Box<Pattern>>,
+    },
     /// `x = 1` in a parameter or destructuring position.
-    Assign { left: Box<Pattern>, right: Box<Expr> },
+    Assign {
+        left: Box<Pattern>,
+        right: Box<Expr>,
+    },
     /// `...x`
     Rest(Box<Pattern>),
 }
@@ -428,9 +517,18 @@ pub enum ObjectMember {
         init: Option<Expr>,
     },
     /// `m() {}`
-    Method { key: PropKey, func: Box<Function> },
-    Get { key: PropKey, func: Box<Function> },
-    Set { key: PropKey, func: Box<Function> },
+    Method {
+        key: PropKey,
+        func: Box<Function>,
+    },
+    Get {
+        key: PropKey,
+        func: Box<Function>,
+    },
+    Set {
+        key: PropKey,
+        func: Box<Function>,
+    },
     /// `...x`
     Spread(Expr),
 }
@@ -589,7 +687,10 @@ pub enum ImportSpecifier {
     /// `import * as ns from "m"`
     Namespace(Name),
     /// `import { a as b } from "m"`
-    Named { imported: ModuleExportName, local: Name },
+    Named {
+        imported: ModuleExportName,
+        local: Name,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -609,7 +710,11 @@ pub enum ExportDecl {
     /// `export default <expr|function|class>`
     Default(ExportDefault),
     /// `export * from "m"` / `export * as ns from "m"`
-    All { alias: Option<ModuleExportName>, source: StrVal, attributes: Vec<ImportAttribute> },
+    All {
+        alias: Option<ModuleExportName>,
+        source: StrVal,
+        attributes: Vec<ImportAttribute>,
+    },
     /// `export var/let/const/function/class ...`
     Decl(Box<Stmt>),
 }
@@ -650,12 +755,28 @@ pub enum UpdateOp {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
-    Add, Sub, Mul, Div, Rem, Exp,
-    Eq, NotEq, StrictEq, StrictNotEq,
-    Lt, LtEq, Gt, GtEq,
-    Shl, Shr, UShr,
-    BitAnd, BitOr, BitXor,
-    In, Instanceof,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Exp,
+    Eq,
+    NotEq,
+    StrictEq,
+    StrictNotEq,
+    Lt,
+    LtEq,
+    Gt,
+    GtEq,
+    Shl,
+    Shr,
+    UShr,
+    BitAnd,
+    BitOr,
+    BitXor,
+    In,
+    Instanceof,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -670,18 +791,32 @@ pub enum LogicalOp {
 pub enum AssignOp {
     /// `=`
     Assign,
-    Add, Sub, Mul, Div, Rem, Exp,
-    Shl, Shr, UShr,
-    BitAnd, BitOr, BitXor,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Exp,
+    Shl,
+    Shr,
+    UShr,
+    BitAnd,
+    BitOr,
+    BitXor,
     /// `&&=`, `||=`, `??=` — these SHORT-CIRCUIT, so they are not sugar for the
     /// arithmetic forms and the compiler must not treat them as such.
-    LogicalAnd, LogicalOr, LogicalCoalesce,
+    LogicalAnd,
+    LogicalOr,
+    LogicalCoalesce,
 }
 
 impl AssignOp {
     /// The short-circuiting forms evaluate their right side conditionally.
     pub fn is_logical(self) -> bool {
-        matches!(self, AssignOp::LogicalAnd | AssignOp::LogicalOr | AssignOp::LogicalCoalesce)
+        matches!(
+            self,
+            AssignOp::LogicalAnd | AssignOp::LogicalOr | AssignOp::LogicalCoalesce
+        )
     }
 }
 
@@ -708,7 +843,13 @@ mod tests {
             value: Box::new(Expr::Num(1.0)),
             covered: false,
         };
-        assert!(matches!(annexb, Expr::Assign { target: Target::Call(_), .. }));
+        assert!(matches!(
+            annexb,
+            Expr::Assign {
+                target: Target::Call(_),
+                ..
+            }
+        ));
 
         // 2. A lone surrogate in a literal, which `String` cannot hold.
         let lone = Expr::Str(StrVal::from_utf16(vec![0xD800]));
@@ -720,7 +861,10 @@ mod tests {
         // 3. Parenthesization, without a wrapper node. `(x) = f` is a valid
         //    assignment but suppresses NamedEvaluation, so the function stays
         //    anonymous — one bool rather than a node 13 sites must peel.
-        let covered = Target::Ident { name: "x".into(), covered: true };
+        let covered = Target::Ident {
+            name: "x".into(),
+            covered: true,
+        };
         assert!(matches!(covered, Target::Ident { covered: true, .. }));
     }
 
@@ -729,11 +873,14 @@ mod tests {
     #[test]
     fn array_holes_and_spreads_are_distinct() {
         // `[1, , ...r]`
-        let a = Expr::Array(vec![
-            Some(ArrayElem::Expr(Expr::Num(1.0))),
-            None,
-            Some(ArrayElem::Spread(Expr::Ident("r".into()))),
-        ], LiteralFlags::default());
+        let a = Expr::Array(
+            vec![
+                Some(ArrayElem::Expr(Expr::Num(1.0))),
+                None,
+                Some(ArrayElem::Spread(Expr::Ident("r".into()))),
+            ],
+            LiteralFlags::default(),
+        );
         match a {
             Expr::Array(items, _) => {
                 assert!(matches!(items[0], Some(ArrayElem::Expr(_))));
@@ -758,7 +905,11 @@ mod tests {
             init: Some(Expr::Num(1.0)),
         };
         match &member {
-            ObjectMember::Prop { init: Some(Expr::Num(n)), shorthand: true, .. } => {
+            ObjectMember::Prop {
+                init: Some(Expr::Num(n)),
+                shorthand: true,
+                ..
+            } => {
                 assert_eq!(*n, 1.0)
             }
             other => panic!("initializer had nowhere to go: {other:?}"),
@@ -768,7 +919,10 @@ mod tests {
         let target = Target::Object {
             props: vec![TargetProp {
                 key: PropKey::Ident("a".into()),
-                target: Target::Ident { name: "a".into(), covered: false },
+                target: Target::Ident {
+                    name: "a".into(),
+                    covered: false,
+                },
                 default: Some(Expr::Num(1.0)),
                 shorthand: true,
             }],
@@ -784,10 +938,19 @@ mod tests {
     /// `a ||= b` must not evaluate `b` when `a` is truthy.
     #[test]
     fn logical_assignment_is_marked_short_circuiting() {
-        for op in [AssignOp::LogicalAnd, AssignOp::LogicalOr, AssignOp::LogicalCoalesce] {
+        for op in [
+            AssignOp::LogicalAnd,
+            AssignOp::LogicalOr,
+            AssignOp::LogicalCoalesce,
+        ] {
             assert!(op.is_logical(), "{op:?} short-circuits");
         }
-        for op in [AssignOp::Assign, AssignOp::Add, AssignOp::BitOr, AssignOp::Exp] {
+        for op in [
+            AssignOp::Assign,
+            AssignOp::Add,
+            AssignOp::BitOr,
+            AssignOp::Exp,
+        ] {
             assert!(!op.is_logical(), "{op:?} does not");
         }
     }

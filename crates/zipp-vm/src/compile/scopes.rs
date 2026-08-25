@@ -156,7 +156,10 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
-        EnclosingFn { cell_locals, upvalues: self.upvalues.clone() }
+        EnclosingFn {
+            cell_locals,
+            upvalues: self.upvalues.clone(),
+        }
     }
 
     /// Resolve a free variable to an upvalue index in THIS function, creating
@@ -352,7 +355,12 @@ impl<'a> FnCompiler<'a> {
         // (which has no outer binding) and a same-named outer var both yield the
         // class. Read-only (store_binding throws on assignment).
         if let Some(cid) = self.super_class {
-            if self.cx.class_names.iter().any(|(n, id)| *id == cid && n == name) {
+            if self
+                .cx
+                .class_names
+                .iter()
+                .any(|(n, id)| *id == cid && n == name)
+            {
                 return Binding::ClassName(cid);
             }
         }
@@ -361,7 +369,13 @@ impl<'a> FnCompiler<'a> {
         // is in TDZ until the class value exists, so LoadClassValue throws a
         // ReferenceError for `class x extends x`) — including functions
         // created inside the heritage expression.
-        if let Some((_, cid)) = self.cx.heritage_classes.iter().rev().find(|(n, _)| n == name) {
+        if let Some((_, cid)) = self
+            .cx
+            .heritage_classes
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+        {
             return Binding::ClassName(*cid);
         }
         // A free variable that resolves in an enclosing function is an upvalue.
@@ -400,7 +414,9 @@ impl<'a> FnCompiler<'a> {
     /// scope stack, where the dead `class C` local of that function sits right
     /// next to the class binding and only `heritage_class` separates them.
     pub(crate) fn class_inner_name_visible(&self) -> bool {
-        let Some(cid) = self.super_class else { return false };
+        let Some(cid) = self.super_class else {
+            return false;
+        };
         // The class's own name: normally the class_names stack entry for THIS
         // class — but compile_class pops that entry when it returns, so an
         // INLINE static field initializer (compiled afterwards) finds it in
@@ -411,13 +427,7 @@ impl<'a> FnCompiler<'a> {
                 return false;
             }
             n.as_str()
-        } else if let Some((n, _)) = self
-            .cx
-            .class_names
-            .iter()
-            .rev()
-            .find(|(_, id)| *id == cid)
-        {
+        } else if let Some((n, _)) = self.cx.class_names.iter().rev().find(|(_, id)| *id == cid) {
             n.as_str()
         } else if let Some((n, _)) = self
             .cx
@@ -520,7 +530,10 @@ impl<'a> FnCompiler<'a> {
     /// `scope_lex_names`.
     fn enclosing_block_lexical(&self, name: &str) -> bool {
         let n = self.scope_lex_names.len();
-        n >= 2 && self.scope_lex_names[1..n - 1].iter().any(|s| s.contains(name))
+        n >= 2
+            && self.scope_lex_names[1..n - 1]
+                .iter()
+                .any(|s| s.contains(name))
     }
 
     /// Like `block_fn_conflicts` but for the B.3.3 VAR-SYNC applicability
@@ -541,7 +554,8 @@ impl<'a> FnCompiler<'a> {
             return true;
         }
         self.scopes[1..n - 1].iter().any(|s| {
-            s.iter().any(|(nm, r)| nm == name && !self.catch_param_regs.contains(r))
+            s.iter()
+                .any(|(nm, r)| nm == name && !self.catch_param_regs.contains(r))
         }) || self.enclosing_block_lexical(name)
     }
 
@@ -586,5 +600,4 @@ impl<'a> FnCompiler<'a> {
         self.string_constants.push(s.to_string());
         si
     }
-
 }

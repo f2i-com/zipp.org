@@ -13,7 +13,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -61,7 +65,10 @@ fn a_failed_match_leaves_the_previous_statics_intact() {
         console.log(dump());
         "#
     ));
-    assert_eq!(out[0], r#""xx 123-abc yy" "123-abc" "abc" "xx " " yy" "123" "abc" """#);
+    assert_eq!(
+        out[0],
+        r#""xx 123-abc yy" "123-abc" "abc" "xx " " yy" "123" "abc" """#
+    );
 }
 
 #[test]
@@ -75,8 +82,14 @@ fn empty_contexts_at_the_subject_edges() {
         "#
     ));
     // leftContext is "" at index 0; rightContext is "" at the end.
-    assert_eq!(out[0], r#"at0 "head tail" "head" "head" "" " tail" "head" "" """#);
-    assert_eq!(out[1], r#"atEnd "head tail" "tail" "tail" "head " "" "tail" "" """#);
+    assert_eq!(
+        out[0],
+        r#"at0 "head tail" "head" "head" "" " tail" "head" "" """#
+    );
+    assert_eq!(
+        out[1],
+        r#"atEnd "head tail" "tail" "tail" "head " "" "tail" "" """#
+    );
 }
 
 #[test]
@@ -90,7 +103,10 @@ fn last_paren_is_the_last_participating_group_and_empty_when_none() {
         "#
     ));
     // No capture groups at all -> lastParen "".
-    assert_eq!(out[0], r#"nogroups "abc 999 def" "999" "" "abc " " def" "" "" """#);
+    assert_eq!(
+        out[0],
+        r#"nogroups "abc 999 def" "999" "" "abc " " def" "" "" """#
+    );
     // The first alternative did not participate: $1 is "", $2 is "b", and
     // lastParen is the LAST participating group.
     assert_eq!(out[1], r#"altskip "--b--" "b" "b" "--" "--" "" "b" """#);
@@ -195,9 +211,15 @@ fn match_and_match_all_refresh_the_statics() {
         console.log("matchAll " + dump());
         "#
     ));
-    assert_eq!(out[0], r#"match "k=1 j=22" "k=1" "1" "" " j=22" "k" "1" """#);
+    assert_eq!(
+        out[0],
+        r#"match "k=1 j=22" "k=1" "1" "" " j=22" "k" "1" """#
+    );
     // matchAll leaves the LAST match consumed.
-    assert_eq!(out[1], r#"matchAll "k=1 j=22" "j=22" "22" "k=1 " "" "j" "22" """#);
+    assert_eq!(
+        out[1],
+        r#"matchAll "k=1 j=22" "j=22" "22" "k=1 " "" "j" "22" """#
+    );
 }
 
 /// B71 moved slot 1 (`lastMatch` / `RegExp["$&"]`) into the DEFERRED set, so that a

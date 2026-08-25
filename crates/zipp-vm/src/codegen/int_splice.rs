@@ -17,17 +17,35 @@ pub(crate) struct IntEntry<'a> {
     /// the i53 guards' "resume AFTER this op" (`vip + 1`) is always in range.
     /// EMPTY ⇒ the code is the proto's own and `vip` IS the resume ip.
     pub(crate) resume: &'a [u32],
-    /// One `(absolute address of `global_gens[g]`, baked generation)` per
-    /// spliced callee slot, compared ONCE at region entry instead of per call.
-    /// Sound because `slot_guard` keying admits only slots NO bytecode store
-    /// can reach, and an INT region runs no call, no allocation and no property
-    /// write — so nothing between entry and exit can bump the generation.
+    /// Address/value guards compared ONCE at region entry: one
+    /// `global_gens[g]` generation per spliced callee slot.
+    /// Sound because a flattened INT region runs no call, allocation, delete,
+    /// or property write, so neither fact can change between entry and exit.
     pub(crate) guards: &'a [(u64, u32)],
+    /// Expected VM global-route epoch when a flattened body performs raw
+    /// global accesses. The emitter reads it relative to the live VM argument,
+    /// so persistent code remains valid after an embedded `ScriptState` moves.
+    pub(crate) route_epoch: Option<u32>,
+    /// Read-only dense computed-call proofs run once before any region op.
+    /// They validate exact receiver/element identities and ABA versions.
+    pub(crate) computed_guards: &'a [DenseComputedEntryGuard],
     /// `(jit_regs_fits address, highest scratch slot used above rbx)`. The
     /// flattened body writes the callee window above the caller frame, and
     /// `flush_exit` stores every home back to `[rbx + dreg(r)]`; a `0` address
     /// means no carved window and no check.
     pub(crate) regs_fits: (usize, u64),
+    /// First synthetic register above the caller's real frame. `None` for an
+    /// ordinary region and the established Call splice; computed dispatch
+    /// scratch is defs-before-use and is never observable at an interpreter
+    /// resume, so integer emitters neither entry-load nor exit-flush it.
+    pub(crate) scratch_base: Option<u16>,
+}
+
+impl IntEntry<'_> {
+    #[inline]
+    pub(crate) fn is_scratch(&self, reg: u16) -> bool {
+        self.scratch_base.is_some_and(|base| reg >= base)
+    }
 }
 
 /// A flattened region: a synthetic proto whose `[start, end]` IS the spliced
@@ -39,7 +57,10 @@ pub(crate) struct IntSplice {
     pub(crate) ta_plan: TaPinPlan,
     pub(crate) resume: Vec<u32>,
     pub(crate) guards: Vec<(u64, u32)>,
+    pub(crate) route_epoch: Option<u32>,
+    pub(crate) computed_guards: Vec<DenseComputedEntryGuard>,
     pub(crate) regs_fits: (usize, u64),
+    pub(crate) scratch_base: Option<u16>,
 }
 
 impl IntSplice {
@@ -47,9 +68,21 @@ impl IntSplice {
         IntEntry {
             resume: &self.resume,
             guards: &self.guards,
+            route_epoch: self.route_epoch,
+            computed_guards: &self.computed_guards,
             regs_fits: self.regs_fits,
+            scratch_base: self.scratch_base,
         }
     }
+}
+
+/// One native-entry validation bundle for a bounded dense computed-call site.
+pub(crate) struct DenseComputedEntryGuard {
+    pub(crate) recv_src: TaPinSrc,
+    pub(crate) recv_bits: u64,
+    pub(crate) recv_ver: u32,
+    pub(crate) elements: Vec<(u64, u32)>,
+    pub(crate) helper: usize,
 }
 
 /// One spliced call site, after every admission check passed.
@@ -102,6 +135,7 @@ pub(crate) fn plan_int_splice(
     end: u32,
     ta_plan: &TaPinPlan,
     leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+    computed_leaf_plan: &FxHashMap<usize, DenseComputedLeafPlan>,
     regs_fits_helper: usize,
     metered: bool,
 ) -> Option<IntSplice> {
@@ -115,6 +149,28 @@ pub(crate) fn plan_int_splice(
     let calls: Vec<usize> = (s..=e)
         .filter(|&ip| matches!(proto.code[ip], Instr::Call { .. }))
         .collect();
+    let computed: Vec<usize> = (s..=e)
+        .filter(|&ip| matches!(proto.code[ip], Instr::CallMethodComputed { .. }))
+        .collect();
+    if !computed.is_empty() {
+        // Keep the first lane deliberately bounded to one computed dispatch and
+        // no ordinary Call splice. The transformed result is still generic over
+        // every dense arm/key; larger mixed-call regions retain the existing MEM
+        // helper until their cross-site liveness proof is equally explicit.
+        if computed.len() == 1 && calls.is_empty() {
+            return plan_int_computed_splice(
+                proto,
+                start,
+                end,
+                ta_plan,
+                computed_leaf_plan,
+                computed[0],
+                regs_fits_helper,
+                metered,
+            );
+        }
+        decline!("[{start},{end}] mixed/multiple computed call sites");
+    }
     if calls.is_empty() {
         return None; // nothing to flatten — the untouched path stays untouched
     }
@@ -129,6 +185,7 @@ pub(crate) fn plan_int_splice(
     let mut sites: Vec<Site> = Vec::with_capacity(calls.len());
     let mut win_top = 0u64; // highest scratch slot used, as a caller reg number
     let mut guards: Vec<(u64, u32)> = Vec::new();
+    let mut route_epoch: Option<u32> = None;
     let mut prev_end = s; // spans must not overlap
     for &c in &calls {
         let Instr::Call {
@@ -212,6 +269,34 @@ pub(crate) fn plan_int_splice(
         }
         if !guards.contains(&guard) {
             guards.push(guard);
+        }
+        let body_has_direct_global = lp.body.iter().any(|ins| {
+            matches!(
+                ins,
+                Instr::LoadGlobal { .. }
+                    | Instr::LoadGlobalOrUndefined { .. }
+                    | Instr::StoreGlobal { .. }
+                    | Instr::StoreGlobalStrict { .. }
+                    | Instr::StoreGlobalResolved { .. }
+            )
+        });
+        if body_has_direct_global {
+            // `emit_splice` deliberately discards the typed schedule and
+            // flattens the leaf bytecode itself. Hoist the independent route
+            // proof built for that exact body; coupling this to `typed_lane`
+            // would incorrectly disable valid global-store leaves, because
+            // their transactional typed schedule is intentionally narrower
+            // than the established raw INT emitter.
+            let Some(route_guard) = lp.direct_global_route_epoch else {
+                decline!("@{c} direct globals lack a route-epoch guard");
+            };
+            if let Some(existing) = route_epoch {
+                if existing != route_guard {
+                    decline!("@{c} inconsistent route-epoch guards");
+                }
+            } else {
+                route_epoch = Some(route_guard);
+            }
         }
         sites.push(Site {
             call_ip: c,
@@ -341,7 +426,236 @@ pub(crate) fn plan_int_splice(
         ta_plan: new_ta,
         resume,
         guards,
+        route_epoch,
+        computed_guards: Vec::new(),
         regs_fits: (regs_fits_helper, win_top),
+        scratch_base: None,
+    })
+}
+
+/// Computed-call-only sibling of the ordinary Call splice. Every dense arm was
+/// already proved a pure integer leaf from live state. This pass supplies the
+/// remaining control proof: a bounded key dispatch, a replayable pre-call
+/// prefix for every miss/bail, and entry guards that freeze the exact dense
+/// receiver/elements for the duration of the call-free native loop.
+#[allow(clippy::too_many_arguments)]
+fn plan_int_computed_splice(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    ta_plan: &TaPinPlan,
+    computed_leaf_plan: &FxHashMap<usize, DenseComputedLeafPlan>,
+    call_ip: usize,
+    regs_fits_helper: usize,
+    metered: bool,
+) -> Option<IntSplice> {
+    if !int_computed_leaf_enabled() {
+        return None;
+    }
+    if metered {
+        decline!("[{start},{end}] computed splice in metered VM");
+    }
+    let Some(cp) = computed_leaf_plan.get(&call_ip) else {
+        decline!("@{call_ip} no dense computed leaf plan");
+    };
+    if cp.variants.is_empty() || cp.variants.len() > 4 {
+        decline!("@{call_ip} computed arm count {}", cp.variants.len());
+    }
+    let Instr::CallMethodComputed {
+        dst,
+        key,
+        arg_base,
+        argc,
+        ..
+    } = proto.code[call_ip]
+    else {
+        return None;
+    };
+    let (s, e) = (start as usize, end as usize);
+    let fallback = cp.fallback_ip as usize;
+    if !(s..=call_ip).contains(&fallback) {
+        decline!("@{call_ip} fallback @{fallback} outside pure region prefix");
+    }
+    span_is_replayable(proto, fallback, call_ip, s, e)?;
+
+    // Two dispatch temporaries plus one SHARED callee window. Arms are mutually
+    // exclusive and every success jumps to the common continuation, so no arm's
+    // locals can be live into another; sharing avoids turning a small 3-way
+    // helper table into dozens of artificial numeric registers.
+    let key_const = proto.reg_count;
+    let key_cmp = key_const.checked_add(1)?;
+    let win = key_cmp.checked_add(1)?;
+    let mut win_top = win as u64;
+    let mut wins = Vec::with_capacity(cp.variants.len());
+    for lp in &cp.variants {
+        if lp.upvals.len() != 0
+            || !lp.nested.is_empty()
+            || lp.typed_lane.is_none()
+            || lp.param_count != argc
+            || lp.uninit_mask != 0
+            || !matches!(lp.body.last(), Some(Instr::Return { .. }))
+        {
+            decline!("@{call_ip} computed arm lost its pure typed proof");
+        }
+        let arm_win = (win as u64).max(lp.reg_window as u64);
+        win_top = win_top.max(arm_win.checked_add(lp.callee_reg_count as u64)?);
+        if win_top > MAX_SPLICE_WINDOW_TOP {
+            decline!("@{call_ip} computed windows exceed register headroom");
+        }
+        wins.push(arm_win as u16);
+    }
+
+    let mut code = proto.code.clone();
+    let mut constants = proto.constants.clone();
+    let base = code.len();
+    for ins in &mut code[s..=e] {
+        *ins = Instr::ReturnUndefined;
+    }
+    let mut flat = Vec::new();
+    let mut resume = Vec::new();
+    let mut vip_of: FxHashMap<usize, usize> = FxHashMap::default();
+    let mut access: FxHashMap<usize, u8> = FxHashMap::default();
+    let mut fallback_fixup = None;
+
+    for o in s..=e {
+        vip_of.insert(o, flat.len());
+        if cp.drop_obj_def.is_some_and(|d| d as usize == o) {
+            continue;
+        }
+        if o != call_ip {
+            if let Some(&j) = ta_plan.access.get(&o) {
+                access.insert(base + flat.len(), j);
+            }
+            flat.push(proto.code[o].clone());
+            resume.push(o as u32);
+            continue;
+        }
+
+        for (index, (lp, &win)) in cp.variants.iter().zip(&wins).enumerate() {
+            flat.push(Instr::LoadInt {
+                dst: key_const,
+                val: index as i32,
+            });
+            resume.push(cp.fallback_ip);
+            flat.push(Instr::Eq {
+                dst: key_cmp,
+                a: key,
+                b: key_const,
+            });
+            resume.push(cp.fallback_ip);
+            let miss_at = flat.len();
+            flat.push(Instr::JumpIfFalse {
+                cond: key_cmp,
+                target: u32::MAX,
+            });
+            resume.push(cp.fallback_ip);
+
+            let site = Site {
+                call_ip,
+                def_ip: fallback,
+                dst,
+                arg_base,
+                win,
+                plan: lp,
+            };
+            emit_splice(
+                &site,
+                &mut flat,
+                &mut resume,
+                &mut constants,
+                cp.fallback_ip,
+            )?;
+            // Success rejoins the original continuation. The ordinary target
+            // remapper below maps it to the synthetic copy of `call_ip + 1`.
+            flat.push(Instr::Jump {
+                target: call_ip as u32 + 1,
+            });
+            resume.push(cp.fallback_ip);
+            let next = (base + flat.len()) as u32;
+            let Instr::JumpIfFalse { target, .. } = &mut flat[miss_at] else {
+                unreachable!()
+            };
+            *target = next;
+        }
+        // No bounded arm matched. Keep a sentinel through ordinary target
+        // remapping, then patch it to the ORIGINAL replay prefix; otherwise an
+        // in-range original ip would be mistaken for a synthetic branch target.
+        fallback_fixup = Some(flat.len());
+        flat.push(Instr::Jump { target: u32::MAX });
+        resume.push(cp.fallback_ip);
+    }
+    resume.push(*resume.last()?);
+
+    for ins in &mut flat {
+        let target = match ins {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => target,
+            _ => continue,
+        };
+        if (s..=e).contains(&(*target as usize)) {
+            *target = (base + vip_of[&(*target as usize)]) as u32;
+        }
+    }
+    let fix = fallback_fixup?;
+    let Instr::Jump { target } = &mut flat[fix] else {
+        unreachable!()
+    };
+    *target = cp.fallback_ip;
+
+    let new_start = base as u32;
+    let new_end = (base + flat.len() - 1) as u32;
+    code.extend(flat);
+    for (&ip, &j) in &ta_plan.access {
+        if !(s..=e).contains(&ip) {
+            access.insert(ip, j);
+        }
+    }
+    let new_ta = TaPinPlan {
+        pins: ta_plan.pins.clone(),
+        access,
+    };
+    let mut sp = proto.clone();
+    sp.reg_count = sp.reg_count.max(win_top as u16);
+    sp.code = code;
+    sp.constants = constants;
+    if !int_unadmitted_ips(&sp, new_start, new_end, &new_ta, false).is_some_and(|v| v.is_empty()) {
+        decline!("[{start},{end}] computed flattened body is not INT-admissible");
+    }
+
+    let computed_guard = DenseComputedEntryGuard {
+        recv_src: cp.recv_src,
+        recv_bits: cp.recv_bits,
+        recv_ver: cp.recv_ver,
+        elements: cp
+            .variants
+            .iter()
+            .map(|lp| (lp.callee_bits, lp.callee_ver))
+            .collect(),
+        helper: cp.guard_helper,
+    };
+    if std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!(
+            "[jit] INT computed splice [{start},{end}] @{}: {} dense arms, fallback @{}, {} ops",
+            call_ip,
+            cp.variants.len(),
+            cp.fallback_ip,
+            new_end - new_start + 1
+        );
+    }
+    Some(IntSplice {
+        proto: sp,
+        start: new_start,
+        end: new_end,
+        ta_plan: new_ta,
+        resume,
+        guards: Vec::new(),
+        route_epoch: None,
+        computed_guards: vec![computed_guard],
+        regs_fits: (regs_fits_helper, win_top),
+        scratch_base: Some(proto.reg_count),
     })
 }
 
@@ -576,22 +890,43 @@ fn span_is_replayable(
     let mut written: FxHashSet<u16> = FxHashSet::default();
     let mut all_written: FxHashSet<u16> = FxHashSet::default();
     for ip in def_ip..call_ip {
-        match proto.code[ip] {
-            Instr::StoreGlobal { .. }
-            | Instr::StoreGlobalStrict { .. }
-            | Instr::StoreGlobalResolved { .. }
-            | Instr::SetIndex { .. }
-            | Instr::SetProp { .. } => {
-                decline!("@{call_ip} callee-def span writes at @{ip}");
-            }
-            Instr::Jump { .. }
-            | Instr::JumpIfFalse { .. }
-            | Instr::JumpIfTrue { .. }
-            | Instr::JumpIfNotLt { .. }
-            | Instr::JumpIfNotLe { .. } => {
-                decline!("@{call_ip} callee-def span branches at @{ip}");
-            }
-            _ => {}
+        // Fail closed: this span is replayed from `def_ip` after ANY native
+        // dispatch/guard exit.  It may therefore contain only operations whose
+        // admitted INTEGER implementation cannot perform observable work.  In
+        // particular, a pinned `arr.push(int)` is an admitted `CallMethod`; if
+        // it sat here, a later computed-key miss would commit the push and then
+        // replay it in the interpreter.  Keep calls, construction, printing,
+        // appends, throws and every store-like opcode out by using a pure
+        // allowlist instead of trying to enumerate today's effectful variants.
+        if !matches!(
+            proto.code[ip],
+            Instr::LoadConst { .. }
+                | Instr::LoadInt { .. }
+                | Instr::Move { .. }
+                | Instr::LoadGlobal { .. }
+                | Instr::Add { .. }
+                | Instr::Sub { .. }
+                | Instr::Mul { .. }
+                | Instr::Mod { .. }
+                | Instr::AddInt { .. }
+                | Instr::Neg { .. }
+                | Instr::Bitwise { .. }
+                | Instr::Not { .. }
+                | Instr::Lt { .. }
+                | Instr::Le { .. }
+                | Instr::Gt { .. }
+                | Instr::Ge { .. }
+                | Instr::Eq { .. }
+                | Instr::Ne { .. }
+                | Instr::GetIndex { .. }
+                | Instr::GetProp { .. }
+                | Instr::MathOp {
+                    op: MathFn::Imul,
+                    argc: 2,
+                    ..
+                }
+        ) {
+            decline!("@{call_ip} non-replayable op @{ip} in callee-def span");
         }
         if let Some((_, Some(d))) = splice_ud(&proto.code[ip]) {
             all_written.insert(d);
@@ -888,6 +1223,18 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
             v.push(obj);
             r(v, Some(dst))
         }
+        Instr::CallMethodComputed {
+            dst,
+            obj,
+            key,
+            arg_base,
+            argc,
+        } => {
+            let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
+            v.push(obj);
+            v.push(key);
+            r(v, Some(dst))
+        }
         Instr::Print { arg_base, argc, .. } => r((0..argc).map(|k| arg_base + k).collect(), None),
         Instr::ArrayAppend { arr, val, .. } => r(vec![arr, val], None),
         Instr::Jump { .. } | Instr::ReturnUndefined | Instr::GenStart => r(vec![], None),
@@ -931,11 +1278,68 @@ pub(crate) fn emit_int_splice_entry_guards(
         }
         dynasm!(ops ; test rax, rax ; jz => entry_bail);
     }
+    if let Some(epoch) = entry.route_epoch {
+        let epoch_off = crate::vm::host_api::JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32;
+        dynasm!(ops
+            ; cmp DWORD [rdi + epoch_off], epoch as i32
+            ; jne => entry_bail
+        );
+    }
     for &(addr, gen) in entry.guards {
         dynasm!(ops
             ; mov rax, QWORD addr as i64
             ; cmp DWORD [rax], gen as i32
             ; jne => entry_bail
         );
+    }
+    if !entry.computed_guards.is_empty() {
+        // Win64 shadow/alignment exactly like `jit_regs_fits` above. These
+        // helpers are read-only and execute before any native region op/home,
+        // so every miss can take the header entry bail with no flush/replay
+        // ambiguity.
+        let pad: i32 = if has_shadow { 0 } else { 40 };
+        let guard_fail = ops.new_dynamic_label();
+        let guards_done = ops.new_dynamic_label();
+        if pad != 0 {
+            dynasm!(ops ; sub rsp, pad);
+        }
+        for guard in entry.computed_guards {
+            match guard.recv_src {
+                TaPinSrc::Global(g) => {
+                    dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]);
+                }
+                TaPinSrc::Reg(r) => {
+                    dynasm!(ops ; mov rdx, [rbx + dreg(r)]);
+                }
+            }
+            dynasm!(ops
+                ; mov rax, QWORD guard.recv_bits as i64
+                ; cmp rdx, rax
+                ; jne => guard_fail
+            );
+            for (index, &(callee_bits, callee_ver)) in guard.elements.iter().enumerate() {
+                let packed = ((guard.recv_ver as u64) << 32) | index as u64;
+                let expect = ((callee_ver as u64) << 1) | 1;
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, QWORD guard.recv_bits as i64
+                    ; mov r8, QWORD packed as i64
+                    ; mov r9, QWORD callee_bits as i64
+                    ; mov rax, QWORD guard.helper as i64
+                    ; call rax
+                    ; mov r10, QWORD expect as i64
+                    ; cmp rax, r10
+                    ; jne => guard_fail
+                );
+            }
+        }
+        if pad != 0 {
+            dynasm!(ops ; add rsp, pad);
+        }
+        dynasm!(ops ; jmp => guards_done ; => guard_fail);
+        if pad != 0 {
+            dynasm!(ops ; add rsp, pad);
+        }
+        dynasm!(ops ; jmp => entry_bail ; => guards_done);
     }
 }

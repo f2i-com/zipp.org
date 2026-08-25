@@ -24,7 +24,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -259,18 +263,36 @@ const PIN_MARKER: &str = "ZIPP_ICGATE_PIN";
 #[ignore]
 fn icgate_pin_child() {
     let out = zipp_vm::run(PIN_JS).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     let set_miss = zipp_vm::ic_stats().4;
-    println!("{PIN_MARKER} out={} set_miss={set_miss}", out.output.join("|"));
+    println!(
+        "{PIN_MARKER} out={} set_miss={set_miss}",
+        out.output.join("|")
+    );
 }
 
 /// `(stdout of the script, SetProp misses)` from one child run.
 fn pin_child(gate_off: bool) -> (String, u64) {
     let exe = std::env::current_exe().expect("test binary path");
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["--exact", "icgate_pin_child", "--ignored", "--nocapture", "--test-threads", "1"]);
+    cmd.args([
+        "--exact",
+        "icgate_pin_child",
+        "--ignored",
+        "--nocapture",
+        "--test-threads",
+        "1",
+    ]);
     cmd.env("ZIPP_ICSTATS", "1");
     cmd.env("ZIPP_ICGATE_PIN_CHILD", "1");
+    // Isolate the older refill/rotation mechanism. Adaptive direct-miss sites
+    // deliberately call the Rust helper on every access, so their ICSTATS
+    // "miss" count cannot measure how many identity ways would have hit.
+    cmd.env("ZIPP_NO_DIRECT_IC_MISS", "1");
     // This is an IC mechanism pin: keep the field-write stream reducer from
     // consuming the measured loop before its SetProp site reaches the IC.
     cmd.env("ZIPP_NO_FIELD_WRITE_STREAM", "1");
@@ -333,5 +355,8 @@ fn gate_and_rotation_escape_are_engaged() {
          (the (n-8)/n floor here is ~{})",
         PIN_ITERS / 9
     );
-    assert!(on * 4 < off, "gated {on} vs ungated {off} is not a mechanism");
+    assert!(
+        on * 4 < off,
+        "gated {on} vs ungated {off} is not a mechanism"
+    );
 }

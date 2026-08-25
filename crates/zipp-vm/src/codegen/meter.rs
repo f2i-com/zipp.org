@@ -121,8 +121,12 @@ pub(crate) fn charge_block(
     exit_stubs: &mut rustc_hash::FxHashMap<u32, dynasmrt::DynamicLabel>,
 ) -> bool {
     let Some((m, blocks)) = bm else { return false };
-    let Some(&len) = blocks.get(&ip) else { return false };
-    let stub = *exit_stubs.entry(ip as u32).or_insert_with(|| ops.new_dynamic_label());
+    let Some(&len) = blocks.get(&ip) else {
+        return false;
+    };
+    let stub = *exit_stubs
+        .entry(ip as u32)
+        .or_insert_with(|| ops.new_dynamic_label());
     emit_charge(ops, m, len, stub);
     true
 }
@@ -194,7 +198,11 @@ mod tests {
     fn assert_covers(code: &[Instr], start: usize, end: usize) {
         let bs = blocks(code, start, end);
         let total: u32 = bs.iter().map(|&(_, n)| n).sum();
-        assert_eq!(total as usize, end - start + 1, "blocks must partition the region");
+        assert_eq!(
+            total as usize,
+            end - start + 1,
+            "blocks must partition the region"
+        );
         let mut next = start;
         for (head, len) in bs {
             assert_eq!(head, next, "blocks must be contiguous and in order");

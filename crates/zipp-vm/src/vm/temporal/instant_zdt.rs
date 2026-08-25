@@ -13,11 +13,16 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn make_instant(&mut self, ns: i128) -> Result<Value, Thrown> {
         if ns.abs() > 8_640_000_000_000_000_000_000 {
-            return Err(Thrown("RangeError: Instant outside the supported range".into()));
+            return Err(Thrown(
+                "RangeError: Instant outside the supported range".into(),
+            ));
         }
         let hi = (ns >> 64) as i64;
         let lo = ns as i64;
-        let idx = self.heap.alloc(HeapObj::Temporal { kind: 4, fields: vec![hi, lo] });
+        let idx = self.heap.alloc(HeapObj::Temporal {
+            kind: 4,
+            fields: vec![hi, lo],
+        });
         if self.instant_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.instant_proto));
         }
@@ -56,13 +61,19 @@ impl<'p> Vm<'p> {
     pub(crate) fn make_zoned_date_time(&mut self, args: &[Value]) -> Result<Value, Thrown> {
         let _gc = self.gc_lock_guard();
         // Beyond-i128 saturates (sign preserved) — certainly out of range below.
-        let ns = self.to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?.to_i128_sat();
+        let ns = self
+            .to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?
+            .to_i128_sat();
         if ns.abs() > 8_640_000_000_000_000_000_000 {
-            return Err(Thrown("RangeError: ZonedDateTime outside the supported range".into()));
+            return Err(Thrown(
+                "RangeError: ZonedDateTime outside the supported range".into(),
+            ));
         }
         let tzarg = args.get(1).copied().unwrap_or(Value::UNDEFINED);
         if tzarg == Value::UNDEFINED {
-            return Err(Thrown("TypeError: Temporal.ZonedDateTime requires a time zone".into()));
+            return Err(Thrown(
+                "TypeError: Temporal.ZonedDateTime requires a time zone".into(),
+            ));
         }
         // The CONSTRUCTOR's time zone is an IDENTIFIER (ParseTimeZoneIdentifier):
         // a named id or a minute-precision UTC offset. An ISO datetime string
@@ -82,9 +93,13 @@ impl<'p> Vm<'p> {
         let (id, offset_ns) = self.parse_tz_arg(tzarg)?;
         let hi = (ns >> 64) as i64;
         let lo = ns as i64;
-        let idx = self.heap.alloc(HeapObj::Temporal { kind: 7, fields: vec![hi, lo, offset_ns] });
+        let idx = self.heap.alloc(HeapObj::Temporal {
+            kind: 7,
+            fields: vec![hi, lo, offset_ns],
+        });
         if self.zoneddatetime_proto != 0 {
-            self.proto_of.insert(idx, Value::heap(self.zoneddatetime_proto));
+            self.proto_of
+                .insert(idx, Value::heap(self.zoneddatetime_proto));
         }
         let idv = self.alloc_str(id);
         self.zdt_tz.insert(idx, idv);
@@ -165,7 +180,9 @@ impl<'p> Vm<'p> {
             }
             "toPlainTime" => {
                 let f = self.zdt_local(idx);
-                Ok(Some(self.make_plain_time([f[3], f[4], f[5], f[6], f[7], f[8]])?))
+                Ok(Some(
+                    self.make_plain_time([f[3], f[4], f[5], f[6], f[7], f[8]])?,
+                ))
             }
             "startOfDay" => {
                 // GetStartOfDay: local midnight resolved through the zone with
@@ -177,7 +194,11 @@ impl<'p> Vm<'p> {
                 let midnight_local = local.div_euclid(DAY_NS) * DAY_NS;
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
                 let new_ns = tz_start_of_day(&id, midnight_local)?;
-                Ok(Some(self.make_zoned_date_time_raw(new_ns, self.zdt_offset_ns(idx), idx)?))
+                Ok(Some(self.make_zoned_date_time_raw(
+                    new_ns,
+                    self.zdt_offset_ns(idx),
+                    idx,
+                )?))
             }
             "equals" => {
                 // ToTemporalZonedDateTime casts the argument (string / property bag /
@@ -207,7 +228,9 @@ impl<'p> Vm<'p> {
                 // argument is REQUIRED: undefined is a TypeError here.
                 let cv = args.first().copied().unwrap_or(Value::UNDEFINED);
                 if cv == Value::UNDEFINED {
-                    return Err(Thrown("TypeError: withCalendar requires a calendar argument".into()));
+                    return Err(Thrown(
+                        "TypeError: withCalendar requires a calendar argument".into(),
+                    ));
                 }
                 let ncal = self.validate_calendar_value(cv)?;
                 let (ns, off) = (self.zdt_epoch_ns(idx).unwrap_or(0), self.zdt_offset_ns(idx));
@@ -218,8 +241,11 @@ impl<'p> Vm<'p> {
                 // No argument is GetStartOfDay, NOT midnight-disambiguated: in
                 // America/Toronto on 1919-03-31 those differ by 30 minutes.
                 let tv = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let time =
-                    if tv == Value::UNDEFINED { None } else { Some(self.to_plain_time(tv)?) };
+                let time = if tv == Value::UNDEFINED {
+                    None
+                } else {
+                    Some(self.to_plain_time(tv)?)
+                };
                 let f = self.zdt_local(idx);
                 let midnight = (iso_to_epoch_days(f[0], f[1], f[2]) as i128) * DAY_NS;
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
@@ -237,7 +263,8 @@ impl<'p> Vm<'p> {
                 // DST boundary keeps the clock time; the time part is then added
                 // as exact duration on the timeline.
                 let dur = self.to_duration(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-                let reject = self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
+                let reject =
+                    self.read_overflow(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
                 let sign: i64 = if name == "add" { 1 } else { -1 };
                 let lf = self.zdt_local(idx);
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
@@ -261,8 +288,8 @@ impl<'p> Vm<'p> {
                     let (ay, am, ad) =
                         cal_add_year_month(cal, cy, cm, cd, dur[0] * sign, dur[1] * sign, reject)
                             .ok_or_else(|| {
-                                Thrown("RangeError: date arithmetic overflows the month".into())
-                            })?;
+                            Thrown("RangeError: date arithmetic overflows the month".into())
+                        })?;
                     let ed = cal_to_epoch_days(cal, ay, am, ad) + (dur[2] * 7 + dur[3]) * sign;
                     let local = (ed as i128) * DAY_NS
                         + time_to_ns(&[lf[3], lf[4], lf[5], lf[6], lf[7], lf[8]]);
@@ -293,22 +320,52 @@ impl<'p> Vm<'p> {
                 // GetOptionsObject: a defined non-object options bag is a TypeError
                 // (a primitive must not be read for properties / silently ignored).
                 if opts != Value::UNDEFINED && !self.is_object_value(opts) {
-                    return Err(Thrown("TypeError: options must be an object or undefined".into()));
+                    return Err(Thrown(
+                        "TypeError: options must be an object or undefined".into(),
+                    ));
                 }
                 let all_units = &[
-                    "auto", "year", "years", "month", "months", "week", "weeks", "day", "days",
-                    "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
-                    "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
+                    "auto",
+                    "year",
+                    "years",
+                    "month",
+                    "months",
+                    "week",
+                    "weeks",
+                    "day",
+                    "days",
+                    "hour",
+                    "hours",
+                    "minute",
+                    "minutes",
+                    "second",
+                    "seconds",
+                    "millisecond",
+                    "milliseconds",
+                    "microsecond",
+                    "microseconds",
+                    "nanosecond",
+                    "nanoseconds",
                 ];
                 let order = [
-                    "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
-                    "microsecond", "nanosecond",
+                    "year",
+                    "month",
+                    "week",
+                    "day",
+                    "hour",
+                    "minute",
+                    "second",
+                    "millisecond",
+                    "microsecond",
+                    "nanosecond",
                 ];
                 let rank = |u: &str| order.iter().position(|&x| x == u).unwrap_or(9);
                 // GetDifferenceSettings order: largestUnit, roundingIncrement, roundingMode,
                 // smallestUnit — resolve "auto" + validate only after all four are read.
-                let largest_raw =
-                    normalize_unit(&self.opt_string(opts, "largestUnit", "auto", all_units)?, "auto");
+                let largest_raw = normalize_unit(
+                    &self.opt_string(opts, "largestUnit", "auto", all_units)?,
+                    "auto",
+                );
                 let inc = self.read_rounding_increment(opts)?;
                 let mode = self.read_rounding_mode(opts, "trunc")?;
                 let smallest = normalize_unit(
@@ -316,7 +373,11 @@ impl<'p> Vm<'p> {
                     "nanosecond",
                 );
                 let largest = if largest_raw == "auto" {
-                    if rank(&smallest) < rank("hour") { smallest.clone() } else { "hour".to_string() }
+                    if rank(&smallest) < rank("hour") {
+                        smallest.clone()
+                    } else {
+                        "hour".to_string()
+                    }
                 } else {
                     largest_raw
                 };
@@ -336,7 +397,11 @@ impl<'p> Vm<'p> {
                 }
                 // since = negate(until): forward (this → other) difference with a
                 // sign-negated rounding mode, then negate the result.
-                let eff = if name == "since" { negate_mode(&mode) } else { mode.clone() };
+                let eff = if name == "since" {
+                    negate_mode(&mode)
+                } else {
+                    mode.clone()
+                };
                 let ns1 = self.zdt_epoch_ns(idx).unwrap_or(0);
                 let ns2 = self.zdt_epoch_ns(oz.heap_index()).unwrap_or(0);
                 let mut out = if rank(&largest) > rank("day") {
@@ -374,7 +439,12 @@ impl<'p> Vm<'p> {
                 let (su, inc, mode) = self.read_round_options(
                     opts,
                     &[
-                        "day", "hour", "minute", "second", "millisecond", "microsecond",
+                        "day",
+                        "hour",
+                        "minute",
+                        "second",
+                        "millisecond",
+                        "microsecond",
                         "nanosecond",
                     ],
                     true,
@@ -444,14 +514,21 @@ impl<'p> Vm<'p> {
                 // merge in CALENDAR space, so the raw values cannot just overwrite
                 // the ISO wall-clock.
                 let mut date_raw: [Option<i64>; 3] = [None; 3];
-                let mut read_slot = |vm: &mut Self, nm: &str, slot: usize, f: &mut [i64; 9], any: &mut bool, date_raw: &mut [Option<i64>; 3]| -> Result<(), Thrown> {
+                let mut read_slot = |vm: &mut Self,
+                                     nm: &str,
+                                     slot: usize,
+                                     f: &mut [i64; 9],
+                                     any: &mut bool,
+                                     date_raw: &mut [Option<i64>; 3]|
+                 -> Result<(), Thrown> {
                     let v = if slot == 1 {
-                        vm.read_month_field_raw(bag, cal)?.map(|(mm, valid, conflict)| {
-                            month_valid = valid;
-                            month_conflict = conflict;
-                            month_ref = Some(mm);
-                            mm.floor()
-                        })
+                        vm.read_month_field_raw(bag, cal)?
+                            .map(|(mm, valid, conflict)| {
+                                month_valid = valid;
+                                month_conflict = conflict;
+                                month_ref = Some(mm);
+                                mm.floor()
+                            })
                     } else {
                         vm.opt_int_field(bag, nm)?
                     };
@@ -487,7 +564,9 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 if era.is_some() != era_year.is_some() {
-                    return Err(Thrown("TypeError: era and eraYear must be given together".into()));
+                    return Err(Thrown(
+                        "TypeError: era and eraYear must be given together".into(),
+                    ));
                 }
                 // Merge the date in calendar space (NonIsoFieldKeysToIgnore: an
                 // era+eraYear pair and `year` are mutually exclusive inputs).
@@ -568,7 +647,12 @@ impl<'p> Vm<'p> {
 
     /// Build a ZonedDateTime from epoch ns + offset, copying the time-zone id of an
     /// existing instance `src` (used by methods that derive a new ZDT in place).
-    pub(crate) fn make_zoned_date_time_raw(&mut self, ns: i128, offset_ns: i64, src: u32) -> Result<Value, Thrown> {
+    pub(crate) fn make_zoned_date_time_raw(
+        &mut self,
+        ns: i128,
+        offset_ns: i64,
+        src: u32,
+    ) -> Result<Value, Thrown> {
         if ns.abs() > NS_MAX_INSTANT {
             return Err(Thrown(
                 "RangeError: ZonedDateTime is outside the representable range".into(),
@@ -577,9 +661,13 @@ impl<'p> Vm<'p> {
         let _gc = self.gc_lock_guard();
         let hi = (ns >> 64) as i64;
         let lo = ns as i64;
-        let idx = self.heap.alloc(HeapObj::Temporal { kind: 7, fields: vec![hi, lo, offset_ns] });
+        let idx = self.heap.alloc(HeapObj::Temporal {
+            kind: 7,
+            fields: vec![hi, lo, offset_ns],
+        });
         if self.zoneddatetime_proto != 0 {
-            self.proto_of.insert(idx, Value::heap(self.zoneddatetime_proto));
+            self.proto_of
+                .insert(idx, Value::heap(self.zoneddatetime_proto));
         }
         if let Some(tz) = self.zdt_tz.get(&src).copied() {
             self.zdt_tz.insert(idx, tz);
@@ -594,7 +682,11 @@ impl<'p> Vm<'p> {
     /// `Temporal.ZonedDateTime.from(item[, options])`. From a ZDT instance → a copy;
     /// from a property bag `{timeZone, year, month, day, …}` → built from the local
     /// wall-clock + zone offset; from an ISO string `…±OFF[tz]` → parsed.
-    pub(crate) fn zoned_date_time_from(&mut self, item: Value, options: Value) -> Result<Value, Thrown> {
+    pub(crate) fn zoned_date_time_from(
+        &mut self,
+        item: Value,
+        options: Value,
+    ) -> Result<Value, Thrown> {
         let _gc = self.gc_lock_guard();
         if item.is_heap() {
             if let Some(ns) = self.zdt_epoch_ns(item.heap_index()) {
@@ -616,7 +708,8 @@ impl<'p> Vm<'p> {
                 let bag = self.read_pdt_bag(item, true)?;
                 if bag.tz == Value::UNDEFINED {
                     return Err(Thrown(
-                        "TypeError: Temporal.ZonedDateTime.from requires a timeZone property".into(),
+                        "TypeError: Temporal.ZonedDateTime.from requires a timeZone property"
+                            .into(),
                     ));
                 }
                 // ToTemporalTimeZoneIdentifier: a string is parsed, a wrong type
@@ -660,7 +753,9 @@ impl<'p> Vm<'p> {
         // options bag is read — so `from("bad-string", primitiveOptions)` is a
         // RangeError, not the options TypeError.
         if !temporal_string_ok(&s, false, true) {
-            return Err(Thrown(format!("RangeError: invalid ZonedDateTime string \"{s}\"")));
+            return Err(Thrown(format!(
+                "RangeError: invalid ZonedDateTime string \"{s}\""
+            )));
         }
         let cal = self.calendar_from_annotation(&s)?;
         let (f, str_offset, id, _zone_offset, behaviour) = parse_zdt_string(&s)
@@ -705,7 +800,12 @@ impl<'p> Vm<'p> {
     /// Allocate a ZonedDateTime from epoch ns, offset, and an (owned) tz id.
     /// IsValidEpochNanoseconds: an out-of-range instant is a RangeError (so every
     /// ZDT-producing path is guarded centrally, not per-caller).
-    pub(crate) fn alloc_zdt(&mut self, ns: i128, offset_ns: i64, id: String) -> Result<Value, Thrown> {
+    pub(crate) fn alloc_zdt(
+        &mut self,
+        ns: i128,
+        offset_ns: i64,
+        id: String,
+    ) -> Result<Value, Thrown> {
         if ns.abs() > NS_MAX_INSTANT {
             return Err(Thrown(
                 "RangeError: ZonedDateTime is outside the representable range".into(),
@@ -713,9 +813,13 @@ impl<'p> Vm<'p> {
         }
         let hi = (ns >> 64) as i64;
         let lo = ns as i64;
-        let idx = self.heap.alloc(HeapObj::Temporal { kind: 7, fields: vec![hi, lo, offset_ns] });
+        let idx = self.heap.alloc(HeapObj::Temporal {
+            kind: 7,
+            fields: vec![hi, lo, offset_ns],
+        });
         if self.zoneddatetime_proto != 0 {
-            self.proto_of.insert(idx, Value::heap(self.zoneddatetime_proto));
+            self.proto_of
+                .insert(idx, Value::heap(self.zoneddatetime_proto));
         }
         let idv = self.alloc_str(id);
         self.zdt_tz.insert(idx, idv);
@@ -741,7 +845,9 @@ impl<'p> Vm<'p> {
         // TypeError.
         if tz.is_heap() {
             if let HeapObj::Temporal { kind: 7, .. } = self.heap.get(tz.heap_index()) {
-                let id = self.zdt_tz_id(tz.heap_index()).unwrap_or_else(|| "UTC".to_string());
+                let id = self
+                    .zdt_tz_id(tz.heap_index())
+                    .unwrap_or_else(|| "UTC".to_string());
                 return parse_time_zone(&id)
                     .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{id}\"")));
             }
@@ -751,7 +857,9 @@ impl<'p> Vm<'p> {
                     .ok_or_else(|| Thrown(format!("RangeError: invalid time zone \"{s}\"")));
             }
         }
-        Err(Thrown("TypeError: timeZone is not a string or object".into()))
+        Err(Thrown(
+            "TypeError: timeZone is not a string or object".into(),
+        ))
     }
 
     /// `Temporal.Now.*` time-zone argument: `undefined` is the system zone (UTC
@@ -784,7 +892,9 @@ impl<'p> Vm<'p> {
         }
         let s = self.to_js_string(dir_v)?;
         if s != "next" && s != "previous" {
-            return Err(Thrown(format!("RangeError: invalid direction option '{s}'")));
+            return Err(Thrown(format!(
+                "RangeError: invalid direction option '{s}'"
+            )));
         }
         Ok(s)
     }
@@ -806,7 +916,10 @@ impl<'p> Vm<'p> {
         rel: Value,
     ) -> Result<([i64; 9], Option<String>, i64, Cal), Thrown> {
         if rel.is_heap() {
-            if matches!(self.heap.get(rel.heap_index()), HeapObj::Temporal { kind: 7, .. }) {
+            if matches!(
+                self.heap.get(rel.heap_index()),
+                HeapObj::Temporal { kind: 7, .. }
+            ) {
                 let idx = rel.heap_index();
                 let cal = self.cal_of(idx);
                 let id = self.zdt_tz_id(idx).unwrap_or_else(|| "UTC".to_string());
@@ -824,7 +937,11 @@ impl<'p> Vm<'p> {
             {
                 let bag = self.read_pdt_bag(rel, true)?;
                 let zoned = bag.tz != Value::UNDEFINED;
-                let id = if zoned { self.parse_tz_arg(bag.tz)?.0 } else { String::new() };
+                let id = if zoned {
+                    self.parse_tz_arg(bag.tz)?.0
+                } else {
+                    String::new()
+                };
                 let cal = bag.cal;
                 let mut f = self.finish_pdt_fields(&bag, false)?;
                 if !zoned {
@@ -951,7 +1068,9 @@ impl<'p> Vm<'p> {
         }
         let offs = self.to_js_string(offv)?;
         if !valid_offset_string(&offs) {
-            return Err(Thrown(format!("RangeError: invalid offset string \"{offs}\"")));
+            return Err(Thrown(format!(
+                "RangeError: invalid offset string \"{offs}\""
+            )));
         }
         Ok(parse_offset_ns(&offs).map(|n| n as i64))
     }
@@ -968,18 +1087,31 @@ impl<'p> Vm<'p> {
     ) -> Result<f64, Thrown> {
         // GetOptionsObject: a non-undefined options must be an object.
         if opts != Value::UNDEFINED && !self.is_object_value(opts) {
-            return Err(Thrown("TypeError: options must be an object or undefined".into()));
+            return Err(Thrown(
+                "TypeError: options must be an object or undefined".into(),
+            ));
         }
         let rel = if opts == Value::UNDEFINED {
             Value::UNDEFINED
         } else {
             self.get_prop(opts, "relativeTo")?
         };
-        let order = |a: i128, b: i128| if a < b { -1.0 } else if a > b { 1.0 } else { 0.0 };
+        let order = |a: i128, b: i128| {
+            if a < b {
+                -1.0
+            } else if a > b {
+                1.0
+            } else {
+                0.0
+            }
+        };
         // GetTemporalRelativeToOption parses/validates the relativeTo (throwing on an
         // invalid string) BEFORE the identical-slots short-circuit below.
-        let start =
-            if rel != Value::UNDEFINED { Some(self.relative_to_dt(rel)?) } else { None };
+        let start = if rel != Value::UNDEFINED {
+            Some(self.relative_to_dt(rel)?)
+        } else {
+            None
+        };
         // Two durations with identical internal slots compare equal (+0) — even with
         // calendar units and no relativeTo (the relativeTo requirement is skipped).
         if fa == fb {
@@ -1036,8 +1168,16 @@ impl<'p> Vm<'p> {
     ) -> Result<[i64; 10], Thrown> {
         let end = dt_add_dur(cal, start, f);
         let order = [
-            "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
-            "microsecond", "nanosecond",
+            "year",
+            "month",
+            "week",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
         ];
         let rank = |u: &str| order.iter().position(|&x| x == u).unwrap_or(9);
         if rank(largest) >= rank("day") {
@@ -1052,7 +1192,9 @@ impl<'p> Vm<'p> {
             // Calendar largestUnit + day/time smallestUnit → round the day+time
             // remainder and roll an overflowing day up into the calendar units.
             let df = difference_datetime_cal(cal, start, end, largest);
-            Ok(round_datetime_diff_daytime(cal, start, df, smallest, largest, inc, mode))
+            Ok(round_datetime_diff_daytime(
+                cal, start, df, smallest, largest, inc, mode,
+            ))
         }
     }
 
@@ -1099,7 +1241,12 @@ impl<'p> Vm<'p> {
         format!(
             "{}T{:02}:{:02}:{:02}{}{}[{}]",
             iso_date_string(f[0], f[1], f[2]),
-            f[3], f[4], f[5], frac, offset, tz
+            f[3],
+            f[4],
+            f[5],
+            frac,
+            offset,
+            tz
         )
     }
 
@@ -1107,39 +1254,52 @@ impl<'p> Vm<'p> {
     /// rounding of the instant + roundingMode, the calendarName suffix, plus the
     /// `offset` ("auto"/"never") and `timeZoneName` ("auto"/"never"/"critical")
     /// suffixes. Order: `<date>T<time><offset>[tz][u-ca=…]`.
-    pub(crate) fn zdt_to_string_opts(&mut self, idx: u32, options: Value) -> Result<String, Thrown> {
+    pub(crate) fn zdt_to_string_opts(
+        &mut self,
+        idx: u32,
+        options: Value,
+    ) -> Result<String, Thrown> {
         // All six options are read in ALPHABETICAL order — calendarName,
         // fractionalSecondDigits, offset, roundingMode, smallestUnit,
         // timeZoneName — and only then is the smallestUnit unit-CLASS
         // validated, so timeZoneName is observably read before the date-unit
         // RangeError (options-read-before-algorithmic-validation).
-        let (unit, digits, omit, mode, cal_suf, show_offset, tzn) =
-            if options == Value::UNDEFINED {
-                // `showCalendar` still defaults to "auto", which annotates every
-                // NON-ISO calendar — hard-coding "" here dropped `[u-ca=gregory]`
-                // from `zdt.toString()` and `zdt.toString(undefined)` while
-                // `zdt.toString({})` (which takes the branch below) kept it
-                // (ZonedDateTime/prototype/toString/options-undefined.js).
-                let cal_suf = self.calendar_name_suffix(Value::UNDEFINED, self.cal_of(idx))?;
-                (1, -1, false, "trunc".to_string(), cal_suf, true, "auto".to_string())
-            } else {
-                if !self.is_object_value(options) {
-                    return Err(Thrown("TypeError: options must be an object or undefined".into()));
-                }
-                let cal_suf = self.calendar_name_suffix(options, self.cal_of(idx))?;
-                let fsd = self.read_fsd(options)?;
-                let off_opt = self.opt_string(options, "offset", "auto", &["auto", "never"])?;
-                let mode = self.read_rounding_mode_opt(options)?;
-                let su = self.read_tostring_unit_token(options)?;
-                let tzn = self.opt_string(
-                    options,
-                    "timeZoneName",
-                    "auto",
-                    &["auto", "never", "critical"],
-                )?;
-                let (unit, digits, omit) = Self::tostring_precision(su.as_deref(), fsd)?;
-                (unit, digits, omit, mode, cal_suf, off_opt != "never", tzn)
-            };
+        let (unit, digits, omit, mode, cal_suf, show_offset, tzn) = if options == Value::UNDEFINED {
+            // `showCalendar` still defaults to "auto", which annotates every
+            // NON-ISO calendar — hard-coding "" here dropped `[u-ca=gregory]`
+            // from `zdt.toString()` and `zdt.toString(undefined)` while
+            // `zdt.toString({})` (which takes the branch below) kept it
+            // (ZonedDateTime/prototype/toString/options-undefined.js).
+            let cal_suf = self.calendar_name_suffix(Value::UNDEFINED, self.cal_of(idx))?;
+            (
+                1,
+                -1,
+                false,
+                "trunc".to_string(),
+                cal_suf,
+                true,
+                "auto".to_string(),
+            )
+        } else {
+            if !self.is_object_value(options) {
+                return Err(Thrown(
+                    "TypeError: options must be an object or undefined".into(),
+                ));
+            }
+            let cal_suf = self.calendar_name_suffix(options, self.cal_of(idx))?;
+            let fsd = self.read_fsd(options)?;
+            let off_opt = self.opt_string(options, "offset", "auto", &["auto", "never"])?;
+            let mode = self.read_rounding_mode_opt(options)?;
+            let su = self.read_tostring_unit_token(options)?;
+            let tzn = self.opt_string(
+                options,
+                "timeZoneName",
+                "auto",
+                &["auto", "never", "critical"],
+            )?;
+            let (unit, digits, omit) = Self::tostring_precision(su.as_deref(), fsd)?;
+            (unit, digits, omit, mode, cal_suf, off_opt != "never", tzn)
+        };
         // Round the instant to the requested unit, then express in the offset.
         // Rounding is on the ABSOLUTE timeline (epoch ns), so it rounds as-if the
         // value were positive (like Instant.toString) — NOT sign-relative, which
@@ -1160,7 +1320,11 @@ impl<'p> Vm<'p> {
         let local = rounded + off as i128;
         let t = ns_to_time(local.rem_euclid(DAY_NS));
         let (ny, nm, nd) = epoch_days_to_iso(local.div_euclid(DAY_NS) as i64);
-        let offset_s = if show_offset { format_offset_rounded(off) } else { String::new() };
+        let offset_s = if show_offset {
+            format_offset_rounded(off)
+        } else {
+            String::new()
+        };
         let tz_suf = match tzn.as_str() {
             "never" => String::new(),
             "critical" => format!("[!{tz}]"),
@@ -1182,7 +1346,10 @@ impl<'p> Vm<'p> {
                 return Ok(ns);
             }
             // A ZonedDateTime yields its epoch nanoseconds.
-            if matches!(self.heap.get(v.heap_index()), HeapObj::Temporal { kind: 7, .. }) {
+            if matches!(
+                self.heap.get(v.heap_index()),
+                HeapObj::Temporal { kind: 7, .. }
+            ) {
                 if let Some(ns) = self.zdt_epoch_ns(v.heap_index()) {
                     return Ok(ns);
                 }
@@ -1198,7 +1365,9 @@ impl<'p> Vm<'p> {
                 return self.parse_instant_string(&s);
             }
         }
-        Err(Thrown("TypeError: cannot convert value to a Temporal.Instant".into()))
+        Err(Thrown(
+            "TypeError: cannot convert value to a Temporal.Instant".into(),
+        ))
     }
 
     pub(crate) fn parse_instant_string(&mut self, s: &str) -> Result<i128, Thrown> {
@@ -1210,12 +1379,19 @@ impl<'p> Vm<'p> {
         // IsValidEpochNanoseconds: compare/equals/since/until reach the ns directly
         // (only make_instant via from() range-checks otherwise).
         if ns.abs() > NS_MAX_INSTANT {
-            return Err(Thrown(format!("RangeError: instant '{s}' is outside the supported range")));
+            return Err(Thrown(format!(
+                "RangeError: instant '{s}' is outside the supported range"
+            )));
         }
         Ok(ns)
     }
 
-    pub(crate) fn instant_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn instant_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
         let ns = match self.instant_ns(idx) {
             Some(n) => n,
             None => return Ok(None),
@@ -1269,7 +1445,9 @@ impl<'p> Vm<'p> {
                 );
                 Ok(Some(self.alloc_str(s)))
             }
-            "valueOf" => Err(Thrown("TypeError: Called Temporal.Instant.prototype.valueOf".into())),
+            "valueOf" => Err(Thrown(
+                "TypeError: Called Temporal.Instant.prototype.valueOf".into(),
+            )),
             "equals" => {
                 let o = self.to_instant_ns(a0)?;
                 Ok(Some(Value::bool(ns == o)))
@@ -1286,7 +1464,8 @@ impl<'p> Vm<'p> {
                 let dur = self.to_duration_f64(a0)?;
                 if dur[0] != 0.0 || dur[1] != 0.0 || dur[2] != 0.0 || dur[3] != 0.0 {
                     return Err(Thrown(
-                        "RangeError: Instant arithmetic does not accept calendar (date) units".into(),
+                        "RangeError: Instant arithmetic does not accept calendar (date) units"
+                            .into(),
                     ));
                 }
                 let sign: i128 = if name == "add" { 1 } else { -1 };
@@ -1306,12 +1485,21 @@ impl<'p> Vm<'p> {
                 let diff = if name == "until" { o - ns } else { ns - o };
                 let inc_ns = unit_ns(&smallest) * inc;
                 let rounded = round_increment(diff, inc_ns, &mode);
-                Ok(Some(self.make_duration(balance_duration_ns(rounded, &largest)?)))
+                Ok(Some(
+                    self.make_duration(balance_duration_ns(rounded, &largest)?),
+                ))
             }
             "round" => {
                 let (su, inc, mode) = self.read_round_options(
                     a0,
-                    &["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"],
+                    &[
+                        "hour",
+                        "minute",
+                        "second",
+                        "millisecond",
+                        "microsecond",
+                        "nanosecond",
+                    ],
                     false,
                 )?;
                 let inc_ns = unit_ns(&su) * inc;
@@ -1329,5 +1517,4 @@ impl<'p> Vm<'p> {
     }
 
     // ── Temporal.PlainYearMonth ──
-
 }

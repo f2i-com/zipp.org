@@ -157,6 +157,99 @@ pub(crate) fn call_inline_enabled() -> bool {
     }
 }
 
+/// Compile `obj[key](args...)` loop sites through the guarded dense-Array
+/// helper. ON by default; `ZIPP_NO_COMPUTED_CALL_DENSE=1` restores the former
+/// region rejection for a same-binary A/B. Read only while selecting a tier,
+/// never by generated hot code.
+pub(crate) fn computed_call_dense_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_COMPUTED_CALL_DENSE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Admit captured-cell reads/writes to the Tier-C whole-function memory path.
+/// The Tier-C-specific helpers resolve the closure activation supplied by the
+/// native entry (not `frames.last()`, because a cross-call is frame-free) and
+/// preserve const / named-function / TDZ PutValue semantics by declining before
+/// a write. `ZIPP_NO_TIERC_UPVAL=1` restores the former blacklist for a
+/// same-binary A/B.
+pub(crate) fn tierc_upval_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_TIERC_UPVAL").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Allow a Tier-C cross-call attempt at a call site whose filled IC ways are
+/// multiple closure identities sharing one FuncProto. The runtime helper still
+/// resolves the live callee on every invocation, so a later different/native/
+/// exotic value falls through untouched. `ZIPP_NO_POLY_CROSSCALL=1` restores
+/// monomorphic-only planting.
+pub(crate) fn poly_crosscall_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_POLY_CROSSCALL").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Plant the exact rotating lexical-arrow two-argument cross-call lane. The
+/// planner bakes only immutable integer metadata; the runtime helper still
+/// resolves the live closure and live Tier-C entry on every invocation.
+/// `ZIPP_NO_SAME_PROTO_CROSS2=1` restores the generic cross-call helper for a
+/// same-binary A/B.
+pub(crate) fn same_proto_cross2_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_SAME_PROTO_CROSS2").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+env_off_switch! {
+    /// Scalar-replace fresh, non-escaping object/array literals in the narrow
+    /// straight-line local loop lane. Default ON; `ZIPP_NO_LOCAL_SROA=1`
+    /// restores ordinary allocation and interpreter/MEM admission for a
+    /// same-binary A/B. Instrumented and GC-stress VMs decline separately so
+    /// resource accounting and collector torture retain literal allocations.
+    fn local_sroa_enabled() = "ZIPP_NO_LOCAL_SROA"
+}
+
+env_off_switch! {
+    /// Within LOCAL-SROA, virtualize an exact ASCII-string-plus-bounded-int
+    /// field whose sole observation is `.length`. Default ON;
+    /// `ZIPP_NO_LOCAL_CONCAT_LEN=1` retains aggregate scalar replacement while
+    /// restoring the real concat and length helper for an independent A/B.
+    fn local_concat_len_enabled() = "ZIPP_NO_LOCAL_CONCAT_LEN"
+}
+
 /// Sentinel in `bail_ip` meaning the native code completed via `Return` (the
 /// result is in the returned `u64`). Any other value is the ip to resume at.
 pub const NO_BAIL: u32 = u32::MAX;
@@ -230,6 +323,82 @@ pub const DV_PIN_KIND: u8 = 255;
 /// access takes the generic `jit_char_code_at` helper — full flatten/surrogate
 /// semantics). ASCII-only is the correctness gate: byte i == UTF-16 unit i.
 pub const STR_PIN_KIND: u8 = 254;
+
+/// First `TaPin::kind` marker for a **length-only** TypedArray receiver.  The
+/// marker encodes the live TypedArray's element kind as
+/// `TA_LEN_PIN_BASE + kind`, but it is deliberately disjoint from the raw
+/// element-kind namespace (`0..9`) and from every other synthetic pin kind.
+///
+/// This separation is a soundness boundary, not just bookkeeping.  A
+/// `Uint32Array.length` may safely inhabit an INTEGER home even though a
+/// `Uint32Array` *element* cannot yet use that tier (the full element range is
+/// not proven through its lazy-sign-extension paths).  Giving the length read
+/// the raw dtype kind would accidentally make an unrelated `GetIndex` look
+/// pinned for an element load.  Only `Recv::Len` in `build_ta_pin_plan` creates
+/// one of these markers, and only a `GetProp "length"` consumes it.
+///
+/// Kinds 0..=8 are the existing non-BigInt fixed-width TypedArray family.  The
+/// authoritative `TA_KINDS` table is checked by both encoder and decoder so a
+/// future reorder/extension fails closed.  BigInt and the later Float16 kind
+/// stay on the generic property path for this contained first widening.
+pub const TA_LEN_PIN_BASE: u8 = 240;
+const TA_LEN_PIN_COUNT: u8 = 9;
+
+env_off_switch!(
+    /// Default-on kill switch for the INTEGER-tier TypedArray `.length` pin.
+    fn int_ta_length_enabled() = "ZIPP_NO_INT_TA_LENGTH"
+);
+
+/// Encode a live non-BigInt TypedArray kind as a length-only pin marker.
+pub(crate) fn ta_len_pin_kind(kind: u8) -> Option<u8> {
+    if !int_ta_length_enabled() || kind >= TA_LEN_PIN_COUNT {
+        return None;
+    }
+    let &(_, _, is_bigint, _) = crate::vm::native::TA_KINDS.get(kind as usize)?;
+    if is_bigint {
+        return None;
+    }
+    TA_LEN_PIN_BASE.checked_add(kind)
+}
+
+/// Decode a length-only pin marker back to its expected TypedArray kind.
+/// Unknown/reserved marker bytes return `None`; snapshotting then writes the
+/// all-zero fail-closed record used by every pin guard.
+pub(crate) fn ta_len_base_kind(marker: u8) -> Option<u8> {
+    let kind = marker.checked_sub(TA_LEN_PIN_BASE)?;
+    if kind >= TA_LEN_PIN_COUNT {
+        return None;
+    }
+    let &(_, _, is_bigint, _) = crate::vm::native::TA_KINDS.get(kind as usize)?;
+    (!is_bigint).then_some(kind)
+}
+
+pub(crate) fn is_ta_len_pin(kind: u8) -> bool {
+    ta_len_base_kind(kind).is_some()
+}
+
+#[cfg(test)]
+mod ta_len_pin_tests {
+    use super::*;
+
+    #[test]
+    fn length_pin_markers_are_disjoint_and_malformed_values_fail_closed() {
+        for kind in 0..TA_LEN_PIN_COUNT {
+            // Structural decoder coverage is independent of the process-latched
+            // off switch (this unit test also runs in explicit ablation jobs).
+            let marker = TA_LEN_PIN_BASE + kind;
+            assert_eq!(ta_len_base_kind(marker), Some(kind));
+            assert!(marker > TA_LEN_PIN_BASE.saturating_sub(1));
+            assert!(marker < ARR_NUM_PIN_KIND);
+        }
+        for malformed in [0, 8, 9, 239, 249, 250, 251, 252, 253, 254, 255] {
+            assert_eq!(ta_len_base_kind(malformed), None, "marker {malformed}");
+        }
+        assert_eq!(ta_len_pin_kind(9), None); // BigInt64Array
+        assert_eq!(ta_len_pin_kind(10), None); // BigUint64Array
+        assert_eq!(ta_len_pin_kind(11), None); // Float16Array (contained lane)
+    }
+}
 
 /// `TaPin::kind` marker for a pinned dense `HeapObj::Array` receiver (not a TA
 /// element kind). Snapshot: `base = items.as_ptr()` (the `Vec<Value>` storage),
@@ -321,6 +490,18 @@ pub struct SpanCodeUnitPairPlan {
     pub helper: usize,
 }
 
+/// One call site selected for Tier-C native cross-call dispatch. `None` keeps
+/// the generic live-callee helper. `Some` selects the exact rotating
+/// same-prototype lexical-arrow/two-argument helper; its fields are immutable
+/// FuncProto integers only, never heap or executable-code pointers.
+pub type CrossCallPlan = FxHashMap<usize, Option<SameProtoCross2Plan>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SameProtoCross2Plan {
+    pub fid: u32,
+    pub callee_regs: u16,
+}
+
 /// Q4 leaf-call inlining (v1). One inlinable monomorphic PLAIN-LEAF callee for a
 /// `Call` site in a memory-path region. Built in dispatch.rs from LIVE VM state
 /// (the resolved Callee IC entry) at OSR compile time; the emitted code guards
@@ -352,6 +533,13 @@ pub struct LeafInlinePlan {
     /// AFTER the bits compare — restoring the exact `(bits, version)` tuple the
     /// interpreter's `ic_call` checks.
     pub callee_ver: u32,
+    /// Polymorphic same-prototype guard. `Some(fid)` replaces the exact
+    /// identity/version check with a read-only runtime check that the live
+    /// callee is a plain function/empty closure for this FuncProto. Admitted
+    /// only for capture-free, non-arrow leaves, so instance identity has no
+    /// remaining call semantics.
+    pub same_proto_fid: Option<u32>,
+    pub same_proto_guard: usize,
     /// Offset (in registers) of the carved callee scratch window above the
     /// caller frame's window: callee reg `r` lives at caller reg `reg_window+r`.
     pub reg_window: u16,
@@ -371,6 +559,10 @@ pub struct LeafInlinePlan {
     /// Callee formal parameter count (args 0..min(argc,param_count) are copied
     /// into scratch regs `reg_window+1 ..` ; reg `reg_window+0` is `this`).
     pub param_count: u16,
+    /// Zero-based caller arguments whose default-parameter prologues were
+    /// removed from `body`. Every bit is guarded non-`undefined` before the
+    /// inline; a miss falls back to the real call and evaluates defaults.
+    pub default_arg_mask: u64,
     /// The callee body ops to emit inline (with their OWN register numbers).
     pub body: Vec<Instr>,
     /// Resolved numeric-constant bits the body's `LoadConst` ops reference,
@@ -422,6 +614,13 @@ pub struct LeafInlinePlan {
     /// keying conditions). `None` = today's identity+version guard,
     /// byte-identical emission (pinned by `ZIPP_NO_SPLICE_SLOTGEN=1`).
     pub slot_guard: Option<(u64, u32)>,
+    /// VM-relative global-route epoch for a body containing direct raw global
+    /// loads/stores. `Some(0)` means the planner proved every referenced slot
+    /// directly routable and mutable as required, in the root realm, before
+    /// any route change. Generic MEM splices compare this per call; the INT
+    /// splice hoists the same proof to region entry. A global-using body is not
+    /// admitted into this plan at all when the proof is unavailable.
+    pub direct_global_route_epoch: Option<u32>,
     /// Typed splice lane: a fully scheduled register-resident emission for a
     /// proven-numeric straight-line body (see `build_typed_lane`). `Some` ⇒
     /// `emit_inline_leaf_call` emits the lane INSTEAD of the boxed per-op
@@ -434,6 +633,33 @@ pub struct LeafInlinePlan {
     /// Exact dense-array span / string-code-unit predicate fusion. `None`
     /// preserves the generic boxed leaf expansion byte-for-byte.
     pub span_code_unit_pred: Option<SpanCodeUnitPredPlan>,
+}
+
+/// A bounded `array[key](args...)` whose live dense own elements are exact,
+/// capture-free numeric leaves. The INTEGER splice validates the receiver,
+/// its ABA version, and every element's `(bits, version)` tuple once at native
+/// entry, then dispatches on the live integer key without a per-iteration call.
+/// Any mismatch occurs before the region has executed and returns to the
+/// interpreter; an unmatched key leaves at the original pure call prefix.
+pub struct DenseComputedLeafPlan {
+    /// Stable source that produces the receiver copied into the call's `obj`
+    /// register. It is re-read by the entry guard, never trusted as a constant.
+    pub recv_src: TaPinSrc,
+    pub recv_bits: u64,
+    pub recv_ver: u32,
+    /// Earliest instruction in the pure receiver/key/argument prefix. A
+    /// runtime key outside the bounded arms resumes here so the real call sees
+    /// every operand exactly as the interpreter would have produced it.
+    pub fallback_ip: u32,
+    /// The sole in-region definition that copies/loads the receiver into the
+    /// call's transient `obj` register. The synthetic success path does not use
+    /// that register, so this pure dead def is omitted; an interpreter fallback
+    /// resumes no later than it and recreates the exact slot.
+    pub drop_obj_def: Option<u32>,
+    /// Arm `i` is valid only for canonical dense index `i`.
+    pub variants: Vec<LeafInlinePlan>,
+    /// Read-only Win64 validator for one `(receiver, index, callee)` tuple.
+    pub guard_helper: usize,
 }
 
 /// Identity guard for a nested inline. Same `(bits, version)` tuple the outer
@@ -486,15 +712,14 @@ impl LeafInlinePlan {
 /// version guards re-check the prototype chain each call (a `setPrototypeOf` /
 /// method reassignment on the chain bumps a hop version → fall to the helper).
 pub struct SuperInline {
-    /// Class-redefinition guard: a raw pointer to the VM's `mi_class_epoch` (a
-    /// scalar field — its address is stable for the run) + the epoch baked at
-    /// compile time. A re-executed class declaration swaps
+    /// Class-redefinition guard: the `mi_class_epoch` value baked at compile
+    /// time. Emitted code reads the live field relative to its VM argument;
+    /// `ScriptState` may move between persistent entries. A re-executed class declaration swaps
     /// `class_values[home_class_id]` to a new class WITHOUT mutating the old
-    /// prototype objects the hop guards watch, so `*epoch_ptr != epoch_val` is
+    /// prototype objects the hop guards watch, so a changed epoch is
     /// the discriminator that catches it (→ fall to the helper, which resolves
     /// super against the live `class_values[id]`). Mirrors the interpreter's
     /// `ic_super_method` `home == class_values[home_class_id]` check.
-    pub epoch_ptr: u64,
     pub epoch_val: u32,
     /// Super-chain hop version guards `(heap_idx, version)`, anchor..holder.
     pub hops: Vec<(u32, u32)>,
@@ -664,6 +889,10 @@ pub struct HeapHelperAddrs {
     /// op in the interpreter), or `CALL_THREW` (exception pending → the region
     /// exits and the interpreter unwinds WITHOUT re-executing the call).
     pub call_method_ic: usize,
+    /// Pure-prefix helper for `array[index](args...)`: accepts only an own,
+    /// non-hole dense element holding a plain Func/Closure, then frame-calls it
+    /// with `this = array`. Every other receiver/key/element deopts untouched.
+    pub call_method_computed_dense: usize,
     /// Guarded direct `RegExp.prototype.test` / `exec` CallMethod helper.
     pub regexp_call_direct: usize,
     /// Guarded primitive-string `matchAll` / regex `replace` helper.
@@ -680,6 +909,9 @@ pub struct HeapHelperAddrs {
     /// bits, `SELF_CALL_DEOPT` (not eligible — the emitted site falls through
     /// to the unchanged `call_ic` helper, a pure prefix), or `CALL_THREW`.
     pub cross_call: usize,
+    /// Exact rotating same-prototype lexical-arrow/two-argument sibling of
+    /// `cross_call`; it shares the same live-resolution and fallback protocol.
+    pub cross_call_same_proto2: usize,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
     /// class-instance receiver): interpreter-IC resolution + getter frame
     /// call. Returns the value bits / `SELF_CALL_DEOPT` / `CALL_THREW`.
@@ -722,6 +954,12 @@ pub struct HeapHelperAddrs {
     /// Helper for `UpvalGet` (resolves the running closure's k-th upvalue cell,
     /// then loads it). Same purity/TDZ contract as `cell_get`.
     pub upval_get: usize,
+    /// Tier-C variants resolve the frame-free native activation's closure from
+    /// `Vm::jit_tierc_closure`. Region code keeps using `upval_get/set` above.
+    pub tierc_upval_get: usize,
+    pub tierc_upval_set: usize,
+    /// Exact captured `x = (x + 1) | 0` Int fast prefix (returns old bits).
+    pub tierc_upval_inc_i32: usize,
     /// Intrinsic for `s.indexOf(t)` (ASCII/ASCII, 1 arg); deopts otherwise.
     pub str_index_of: usize,
     /// Intrinsic for `s.substring(a[,b])` / `s.slice(a[,b])` (ASCII,
@@ -729,6 +967,10 @@ pub struct HeapHelperAddrs {
     pub str_substring: usize,
     /// Intrinsic for `Map.get`/`Map.has`/`Set.has` (op selects which).
     pub coll_lookup: usize,
+    /// Guarded Tier-C `Map.set`/`Map.clear` mutation helper.
+    pub coll_mutate: usize,
+    /// Guarded primitive-string `toUpperCase()` helper.
+    pub str_upper_case: usize,
     /// Helpers for `CellSet` / `UpvalSet` — a captured-cell WRITE. A plain heap
     /// store: no TDZ check, no alloc, no user code, so no pinned refetch.
     pub cell_set: usize,
@@ -845,11 +1087,13 @@ impl HeapHelperAddrs {
             str_append: self.str_append,
             str_append_index: self.str_append_index,
             call_method_ic: self.call_method_ic,
+            call_method_computed_dense: self.call_method_computed_dense,
             regexp_call_direct: self.regexp_call_direct,
             string_regexp_call_direct: self.string_regexp_call_direct,
             has_own_call: self.has_own_call,
             call_ic: self.call_ic,
             cross_call: self.cross_call,
+            cross_call_same_proto2: self.cross_call_same_proto2,
             get_prop_slow: self.get_prop_slow,
             set_prop_slow: self.set_prop_slow,
             get_prop_acc: self.get_prop_acc,
@@ -864,11 +1108,16 @@ impl HeapHelperAddrs {
             cell_get: self.cell_get,
             cell_set: self.cell_set,
             upval_set: self.upval_set,
+            tierc_upval_get: self.tierc_upval_get,
+            tierc_upval_set: self.tierc_upval_set,
+            tierc_upval_inc_i32: self.tierc_upval_inc_i32,
             get_index_concat: self.get_index_concat,
             upval_get: self.upval_get,
             str_index_of: self.str_index_of,
             str_substring: self.str_substring,
             coll_lookup: self.coll_lookup,
+            coll_mutate: self.coll_mutate,
+            str_upper_case: self.str_upper_case,
             forin_live: self.forin_live,
             iter_next: self.iter_next,
             regexp_scalar_get_iterator: self.regexp_scalar_get_iterator,
@@ -989,6 +1238,24 @@ pub(crate) fn int_splice_enabled() -> bool {
         2 => false,
         _ => {
             let on = std::env::var_os("ZIPP_NO_INT_SPLICE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Bounded dense-array computed leaf splice. `ZIPP_NO_INT_COMPUTED_LEAF=1`
+/// restores the existing MEMORY `CallMethodComputed` helper on the same binary.
+/// Kept separate from `ZIPP_NO_INT_SPLICE`: the ordinary global-slot Call
+/// splice and this exact dense-array proof have independent A/B surfaces.
+pub(crate) fn int_computed_leaf_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INT_COMPUTED_LEAF").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -1518,9 +1785,7 @@ fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePlan> {
         return None;
     }
     if std::env::var_os("ZIPP_JITLOG").is_some() {
-        eprintln!(
-            "[jit] markdown-inline plan installed (escape_global={escape_html_global})"
-        );
+        eprintln!("[jit] markdown-inline plan installed (escape_global={escape_html_global})");
     }
     Some(MarkdownInlinePlan { escape_html_global })
 }
@@ -1537,10 +1802,7 @@ fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePlan> {
 /// Keeping this exact is intentional.  A looser source-level resemblance can
 /// hide getters, coercions, a different visit order, or observable work between
 /// recursive calls. `ZIPP_NO_JSON_WALK_REDUCE=1` omits the plan entirely.
-fn json_walk_plan(
-    proto: &FuncProto,
-    const_strs: &FxHashMap<u32, u64>,
-) -> Option<JsonWalkPlan> {
+fn json_walk_plan(proto: &FuncProto, const_strs: &FxHashMap<u32, u64>) -> Option<JsonWalkPlan> {
     if std::env::var_os("ZIPP_NO_JSON_WALK_REDUCE").is_some()
         || proto.param_count != 1
         || proto.reg_count != 43
@@ -1621,43 +1883,191 @@ fn json_walk_plan(
             }
         };
     }
-    op!(1, Instr::AddInt { dst: 6, a: 6, imm: 1, upd: true });
+    op!(
+        1,
+        Instr::AddInt {
+            dst: 6,
+            a: 6,
+            imm: 1,
+            upd: true
+        }
+    );
     op!(2, Instr::StoreGlobalResolved { idx, src: 6 } if *idx == nodes);
     op!(3, Instr::LoadNull { dst: 9 });
     op!(4, Instr::Eq { dst: 7, a: 1, b: 9 });
-    op!(5, Instr::JumpIfFalse { cond: 7, target: 10 });
-    op!(7, Instr::AddInt { dst: 10, a: 10, imm: 1, upd: true });
+    op!(
+        5,
+        Instr::JumpIfFalse {
+            cond: 7,
+            target: 10
+        }
+    );
+    op!(
+        7,
+        Instr::AddInt {
+            dst: 10,
+            a: 10,
+            imm: 1,
+            upd: true
+        }
+    );
     op!(8, Instr::StoreGlobalResolved { idx, src: 10 } if *idx == nulls);
     op!(9, Instr::ReturnUndefined);
     op!(10, Instr::TypeOf { dst: 5, a: 1 });
-    op!(12, Instr::Eq { dst: 12, a: 5, b: 14 });
-    op!(13, Instr::JumpIfFalse { cond: 12, target: 20 });
+    op!(
+        12,
+        Instr::Eq {
+            dst: 12,
+            a: 5,
+            b: 14
+        }
+    );
+    op!(
+        13,
+        Instr::JumpIfFalse {
+            cond: 12,
+            target: 20
+        }
+    );
     op!(15, Instr::LoadInt { dst: 18, val: 2 });
-    op!(16, Instr::Mul { dst: 16, a: 1, b: 18 });
-    op!(17, Instr::Add { dst: 15, a: 15, b: 16 });
+    op!(
+        16,
+        Instr::Mul {
+            dst: 16,
+            a: 1,
+            b: 18
+        }
+    );
+    op!(
+        17,
+        Instr::Add {
+            dst: 15,
+            a: 15,
+            b: 16
+        }
+    );
     op!(18, Instr::StoreGlobalResolved { idx, src: 15 } if *idx == sum2x);
     op!(19, Instr::ReturnUndefined);
-    op!(21, Instr::Eq { dst: 16, a: 5, b: 18 });
-    op!(22, Instr::JumpIfFalse { cond: 16, target: 31 });
-    op!(24, Instr::AddInt { dst: 19, a: 19, imm: 1, upd: true });
+    op!(
+        21,
+        Instr::Eq {
+            dst: 16,
+            a: 5,
+            b: 18
+        }
+    );
+    op!(
+        22,
+        Instr::JumpIfFalse {
+            cond: 16,
+            target: 31
+        }
+    );
+    op!(
+        24,
+        Instr::AddInt {
+            dst: 19,
+            a: 19,
+            imm: 1,
+            upd: true
+        }
+    );
     op!(25, Instr::StoreGlobalResolved { idx, src: 19 } if *idx == strings);
-    op!(27, Instr::GetProp { dst: 21, obj: 1, name: 2 });
-    op!(28, Instr::Add { dst: 20, a: 20, b: 21 });
+    op!(
+        27,
+        Instr::GetProp {
+            dst: 21,
+            obj: 1,
+            name: 2
+        }
+    );
+    op!(
+        28,
+        Instr::Add {
+            dst: 20,
+            a: 20,
+            b: 21
+        }
+    );
     op!(29, Instr::StoreGlobalResolved { idx, src: 20 } if *idx == string_len);
     op!(30, Instr::ReturnUndefined);
-    op!(32, Instr::Eq { dst: 21, a: 5, b: 23 });
-    op!(33, Instr::JumpIfFalse { cond: 21, target: 38 });
-    op!(35, Instr::AddInt { dst: 24, a: 24, imm: 1, upd: true });
+    op!(
+        32,
+        Instr::Eq {
+            dst: 21,
+            a: 5,
+            b: 23
+        }
+    );
+    op!(
+        33,
+        Instr::JumpIfFalse {
+            cond: 21,
+            target: 38
+        }
+    );
+    op!(
+        35,
+        Instr::AddInt {
+            dst: 24,
+            a: 24,
+            imm: 1,
+            upd: true
+        }
+    );
     op!(36, Instr::StoreGlobalResolved { idx, src: 24 } if *idx == bools);
     op!(37, Instr::ReturnUndefined);
     op!(38, Instr::IsArray { dst: 25, a: 1 });
-    op!(39, Instr::JumpIfFalse { cond: 25, target: 50 });
+    op!(
+        39,
+        Instr::JumpIfFalse {
+            cond: 25,
+            target: 50
+        }
+    );
     op!(40, Instr::LoadInt { dst: 3, val: 0 });
-    op!(41, Instr::GetProp { dst: 28, obj: 1, name: 4 });
-    op!(42, Instr::JumpIfNotLt { a: 3, b: 28, target: 49 });
-    op!(44, Instr::GetIndex { dst: 32, obj: 1, key: 3 });
-    op!(45, Instr::Call { dst: 30, callee: 31, arg_base: 32, argc: 1 });
-    op!(46, Instr::AddInt { dst: 3, a: 3, imm: 1, upd: true });
+    op!(
+        41,
+        Instr::GetProp {
+            dst: 28,
+            obj: 1,
+            name: 4
+        }
+    );
+    op!(
+        42,
+        Instr::JumpIfNotLt {
+            a: 3,
+            b: 28,
+            target: 49
+        }
+    );
+    op!(
+        44,
+        Instr::GetIndex {
+            dst: 32,
+            obj: 1,
+            key: 3
+        }
+    );
+    op!(
+        45,
+        Instr::Call {
+            dst: 30,
+            callee: 31,
+            arg_base: 32,
+            argc: 1
+        }
+    );
+    op!(
+        46,
+        Instr::AddInt {
+            dst: 3,
+            a: 3,
+            imm: 1,
+            upd: true
+        }
+    );
     op!(47, Instr::Move { dst: 33, src: 3 });
     op!(48, Instr::Jump { target: 41 });
     op!(49, Instr::ReturnUndefined);
@@ -1665,14 +2075,64 @@ fn json_walk_plan(
     op!(51, Instr::ForInKeys { dst: 35, obj: 34 });
     op!(52, Instr::LenOf { dst: 36, obj: 35 });
     op!(53, Instr::LoadInt { dst: 37, val } if *val == crate::bytecode::FORIN_SNAPSHOT_PREFIX as i32);
-    op!(54, Instr::JumpIfNotLt { a: 37, b: 36, target: 63 });
-    op!(55, Instr::GetIndex { dst: 4, obj: 35, key: 37 });
-    op!(56, Instr::ForInLive { dst: 38, obj: 35, key: 4 });
-    op!(57, Instr::JumpIfFalse { cond: 38, target: 61 });
+    op!(
+        54,
+        Instr::JumpIfNotLt {
+            a: 37,
+            b: 36,
+            target: 63
+        }
+    );
+    op!(
+        55,
+        Instr::GetIndex {
+            dst: 4,
+            obj: 35,
+            key: 37
+        }
+    );
+    op!(
+        56,
+        Instr::ForInLive {
+            dst: 38,
+            obj: 35,
+            key: 4
+        }
+    );
+    op!(
+        57,
+        Instr::JumpIfFalse {
+            cond: 38,
+            target: 61
+        }
+    );
     op!(58, Instr::LoadGlobal { dst: 39, idx } if *idx == self_global);
-    op!(59, Instr::GetIndex { dst: 40, obj: 1, key: 4 });
-    op!(60, Instr::Call { dst: 38, callee: 39, arg_base: 40, argc: 1 });
-    op!(61, Instr::AddInt { dst: 37, a: 37, imm: 1, upd: false });
+    op!(
+        59,
+        Instr::GetIndex {
+            dst: 40,
+            obj: 1,
+            key: 4
+        }
+    );
+    op!(
+        60,
+        Instr::Call {
+            dst: 38,
+            callee: 39,
+            arg_base: 40,
+            argc: 1
+        }
+    );
+    op!(
+        61,
+        Instr::AddInt {
+            dst: 37,
+            a: 37,
+            imm: 1,
+            upd: false
+        }
+    );
     op!(62, Instr::Jump { target: 54 });
     op!(63, Instr::ReturnUndefined);
     Some(JsonWalkPlan {
@@ -1764,6 +2224,10 @@ pub struct Region {
     /// were rewritten to scratch field-globals. The interpreter must sync the
     /// object's fields ↔ the pool slots around each native run.
     field_plan: Option<FieldSyncPlan>,
+    /// Fresh local aggregates elided from an index-preserving cloned proto.
+    /// On an internal guard bail the interpreter materializes the allocations
+    /// that have logically executed before resuming original bytecode.
+    local_sroa: Option<LocalSroaPlan>,
     /// W20: the register-tier compile engaged the BOXREF arms (a boxed heap value
     /// and an inline-cache probe inside a register-homed region). On eviction such
     /// a region RETRIES without them instead of being blacklisted — a blacklisted
@@ -1815,6 +2279,10 @@ pub const IC_ROT_PERIOD: u64 = 1u64 << (8 * std::mem::size_of::<IcRotCursor>() a
 // -25.7% on property-ic-shapes; a frozen site (an unbounded period) measured
 // -0.6%. Widening the cursor is therefore a silent decay, not a refactor.
 const _: () = assert!(IC_ROT_PERIOD == 256);
+/// Sustained-identity proof before one site may request direct-miss form.
+const DIRECT_MISS_EVICTION_THRESHOLD: IcRotCursor = 32;
+/// Maximum adaptive park/recompile events per Tier-C body or OSR region.
+const DIRECT_MISS_RECOMPILE_CAP: u8 = 4;
 
 /// One way of a JIT'd `GetProp`/`SetProp` site's inline cache. `repr(C)` with a
 /// fixed layout the native code indexes directly: `obj_bits @0`, `vals_ptr @8`,
@@ -2013,6 +2481,56 @@ pub(crate) fn acc_always_emit() -> bool {
     }
 }
 
+/// Let a property site that has proved megamorphic by receiver identity
+/// recompile without its eight identity probes. The resulting native site
+/// enters the unchanged, shape-memoized Rust miss helper directly; no object
+/// layout pointer or cached Value bits are added. Default ON, with a process-
+/// local off switch for same-binary A/B and incident response.
+#[inline]
+pub(crate) fn direct_ic_miss_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_DIRECT_IC_MISS").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Test/diagnostic lever: compile every eligible property site in direct-miss
+/// form from its first native body. The helper still performs every live heap,
+/// shape, descriptor, prototype and exotic check; this only bypasses the
+/// identity-way probe prefix. Ignored when the off switch above is present.
+#[inline]
+fn force_direct_ic_miss() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_FORCE_DIRECT_IC_MISS").is_some() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Per-property-site native emission choices. Site ids are fresh per compile;
+/// these decisions come from the stable `(func_id, op_ip)` history recorded by
+/// [`Jit`]. A direct-miss site deliberately has no accessor probe arms: an
+/// accessor is rediscovered by the safe helper and routed through its existing
+/// slow path.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct IcSiteEmit {
+    pub(crate) acc: bool,
+    pub(crate) direct_miss: bool,
+}
+
 /// What an accessor-resolving miss helper may do at a site — the answer of
 /// [`Jit::acc_way_gate`]. `Fill` = the probe has the arms, fill the way and
 /// return `PROP_VIA_IC` (wave-2's flow). `Slow` = never fill, stay on the
@@ -2024,6 +2542,19 @@ pub(crate) fn acc_always_emit() -> bool {
 pub enum AccWayGate {
     Fill,
     Slow,
+    Recompile,
+}
+
+/// Result of asking whether a shape-memo hit should switch this site from the
+/// identity probe to the direct helper form.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DirectMissGate {
+    /// Keep the current probe/fill behaviour (feature disabled or bad site).
+    Probe,
+    /// This compile already omitted the identity probes.
+    Direct,
+    /// The stable site was marked and its owning compile parked; deopt before
+    /// any observable read/write effect so the next compile emits direct form.
     Recompile,
 }
 
@@ -2045,6 +2576,9 @@ struct IcSiteMeta {
     region_entry: u32,
     /// True when this site's probe was emitted WITH the accessor arms.
     acc_emitted: bool,
+    /// True when this site was emitted WITHOUT identity ways and enters the
+    /// shape-memoized miss helper directly.
+    direct_miss_emitted: bool,
 }
 
 impl IcEntry {
@@ -2211,6 +2745,17 @@ pub struct Jit {
     /// (`register_ic_sites`), so the evict-on-fill branch in
     /// [`Jit::acc_way_fill_ok`] can fire at most once per key.
     acc_sites: FxHashSet<(u32, u32)>,
+    /// Stable property ops whose identity IC has proved to thrash while the
+    /// `(site, shape) -> slot` memo kept hitting. Site ids are compile-local,
+    /// so the durable key is `(func_id, op_ip)`. Monotonic and bounded by the
+    /// number of property bytecodes loaded into this VM.
+    direct_miss_sites: FxHashSet<(u32, u32)>,
+    /// Adaptive direct-miss recompiles per owning native artifact
+    /// `(func_id, region_entry)`. A hostile function with many property ops
+    /// must not force one fresh O(n)-site IC reservation per op (O(n^2) table
+    /// growth, outside the JS heap limit). Sibling proven sites are batched and
+    /// the remaining number of parks is capped.
+    direct_miss_recompiles: FxHashMap<(u32, u32), u8>,
     /// Tier C bodies evicted by the accessor site gate, parked for the same
     /// reason as `retired`: the fill helper that evicts runs INSIDE the native
     /// frame being evicted, so dropping the `ExecutableBuffer` would unmap the
@@ -2400,9 +2945,7 @@ impl Jit {
         Option<MarkdownInlinePlan>,
     )> {
         match self.cross_entries.get(func_id as usize) {
-            Some(&(p, mask, json, markdown)) if !p.is_null() => {
-                Some((p, mask, json, markdown))
-            }
+            Some(&(p, mask, json, markdown)) if !p.is_null() => Some((p, mask, json, markdown)),
             _ => None,
         }
     }
@@ -2462,11 +3005,14 @@ impl Jit {
         // Tier-C leaf-inline plan for this whole function (built by the caller from
         // the live ICs; empty = no inlining, e.g. when ZIPP_NO_TIERC_LEAF is set).
         leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+        // Tier-C transactional own-method/global plans. Empty keeps the
+        // existing live method-cross-call path byte-for-byte.
+        method_plan: &FxHashMap<usize, MethodInlinePlan>,
         // Tier-C cross-call plan (B83): the `Call` ips whose live interpreter IC
         // names a plain user-function callee — those sites get the native
         // cross-call attempt with the unchanged `call_ic` helper as fallback.
         // Empty = no cross-call emission (e.g. ZIPP_NO_CROSSCALL).
-        cross_plan: &FxHashSet<usize>,
+        cross_plan: &CrossCallPlan,
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -2525,16 +3071,18 @@ impl Jit {
                 helpers,
                 const_strs,
                 leaf_plan,
+                method_plan,
                 cross_plan,
                 &acc_emit,
                 meter,
             ) {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!(
-                        "[jit] Tier C fn{func_id} compiled (whole-function mem path, leaf_inlines={}, acc_arms={}/{})",
+                        "[jit] Tier C fn{func_id} compiled (whole-function mem path, leaf_inlines={}, acc_arms={}/{}, direct_miss={})",
                         leaf_plan.len(),
-                        acc_emit.iter().filter(|&&b| b).count(),
-                        acc_emit.len()
+                        acc_emit.iter().filter(|s| s.acc).count(),
+                        acc_emit.len(),
+                        acc_emit.iter().filter(|s| s.direct_miss).count()
                     );
                 }
                 // Cross-call entry (B83): a Tier C body never bakes a
@@ -2563,13 +3111,7 @@ impl Jit {
                     .is_none()
                     .then(|| markdown_inline_plan(proto))
                     .flatten();
-                self.set_cross_entry(
-                    func_id,
-                    entry,
-                    uninit_mask,
-                    json_walk,
-                    markdown_inline,
-                );
+                self.set_cross_entry(func_id, entry, uninit_mask, json_walk, markdown_inline);
                 return;
             }
         }
@@ -2827,14 +3369,97 @@ impl Jit {
         const_strs: &FxHashMap<u32, u64>,
         ta_plan: &TaPinPlan,
         leaf_plan: &FxHashMap<usize, LeafInlinePlan>,
+        computed_leaf_plan: &FxHashMap<usize, DenseComputedLeafPlan>,
         method_plan: &FxHashMap<usize, MethodInlinePlan>,
-        cross_plan: &FxHashSet<usize>,
+        cross_plan: &CrossCallPlan,
     ) {
         let key = (func_id, start);
         if self.regions.contains_key(&key) || self.region_blacklist.contains(&key) {
             return;
         }
         let meter = self.meter;
+
+        // Fresh LOCAL aggregate scalar replacement. Unlike the older global-
+        // object field promotion below, scalar homes are otherwise-unused
+        // registers in this activation: nested execution gets a distinct frame
+        // window, and GC already scans every register. The planner is deliberately
+        // fail-closed (straight-line, no escape/accessor/dynamic-key surface).
+        // Metered execution retains real allocation for heap limits; GC stress
+        // retains it so collector torture keeps exercising the literal path.
+        if !self.region_int_blacklist.contains(&key)
+            && local_sroa_enabled()
+            && meter.is_none()
+            && std::env::var_os("ZIPP_GC_STRESS").is_none()
+        {
+            if let Some(mut local) = plan_local_sroa(proto, start, end) {
+                if local_concat_len_enabled() {
+                    plan_local_concat_len(proto, start, end, &mut local);
+                }
+                let rewritten = &local.proto;
+                let n_sites = rewritten.code[start as usize..=end as usize]
+                    .iter()
+                    .filter(|i| matches!(i, Instr::GetProp { .. } | Instr::SetProp { .. }))
+                    .count();
+                let ic_base_idx = self.reserve_ic_sites(n_sites);
+                let acc_emit = self.register_ic_sites(
+                    ic_base_idx,
+                    func_id,
+                    start,
+                    &rewritten.code[start as usize..=end as usize],
+                    start,
+                );
+                let helpers = heap_helpers.to_heap_helpers(func_id, ic_base_idx);
+                let empty_ta = TaPinPlan::default();
+                let empty_leaf = FxHashMap::default();
+                let empty_method = FxHashMap::default();
+                let empty_cross = CrossCallPlan::default();
+                if let Some((code, is_mem, is_boxref)) = compile_region(
+                    rewritten,
+                    start,
+                    end,
+                    globals_base_helper,
+                    helpers,
+                    const_strs,
+                    &empty_ta,
+                    &empty_leaf,
+                    &empty_method,
+                    &empty_cross,
+                    &acc_emit,
+                    false,
+                    meter,
+                ) {
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!(
+                            "[jit] LOCAL-SROA region fn{func_id} [{start},{end}] objects={} arrays={} concat_lens={} tier={}",
+                            local.runtime.objects.len(),
+                            local.runtime.arrays.len(),
+                            local.runtime.concat_lens.len(),
+                            if is_mem { "MEM" } else { "DOUBLE" }
+                        );
+                    }
+                    self.regions.insert(
+                        key,
+                        Region {
+                            code,
+                            start,
+                            end,
+                            deopts: 0,
+                            ok_runs: 0,
+                            is_int: false,
+                            is_mem,
+                            field_plan: None,
+                            local_sroa: Some(local.runtime),
+                            is_boxref,
+                        },
+                    );
+                    self.note_reg_region_installed(func_id, is_mem);
+                    if !is_mem {
+                        self.yield_tier_c_to_region(func_id);
+                    }
+                    return;
+                }
+            }
+        }
 
         // ── object scalar-replacement (SROA) ── if the region's heap ops all
         // target one non-escaping global object, rewrite them to scratch
@@ -2883,6 +3508,7 @@ impl Jit {
                                 is_int,
                                 is_mem: false,
                                 field_plan: Some(plan),
+                                local_sroa: None,
                                 is_boxref: false,
                             },
                         );
@@ -2909,6 +3535,7 @@ impl Jit {
                 end,
                 ta_plan,
                 leaf_plan,
+                computed_leaf_plan,
                 heap_helpers.regs_fits,
                 meter.is_some(),
             );
@@ -2941,6 +3568,7 @@ impl Jit {
                         is_int: true,
                         is_mem: false,
                         field_plan: None,
+                        local_sroa: None,
                         is_boxref: false,
                     },
                 );
@@ -2986,9 +3614,10 @@ impl Jit {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     let tier = if is_mem { "MEM" } else { "DOUBLE" };
                     eprintln!(
-                        "[jit] {tier} region fn{func_id} [{start},{end}] compiled (acc_arms={}/{})",
-                        acc_emit.iter().filter(|&&b| b).count(),
-                        acc_emit.len()
+                        "[jit] {tier} region fn{func_id} [{start},{end}] compiled (acc_arms={}/{}, direct_miss={})",
+                        acc_emit.iter().filter(|s| s.acc).count(),
+                        acc_emit.len(),
+                        acc_emit.iter().filter(|s| s.direct_miss).count()
                     );
                 }
                 self.regions.insert(
@@ -3002,6 +3631,7 @@ impl Jit {
                         is_int: false,
                         is_mem,
                         field_plan: None,
+                        local_sroa: None,
                         is_boxref,
                     },
                 );
@@ -3041,7 +3671,7 @@ impl Jit {
                 // non-numeric → the inline-cache mem path handles any type).
                 (
                     r.deopts >= OSR_DEOPT_LIMIT,
-                    r.is_int || r.field_plan.is_some() || r.is_boxref,
+                    r.is_int || r.field_plan.is_some() || r.local_sroa.is_some() || r.is_boxref,
                 )
             } else {
                 // A clean exit: the region reached its loop exit instead of
@@ -3122,7 +3752,7 @@ impl Jit {
     /// `[start, end]` slice, or the whole body for Tier C) and `code_off` its
     /// first ip — the k-th `GetProp`/`SetProp` in it uses site `base + k`,
     /// mirroring the emitters' `ic_site` cursor (proto_mem debug-asserts the
-    /// same count). Returns the per-site emit flags for the emitter.
+    /// same count). Returns the per-site emit choices for the emitter.
     fn register_ic_sites(
         &mut self,
         base: u32,
@@ -3130,23 +3760,31 @@ impl Jit {
         region_entry: u32,
         code: &[Instr],
         code_off: u32,
-    ) -> Vec<bool> {
+    ) -> Vec<IcSiteEmit> {
         let on = accessor_way_enabled();
         let always = acc_always_emit();
+        let direct_on = direct_ic_miss_enabled();
+        let force_direct = direct_on && force_direct_ic_miss();
         let mut flags = Vec::new();
         for (i, instr) in code.iter().enumerate() {
             if matches!(instr, Instr::GetProp { .. } | Instr::SetProp { .. }) {
                 let op_ip = code_off + i as u32;
-                let emit = on && (always || self.acc_sites.contains(&(func_id, op_ip)));
+                let direct_miss = direct_on
+                    && (force_direct || self.direct_miss_sites.contains(&(func_id, op_ip)));
+                // A direct site has no identity ways to carry an accessor tag.
+                // Accessors remain exact via the existing slow helper.
+                let acc =
+                    !direct_miss && on && (always || self.acc_sites.contains(&(func_id, op_ip)));
                 if let Some(m) = self.ic_site_meta.get_mut(base as usize + flags.len()) {
                     *m = IcSiteMeta {
                         func_id,
                         op_ip,
                         region_entry,
-                        acc_emitted: emit,
+                        acc_emitted: acc,
+                        direct_miss_emitted: direct_miss,
                     };
                 }
-                flags.push(emit);
+                flags.push(IcSiteEmit { acc, direct_miss });
             }
         }
         flags
@@ -3177,6 +3815,13 @@ impl Jit {
         let Some(&m) = self.ic_site_meta.get(site as usize) else {
             return AccWayGate::Slow;
         };
+        // A direct-miss compile has no identity probe and therefore nowhere an
+        // accessor-tagged way could be consumed. Keep routing through the
+        // existing live slow helper; never evict direct form merely to add dead
+        // accessor metadata.
+        if m.direct_miss_emitted {
+            return AccWayGate::Slow;
+        }
         if m.acc_emitted {
             return AccWayGate::Fill;
         }
@@ -3218,6 +3863,142 @@ impl Jit {
         AccWayGate::Recompile
     }
 
+    /// Flip a proven identity-thrashing, shape-memo-hitting property op to the
+    /// compile-time direct-miss form. Callers ask only BEFORE an observable
+    /// data read/write is committed; `Recompile` therefore permits exact
+    /// interpreter replay. The emitted form calls the same helper, so all live
+    /// object-kind, shape, descriptor, prototype and exotic checks remain in
+    /// one Rust implementation.
+    pub fn direct_miss_gate(&mut self, site: u32, memo_sites: &FxHashSet<u32>) -> DirectMissGate {
+        if !direct_ic_miss_enabled() {
+            return DirectMissGate::Probe;
+        }
+        let Some(&m) = self.ic_site_meta.get(site as usize) else {
+            return DirectMissGate::Probe;
+        };
+        if m.direct_miss_emitted {
+            return DirectMissGate::Direct;
+        }
+        // A gate flip deopts and replays this bytecode once. Unmetered code can
+        // do that because the proven own-data access has no observable effect;
+        // a metered native block, however, may already have charged the op.
+        // Never introduce a second charge in a sandboxed activation. Sites
+        // marked before instrumentation may still EMIT direct form safely —
+        // that form executes once and uses the ordinary charged helper path.
+        if self.meter.is_some() {
+            return DirectMissGate::Probe;
+        }
+        if !self.ic_direct_candidate(site) || !memo_sites.contains(&site) {
+            return DirectMissGate::Probe;
+        }
+
+        let owner = (m.func_id, m.region_entry);
+        // A hostile function with N named-property ops must not manufacture N
+        // recompiles that each reserve N fresh IC sites. Four parks keeps total
+        // table growth linear; sites not selected by then retain the safe probe.
+        if self
+            .direct_miss_recompiles
+            .get(&owner)
+            .copied()
+            .unwrap_or(0)
+            >= DIRECT_MISS_RECOMPILE_CAP
+        {
+            return DirectMissGate::Probe;
+        }
+
+        // Batch siblings in this same native artifact only when EACH has both
+        // parts of the proof: a full round of identity-way eviction and at
+        // least one guardable shape-slot memo. Old site ids from an earlier
+        // compile are useful durable evidence too; their metadata carries the
+        // same stable `(func_id, op_ip)` key.
+        let mut stable = Vec::new();
+        for (id, sm) in self.ic_site_meta.iter().copied().enumerate() {
+            let sid = id as u32;
+            if sm.func_id == m.func_id
+                && sm.region_entry == m.region_entry
+                && memo_sites.contains(&sid)
+                && self.ic_thrashing(sid)
+            {
+                stable.push((sm.func_id, sm.op_ip));
+            }
+        }
+        // The triggering site crossed the stronger 32-eviction threshold, so
+        // it is present even if a defensive caller supplied an incomplete
+        // sibling set (the explicit membership check above still proves memo).
+        stable.push((m.func_id, m.op_ip));
+        stable.sort_unstable();
+        stable.dedup();
+        let mut marked = 0usize;
+        for key in stable {
+            marked += self.direct_miss_sites.insert(key) as usize;
+        }
+        if marked == 0 {
+            return DirectMissGate::Probe;
+        }
+        *self.direct_miss_recompiles.entry(owner).or_insert(0) += 1;
+
+        if m.region_entry == u32::MAX {
+            if let Some(f) = self.compiled.remove(&m.func_id) {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!(
+                        "[jit] Tier C fn{} EVICTED (direct-miss site gate, ip {}, batched {})",
+                        m.func_id, m.op_ip, marked
+                    );
+                }
+                self.retired_fns.push(f);
+                self.counts.remove(&m.func_id);
+                self.set_fn_state(m.func_id, FN_COLD);
+                self.clear_cross_entry(m.func_id);
+                if self.self_cache.is_some_and(|(id, _)| id == m.func_id) {
+                    self.self_cache = None;
+                }
+            }
+        } else {
+            let key = (m.func_id, m.region_entry);
+            if let Some(r) = self.regions.remove(&key) {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!(
+                        "[jit] region fn{} [{}] EVICTED (direct-miss site gate, ip {}, batched {})",
+                        key.0, key.1, m.op_ip, marked
+                    );
+                }
+                self.note_reg_region_removed(key.0, &r);
+                self.retired.push(r);
+                self.region_counts.remove(&key);
+            }
+        }
+        DirectMissGate::Recompile
+    }
+
+    /// Whether this compile omitted the identity probes at `site`. Miss helpers
+    /// use this only to avoid refilling dead ways after a first-seen shape had
+    /// to take the full safe lookup path.
+    #[inline]
+    pub fn direct_miss_active(&self, site: u32) -> bool {
+        self.ic_site_meta
+            .get(site as usize)
+            .is_some_and(|m| m.direct_miss_emitted)
+    }
+
+    /// Cheap preflight before a helper builds the one-shot set of sibling
+    /// sites with shape memos. False means the gate cannot park this artifact,
+    /// so a capped or metered site pays no allocation/hash work per access.
+    #[inline]
+    pub fn direct_miss_gate_ready(&self, site: u32) -> bool {
+        if !direct_ic_miss_enabled() || self.meter.is_some() || !self.ic_direct_candidate(site) {
+            return false;
+        }
+        self.ic_site_meta.get(site as usize).is_some_and(|m| {
+            !m.direct_miss_emitted
+                && self
+                    .direct_miss_recompiles
+                    .get(&(m.func_id, m.region_entry))
+                    .copied()
+                    .unwrap_or(0)
+                    < DIRECT_MISS_RECOMPILE_CAP
+        })
+    }
+
     /// Base pointer of the inline-cache table (for a region prologue to pin).
     pub fn ic_base_ptr(&self) -> *const IcEntry {
         self.ic_table.as_ptr()
@@ -3240,6 +4021,18 @@ impl Jit {
         self.ic_rot
             .get(site as usize)
             .is_some_and(|&r| r >= JIT_IC_WAYS as IcRotCursor)
+    }
+
+    /// Stronger than the refill-suppression threshold: wait for 32 actual way
+    /// evictions (40 distinct identity misses after the initial fills) before
+    /// making the permanent compile-site decision. A brief ninth receiver or
+    /// a one-off allocation burst therefore cannot poison a later monomorphic
+    /// phase, while sustained many-identity sites converge almost immediately.
+    #[inline]
+    pub fn ic_direct_candidate(&self, site: u32) -> bool {
+        self.ic_rot
+            .get(site as usize)
+            .is_some_and(|&r| r >= DIRECT_MISS_EVICTION_THRESHOLD)
     }
 
     /// Advance the fill cursor for a miss the gate SUPPRESSED — the rotation
@@ -3289,6 +4082,17 @@ impl Region {
     /// The interpreter syncs the object's fields ↔ the pool globals around `run`.
     pub fn field_plan(&self) -> Option<&FieldSyncPlan> {
         self.field_plan.as_ref()
+    }
+
+    /// The local aggregate materialization plan, if this region elides fresh
+    /// object/array literals.
+    pub fn local_sroa_plan(&self) -> Option<&LocalSroaPlan> {
+        self.local_sroa.as_ref()
+    }
+
+    /// Inclusive bytecode bounds of this OSR region.
+    pub fn bounds(&self) -> (u32, u32) {
+        (self.start, self.end)
     }
 
     /// True if this region runs on the memory-backed path. Diagnostic only.

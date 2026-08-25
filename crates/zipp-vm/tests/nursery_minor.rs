@@ -44,7 +44,11 @@ fn run_ok(src: &str) -> Vec<String> {
     static NURSERY_ON: std::sync::Once = std::sync::Once::new();
     NURSERY_ON.call_once(|| std::env::set_var("ZIPP_NURSERY", "1"));
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -54,7 +58,11 @@ fn run_ok(src: &str) -> Vec<String> {
 /// into O(iterations x heap) — a fraction of the allocations reaches the same
 /// minor/major interleavings there.
 fn scaled(n: usize) -> usize {
-    if std::env::var_os("ZIPP_GC_STRESS").is_some() { n / 50 } else { n }
+    if std::env::var_os("ZIPP_GC_STRESS").is_some() {
+        n / 50
+    } else {
+        n
+    }
 }
 
 /// Oracle idiom 1: young objects pushed into a RETAINED array. The array goes
@@ -239,7 +247,9 @@ fn nursery_parity_old_field_overwrite_reaches_young() {
         "#
     ));
     // holder h & 7 last written at the largest i < N with i & 7 == h.
-    let last: u64 = (0..8u64).map(|h| (n as u64 - 8) + ((h + 8 - (n as u64 & 7)) % 8)).sum();
+    let last: u64 = (0..8u64)
+        .map(|h| (n as u64 - 8) + ((h + 8 - (n as u64 & 7)) % 8))
+        .sum();
     assert_eq!(out[0], format!("{last}"));
 }
 
@@ -361,7 +371,9 @@ fn nursery_parity_old_map_value_updates_reach_young() {
         console.log(m.size + ":" + s);
         "#
     ));
-    let s: u64 = (0..64u64).map(|k| (n as u64 - 64) + ((k + 64 - (n as u64 & 63)) % 64)).sum();
+    let s: u64 = (0..64u64)
+        .map(|k| (n as u64 - 64) + ((k + 64 - (n as u64 & 63)) % 64))
+        .sum();
     assert_eq!(out[0], format!("64:{s}"));
 }
 
@@ -391,7 +403,9 @@ fn nursery_parity_trivial_setter_stores_reach_young() {
         console.log(s);
         "#
     ));
-    let s: u64 = (0..4u64).map(|b| (n as u64 - 4) + ((b + 4 - (n as u64 & 3)) % 4)).sum();
+    let s: u64 = (0..4u64)
+        .map(|b| (n as u64 - 4) + ((b + 4 - (n as u64 & 3)) % 4))
+        .sum();
     assert_eq!(out[0], format!("{s}"));
 }
 
@@ -470,8 +484,14 @@ fn budget_adapts_and_pins() {
     let exe = std::env::current_exe().expect("test exe path");
     for (probe, envs) in [
         ("probe_budget_grows_then_shrinks", vec![]),
-        ("probe_budget_pinned_by_env", vec![("ZIPP_NURSERY_YOUNG_BUDGET", "32768")]),
-        ("probe_budget_pinned_by_no_adapt", vec![("ZIPP_NO_NURSERY_ADAPT", "1")]),
+        (
+            "probe_budget_pinned_by_env",
+            vec![("ZIPP_NURSERY_YOUNG_BUDGET", "32768")],
+        ),
+        (
+            "probe_budget_pinned_by_no_adapt",
+            vec![("ZIPP_NO_NURSERY_ADAPT", "1")],
+        ),
     ] {
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg(probe).arg("--ignored");
@@ -489,7 +509,10 @@ fn budget_adapts_and_pins() {
             "{probe} failed:\n{stdout}\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(!stdout.contains("running 0 tests"), "{probe} filter matched nothing");
+        assert!(
+            !stdout.contains("running 0 tests"),
+            "{probe} filter matched nothing"
+        );
     }
 }
 
@@ -660,7 +683,10 @@ fn all_modes_answer_identically() {
         // configuration.
         &[("ZIPP_NO_VALGRAIN_REMSET", "1")],
         &[("ZIPP_NO_VALGRAIN_REMSET", "1"), ("ZIPP_GC_STRESS", "1")],
-        &[("ZIPP_NO_VALGRAIN_REMSET", "1"), ("ZIPP_NURSERY_VERIFY", "1")],
+        &[
+            ("ZIPP_NO_VALGRAIN_REMSET", "1"),
+            ("ZIPP_NURSERY_VERIFY", "1"),
+        ],
         // W10: minor-marks cache off (per-minor rebuild).
         &[("ZIPP_NO_NONYOUNG_CACHE", "1")],
         // Exercise the configurable major backstop at its densest valid
@@ -730,7 +756,10 @@ fn probe_bounded_heap_under_sustained_old_garbage() {
     );
     assert_eq!(out.last().map(String::as_str), Some("8:200000"));
     let (minors, majors, _, _, swept_young, _, _, peak) = zipp_vm::gc_nursery_stats();
-    assert!(minors >= 2, "the nursery never ran a minor (minors={minors})");
+    assert!(
+        minors >= 2,
+        "the nursery never ran a minor (minors={minors})"
+    );
     assert!(
         majors >= 1,
         "sustained old garbage must eventually latch a major (majors={majors}, minors={minors})"
@@ -762,7 +791,10 @@ fn probe_churn_reuses_slots_through_minors() {
     );
     assert_eq!(out[0], "last:499999");
     let (minors, _, _, _, _, _, _, peak) = zipp_vm::gc_nursery_stats();
-    assert!(minors >= 3, "churn at this scale must run several minors (minors={minors})");
+    assert!(
+        minors >= 3,
+        "churn at this scale must run several minors (minors={minors})"
+    );
     assert!(
         peak < 200_000,
         "peak {peak} slots for a ~zero live set — minors are not recycling the free list"
@@ -772,9 +804,10 @@ fn probe_churn_reuses_slots_through_minors() {
 #[test]
 fn sustained_old_garbage_keeps_the_heap_bounded() {
     let exe = std::env::current_exe().expect("test exe path");
-    for probe in
-        ["probe_bounded_heap_under_sustained_old_garbage", "probe_churn_reuses_slots_through_minors"]
-    {
+    for probe in [
+        "probe_bounded_heap_under_sustained_old_garbage",
+        "probe_churn_reuses_slots_through_minors",
+    ] {
         let out = std::process::Command::new(&exe)
             .args([probe, "--ignored", "--exact"])
             .env("ZIPP_NURSERY", "1") // opt-in (B120)

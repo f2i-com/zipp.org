@@ -27,7 +27,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -37,7 +41,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -222,9 +230,16 @@ fn wide_imm_matrix(cases: &[(&str, &str)], iters: u32) -> String {
             names.push(f);
         }
     }
-    let calls = names.iter().map(|f| format!("{f}(x)")).collect::<Vec<_>>().join(" + ");
-    let probes =
-        names.iter().map(|f| format!("probes.push({f}(j));")).collect::<Vec<_>>().join(" ");
+    let calls = names
+        .iter()
+        .map(|f| format!("{f}(x)"))
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let probes = names
+        .iter()
+        .map(|f| format!("probes.push({f}(j));"))
+        .collect::<Vec<_>>()
+        .join(" ");
     format!(
         r#""use strict";
 {fns}        var acc = 0;
@@ -270,11 +285,20 @@ fn tl_parity_wide_imm_boundaries() {
             // 2^31: one past — the first wide positive.
             ("w2p31", "var k = 2147483647, m = 1; var c = k + m;"),
             // -2^31: the most negative immediate that still fits imm32.
-            ("i32min", "var z = 0; var k = z - 2147483647, m = z - 1; var c = k + m;"),
+            (
+                "i32min",
+                "var z = 0; var k = z - 2147483647, m = z - 1; var c = k + m;",
+            ),
             // -2^31-1: one past — the first wide negative.
-            ("wm2p31", "var z = 0; var k = z - 2147483647, m = z - 2; var c = k + m;"),
+            (
+                "wm2p31",
+                "var z = 0; var k = z - 2147483647, m = z - 2; var c = k + m;",
+            ),
             // 2^32-1.
-            ("wu32max", "var k = 2147483647, m = 2147483647, n = 1; var c = k + m + n;"),
+            (
+                "wu32max",
+                "var k = 2147483647, m = 2147483647, n = 1; var c = k + m + n;",
+            ),
             // `>>> 0` of a negative → a wide positive immediate.
             ("wushr", "var z = 0; var c = (z - 2) >>> 0;"),
         ],
@@ -360,13 +384,25 @@ fn typed_lane_jitlog_census() {
     let exe = std::env::current_exe().expect("test exe path");
     for (filter, needle) in [
         ("tl_parity_mulberry_ri_stream", "TYPED-LANE (ops="),
-        ("tl_parity_tokis_control", "typed-lane=DECLINED(op-outside-lane-set)"),
-        ("tl_parity_reg_budget_decline", "typed-lane=DECLINED(gpr-budget)"),
-        ("tl_parity_zero_arg_activation", "typed-lane=DECLINED(param-not-passed)"),
+        (
+            "tl_parity_tokis_control",
+            "typed-lane=DECLINED(op-outside-lane-set)",
+        ),
+        (
+            "tl_parity_reg_budget_decline",
+            "typed-lane=DECLINED(gpr-budget)",
+        ),
+        (
+            "tl_parity_zero_arg_activation",
+            "typed-lane=DECLINED(param-not-passed)",
+        ),
         // Unary minus is `Neg` — outside the closed set, so a `-N` literal
         // costs the lane. This is what forces the wide-immediate matrix to
         // spell its negative constants `z - N`.
-        ("tl_parity_ushr_neg_literal_control", "typed-lane=DECLINED(op-outside-lane-set)"),
+        (
+            "tl_parity_ushr_neg_literal_control",
+            "typed-lane=DECLINED(op-outside-lane-set)",
+        ),
     ] {
         let out = std::process::Command::new(&exe)
             .arg(filter)

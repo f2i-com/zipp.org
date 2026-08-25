@@ -983,7 +983,10 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                         next_or_bt!(true)
                     }
 
-                    &Insn::BackRef { group: cg_idx, icase } => {
+                    &Insn::BackRef {
+                        group: cg_idx,
+                        icase,
+                    } => {
                         let cg = self.s.groups.mat(cg_idx as usize);
                         // Backreferences to a capture group that did not match always succeed (ES5
                         // 15.10.2.9).
@@ -1660,10 +1663,7 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                                 };
                                 if let Some(end) = end {
                                     self.take_group_ranges(&mut caps_buf);
-                                    sink(
-                                        inp.pos_to_offset(pos)..inp.pos_to_offset(end),
-                                        &caps_buf,
-                                    );
+                                    sink(inp.pos_to_offset(pos)..inp.pos_to_offset(end), &caps_buf);
                                     emitted += 1;
                                     // If we matched the empty string, we have to increment.
                                     pos = if end != pos {

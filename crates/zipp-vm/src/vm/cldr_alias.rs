@@ -164,7 +164,10 @@ fn lang_rules() -> &'static [LangRule] {
             .lines()
             .filter_map(|l| l.split_once('|'))
             .filter_map(|(t, r)| {
-                Some(LangRule { from: parse_ids(t)?, to: parse_ids(r)? })
+                Some(LangRule {
+                    from: parse_ids(t)?,
+                    to: parse_ids(r)?,
+                })
             })
             .collect();
         v.sort_by_key(|r| {
@@ -252,7 +255,11 @@ fn apply_rule(r: &LangRule, t: &mut LangTag) -> bool {
         (&r.from.script, &r.to.script, &mut t.script),
         (&r.from.region, &r.to.region, &mut t.region),
     ] {
-        let next = if matched.is_empty() && !field.is_empty() { None } else { Some(repl.clone()) };
+        let next = if matched.is_empty() && !field.is_empty() {
+            None
+        } else {
+            Some(repl.clone())
+        };
         if let Some(n) = next {
             if *field != n {
                 *field = n;
@@ -293,7 +300,9 @@ fn replace_territory(t: &mut LangTag) -> bool {
     if t.region.is_empty() {
         return false;
     }
-    let Some(repl) = territory_alias().get(t.region.as_str()) else { return false };
+    let Some(repl) = territory_alias().get(t.region.as_str()) else {
+        return false;
+    };
     let list: Vec<&str> = repl.split(' ').collect();
     let pick = if list.len() == 1 {
         list[0].to_string()
@@ -455,43 +464,56 @@ pub(crate) fn add_likely_subtags(t: &LangTag) -> Option<LangTag> {
     let hit: Option<(String, String, String)> = None
         .or_else(|| {
             (!und && !script.is_empty())
-                .then(|| l.lang_script.get(&(lang, script)).map(|r| {
-                    (lang.to_string(), script.to_string(), r.to_string())
-                }))
+                .then(|| {
+                    l.lang_script
+                        .get(&(lang, script))
+                        .map(|r| (lang.to_string(), script.to_string(), r.to_string()))
+                })
                 .flatten()
         })
         .or_else(|| {
             (!und && !region.is_empty())
-                .then(|| l.lang_region.get(&(lang, region)).map(|s| {
-                    (lang.to_string(), s.to_string(), region.to_string())
-                }))
+                .then(|| {
+                    l.lang_region
+                        .get(&(lang, region))
+                        .map(|s| (lang.to_string(), s.to_string(), region.to_string()))
+                })
                 .flatten()
         })
         .or_else(|| {
-            (!und).then(|| l.lang.get(lang).map(|(s, r)| {
-                (lang.to_string(), s.to_string(), r.to_string())
-            }))
-            .flatten()
+            (!und)
+                .then(|| {
+                    l.lang
+                        .get(lang)
+                        .map(|(s, r)| (lang.to_string(), s.to_string(), r.to_string()))
+                })
+                .flatten()
         })
         .or_else(|| {
             (und && !script.is_empty() && !region.is_empty())
-                .then(|| l.und_script_region.get(&(script, region)).map(|la| {
-                    (la.to_string(), script.to_string(), region.to_string())
-                }))
+                .then(|| {
+                    l.und_script_region
+                        .get(&(script, region))
+                        .map(|la| (la.to_string(), script.to_string(), region.to_string()))
+                })
                 .flatten()
         })
         .or_else(|| {
             (!script.is_empty())
-                .then(|| l.und_script.get(script).map(|(la, r)| {
-                    (la.to_string(), script.to_string(), r.to_string())
-                }))
+                .then(|| {
+                    l.und_script
+                        .get(script)
+                        .map(|(la, r)| (la.to_string(), script.to_string(), r.to_string()))
+                })
                 .flatten()
         })
         .or_else(|| {
             (und && !region.is_empty())
-                .then(|| l.und_region.get(region).map(|(la, s)| {
-                    (la.to_string(), s.to_string(), region.to_string())
-                }))
+                .then(|| {
+                    l.und_region
+                        .get(region)
+                        .map(|(la, s)| (la.to_string(), s.to_string(), region.to_string()))
+                })
                 .flatten()
         })
         .or_else(|| {
@@ -502,8 +524,16 @@ pub(crate) fn add_likely_subtags(t: &LangTag) -> Option<LangTag> {
     let mut out = t.clone();
     // The original's own subtags win over the match's; only the gaps are filled.
     out.language = if und { mlang } else { t.language.clone() };
-    out.script = if script.is_empty() { mscript } else { t.script.clone() };
-    out.region = if region.is_empty() { mregion } else { t.region.clone() };
+    out.script = if script.is_empty() {
+        mscript
+    } else {
+        t.script.clone()
+    };
+    out.region = if region.is_empty() {
+        mregion
+    } else {
+        t.region.clone()
+    };
     Some(out)
 }
 
@@ -594,7 +624,10 @@ mod tests {
             ("und-u-rg-no23", "und-u-rg-no50"),
             ("und-NO-u-sd-cn11", "und-NO-u-sd-cnbj"),
             ("en-t-iw", "en-t-he"),
-            ("und-Latn-t-und-hani-m0-names", "und-Latn-t-und-hani-m0-prprname"),
+            (
+                "und-Latn-t-und-hani-m0-names",
+                "und-Latn-t-und-hani-m0-prprname",
+            ),
             // Not aliased — the rows CLDR keeps COMMENTED OUT must stay out.
             ("sr", "sr"),
             ("qaa", "qaa"),

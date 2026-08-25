@@ -7,9 +7,9 @@ use crate::ir::Node;
 use crate::startpredicate;
 use crate::types::{BracketContents, CaptureGroupID, LoopID};
 use crate::unicode;
-use core::convert::TryInto;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, vec::Vec};
+use core::convert::TryInto;
 
 /// \return an anchor instruction for a given IR anchor.
 fn make_anchor(anchor_type: ir::AnchorType, multiline: bool) -> Insn {
@@ -346,18 +346,16 @@ impl Emitter {
                             icase,
                         })
                     }
-                    Node::NamedBackRef { groups, icase } => {
-                        self.emit_insn(Insn::BackRefMulti {
-                            groups: groups
-                                .iter()
-                                .map(|&group| {
-                                    debug_assert!(group >= 1, "Group should not be zero");
-                                    group - 1
-                                })
-                                .collect(),
-                            icase: *icase,
-                        })
-                    }
+                    Node::NamedBackRef { groups, icase } => self.emit_insn(Insn::BackRefMulti {
+                        groups: groups
+                            .iter()
+                            .map(|&group| {
+                                debug_assert!(group >= 1, "Group should not be zero");
+                                group - 1
+                            })
+                            .collect(),
+                        icase: *icase,
+                    }),
 
                     Node::ByteSet(bytes) => self.emit_byte_set_insn(bytes),
 

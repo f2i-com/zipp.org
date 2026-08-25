@@ -22,7 +22,11 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -36,7 +40,10 @@ fn run_both_ways(src: &str) -> Vec<String> {
     std::env::set_var("ZIPP_NO_DENSE_BACKEDGE", "1");
     let probed = run_ok(src);
     std::env::remove_var("ZIPP_NO_DENSE_BACKEDGE");
-    assert_eq!(dense, probed, "dense back-edge verdict changed an answer for: {src}");
+    assert_eq!(
+        dense, probed,
+        "dense back-edge verdict changed an answer for: {src}"
+    );
     dense
 }
 
@@ -48,7 +55,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node v24 on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()

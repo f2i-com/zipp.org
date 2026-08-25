@@ -250,7 +250,10 @@ impl<'p> Vm<'p> {
             // InstallErrorCause: options (arg 1; arg 2 for AggregateError) with
             // a `cause` (HasProperty: proto chain + has trap, observable) adds
             // a non-enumerable own `cause` data property.
-            let options = args.get(if k == 7 { 2 } else { 1 }).copied().unwrap_or(Value::UNDEFINED);
+            let options = args
+                .get(if k == 7 { 2 } else { 1 })
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
             if self.is_object_value(options) {
                 let kc = self.alloc_str("cause".to_string());
                 if self.has_property_dyn(options, kc)? {
@@ -309,7 +312,9 @@ impl<'p> Vm<'p> {
             let (n, max) = self.validate_array_buffer_args(args)?;
             let over = self.newtarget_proto_override(new_target, cv, self.arraybuffer_proto)?;
             if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
-                return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
+                return Err(Thrown(
+                    "RangeError: ArrayBuffer length exceeds the maximum".into(),
+                ));
             }
             let buf = self.alloc_array_buffer(n);
             if let Some(m) = max {
@@ -321,7 +326,9 @@ impl<'p> Vm<'p> {
             let (n, max) = self.validate_array_buffer_args(args)?;
             let over = self.newtarget_proto_override(new_target, cv, self.sab_proto)?;
             if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
-                return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
+                return Err(Thrown(
+                    "RangeError: ArrayBuffer length exceeds the maximum".into(),
+                ));
             }
             // Truly-shared storage (marks shared_buffers + links sab_proto).
             let buf = self.alloc_shared_array_buffer(n, max);
@@ -348,9 +355,10 @@ impl<'p> Vm<'p> {
         }
         if ci == self.weakmap_ctor && ci != 0 {
             let over = self.newtarget_proto_override(new_target, cv, self.weakmap_proto)?;
-            let wm = Value::heap(
-                self.heap.alloc(HeapObj::WeakMap { keys: Vec::new(), vals: Vec::new() }),
-            );
+            let wm = Value::heap(self.heap.alloc(HeapObj::WeakMap {
+                keys: Vec::new(),
+                vals: Vec::new(),
+            }));
             let wm = self.set_ctor_proto(wm, over);
             let it = args.first().copied().unwrap_or(Value::UNDEFINED);
             if !it.is_nullish() {
@@ -372,7 +380,9 @@ impl<'p> Vm<'p> {
             let t = args.first().copied().unwrap_or(Value::UNDEFINED);
             // CanBeHeldWeakly: any object, or a non-registered Symbol.
             if !self.can_be_held_weakly(t) {
-                return Err(Thrown("TypeError: WeakRef: target cannot be held weakly".into()));
+                return Err(Thrown(
+                    "TypeError: WeakRef: target cannot be held weakly".into(),
+                ));
             }
             let over = self.newtarget_proto_override(new_target, cv, self.weakref_proto)?;
             let wr = Value::heap(self.heap.alloc(HeapObj::WeakRef(t)));
@@ -386,9 +396,10 @@ impl<'p> Vm<'p> {
                 ));
             }
             let over = self.newtarget_proto_override(new_target, cv, self.finreg_proto)?;
-            let fr = Value::heap(
-                self.heap.alloc(HeapObj::FinalizationRegistry { cleanup: cb, tokens: Vec::new() }),
-            );
+            let fr = Value::heap(self.heap.alloc(HeapObj::FinalizationRegistry {
+                cleanup: cb,
+                tokens: Vec::new(),
+            }));
             return Ok(self.set_ctor_proto(fr, over));
         }
         if ci == self.abstractmodulesource_ctor && ci != 0 {
@@ -402,7 +413,8 @@ impl<'p> Vm<'p> {
             let over = self.newtarget_proto_override(new_target, cv, self.shadowrealm_proto)?;
             let idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
             if self.shadowrealm_proto != 0 {
-                self.proto_of.insert(idx, Value::heap(self.shadowrealm_proto));
+                self.proto_of
+                    .insert(idx, Value::heap(self.shadowrealm_proto));
             }
             self.shadow_realms.insert(idx);
             return Ok(self.set_ctor_proto(Value::heap(idx), over));
@@ -413,10 +425,16 @@ impl<'p> Vm<'p> {
             // OrdinaryCreateFromConstructor read newTarget.prototype (a user
             // getter may have detached or shrunk the buffer): re-validate the
             // view per GetViewByteLength before exposing it.
-            if let HeapObj::DataView { buffer, byte_offset, byte_length } =
-                *self.heap.get(r.heap_index())
+            if let HeapObj::DataView {
+                buffer,
+                byte_offset,
+                byte_length,
+            } = *self.heap.get(r.heap_index())
             {
-                if matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { detached: true, .. }) {
+                if matches!(
+                    self.heap.get(buffer),
+                    HeapObj::ArrayBuffer { detached: true, .. }
+                ) {
                     return Err(Thrown(
                         "TypeError: Cannot construct a DataView on a detached ArrayBuffer".into(),
                     ));
@@ -461,7 +479,9 @@ impl<'p> Vm<'p> {
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.ta_base_ctor && ci != 0 {
-            return Err(Thrown("TypeError: Abstract class TypedArray not directly constructable".into()));
+            return Err(Thrown(
+                "TypeError: Abstract class TypedArray not directly constructable".into(),
+            ));
         }
         if ci == self.iterator_ctor && ci != 0 {
             // %Iterator% is abstract ONLY against itself: `new Iterator()` (or
@@ -499,7 +519,8 @@ impl<'p> Vm<'p> {
             let y = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
             let d = self.temporal_ctor_int(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
-            let cal = self.validate_calendar_identifier(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
+            let cal = self
+                .validate_calendar_identifier(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
             let r = self.make_plain_date(y, m, d)?;
             let r = self.tag_cal(r, cal);
             let over = self.newtarget_proto_override(new_target, cv, self.plaindate_proto)?;
@@ -527,7 +548,8 @@ impl<'p> Vm<'p> {
                     *slot = self.temporal_ctor_int(v)?;
                 }
             }
-            let cal = self.validate_calendar_identifier(args.get(9).copied().unwrap_or(Value::UNDEFINED))?;
+            let cal = self
+                .validate_calendar_identifier(args.get(9).copied().unwrap_or(Value::UNDEFINED))?;
             let r = self.make_plain_date_time(f)?;
             let r = self.tag_cal(r, cal);
             let over = self.newtarget_proto_override(new_target, cv, self.plaindatetime_proto)?;
@@ -536,8 +558,9 @@ impl<'p> Vm<'p> {
         if ci == self.instant_ctor && ci != 0 {
             // Beyond-i128 saturates (sign preserved) — certainly outside the
             // Instant range, which make_instant validates.
-            let ns =
-                self.to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?.to_i128_sat();
+            let ns = self
+                .to_bigint(args.first().copied().unwrap_or(Value::UNDEFINED))?
+                .to_i128_sat();
             let r = self.make_instant(ns)?;
             let over = self.newtarget_proto_override(new_target, cv, self.instant_proto)?;
             return Ok(self.set_ctor_proto(r, over));
@@ -546,7 +569,8 @@ impl<'p> Vm<'p> {
             // (year, month, calendar?, referenceISODay=1)
             let y = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             let m = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-            let cal = self.validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+            let cal = self
+                .validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             let rd = match args.get(3).copied() {
                 Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
                 _ => 1,
@@ -560,7 +584,8 @@ impl<'p> Vm<'p> {
             // (month, day, calendar?, referenceISOYear=1972)
             let m = self.temporal_ctor_int(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             let d = self.temporal_ctor_int(args.get(1).copied().unwrap_or(Value::UNDEFINED))?;
-            let cal = self.validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+            let cal = self
+                .validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             let ry = match args.get(3).copied() {
                 Some(v) if v != Value::UNDEFINED => self.temporal_ctor_int(v)?,
                 _ => 1972,
@@ -571,7 +596,8 @@ impl<'p> Vm<'p> {
             return Ok(self.set_ctor_proto(r, over));
         }
         if ci == self.zoneddatetime_ctor && ci != 0 {
-            let cal = self.validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
+            let cal = self
+                .validate_calendar_identifier(args.get(2).copied().unwrap_or(Value::UNDEFINED))?;
             let r = self.make_zoned_date_time(args)?;
             let r = self.tag_cal(r, cal);
             let over = self.newtarget_proto_override(new_target, cv, self.zoneddatetime_proto)?;
@@ -597,7 +623,9 @@ impl<'p> Vm<'p> {
         // Constructing through a Proxy: `construct` trap (or construct the target).
         if let Some((target, handler, revoked)) = self.proxy_parts(ci) {
             if revoked {
-                return Err(Thrown("TypeError: Cannot perform 'construct' on a revoked proxy".into()));
+                return Err(Thrown(
+                    "TypeError: Cannot perform 'construct' on a revoked proxy".into(),
+                ));
             }
             return match self.proxy_trap(handler, "construct")? {
                 Some(trap) => {
@@ -620,7 +648,11 @@ impl<'p> Vm<'p> {
         // Reflect.construct newTarget) but their [[Construct]] unconditionally
         // throws: `new Symbol()` / `new BigInt()` are TypeErrors.
         if ci != 0 && (ci == self.symbol_ctor || ci == self.bigint_ctor) {
-            let n = if ci == self.symbol_ctor { "Symbol" } else { "BigInt" };
+            let n = if ci == self.symbol_ctor {
+                "Symbol"
+            } else {
+                "BigInt"
+            };
             return Err(Thrown(format!("TypeError: {n} is not a constructor")));
         }
         // A core built-in constructor used as a VALUE (`new C()` where C is the
@@ -629,9 +661,10 @@ impl<'p> Vm<'p> {
         // Identify it by its own `prototype` (the canonical proto object), so it
         // works however the constructor was obtained.
         let builtin_proto = match self.heap.get(ci) {
-            HeapObj::Object(m) if m.is_ctor => {
-                m.get("prototype").filter(|p| p.is_heap()).map(|p| p.heap_index())
-            }
+            HeapObj::Object(m) if m.is_ctor => m
+                .get("prototype")
+                .filter(|p| p.is_heap())
+                .map(|p| p.heap_index()),
             _ => None,
         };
         if let Some(p) = builtin_proto {
@@ -704,13 +737,23 @@ impl<'p> Vm<'p> {
             if p == self.num_proto && self.num_proto != 0 {
                 // ToNumber(value) — observable (a user valueOf/toString runs) and
                 // abrupt; `to_number` alone returns NaN for a plain object.
-                let n = if args.is_empty() { 0.0 } else { self.to_number_coerce(a0)? };
-                let r = Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 1, value: Value::num(n) }));
+                let n = if args.is_empty() {
+                    0.0
+                } else {
+                    self.to_number_coerce(a0)?
+                };
+                let r = Value::heap(self.heap.alloc(HeapObj::Boxed {
+                    kind: 1,
+                    value: Value::num(n),
+                }));
                 return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.bool_proto && self.bool_proto != 0 {
                 let b = !args.is_empty() && self.truthy(a0);
-                let r = Value::heap(self.heap.alloc(HeapObj::Boxed { kind: 2, value: Value::bool(b) }));
+                let r = Value::heap(self.heap.alloc(HeapObj::Boxed {
+                    kind: 2,
+                    value: Value::bool(b),
+                }));
                 return Ok(self.set_ctor_proto(r, over));
             }
             if p == self.str_proto && self.str_proto != 0 {
@@ -734,7 +777,10 @@ impl<'p> Vm<'p> {
                 // silently indexed instead of throwing TypeError, and a throwing
                 // `[0]`/`[1]` getter or adder left the iterator open
                 // (staging/sm/Map/constructor-iterator-close.js).
-                let map_v = Value::heap(self.heap.alloc(HeapObj::Map { keys: Vec::new(), vals: Vec::new() }));
+                let map_v = Value::heap(self.heap.alloc(HeapObj::Map {
+                    keys: Vec::new(),
+                    vals: Vec::new(),
+                }));
                 if !a0.is_nullish() {
                     self.add_entries_via_adder(map_v, a0, true)?;
                 }
@@ -761,12 +807,16 @@ impl<'p> Vm<'p> {
                 }
                 let prom = self.alloc_promise();
                 let pair = self.new_resolver_pair();
-                let res = Value::heap(
-                    self.heap.alloc(HeapObj::BoundResolver { promise: prom, is_reject: false, pair }),
-                );
-                let rej = Value::heap(
-                    self.heap.alloc(HeapObj::BoundResolver { promise: prom, is_reject: true, pair }),
-                );
+                let res = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                    promise: prom,
+                    is_reject: false,
+                    pair,
+                }));
+                let rej = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                    promise: prom,
+                    is_reject: true,
+                    pair,
+                }));
                 if self.call_value(a0, Value::UNDEFINED, &[res, rej]).is_err() {
                     let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
                     // Step 10.a Call([[Reject]]): no-op once the pair fired
@@ -781,8 +831,10 @@ impl<'p> Vm<'p> {
         // A user function with no [[Construct]] (generator, async, arrow, or a
         // concise method) — `new` on it is a TypeError. Gated to Func/Closure so
         // built-in Native ctors, classes, and bound functions are untouched.
-        if matches!(self.heap.get(cv.heap_index()), HeapObj::Func(_) | HeapObj::Closure { .. })
-            && !self.is_constructor(cv)
+        if matches!(
+            self.heap.get(cv.heap_index()),
+            HeapObj::Func(_) | HeapObj::Closure { .. }
+        ) && !self.is_constructor(cv)
         {
             return Err(Thrown("TypeError: function is not a constructor".into()));
         }
@@ -820,9 +872,9 @@ impl<'p> Vm<'p> {
             let hint = fid
                 .and_then(|f| self.ctor_field_hint.get(f as usize).copied())
                 .unwrap_or(0);
-            let obj = Value::heap(
-                self.heap.alloc(HeapObj::Object(Box::new(ObjMap::with_capacity(hint as usize)))),
-            );
+            let obj = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
+                ObjMap::with_capacity(hint as usize),
+            ))));
             if proto.is_heap() {
                 self.proto_of.insert(obj.heap_index(), proto);
             }
@@ -866,7 +918,11 @@ impl<'p> Vm<'p> {
         // `new (boundFn)(...)`: [[Construct]] forwards to the bound target with the
         // bound arguments prepended (the bound `this` is ignored for construction).
         let bound_parts = match self.heap.get(cv.heap_index()) {
-            HeapObj::Bound { target, args: bargs, .. } => Some((*target, bargs.clone())),
+            HeapObj::Bound {
+                target,
+                args: bargs,
+                ..
+            } => Some((*target, bargs.clone())),
             _ => None,
         };
         if let Some((target, bargs)) = bound_parts {
@@ -877,12 +933,17 @@ impl<'p> Vm<'p> {
             let nt = if new_target == cv { target } else { new_target };
             return self.construct_with_newtarget(target, &combined, nt);
         }
-        let (ctor, ctor_ups, has_explicit, parent, extends_null) = match self.heap.get(cv.heap_index()) {
-            HeapObj::Class(c) => {
-                (c.ctor, c.ctor_upvalues.clone(), c.has_explicit_ctor, c.parent, c.extends_null)
-            }
-            _ => return Err(Thrown("TypeError: value is not a constructor".into())),
-        };
+        let (ctor, ctor_ups, has_explicit, parent, extends_null) =
+            match self.heap.get(cv.heap_index()) {
+                HeapObj::Class(c) => (
+                    c.ctor,
+                    c.ctor_upvalues.clone(),
+                    c.has_explicit_ctor,
+                    c.parent,
+                    c.extends_null,
+                ),
+                _ => return Err(Thrown("TypeError: value is not a constructor".into())),
+            };
         // The instance links to its class for method lookup + instanceof; its own
         // keys hold only the fields (so enumeration / JSON stay method-free).
         let mut map = ObjMap::new();
@@ -973,7 +1034,8 @@ impl<'p> Vm<'p> {
                     // ignores a primitive return and yields `this`).
                     if ret != Value::UNDEFINED {
                         return Err(Thrown(
-                            "TypeError: Derived constructors may only return object or undefined".into(),
+                            "TypeError: Derived constructors may only return object or undefined"
+                                .into(),
                         ));
                     }
                     // …and `this` must have been initialised by `super(...)`.
@@ -999,7 +1061,8 @@ impl<'p> Vm<'p> {
             // super(...args) calls a null parent — TypeError per spec.
             if extends_null {
                 return Err(Thrown(
-                    "TypeError: Super constructor null of anonymous class is not a constructor".into(),
+                    "TypeError: Super constructor null of anonymous class is not a constructor"
+                        .into(),
                 ));
             }
             if let Some(pidx) = parent {
@@ -1012,7 +1075,11 @@ impl<'p> Vm<'p> {
                 // retargeted
                 // (staging/sm/class/superCallProperBase.js).
                 let live = self.object_get_prototype_of(cv);
-                let sup = if live.is_heap() { live } else { Value::heap(pidx) };
+                let sup = if live.is_heap() {
+                    live
+                } else {
+                    Value::heap(pidx)
+                };
                 let r = self.run_class_ctor(sup, inst, args, new_target);
                 // An explicit DERIVED parent in the chain may have left a this-TDZ
                 // mark (it threw pre-super) or a banked return-override (it
@@ -1101,7 +1168,12 @@ impl<'p> Vm<'p> {
         // (buffer, byteOffset, length) on a fixed/resizable buffer) and move it into
         // the instance. The TA references a freshly-constructed ArrayBuffer, which is
         // correct to share. Detected by the parent being a TypedArray constructor.
-        if cval.is_heap() && self.ta_ctors.iter().any(|&c| c != 0 && c == cval.heap_index()) {
+        if cval.is_heap()
+            && self
+                .ta_ctors
+                .iter()
+                .any(|&c| c != 0 && c == cval.heap_index())
+        {
             let tv = self.construct(cval, args)?;
             let tvi = tv.heap_index();
             let cloned = self.heap.get(tvi).clone();
@@ -1120,13 +1192,23 @@ impl<'p> Vm<'p> {
         // `class B extends ArrayBuffer`: materialize a REAL ArrayBuffer into the
         // instance slot (so byteLength/slice's brand checks pass); the resizable
         // max lives in the ab_max side table, keyed by the instance's heap index.
-        if cval.is_heap() && cval.heap_index() == self.arraybuffer_ctor && self.arraybuffer_ctor != 0
+        if cval.is_heap()
+            && cval.heap_index() == self.arraybuffer_ctor
+            && self.arraybuffer_ctor != 0
         {
             let (n, max) = self.validate_array_buffer_args(args)?;
             if n > super::typedarray::MAX_ARRAY_BUFFER_LEN as usize {
-                return Err(Thrown("RangeError: ArrayBuffer length exceeds the maximum".into()));
+                return Err(Thrown(
+                    "RangeError: ArrayBuffer length exceeds the maximum".into(),
+                ));
             }
-            self.heap.replace(oidx, HeapObj::ArrayBuffer { data: vec![0u8; n].into(), detached: false });
+            self.heap.replace(
+                oidx,
+                HeapObj::ArrayBuffer {
+                    data: vec![0u8; n].into(),
+                    detached: false,
+                },
+            );
             if let Some(m) = max {
                 self.ab_max.insert(oidx, m);
             }
@@ -1159,8 +1241,10 @@ impl<'p> Vm<'p> {
         // instance was still a plain Object). `Reflect.construct` already worked;
         // only the derived-`super()` path lands here.
         if cval.is_heap() && self.intl_ctors[0] != 0 {
-            if let Some(kind) =
-                self.intl_ctors.iter().position(|&c| c != 0 && c == cval.heap_index())
+            if let Some(kind) = self
+                .intl_ctors
+                .iter()
+                .position(|&c| c != 0 && c == cval.heap_index())
             {
                 let locales = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let options = args.get(1).copied().unwrap_or(Value::UNDEFINED);
@@ -1179,8 +1263,14 @@ impl<'p> Vm<'p> {
         // object into the instance — Boxed/Date/RegExp carry no heap-index-keyed
         // side state that matters here.
         if pidx != 0
-            && [self.bool_proto, self.num_proto, self.str_proto, self.date_proto, self.regexp_proto]
-                .contains(&pidx)
+            && [
+                self.bool_proto,
+                self.num_proto,
+                self.str_proto,
+                self.date_proto,
+                self.regexp_proto,
+            ]
+            .contains(&pidx)
         {
             let tv = self.construct(cval, args)?;
             let cloned = self.heap.get(tv.heap_index()).clone();
@@ -1201,8 +1291,13 @@ impl<'p> Vm<'p> {
         // carrying the function-keyed side tables so name/length/prototype and
         // callability follow the instance's heap index.
         if cval.is_heap()
-            && [self.function_ctor, self.gen_fn_ctor, self.async_fn_ctor, self.asyncgen_fn_ctor]
-                .contains(&cval.heap_index())
+            && [
+                self.function_ctor,
+                self.gen_fn_ctor,
+                self.async_fn_ctor,
+                self.asyncgen_fn_ctor,
+            ]
+            .contains(&cval.heap_index())
             && cval.heap_index() != 0
         {
             let tv = self.construct(cval, args)?;
@@ -1242,7 +1337,13 @@ impl<'p> Vm<'p> {
         // on the real variant), then add iterable entries via the instance's
         // adder (honouring a subclass override) — modeled on the Map/Set arms.
         if pidx == self.weakmap_proto && self.weakmap_proto != 0 {
-            self.heap.replace(oidx, HeapObj::WeakMap { keys: Vec::new(), vals: Vec::new() });
+            self.heap.replace(
+                oidx,
+                HeapObj::WeakMap {
+                    keys: Vec::new(),
+                    vals: Vec::new(),
+                },
+            );
             // Re-branded in place: no stale collection index may key this slot.
             self.coll_index_invalidate(oidx);
             if sub_proto.is_heap() {
@@ -1304,7 +1405,13 @@ impl<'p> Vm<'p> {
         if pidx == self.map_proto && self.map_proto != 0 {
             // Brand first so the `set` adder operates on a real Map, then add entries
             // via the adder resolved off the instance (honouring a subclass override).
-            self.heap.replace(oidx, HeapObj::Map { keys: Vec::new(), vals: Vec::new() });
+            self.heap.replace(
+                oidx,
+                HeapObj::Map {
+                    keys: Vec::new(),
+                    vals: Vec::new(),
+                },
+            );
             // Re-branded in place: no stale collection index may key this slot.
             self.coll_index_invalidate(oidx);
             if sub_proto.is_heap() {
@@ -1327,22 +1434,29 @@ impl<'p> Vm<'p> {
                     self.display(a0)
                 )));
             }
-            self.heap.replace(oidx, HeapObj::Promise {
-                state: PromiseState::Pending,
-                result: Value::UNDEFINED,
-                reactions: crate::heap::Reactions::None,
-                handled: false,
-            });
+            self.heap.replace(
+                oidx,
+                HeapObj::Promise {
+                    state: PromiseState::Pending,
+                    result: Value::UNDEFINED,
+                    reactions: crate::heap::Reactions::None,
+                    handled: false,
+                },
+            );
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }
             let pair = self.new_resolver_pair();
-            let res = Value::heap(
-                self.heap.alloc(HeapObj::BoundResolver { promise: oidx, is_reject: false, pair }),
-            );
-            let rej = Value::heap(
-                self.heap.alloc(HeapObj::BoundResolver { promise: oidx, is_reject: true, pair }),
-            );
+            let res = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                promise: oidx,
+                is_reject: false,
+                pair,
+            }));
+            let rej = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+                promise: oidx,
+                is_reject: true,
+                pair,
+            }));
             if self.call_value(a0, Value::UNDEFINED, &[res, rej]).is_err() {
                 let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
                 // Step 10.a Call([[Reject]]): no-op once the pair fired.
@@ -1382,5 +1496,4 @@ impl<'p> Vm<'p> {
         }
         Ok(false)
     }
-
 }

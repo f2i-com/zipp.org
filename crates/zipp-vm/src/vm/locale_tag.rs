@@ -77,7 +77,9 @@ pub(crate) fn is_variant_subtag(s: &str) -> bool {
 /// alphanumeric subtags. Also the shape ECMA-402 demands of the `calendar`,
 /// `collation`, `numberingSystem` and `firstDayOfWeek` options.
 pub(crate) fn is_type_sequence(s: &str) -> bool {
-    !s.is_empty() && s.split('-').all(|p| (3..=8).contains(&p.len()) && is_alnum(p))
+    !s.is_empty()
+        && s.split('-')
+            .all(|p| (3..=8).contains(&p.len()) && is_alnum(p))
 }
 /// A `-u-` keyword key: exactly two alphanumerics whose second is a letter.
 fn is_u_key(s: &str) -> bool {
@@ -161,7 +163,10 @@ impl LangTag {
     /// Read a `-u-` keyword value. `Some("")` means "present with no value"
     /// (`-u-kn` — the canonical spelling of `-u-kn-true`).
     pub(crate) fn u_value(&self, key: &str) -> Option<&str> {
-        self.u_keywords.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+        self.u_keywords
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
     }
 
     /// Insert/replace a `-u-` keyword, keeping the list sorted by key. An empty
@@ -182,7 +187,11 @@ impl LangTag {
 /// `"true"` dropped (UTS-35 canonical form of `-u-kn-true` is `-u-kn`).
 fn canon_u_value(v: &str) -> String {
     let l = v.to_ascii_lowercase();
-    if l == "true" { String::new() } else { l }
+    if l == "true" {
+        String::new()
+    } else {
+        l
+    }
 }
 
 /// Parse + canonicalize a `unicode_locale_id`. `None` when the tag is not
@@ -275,7 +284,11 @@ pub(crate) fn parse_lang_tag(tag: &str) -> Option<LangTag> {
                 if !body.iter().all(|p| is_alnum(p)) {
                     return None;
                 }
-                t.private = body.iter().map(|p| p.to_ascii_lowercase()).collect::<Vec<_>>().join("-");
+                t.private = body
+                    .iter()
+                    .map(|p| p.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join("-");
             }
             'u' => {
                 parse_unicode_ext(body, &mut t)?;
@@ -286,12 +299,18 @@ pub(crate) fn parse_lang_tag(tag: &str) -> Option<LangTag> {
             }
             _ => {
                 // other_extensions: (sep alphanum{2,8})+
-                if !body.iter().all(|p| (2..=8).contains(&p.len()) && is_alnum(p)) {
+                if !body
+                    .iter()
+                    .all(|p| (2..=8).contains(&p.len()) && is_alnum(p))
+                {
                     return None;
                 }
                 t.other.push((
                     sing,
-                    body.iter().map(|p| p.to_ascii_lowercase()).collect::<Vec<_>>().join("-"),
+                    body.iter()
+                        .map(|p| p.to_ascii_lowercase())
+                        .collect::<Vec<_>>()
+                        .join("-"),
                 ));
             }
         }
@@ -341,8 +360,9 @@ fn parse_unicode_ext(body: &[&str], t: &mut LangTag) -> Option<()> {
 /// `transformed_extensions = "t" ((sep tlang (sep tfield)*) | (sep tfield)+)`,
 /// where `tfield = tkey tvalue` and `tkey = alpha digit`.
 fn parse_transform_ext(body: &[&str]) -> Option<String> {
-    let is_tkey =
-        |s: &str| s.len() == 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1].is_ascii_digit();
+    let is_tkey = |s: &str| {
+        s.len() == 2 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1].is_ascii_digit()
+    };
     let mut j = 0usize;
     let mut out: Vec<String> = vec![];
     if !is_tkey(body[0]) {
@@ -386,7 +406,11 @@ fn parse_transform_ext(body: &[&str]) -> Option<String> {
         }
         fields.push((
             k,
-            body[vstart..j].iter().map(|p| p.to_ascii_lowercase()).collect::<Vec<_>>().join("-"),
+            body[vstart..j]
+                .iter()
+                .map(|p| p.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join("-"),
         ));
     }
     if out.is_empty() && fields.is_empty() {
@@ -449,10 +473,27 @@ mod tests {
     #[test]
     fn rejects_malformed_tags() {
         for bad in [
-            "", "i", "x", "u", "419", "u-nu-latn-cu-bob", "hans-cmn-cn", "abcdefghi",
-            "cmn-hans-cn-u-u", "cmn-hans-cn-t-u-ca-u", "de-gregory-gregory", "*", "de-*",
-            "中文", "en-ß", "ıd", "en-emodeng-emodeng", "de-t-en-emodeng-emodeng", "en-t",
-            "da-u", "en-US-u-ca-gregory-",
+            "",
+            "i",
+            "x",
+            "u",
+            "419",
+            "u-nu-latn-cu-bob",
+            "hans-cmn-cn",
+            "abcdefghi",
+            "cmn-hans-cn-u-u",
+            "cmn-hans-cn-t-u-ca-u",
+            "de-gregory-gregory",
+            "*",
+            "de-*",
+            "中文",
+            "en-ß",
+            "ıd",
+            "en-emodeng-emodeng",
+            "de-t-en-emodeng-emodeng",
+            "en-t",
+            "da-u",
+            "en-US-u-ca-gregory-",
         ] {
             assert!(canonicalize_tag(bad).is_none(), "{bad} should be invalid");
         }
@@ -461,11 +502,16 @@ mod tests {
     #[test]
     fn canonical_ordering() {
         assert_eq!(
-            canonicalize_tag("de-latn-de-fonipa-1996-u-ca-gregory-co-phonebk-hc-h23-kf-true-kn-false-nu-latn")
-                .as_deref(),
+            canonicalize_tag(
+                "de-latn-de-fonipa-1996-u-ca-gregory-co-phonebk-hc-h23-kf-true-kn-false-nu-latn"
+            )
+            .as_deref(),
             Some("de-Latn-DE-1996-fonipa-u-ca-gregory-co-phonebk-hc-h23-kf-kn-false-nu-latn")
         );
         assert_eq!(canonicalize_tag("EN-us").as_deref(), Some("en-US"));
-        assert_eq!(canonicalize_tag("da-u-ca-gregory-ca-buddhist").as_deref(), Some("da-u-ca-gregory"));
+        assert_eq!(
+            canonicalize_tag("da-u-ca-gregory-ca-buddhist").as_deref(),
+            Some("da-u-ca-gregory")
+        );
     }
 }

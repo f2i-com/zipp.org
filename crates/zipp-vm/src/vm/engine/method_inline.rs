@@ -40,8 +40,9 @@ impl<'p> Vm<'p> {
     ///   declines), so no observable `valueOf`/`ToPrimitive` ever runs off-frame.
     /// * A nested `super.m()` is resolved via the SAME `ic_super_method` cache
     ///   the interpreter uses (live home-class value + version-guarded chain),
-    ///   then evaluated off-frame recursively (depth-bounded) or, if its target
-    ///   isn't trivial, by a real `jit_frame_call` — identical observable effect.
+    ///   then evaluated off-frame recursively (depth-bounded) only when its target
+    ///   is trivial and effect-free. Otherwise the entire method declines before
+    ///   entering that target, so a later frame-call fallback cannot replay it.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn try_method_inline(
         &mut self,
@@ -53,6 +54,14 @@ impl<'p> Vm<'p> {
     ) -> Option<u64> {
         // Pass 1: validate the body shape without executing anything.
         let body_len = self.method_body_inlinable(fid)?;
+        // A post-execution charge cannot enforce a hard budget before a long
+        // straight-line body runs, and nested super/accessor bodies add work not
+        // represented by `body_len`. Fail closed to the ordinary frame path,
+        // whose per-op/native-block meter is exact and checked before execution.
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return None;
+        }
         // Pass 2: execute over a local register window.
         let out = self.run_method_inline(fid, recv, caller_base, arg_base, argc, body_len, 0);
         // These ops ran here, not in `run_loop`, so the dispatch hook never saw
@@ -79,6 +88,10 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Option<u64> {
         let body_len = self.method_body_inlinable(fid)?;
+        #[cfg(feature = "instrument")]
+        if self.jit.metered() {
+            return None;
+        }
         let p = self.func(fid as usize);
         let mut regs = [Value::UNDEFINED; Self::MI_MAX_REGS];
         regs[0] = this_v;
@@ -108,9 +121,9 @@ impl<'p> Vm<'p> {
         let i = fid as usize;
         if i < self.mi_cache.len() {
             match self.mi_cache[i] {
-                v if v == i32::MIN => {}        // not yet computed
-                -1 => return None,              // memoized ineligible
-                v => return Some(v as usize),   // memoized body length
+                v if v == i32::MIN => {}      // not yet computed
+                -1 => return None,            // memoized ineligible
+                v => return Some(v as usize), // memoized body length
             }
         } else {
             self.mi_cache.resize(i + 1, i32::MIN);
@@ -371,15 +384,19 @@ impl<'p> Vm<'p> {
                         }
                     };
                 }
-                I::SuperMethod { dst, home_class_id, name, argc: sargc, .. } => {
-                    let bits = self.mi_super_call(
-                        fid, body_ip, home_class_id, name, sargc, recv, depth,
-                    )?;
+                I::SuperMethod {
+                    dst,
+                    home_class_id,
+                    name,
+                    argc: sargc,
+                    ..
+                } => {
+                    let bits =
+                        self.mi_super_call(fid, body_ip, home_class_id, name, sargc, recv, depth)?;
                     // A nested super target threw — propagate (the region exits;
                     // never re-executed). `CALL_THREW`/`SELF_CALL_DEOPT` are NaN-
                     // tagged sentinels never produced as a real result.
-                    if bits == crate::codegen::CALL_THREW
-                        || bits == crate::codegen::SELF_CALL_DEOPT
+                    if bits == crate::codegen::CALL_THREW || bits == crate::codegen::SELF_CALL_DEOPT
                     {
                         // DEOPT here would re-run the WHOLE method (incl. the
                         // super call) in the interpreter — but a super target that
@@ -396,7 +413,11 @@ impl<'p> Vm<'p> {
                     }
                     regs[dst as usize] = Value::from_bits(bits);
                 }
-                I::SuperGet { dst, home_class_id, name } => {
+                I::SuperGet {
+                    dst,
+                    home_class_id,
+                    name,
+                } => {
                     let v = self.mi_super_get(fid, body_ip, home_class_id, name, recv)?;
                     regs[dst as usize] = v;
                 }
@@ -407,7 +428,12 @@ impl<'p> Vm<'p> {
                     let v = self.super_base(home_class_id, is_static);
                     regs[dst as usize] = v;
                 }
-                I::SuperSet { home_class_id, name, val, base: _ } => {
+                I::SuperSet {
+                    home_class_id,
+                    name,
+                    val,
+                    base: _,
+                } => {
                     // The body's only off-frame side effect. Commits exactly once
                     // (an inherited trivial setter over recv's own data slot) or
                     // declines BEFORE committing (None).
@@ -449,7 +475,12 @@ impl<'p> Vm<'p> {
     /// `numeric_binop` slow path can run observable coercion, so it belongs on
     /// the frame call.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn mi_num_binop(&mut self, op: crate::vm::helpers_misc::BigOp, va: Value, vb: Value) -> Option<Value> {
+    pub(crate) fn mi_num_binop(
+        &mut self,
+        op: crate::vm::helpers_misc::BigOp,
+        va: Value,
+        vb: Value,
+    ) -> Option<Value> {
         use crate::vm::helpers_misc::BigOp;
         match op {
             BigOp::Sub => {
@@ -546,6 +577,20 @@ impl<'p> Vm<'p> {
             Some(b) => b,
             None => return Some(SELF_CALL_DEOPT),
         };
+        // The caller may still hit a later per-execution guard and decline the
+        // WHOLE outer method to a frame call.  Therefore a nested super target
+        // must itself be effect-free: otherwise its terminal SuperSet could
+        // commit here and the outer decline would replay that write.  This
+        // check is recursive in practice — a target containing SuperMethod is
+        // allowed, but that deeper call applies the same gate before entering
+        // its own target.  SuperSet is the only committing op admitted by
+        // `method_body_inlinable_scan`.
+        if self.func(fid as usize).code[..blen]
+            .iter()
+            .any(|instr| matches!(instr, Instr::SuperSet { .. }))
+        {
+            return Some(SELF_CALL_DEOPT);
+        }
         // Only 0-arg super targets run off-frame (every `super.area()` is 0-arg).
         // A super call WITH arguments declines the whole method to a clean frame
         // call (nothing committed) rather than staging args into the pinned
@@ -598,9 +643,7 @@ impl<'p> Vm<'p> {
             // slot. The interpreter frame-calls it with `this = recv`, so reading
             // recv's own field is byte-identical. Anything else → decline (the whole
             // accessor frame-calls; nothing committed).
-            GetAct::Accessor { fid, .. } => {
-                self.accessor_fast_get(fid, recv).map(Value::from_bits)
-            }
+            GetAct::Accessor { fid, .. } => self.accessor_fast_get(fid, recv).map(Value::from_bits),
             // No usable resolution (the interpreter would take its own slow path
             // which can differ) → decline. Nothing committed.
             GetAct::None => None,
@@ -715,7 +758,13 @@ impl<'p> Vm<'p> {
         }
         let c = &p.code;
         // Plain `this.field = arg` (val register == the formal param, reg 1).
-        if let Instr::SetProp { obj: 0, name, val: 1, strict: _ } = c.first()? {
+        if let Instr::SetProp {
+            obj: 0,
+            name,
+            val: 1,
+            strict: _,
+        } = c.first()?
+        {
             return Some((&p.string_constants[*name as usize], false));
         }
         // `this.field = (arg | 0)`: LoadInt 0 → Bitwise Or(arg, 0) → SetProp.
@@ -727,15 +776,171 @@ impl<'p> Vm<'p> {
             return None;
         }
         let or_dst = match c.get(1)? {
-            Instr::Bitwise { dst, a: 1, b, op: BitwiseOp::Or } if *b == zero_dst => *dst,
+            Instr::Bitwise {
+                dst,
+                a: 1,
+                b,
+                op: BitwiseOp::Or,
+            } if *b == zero_dst => *dst,
             _ => return None,
         };
         match c.get(2)? {
-            Instr::SetProp { obj: 0, name, val, strict: _ } if *val == or_dst => {
-                Some((&p.string_constants[*name as usize], true))
-            }
+            Instr::SetProp {
+                obj: 0,
+                name,
+                val,
+                strict: _,
+            } if *val == or_dst => Some((&p.string_constants[*name as usize], true)),
             _ => None,
         }
     }
+}
 
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod replay_safety_tests {
+    use super::*;
+
+    fn vm(source: &str) -> Vm<'static> {
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let program = Box::leak(Box::new(
+            crate::compile::compile_program(&ast, source).expect("source compiles"),
+        ));
+        let mut vm = Vm::new(program);
+        vm.run().expect("program runs");
+        vm
+    }
+
+    fn global(vm: &Vm<'_>, name: &str) -> Value {
+        let slot = vm
+            .program
+            .global_names
+            .iter()
+            .position(|candidate| candidate == name)
+            .unwrap_or_else(|| panic!("missing global {name}"));
+        vm.globals[slot]
+    }
+
+    /// A nested off-frame super call must not commit its own SuperSet and then
+    /// let a later outer guard decline to a full-frame replay of the method.
+    #[test]
+    fn nested_effectful_super_target_declines_before_its_store() {
+        let mut vm = vm(r#"
+                class Parent { set value(v) { this.n = v | 0; } }
+                class Middle extends Parent {
+                    bump() {
+                        const next = this.n + 1;
+                        super.value = next;
+                        return next;
+                    }
+                }
+                class Child extends Middle {
+                    run() {
+                        const next = super.bump();
+                        return next + this.tail;
+                    }
+                }
+                var subject = new Child();
+                subject.n = 0;
+                subject.tail = 1;
+                subject.run();
+                subject.tail = {};
+            "#);
+        let subject = global(&vm, "subject");
+        let run_fid = vm
+            .program
+            .functions
+            .iter()
+            .position(|proto| proto.source.contains("const next = super.bump()"))
+            .expect("Child.run function") as u32;
+        let before = vm.get_prop(subject, "n").expect("read n");
+
+        assert_eq!(
+            vm.try_method_inline(run_fid, subject, 0, 0, 0),
+            None,
+            "the outer non-number Add must decline"
+        );
+        assert_eq!(
+            vm.get_prop(subject, "n").expect("read n after decline"),
+            before,
+            "a decline must not retain the nested super setter's write"
+        );
+    }
+
+    /// A metered VM must use the ordinary frame path, which checks the budget
+    /// before each interpreted op/native block rather than after off-loop work.
+    #[cfg(feature = "instrument")]
+    #[test]
+    fn metered_method_body_declines_before_off_loop_work() {
+        let mut vm = vm(r#"
+                class Subject {
+                    value() { return this.n + 1; }
+                }
+                var subject = new Subject();
+                subject.n = 20;
+            "#);
+        let subject = global(&vm, "subject");
+        let fid = vm
+            .program
+            .functions
+            .iter()
+            .position(|proto| proto.source.contains("return this.n + 1"))
+            .expect("Subject.value function") as u32;
+        vm.set_instrumentation(crate::vm::instrument::Recorder::new());
+        let before = vm.instr_rec.as_ref().expect("recorder attached").used;
+
+        assert_eq!(
+            vm.try_method_inline(fid, subject, 0, 0, 0),
+            None,
+            "nested work must fall back to the exactly metered frame path"
+        );
+        assert_eq!(
+            vm.instr_rec.as_ref().unwrap().used,
+            before,
+            "a declined speculative path must not consume metered work"
+        );
+    }
+
+    /// Direct accessor shortcuts also bypass the dispatch loop. They must not
+    /// read or write a JS accessor body without charging it in a metered VM.
+    #[cfg(feature = "instrument")]
+    #[test]
+    fn metered_accessor_shortcuts_decline_before_read_or_write() {
+        let mut vm = vm(r#"
+                class Subject {
+                    get value() { return this.n; }
+                    set value(x) { this.n = x | 0; }
+                }
+                var subject = new Subject();
+                subject.n = 20;
+            "#);
+        let subject = global(&vm, "subject");
+        let getter = vm
+            .program
+            .functions
+            .iter()
+            .position(|proto| proto.source.contains("return this.n"))
+            .expect("value getter") as u32;
+        let setter = vm
+            .program
+            .functions
+            .iter()
+            .position(|proto| proto.source.contains("this.n = x | 0"))
+            .expect("value setter") as u32;
+        vm.set_instrumentation(crate::vm::instrument::Recorder::new());
+        let before_steps = vm.instr_rec.as_ref().expect("recorder attached").used;
+        let before_value = vm.get_prop(subject, "n").expect("read n");
+
+        assert_eq!(vm.accessor_fast_get(getter, subject), None);
+        assert_eq!(vm.accessor_fast_set(setter, subject, Value::int(99)), None);
+        assert_eq!(
+            vm.get_prop(subject, "n").expect("read n after decline"),
+            before_value,
+            "the metered setter shortcut must decline before its store"
+        );
+        assert_eq!(
+            vm.instr_rec.as_ref().unwrap().used,
+            before_steps,
+            "declined accessor shortcuts must not consume untracked work"
+        );
+    }
 }

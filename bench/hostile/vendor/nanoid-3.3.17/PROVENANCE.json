@@ -1,0 +1,23 @@
+{
+  "package": "nanoid",
+  "version": "3.3.17",
+  "license": "MIT",
+  "npm_tarball": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.17.tgz",
+  "npm_integrity": "sha512-xQLf0A3HOMlgHq0n247/LRuAOYmB7dXJ/DvAxGvsSBij45XtBSmQycu+F8ODbHwns/XyFZagyL1+J0Offw1E0g==",
+  "repository": "https://github.com/ai/nanoid.git",
+  "tag": "3.3.17",
+  "files": {
+    "non-secure/index.mjs": {
+      "upstream_path": "non-secure/index.js",
+      "upstream_url": "https://raw.githubusercontent.com/ai/nanoid/3.3.17/non-secure/index.js",
+      "content_change": "none; only the local extension is .mjs to make the ESM goal explicit",
+      "sha256": "f501474edb0fbf91fd3d53e3556f8f1e19c0dd41da37eb63ae3779447d7ef573"
+    },
+    "LICENSE": {
+      "upstream_path": "LICENSE",
+      "upstream_url": "https://raw.githubusercontent.com/ai/nanoid/3.3.17/LICENSE",
+      "content_change": "none",
+      "sha256": "da4db1480d9beea3483a2eda5c53b22238d0827d57da162b48f122e04d2d9987"
+    }
+  }
+}

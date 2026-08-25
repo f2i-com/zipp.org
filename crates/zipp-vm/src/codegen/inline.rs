@@ -156,7 +156,21 @@ pub(crate) fn emit_inline_leaf_call(
     let fallback = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     let w = plan.reg_window;
-    if let Some((gen_addr, gen_val)) = plan.slot_guard {
+    if let Some(fid) = plan.same_proto_fid {
+        // The live callee may be any of the rotating function identities seen
+        // at this site, but it must still be an ordinary capture-free function
+        // for the planned FuncProto. The read-only helper rejects bound/native/
+        // wrapped/proxy/non-callable/cross-proto replacements to the real call.
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rdx, [rbx + dreg(callee)]
+            ; mov r8d, fid as i32
+            ; mov rax, QWORD plan.same_proto_guard as i64
+            ; call rax
+            ; test rax, rax
+            ; jz => fallback
+        );
+    } else if let Some((gen_addr, gen_val)) = plan.slot_guard {
         // ── W12 slot-generation guard ── the planner proved the callee
         // register holds global slot g's value at this call and every write
         // to g bumps `global_gens[g]` (`slot_guard_key`'s conditions), so ONE
@@ -199,6 +213,53 @@ pub(crate) fn emit_inline_leaf_call(
             ; cmp edx, DWORD plan.callee_ver as i32
             ; jne => fallback
         );
+    }
+    let body_has_direct_global = plan.body.iter().any(|ins| {
+        matches!(
+            ins,
+            Instr::LoadGlobal { .. }
+                | Instr::LoadGlobalOrUndefined { .. }
+                | Instr::StoreGlobal { .. }
+                | Instr::StoreGlobalStrict { .. }
+                | Instr::StoreGlobalResolved { .. }
+        )
+    });
+    debug_assert!(
+        !body_has_direct_global || plan.direct_global_route_epoch.is_some(),
+        "a raw-global leaf reached emission without a route proof"
+    );
+    // The generic boxed expansion emits raw r12 loads/stores and the fused
+    // span helper reads the same slots through Vm. They do not consume the
+    // typed schedule's GlobalRouteGuard, so perform the equivalent VM-relative
+    // comparison before either path can commit. A miss runs the real call.
+    // A typed-only body already emits this check as its first lane step.
+    if let Some(epoch) = plan
+        .direct_global_route_epoch
+        .filter(|_| plan.typed_lane.is_none() || plan.span_code_unit_pred.is_some())
+    {
+        let epoch_off = crate::vm::host_api::JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32;
+        dynasm!(ops
+            ; cmp DWORD [rdi + epoch_off], epoch as i32
+            ; jne => fallback
+        );
+    }
+    // A specialized non-simple callee has only its exact default-parameter
+    // prologue removed. Each supplied live argument must be non-undefined;
+    // explicit undefined (and, conservatively, any future unsupported shape)
+    // performs the real call so initializer ordering/throws/re-entry stay exact.
+    if plan.default_arg_mask != 0 {
+        let undefined = Value::UNDEFINED.bits();
+        for arg in 0..64u16 {
+            if plan.default_arg_mask & (1u64 << arg) == 0 {
+                continue;
+            }
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(arg_base + arg)]
+                ; mov r10, QWORD undefined as i64
+                ; cmp rax, r10
+                ; je => fallback
+            );
+        }
     }
     dynasm!(ops
         // ── headroom flag ── 0 ⇒ the scratch window might overflow the pinned
@@ -1233,9 +1294,9 @@ pub(crate) fn emit_mi_body(
                 // chain) without touching the old prototypes the hop guards watch;
                 // the interpreter re-resolves super via the live class_values, so
                 // catch the swap via the VM epoch (→ helper). One load + compare.
+                let epoch_off = crate::vm::host_api::JIT_MI_CLASS_EPOCH_OFFSET as i32;
                 dynasm!(ops
-                    ; mov rcx, QWORD s.epoch_ptr as i64
-                    ; mov ecx, [rcx]
+                    ; mov ecx, [rdi + epoch_off]
                     ; cmp ecx, DWORD s.epoch_val as i32
                     ; jne => fallback
                 );
@@ -1313,9 +1374,9 @@ pub(crate) fn emit_mi_body(
                 let s = supers
                     .get(&bi)
                     .expect("build_accessor_shape baked a SuperInline for this op");
+                let epoch_off = crate::vm::host_api::JIT_MI_CLASS_EPOCH_OFFSET as i32;
                 dynasm!(ops
-                    ; mov rcx, QWORD s.epoch_ptr as i64
-                    ; mov ecx, [rcx]
+                    ; mov ecx, [rdi + epoch_off]
                     ; cmp ecx, DWORD s.epoch_val as i32
                     ; jne => fallback
                 );
@@ -1441,13 +1502,16 @@ pub(crate) fn emit_inline_method_call(
     // Load the receiver ONCE into rax. On a per-shape guard MISS we `jne` before
     // running any body, so rax still holds the receiver for the next arm; only a
     // HIT clobbers rax (then jumps to `done`). The headroom flag is checked once.
-    dynasm!(ops
-        ; mov rax, [rbx + dreg(obj)]
-        // ── headroom flag ── 0 ⇒ a scratch window might overflow the pinned
-        // register file → take the helper (covers every arm's window).
-        ; cmp QWORD [rsp + method_flag_off], 0
-        ; je => fallback
-    );
+    dynasm!(ops ; mov rax, [rbx + dreg(obj)]);
+    // A typed-only plan uses no scratch window. Its Tier-C wrapper sets
+    // win_top == reg_window, allowing it to skip both the entry helper and this
+    // per-call flag load. Boxed/super plans retain the historical guard.
+    if plan.win_top > plan.reg_window {
+        dynasm!(ops
+            ; cmp QWORD [rsp + method_flag_off], 0
+            ; je => fallback
+        );
+    }
     // ── per-receiver guard tree (≤ JIT_IC_WAYS arms) ── each arm guards a
     // specific instance's identity+version (the ABA / own-shadow / freeze /
     // setPrototypeOf / vals-realloc discriminator); a miss tries the next arm,
@@ -1762,6 +1826,15 @@ const LANE_XMM_HOMES: [u8; 4] = [2, 3, 4, 5];
 /// Defensive cap on scheduled body length (splice bodies are ≤ ~64 ops).
 const LANE_MAX_BODY: usize = 96;
 
+env_off_switch! {
+    /// `ZIPP_NO_TYPED_GLOBAL_LOAD=1` restores the typed splice planner's old
+    /// rule that a `LoadGlobal` may only feed a nested-callee identity guard.
+    /// The default path may also consume it numerically through a live Int-tagged
+    /// load, behind the VM's global-route epoch guard; any other representation
+    /// or a later observable routing change falls back to the real call.
+    fn typed_global_load_enabled() = "ZIPP_NO_TYPED_GLOBAL_LOAD"
+}
+
 /// A 32-bit operand of a lane ALU op: a GPR home's low 32 bits (which ARE the
 /// ToInt32 of the exact i64 value it holds — |v| ≤ 2^53 keeps truncation
 /// trivial) or a compile-time i32 immediate.
@@ -1789,6 +1862,41 @@ pub(crate) enum LaneStep {
     ParamLoad {
         slot: u16,
         d: u8,
+    },
+    /// Guard the VM-wide direct-global routing assumption before any raw
+    /// `[r12 + slot*8]` read in the lane. Ordinary leaf plans only pass this
+    /// guard while the epoch is still zero; `delete` / `defineProperty` makes
+    /// it non-zero and permanently sends the compiled prefix to the real call.
+    GlobalRouteGuard {
+        epoch_val: u32,
+    },
+    /// A real method call at the native-call nesting cap must return to the
+    /// interpreter's flat-frame path. The transactional inline therefore
+    /// shares the same cap as every Tier-C cross-call prefix.
+    CallDepthGuard,
+    /// Load a directly-routable live global slot, tag-guard it as Int and
+    /// sign-extend it into a home. Used only by ordinary leaf plans, whose VM
+    /// planner has already proved every referenced global is slot-backed.
+    GlobalLoadInt {
+        slot: u32,
+        d: u8,
+    },
+    /// Transactional method-lane exit commits. The scheduler appends these
+    /// only after every tag/range/identity guard and after the return value has
+    /// been materialized in the caller window. They contain no branch, helper
+    /// call or allocation, so once the first one runs there is no replay path.
+    GlobalCommitImm {
+        slot: u32,
+        bits: u64,
+    },
+    GlobalCommitInt {
+        slot: u32,
+        s: u8,
+        narrow: bool,
+    },
+    GlobalCommitF64 {
+        slot: u32,
+        s: u8,
     },
     /// The nested-splice identity guard, fused with its feeding `LoadGlobal`:
     /// re-read `globals[g]` (the value the guarded register would hold) and
@@ -1923,7 +2031,6 @@ pub(crate) enum LaneStep {
     /// dst. Emitted with rax/rcx only — the boxed emitter's copy of this
     /// block clobbers rdx and r10, which ARE lane value homes.
     SuperGuard {
-        epoch_ptr: u64,
         epoch_val: u32,
         hops_at: u16,
         hops_len: u16,
@@ -1972,6 +2079,7 @@ fn lane_use_def(ins: &Instr) -> Option<(([u16; 3], u8), Option<u16>)> {
         Instr::LoadInt { dst, .. }
         | Instr::LoadConst { dst, .. }
         | Instr::LoadGlobal { dst, .. }
+        | Instr::LoadGlobalOrUndefined { dst, .. }
         | Instr::UpvalGet { dst, .. } => u0(Some(dst)),
         Instr::Move { dst, src } => u1(src, Some(dst)),
         Instr::Add { dst, a, b }
@@ -1992,7 +2100,10 @@ fn lane_use_def(ins: &Instr) -> Option<(([u16; 3], u8), Option<u16>)> {
                 u1(arg_base, Some(dst))
             }
         }
-        Instr::UpvalSet { src, .. } => u1(src, None),
+        Instr::UpvalSet { src, .. }
+        | Instr::StoreGlobal { src, .. }
+        | Instr::StoreGlobalStrict { src, .. }
+        | Instr::StoreGlobalResolved { src, .. } => u1(src, None),
         // W19 (MI-LANE): `this.<field>` reads NO vreg — the receiver is baked
         // into the step as an absolute `vals` address behind the arm's
         // identity+version guard. `obj != 0` stays unmodelled (`None`).
@@ -2055,6 +2166,30 @@ fn lane_buffer_live_from(body: &[Instr], from: usize, idx: u16) -> bool {
     true // survives to the exit commit
 }
 
+/// Is the CURRENT buffered value of global slot `idx` still needed at or after
+/// `from`? A later read observes it; a later write supersedes it; otherwise it
+/// remains live until the transactional exit commit.
+fn lane_global_buffer_live_from(body: &[Instr], from: usize, idx: u32) -> bool {
+    for ins in &body[from.min(body.len())..] {
+        match *ins {
+            Instr::LoadGlobal { idx: k, .. } | Instr::LoadGlobalOrUndefined { idx: k, .. }
+                if k == idx =>
+            {
+                return true;
+            }
+            Instr::StoreGlobal { idx: k, .. }
+            | Instr::StoreGlobalStrict { idx: k, .. }
+            | Instr::StoreGlobalResolved { idx: k, .. }
+                if k == idx =>
+            {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 /// ToInt32 of an exact integer ≤ 2^53 in magnitude: the low 32 bits.
 fn to_i32_exact(v: i64) -> i32 {
     v as u32 as i32
@@ -2096,9 +2231,13 @@ struct LaneBuilder<'a> {
     slots: Vec<Av>,
     binds: FxHashMap<u16, usize>,
     buffer: FxHashMap<u16, usize>,
+    gbuffer: FxHashMap<u32, usize>,
     uentry: FxHashMap<u16, usize>,
     steps: Vec<LaneStep>,
     n_guards: u16,
+    /// Ordinary leaf planning pre-validates direct global routing. Method lanes
+    /// do not, so they retain the historical callee-guard-only treatment.
+    allow_global_values: bool,
     /// Side storage for `LaneStep::SuperGuard` hop lists.
     hop_pool: Vec<(u32, u32)>,
 }
@@ -2129,6 +2268,11 @@ impl LaneBuilder<'_> {
         }
         for (&idx, &sid) in &self.buffer {
             if hits(sid) && lane_buffer_live_from(self.body, from, idx) {
+                return true;
+            }
+        }
+        for (&idx, &sid) in &self.gbuffer {
+            if hits(sid) && lane_global_buffer_live_from(self.body, from, idx) {
                 return true;
             }
         }
@@ -2176,6 +2320,18 @@ impl LaneBuilder<'_> {
     fn resolve(&mut self, i: usize, v: u16) -> Result<usize, &'static str> {
         if let Some(&sid) = self.binds.get(&v) {
             return match self.slots[sid] {
+                Av::Callee { g } if self.allow_global_values => {
+                    let h = self.alloc_gpr(i, &[], None)?;
+                    self.steps.push(LaneStep::GlobalLoadInt { slot: g, d: h });
+                    self.n_guards += 1;
+                    let sid = self.push_slot(Av::Int {
+                        h,
+                        lo: IV32.0,
+                        hi: IV32.1,
+                    });
+                    self.binds.insert(v, sid);
+                    Ok(sid)
+                }
                 Av::Callee { .. } => Err("callee-value-escapes"),
                 _ => Ok(sid),
             };
@@ -2470,7 +2626,6 @@ impl LaneBuilder<'_> {
 /// flattener instead of by the emitter).
 #[derive(Clone)]
 pub(crate) struct MiSuperGuard {
-    pub(crate) epoch_ptr: u64,
     pub(crate) epoch_val: u32,
     pub(crate) hops: Vec<(u32, u32)>,
     pub(crate) holder_vals_ptr: u64,
@@ -2635,7 +2790,6 @@ fn mi_flatten(
                 guards.insert(
                     flat.len(),
                     MiSuperGuard {
-                        epoch_ptr: s.epoch_ptr,
                         epoch_val: s.epoch_val,
                         hops: s.hops.clone(),
                         holder_vals_ptr: s.holder_vals_ptr,
@@ -2706,6 +2860,7 @@ pub(crate) fn build_mi_lane(
     param_count: u16,
     argc: u16,
     arg_base: u16,
+    global_route_guard: Option<u32>,
 ) -> Result<TypedLanePlan, &'static str> {
     // ── v1: EFFECT-FREE bodies only ── an effectful body's mid-lane guard bail
     // would re-run the whole call through the helper and DOUBLE-APPLY a store
@@ -2774,6 +2929,8 @@ pub(crate) fn build_mi_lane(
         &consts,
         &no_nested,
         Some(&ctx),
+        global_route_guard,
+        global_route_guard.is_some(),
     )
 }
 
@@ -2782,6 +2939,7 @@ pub(crate) fn build_mi_lane(
 /// emitted byte-identically to today. See the module comment above for the
 /// invariants; the closed op set is exactly the match below.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn build_typed_lane(
     body: &[Instr],
     param_count: u16,
@@ -2792,6 +2950,39 @@ pub(crate) fn build_typed_lane(
     upvals: &FxHashMap<u16, u64>,
     consts: &FxHashMap<u32, u64>,
     nested: &FxHashMap<usize, NestedGuard>,
+) -> Result<TypedLanePlan, &'static str> {
+    build_typed_lane_guarded(
+        body,
+        param_count,
+        argc,
+        arg_base,
+        reg_window,
+        callee_reg_count,
+        upvals,
+        consts,
+        nested,
+        None,
+    )
+}
+
+/// VM-facing typed-lane builder. `global_route_guard` is the expected value of
+/// the VM's global-route epoch; emitted code reads it relative to the live VM
+/// argument so a persistent `ScriptState` may move safely. Passing `None` is
+/// deliberately fail-closed when the body contains a direct global access;
+/// the unit-facing wrapper above therefore cannot accidentally construct an
+/// unguarded raw-global lane.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_typed_lane_guarded(
+    body: &[Instr],
+    param_count: u16,
+    argc: u16,
+    arg_base: u16,
+    reg_window: u16,
+    callee_reg_count: u16,
+    upvals: &FxHashMap<u16, u64>,
+    consts: &FxHashMap<u32, u64>,
+    nested: &FxHashMap<usize, NestedGuard>,
+    global_route_guard: Option<u32>,
 ) -> Result<TypedLanePlan, &'static str> {
     build_lane_inner(
         body,
@@ -2804,6 +2995,8 @@ pub(crate) fn build_typed_lane(
         consts,
         nested,
         None,
+        global_route_guard,
+        false,
     )
 }
 
@@ -2819,6 +3012,8 @@ fn build_lane_inner(
     consts: &FxHashMap<u32, u64>,
     nested: &FxHashMap<usize, NestedGuard>,
     mi: Option<&MiLaneCtx>,
+    global_route_guard: Option<u32>,
+    allow_global_stores: bool,
 ) -> Result<TypedLanePlan, &'static str> {
     use crate::bytecode::BitwiseOp as B;
     if body.len() > LANE_MAX_BODY {
@@ -2836,6 +3031,33 @@ fn build_lane_inner(
     }) {
         return Err("branchy-body");
     }
+    let has_direct_global = body.iter().any(|ins| {
+        matches!(
+            ins,
+            Instr::LoadGlobal { .. }
+                | Instr::LoadGlobalOrUndefined { .. }
+                | Instr::StoreGlobal { .. }
+                | Instr::StoreGlobalStrict { .. }
+                | Instr::StoreGlobalResolved { .. }
+        )
+    });
+    if has_direct_global && global_route_guard.is_none() {
+        return Err("global-route-unguarded");
+    }
+    let mut steps = Vec::new();
+    let mut n_guards = 0;
+    if mi.is_some() && allow_global_stores {
+        // This lane replaces a real CallMethod activation. At the native-call
+        // nesting cap the ordinary helper declines to the flat interpreter;
+        // doing the same here preserves its catchable recursion contract.
+        steps.push(LaneStep::CallDepthGuard);
+        n_guards += 1;
+    }
+    if has_direct_global {
+        let epoch_val = global_route_guard.expect("checked above");
+        steps.push(LaneStep::GlobalRouteGuard { epoch_val });
+        n_guards += 1;
+    }
     let mut b = LaneBuilder {
         body,
         param_count,
@@ -2844,9 +3066,11 @@ fn build_lane_inner(
         slots: Vec::new(),
         binds: FxHashMap::default(),
         buffer: FxHashMap::default(),
+        gbuffer: FxHashMap::default(),
         uentry: FxHashMap::default(),
-        steps: Vec::new(),
-        n_guards: 0,
+        steps,
+        n_guards,
+        allow_global_values: global_route_guard.is_some() && typed_global_load_enabled(),
         hop_pool: Vec::new(),
     };
     // ── entry: hoisted upval loads ── every upval index whose FIRST body op
@@ -2936,8 +3160,12 @@ fn build_lane_inner(
                 let sid = b.resolve(i, src)?;
                 b.binds.insert(dst, sid);
             }
-            Instr::LoadGlobal { dst, idx } => {
-                let sid = b.push_slot(Av::Callee { g: idx });
+            Instr::LoadGlobal { dst, idx } | Instr::LoadGlobalOrUndefined { dst, idx } => {
+                let sid = if let Some(&sid) = b.gbuffer.get(&idx) {
+                    sid
+                } else {
+                    b.push_slot(Av::Callee { g: idx })
+                };
                 b.binds.insert(dst, sid);
             }
             // ── W19 (MI-LANE): `this.<field>` ── a baked absolute load behind
@@ -2985,7 +3213,6 @@ fn build_lane_inner(
                 }
                 b.hop_pool.extend_from_slice(&g.hops);
                 b.steps.push(LaneStep::SuperGuard {
-                    epoch_ptr: g.epoch_ptr,
                     epoch_val: g.epoch_val,
                     hops_at: at as u16,
                     hops_len: g.hops.len() as u16,
@@ -3177,6 +3404,12 @@ fn build_lane_inner(
                 }
                 b.buffer.insert(idx, sid);
             }
+            Instr::StoreGlobal { idx, src } | Instr::StoreGlobalStrict { idx, src }
+                if allow_global_stores =>
+            {
+                let sid = b.resolve(i, src)?;
+                b.gbuffer.insert(idx, sid);
+            }
             Instr::Return { src } => {
                 if i != body.len() - 1 {
                     return Err("return-not-terminal");
@@ -3239,6 +3472,27 @@ fn build_lane_inner(
             slot: reg_window + k as u16,
         });
     }
+    // ── exit global commit ── unlike cell commits these are raw stores of
+    // already-boxed numeric values to planner-proved direct slots. They are
+    // deliberately LAST: no guard, helper, allocation or fallback follows the
+    // first commit, so interpreter replay can never double-apply a write.
+    let mut gpending: Vec<(u32, usize)> = b.gbuffer.iter().map(|(&k, &s)| (k, s)).collect();
+    gpending.sort_unstable();
+    for (slot, sid) in gpending {
+        match b.slots[sid] {
+            Av::ImmI(_) | Av::ImmF(_) => b.steps.push(LaneStep::GlobalCommitImm {
+                slot,
+                bits: lane_box_imm(b.slots[sid]),
+            }),
+            Av::Int { h, lo, hi } => b.steps.push(LaneStep::GlobalCommitInt {
+                slot,
+                s: h,
+                narrow: lo >= IV32.0 && hi <= IV32.1,
+            }),
+            Av::F64 { h } => b.steps.push(LaneStep::GlobalCommitF64 { slot, s: h }),
+            Av::Callee { .. } => return Err("global-value-unresolved"),
+        }
+    }
     let n_ops = b.steps.len() as u16;
     let n_guards = b.n_guards;
     Ok(TypedLanePlan {
@@ -3300,6 +3554,71 @@ fn emit_typed_lane(
                     ; cmp ecx, INT_TAG_HI as i32
                     ; jne => fallback
                     ; movsxd Rq(d), eax
+                );
+            }
+            LaneStep::GlobalRouteGuard { epoch_val } => {
+                let epoch_off = crate::vm::host_api::JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32;
+                dynasm!(ops
+                    ; cmp DWORD [rdi + epoch_off], epoch_val as i32
+                    ; jne => fallback
+                );
+            }
+            LaneStep::CallDepthGuard => {
+                let depth_off = crate::vm::host_api::JIT_CALL_DEPTH_OFFSET as i32;
+                dynasm!(ops
+                    ; mov eax, [rdi + depth_off]
+                    ; cmp eax, crate::vm::JIT_REGION_CALL_MAX as i32
+                    ; jae => fallback
+                );
+            }
+            LaneStep::GlobalLoadInt { slot, d } => {
+                dynasm!(ops
+                    ; mov rax, [r12 + (slot as i32) * 8]
+                    ; mov rcx, rax
+                    ; shr rcx, 48
+                    ; cmp ecx, INT_TAG_HI as i32
+                    ; jne => fallback
+                    ; movsxd Rq(d), eax
+                );
+            }
+            LaneStep::GlobalCommitImm { slot, bits } => {
+                dynasm!(ops
+                    ; mov rax, QWORD bits as i64
+                    ; mov [r12 + (slot as i32) * 8], rax
+                );
+            }
+            LaneStep::GlobalCommitInt { slot, s, narrow } => {
+                if narrow {
+                    dynasm!(ops
+                        ; mov eax, Rd(s)
+                        ; mov rcx, QWORD INT_TAG as i64
+                        ; or rax, rcx
+                        ; mov [r12 + (slot as i32) * 8], rax
+                    );
+                } else {
+                    let wide = ops.new_dynamic_label();
+                    let store = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; movsxd rax, Rd(s)
+                        ; cmp rax, Rq(s)
+                        ; jne => wide
+                        ; mov eax, eax
+                        ; mov rcx, QWORD INT_TAG as i64
+                        ; or rax, rcx
+                        ; jmp => store
+                        ; => wide
+                        ; xorps xmm0, xmm0
+                        ; cvtsi2sd xmm0, Rq(s)
+                        ; movq rax, xmm0
+                        ; => store
+                        ; mov [r12 + (slot as i32) * 8], rax
+                    );
+                }
+            }
+            LaneStep::GlobalCommitF64 { slot, s } => {
+                dynasm!(ops
+                    ; movq rax, Rx(s)
+                    ; mov [r12 + (slot as i32) * 8], rax
                 );
             }
             LaneStep::CalleeGuard { gidx, bits, ver } => {
@@ -3598,7 +3917,6 @@ fn emit_typed_lane(
             // would silently corrupt live intermediates. r13 (the version
             // array base) is valid — a v1 lane runs no allocating helper.
             LaneStep::SuperGuard {
-                epoch_ptr,
                 epoch_val,
                 hops_at,
                 hops_len,
@@ -3606,9 +3924,9 @@ fn emit_typed_lane(
                 holder_slot,
                 fn_bits,
             } => {
+                let epoch_off = crate::vm::host_api::JIT_MI_CLASS_EPOCH_OFFSET as i32;
                 dynasm!(ops
-                    ; mov rcx, QWORD epoch_ptr as i64
-                    ; mov ecx, [rcx]
+                    ; mov ecx, [rdi + epoch_off]
                     ; cmp ecx, DWORD epoch_val as i32
                     ; jne => fallback
                 );
@@ -3973,5 +4291,150 @@ mod lane_tests {
             .steps
             .iter()
             .any(|s| matches!(s, LaneStep::CellCommit { .. })));
+    }
+
+    /// Transactional global writes are never emitted in source order. Even a
+    /// late type guard must precede the first store; repeated writes collapse
+    /// to last-write-wins, and a read after a buffered write forwards that
+    /// buffered value instead of re-reading the live global table.
+    #[test]
+    fn method_global_commits_are_a_guard_free_tail() {
+        let body = vec![
+            Instr::LoadGlobal { dst: 1, idx: 7 },
+            Instr::LoadInt { dst: 2, val: 1 },
+            Instr::Add { dst: 3, a: 1, b: 2 },
+            Instr::StoreGlobalStrict { idx: 7, src: 3 },
+            // Must forward the buffered value written above.
+            Instr::LoadGlobal { dst: 4, idx: 7 },
+            // Its Int tag check is deliberately late, after the first textual
+            // StoreGlobal, and must still run before any physical commit.
+            Instr::LoadGlobal { dst: 5, idx: 8 },
+            Instr::Bitwise {
+                dst: 6,
+                a: 4,
+                b: 5,
+                op: crate::bytecode::BitwiseOp::Xor,
+            },
+            // Repeat slot 7 and alias the buffered slot-7 value into slot 9.
+            Instr::StoreGlobal { idx: 7, src: 6 },
+            Instr::StoreGlobal { idx: 9, src: 4 },
+            Instr::Return { src: 6 },
+        ];
+        let mi = MiLaneCtx {
+            vals_ptr: 0,
+            fields: FxHashMap::default(),
+            guards: FxHashMap::default(),
+        };
+        let lane = build_lane_inner(
+            &body,
+            0,
+            0,
+            0,
+            0,
+            10,
+            &no_upvals(),
+            &no_consts(),
+            &no_nested(),
+            Some(&mi),
+            Some(0),
+            true,
+        )
+        .expect("closed global method body must schedule");
+
+        let first_commit = lane
+            .steps
+            .iter()
+            .position(|s| {
+                matches!(
+                    s,
+                    LaneStep::GlobalCommitImm { .. }
+                        | LaneStep::GlobalCommitInt { .. }
+                        | LaneStep::GlobalCommitF64 { .. }
+                )
+            })
+            .expect("buffered stores must commit");
+        assert!(lane.steps[..first_commit]
+            .iter()
+            .any(|s| matches!(s, LaneStep::CallDepthGuard)));
+        assert!(lane.steps[..first_commit]
+            .iter()
+            .any(|s| matches!(s, LaneStep::GlobalRouteGuard { .. })));
+        assert!(lane.steps[..first_commit]
+            .iter()
+            .any(|s| matches!(s, LaneStep::GlobalLoadInt { slot: 8, .. })));
+        assert!(lane.steps[first_commit..].iter().all(|s| matches!(
+            s,
+            LaneStep::GlobalCommitImm { .. }
+                | LaneStep::GlobalCommitInt { .. }
+                | LaneStep::GlobalCommitF64 { .. }
+        )));
+
+        let loads_7 = lane
+            .steps
+            .iter()
+            .filter(|s| matches!(s, LaneStep::GlobalLoadInt { slot: 7, .. }))
+            .count();
+        assert_eq!(loads_7, 1, "read-after-write must use the buffered value");
+        let committed: Vec<u32> = lane.steps[first_commit..]
+            .iter()
+            .map(|s| match *s {
+                LaneStep::GlobalCommitImm { slot, .. }
+                | LaneStep::GlobalCommitInt { slot, .. }
+                | LaneStep::GlobalCommitF64 { slot, .. } => slot,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(committed, vec![7, 9], "last write per slot, sorted commit");
+    }
+
+    #[test]
+    fn method_globals_fail_closed_without_exact_route_or_store_kind() {
+        let mi = MiLaneCtx {
+            vals_ptr: 0,
+            fields: FxHashMap::default(),
+            guards: FxHashMap::default(),
+        };
+        let load = [
+            Instr::LoadGlobal { dst: 1, idx: 7 },
+            Instr::Return { src: 1 },
+        ];
+        let unguarded = build_lane_inner(
+            &load,
+            0,
+            0,
+            0,
+            0,
+            2,
+            &no_upvals(),
+            &no_consts(),
+            &no_nested(),
+            Some(&mi),
+            None,
+            true,
+        );
+        assert_eq!(unguarded.err(), Some("global-route-unguarded"));
+
+        // StoreGlobalResolved carries environment-routing semantics that this
+        // root-slot transaction deliberately does not reproduce.
+        let resolved = [
+            Instr::LoadInt { dst: 1, val: 1 },
+            Instr::StoreGlobalResolved { idx: 7, src: 1 },
+            Instr::Return { src: 1 },
+        ];
+        let unsupported = build_lane_inner(
+            &resolved,
+            0,
+            0,
+            0,
+            0,
+            2,
+            &no_upvals(),
+            &no_consts(),
+            &no_nested(),
+            Some(&mi),
+            Some(0),
+            true,
+        );
+        assert_eq!(unsupported.err(), Some("op-outside-lane-set"));
     }
 }

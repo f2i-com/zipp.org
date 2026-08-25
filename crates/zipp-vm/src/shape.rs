@@ -146,8 +146,22 @@ impl Table {
         // plain constants.
         Table {
             nodes: vec![
-                Node { parent: 0, key: "".into(), attr_bits: 0, len: 0, next: Vec::new(), index: None },
-                Node { parent: 0, key: "".into(), attr_bits: 0, len: 0, next: Vec::new(), index: None },
+                Node {
+                    parent: 0,
+                    key: "".into(),
+                    attr_bits: 0,
+                    len: 0,
+                    next: Vec::new(),
+                    index: None,
+                },
+                Node {
+                    parent: 0,
+                    key: "".into(),
+                    attr_bits: 0,
+                    len: 0,
+                    next: Vec::new(),
+                    index: None,
+                },
             ],
         }
     }
@@ -191,7 +205,10 @@ fn disabled() -> bool {
 /// setters.
 #[inline]
 pub fn attr_bits(writable: bool, enumerable: bool, configurable: bool, accessor: bool) -> u8 {
-    (writable as u8) | ((enumerable as u8) << 1) | ((configurable as u8) << 2) | ((accessor as u8) << 3)
+    (writable as u8)
+        | ((enumerable as u8) << 1)
+        | ((configurable as u8) << 2)
+        | ((accessor as u8) << 3)
 }
 
 /// The shape reached by appending `key` to `from`. [`DICT`] in, [`DICT`] out.
@@ -382,7 +399,10 @@ mod tests {
     fn attributes_are_part_of_identity() {
         let plain = add(EMPTY, "x", D);
         let non_enum = add(EMPTY, "x", attr_bits(true, false, true, false));
-        assert_ne!(plain, non_enum, "enumerability is observable, so it is shape state");
+        assert_ne!(
+            plain, non_enum,
+            "enumerability is observable, so it is shape state"
+        );
     }
 
     #[test]

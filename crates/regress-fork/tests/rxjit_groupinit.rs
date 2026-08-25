@@ -53,8 +53,14 @@ fn stream_drain(re: &Regex, text: &str, start: usize, cap: usize) -> Stream {
         if re.scan_ascii(text, from, cap, &mut |r, caps| out.push((r, caps.to_vec()))) {
             return out;
         }
-        let (last, _) = out.last().expect("a non-exhausted drain emitted at least one hit");
-        from = if last.start == last.end { last.end + 1 } else { last.end };
+        let (last, _) = out
+            .last()
+            .expect("a non-exhausted drain emitted at least one hit");
+        from = if last.start == last.end {
+            last.end + 1
+        } else {
+            last.end
+        };
     }
 }
 
@@ -82,7 +88,10 @@ fn cases() -> Vec<(String, String)> {
     add(r"(?:(a)(b)(c)(d)e|z)", "abcdz abcz abz az z");
     // The row's own shapes.
     add(r"([a-z]+)=(\d+)", "a=1 bb=22 ccc=333 x= =5 e=6 q");
-    add(r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})", "1.2.3.4 x 10.20.30.40 9.9.9");
+    add(
+        r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})",
+        "1.2.3.4 x 10.20.30.40 9.9.9",
+    );
     add(r"//+(\w+)", "a//b/c//dd///e");
     // Empty matches interleaved with capturing ones (advance + reset).
     add(r"(a)|", "aba");
@@ -144,16 +153,31 @@ fn rx_groupinit_prologue_reset() {
             let ctx = format!("/{p}/g over {s:?} from {start}");
             assert_eq!(interp_iter, on_iter, "iter: jit/interp divergence, {ctx}");
             assert_eq!(interp_iter, off_iter, "iter: off-switch divergence, {ctx}");
-            assert_eq!(interp_drain, on_drain3, "drain: jit/interp divergence, {ctx}");
-            assert_eq!(on_drain_all, off_drain_all, "drain: switch divergence, {ctx}");
+            assert_eq!(
+                interp_drain, on_drain3,
+                "drain: jit/interp divergence, {ctx}"
+            );
+            assert_eq!(
+                on_drain_all, off_drain_all,
+                "drain: switch divergence, {ctx}"
+            );
             // A drained stream must equal the one-match-at-a-time stream: the
             // iter path opens a FRESH session per match (so `Session::new`
             // resets its slots), the drain shares one across hits. Only the
             // per-attempt reset makes the two agree.
-            assert_eq!(on_iter, on_drain_all, "drain != iter under the emitted reset, {ctx}");
+            assert_eq!(
+                on_iter, on_drain_all,
+                "drain != iter under the emitted reset, {ctx}"
+            );
             assert_eq!(on_drain1, on_drain_all, "cap-1 resume diverged, {ctx}");
-            assert_eq!(interp_iter, legacy_on, "run_attempt: emitted-reset divergence, {ctx}");
-            assert_eq!(interp_iter, legacy_off, "run_attempt: off-switch divergence, {ctx}");
+            assert_eq!(
+                interp_iter, legacy_on,
+                "run_attempt: emitted-reset divergence, {ctx}"
+            );
+            assert_eq!(
+                interp_iter, legacy_off,
+                "run_attempt: off-switch divergence, {ctx}"
+            );
         }
     }
 
@@ -188,8 +212,14 @@ fn rx_groupinit_prologue_reset() {
         4096,
     ));
     regress::__rxjit_force(None);
-    assert_eq!(grow_on, grow_off, "bt-grow retry diverged across the switch");
-    assert_eq!(grow_on, grow_interp, "bt-grow retry diverged from the interpreter");
+    assert_eq!(
+        grow_on, grow_off,
+        "bt-grow retry diverged across the switch"
+    );
+    assert_eq!(
+        grow_on, grow_interp,
+        "bt-grow retry diverged from the interpreter"
+    );
 
     // --- 3. The thread-local scratch is SHARED between regexes. A regex with
     // the same group count must not read the previous one's leftovers. ---
@@ -224,5 +254,8 @@ fn rx_groupinit_prologue_reset() {
     let compiled = engaged.__rxjit_is_compiled();
     regress::__rx_groupinit_force(None);
     regress::__rxjit_force(None);
-    assert!(compiled, "the forced JIT did not compile: the corpus ran interpreted");
+    assert!(
+        compiled,
+        "the forced JIT did not compile: the corpus ran interpreted"
+    );
 }

@@ -17,13 +17,18 @@ use zipp_vm::run;
 
 fn out(src: &str) -> String {
     let o = run(src).expect("compile");
-    assert!(o.error.is_none(), "unexpected throw: {:?}\nsrc:\n{src}", o.error);
+    assert!(
+        o.error.is_none(),
+        "unexpected throw: {:?}\nsrc:\n{src}",
+        o.error
+    );
     o.output.join("\n")
 }
 
 fn thrown(src: &str) -> String {
     let o = run(src).expect("compile");
-    o.error.unwrap_or_else(|| format!("did not throw; output {:?}", o.output))
+    o.error
+        .unwrap_or_else(|| format!("did not throw; output {:?}", o.output))
 }
 
 /// Decorator EXPRESSIONS evaluate in source order interleaved with computed
@@ -43,7 +48,10 @@ fn decorator_expressions_evaluate_in_source_order_before_the_heritage() {
       }
       console.log(L.join(","));
     "#;
-    assert_eq!(out(src), "eval C1,eval C2,heritage,eval m,key mk,eval f,key fk");
+    assert_eq!(
+        out(src),
+        "eval C1,eval C2,heritage,eval m,key mk,eval f,key fk"
+    );
 }
 
 /// Elements are DECORATED in four groups — static non-fields, instance
@@ -253,7 +261,11 @@ fn add_initializer_is_closed_per_decorator_call() {
 fn accessor_decorator_result_is_validated() {
     for bad in ["{ get: 5 }", "{ set: 5 }", "{ init: 5 }", "5"] {
         let src = format!("function d(v, c) {{ return {bad}; }} class X {{ @d accessor a = 1; }}");
-        assert!(thrown(&src).contains("TypeError"), "{bad}: {}", thrown(&src));
+        assert!(
+            thrown(&src).contains("TypeError"),
+            "{bad}: {}",
+            thrown(&src)
+        );
     }
     // An Object with none of the three is a no-op, not an error — and a
     // function IS an Object (`If newValue is an Object`), which is where both

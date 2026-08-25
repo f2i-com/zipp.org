@@ -722,6 +722,199 @@ mod tests {
         assert_eq!(st.eval_in_context("counter"), Ok(JsValue::Number(2.0)));
     }
 
+    /// Persistent native code receives the live VM on every entry. Epoch
+    /// guards must derive their address from that argument rather than baking
+    /// a pointer into the movable `ScriptState` allocation.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[test]
+    fn moving_hot_state_keeps_route_and_class_epoch_guards_live() {
+        let mut first = Vec::with_capacity(1);
+        first.push(
+            compile_script(
+                r#"
+                routeState = 1;
+                var routeSeen = 0;
+                function routeRandom() {
+                    routeState = (routeState + 1) | 0;
+                    return routeState;
+                }
+                var routeObj = { random: routeRandom };
+                function invokeRoute() { return routeObj.random(); }
+                function warmRoute(n) {
+                    var out = 0;
+                    for (var i = 0; i < n; i++) out = invokeRoute();
+                    return out;
+                }
+
+                leafState = 1;
+                var leafSeen = 0, leafLast = 0;
+                function leafStep(x) {
+                    leafState = (leafState + x) | 0;
+                    return leafState;
+                }
+                function warmLeaf(n) {
+                    var out = 0, kind = "";
+                    for (var i = 0; i < n; i++) {
+                        kind = (i & 1) ? "odd" : "even";
+                        out = leafStep((i & 3) + 1);
+                    }
+                    return kind === "never" ? -1 : out;
+                }
+
+                intLeafState = 1;
+                var intLeafSeen = 0, intLeafLast = 0;
+                function intLeafStep(x) {
+                    intLeafState = (intLeafState + x) | 0;
+                }
+                function warmIntLeaf(n) {
+                    for (var i = 0; i < n; i++) intLeafStep(1);
+                    return intLeafState;
+                }
+
+                function make(k) {
+                    class A {
+                        constructor(v) { this._v = v | 0; }
+                        area() { return this._v + k; }
+                    }
+                    class B extends A {
+                        area() { return super.area() * 3 + 1; }
+                    }
+                    return new B(11);
+                }
+                var superObj = make(1);
+                function invokeSuper() { return superObj.area(); }
+                function warmSuper(n) {
+                    var out = 0;
+                    for (var i = 0; i < n; i++) out = invokeSuper();
+                    return out;
+                }
+                function retargetSuper() { make(50); return invokeSuper(); }
+            "#,
+            )
+            .expect("compiles"),
+        );
+        let st = &mut first[0];
+        st.run_init().expect("initializes");
+        assert_eq!(
+            st.call_global("warmRoute", &[JsValue::Number(5_000.0)]),
+            Ok(JsValue::Number(5_001.0))
+        );
+        assert_eq!(
+            st.call_global("warmLeaf", &[JsValue::Number(5_000.0)]),
+            Ok(JsValue::Number(12_501.0))
+        );
+        assert_eq!(
+            st.call_global("warmIntLeaf", &[JsValue::Number(5_000.0)]),
+            Ok(JsValue::Number(5_001.0))
+        );
+        assert_eq!(
+            st.call_global("warmSuper", &[JsValue::Number(60_000.0)]),
+            Ok(JsValue::Number(37.0))
+        );
+
+        // Keep the first Vec's allocation alive while moving the state into a
+        // separately allocated Vec. A stale absolute epoch pointer therefore
+        // remains readable (and unchanged), making this a deterministic
+        // regression rather than relying on freed-memory behaviour.
+        let before = first[0].vm.as_ref().unwrap() as *const Vm<'static> as usize;
+        let mut second = Vec::with_capacity(1);
+        second.push(first.pop().unwrap());
+        let after = second[0].vm.as_ref().unwrap() as *const Vm<'static> as usize;
+        assert_ne!(before, after, "the test must physically move the VM");
+        // Refill the exact old allocation with a different live VM whose
+        // epochs are both zero. Before the fix, absolute pointers baked while
+        // warming `first[0]` legally read these unchanged sentinel fields and
+        // deterministically missed both mutations below.
+        first.push(compile_script("0;").expect("sentinel compiles"));
+        let sentinel = first[0].vm.as_ref().unwrap() as *const Vm<'static> as usize;
+        assert_eq!(before, sentinel, "the old VM address must remain live");
+        let st = &mut second[0];
+
+        st.eval_in_context(
+            r#"Object.defineProperty(globalThis, "routeState", {
+                   configurable: true,
+                   get: function () { return 40; },
+                   set: function (v) { routeSeen = v; }
+               });
+               Object.defineProperty(globalThis, "leafState", {
+                   configurable: true,
+                   get: function () { return 40; },
+                   set: function (v) {
+                       leafSeen = (leafSeen + 1) | 0;
+                       leafLast = v;
+                   }
+               });
+               Object.defineProperty(globalThis, "intLeafState", {
+                   configurable: true,
+                   get: function () { return 50; },
+                   set: function (v) {
+                       intLeafSeen = (intLeafSeen + 1) | 0;
+                       intLeafLast = v;
+                   }
+               })"#,
+        )
+        .expect("installs a live global-object route");
+        assert_eq!(
+            st.call_global("invokeRoute", &[]),
+            Ok(JsValue::Number(40.0))
+        );
+        assert_eq!(
+            st.eval_in_context("routeSeen"),
+            Ok(JsValue::Number(41.0)),
+            "the moved VM must take the setter route, not a stale raw-slot lane"
+        );
+        assert_eq!(
+            st.call_global("warmLeaf", &[JsValue::Number(8.0)]),
+            Ok(JsValue::Number(40.0)),
+            "the generic MEM leaf must fall back after its global route changes"
+        );
+        assert_eq!(
+            st.eval_in_context("leafSeen + ',' + leafLast"),
+            Ok(JsValue::String("8,44".into())),
+            "the moved generic leaf must invoke the live setter exactly once per call"
+        );
+        assert_eq!(
+            st.call_global("warmIntLeaf", &[JsValue::Number(8.0)]),
+            Ok(JsValue::Number(50.0)),
+            "the INT splice must entry-bail after its global route changes"
+        );
+        assert_eq!(
+            st.eval_in_context("intLeafSeen + ',' + intLeafLast"),
+            Ok(JsValue::String("8,51".into())),
+            "the moved INT splice must invoke the live setter exactly once per call"
+        );
+        st.eval_in_context("delete globalThis.leafState; delete globalThis.intLeafState;")
+            .expect("removes both live descriptor routes");
+        let leaf_err = st
+            .call_global("warmLeaf", &[JsValue::Number(4.0)])
+            .expect_err("deleting the dynamic global must make its binding absent");
+        assert!(
+            leaf_err.contains("ReferenceError: leafState is not defined"),
+            "generic leaf resumed a stale raw slot after delete: {leaf_err}"
+        );
+        let int_leaf_err = st
+            .call_global("warmIntLeaf", &[JsValue::Number(4.0)])
+            .expect_err("deleting the dynamic global must make its binding absent");
+        assert!(
+            int_leaf_err.contains("ReferenceError: intLeafState is not defined"),
+            "INT leaf resumed a stale raw slot after delete: {int_leaf_err}"
+        );
+        assert_eq!(
+            st.eval_in_context("leafSeen + ',' + intLeafSeen"),
+            Ok(JsValue::String("8,8".into())),
+            "deleted setters must not observe the failed real-call writes"
+        );
+
+        // Re-running the factory changes the live class epoch. Zipp's existing
+        // per-class-id semantics retarget the first instance too; the important
+        // invariant here is that moved native code observes the new epoch and
+        // agrees with the interpreter instead of using the stale super chain.
+        assert_eq!(
+            st.call_global("retargetSuper", &[]),
+            Ok(JsValue::Number(184.0))
+        );
+    }
+
     #[test]
     fn eval_declarations_persist_across_calls() {
         let mut st = compile_script("var x = 1;").expect("compiles");

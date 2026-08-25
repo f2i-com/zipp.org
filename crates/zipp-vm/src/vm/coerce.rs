@@ -83,6 +83,50 @@ fn ascii_char_append_enabled() -> bool {
     }
 }
 
+/// Let the fused `acc += ascii_source[index]` helper create the first mutable
+/// builder when `acc` is still the permanently interned empty/string literal.
+/// Subsequent loop iterations retain the allocation-free in-place path. The
+/// old first-iteration deopt is independently available for same-binary A/B.
+#[inline]
+fn str_append_index_first_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_STR_APPEND_INDEX_FIRST").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
+/// Small proven-linear string builders overwhelmingly finish below this size
+/// (IDs, tokens, short keys). Reserving it while constructing the first
+/// mutable builder avoids the ordinary 8 -> 16 -> 32 backing-buffer growths;
+/// it does not add a heap slot or change when the JS string itself is born.
+const STR_APPEND_INDEX_FIRST_RESERVE: usize = 32;
+
+/// Same-binary ablation for the bounded first-builder reserve. This is read
+/// only on the first append (never on the per-character in-place hot path).
+#[inline]
+fn str_append_index_reserve_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_STR_APPEND_INDEX_RESERVE").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn markdown_push_escaped_ascii(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -97,6 +141,23 @@ fn markdown_push_escaped_ascii(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 impl<'p> Vm<'p> {
+    /// Sandboxed VMs retain the historical exact-capacity builder. The public
+    /// heap ceiling intentionally counts HeapObj slots, not payload buffers;
+    /// applying this reserve there would therefore add up to 31 uncharged
+    /// bytes per live one-byte builder. Keeping the optimization out of every
+    /// instrumented VM makes its incremental accounting undercount exactly 0.
+    #[inline]
+    fn str_append_index_reserve_allowed(&self) -> bool {
+        if !str_append_index_reserve_enabled() {
+            return false;
+        }
+        #[cfg(feature = "instrument")]
+        if self.instr_rec.is_some() {
+            return false;
+        }
+        true
+    }
+
     /// Execute the exact [`crate::codegen::MarkdownInlinePlan`] over one flat
     /// ASCII primitive string. The source recogniser licenses the state
     /// machine; these live guards preserve every remaining observable lookup.
@@ -294,7 +355,7 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
 /// rightmost leaf; `fallback` ran the original inner Add followed by the outer
 /// Add.  Off, the hot path pays one relaxed byte load, matching chainstats.
 mod pairstats {
-    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
     static ON: AtomicU8 = AtomicU8::new(2);
     static FAST_STR: AtomicU64 = AtomicU64::new(0);
@@ -362,7 +423,7 @@ pub(crate) fn concat_pair_stats() -> (u64, u64, u64, u64) {
 /// `fallback` delegates to the exact ordinary `+` path. Off, each opcode pays
 /// one relaxed byte load; the compiler rollback emits no opcode at all.
 mod pad2stats {
-    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
     static ON: AtomicU8 = AtomicU8::new(2);
     static ZERO: AtomicU64 = AtomicU64::new(0);
@@ -1452,12 +1513,13 @@ impl<'p> Vm<'p> {
         ))
     }
 
-    /// Allocation-free prefix for the fused `acc += obj[key]` opcode. A hit is
-    /// fully primitive and cannot invoke JavaScript: `obj` is a flat ASCII
-    /// string, `key` is an in-range tagged integer, and `acc` is the mutable
-    /// flat builder licensed by the compiler's existing linearity proof. The
-    /// indexed byte is copied before borrowing `acc` mutably, so even the
-    /// defensive `obj == acc` case reads the pre-append string exactly.
+    /// Pure prefix for the fused `acc += obj[key]` opcode. A hit cannot invoke
+    /// JavaScript: `obj` is a flat ASCII string, `key` is an in-range tagged
+    /// integer, and `acc` is either the mutable flat builder licensed by the
+    /// compiler's existing linearity proof or its interned string seed. The
+    /// seed case allocates the first mutable builder; later iterations append
+    /// in place. The indexed byte is copied before borrowing `acc` mutably, so
+    /// even the defensive `obj == acc` case reads the pre-append string exactly.
     ///
     /// A miss performs no mutation. The interpreter then runs the historical
     /// GetIndex + StrAppendInPlace/Add sequence; native code deopts to that arm.
@@ -1468,11 +1530,7 @@ impl<'p> Vm<'p> {
         obj: Value,
         key: Value,
     ) -> Option<Value> {
-        if !acc.is_heap()
-            || acc.heap_index() <= crate::heap::INTERN_PINNED_END
-            || !obj.is_heap()
-            || !key.is_int()
-        {
+        if !acc.is_heap() || !obj.is_heap() || !key.is_int() {
             return None;
         }
         let i = key.as_int();
@@ -1483,6 +1541,36 @@ impl<'p> Vm<'p> {
             HeapObj::Str(s) if s.is_ascii() => *s.as_bytes().get(i as usize)?,
             _ => return None,
         };
+        if acc.heap_index() <= crate::heap::INTERN_PINNED_END {
+            if !str_append_index_first_enabled()
+                || !matches!(self.heap.get(acc.heap_index()), HeapObj::Str(_))
+            {
+                return None;
+            }
+            if self.str_append_index_reserve_allowed() {
+                // The pinned prefix consists only of flat ASCII strings. The
+                // indexed byte was copied above, before this second borrow, so
+                // `obj == acc` observes the pre-append source exactly. Build the
+                // ordinary non-interned flat result in one payload allocation,
+                // but with bounded spare capacity for later licensed appends.
+                let seed = match self.heap.get(acc.heap_index()) {
+                    HeapObj::Str(s) => s.as_bytes(),
+                    _ => return None,
+                };
+                let len = seed.len().checked_add(1)?;
+                let mut bytes = Vec::with_capacity(len.max(STR_APPEND_INDEX_FIRST_RESERVE));
+                bytes.extend_from_slice(seed);
+                bytes.push(byte);
+                return Some(Value::heap(
+                    self.heap
+                        .alloc(HeapObj::Str(crate::heap::JsStr::from_ascii(bytes))),
+                ));
+            }
+            // The single-byte string is permanently interned at its byte value.
+            // `str_append_inplace` copies the seed + byte into a non-interned
+            // flat Str, exactly like the interpreter fallback, without coercion.
+            return self.str_append_inplace(acc, Value::heap(byte as u32));
+        }
         match self.heap.get_mut(acc.heap_index()) {
             HeapObj::Str(out) => {
                 out.push_ascii(byte);
@@ -2977,7 +3065,6 @@ mod str_append_index_ascii_tests {
         let out = flat(&mut vm, crate::heap::JsStr::new("seed".into()));
         let unicode = flat(&mut vm, crate::heap::JsStr::new("A😀".into()));
         let lone = flat(&mut vm, crate::heap::JsStr::from_code_point(0xD800));
-        let interned_out = Value::heap(crate::heap::INTERN_EMPTY);
 
         for (acc, obj, key) in [
             (out, unicode, Value::int(0)),
@@ -2985,12 +3072,59 @@ mod str_append_index_ascii_tests {
             (out, out, Value::int(-1)),
             (out, out, Value::int(99)),
             (out, out, Value::num(1.5)),
-            (interned_out, out, Value::int(0)),
         ] {
             assert_eq!(vm.str_append_index_ascii_fast(acc, obj, key), None);
             assert_eq!(vm.display(out), "seed");
-            assert_eq!(vm.display(interned_out), "");
         }
+    }
+
+    #[test]
+    fn interned_seed_allocates_the_first_mutable_builder() {
+        let mut vm = vm();
+        let source = flat(&mut vm, crate::heap::JsStr::new("AZ".into()));
+        let seed = Value::heap(crate::heap::INTERN_EMPTY);
+        let heap_len = vm.heap.len();
+
+        let out = vm
+            .str_append_index_ascii_fast(seed, source, Value::int(1))
+            .expect("interned seed takes the pure first-append path");
+        assert_ne!(out, seed);
+        assert_eq!(vm.heap.len(), heap_len + 1);
+        assert_eq!(vm.display(seed), "");
+        assert_eq!(vm.display(out), "Z");
+        assert!(out.heap_index() > crate::heap::INTERN_PINNED_END);
+        match vm.heap.get(out.heap_index()) {
+            HeapObj::Str(s) => assert!(
+                s.byte_capacity() >= STR_APPEND_INDEX_FIRST_RESERVE,
+                "first builder did not receive the bounded reserve"
+            ),
+            other => panic!("first builder changed heap kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interned_seed_alias_reads_before_reserved_builder_allocation() {
+        let mut vm = vm();
+        let seed = Value::heap(crate::heap::INTERN_PAD2_START);
+        assert_eq!(vm.display(seed), "00");
+        let heap_len = vm.heap.len();
+
+        let out = vm
+            .str_append_index_ascii_fast(seed, seed, Value::int(0))
+            .expect("pinned source/seed alias remains a pure hit");
+        assert_ne!(out, seed);
+        assert_eq!(vm.heap.len(), heap_len + 1);
+        assert_eq!(vm.display(seed), "00");
+        assert_eq!(vm.display(out), "000");
+    }
+
+    #[test]
+    #[cfg(feature = "instrument")]
+    fn instrumented_vm_declines_the_uncharged_payload_reserve() {
+        let mut vm = vm();
+        assert!(vm.str_append_index_reserve_allowed());
+        vm.set_instrumentation(crate::vm::instrument::Recorder::new());
+        assert!(!vm.str_append_index_reserve_allowed());
     }
 }
 

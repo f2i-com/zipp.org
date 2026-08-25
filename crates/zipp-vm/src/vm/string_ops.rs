@@ -3,7 +3,7 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -39,7 +39,10 @@ impl<'p> Vm<'p> {
         if m != Value::UNDEFINED {
             return Ok(self.truthy(m));
         }
-        Ok(matches!(self.heap.get(v.heap_index()), HeapObj::RegExp { .. }))
+        Ok(matches!(
+            self.heap.get(v.heap_index()),
+            HeapObj::RegExp { .. }
+        ))
     }
 
     /// The value-form (`.call`/`.apply`) entry for the String.prototype methods that
@@ -129,7 +132,9 @@ impl<'p> Vm<'p> {
             let s = self.to_js_string(recv)?;
             self.alloc_str(s).heap_index()
         };
-        Ok(self.string_method(s_idx, name, args)?.unwrap_or(Value::UNDEFINED))
+        Ok(self
+            .string_method(s_idx, name, args)?
+            .unwrap_or(Value::UNDEFINED))
     }
 
     /// The pristine dispatch shortcut for `String.prototype.matchAll` — B77's
@@ -225,8 +230,10 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         let name = if is_replace { "replace" } else { "matchAll" };
         let s_idx = if recv.is_heap()
-            && matches!(self.heap.get(recv.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. })
-        {
+            && matches!(
+                self.heap.get(recv.heap_index()),
+                HeapObj::Str(_) | HeapObj::Cons { .. }
+            ) {
             recv.heap_index()
         } else {
             super::proxy_regexp::rxstats::count_string_call_direct_decline();
@@ -324,7 +331,10 @@ impl<'p> Vm<'p> {
         if u < 128 {
             return Value::heap(u as u32);
         }
-        Value::heap(self.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(u as u32))))
+        Value::heap(
+            self.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(u as u32))),
+        )
     }
 
     /// The string Value for code point `cp` (for-of / iterator steps): an
@@ -334,7 +344,10 @@ impl<'p> Vm<'p> {
         if cp < 128 {
             return Value::heap(cp);
         }
-        Value::heap(self.heap.alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(cp))))
+        Value::heap(
+            self.heap
+                .alloc(HeapObj::Str(crate::heap::JsStr::from_code_point(cp))),
+        )
     }
 
     /// Allocate the receiver substring corresponding to subslice `t` of the
@@ -351,7 +364,12 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc_js(exact))
     }
 
-    pub(crate) fn string_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn string_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::StringOps);
         self.heap.flatten(idx); // materialize a rope receiver before reading it
         let arg0 = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -400,7 +418,11 @@ impl<'p> Vm<'p> {
         match name {
             "charCodeAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let u = if i >= 0 { self.heap_unit_at(idx, i as usize) } else { None };
+                let u = if i >= 0 {
+                    self.heap_unit_at(idx, i as usize)
+                } else {
+                    None
+                };
                 return Ok(Some(match u {
                     Some(u) => Value::int(u as i32),
                     None => Value::num(f64::NAN),
@@ -408,7 +430,11 @@ impl<'p> Vm<'p> {
             }
             "codePointAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let c = if i >= 0 { self.heap_code_point_at(idx, i as usize) } else { None };
+                let c = if i >= 0 {
+                    self.heap_code_point_at(idx, i as usize)
+                } else {
+                    None
+                };
                 return Ok(Some(match c {
                     Some(cp) => Value::int(cp as i32),
                     None => Value::UNDEFINED,
@@ -416,7 +442,11 @@ impl<'p> Vm<'p> {
             }
             "charAt" => {
                 let i = self.to_integer_strict(arg0)?;
-                let u = if i >= 0 { self.heap_unit_at(idx, i as usize) } else { None };
+                let u = if i >= 0 {
+                    self.heap_unit_at(idx, i as usize)
+                } else {
+                    None
+                };
                 return Ok(Some(match u {
                     Some(u) => self.str_from_unit(u),
                     None => Value::heap(crate::heap::INTERN_EMPTY),
@@ -426,7 +456,11 @@ impl<'p> Vm<'p> {
                 let len = self.heap_str_units(idx) as i64;
                 let i = self.to_integer_strict(arg0)?;
                 let abs = if i < 0 { i + len } else { i };
-                let u = if abs >= 0 && abs < len { self.heap_unit_at(idx, abs as usize) } else { None };
+                let u = if abs >= 0 && abs < len {
+                    self.heap_unit_at(idx, abs as usize)
+                } else {
+                    None
+                };
                 return Ok(Some(match u {
                     Some(u) => self.str_from_unit(u),
                     None => Value::UNDEFINED,
@@ -440,8 +474,18 @@ impl<'p> Vm<'p> {
                 // Negative indices count from the end (i64 so a saturated
                 // ±Infinity clamps correctly); absent/undefined end -> length.
                 let len = self.heap_str_units(idx) as i64;
-                let norm = |i: i64| if i < 0 { len.saturating_add(i).max(0) } else { i.min(len) };
-                let start = if args.is_empty() { 0 } else { norm(self.to_integer_strict(arg0)?) };
+                let norm = |i: i64| {
+                    if i < 0 {
+                        len.saturating_add(i).max(0)
+                    } else {
+                        i.min(len)
+                    }
+                };
+                let start = if args.is_empty() {
+                    0
+                } else {
+                    norm(self.to_integer_strict(arg0)?)
+                };
                 let end = if args.len() < 2 || args[1] == Value::UNDEFINED {
                     len
                 } else {
@@ -460,7 +504,11 @@ impl<'p> Vm<'p> {
                 // Each index clamps to [0,len] (negatives -> 0), then start/end
                 // swap so start <= end (distinct from slice's negative-from-end).
                 let len = self.heap_str_units(idx) as i64;
-                let s0 = if args.is_empty() { 0 } else { self.to_integer_strict(arg0)?.clamp(0, len) };
+                let s0 = if args.is_empty() {
+                    0
+                } else {
+                    self.to_integer_strict(arg0)?.clamp(0, len)
+                };
                 let e0 = if args.len() < 2 || args[1] == Value::UNDEFINED {
                     len
                 } else {
@@ -561,7 +609,8 @@ impl<'p> Vm<'p> {
                 self.heap.alloc_js(case_map_exact(js_recv.as_bytes(), true)),
             ))),
             "toLowerCase" => Ok(Some(Value::heap(
-                self.heap.alloc_js(case_map_exact(js_recv.as_bytes(), false)),
+                self.heap
+                    .alloc_js(case_map_exact(js_recv.as_bytes(), false)),
             ))),
             // NB: `slice` / `substring` are handled by the no-clone fast path in
             // the early match above (before the receiver is copied).
@@ -585,7 +634,8 @@ impl<'p> Vm<'p> {
                 // Non-well-formed receiver: repeat the EXACT bytes, with seam
                 // canonicalization — '\uDC00\uD800'.repeat(2) forms a real
                 // astral scalar at each junction (UTF-16 unit semantics).
-                let mut out: Vec<u8> = Vec::with_capacity(js_recv.as_bytes().len() * n_int as usize);
+                let mut out: Vec<u8> =
+                    Vec::with_capacity(js_recv.as_bytes().len() * n_int as usize);
                 for _ in 0..n_int as usize {
                     crate::heap::wtf8_push(&mut out, js_recv.as_bytes());
                 }
@@ -600,7 +650,11 @@ impl<'p> Vm<'p> {
                 if self.is_object_value(arg0) {
                     let searcher = self.get_prop(arg0, "@@search")?;
                     if searcher != Value::UNDEFINED && searcher != Value::NULL {
-                        return Ok(Some(self.call_value(searcher, arg0, &[Value::heap(idx)])?));
+                        return Ok(Some(self.call_value(
+                            searcher,
+                            arg0,
+                            &[Value::heap(idx)],
+                        )?));
                     }
                 }
                 // Build a RegExp from the (non-object) argument, then Invoke its
@@ -713,7 +767,9 @@ impl<'p> Vm<'p> {
                         .str_cow(idx)
                         .map(|c| c.into_owned())
                         .unwrap_or_default();
-                    Ok(Some(self.string_replace_plain(&sl, idx, arg0, repl, false)?))
+                    Ok(Some(
+                        self.string_replace_plain(&sl, idx, arg0, repl, false)?,
+                    ))
                 }
             }
             // `replaceAll` (regexp or otherwise) funnels into `string_replace_plain`,
@@ -733,7 +789,11 @@ impl<'p> Vm<'p> {
                     let m = self.get_prop(arg0, "@@split")?;
                     if self.is_callable(m) {
                         let limit_raw = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                        return Ok(Some(self.call_value(m, arg0, &[Value::heap(idx), limit_raw])?));
+                        return Ok(Some(self.call_value(
+                            m,
+                            arg0,
+                            &[Value::heap(idx), limit_raw],
+                        )?));
                     }
                     // GetMethod step 3: a present-but-NOT-CALLABLE @@split is a
                     // TypeError, not a silent fall-through to the default
@@ -774,7 +834,11 @@ impl<'p> Vm<'p> {
                     // No separator → the whole string as a single element (lim 0
                     // → []). The receiver itself — exact, strings are immutable.
                     None => {
-                        if lim == 0 { Vec::new() } else { vec![Value::heap(idx)] }
+                        if lim == 0 {
+                            Vec::new()
+                        } else {
+                            vec![Value::heap(idx)]
+                        }
                     }
                     Some(sep) => {
                         if lim == 0 {
@@ -834,14 +898,17 @@ impl<'p> Vm<'p> {
             "startsWith" => {
                 if self.is_regexp(arg0)? {
                     return Err(Thrown(
-                        "TypeError: String.prototype.startsWith argument must not be a RegExp".into(),
+                        "TypeError: String.prototype.startsWith argument must not be a RegExp"
+                            .into(),
                     ));
                 }
                 let needle = self.to_js_string(arg0)?;
                 let len = unit_len(&s) as i64;
-                let pos =
-                    if args.len() >= 2 { self.to_integer_strict(args[1])?.clamp(0, len) } else { 0 }
-                        as usize;
+                let pos = if args.len() >= 2 {
+                    self.to_integer_strict(args[1])?.clamp(0, len)
+                } else {
+                    0
+                } as usize;
                 // An ANCHORED position: a start in the middle of a surrogate pair
                 // makes the spec substring begin with a trail surrogate, which a
                 // well-formed needle can never match (only the empty one).
@@ -849,7 +916,11 @@ impl<'p> Vm<'p> {
                     s[pos.min(s.len())..].starts_with(&needle)
                 } else {
                     let (lo, hi) = crate::heap::unit_byte_bounds(&s, pos);
-                    if lo != hi { needle.is_empty() } else { s[lo..].starts_with(&needle) }
+                    if lo != hi {
+                        needle.is_empty()
+                    } else {
+                        s[lo..].starts_with(&needle)
+                    }
                 };
                 Ok(Some(Value::bool(r)))
             }
@@ -872,7 +943,11 @@ impl<'p> Vm<'p> {
                     s[..end.min(s.len())].ends_with(&needle)
                 } else {
                     let (lo, hi) = crate::heap::unit_byte_bounds(&s, end);
-                    if lo != hi { needle.is_empty() } else { s[..lo].ends_with(&needle) }
+                    if lo != hi {
+                        needle.is_empty()
+                    } else {
+                        s[..lo].ends_with(&needle)
+                    }
                 };
                 Ok(Some(Value::bool(r)))
             }
@@ -886,8 +961,10 @@ impl<'p> Vm<'p> {
                 for a in args {
                     let av = *a;
                     if av.is_heap() && self.heap.is_str_like(av.heap_index()) {
-                        let part =
-                            self.heap.str_wtf8_cow(av.heap_index()).map(|c| c.into_owned());
+                        let part = self
+                            .heap
+                            .str_wtf8_cow(av.heap_index())
+                            .map(|c| c.into_owned());
                         crate::heap::wtf8_push(&mut out, &part.unwrap_or_default());
                     } else {
                         let part = self.to_js_string(av)?;
@@ -900,7 +977,11 @@ impl<'p> Vm<'p> {
             "substr" => {
                 // Legacy substr(start, length); negative start counts from the end.
                 let len = unit_len(&s) as i64;
-                let mut start = if args.is_empty() { 0 } else { self.to_integer_strict(arg0)? };
+                let mut start = if args.is_empty() {
+                    0
+                } else {
+                    self.to_integer_strict(arg0)?
+                };
                 if start < 0 {
                     start = (len + start).max(0);
                 }
@@ -910,7 +991,11 @@ impl<'p> Vm<'p> {
                     avail
                 } else {
                     let c = self.to_integer_strict(args[1])?;
-                    if c < 0 { 0 } else { (c as usize).min(avail) }
+                    if c < 0 {
+                        0
+                    } else {
+                        (c as usize).min(avail)
+                    }
                 };
                 let sub = subu(start, start + count);
                 Ok(Some(Value::heap(self.heap.alloc_js(sub))))
@@ -947,7 +1032,8 @@ impl<'p> Vm<'p> {
                 };
                 if !matches!(form.as_str(), "NFC" | "NFD" | "NFKC" | "NFKD") {
                     return Err(Thrown(
-                        "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD.".into(),
+                        "RangeError: The normalization form should be one of NFC, NFD, NFKC, NFKD."
+                            .into(),
                     ));
                 }
                 use unicode_normalization::UnicodeNormalization;
@@ -1035,11 +1121,23 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::heap(self.heap.alloc_js(js))))
             }
             "replace" => {
-                let r = self.string_replace_plain(&s, idx, arg0, args.get(1).copied().unwrap_or(Value::UNDEFINED), false)?;
+                let r = self.string_replace_plain(
+                    &s,
+                    idx,
+                    arg0,
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                    false,
+                )?;
                 Ok(Some(r))
             }
             "replaceAll" => {
-                let r = self.string_replace_plain(&s, idx, arg0, args.get(1).copied().unwrap_or(Value::UNDEFINED), true)?;
+                let r = self.string_replace_plain(
+                    &s,
+                    idx,
+                    arg0,
+                    args.get(1).copied().unwrap_or(Value::UNDEFINED),
+                    true,
+                )?;
                 Ok(Some(r))
             }
             // TransformCase (ECMA-402): CanonicalizeLocaleList first (so a
@@ -1170,7 +1268,11 @@ impl<'p> Vm<'p> {
         // undefined `flags` is a TypeError) and `ToString(flags)` must contain "g".
         // All of this BEFORE the @@replace delegation and before any ToString of the
         // receiver/searchValue. String.prototype.replace has no such restriction.
-        if all && search_v != Value::UNDEFINED && search_v != Value::NULL && self.is_regexp(search_v)? {
+        if all
+            && search_v != Value::UNDEFINED
+            && search_v != Value::NULL
+            && self.is_regexp(search_v)?
+        {
             let flags = self.get_prop(search_v, "flags")?;
             if flags == Value::UNDEFINED || flags == Value::NULL {
                 return Err(Thrown(
@@ -1205,7 +1307,11 @@ impl<'p> Vm<'p> {
         }
         let search = self.to_js_string(search_v)?;
         let functional = self.is_callable(repl_v);
-        let repl_str = if functional { String::new() } else { self.to_js_string(repl_v)? };
+        let repl_str = if functional {
+            String::new()
+        } else {
+            self.to_js_string(repl_v)?
+        };
         // Match byte offsets (non-overlapping). An empty searchValue matches at
         // every char boundary including the end (replaceAll), or just position 0.
         // (Spec: every UNIT boundary — the position between a surrogate pair's
@@ -1257,7 +1363,6 @@ impl<'p> Vm<'p> {
         out.push_str(&s[last..]);
         Ok(self.alloc_str(out))
     }
-
 }
 
 /// `toUpperCase`/`toLowerCase` over the receiver's EXACT WTF-8 bytes. The
@@ -1275,14 +1380,28 @@ fn case_map_exact(bytes: &[u8], upper: bool) -> crate::heap::JsStr {
     while !rest.is_empty() {
         match std::str::from_utf8(rest) {
             Ok(s) => {
-                out.extend_from_slice(if upper { s.to_uppercase() } else { s.to_lowercase() }.as_bytes());
+                out.extend_from_slice(
+                    if upper {
+                        s.to_uppercase()
+                    } else {
+                        s.to_lowercase()
+                    }
+                    .as_bytes(),
+                );
                 break;
             }
             Err(e) => {
                 let valid = e.valid_up_to();
                 // The valid prefix is UTF-8 by construction.
                 let s = std::str::from_utf8(&rest[..valid]).unwrap();
-                out.extend_from_slice(if upper { s.to_uppercase() } else { s.to_lowercase() }.as_bytes());
+                out.extend_from_slice(
+                    if upper {
+                        s.to_uppercase()
+                    } else {
+                        s.to_lowercase()
+                    }
+                    .as_bytes(),
+                );
                 // Copy the invalid (lone-surrogate) bytes verbatim and resume.
                 let skip = e.error_len().unwrap_or(rest.len() - valid);
                 out.extend_from_slice(&rest[valid..valid + skip]);

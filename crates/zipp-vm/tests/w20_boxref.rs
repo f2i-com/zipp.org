@@ -58,7 +58,11 @@ use std::process::Command;
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -68,7 +72,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -146,8 +154,12 @@ fn boxref_parity_global_receiver() {
 /// runs — over all four `BOOL_GPRS` and both volatile xmm home halves — and this
 /// is what fails if the spill around that call is wrong.
 fn bool_sweep_kernel(k: usize, nrecv: usize, mask: usize) -> String {
-    const DEFS: [&str; 4] =
-        ["b0 = i >= 4;", "b1 = i < 4;", "b2 = t > 2.5;", "b3 = t < 2.5;"];
+    const DEFS: [&str; 4] = [
+        "b0 = i >= 4;",
+        "b1 = i < 4;",
+        "b2 = t > 2.5;",
+        "b3 = t < 2.5;",
+    ];
     let init: String = (0..k).map(|j| format!("var b{j} = false;\n  ")).collect();
     let defs: String = DEFS[..k].iter().map(|d| format!("    {d}\n")).collect();
     let out: String = (0..k)
@@ -193,8 +205,12 @@ fn boxref_parity_bool_homes_across_the_miss_call() {
 #[test]
 fn boxref_parity_bool_homes_global_receiver() {
     for k in 1..=4 {
-        const DEFS: [&str; 4] =
-            ["b0 = i >= 4;", "b1 = i < 4;", "b2 = t > 2.5;", "b3 = t < 2.5;"];
+        const DEFS: [&str; 4] = [
+            "b0 = i >= 4;",
+            "b1 = i < 4;",
+            "b2 = t > 2.5;",
+            "b3 = t < 2.5;",
+        ];
         let init: String = (0..k).map(|j| format!("var b{j} = false;\n  ")).collect();
         let defs: String = DEFS[..k].iter().map(|d| format!("    {d}\n")).collect();
         let out: String = (0..k)
@@ -627,6 +643,8 @@ fn jitlog_of(src: &str, env: &[(&str, &str)]) -> String {
 #[test]
 #[ignore = "worker: spawned by jitlog_of with ZIPP_BOXREF_SRC set"]
 fn boxref_jitlog_child() {
-    let Some(src) = std::env::var_os("ZIPP_BOXREF_SRC") else { return };
+    let Some(src) = std::env::var_os("ZIPP_BOXREF_SRC") else {
+        return;
+    };
     let _ = run_ok(&src.to_string_lossy());
 }

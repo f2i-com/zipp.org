@@ -17,7 +17,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -204,7 +208,10 @@ fn mastep_parity_result_objects_escape_and_stay_readable() {
         );
         "##
     ));
-    assert_eq!(out[0], r#"t9=g1@0#g1h2i3,h2@2#g1h2i3,i3@4#g1h2i3|3|["h2","h","2"]"#);
+    assert_eq!(
+        out[0],
+        r#"t9=g1@0#g1h2i3,h2@2#g1h2i3,i3@4#g1h2i3|3|["h2","h","2"]"#
+    );
 }
 
 #[test]

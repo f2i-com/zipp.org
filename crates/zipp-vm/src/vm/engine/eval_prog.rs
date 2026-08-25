@@ -31,11 +31,8 @@ impl<'p> Vm<'p> {
         // their concrete additions before global-map/GDI mutation and before
         // any FuncProto/ClassDef is leaked into the VM-lifetime tables.
         #[cfg(feature = "instrument")]
-        self.instrument_dynamic_code_install(
-            eval_prog.functions.len(),
-            eval_prog.classes.len(),
-        )
-        .map_err(|message| Thrown(message.into()))?;
+        self.instrument_dynamic_code_install(eval_prog.functions.len(), eval_prog.classes.len())
+            .map_err(|message| Thrown(message.into()))?;
         // A $262.evalScript: SCRIPT GlobalDeclarationInstantiation semantics
         // for THIS program only (lexical-collision SyntaxErrors, realm-
         // persistent lexicals, non-configurable brandNew var/fn bindings).
@@ -125,8 +122,7 @@ impl<'p> Vm<'p> {
         }
         // 5. Re-index function-id, global-slot, and class-id operands, leak each
         //    FuncProto (stable address — raw pointers live into it), append.
-        let mut new_funcs: Vec<&'static FuncProto> =
-            Vec::with_capacity(eval_prog.functions.len());
+        let mut new_funcs: Vec<&'static FuncProto> = Vec::with_capacity(eval_prog.functions.len());
         for mut f in eval_prog.functions {
             for ins in f.code.iter_mut() {
                 match ins {
@@ -361,9 +357,7 @@ impl<'p> Vm<'p> {
                                 _ => None,
                             };
                             if let Some(a) = pos_attrs {
-                                if !a.configurable
-                                    && (a.accessor || !a.writable || !a.enumerable)
-                                {
+                                if !a.configurable && (a.accessor || !a.writable || !a.enumerable) {
                                     return Err(Thrown(format!(
                                         "TypeError: cannot declare global function {name}"
                                     )));
@@ -391,11 +385,12 @@ impl<'p> Vm<'p> {
         // (StoreGlobal* throw on a write to an INITIALIZED const slot), and
         // lexical invisibility to global-object property reflection.
         if script_gdi && var_env_global {
+            let mut route_changed = false;
             for &slot in &eval_prog.lexical_globals {
-                self.eval_lexical_globals.insert(gmap[slot as usize]);
+                route_changed |= self.eval_lexical_globals.insert(gmap[slot as usize]);
             }
             for &slot in &eval_prog.const_globals {
-                self.eval_const_globals.insert(gmap[slot as usize]);
+                route_changed |= self.eval_const_globals.insert(gmap[slot as usize]);
             }
             for &slot in &eval_prog.hoisted_globals {
                 self.eval_var_globals.insert(gmap[slot as usize]);
@@ -404,6 +399,13 @@ impl<'p> Vm<'p> {
                 if let Some(slot) = self.eval_funcs[local].name_global {
                     self.eval_var_globals.insert(slot as u32);
                 }
+            }
+            if route_changed {
+                // A persistent script lexical changes global-object routing;
+                // a const additionally makes raw stores illegal. Invalidate
+                // every baked direct-global route before the script body can
+                // initialize (or throw while initializing) the new binding.
+                self.note_global_route_change();
             }
         }
         // 5. CreateGlobalVarBinding for eval `var` names: an ABSENT binding
@@ -583,7 +585,7 @@ impl<'p> Vm<'p> {
         // Object-method direct eval: super.x resolves via the caller's
         // [[HomeObject]] (same stamp pattern as the brand chain above).
         if let Some(home) = caller_home_obj {
-            self.closure_home.insert(script.heap_index(), home);
+            self.record_closure_home(script.heap_index(), home);
         }
         // The eval frame resolves the caller's dynamic EvalScope through
         // the same stamp the Dyn ops use for closures.
@@ -623,9 +625,15 @@ impl<'p> Vm<'p> {
             .map_err(|e| Thrown(format!("SyntaxError: {e}")))?;
         // Dev aid (same flag as the main-program dump in lib.rs).
         if std::env::var_os("ZIPP_VM_DUMP").is_some() {
-            eprintln!("── evalScript program (hoisted={:?}) ──", prog.hoisted_globals);
+            eprintln!(
+                "── evalScript program (hoisted={:?}) ──",
+                prog.hoisted_globals
+            );
             for (fid, f) in prog.functions.iter().enumerate() {
-                eprintln!("── eval fn {fid} (regs={}, params={}) ──", f.reg_count, f.param_count);
+                eprintln!(
+                    "── eval fn {fid} (regs={}, params={}) ──",
+                    f.reg_count, f.param_count
+                );
                 for (ip, instr) in f.code.iter().enumerate() {
                     eprintln!("  {ip:4}  {instr:?}");
                 }
@@ -662,17 +670,16 @@ impl<'p> Vm<'p> {
         caller_cells: Option<Vec<Value>>,
         eval_scope_idx: Option<u32>,
     ) -> Result<(Value, Vec<u32>), Thrown> {
-        let (gmap, base_func) =
-            self.prepare_eval_program(
-                eval_prog,
-                module,
-                caller_home,
-                var_env_global,
-                eval_scope_idx,
-                None,
-                None,
-                None,
-            )?;
+        let (gmap, base_func) = self.prepare_eval_program(
+            eval_prog,
+            module,
+            caller_home,
+            var_env_global,
+            eval_scope_idx,
+            None,
+            None,
+            None,
+        )?;
         let completion = self.execute_eval_program(
             base_func,
             this_override,

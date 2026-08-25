@@ -5,6 +5,26 @@
 #![allow(unused_imports)]
 use super::*;
 
+#[inline]
+fn xmm_home_id_is_physical(home: u8) -> bool {
+    (HOME_XMM_FIRST..=HOME_XMM_LAST).contains(&home)
+}
+
+/// Virtual numeric-home colours are valid only while being consumed by the
+/// GPR mapper.  Keep an explicit fail-closed boundary in front of the hardware
+/// XMM emitter so a future refactor cannot accidentally interpret colour 16 as
+/// an architectural register number.
+fn xmm_plan_is_physical(plan: &RegionPlan) -> bool {
+    plan.reg_home.values().all(|h| match *h {
+        Home::Xmm(x) => xmm_home_id_is_physical(x),
+        Home::Gpr(_) => true,
+    }) && plan
+        .glob_home
+        .values()
+        .chain(plan.addint_imm_home.values())
+        .all(|&x| xmm_home_id_is_physical(x))
+}
+
 /// `2^53` — the largest magnitude where consecutive integers are all exactly
 /// representable in f64. Above it, JS `+`/`-` round, so an exact i64 result would
 /// diverge: the int path bails to the interpreter when a result leaves
@@ -12,6 +32,98 @@ use super::*;
 pub(crate) const TWO_POW_53: i64 = 9_007_199_254_740_992;
 /// `2^54` — the unsigned upper bound for the shifted range check `(x + 2^53) ≤ 2^54`.
 pub(crate) const TWO_POW_54: i64 = 18_014_398_509_481_984;
+
+/// Exact load shape for a non-BigInt integer TypedArray whose complete value
+/// range fits the INTEGER tier's signed-i64/i53 home contract.
+///
+/// Keep the dtype decision in this one place: admission, the xmm-home emitter
+/// and the GPR-home emitter all consume this enum. The metadata check against
+/// `TA_KINDS` makes the numeric kind ids fail closed if that authoritative
+/// table is ever reordered or extended. Uint32 is intentionally absent: its
+/// values do fit i53, but the GPR tier's deferred-sign-extension analysis has
+/// historically treated every pinned GetIndex as i32-range. Widening that
+/// proof is separate work; silently admitting kind 6 here would sign-mangle
+/// values above `i32::MAX` on some downstream paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IntTaLoadKind {
+    I8,
+    U8,
+    I16,
+    U16,
+    I32,
+}
+
+/// Kill switch for the narrow fixed-width integer TypedArray read widening.
+/// Int32 (the pre-existing path) remains enabled when the switch is set, so an
+/// off run is an exact semantic fallback rather than a JIT-wide disable.
+fn int_ta_narrow_reads_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INT_TA_NARROW_READS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+pub(crate) fn int_ta_load_kind(kind: u8) -> Option<IntTaLoadKind> {
+    use crate::vm::native::TA_KINDS;
+
+    let &(name, size, is_bigint, is_float) = TA_KINDS.get(kind as usize)?;
+    if is_bigint || is_float {
+        return None;
+    }
+    let load = match (kind, name, size) {
+        (0, "Int8Array", 1) => IntTaLoadKind::I8,
+        (1, "Uint8Array", 1) | (2, "Uint8ClampedArray", 1) => IntTaLoadKind::U8,
+        (3, "Int16Array", 2) => IntTaLoadKind::I16,
+        (4, "Uint16Array", 2) => IntTaLoadKind::U16,
+        (5, "Int32Array", 4) => IntTaLoadKind::I32,
+        // Uint32 and every future non-float numeric kind decline until their
+        // full range is proven through lazy-sx, compares, exits and boxing.
+        _ => return None,
+    };
+    if load != IntTaLoadKind::I32 && !int_ta_narrow_reads_enabled() {
+        return None;
+    }
+    Some(load)
+}
+
+/// Dense Array `.length` is independent of element representation. The old
+/// lane admitted only `ARR_INT_PIN_KIND` because it shared a predicate with
+/// element reads; object-, hole- and double-bearing dense arrays use the same
+/// snapshot `{identity, items base, items.len()}` and are equally safe for a
+/// length-only access. The snapshot helper already rejects overlays and mapped
+/// arguments, and every emitted read still guards the live receiver identity.
+pub(crate) fn int_arr_length_kind(kind: u8) -> bool {
+    if kind == ARR_INT_PIN_KIND {
+        return true; // pre-existing path remains live under the off switch
+    }
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    let on = match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INT_DENSE_ARRAY_LENGTH").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    };
+    on && is_arr_pin(kind)
+}
+
+/// Pin kinds whose third snapshot word is an exact INTEGER-tier `.length`.
+/// The TypedArray marker is length-only and therefore does not change any raw
+/// element read/store admission (in particular, Uint32 remains excluded from
+/// the integer element lane).
+pub(crate) fn int_length_pin_kind(kind: u8) -> bool {
+    int_arr_length_kind(kind) || is_ta_len_pin(kind)
+}
 
 /// W20 M1: zero every bool gpr home that gets NO entry load.
 ///
@@ -77,7 +189,10 @@ pub(crate) fn arr_push_pin(proto: &FuncProto, ip: usize, ta_plan: &TaPinPlan) ->
     }
     match proto.code.get(ip)? {
         Instr::CallMethod { name, argc: 1, .. }
-            if proto.string_constants.get(*name as usize).is_some_and(|k| k == "push") =>
+            if proto
+                .string_constants
+                .get(*name as usize)
+                .is_some_and(|k| k == "push") =>
         {
             Some(j)
         }
@@ -307,19 +422,30 @@ pub(crate) fn int_unadmitted_ips(
     }
     let mut unadmitted: Vec<usize> = Vec::new();
     let (s, e) = (start as usize, end as usize);
-    // A pinned Int32Array (kind 5) element access runs inline on the int path: the
-    // element is a signed i32 ⇒ sign-extends to an i64 home (GetIndex) / stores its
-    // low 32 bits (SetIndex). Any other element kind (e.g. a Float64Array) declines
-    // here so the region falls through to the regalloc/memory path.
-    let pinned_i32 = |ip: usize| -> bool {
-        ta_plan.access.get(&ip).map_or(false, |&j| ta_plan.pins[j as usize].kind == 5)
+    // Reads from the exact fixed-width integer kinds whose full range is i32
+    // fit the lane; writes remain Int32-only because width/clamp conversion is
+    // dtype-specific and is deliberately not part of this read-only widening.
+    let pinned_int_read = |ip: usize| -> bool {
+        ta_plan
+            .access
+            .get(&ip)
+            .is_some_and(|&j| int_ta_load_kind(ta_plan.pins[j as usize].kind).is_some())
+    };
+    let pinned_i32_write = |ip: usize| -> bool {
+        ta_plan
+            .access
+            .get(&ip)
+            .is_some_and(|&j| ta_plan.pins[j as usize].kind == 5)
     };
     // A pinned flat-ASCII STRING (kind 254) access: `str.charCodeAt(i)` (a direct
     // byte load into an i64 home, OOB→deopt) and `str.length` (read from the pin's
     // `units`). Both gate on the per-access identity guard. Lets the fnv1a-style
     // `for (i<str.length) h=imul(h^str.charCodeAt(i),C)` loop run unboxed.
     let pinned_str = |ip: usize| -> bool {
-        ta_plan.access.get(&ip).map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND)
+        ta_plan
+            .access
+            .get(&ip)
+            .map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND)
     };
     // W9: a pinned-DataView get* of an INT-LANE kind (<= 6 — never a float,
     // which cannot inhabit an i64 home). Only under `admit_dv` (the GPR-routed
@@ -342,7 +468,15 @@ pub(crate) fn int_unadmitted_ips(
     // a store would have to re-box and can grow/realloc the Vec, so `SetIndex`
     // still falls to the memory path (see the catch-all below).
     let pinned_int_arr = |ip: usize| -> bool {
-        ta_plan.access.get(&ip).map_or(false, |&j| ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND)
+        ta_plan.access.get(&ip).map_or(false, |&j| {
+            ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND
+        })
+    };
+    let pinned_len = |ip: usize| -> bool {
+        ta_plan
+            .access
+            .get(&ip)
+            .is_some_and(|&j| int_length_pin_kind(ta_plan.pins[j as usize].kind))
     };
     for (off, instr) in proto.code[s..=e].iter().enumerate() {
         match *instr {
@@ -376,9 +510,10 @@ pub(crate) fn int_unadmitted_ips(
             | Instr::JumpIfNotLe { .. }
             | Instr::Return { .. }
             | Instr::ReturnUndefined => {}
-            // A kind-5 (Int32) pinned element op is admissible; any other index op
-            // (non-pinned, or a different element kind) declines to the mem path.
-            Instr::GetIndex { .. } | Instr::SetIndex { .. } if pinned_i32(s + off) => {}
+            // Fixed-width integer reads (i8/u8/i16/u16/i32) and the pre-existing
+            // Int32 write are admissible; all other index ops decline to MEM.
+            Instr::GetIndex { .. } if pinned_int_read(s + off) => {}
+            Instr::SetIndex { .. } if pinned_i32_write(s + off) => {}
             // Dense all-Int Array READ (see `pinned_int_arr`); the write is not
             // admitted and falls through to the catch-all.
             Instr::GetIndex { .. } if pinned_int_arr(s + off) => {}
@@ -386,11 +521,12 @@ pub(crate) fn int_unadmitted_ips(
             // (CallMethod). A non-length GetProp / non-charCodeAt or unpinned call
             // still hits the catch-all reject below.
             Instr::GetProp { .. } if pinned_str(s + off) => {}
-            // Dense all-Int Array `.length` — read straight from the pin snapshot.
+            // Dense Array `.length` — element representation is irrelevant;
+            // read `items.len()` straight from the guarded pin snapshot.
             // The name is re-checked (the pin planner registers a GetProp only for
             // `length`, but this keeps that an assertion rather than an assumption).
             Instr::GetProp { name, .. }
-                if pinned_int_arr(s + off)
+                if pinned_len(s + off)
                     && proto.string_constants.get(name as usize).is_some_and(|k| k == "length") => {}
             Instr::CallMethod { .. } if pinned_str(s + off) => {}
             // W9: pinned-DV get* (int-lane kinds) under the GPR-routed retry.
@@ -638,7 +774,9 @@ pub(crate) fn compile_region_int_maybe_cold(
             }
             return None;
         }
-        (s_..=e_).filter(|&ip| cold_blocks.contains(&block_of[ip - s_])).collect()
+        (s_..=e_)
+            .filter(|&ip| cold_blocks.contains(&block_of[ip - s_]))
+            .collect()
     };
     // The i64 homes carry sign-extended integers, so Bitwise (int32-lane) ops run
     // inline here with no per-op reload/rebox — admit them (admit_bitwise=true), and
@@ -664,6 +802,52 @@ pub(crate) fn compile_region_int_maybe_cold(
     ) {
         Some(p) => p,
         None => {
+            // A bounded dense-computed splice is deliberately much wider than
+            // its source region: mutually-exclusive leaf bodies share one
+            // scratch window, but the flattened caller still carries many
+            // next-def-bounded temporaries whose ordinary one-home plan can
+            // overflow the XMM pool before either emitter gets a chance to
+            // price it.  Give ONLY that already-guarded/call-free synthetic
+            // body one pass through the GPR emitter's proven write-through
+            // sharing plan.  The original proto, ordinary Call splices, and
+            // `ZIPP_NO_INT_COMPUTED_LEAF=1` never have `computed_guards`, so
+            // their planning and emitted bytes are unchanged.
+            //
+            // `admit_wt_share` retains its existing next-def/confined-control
+            // proof; `share_homes` merely forces the verified linear-scan
+            // reuse.  No XMM emitter sees this plan.  The post-share GPR
+            // attempt is also the only existing scope in which frame spilling
+            // may be considered, and its own default/off switches still apply.
+            if !entry.computed_guards.is_empty()
+                && !entry.resume.is_empty()
+                && cold.is_empty()
+                && gpr_homes_enabled()
+                && gpr_wt_share_enabled()
+            {
+                if let Some(shared) = plan_region_cold_gpr_virtual(
+                    proto, start, end, ta_plan, true, false, true, true, &cold, false, 18,
+                ) {
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!(
+                            "[jit] INT-GPR computed retry [{start},{end}]: shared-home re-plan"
+                        );
+                    }
+                    if let GprAttempt::Emitted(f) = compile_region_int_gpr(
+                        proto,
+                        start,
+                        end,
+                        globals_base_helper,
+                        ta_plan,
+                        ta_snapshot,
+                        &shared,
+                        entry,
+                        meter,
+                        true,
+                    ) {
+                        return Some(f);
+                    }
+                }
+            }
             // ── W8: B94 split receivers on GPR homes ── with the split OFF by
             // default (`int_split_enabled`'s xmm-cost refutation) a recycled
             // pinned receiver (`iv[i] = st` with `st` also the xorshift temp)
@@ -678,9 +862,9 @@ pub(crate) fn compile_region_int_maybe_cold(
             let mut split_plan = None;
             if !int_split_enabled() && gpr_split_enabled() && gpr_homes_enabled() && cold.is_empty()
             {
-                if let Some(p2) =
-                    plan_region_cold(proto, start, end, ta_plan, true, true, false, false, &cold, false)
-                {
+                if let Some(p2) = plan_region_cold(
+                    proto, start, end, ta_plan, true, true, false, false, &cold, false,
+                ) {
                     if !p2.split_recvs.is_empty() {
                         match compile_region_int_gpr(
                             proto,
@@ -707,8 +891,16 @@ pub(crate) fn compile_region_int_maybe_cold(
                                 // contract; `ZIPP_NO_GPR_WT_SHARE=1` restores
                                 // the pre-wave plan.
                                 if let Some(shared) = plan_region_cold(
-                                    proto, start, end, ta_plan, true, true,
-                                    gpr_wt_share_enabled(), true, &cold, false,
+                                    proto,
+                                    start,
+                                    end,
+                                    ta_plan,
+                                    true,
+                                    true,
+                                    gpr_wt_share_enabled(),
+                                    true,
+                                    &cold,
+                                    false,
                                 ) {
                                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                                         eprintln!(
@@ -837,6 +1029,14 @@ pub(crate) fn compile_region_int_maybe_cold(
             _ => {}
         }
     }
+    if !xmm_plan_is_physical(&plan) {
+        debug_assert!(
+            false,
+            "a symbolic GPR-only home plan reached the XMM emitter"
+        );
+        decline_emit("int-emit: virtual home reached xmm emitter");
+        return None;
+    }
     // W28: type splits are planned ONLY for `admit_dv`/`share_homes` plans,
     // which route exclusively into the GPR emitter — the plan this xmm emitter
     // holds passes neither, so the map is empty by construction. Refuse rather
@@ -861,7 +1061,10 @@ pub(crate) fn compile_region_int_maybe_cold(
         // Out of range only if `entry.resume` is empty (an unspliced region,
         // where `ip` IS the resume ip) — the map is built one entry past the
         // body so that `ip + 1` is always in it.
-        entry.resume.get(ip.wrapping_sub(s)).map_or(ip as i32, |&r| r as i32)
+        entry
+            .resume
+            .get(ip.wrapping_sub(s))
+            .map_or(ip as i32, |&r| r as i32)
     };
 
     let in_region: Vec<_> = (s..=e).map(|_| ops.new_dynamic_label()).collect();
@@ -1067,6 +1270,9 @@ pub(crate) fn compile_region_int_maybe_cold(
         emit_int_entry_load(&mut ops, x, entry_bail);
     }
     for &(r, x) in &plan.live_in_regs {
+        if entry.is_scratch(r) {
+            continue;
+        }
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_int_entry_load(&mut ops, x, entry_bail);
     }
@@ -1075,6 +1281,9 @@ pub(crate) fn compile_region_int_maybe_cold(
     // `BOOL_GPRS`) — but it is kept: it is the order the other two tiers use.
     emit_bool_home_zero(&mut ops, &plan);
     for &(r, g) in &plan.live_in_bools {
+        if entry.is_scratch(r) {
+            continue;
+        }
         dynasm!(ops ; mov rax, [rbx + dreg(r)]);
         emit_bool_entry_load(&mut ops, g, entry_bail);
     }
@@ -1127,8 +1336,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         // Charge this basic block before running it. A block is straight-line,
         // so entering it means executing all of it — the same count the
         // interpreter would have made, in the same unit.
-        let charged =
-            crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
+        let charged = crate::codegen::meter::charge_block(&mut ops, &blocks, ip, &mut exit_stubs);
         // B9: an ip in a cold block never runs natively — flush every home and
         // hand this exact ip back to the interpreter, which runs the block (and
         // the rest of the iteration) itself.
@@ -1229,11 +1437,15 @@ pub(crate) fn compile_region_int_maybe_cold(
                 }
             }
             Instr::Add { dst, a, b } => {
-                emit_ibin(&mut ops, &plan, ip, rip_after, flush_exit, dst, a, b, true, &mut lc);
+                emit_ibin(
+                    &mut ops, &plan, ip, rip_after, flush_exit, dst, a, b, true, &mut lc,
+                );
                 wt_pre = true; // emit_ibin write-throughs before its own guard
             }
             Instr::Sub { dst, a, b } => {
-                emit_ibin(&mut ops, &plan, ip, rip_after, flush_exit, dst, a, b, false, &mut lc);
+                emit_ibin(
+                    &mut ops, &plan, ip, rip_after, flush_exit, dst, a, b, false, &mut lc,
+                );
                 wt_pre = true; // emit_ibin write-throughs before its own guard
             }
             Instr::Mul { dst, a, b } => {
@@ -1539,9 +1751,15 @@ pub(crate) fn compile_region_int_maybe_cold(
                         ; movsxd rax, eax                // Int payload, sign-extended
                     );
                 } else {
-                    dynasm!(ops
-                        ; movsxd rax, DWORD [rdx + rcx * 4] // sign-extend i32 element → home
-                    );
+                    match int_ta_load_kind(ta_plan.pins[j].kind)? {
+                        IntTaLoadKind::I8 => dynasm!(ops ; movsx rax, BYTE [rdx + rcx]),
+                        IntTaLoadKind::U8 => dynasm!(ops ; movzx eax, BYTE [rdx + rcx]),
+                        IntTaLoadKind::I16 => dynasm!(ops ; movsx rax, WORD [rdx + rcx * 2]),
+                        IntTaLoadKind::U16 => dynasm!(ops ; movzx eax, WORD [rdx + rcx * 2]),
+                        IntTaLoadKind::I32 => {
+                            dynasm!(ops ; movsxd rax, DWORD [rdx + rcx * 4])
+                        }
+                    }
                 }
                 dynasm!(ops
                     ; movq Rx(d), rax
@@ -1824,7 +2042,8 @@ pub(crate) fn compile_region_int_maybe_cold(
             // Vec — there are no calls, and dense-Array stores are not admitted.
             Instr::GetProp { dst, .. }
                 if ta_plan.access.get(&ip).map_or(false, |&j| {
-                    matches!(ta_plan.pins[j as usize].kind, STR_PIN_KIND | ARR_INT_PIN_KIND)
+                    matches!(ta_plan.pins[j as usize].kind, STR_PIN_KIND)
+                        || int_length_pin_kind(ta_plan.pins[j as usize].kind)
                 }) =>
             {
                 let j = ta_plan.access[&ip] as usize;
@@ -1869,7 +2088,13 @@ pub(crate) fn compile_region_int_maybe_cold(
             // signed it IS Math.imul → sign-extend to the home (fits i32, no guard).
             // MUST NOT route through the generic i64 Mul arm (it i53-guards a 64-bit
             // product and would box e.g. imul(0xFFFF,0xFFFF) as +4294836225 not -131071).
-            Instr::MathOp { dst, arg_base, op: MathFn::Imul, argc: 2, .. } => {
+            Instr::MathOp {
+                dst,
+                arg_base,
+                op: MathFn::Imul,
+                argc: 2,
+                ..
+            } => {
                 let d = xh(&plan, dst);
                 let (ax, bx) = (xh(&plan, arg_base), xh(&plan, arg_base + 1));
                 copy_clobber(&mut lc, d);
@@ -1890,10 +2115,7 @@ pub(crate) fn compile_region_int_maybe_cold(
             // lower tier corrupts the tier-attribution reading (see the
             // regalloc emitter's twin arm). Behavior unchanged — still None.
             _ => {
-                decline_emit(format_args!(
-                    "int-emit-unhandled: {:?}",
-                    proto.code[ip]
-                ));
+                decline_emit(format_args!("int-emit-unhandled: {:?}", proto.code[ip]));
                 return None;
             }
         }
@@ -1914,7 +2136,11 @@ pub(crate) fn compile_region_int_maybe_cold(
                     Instr::Bitwise { op, .. } if !matches!(op, crate::bytecode::BitwiseOp::Ushr)
                 ) || matches!(
                     proto.code[ip],
-                    Instr::MathOp { op: MathFn::Imul, argc: 2, .. }
+                    Instr::MathOp {
+                        op: MathFn::Imul,
+                        argc: 2,
+                        ..
+                    }
                 );
                 if emit_int_wt(&mut ops, &plan, d, known_i32) {
                     flag_cmp = None; // the boxing clobbered any fused flags
@@ -1932,6 +2158,9 @@ pub(crate) fn compile_region_int_maybe_cold(
     // to the reg file / globals, restore, return. [rsi] holds the resume ip.
     dynasm!(ops ; => flush_exit);
     for &(r, x) in &plan.num_regs {
+        if entry.is_scratch(r) {
+            continue;
+        }
         // A B94 split receiver is written through (boxed) at each numeric def,
         // so memory is already current; flushing its home here would overwrite
         // the receiver object at any exit taken inside the receiver range.
@@ -1942,6 +2171,9 @@ pub(crate) fn compile_region_int_maybe_cold(
         dynasm!(ops ; mov [rbx + dreg(r)], rax);
     }
     for &(r, g) in &plan.bool_regs {
+        if entry.is_scratch(r) {
+            continue;
+        }
         dynasm!(ops ; mov rax, QWORD BOOL_TAG as i64 ; or rax, Rq(g) ; mov [rbx + dreg(r)], rax);
     }
     for &(gi, x) in &plan.globs {
@@ -1976,5 +2208,22 @@ pub(crate) fn compile_region_int_maybe_cold(
         log_pinned_recvs("INT", start, end, proto, &plan);
     }
     let entry_ptr = buf.ptr(dynasmrt::AssemblyOffset(0));
-    Some(JitFn { _buf: buf, entry: entry_ptr, self_binding: None })
+    Some(JitFn {
+        _buf: buf,
+        entry: entry_ptr,
+        self_binding: None,
+    })
+}
+
+#[cfg(test)]
+mod virtual_home_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn xmm_consumer_rejects_the_first_virtual_home_id() {
+        assert!(xmm_home_id_is_physical(HOME_XMM_FIRST));
+        assert!(xmm_home_id_is_physical(HOME_XMM_LAST));
+        assert!(!xmm_home_id_is_physical(HOME_XMM_LAST + 1));
+        assert!(!xmm_home_id_is_physical(u8::MAX));
+    }
 }

@@ -47,9 +47,11 @@ fn definitely_string(e: &Expr) -> bool {
 /// still retains the full two-Add fallback for adversarial values/coercions.
 fn add_right_pair_parts(value: &Expr) -> Option<(&Expr, &Expr)> {
     match value {
-        Expr::Binary { op: ast::BinaryOp::Add, left, right } if definitely_string(left) => {
-            Some((left, right))
-        }
+        Expr::Binary {
+            op: ast::BinaryOp::Add,
+            left,
+            right,
+        } if definitely_string(left) => Some((left, right)),
         _ => None,
     }
 }
@@ -139,10 +141,11 @@ fn builds_into_dst_incrementally(e: &Expr, target: &str) -> bool {
         // TARGET (`Target::Ident { covered }`), never on the value side, so
         // nothing is lost: a parenthesised object literal reaches the `Object`
         // arm directly instead of through a peel.
-        Expr::Assign { target: tgt, value, .. } => {
+        Expr::Assign {
+            target: tgt, value, ..
+        } => {
             // All three member shapes (`a.b`, `a[b]`, `a.#b`) are one node now.
-            matches!(tgt, Target::Member(_))
-                || builds_into_dst_incrementally(value, target)
+            matches!(tgt, Target::Member(_)) || builds_into_dst_incrementally(value, target)
         }
         _ => false,
     }
@@ -175,7 +178,12 @@ impl<'a> FnCompiler<'a> {
                     let save = self.next_reg;
                     let obj = self.expr(&m.object)?;
                     let name = self.string_name(prop);
-                    self.emit(Instr::SetProp { obj, name, val: src, strict: self.cx.strict_expr_region > 0 });
+                    self.emit(Instr::SetProp {
+                        obj,
+                        name,
+                        val: src,
+                        strict: self.cx.strict_expr_region > 0,
+                    });
                     self.next_reg = save;
                     Ok(())
                 }
@@ -187,7 +195,12 @@ impl<'a> FnCompiler<'a> {
                     if let Some((name, rhs)) = concat_key_literal_prefix(key_expr) {
                         let nidx = self.string_name(name);
                         let key = self.expr(rhs)?;
-                        self.emit(Instr::SetIndexConcat { obj, name: nidx, key, val: src });
+                        self.emit(Instr::SetIndexConcat {
+                            obj,
+                            name: nidx,
+                            key,
+                            val: src,
+                        });
                         self.next_reg = save;
                         return Ok(());
                     }
@@ -204,7 +217,11 @@ impl<'a> FnCompiler<'a> {
                     let save = self.next_reg;
                     let obj = self.expr(&m.object)?;
                     let name = self.string_name(&private_key(field));
-                    self.emit(Instr::SetPrivate { obj, name, val: src });
+                    self.emit(Instr::SetPrivate {
+                        obj,
+                        name,
+                        val: src,
+                    });
                     self.next_reg = save;
                     Ok(())
                 }
@@ -236,7 +253,13 @@ impl<'a> FnCompiler<'a> {
         let r = self.alloc_reg();
         self.call(c, r)?;
         let e = self.alloc_reg();
-        self.emit(Instr::NewError { dst: e, kind: 4, arg: None, opts: None, errors: None });
+        self.emit(Instr::NewError {
+            dst: e,
+            kind: 4,
+            arg: None,
+            opts: None,
+            errors: None,
+        });
         self.emit(Instr::Throw { src: e });
         self.next_reg = save;
         Ok(())
@@ -329,7 +352,12 @@ impl<'a> FnCompiler<'a> {
             self.apply_default_in_place_named(val, init, None)?;
         }
         match *key {
-            PreKey::Static(name) => self.emit(Instr::SetProp { obj, name, val, strict: self.cx.strict_expr_region > 0 }),
+            PreKey::Static(name) => self.emit(Instr::SetProp {
+                obj,
+                name,
+                val,
+                strict: self.cx.strict_expr_region > 0,
+            }),
             PreKey::Computed(k) => self.emit(Instr::SetIndex { obj, key: k, val }),
             PreKey::Private(name) => self.emit(Instr::SetPrivate { obj, name, val }),
             // `obj` is the dummy from pre_member_ref — a SuperProperty store
@@ -338,16 +366,32 @@ impl<'a> FnCompiler<'a> {
             PreKey::Super(name) => match self.super_class {
                 Some(p) => {
                     let b = self.temp();
-                    self.emit(Instr::SuperBase { dst: b, home_class_id: p });
-                    self.emit(Instr::SuperSet { base: b, home_class_id: p, name, val })
+                    self.emit(Instr::SuperBase {
+                        dst: b,
+                        home_class_id: p,
+                    });
+                    self.emit(Instr::SuperSet {
+                        base: b,
+                        home_class_id: p,
+                        name,
+                        val,
+                    })
                 }
                 None => self.emit(Instr::SuperSetObj { name, val }),
             },
             PreKey::SuperComputed(k) => match self.super_class {
                 Some(p) => {
                     let b = self.temp();
-                    self.emit(Instr::SuperBase { dst: b, home_class_id: p });
-                    self.emit(Instr::SuperSetComputed { base: b, home_class_id: p, key: k, val })
+                    self.emit(Instr::SuperBase {
+                        dst: b,
+                        home_class_id: p,
+                    });
+                    self.emit(Instr::SuperSetComputed {
+                        base: b,
+                        home_class_id: p,
+                        key: k,
+                        val,
+                    })
                 }
                 None => self.emit(Instr::SuperSetObjComputed { key: k, val }),
             },
@@ -418,7 +462,12 @@ impl<'a> FnCompiler<'a> {
                     let save = self.next_reg;
                     let obj = self.expr(&m.object)?;
                     let name = self.string_name(prop);
-                    self.emit(Instr::SetProp { obj, name, val, strict: self.cx.strict_expr_region > 0 });
+                    self.emit(Instr::SetProp {
+                        obj,
+                        name,
+                        val,
+                        strict: self.cx.strict_expr_region > 0,
+                    });
                     self.next_reg = save;
                     Ok(())
                 }
@@ -448,11 +497,7 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
-    pub(crate) fn assign_array_target(
-        &mut self,
-        els: &[Option<TargetElem>],
-        src_in: Reg,
-    ) -> R<()> {
+    pub(crate) fn assign_array_target(&mut self, els: &[Option<TargetElem>], src_in: Reg) -> R<()> {
         // Array assignment destructuring: the SPEC's stepwise iterator driver.
         // Per element: evaluate a member target's REFERENCE first, then
         // IteratorStep (no step once exhausted), then the default, then store
@@ -469,26 +514,41 @@ impl<'a> FnCompiler<'a> {
             Some(Some(t)) if t.rest => Some(t),
             _ => None,
         };
-        let elements: &[Option<TargetElem>] =
-            if rest.is_some() { &els[..els.len() - 1] } else { els };
+        let elements: &[Option<TargetElem>] = if rest.is_some() {
+            &els[..els.len() - 1]
+        } else {
+            els
+        };
         let save_top = self.next_reg;
         let iter_reg = self.alloc_reg();
         // GetIterator alone: it now raises the "not iterable" TypeError itself, so
         // the old `CheckIterable` prefix is gone — it did a SECOND observable
         // `Get(@@iterator)` on the RHS (sm/destructuring/order.js asserts exactly
         // one, and sm/destructuring/order-super.js depends on the same log).
-        self.emit(Instr::GetIterator { dst: iter_reg, src: src_in });
+        self.emit(Instr::GetIterator {
+            dst: iter_reg,
+            src: src_in,
+        });
         // GetIteratorFromMethod step 3 reads `next` ONCE, as part of building the
         // iterator record — i.e. BEFORE the first element's target reference is
         // evaluated. Priming it here (as for-of already does) both fixes that
         // order and stops a mid-pattern redefinition of `iterator.next` from
         // being observed.
         let next_reg = self.alloc_reg();
-        self.emit(Instr::IterPrime { dst: next_reg, iter: iter_reg });
+        self.emit(Instr::IterPrime {
+            dst: next_reg,
+            iter: iter_reg,
+        });
         let idx_reg = self.alloc_reg();
-        self.emit(Instr::LoadInt { dst: idx_reg, val: 0 });
+        self.emit(Instr::LoadInt {
+            dst: idx_reg,
+            val: 0,
+        });
         let done = self.alloc_reg();
-        self.emit(Instr::LoadBool { dst: done, val: false });
+        self.emit(Instr::LoadBool {
+            dst: done,
+            val: false,
+        });
         // FINALLY-kind protection (not catch): a `yield` inside the pattern
         // can suspend the generator with this iterator OPEN — a later
         // `.return()` injects a RETURN completion that unwinds through
@@ -496,7 +556,11 @@ impl<'a> FnCompiler<'a> {
         let kind_reg = self.alloc_reg();
         let val_reg = self.alloc_reg();
         let push_at = self.here();
-        self.emit(Instr::PushFinally { target: 0, kind_reg, val_reg });
+        self.emit(Instr::PushFinally {
+            target: 0,
+            kind_reg,
+            val_reg,
+        });
         self.handler_depth += 1;
         for el in elements {
             let save = self.next_reg;
@@ -513,12 +577,30 @@ impl<'a> FnCompiler<'a> {
             // spec marks [[Done]] before propagating); a successful value
             // clears it.
             let jdone = self.here();
-            self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
-            self.emit(Instr::LoadBool { dst: done, val: true });
-            self.emit(Instr::IterNext { value_dst: val, done_dst: dflag, iter: iter_reg, idx: idx_reg, next: next_reg });
+            self.emit(Instr::JumpIfTrue {
+                cond: done,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: true,
+            });
+            self.emit(Instr::IterNext {
+                value_dst: val,
+                done_dst: dflag,
+                iter: iter_reg,
+                idx: idx_reg,
+                next: next_reg,
+            });
             let jexh = self.here();
-            self.emit(Instr::JumpIfTrue { cond: dflag, target: 0 });
-            self.emit(Instr::LoadBool { dst: done, val: false });
+            self.emit(Instr::JumpIfTrue {
+                cond: dflag,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: false,
+            });
             let jgot = self.here();
             self.emit(Instr::Jump { target: 0 });
             let at_undef = self.here();
@@ -529,9 +611,7 @@ impl<'a> FnCompiler<'a> {
             self.patch_jump(jgot, got);
             if let Some(te) = el {
                 match pre {
-                    Some((obj, key)) => {
-                        self.store_pre_ref(te.default.as_ref(), obj, &key, val)?
-                    }
+                    Some((obj, key)) => self.store_pre_ref(te.default.as_ref(), obj, &key, val)?,
                     None => self.assign_maybe_default(&te.target, te.default.as_ref(), val)?,
                 }
             }
@@ -541,18 +621,44 @@ impl<'a> FnCompiler<'a> {
             let save = self.next_reg;
             let pre = self.pre_rest_ref(&rest.target)?;
             let out = self.alloc_reg();
-            self.emit(Instr::ArrayCtor { dst: out, arg_base: 0, argc: 0 });
+            self.emit(Instr::ArrayCtor {
+                dst: out,
+                arg_base: 0,
+                argc: 0,
+            });
             let v = self.alloc_reg();
             let dflag = self.alloc_reg();
             let loop_top = self.here();
             let jrest_done = self.here();
-            self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
-            self.emit(Instr::LoadBool { dst: done, val: true });
-            self.emit(Instr::IterNext { value_dst: v, done_dst: dflag, iter: iter_reg, idx: idx_reg, next: next_reg });
+            self.emit(Instr::JumpIfTrue {
+                cond: done,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: true,
+            });
+            self.emit(Instr::IterNext {
+                value_dst: v,
+                done_dst: dflag,
+                iter: iter_reg,
+                idx: idx_reg,
+                next: next_reg,
+            });
             let jout = self.here();
-            self.emit(Instr::JumpIfTrue { cond: dflag, target: 0 });
-            self.emit(Instr::LoadBool { dst: done, val: false });
-            self.emit(Instr::ArrayAppend { arr: out, val: v, spread: false });
+            self.emit(Instr::JumpIfTrue {
+                cond: dflag,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: false,
+            });
+            self.emit(Instr::ArrayAppend {
+                arr: out,
+                val: v,
+                spread: false,
+            });
             self.emit(Instr::Jump { target: loop_top });
             let rest_done = self.here();
             self.patch_jump(jrest_done, rest_done);
@@ -570,7 +676,10 @@ impl<'a> FnCompiler<'a> {
         self.handler_depth -= 1;
         // Normal completion: close iff not exhausted (strict result checks).
         let jskip = self.here();
-        self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
+        self.emit(Instr::JumpIfTrue {
+            cond: done,
+            target: 0,
+        });
         self.emit(Instr::IterClose { iter: iter_reg });
         let jend = self.here();
         self.emit(Instr::Jump { target: 0 });
@@ -585,13 +694,23 @@ impl<'a> FnCompiler<'a> {
             *target = fin_start;
         }
         let jresume = self.here();
-        self.emit(Instr::JumpIfTrue { cond: done, target: 0 });
+        self.emit(Instr::JumpIfTrue {
+            cond: done,
+            target: 0,
+        });
         let two = self.alloc_reg();
         self.emit(Instr::LoadInt { dst: two, val: 2 });
         let isthrow = self.alloc_reg();
-        self.emit(Instr::Eq { dst: isthrow, a: kind_reg, b: two });
+        self.emit(Instr::Eq {
+            dst: isthrow,
+            a: kind_reg,
+            b: two,
+        });
         let jnotthrow = self.here();
-        self.emit(Instr::JumpIfFalse { cond: isthrow, target: 0 });
+        self.emit(Instr::JumpIfFalse {
+            cond: isthrow,
+            target: 0,
+        });
         self.emit(Instr::IterCloseQuiet { iter: iter_reg });
         let jresume2 = self.here();
         self.emit(Instr::Jump { target: 0 });
@@ -668,7 +787,11 @@ impl<'a> FnCompiler<'a> {
                 let save = self.next_reg;
                 let kreg = keys_base + i as Reg;
                 let val = self.alloc_reg();
-                self.emit(Instr::GetIndex { dst: val, obj: src, key: kreg });
+                self.emit(Instr::GetIndex {
+                    dst: val,
+                    obj: src,
+                    key: kreg,
+                });
                 match (&prop.target, prop.shorthand) {
                     (Target::Ident { name, .. }, true) => {
                         if let Some(init) = &prop.default {
@@ -689,7 +812,12 @@ impl<'a> FnCompiler<'a> {
             let rest_target = rest.ok_or("object-rest destructuring lost its rest target")?;
             let save = self.next_reg;
             let val = self.alloc_reg();
-            self.emit(Instr::ObjectRestDyn { dst: val, src, keys_base, n });
+            self.emit(Instr::ObjectRestDyn {
+                dst: val,
+                src,
+                keys_base,
+                n,
+            });
             self.assign_target(rest_target, val)?;
             self.next_reg = save;
             self.next_reg = block_save;
@@ -702,7 +830,11 @@ impl<'a> FnCompiler<'a> {
                     // `({x} = o)` / `({x = d} = o)` — target is the identifier itself.
                     let val = self.alloc_reg();
                     let nidx = self.string_name(name);
-                    self.emit(Instr::GetProp { dst: val, obj: src, name: nidx });
+                    self.emit(Instr::GetProp {
+                        dst: val,
+                        obj: src,
+                        name: nidx,
+                    });
                     if let Some(init) = &prop.default {
                         // `({x = function(){}} = o)` ⇒ default takes the name "x".
                         self.apply_default_in_place_named(val, init, Some(&**name))?;
@@ -724,7 +856,11 @@ impl<'a> FnCompiler<'a> {
                         let skey: Option<Reg> = if let PropKey::Computed(e) = &prop.key {
                             let raw = self.pin_expr(e)?;
                             let k = self.alloc_reg();
-                            self.emit(Instr::ToPropKey { dst: k, obj: src, src: raw });
+                            self.emit(Instr::ToPropKey {
+                                dst: k,
+                                obj: src,
+                                src: raw,
+                            });
                             Some(k)
                         } else {
                             None
@@ -732,11 +868,19 @@ impl<'a> FnCompiler<'a> {
                         let pre = self.pre_member_ref(&prop.target)?;
                         let val = self.alloc_reg();
                         match skey {
-                            Some(k) => self.emit(Instr::GetIndex { dst: val, obj: src, key: k }),
+                            Some(k) => self.emit(Instr::GetIndex {
+                                dst: val,
+                                obj: src,
+                                key: k,
+                            }),
                             None => {
                                 let name = class_key_name(&prop.key)?;
                                 let nidx = self.string_name(&name);
-                                self.emit(Instr::GetProp { dst: val, obj: src, name: nidx });
+                                self.emit(Instr::GetProp {
+                                    dst: val,
+                                    obj: src,
+                                    name: nidx,
+                                });
                             }
                         }
                         let (obj, key) = pre.expect("member target shape checked above");
@@ -767,7 +911,12 @@ impl<'a> FnCompiler<'a> {
             }
             let save = self.next_reg;
             let val = self.alloc_reg();
-            self.emit(Instr::ObjectRest { dst: val, src, exclude_start, exclude_count });
+            self.emit(Instr::ObjectRest {
+                dst: val,
+                src,
+                exclude_start,
+                exclude_count,
+            });
             self.assign_target(rest_target, val)?;
             self.next_reg = save;
         }
@@ -781,12 +930,18 @@ impl<'a> FnCompiler<'a> {
         match op {
             AssignOp::LogicalOr => {
                 let j = self.here();
-                self.emit(Instr::JumpIfTrue { cond: val, target: 0 }); // truthy → skip
+                self.emit(Instr::JumpIfTrue {
+                    cond: val,
+                    target: 0,
+                }); // truthy → skip
                 j
             }
             AssignOp::LogicalAnd => {
                 let j = self.here();
-                self.emit(Instr::JumpIfFalse { cond: val, target: 0 }); // falsy → skip
+                self.emit(Instr::JumpIfFalse {
+                    cond: val,
+                    target: 0,
+                }); // falsy → skip
                 j
             }
             _ => {
@@ -796,7 +951,10 @@ impl<'a> FnCompiler<'a> {
                 let isnull = self.alloc_reg();
                 self.emit_is_nullish(val, isnull, undef);
                 let j = self.here();
-                self.emit(Instr::JumpIfFalse { cond: isnull, target: 0 });
+                self.emit(Instr::JumpIfFalse {
+                    cond: isnull,
+                    target: 0,
+                });
                 self.next_reg = save;
                 j
             }
@@ -829,17 +987,29 @@ impl<'a> FnCompiler<'a> {
                     // resolves its [[HomeObject]] base at the store op instead.
                     let sb = pid.map(|p| {
                         let b = self.temp();
-                        self.emit(Instr::SuperBase { dst: b, home_class_id: p });
+                        self.emit(Instr::SuperBase {
+                            dst: b,
+                            home_class_id: p,
+                        });
                         b
                     });
                     // A super GET/SET routes to the class op (home_class_id) or the
                     // object-method op ([[HomeObject]]), depending on the lexical context.
                     let emit_get = |s: &mut Self, d: Reg| match pid {
-                        Some(p) => s.emit(Instr::SuperGet { dst: d, home_class_id: p, name }),
+                        Some(p) => s.emit(Instr::SuperGet {
+                            dst: d,
+                            home_class_id: p,
+                            name,
+                        }),
                         None => s.emit(Instr::SuperGetObj { dst: d, name }),
                     };
                     let emit_set = |s: &mut Self, v: Reg| match (pid, sb) {
-                        (Some(p), Some(b)) => s.emit(Instr::SuperSet { base: b, home_class_id: p, name, val: v }),
+                        (Some(p), Some(b)) => s.emit(Instr::SuperSet {
+                            base: b,
+                            home_class_id: p,
+                            name,
+                            val: v,
+                        }),
                         _ => s.emit(Instr::SuperSetObj { name, val: v }),
                     };
                     if is_logical {
@@ -880,7 +1050,12 @@ impl<'a> FnCompiler<'a> {
                         if v != dst {
                             self.emit(Instr::Move { dst, src: v });
                         }
-                        self.emit(Instr::SetProp { obj, name, val: dst, strict: self.cx.strict_expr_region > 0 });
+                        self.emit(Instr::SetProp {
+                            obj,
+                            name,
+                            val: dst,
+                            strict: self.cx.strict_expr_region > 0,
+                        });
                         let end = self.here();
                         self.patch_jump(j, end);
                     } else if matches!(op, AssignOp::Assign) {
@@ -888,16 +1063,30 @@ impl<'a> FnCompiler<'a> {
                         if val != dst {
                             self.emit(Instr::Move { dst, src: val });
                         }
-                        self.emit(Instr::SetProp { obj, name, val: dst, strict: self.cx.strict_expr_region > 0 });
+                        self.emit(Instr::SetProp {
+                            obj,
+                            name,
+                            val: dst,
+                            strict: self.cx.strict_expr_region > 0,
+                        });
                     } else {
                         // Compound `obj.x op= v`: read obj.x, combine, write back.
                         let cur = self.temp();
-                        self.emit(Instr::GetProp { dst: cur, obj, name });
+                        self.emit(Instr::GetProp {
+                            dst: cur,
+                            obj,
+                            name,
+                        });
                         let rhs = self.expr(value)?;
                         let instr = compound_assign_instr(op, dst, cur, rhs)
                             .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                         self.emit(instr);
-                        self.emit(Instr::SetProp { obj, name, val: dst, strict: self.cx.strict_expr_region > 0 });
+                        self.emit(Instr::SetProp {
+                            obj,
+                            name,
+                            val: dst,
+                            strict: self.cx.strict_expr_region > 0,
+                        });
                     }
                     return Ok(dst);
                 }
@@ -913,7 +1102,12 @@ impl<'a> FnCompiler<'a> {
                         if v != dst {
                             self.emit(Instr::Move { dst, src: v });
                         }
-                        self.emit(Instr::SetProp { obj, name, val: dst, strict: self.cx.strict_expr_region > 0 });
+                        self.emit(Instr::SetProp {
+                            obj,
+                            name,
+                            val: dst,
+                            strict: self.cx.strict_expr_region > 0,
+                        });
                         let end = self.here();
                         self.patch_jump(j, end);
                     } else if matches!(op, AssignOp::Assign) {
@@ -921,15 +1115,27 @@ impl<'a> FnCompiler<'a> {
                         if val != dst {
                             self.emit(Instr::Move { dst, src: val });
                         }
-                        self.emit(Instr::SetPrivate { obj, name, val: dst });
+                        self.emit(Instr::SetPrivate {
+                            obj,
+                            name,
+                            val: dst,
+                        });
                     } else {
                         let cur = self.temp();
-                        self.emit(Instr::GetProp { dst: cur, obj, name });
+                        self.emit(Instr::GetProp {
+                            dst: cur,
+                            obj,
+                            name,
+                        });
                         let rhs = self.expr(value)?;
                         let instr = compound_assign_instr(op, dst, cur, rhs)
                             .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                         self.emit(instr);
-                        self.emit(Instr::SetPrivate { obj, name, val: dst });
+                        self.emit(Instr::SetPrivate {
+                            obj,
+                            name,
+                            val: dst,
+                        });
                     }
                     return Ok(dst);
                 }
@@ -943,22 +1149,43 @@ impl<'a> FnCompiler<'a> {
                     let key = self.expr(key_expr)?;
                     let key_reg = self.alloc_reg();
                     if key != key_reg {
-                        self.emit(Instr::Move { dst: key_reg, src: key });
+                        self.emit(Instr::Move {
+                            dst: key_reg,
+                            src: key,
+                        });
                     }
                     // GetSuperBase after the key, BEFORE the RHS (superPropOrdering's
                     // testElemAssign).
                     let sb = pid.map(|p| {
                         let b = self.temp();
-                        self.emit(Instr::SuperBase { dst: b, home_class_id: p });
+                        self.emit(Instr::SuperBase {
+                            dst: b,
+                            home_class_id: p,
+                        });
                         b
                     });
                     let emit_get = |s: &mut Self, d: Reg| match pid {
-                        Some(p) => s.emit(Instr::SuperGetComputed { dst: d, home_class_id: p, key: key_reg }),
-                        None => s.emit(Instr::SuperGetObjComputed { dst: d, key: key_reg }),
+                        Some(p) => s.emit(Instr::SuperGetComputed {
+                            dst: d,
+                            home_class_id: p,
+                            key: key_reg,
+                        }),
+                        None => s.emit(Instr::SuperGetObjComputed {
+                            dst: d,
+                            key: key_reg,
+                        }),
                     };
                     let emit_set = |s: &mut Self, v: Reg| match (pid, sb) {
-                        (Some(p), Some(b)) => s.emit(Instr::SuperSetComputed { base: b, home_class_id: p, key: key_reg, val: v }),
-                        _ => s.emit(Instr::SuperSetObjComputed { key: key_reg, val: v }),
+                        (Some(p), Some(b)) => s.emit(Instr::SuperSetComputed {
+                            base: b,
+                            home_class_id: p,
+                            key: key_reg,
+                            val: v,
+                        }),
+                        _ => s.emit(Instr::SuperSetObjComputed {
+                            key: key_reg,
+                            val: v,
+                        }),
                     };
                     if is_logical {
                         emit_get(self, dst);
@@ -989,32 +1216,40 @@ impl<'a> FnCompiler<'a> {
                 }
                 MemberProp::Computed(key_expr) => {
                     let obj = self.expr(&m.object)?; // evaluate receiver + key once
-                    // Fuse `obj[<plain string literal> + e] = v` → SetIndexConcat,
-                    // like the READ (`exprs.rs`), the delete and `assign_target`
-                    // already do. Those three are sound as-is because nothing
-                    // evaluates between their key and their store; a plain `=`
-                    // evaluates the RHS in between, so the `+`'s OBSERVABLE
-                    // coercion is hoisted into `ToConcatKey` at the `+`'s own
-                    // position and only the (then-pure) concatenation is
-                    // deferred to the store. A previous version of this fusion
-                    // omitted the hoist and ran a user `toString` after the
-                    // RHS — see PERF_ROADMAP B50's wrong-answer note.
-                    //
-                    // Only the plain `=` arm fuses: compound (`+=`) and logical
-                    // (`||=`) assignments read and write through ONE
-                    // ToPropKey-coerced key so a user coercion runs exactly
-                    // once, and the fused op exposes no such key.
+                                                     // Fuse `obj[<plain string literal> + e] = v` → SetIndexConcat,
+                                                     // like the READ (`exprs.rs`), the delete and `assign_target`
+                                                     // already do. Those three are sound as-is because nothing
+                                                     // evaluates between their key and their store; a plain `=`
+                                                     // evaluates the RHS in between, so the `+`'s OBSERVABLE
+                                                     // coercion is hoisted into `ToConcatKey` at the `+`'s own
+                                                     // position and only the (then-pure) concatenation is
+                                                     // deferred to the store. A previous version of this fusion
+                                                     // omitted the hoist and ran a user `toString` after the
+                                                     // RHS — see PERF_ROADMAP B50's wrong-answer note.
+                                                     //
+                                                     // Only the plain `=` arm fuses: compound (`+=`) and logical
+                                                     // (`||=`) assignments read and write through ONE
+                                                     // ToPropKey-coerced key so a user coercion runs exactly
+                                                     // once, and the fused op exposes no such key.
                     if !is_logical && matches!(op, AssignOp::Assign) {
                         if let Some((name, rhs)) = concat_key_literal_prefix(key_expr) {
                             let nidx = self.string_name(name);
                             let key = self.expr(rhs)?;
                             let keyk = self.temp();
-                            self.emit(Instr::ToConcatKey { dst: keyk, src: key });
+                            self.emit(Instr::ToConcatKey {
+                                dst: keyk,
+                                src: key,
+                            });
                             let val = self.expr_into(value, dst)?;
                             if val != dst {
                                 self.emit(Instr::Move { dst, src: val });
                             }
-                            self.emit(Instr::SetIndexConcat { obj, name: nidx, key: keyk, val: dst });
+                            self.emit(Instr::SetIndexConcat {
+                                obj,
+                                name: nidx,
+                                key: keyk,
+                                val: dst,
+                            });
                             return Ok(dst);
                         }
                     }
@@ -1024,14 +1259,26 @@ impl<'a> FnCompiler<'a> {
                         // and the store: coerce ToPropertyKey ONCE (its toString/valueOf
                         // must not run twice).
                         let keyk = self.temp();
-                        self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
-                        self.emit(Instr::GetIndex { dst, obj, key: keyk });
+                        self.emit(Instr::ToPropKey {
+                            dst: keyk,
+                            obj,
+                            src: key,
+                        });
+                        self.emit(Instr::GetIndex {
+                            dst,
+                            obj,
+                            key: keyk,
+                        });
                         let j = self.emit_logical_skip(op, dst);
                         let v = self.expr_into(value, dst)?;
                         if v != dst {
                             self.emit(Instr::Move { dst, src: v });
                         }
-                        self.emit(Instr::SetIndex { obj, key: keyk, val: dst });
+                        self.emit(Instr::SetIndex {
+                            obj,
+                            key: keyk,
+                            val: dst,
+                        });
                         let end = self.here();
                         self.patch_jump(j, end);
                     } else if matches!(op, AssignOp::Assign) {
@@ -1043,14 +1290,26 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::SetIndex { obj, key, val: dst });
                     } else {
                         let keyk = self.temp();
-                        self.emit(Instr::ToPropKey { dst: keyk, obj, src: key });
+                        self.emit(Instr::ToPropKey {
+                            dst: keyk,
+                            obj,
+                            src: key,
+                        });
                         let cur = self.temp();
-                        self.emit(Instr::GetIndex { dst: cur, obj, key: keyk });
+                        self.emit(Instr::GetIndex {
+                            dst: cur,
+                            obj,
+                            key: keyk,
+                        });
                         let rhs = self.expr(value)?;
                         let instr = compound_assign_instr(op, dst, cur, rhs)
                             .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                         self.emit(instr);
-                        self.emit(Instr::SetIndex { obj, key: keyk, val: dst });
+                        self.emit(Instr::SetIndex {
+                            obj,
+                            key: keyk,
+                            val: dst,
+                        });
                     }
                     return Ok(dst);
                 }
@@ -1348,16 +1607,29 @@ impl<'a> FnCompiler<'a> {
         let nidx = self.string_name(name);
         let found = self.alloc_reg();
         let tgt = self.alloc_reg();
-        self.emit(Instr::LoadBool { dst: found, val: false });
+        self.emit(Instr::LoadBool {
+            dst: found,
+            val: false,
+        });
         self.emit(Instr::LoadUndefined { dst: tgt });
         let mut done = Vec::new();
         for &obj in objs {
             let flag = self.temp();
-            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            self.emit(Instr::WithHas {
+                dst: flag,
+                obj,
+                name: nidx,
+            });
             let jf = self.here();
-            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.emit(Instr::JumpIfFalse {
+                cond: flag,
+                target: 0,
+            });
             self.next_reg -= 1; // reclaim the flag temp
-            self.emit(Instr::LoadBool { dst: found, val: true });
+            self.emit(Instr::LoadBool {
+                dst: found,
+                val: true,
+            });
             self.emit(Instr::Move { dst: tgt, src: obj });
             let jd = self.here();
             self.emit(Instr::Jump { target: 0 });
@@ -1377,10 +1649,18 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn emit_with_rmw_read(&mut self, name: &str, found: Reg, tgt: Reg, dst: Reg) {
         let nidx = self.string_name(name);
         let jf = self.here();
-        self.emit(Instr::JumpIfFalse { cond: found, target: 0 }); // → static read
-        // GetBindingValue: HasProperty AGAIN, then Get (both observable
-        // through Proxy traps) — not a bare [[Get]].
-        self.emit(Instr::WithGet { dst, obj: tgt, name: nidx, strict: self.cx.in_strict });
+        self.emit(Instr::JumpIfFalse {
+            cond: found,
+            target: 0,
+        }); // → static read
+            // GetBindingValue: HasProperty AGAIN, then Get (both observable
+            // through Proxy traps) — not a bare [[Get]].
+        self.emit(Instr::WithGet {
+            dst,
+            obj: tgt,
+            name: nidx,
+            strict: self.cx.in_strict,
+        });
         let je = self.here();
         self.emit(Instr::Jump { target: 0 });
         let stat = self.here();
@@ -1399,11 +1679,19 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn emit_with_rmw_write(&mut self, name: &str, found: Reg, tgt: Reg, src: Reg) {
         let nidx = self.string_name(name);
         let jf = self.here();
-        self.emit(Instr::JumpIfFalse { cond: found, target: 0 }); // → static write
-        // SetMutableBinding re-checks HasProperty (the binding may have been
-        // DELETED since the reference resolved): strict throws, sloppy does
-        // not silently recreate the property on the with-object.
-        self.emit(Instr::WithSet { obj: tgt, name: nidx, val: src, strict: self.cx.in_strict });
+        self.emit(Instr::JumpIfFalse {
+            cond: found,
+            target: 0,
+        }); // → static write
+            // SetMutableBinding re-checks HasProperty (the binding may have been
+            // DELETED since the reference resolved): strict throws, sloppy does
+            // not silently recreate the property on the with-object.
+        self.emit(Instr::WithSet {
+            obj: tgt,
+            name: nidx,
+            val: src,
+            strict: self.cx.in_strict,
+        });
         let je = self.here();
         self.emit(Instr::Jump { target: 0 });
         let stat = self.here();
@@ -1413,5 +1701,4 @@ impl<'a> FnCompiler<'a> {
         let end = self.here();
         self.patch_jump(je, end);
     }
-
 }

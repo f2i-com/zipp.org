@@ -302,7 +302,12 @@ fn analyze_run(
                 out.alias.insert(src, idx);
             }
             Instr::AddInt { dst, a, imm, .. } => {
-                arith(&mut out, dst, iv_add(st.reg(a), (imm as i64, imm as i64)), elide);
+                arith(
+                    &mut out,
+                    dst,
+                    iv_add(st.reg(a), (imm as i64, imm as i64)),
+                    elide,
+                );
             }
             Instr::Add { dst, a, b } => arith(&mut out, dst, iv_add(st.reg(a), st.reg(b)), elide),
             Instr::Sub { dst, a, b } => arith(&mut out, dst, iv_sub(st.reg(a), st.reg(b)), elide),
@@ -340,7 +345,11 @@ fn analyze_run(
                 return Some((Some(fall), Some((target as usize, jump))));
             }
             Instr::JumpIfNotLt { a, b, target } | Instr::JumpIfNotLe { a, b, target } => {
-                let op = if matches!(code[ip], Instr::JumpIfNotLt { .. }) { Cmp::Lt } else { Cmp::Le };
+                let op = if matches!(code[ip], Instr::JumpIfNotLt { .. }) {
+                    Cmp::Lt
+                } else {
+                    Cmp::Le
+                };
                 let mut fall = out.clone();
                 let mut jump = out;
                 refine_cmp(&mut fall, a, b, op, true);
@@ -359,7 +368,12 @@ fn analyze_run(
                 out.regs.insert(dst, iv);
                 out.alias.remove(&dst);
             }
-            Instr::MathOp { dst, op: MathFn::Imul, argc: 2, .. } if dv.is_some() => {
+            Instr::MathOp {
+                dst,
+                op: MathFn::Imul,
+                argc: 2,
+                ..
+            } if dv.is_some() => {
                 out.regs.insert(dst, IV_I32); // ToInt32 by definition
                 out.alias.remove(&dst);
             }
@@ -471,4 +485,3 @@ fn analyze_run(
     }
     Some((states, elide))
 }
-

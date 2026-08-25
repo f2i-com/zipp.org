@@ -20,7 +20,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -80,7 +84,10 @@ fn an_index_override_still_takes_the_abstract_path() {
                      a.join(","), JSON.stringify(a)].join(" | "));
         "#,
     );
-    assert_eq!(out[0], "GETTER | 1,GETTER,3 | 1 | 1,GETTER,3 | [1,\"GETTER\",3]");
+    assert_eq!(
+        out[0],
+        "GETTER | 1,GETTER,3 | 1 | 1,GETTER,3 | [1,\"GETTER\",3]"
+    );
 }
 
 #[test]
@@ -185,7 +192,10 @@ fn an_own_constructor_keeps_the_species_families_abstract() {
         console.log(out.join(" | ") + " || species=" + seen.join(","));
         "#,
     );
-    assert_eq!(out[0], "splice:0 | map:1,2,3 | filter:1,2 || species=splice,map,filter");
+    assert_eq!(
+        out[0],
+        "splice:0 | map:1,2,3 | filter:1,2 || species=splice,map,filter"
+    );
 }
 
 /// The exact shape test262 caught: the species callback mutates the receiver and

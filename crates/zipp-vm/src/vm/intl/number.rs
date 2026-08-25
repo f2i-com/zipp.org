@@ -3,14 +3,13 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
-use crate::vm::{cldr_en, dtf_pattern};
 use crate::vm::*;
+use crate::vm::{cldr_en, dtf_pattern};
 
 impl<'p> Vm<'p> {
-
     /// SetNumberFormatDigitOptions (ECMA-402 15.1.3) — shared verbatim by
     /// Intl.NumberFormat and Intl.PluralRules. Reads nine options in one fixed
     /// order (the `constructor-option-read-order` tests observe every Get), then
@@ -30,7 +29,11 @@ impl<'p> Vm<'p> {
         // maximumSignificantDigits is silently ignored when roundingPriority left
         // significant digits out of play.
         let get = |vm: &mut Self, k: &str| -> Result<Value, Thrown> {
-            if options == Value::UNDEFINED { Ok(Value::UNDEFINED) } else { vm.get_prop(options, k) }
+            if options == Value::UNDEFINED {
+                Ok(Value::UNDEFINED)
+            } else {
+                vm.get_prop(options, k)
+            }
         };
         let mnfd_raw = get(self, "minimumFractionDigits")?;
         let mxfd_raw = get(self, "maximumFractionDigits")?;
@@ -48,8 +51,15 @@ impl<'p> Vm<'p> {
             "roundingMode",
             "halfExpand",
             &[
-                "ceil", "floor", "expand", "trunc", "halfCeil", "halfFloor", "halfExpand",
-                "halfTrunc", "halfEven",
+                "ceil",
+                "floor",
+                "expand",
+                "trunc",
+                "halfCeil",
+                "halfFloor",
+                "halfExpand",
+                "halfTrunc",
+                "halfEven",
             ],
         )?;
         let rounding_priority = self.opt_string(
@@ -58,8 +68,12 @@ impl<'p> Vm<'p> {
             "auto",
             &["auto", "morePrecision", "lessPrecision"],
         )?;
-        let trailing_zero_display =
-            self.opt_string(options, "trailingZeroDisplay", "auto", &["auto", "stripIfInteger"])?;
+        let trailing_zero_display = self.opt_string(
+            options,
+            "trailingZeroDisplay",
+            "auto",
+            &["auto", "stripIfInteger"],
+        )?;
         let has_sd = mnsd_raw != Value::UNDEFINED || mxsd_raw != Value::UNDEFINED;
         let has_fd = mnfd_raw != Value::UNDEFINED || mxfd_raw != Value::UNDEFINED;
         let (mut need_sd, mut need_fd) = (true, true);
@@ -82,7 +96,8 @@ impl<'p> Vm<'p> {
         };
         if need_sd {
             if has_sd {
-                let mnsd = self.default_number_option(mnsd_raw, "minimumSignificantDigits", 1, 21)?
+                let mnsd = self
+                    .default_number_option(mnsd_raw, "minimumSignificantDigits", 1, 21)?
                     .unwrap_or(1);
                 let mxsd = self
                     .default_number_option(mxsd_raw, "maximumSignificantDigits", mnsd, 21)?
@@ -149,7 +164,6 @@ impl<'p> Vm<'p> {
         Ok(out)
     }
 
-
     /// Write the resolved digit slots into a resolvedOptions map, in the order the
     /// ECMA-402 table gives them (integer, fraction pair, significant pair).
     pub(crate) fn store_digit_options(&mut self, r: &mut ObjMap, d: &DigitOptions) {
@@ -164,7 +178,6 @@ impl<'p> Vm<'p> {
         }
     }
 
-
     /// GetBooleanOrStringNumberFormatOption(options, "useGrouping",
     /// « "min2", "auto", "always" », "always", fallback) — ECMA-402 15.1.2.
     ///
@@ -173,7 +186,11 @@ impl<'p> Vm<'p> {
     /// the STRINGS "true"/"false" resolve to the fallback instead of throwing
     /// (step 6). Only `false`/falsy stays the boolean `false`, which is why
     /// resolvedOptions still has to keep the two JS types apart.
-    pub(crate) fn read_use_grouping(&mut self, options: Value, fallback: &str) -> Result<UseGrouping, Thrown> {
+    pub(crate) fn read_use_grouping(
+        &mut self,
+        options: Value,
+        fallback: &str,
+    ) -> Result<UseGrouping, Thrown> {
         if options == Value::UNDEFINED {
             return Ok(UseGrouping::Str(fallback.to_string()));
         }
@@ -192,14 +209,19 @@ impl<'p> Vm<'p> {
             return Ok(UseGrouping::Str(fallback.to_string()));
         }
         if !["min2", "auto", "always"].contains(&s.as_str()) {
-            return Err(Thrown(format!("RangeError: invalid useGrouping value: {s}")));
+            return Err(Thrown(format!(
+                "RangeError: invalid useGrouping value: {s}"
+            )));
         }
         Ok(UseGrouping::Str(s))
     }
 
-
     /// Intl.NumberFormat.prototype.format(value).
-    pub(crate) fn intl_number_format(&mut self, resolved: u32, value: Value) -> Result<Value, Thrown> {
+    pub(crate) fn intl_number_format(
+        &mut self,
+        resolved: u32,
+        value: Value,
+    ) -> Result<Value, Thrown> {
         // Number Format Functions step 4 is ? ToNumber(value) — the FULL one, so
         // an object argument's @@toPrimitive/valueOf runs exactly once and its
         // exception propagates (`format({[Symbol.toPrimitive](){…}})`).
@@ -218,10 +240,13 @@ impl<'p> Vm<'p> {
         Ok(self.alloc_str(s))
     }
 
-
     /// The string half of format(), split out so formatToParts/formatRange can
     /// re-partition the same output instead of re-deriving it.
-    pub(crate) fn intl_number_format_str(&mut self, resolved: u32, n: f64) -> Result<String, Thrown> {
+    pub(crate) fn intl_number_format_str(
+        &mut self,
+        resolved: u32,
+        n: f64,
+    ) -> Result<String, Thrown> {
         let style = self.display(self.intl_slot(resolved, "style"));
         // A digit slot is ABSENT when SetNumberFormatDigitOptions did not resolve
         // that pair (significant and fraction digits are mutually exclusive under
@@ -281,7 +306,6 @@ impl<'p> Vm<'p> {
         })
     }
 
-
     /// PartitionNumberRangePattern, same shape as the date-time one.
     pub(crate) fn nf_range_parts(
         &mut self,
@@ -314,7 +338,6 @@ impl<'p> Vm<'p> {
         out.extend(b.into_iter().map(|(t, v)| (t, v, "endRange")));
         Ok(out)
     }
-
 
     /// PartitionNumberPattern: split the formatted number into its typed pieces
     /// (sign, integer runs around the group separators, decimal, fraction, and the
@@ -435,10 +458,13 @@ impl<'p> Vm<'p> {
             // `en`'s cardinal rule is `i = 1 and v = 0`: exactly one integer run
             // reading "1" and no fraction. The operands come from the FORMATTED
             // number, so `{minimumFractionDigits: 1}` on 1 selects "other".
-            let ints: Vec<&String> =
-                parts.iter().filter(|(t, _)| t == "integer").map(|(_, v)| v).collect();
-            let one = ints.len() == 1 && ints[0] == "1"
-                && !parts.iter().any(|(t, _)| t == "fraction");
+            let ints: Vec<&String> = parts
+                .iter()
+                .filter(|(t, _)| t == "integer")
+                .map(|(_, v)| v)
+                .collect();
+            let one =
+                ints.len() == 1 && ints[0] == "1" && !parts.iter().any(|(t, _)| t == "fraction");
             let pattern = cldr_unit_pattern(&u, &disp, one);
             let (prefix, suffix) = match pattern.as_deref().and_then(|p| p.split_once("{0}")) {
                 Some((p, s)) => (p.to_string(), s.to_string()),
@@ -496,9 +522,7 @@ impl<'p> Vm<'p> {
         }
         Ok(parts)
     }
-
 }
-
 
 /// The resolved digit slots of SetNumberFormatDigitOptions. A `None` pair means
 /// that pair is not part of the resolved rounding type and must be left out of
@@ -515,7 +539,6 @@ pub(crate) struct DigitOptions {
     pub rounding_priority: String,
     pub trailing_zero_display: String,
 }
-
 
 /// `useGrouping` is the one option whose resolved value keeps a JS type: `true`
 /// and `false` stay booleans, the strategies stay strings.
@@ -612,94 +635,22 @@ pub(crate) const NUMBERING_SYSTEM_ZERO: &[(&str, u32)] = &[
     ("wcho", 0x1E2F0),
 ];
 
-
 /// `hanidec` is the one Table 10 system whose digits are NOT consecutive.
-const HANIDEC_DIGITS: [char; 10] =
-    ['\u{3007}', '\u{4e00}', '\u{4e8c}', '\u{4e09}', '\u{56db}', '\u{4e94}', '\u{516d}',
-     '\u{4e03}', '\u{516b}', '\u{4e5d}'];
-
-
-pub(crate) const AVAILABLE_NUMBERING_SYSTEMS: &[&str] = &[
-    "adlm",
-    "ahom",
-    "arab",
-    "arabext",
-    "bali",
-    "beng",
-    "bhks",
-    "brah",
-    "cakm",
-    "cham",
-    "deva",
-    "diak",
-    "fullwide",
-    "gara",
-    "gong",
-    "gonm",
-    "gujr",
-    "gukh",
-    "guru",
-    "hanidec",
-    "hmng",
-    "hmnp",
-    "java",
-    "kali",
-    "kawi",
-    "khmr",
-    "knda",
-    "krai",
-    "lana",
-    "lanatham",
-    "laoo",
-    "latn",
-    "lepc",
-    "limb",
-    "mathbold",
-    "mathdbl",
-    "mathmono",
-    "mathsanb",
-    "mathsans",
-    "mlym",
-    "modi",
-    "mong",
-    "mroo",
-    "mtei",
-    "mymr",
-    "mymrepka",
-    "mymrpao",
-    "mymrshan",
-    "mymrtlng",
-    "nagm",
-    "newa",
-    "nkoo",
-    "olck",
-    "onao",
-    "orya",
-    "osma",
-    "outlined",
-    "rohg",
-    "saur",
-    "segment",
-    "shrd",
-    "sind",
-    "sinh",
-    "sora",
-    "sund",
-    "sunu",
-    "takr",
-    "talu",
-    "tamldec",
-    "telu",
-    "thai",
-    "tibt",
-    "tirh",
-    "tnsa",
-    "tols",
-    "vaii",
-    "wara",
-    "wcho"
+const HANIDEC_DIGITS: [char; 10] = [
+    '\u{3007}', '\u{4e00}', '\u{4e8c}', '\u{4e09}', '\u{56db}', '\u{4e94}', '\u{516d}', '\u{4e03}',
+    '\u{516b}', '\u{4e5d}',
 ];
 
+pub(crate) const AVAILABLE_NUMBERING_SYSTEMS: &[&str] = &[
+    "adlm", "ahom", "arab", "arabext", "bali", "beng", "bhks", "brah", "cakm", "cham", "deva",
+    "diak", "fullwide", "gara", "gong", "gonm", "gujr", "gukh", "guru", "hanidec", "hmng", "hmnp",
+    "java", "kali", "kawi", "khmr", "knda", "krai", "lana", "lanatham", "laoo", "latn", "lepc",
+    "limb", "mathbold", "mathdbl", "mathmono", "mathsanb", "mathsans", "mlym", "modi", "mong",
+    "mroo", "mtei", "mymr", "mymrepka", "mymrpao", "mymrshan", "mymrtlng", "nagm", "newa", "nkoo",
+    "olck", "onao", "orya", "osma", "outlined", "rohg", "saur", "segment", "shrd", "sind", "sinh",
+    "sora", "sund", "sunu", "takr", "talu", "tamldec", "telu", "thai", "tibt", "tirh", "tnsa",
+    "tols", "vaii", "wara", "wcho",
+];
 
 /// The `(decimal, group)` separators a numbering system overrides in the CLDR
 /// **root** locale, i.e. independently of which locale is formatting.
@@ -723,7 +674,6 @@ pub(crate) fn numbering_separators(ns: &str) -> Option<(&'static str, &'static s
     }
 }
 
-
 /// Map the ASCII digits of an already-formatted number into `ns`. Everything
 /// else (signs, separators, currency symbols) is untouched — the separators are
 /// locale data this engine does not have, but the DIGITS are not.
@@ -735,7 +685,11 @@ pub(crate) fn translate_digits(s: &str, ns: &str) -> String {
         return s
             .chars()
             .map(|c| {
-                if c.is_ascii_digit() { HANIDEC_DIGITS[(c as u8 - b'0') as usize] } else { c }
+                if c.is_ascii_digit() {
+                    HANIDEC_DIGITS[(c as u8 - b'0') as usize]
+                } else {
+                    c
+                }
             })
             .collect();
     }
@@ -752,7 +706,6 @@ pub(crate) fn translate_digits(s: &str, ns: &str) -> String {
         })
         .collect()
 }
-
 
 /// The compact affix `s` ends with, if any. The affixes are a closed set (the
 /// literal halves of the locale's compact-decimal rows), so recognising one is
@@ -771,19 +724,22 @@ fn compact_affix_of(s: &str, display: &str) -> Option<&'static str> {
         .max_by_key(|aff| aff.len())
 }
 
-
 /// The prefix and suffix of the NEGATIVE subpattern of CLDR's accounting
 /// currency format (`en`: `¤#,##0.00;(¤#,##0.00)` → `("(", ")")`). Everything
 /// before the first and after the last of the pattern's own symbols (`¤`, `#`,
 /// `0`, and the grouping/decimal separators) is affix.
 fn accounting_affixes() -> (&'static str, &'static str) {
-    let neg = crate::vm::cldr_en::PATTERN_ACCOUNTING.split(';').nth(1).unwrap_or("");
+    let neg = crate::vm::cldr_en::PATTERN_ACCOUNTING
+        .split(';')
+        .nth(1)
+        .unwrap_or("");
     let body = |c: char| matches!(c, '¤' | '#' | '0' | ',' | '.');
     let start = neg.find(body).unwrap_or(neg.len());
-    let end = neg.rfind(body).map_or(neg.len(), |i| i + neg[i..].chars().next().unwrap().len_utf8());
+    let end = neg.rfind(body).map_or(neg.len(), |i| {
+        i + neg[i..].chars().next().unwrap().len_utf8()
+    });
     (&neg[..start], &neg[end..])
 }
-
 
 /// The number of minor-unit digits a currency formats with (ECMA-402
 /// CurrencyDigits): 2 unless the ISO 4217 table says otherwise.
@@ -797,7 +753,6 @@ pub(crate) fn currency_digits(code: &str) -> i64 {
     }
 }
 
-
 /// The CLDR `en` pattern that renders `unit` at `width` for the given plural
 /// category — `"{0} km/h"`, `"{0}%"`, `"{0} kilometers per hour"` — or None when
 /// CLDR has no row for it (the caller then echoes the identifier rather than
@@ -810,23 +765,47 @@ pub(crate) fn currency_digits(code: &str) -> i64 {
 fn cldr_unit_pattern(unit: &str, width: &str, one: bool) -> Option<String> {
     use crate::vm::cldr_en as d;
     let pick = |row: &(&str, &str, &'static str, &'static str)| {
-        if one { row.2.to_string() } else { row.3.to_string() }
+        if one {
+            row.2.to_string()
+        } else {
+            row.3.to_string()
+        }
     };
-    if let Some(r) = d::UNIT_PER_PATTERNS.iter().find(|(u, w, ..)| *u == unit && *w == width) {
+    if let Some(r) = d::UNIT_PER_PATTERNS
+        .iter()
+        .find(|(u, w, ..)| *u == unit && *w == width)
+    {
         return Some(pick(r));
     }
-    if let Some(r) = d::UNIT_PATTERNS.iter().find(|(u, w, ..)| *u == unit && *w == width) {
+    if let Some(r) = d::UNIT_PATTERNS
+        .iter()
+        .find(|(u, w, ..)| *u == unit && *w == width)
+    {
         return Some(pick(r));
     }
     let (num, den) = unit.split_once("-per-")?;
-    let num_pat = d::UNIT_PATTERNS.iter().find(|(u, w, ..)| *u == num && *w == width).map(pick)?;
-    if let Some((.., p)) = d::UNIT_PER_UNIT.iter().find(|(u, w, _)| *u == den && *w == width) {
+    let num_pat = d::UNIT_PATTERNS
+        .iter()
+        .find(|(u, w, ..)| *u == num && *w == width)
+        .map(pick)?;
+    if let Some((.., p)) = d::UNIT_PER_UNIT
+        .iter()
+        .find(|(u, w, _)| *u == den && *w == width)
+    {
         return Some(p.replace("{0}", &num_pat));
     }
     // The denominator contributes its NAME only: its own pattern minus the
     // `{0}` placeholder and the spacing that separated them.
-    let den_pat = d::UNIT_PATTERNS.iter().find(|(u, w, ..)| *u == den && *w == width)?;
+    let den_pat = d::UNIT_PATTERNS
+        .iter()
+        .find(|(u, w, ..)| *u == den && *w == width)?;
     let den_name = den_pat.2.replace("{0}", "");
-    let idx = ["long", "short", "narrow"].iter().position(|w| *w == width)?;
-    Some(d::UNIT_COMPOUND_PER[idx].replace("{0}", &num_pat).replace("{1}", den_name.trim()))
+    let idx = ["long", "short", "narrow"]
+        .iter()
+        .position(|w| *w == width)?;
+    Some(
+        d::UNIT_COMPOUND_PER[idx]
+            .replace("{0}", &num_pat)
+            .replace("{1}", den_name.trim()),
+    )
 }

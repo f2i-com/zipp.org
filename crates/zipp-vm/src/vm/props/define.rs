@@ -29,10 +29,17 @@ impl<'p> Vm<'p> {
     /// `Object.defineProperty(obj, key, descriptor)` — define/redefine an own
     /// property with explicit attributes (unspecified attrs default to false on a
     /// new property; an existing non-configurable property rejects most changes).
-    pub(crate) fn object_define_property(&mut self, obj: Value, key: &str, desc: Value) -> Result<(), Thrown> {
+    pub(crate) fn object_define_property(
+        &mut self,
+        obj: Value,
+        key: &str,
+        desc: Value,
+    ) -> Result<(), Thrown> {
         self.defer_check(obj, key)?;
         if !obj.is_heap() {
-            return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
+            return Err(Thrown(
+                "TypeError: Object.defineProperty called on non-object".into(),
+            ));
         }
         self.note_array_proto_index(obj.heap_index(), key);
         // …and the sibling protector: a real own descriptor on the GLOBAL object
@@ -53,8 +60,7 @@ impl<'p> Vm<'p> {
         // exactly the rule that was missing. Guarded on there being no entry yet, so
         // a second define is an ordinary redefine and this is a no-op.
         if self.global_this != 0 && obj.heap_index() == self.global_this {
-            let absent =
-                matches!(self.heap.get(self.global_this), HeapObj::Object(m) if m.pos(key).is_none());
+            let absent = matches!(self.heap.get(self.global_this), HeapObj::Object(m) if m.pos(key).is_none());
             if absent {
                 if let Some((v, a)) = self.global_slot_binding_descriptor(key) {
                     if let HeapObj::Object(m) = self.heap.get_mut(self.global_this) {
@@ -98,8 +104,11 @@ impl<'p> Vm<'p> {
             }
             // An exported string key: {live value, writable:true,
             // enumerable:true, configurable:false}; anything absent rejects.
-            let key_slot =
-                self.module_namespaces.get(&nsidx).and_then(|m| m.get(key)).copied();
+            let key_slot = self
+                .module_namespaces
+                .get(&nsidx)
+                .and_then(|m| m.get(key))
+                .copied();
             let Some(slot) = key_slot else {
                 return reject(key);
             };
@@ -107,8 +116,11 @@ impl<'p> Vm<'p> {
                 return reject(key);
             }
             if let Some(v) = value {
-                let live =
-                    self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED);
+                let live = self
+                    .globals
+                    .get(slot as usize)
+                    .copied()
+                    .unwrap_or(Value::UNDEFINED);
                 if !self.same_value(v, live) {
                     return reject(key);
                 }
@@ -266,8 +278,7 @@ impl<'p> Vm<'p> {
                     // forbidden). A sparse array's length is the VIRTUAL one (an index
                     // below it doesn't grow anything). A TypeError from
                     // DefinePropertyOrThrow; the array is left unchanged.
-                    if i >= self.js_array_len(idx) && self.array_length_nonwritable.contains(&idx)
-                    {
+                    if i >= self.js_array_len(idx) && self.array_length_nonwritable.contains(&idx) {
                         return Err(Thrown(format!(
                             "TypeError: Cannot define property {i}: array length is not writable"
                         )));
@@ -326,10 +337,8 @@ impl<'p> Vm<'p> {
                             }
                         }
                     }
-                    let is_default_data = !attr.accessor
-                        && attr.writable
-                        && attr.enumerable
-                        && attr.configurable;
+                    let is_default_data =
+                        !attr.accessor && attr.writable && attr.enumerable && attr.configurable;
                     // An ARGUMENTS object: an index define past the dense
                     // window is an ordinary named own property — `length`
                     // (items.len()) must stay argc, so never grow the Vec.
@@ -420,7 +429,10 @@ impl<'p> Vm<'p> {
                 } else {
                     value.unwrap_or(cur.map_or(Value::UNDEFINED, |(_, v)| v))
                 };
-                let m = self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table);
+                let m = self
+                    .arr_props
+                    .entry(idx)
+                    .or_insert_with(ObjMap::new_side_table);
                 m.define("length", stored, new_attr);
                 if !new_attr.accessor {
                     if let Some(v) = value {
@@ -450,7 +462,11 @@ impl<'p> Vm<'p> {
                 // / >=2^32) is a RangeError — BEFORE the attribute / writability checks.
                 let new_len: Option<usize> = if let Some(v) = value {
                     let nu = self.to_number_coerce(v)?; // ToNumber inside ToUint32
-                    let u = if nu.is_finite() { (nu.trunc() as i64 as u32) as f64 } else { 0.0 };
+                    let u = if nu.is_finite() {
+                        (nu.trunc() as i64 as u32) as f64
+                    } else {
+                        0.0
+                    };
                     let number_len = self.to_number_coerce(v)?; // numberLen = ToNumber(value)
                     if u != number_len {
                         return Err(Thrown("RangeError: Invalid array length".into()));
@@ -506,9 +522,7 @@ impl<'p> Vm<'p> {
                         if d_wr == Some(false) {
                             self.array_length_nonwritable.insert(idx);
                         }
-                        return Err(Thrown(
-                            "TypeError: Cannot redefine property: length".into(),
-                        ));
+                        return Err(Thrown("TypeError: Cannot redefine property: length".into()));
                     }
                 }
                 // Record a newly non-writable length (writable was true above) so
@@ -557,12 +571,14 @@ impl<'p> Vm<'p> {
         // value, no accessor, no flag escalation) — else TypeError.
         if matches!(self.heap.get(idx), HeapObj::Boxed { kind: 0, .. }) {
             if let Some((sval, len)) = self.string_exotic_chars(obj) {
-                let is_char =
-                    key.parse::<usize>().is_ok_and(|i| i.to_string() == key && i < len);
+                let is_char = key
+                    .parse::<usize>()
+                    .is_ok_and(|i| i.to_string() == key && i < len);
                 if is_char || key == "length" {
                     let cur = if is_char {
                         let i: usize = key.parse().unwrap();
-                        self.get_index(sval, Value::num(i as f64)).unwrap_or(Value::UNDEFINED)
+                        self.get_index(sval, Value::num(i as f64))
+                            .unwrap_or(Value::UNDEFINED)
                     } else {
                         Value::num(len as f64)
                     };
@@ -590,9 +606,20 @@ impl<'p> Vm<'p> {
         let target = match self.heap.get(idx) {
             HeapObj::Object(_) => 0u8,
             HeapObj::Class(_) => 1,
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => 2,
-            HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_) => {
-                return Err(Thrown("TypeError: Object.defineProperty called on non-object".into()));
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => 2,
+            HeapObj::Str(_)
+            | HeapObj::Cons { .. }
+            | HeapObj::Symbol { .. }
+            | HeapObj::BigInt(_)
+            | HeapObj::BigIntBig(_) => {
+                return Err(Thrown(
+                    "TypeError: Object.defineProperty called on non-object".into(),
+                ));
             }
             _ => 3, // Array named prop + exotic objects -> arr_props side table
         };
@@ -628,11 +655,20 @@ impl<'p> Vm<'p> {
                 _ => None,
             },
             1 => match self.heap.get(idx) {
-                HeapObj::Class(c) => c.statics.pos(key).map(|i| (c.statics.attrs[i], c.statics.vals[i])),
+                HeapObj::Class(c) => c
+                    .statics
+                    .pos(key)
+                    .map(|i| (c.statics.attrs[i], c.statics.vals[i])),
                 _ => None,
             },
-            3 => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
-            _ => self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
+            3 => self
+                .arr_props
+                .get(&idx)
+                .and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
+            _ => self
+                .fn_props
+                .get(&idx)
+                .and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
         };
         // A RegExp's `lastIndex` is a struct-backed own data property (default
         // {writable:true, enumerable:false, configurable:false}; only attr
@@ -693,8 +729,9 @@ impl<'p> Vm<'p> {
                 _ => self.arr_props.get(&idx).map_or(true, |m| m.extensible),
             }
         };
-        let (attr, stored) = self
-            .merge_property_descriptor(key, existing, extensible, value, get, set, d_wr, d_en, d_cf)?;
+        let (attr, stored) = self.merge_property_descriptor(
+            key, existing, extensible, value, get, set, d_wr, d_en, d_cf,
+        )?;
         // Nursery barrier + B6 oracle: NURSERY_DESIGN.md §1 case 1's define
         // route (Object/Class/sidecar targets all store `stored` under holder
         // `idx`; the sidecars are additionally root-rescanned every minor).
@@ -714,10 +751,16 @@ impl<'p> Vm<'p> {
                 }
             }
             3 => {
-                self.arr_props.entry(idx).or_insert_with(ObjMap::new_side_table).define(key, stored, attr);
+                self.arr_props
+                    .entry(idx)
+                    .or_insert_with(ObjMap::new_side_table)
+                    .define(key, stored, attr);
             }
             _ => {
-                self.fn_props.entry(idx).or_insert_with(ObjMap::new_side_table).define(key, stored, attr);
+                self.fn_props
+                    .entry(idx)
+                    .or_insert_with(ObjMap::new_side_table)
+                    .define(key, stored, attr);
             }
         }
         // Write a defined `lastIndex` VALUE through to the RegExp slot (the
@@ -818,7 +861,9 @@ impl<'p> Vm<'p> {
                     || change_frozen_value
                     || change_accessor
                 {
-                    return Err(Thrown(format!("TypeError: Cannot redefine property: {key}")));
+                    return Err(Thrown(format!(
+                        "TypeError: Cannot redefine property: {key}"
+                    )));
                 }
             }
         }
@@ -831,7 +876,8 @@ impl<'p> Vm<'p> {
         // When redefining an existing accessor with only one half present, the
         // missing half is preserved (spec keeps fields absent from the new desc).
         let existing_get = existing.and_then(|(a, v)| if a.accessor { Some(v) } else { None });
-        let existing_set = existing.and_then(|(a, _)| if a.accessor { Some(a.setter) } else { None });
+        let existing_set =
+            existing.and_then(|(a, _)| if a.accessor { Some(a.setter) } else { None });
         let attr = PropAttr {
             writable: wr,
             enumerable: en,
@@ -850,9 +896,10 @@ impl<'p> Vm<'p> {
             // it defaults to undefined unless the descriptor specifies one.
             value.unwrap_or(Value::UNDEFINED)
         } else {
-            value.or(existing.map(|(_, v)| v)).unwrap_or(Value::UNDEFINED)
+            value
+                .or(existing.map(|(_, v)| v))
+                .unwrap_or(Value::UNDEFINED)
         };
         Ok((attr, stored))
     }
-
 }

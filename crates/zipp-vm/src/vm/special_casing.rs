@@ -230,7 +230,10 @@ mod tests {
         assert_eq!(transform_case("\u{130}", "tr", false).unwrap(), "i");
         assert_eq!(transform_case("I\u{307}", "tr", false).unwrap(), "i");
         // A class-220 mark may intervene between the I and its dot (After_I).
-        assert_eq!(transform_case("I\u{323}\u{307}", "tr", false).unwrap(), "i\u{323}");
+        assert_eq!(
+            transform_case("I\u{323}\u{307}", "tr", false).unwrap(),
+            "i\u{323}"
+        );
         // A class-230 mark breaks both After_I and Not_Before_Dot.
         assert_eq!(
             transform_case("I\u{300}\u{307}", "tr", false).unwrap(),
@@ -243,13 +246,22 @@ mod tests {
 
     #[test]
     fn lithuanian_explicit_dot() {
-        assert_eq!(transform_case("I\u{300}", "lt", false).unwrap(), "i\u{307}\u{300}");
-        assert_eq!(transform_case("\u{12E}\u{300}", "lt", false).unwrap(), "\u{12F}\u{307}\u{300}");
+        assert_eq!(
+            transform_case("I\u{300}", "lt", false).unwrap(),
+            "i\u{307}\u{300}"
+        );
+        assert_eq!(
+            transform_case("\u{12E}\u{300}", "lt", false).unwrap(),
+            "\u{12F}\u{307}\u{300}"
+        );
         // No accent above: the ordinary mapping, no explicit dot.
         assert_eq!(transform_case("I", "lt", false).unwrap(), "i");
         // Uppercasing strips the dot the lowercase letter carried.
         assert_eq!(transform_case("i\u{307}", "lt", true).unwrap(), "I");
-        assert_eq!(transform_case("i\u{323}\u{307}", "lt", true).unwrap(), "I\u{323}");
+        assert_eq!(
+            transform_case("i\u{323}\u{307}", "lt", true).unwrap(),
+            "I\u{323}"
+        );
         // Not after a Soft_Dotted letter: the dot stays.
         assert_eq!(transform_case("I\u{307}", "lt", true).unwrap(), "I\u{307}");
     }

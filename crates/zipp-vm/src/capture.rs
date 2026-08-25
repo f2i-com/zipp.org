@@ -311,7 +311,11 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
         }
         // Descend into try/switch/labeled bodies so a binding declared inside one
         // that a nested closure captures is detected (and boxed).
-        Stmt::Try { block, handler, finalizer } => {
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
             collect_bound_in_body(block, out);
             if let Some(h) = handler {
                 // The catch PARAMETER is a binding of this scope like any other:
@@ -413,7 +417,12 @@ fn stmt_refs(s: &Stmt, out: &mut HashSet<String>) {
             stmt_refs(body, out);
             expr_refs(test, out);
         }
-        Stmt::For { init, test, update, body } => {
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
             if let Some(init) = init {
                 match init {
                     ForInit::Var(d) => {
@@ -444,7 +453,9 @@ fn stmt_refs(s: &Stmt, out: &mut HashSet<String>) {
             // (minus what it binds), exactly like a function expression would.
             fn_node_free(f, out);
         }
-        Stmt::ForOf { left, right, body, .. } => {
+        Stmt::ForOf {
+            left, right, body, ..
+        } => {
             for_head_refs(left, out);
             expr_refs(right, out);
             stmt_refs(body, out);
@@ -454,7 +465,11 @@ fn stmt_refs(s: &Stmt, out: &mut HashSet<String>) {
             expr_refs(right, out);
             stmt_refs(body, out);
         }
-        Stmt::Try { block, handler, finalizer } => {
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
             for st in block {
                 stmt_refs(st, out);
             }
@@ -875,7 +890,12 @@ fn collect_nested_free(s: &Stmt, out: &mut HashSet<String>) {
             collect_nested_free(body, out);
             collect_nested_free_expr(test, out);
         }
-        Stmt::For { init, test, update, body } => {
+        Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
             // A closure in the INIT (`for (let i = 0, f = () => i; …)`)
             // captures head bindings too — scan declarator initializers.
             if let Some(init) = init {
@@ -898,7 +918,9 @@ fn collect_nested_free(s: &Stmt, out: &mut HashSet<String>) {
             }
             collect_nested_free(body, out);
         }
-        Stmt::ForOf { left, right, body, .. } => {
+        Stmt::ForOf {
+            left, right, body, ..
+        } => {
             for_head_nested_free(left, out);
             collect_nested_free_expr(right, out);
             collect_nested_free(body, out);
@@ -914,7 +936,11 @@ fn collect_nested_free(s: &Stmt, out: &mut HashSet<String>) {
             }
         }
         Stmt::FnDecl(f) => fn_node_free(f, out),
-        Stmt::Try { block, handler, finalizer } => {
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
             for st in block {
                 collect_nested_free(st, out);
             }

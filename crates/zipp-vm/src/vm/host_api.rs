@@ -38,8 +38,19 @@ use crate::vm::Vm;
 /// field is private to `vm`, so the offset is computed here, inside the module
 /// tree that can see it (the `JIT_RECURSE_DEPTH_OFFSET` precedent).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const JIT_CALL_DEPTH_OFFSET: usize =
-    core::mem::offset_of!(Vm<'static>, jit_call_depth);
+pub(crate) const JIT_CALL_DEPTH_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit_call_depth);
+
+/// Byte offsets of VM-owned scalar epochs read by persistent native code.
+///
+/// `ScriptState` is movable, so compiled code must derive these addresses from
+/// the live VM argument (`rdi`) on every entry. Baking `&vm.field` would leave a
+/// dangling/stale address after an embedder moves the state between calls.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_GLOBAL_ROUTE_EPOCH_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, global_route_epoch);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_MI_CLASS_EPOCH_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, mi_class_epoch);
 
 /// Whether a global slot holds a top-level function/class declaration or an
 /// ordinary variable. Hosts use this to decide what is callable.
@@ -188,7 +199,11 @@ impl<'p> Vm<'p> {
         let push = |slot: u32, scope: SymbolScope, out: &mut Vec<Symbol>| {
             if let Some(name) = p.global_names.get(slot as usize) {
                 if !name.is_empty() {
-                    out.push(Symbol { name: name.clone(), index: slot, scope });
+                    out.push(Symbol {
+                        name: name.clone(),
+                        index: slot,
+                        scope,
+                    });
                 }
             }
         };
@@ -481,8 +496,7 @@ impl<'p> Vm<'p> {
                 Value::heap(i)
             }
             HostValue::Array(items) => {
-                let vals: Vec<Value> =
-                    items.iter().map(|it| self.host_in(it, depth + 1)).collect();
+                let vals: Vec<Value> = items.iter().map(|it| self.host_in(it, depth + 1)).collect();
                 Value::heap(self.heap.alloc(HeapObj::Array(vals)))
             }
             HostValue::Object(pairs) => {

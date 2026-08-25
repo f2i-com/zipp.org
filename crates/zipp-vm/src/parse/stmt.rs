@@ -8,7 +8,11 @@ use super::token::{Keyword, Punct, StrVal, TokenKind};
 /// `FunctionDeclaration` gets the Annex B B.3.2.4/B.3.2.5 carve-out; a generator
 /// or async declaration is a different production and keeps the error.
 fn fn_bind_kind(f: &Function) -> BindKind {
-    if f.is_generator || f.is_async { BindKind::GenFunction } else { BindKind::Function }
+    if f.is_generator || f.is_async {
+        BindKind::GenFunction
+    } else {
+        BindKind::Function
+    }
 }
 
 /// The spec's `IsLabelledFunction`: a Statement that is a FunctionDeclaration
@@ -64,8 +68,11 @@ impl<'s> Parser<'s> {
         if strict {
             self.ctx.strict = true;
         }
-        self.scopes
-            .push(if goal == Goal::Module { ScopeKind::Module } else { ScopeKind::Script });
+        self.scopes.push(if goal == Goal::Module {
+            ScopeKind::Module
+        } else {
+            ScopeKind::Script
+        });
         let mut body = Vec::new();
         while !self.at_eof() {
             body.push(self.parse_stmt_list_item()?);
@@ -79,7 +86,12 @@ impl<'s> Parser<'s> {
             }
         }
         self.scopes.pop()?;
-        Ok(Program { goal, strict: self.ctx.strict, directives, body })
+        Ok(Program {
+            goal,
+            strict: self.ctx.strict,
+            directives,
+            body,
+        })
     }
 
     /// `import` / `export`, legal only at a module's top level.
@@ -183,7 +195,12 @@ impl<'s> Parser<'s> {
         self.bump_after_operand()?;
         let attributes = self.parse_import_attributes()?;
         self.semicolon()?;
-        Ok(ImportDecl { specifiers, source, attributes, phase })
+        Ok(ImportDecl {
+            specifiers,
+            source,
+            attributes,
+            phase,
+        })
     }
 
     /// Record one ExportedName, rejecting a duplicate. §16.2.3.1: a module's
@@ -349,9 +366,9 @@ impl<'s> Parser<'s> {
             // falls back to the UTF-16 representation for exactly the strings
             // UTF-8 cannot hold, i.e. the ones carrying a lone surrogate.
             if matches!(s, StrVal::Utf16(_)) {
-                return Err(self.err_here(
-                    "SyntaxError: a module export name must be well-formed Unicode",
-                ));
+                return Err(
+                    self.err_here("SyntaxError: a module export name must be well-formed Unicode")
+                );
             }
             self.bump_after_operand()?;
             return Ok(ModuleExportName::Str(s));
@@ -379,7 +396,11 @@ impl<'s> Parser<'s> {
             self.bump_after_operand()?;
             let attributes = self.parse_import_attributes()?;
             self.semicolon()?;
-            return Ok(ExportDecl::All { alias, source, attributes });
+            return Ok(ExportDecl::All {
+                alias,
+                source,
+                attributes,
+            });
         }
         // `export default …`
         if self.at_kw(Keyword::Default) {
@@ -479,7 +500,11 @@ impl<'s> Parser<'s> {
                     }
                 }
             }
-            return Ok(ExportDecl::Named { specifiers, source, attributes });
+            return Ok(ExportDecl::Named {
+                specifiers,
+                source,
+                attributes,
+            });
         }
         // `export var/let/const/function/class …` — the declaration binds
         // exactly as it would without the `export`.
@@ -718,7 +743,11 @@ impl<'s> Parser<'s> {
                 ));
             }
             self.declare_pattern(&id, kind, pos)?;
-            let init = if self.eat(Punct::Eq, true)? { Some(self.parse_assign_full()?) } else { None };
+            let init = if self.eat(Punct::Eq, true)? {
+                Some(self.parse_assign_full()?)
+            } else {
+                None
+            };
             // `using` requires an initializer wherever it appears.
             if init.is_none() && matches!(kind, VarKind::Using | VarKind::AwaitUsing) {
                 return Err(SyntaxError::new(
@@ -804,7 +833,12 @@ impl<'s> Parser<'s> {
                 self.bump_before_operand()?;
                 Ok(Stmt::Empty)
             }
-            TokenKind::Ident { kw, had_escape: false, private: false, .. } => match kw {
+            TokenKind::Ident {
+                kw,
+                had_escape: false,
+                private: false,
+                ..
+            } => match kw {
                 Keyword::If => self.parse_if(),
                 Keyword::While => self.parse_while(),
                 Keyword::Do => self.parse_do_while(),
@@ -835,8 +869,9 @@ impl<'s> Parser<'s> {
                 Keyword::Throw => {
                     self.bump_before_operand()?;
                     if self.cur().newline_before {
-                        return Err(self
-                            .err_here("SyntaxError: no line break allowed after 'throw'"));
+                        return Err(
+                            self.err_here("SyntaxError: no line break allowed after 'throw'")
+                        );
                     }
                     let e = self.parse_expr_full()?;
                     self.semicolon()?;
@@ -870,7 +905,11 @@ impl<'s> Parser<'s> {
                         None
                     };
                     self.semicolon()?;
-                    Ok(if is_break { Stmt::Break(label) } else { Stmt::Continue(label) })
+                    Ok(if is_break {
+                        Stmt::Break(label)
+                    } else {
+                        Stmt::Continue(label)
+                    })
                 }
                 Keyword::Debugger => {
                     self.bump_before_operand()?;
@@ -889,7 +928,10 @@ impl<'s> Parser<'s> {
                     let object = self.parse_expr_full()?;
                     self.expect(Punct::RParen, true)?;
                     let body = self.in_nested_body(|p| p.parse_stmt())?;
-                    Ok(Stmt::With { object, body: Box::new(body) })
+                    Ok(Stmt::With {
+                        object,
+                        body: Box::new(body),
+                    })
                 }
                 // `var` is a VariableStatement, which IS a Statement, so it is
                 // legal as the unbraced body of `if`/`else`/`while`/`for`/`do`.
@@ -995,7 +1037,9 @@ impl<'s> Parser<'s> {
         if self.is_binding_ident() {
             let save = self.save();
             let tok = self.bump_after_operand()?;
-            let TokenKind::Ident { name, .. } = tok.kind else { unreachable!() };
+            let TokenKind::Ident { name, .. } = tok.kind else {
+                unreachable!()
+            };
             let name = name.into_boxed_str();
             if self.at(Punct::Colon) {
                 self.bump_before_operand()?;
@@ -1024,7 +1068,10 @@ impl<'s> Parser<'s> {
                         start,
                     ));
                 }
-                return Ok(Stmt::Labeled { label: name, body: Box::new(body) });
+                return Ok(Stmt::Labeled {
+                    label: name,
+                    body: Box::new(body),
+                });
             }
             self.restore(save);
         }
@@ -1150,15 +1197,27 @@ impl<'s> Parser<'s> {
                 }
                 self.bump_before_operand()?;
                 self.ctx.in_ = saved_in;
-                let right = if of { self.parse_assign_full()? } else { self.parse_expr_full()? };
+                let right = if of {
+                    self.parse_assign_full()?
+                } else {
+                    self.parse_expr_full()?
+                };
                 self.expect(Punct::RParen, true)?;
                 let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
                 let left = ForTarget::Var(VarDecl {
                     kind,
-                    decls: vec![Declarator { id: pat, init: None }],
+                    decls: vec![Declarator {
+                        id: pat,
+                        init: None,
+                    }],
                 });
                 if of {
-                    Stmt::ForOf { left, right, body, is_await }
+                    Stmt::ForOf {
+                        left,
+                        right,
+                        body,
+                        is_await,
+                    }
                 } else {
                     Stmt::ForIn { left, right, body }
                 }
@@ -1194,8 +1253,10 @@ impl<'s> Parser<'s> {
                     let right = self.parse_expr_full()?;
                     self.expect(Punct::RParen, true)?;
                     let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
-                    let left =
-                        ForTarget::Var(VarDecl { kind, decls: vec![Declarator { id: pat, init }] });
+                    let left = ForTarget::Var(VarDecl {
+                        kind,
+                        decls: vec![Declarator { id: pat, init }],
+                    });
                     Stmt::ForIn { left, right, body }
                 } else {
                     let mut decls = vec![Declarator { id: pat, init }];
@@ -1261,19 +1322,29 @@ impl<'s> Parser<'s> {
                     && head_bare_async
                     && matches!(&e, Expr::Ident(n) if &**n == "async")
                 {
-                    return Err(self
-                        .err_here("SyntaxError: 'async' is not a valid for-of loop target"));
+                    return Err(
+                        self.err_here("SyntaxError: 'async' is not a valid for-of loop target")
+                    );
                 }
                 self.cover.pattern_only = outer_po;
                 self.bump_before_operand()?;
                 self.ctx.in_ = saved_in;
                 let target = self.expr_to_target(e, true, pos)?;
-                let right = if of { self.parse_assign_full()? } else { self.parse_expr_full()? };
+                let right = if of {
+                    self.parse_assign_full()?
+                } else {
+                    self.parse_expr_full()?
+                };
                 self.expect(Punct::RParen, true)?;
                 let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
                 let left = ForTarget::Target(target);
                 if of {
-                    Stmt::ForOf { left, right, body, is_await }
+                    Stmt::ForOf {
+                        left,
+                        right,
+                        body,
+                        is_await,
+                    }
                 } else {
                     Stmt::ForIn { left, right, body }
                 }
@@ -1304,12 +1375,25 @@ impl<'s> Parser<'s> {
 
     /// The `;;` form, with the first `;` already consumed.
     fn parse_for_classic(&mut self, init: Option<ForInit>) -> PResult<Stmt> {
-        let test = if self.at(Punct::Semi) { None } else { Some(self.parse_expr_full()?) };
+        let test = if self.at(Punct::Semi) {
+            None
+        } else {
+            Some(self.parse_expr_full()?)
+        };
         self.expect(Punct::Semi, true)?;
-        let update = if self.at(Punct::RParen) { None } else { Some(self.parse_expr_full()?) };
+        let update = if self.at(Punct::RParen) {
+            None
+        } else {
+            Some(self.parse_expr_full()?)
+        };
         self.expect(Punct::RParen, true)?;
         let body = Box::new(self.in_loop(|p| p.in_nested_body(|p| p.parse_stmt()))?);
-        Ok(Stmt::For { init, test, update, body })
+        Ok(Stmt::For {
+            init,
+            test,
+            update,
+            body,
+        })
     }
 
     fn parse_switch(&mut self) -> PResult<Stmt> {
@@ -1410,12 +1494,19 @@ impl<'s> Parser<'s> {
         } else {
             None
         };
-        let finalizer =
-            if self.eat_kw(Keyword::Finally, true)? { Some(self.parse_block_body()?) } else { None };
+        let finalizer = if self.eat_kw(Keyword::Finally, true)? {
+            Some(self.parse_block_body()?)
+        } else {
+            None
+        };
         if handler.is_none() && finalizer.is_none() {
             return Err(self.err_here("SyntaxError: missing catch or finally after try"));
         }
-        Ok(Stmt::Try { block, handler, finalizer })
+        Ok(Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        })
     }
 
     fn parse_block_body(&mut self) -> PResult<Vec<Stmt>> {

@@ -206,10 +206,7 @@ fn zz_off_switch_and_gc_stress_agree() {
         return;
     }
     let exe = std::env::current_exe().expect("test binary path");
-    for (label, key) in [
-        ("off", "ZIPP_NO_JSON_PLAIN_FAST"),
-        ("gc", "ZIPP_GC_STRESS"),
-    ] {
+    for (label, key) in [("off", "ZIPP_NO_JSON_PLAIN_FAST"), ("gc", "ZIPP_GC_STRESS")] {
         let out = std::process::Command::new(&exe)
             .args(["--skip", "zz_off_switch_and_gc_stress_agree"])
             .env("ZIPP_JSON_PLAIN_CHILD", "1")

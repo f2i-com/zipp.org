@@ -3,6 +3,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -463,6 +464,108 @@ class BenchResultTests(unittest.TestCase):
                 {"preserved": True},
             )
 
+            new_path = Path(directory) / "interrupted-first-write.json"
+            with (
+                mock.patch.object(
+                    bench.json,
+                    "dump",
+                    side_effect=RuntimeError("interrupted"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "interrupted"),
+            ):
+                bench.write_json_result(new_path, {"partial": True}, overwrite=False)
+            self.assertFalse(new_path.exists())
+            self.assertEqual(list(Path(directory).glob(".*.tmp")), [])
+
+    def test_relevant_environment_never_serializes_credentials_or_paths(self):
+        with mock.patch.dict(
+            bench.os.environ,
+            {
+                "ZIPP_NOJIT": "1",
+                "ZIPP_API_TOKEN": "zipp-secret",
+                "ZIPP_PRIVATEKEY": "123456789",
+                "ZIPP_GITHUB_PAT": "123456",
+                "ZIPP_PIN": "123456",
+                "ZIPP_UNKNOWN_CONTROL": "1",
+                "MIMALLOC_LICENSE": "424242",
+                "NODE_AUTH_TOKEN": "node-secret",
+                "DENO_AUTH_TOKENS": "example.test=deno-secret",
+                "RUST_BACKTRACE": "full",
+                "RUST_LOG": "zipp=debug",
+                "RUSTUP_HOME": r"C:\\Users\\private\\.rustup",
+                "UNRELATED_SECRET": "not-in-scope",
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                bench.relevant_environment(),
+                {
+                    "DENO_AUTH_TOKENS": "<redacted>",
+                    "MIMALLOC_LICENSE": "<redacted>",
+                    "NODE_AUTH_TOKEN": "<redacted>",
+                    "RUSTUP_HOME": "<redacted>",
+                    "RUST_BACKTRACE": "full",
+                    "RUST_LOG": "<redacted>",
+                    "ZIPP_API_TOKEN": "<redacted>",
+                    "ZIPP_GITHUB_PAT": "<redacted>",
+                    "ZIPP_NOJIT": "1",
+                    "ZIPP_PIN": "<redacted>",
+                    "ZIPP_PRIVATEKEY": "<redacted>",
+                    "ZIPP_UNKNOWN_CONTROL": "<redacted>",
+                },
+            )
+
+    def test_publication_paths_must_be_tracked_and_clean_against_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                )
+
+            git("init", "--quiet")
+            git("config", "user.email", "bench-test@example.invalid")
+            git("config", "user.name", "Benchmark Test")
+            tracked = root / "tracked.js"
+            tracked.write_text("print(1);\n", encoding="utf-8")
+            git("add", "tracked.js")
+            git("commit", "--quiet", "-m", "fixture")
+
+            self.assertEqual(
+                bench.git_paths_match_head([tracked], root=root),
+                (True, None),
+            )
+            tracked.write_text("print(2);\n", encoding="utf-8")
+            clean, reason = bench.git_paths_match_head([tracked], root=root)
+            self.assertFalse(clean)
+            self.assertIn("differ from HEAD", reason)
+
+            tracked.write_text("print(1);\n", encoding="utf-8")
+            git("update-index", "--assume-unchanged", "tracked.js")
+            tracked.write_text("print(4);\n", encoding="utf-8")
+            clean, reason = bench.git_paths_match_head([tracked], root=root)
+            self.assertFalse(clean)
+            self.assertIn("differ from HEAD", reason)
+
+            git("update-index", "--no-assume-unchanged", "tracked.js")
+            tracked.write_text("print(1);\n", encoding="utf-8")
+            git("update-index", "--skip-worktree", "tracked.js")
+            tracked.write_text("print(5);\n", encoding="utf-8")
+            clean, reason = bench.git_paths_match_head([tracked], root=root)
+            self.assertFalse(clean)
+            self.assertIn("differ from HEAD", reason)
+
+            untracked = root / "untracked.js"
+            untracked.write_text("print(3);\n", encoding="utf-8")
+            clean, reason = bench.git_paths_match_head([untracked], root=root)
+            self.assertFalse(clean)
+            self.assertIn("untracked", reason)
+
     def test_modern_v2_replay_uses_stored_analysis_metadata(self):
         observations = [
             v2_observation("old", 0, startup=0.1, cold=1.0),
@@ -690,7 +793,7 @@ class ProvenanceTests(unittest.TestCase):
         )
         self.assertTrue(any("DIRTY" in reason for reason in reasons))
         self.assertTrue(
-            bench.provenance_is_fatal(reasons, is_ab=False, overridden=False)
+            bench.provenance_is_fatal(reasons, is_ab=False)
         )
 
     def test_nonhead_engine_is_a_reason(self):
@@ -716,7 +819,7 @@ class ProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(len(reasons), 2)
         self.assertTrue(
-            bench.provenance_is_fatal(reasons, is_ab=False, overridden=False)
+            bench.provenance_is_fatal(reasons, is_ab=False)
         )
 
     def test_overrides_downgrade_fatal_to_recorded(self):
@@ -730,9 +833,30 @@ class ProvenanceTests(unittest.TestCase):
             meta, self.HEAD, is_ab=False, allow_dirty=True, allow_nonhead=False
         )
         self.assertEqual(len(partial), 1)
-        self.assertFalse(
-            bench.provenance_is_fatal(partial, is_ab=False, overridden=True)
+        self.assertTrue(bench.provenance_is_fatal(partial, is_ab=False))
+
+    def test_assessment_records_covered_reasons_and_keeps_partial_uncovered(self):
+        meta = [engine_meta("zipp", commit=self.OTHER, dirty=True)]
+        recorded, uncovered = bench.provenance_assessment(
+            meta,
+            self.HEAD,
+            is_ab=False,
+            allow_dirty=True,
+            allow_nonhead=True,
         )
+        self.assertEqual(len(recorded), 2)
+        self.assertEqual(uncovered, [])
+
+        recorded, uncovered = bench.provenance_assessment(
+            meta,
+            self.HEAD,
+            is_ab=False,
+            allow_dirty=True,
+            allow_nonhead=False,
+        )
+        self.assertEqual(len(recorded), 2)
+        self.assertEqual(len(uncovered), 1)
+        self.assertIn(self.OTHER, uncovered[0])
 
     def test_missing_identity_is_a_reason(self):
         reasons = bench.check_engine_provenance(
@@ -758,9 +882,7 @@ class ProvenanceTests(unittest.TestCase):
             allow_nonhead=False,
         )
         self.assertEqual(reasons, [])
-        self.assertFalse(
-            bench.provenance_is_fatal(["x"], is_ab=True, overridden=False)
-        )
+        self.assertFalse(bench.provenance_is_fatal(["x"], is_ab=True))
 
     def test_ab_sides_reporting_one_source_is_a_reason(self):
         reasons = bench.check_engine_provenance(

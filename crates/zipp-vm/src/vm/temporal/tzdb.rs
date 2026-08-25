@@ -142,7 +142,11 @@ fn final_transitions(zone: u16, year: i64, out: &mut Vec<(i64, i32)>) {
     // the last rule of the preceding year (which is why a southern-hemisphere
     // zone correctly starts January already on DST).
     let mut save = if year == z.fin_year as i64 {
-        let last = if z.ntr > 0 { TRANS_OFF[(z.tr + z.ntr - 1) as usize] } else { z.init };
+        let last = if z.ntr > 0 {
+            TRANS_OFF[(z.tr + z.ntr - 1) as usize]
+        } else {
+            z.init
+        };
         last - z.std
     } else {
         rules[rules.len() - 1].save
@@ -317,8 +321,14 @@ mod tests {
         let syd = lookup("Australia/Sydney").unwrap().zone;
         assert_eq!(offset_seconds(syd, 1_704_067_200), 39600);
         // Half-hour and three-quarter-hour zones.
-        assert_eq!(offset_seconds(lookup("Asia/Kolkata").unwrap().zone, 0), 19800);
-        assert_eq!(offset_seconds(lookup("Pacific/Chatham").unwrap().zone, 0), 45900);
+        assert_eq!(
+            offset_seconds(lookup("Asia/Kolkata").unwrap().zone, 0),
+            19800
+        );
+        assert_eq!(
+            offset_seconds(lookup("Pacific/Chatham").unwrap().zone, 0),
+            45900
+        );
     }
 
     #[test]
@@ -349,8 +359,14 @@ mod tests {
         let n = next_transition(ny, t).unwrap();
         let p = previous_transition(ny, t).unwrap();
         assert!(p < t && t < n);
-        assert_eq!((offset_seconds(ny, n - 1), offset_seconds(ny, n)), (-18000, -14400));
-        assert_eq!((offset_seconds(ny, p - 1), offset_seconds(ny, p)), (-14400, -18000));
+        assert_eq!(
+            (offset_seconds(ny, n - 1), offset_seconds(ny, n)),
+            (-18000, -14400)
+        );
+        assert_eq!(
+            (offset_seconds(ny, p - 1), offset_seconds(ny, p)),
+            (-14400, -18000)
+        );
         // A zone that has never had a transition.
         let utc = lookup("UTC").unwrap().zone;
         assert_eq!(next_transition(utc, 0), None);

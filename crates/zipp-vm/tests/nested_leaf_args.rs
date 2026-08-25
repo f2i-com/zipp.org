@@ -11,7 +11,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -29,7 +33,13 @@ fn args_flow_through_the_splice() {
         console.log(s + "," + wrap(100));
         "#
     ));
-    assert_eq!(out[0], format!("{},308", (0..HOT).map(|i| (i & 15) * 3 + 7 + 1).sum::<usize>()));
+    assert_eq!(
+        out[0],
+        format!(
+            "{},308",
+            (0..HOT).map(|i| (i & 15) * 3 + 7 + 1).sum::<usize>()
+        )
+    );
 }
 
 #[test]

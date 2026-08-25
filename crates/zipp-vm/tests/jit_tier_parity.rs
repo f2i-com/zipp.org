@@ -24,7 +24,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -50,7 +54,10 @@ fn array_push_respects_integrity() {
                      t("prevExt", Object.preventExtensions([1])), t("lenRO", d)].join(" "));
         "#
     ));
-    assert_eq!(out[0], "freeze:TypeError seal:TypeError prevExt:TypeError lenRO:TypeError");
+    assert_eq!(
+        out[0],
+        "freeze:TypeError seal:TypeError prevExt:TypeError lenRO:TypeError"
+    );
 }
 
 /// A non-writable `length` lives in `array_length_nonwritable`, a side table
@@ -89,7 +96,10 @@ fn creating_an_index_consults_the_prototype_setter() {
         delete Array.prototype[4];
         "#
     ));
-    assert_eq!(out[0], format!("len=4 b4=G own=false hits={HOT} last={}", HOT - 1));
+    assert_eq!(
+        out[0],
+        format!("len=4 b4=G own=false hits={HOT} last={}", HOT - 1)
+    );
 }
 
 /// An arrow's reg 0 is its CAPTURED `this`; the receiver is ignored. Three JIT

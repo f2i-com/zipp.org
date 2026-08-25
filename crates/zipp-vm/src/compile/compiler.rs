@@ -16,6 +16,32 @@ fn checked_global_slot_index(len: usize) -> Option<u32> {
     (slot < u32::MAX).then_some(slot)
 }
 
+/// Default-on removal of unnecessary heap cells for arrow-body lexicals.
+///
+/// A block-bodied arrow used to pre-create a TDZ cell for every body-level
+/// `let`/`const`/`class`, even when no nested callable could observe the binding.
+/// A binding whose first possible reference is its own simple declaration does
+/// not need that early cell: the declaration compiler enforces its initializer
+/// TDZ directly, and all later uses can address a plain register. Captures,
+/// direct eval, complex declarations and any earlier reference retain the cell.
+/// Keeping the old lowering behind a same-binary switch makes the allocation/JIT
+/// effect independently measurable.
+#[inline]
+fn arrow_lexical_unbox_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_ARROW_LEXICAL_UNBOX").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
 impl Compiler {
     /// Whether `name` names a binding of the eval's VARIABLE ENVIRONMENT — the
     /// calling function's own activation. Such a name is re-used by a top-level
@@ -255,7 +281,7 @@ impl Compiler {
             &prog.body,
             &prog.directives,
             true,
-            false, // top-level script is not a generator
+            false,     // top-level script is not a generator
             top_async, // a module top level is async (top-level await)
             captured,
             Vec::new(),
@@ -287,7 +313,9 @@ impl Compiler {
         // A real function body leaves any enclosing field-initializer context
         // (the eval ROOT script keeps it: PerformEval's ContainsArguments check
         // spans the eval program's top level and its arrows).
-        let saved_field_init = if is_script { self.in_field_init } else {
+        let saved_field_init = if is_script {
+            self.in_field_init
+        } else {
             std::mem::replace(&mut self.in_field_init, false)
         };
         // A (non-arrow) function body has its own `this` — leave any enclosing
@@ -469,19 +497,19 @@ impl Compiler {
         }
         if !is_script {
             fc.reserve_arguments(); // non-arrow functions bind `arguments`
-            // A nested arrow that reads `arguments` captures THIS function's
-            // arguments object lexically: materialize it (uses_arguments) and box
-            // its register into a cell so the arrow grabs the live cell as an upvalue.
-            // (No-op when a formal named `arguments` suppressed the binding — the
-            // arrow then captures the PARAMETER like any other name.)
-            //
-            // A body (or parameter default) that may DIRECT-EVAL needs the same
-            // treatment: `free_vars` cannot look inside the eval string, so
-            // nothing else marks `arguments` as used, and an unboxed binding is
-            // absent from the eval site map — `function(){ return eval("arguments") }`
-            // threw ReferenceError. A closure in a PARAMETER default is created
-            // before the body runs and captures the same object, which the
-            // body-only scan never sees.
+                                    // A nested arrow that reads `arguments` captures THIS function's
+                                    // arguments object lexically: materialize it (uses_arguments) and box
+                                    // its register into a cell so the arrow grabs the live cell as an upvalue.
+                                    // (No-op when a formal named `arguments` suppressed the binding — the
+                                    // arrow then captures the PARAMETER like any other name.)
+                                    //
+                                    // A body (or parameter default) that may DIRECT-EVAL needs the same
+                                    // treatment: `free_vars` cannot look inside the eval string, so
+                                    // nothing else marks `arguments` as used, and an unboxed binding is
+                                    // absent from the eval site map — `function(){ return eval("arguments") }`
+                                    // threw ReferenceError. A closure in a PARAMETER default is created
+                                    // before the body runs and captures the same object, which the
+                                    // body-only scan never sees.
             if capture::nested_uses_arguments(body)
                 || body_refs_eval
                 || params_ast.is_some_and(capture::params_nested_use_arguments)
@@ -789,7 +817,11 @@ impl Compiler {
                     // statement variant now, so they share an arm; the order of
                     // pushes is still source order.
                     ast::Stmt::Export(e) => match &**e {
-                        ast::ExportDecl::Named { source: Some(srcspec), attributes, .. } => {
+                        ast::ExportDecl::Named {
+                            source: Some(srcspec),
+                            attributes,
+                            ..
+                        } => {
                             fc.cx.module_imports.push(ImportEntry {
                                 local_slot: u32::MAX,
                                 import: ImportName::SideEffect,
@@ -797,7 +829,9 @@ impl Compiler {
                                 mtype: with_clause_type(attributes),
                             });
                         }
-                        ast::ExportDecl::All { source, attributes, .. } => {
+                        ast::ExportDecl::All {
+                            source, attributes, ..
+                        } => {
                             fc.cx.module_imports.push(ImportEntry {
                                 local_slot: u32::MAX,
                                 import: ImportName::SideEffect,
@@ -927,21 +961,33 @@ impl Compiler {
             // object (arguments-parameter-shadowing.js). A simple parameter
             // list (or strict mode) uses one environment, where the names stay
             // shared — the skip in the loop above is then exactly right.
-            if !is_strict
-                && params_ast.is_some_and(|pa| !pa.simple)
-                && hv.contains("arguments")
-            {
+            if !is_strict && params_ast.is_some_and(|pa| !pa.simple) && hv.contains("arguments") {
                 if let Some(areg) = fc.arguments_reg {
                     fc.uses_arguments = true;
                     let body_reg = fc.declare_local("arguments");
-                    match (fc.cell_regs.contains(&areg), fc.cell_regs.contains(&body_reg)) {
-                        (false, false) => fc.emit(Instr::Move { dst: body_reg, src: areg }),
-                        (false, true) => fc.emit(Instr::CellSet { cell: body_reg, src: areg }),
-                        (true, false) => fc.emit(Instr::CellGet { dst: body_reg, cell: areg }),
+                    match (
+                        fc.cell_regs.contains(&areg),
+                        fc.cell_regs.contains(&body_reg),
+                    ) {
+                        (false, false) => fc.emit(Instr::Move {
+                            dst: body_reg,
+                            src: areg,
+                        }),
+                        (false, true) => fc.emit(Instr::CellSet {
+                            cell: body_reg,
+                            src: areg,
+                        }),
+                        (true, false) => fc.emit(Instr::CellGet {
+                            dst: body_reg,
+                            cell: areg,
+                        }),
                         (true, true) => {
                             let t = fc.alloc_reg();
                             fc.emit(Instr::CellGet { dst: t, cell: areg });
-                            fc.emit(Instr::CellSet { cell: body_reg, src: t });
+                            fc.emit(Instr::CellSet {
+                                cell: body_reg,
+                                src: t,
+                            });
                         }
                     }
                 }
@@ -1053,8 +1099,7 @@ impl Compiler {
             fc.emit(Instr::ReturnUndefined);
         }
 
-        let upvalues: Vec<UpvalSource> =
-            fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         fc.cx.in_field_init = saved_field_init;
         fc.cx.in_derived_ctor = saved_idc;
         fc.cx.dyn_global_zone = saved_dyn_zone;
@@ -1064,9 +1109,15 @@ impl Compiler {
             code: fc.code,
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
-            length: params_ast.map(expected_arg_count).unwrap_or(params.len() as u16),
+            length: params_ast
+                .map(expected_arg_count)
+                .unwrap_or(params.len() as u16),
             rest_reg: fc.rest_reg,
-            arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
+            arguments_reg: if fc.uses_arguments {
+                fc.arguments_reg
+            } else {
+                None
+            },
             is_generator,
             is_async,
             non_constructable: false, // a plain function/expression IS constructable
@@ -1168,9 +1219,9 @@ impl Compiler {
         fc.in_generator = is_generator;
         fc.in_async = is_async;
         fc.reserve_arguments(); // class methods/ctors bind `arguments`
-        // A nested arrow reading `arguments` captures this method's arguments
-        // object lexically — materialize + box it (see compile_function_body,
-        // whose direct-eval / parameter-default cases apply here identically).
+                                // A nested arrow reading `arguments` captures this method's arguments
+                                // object lexically — materialize + box it (see compile_function_body,
+                                // whose direct-eval / parameter-default cases apply here identically).
         if capture::nested_uses_arguments(body)
             || cls_body_refs_eval
             || params_ast.is_some_and(capture::params_nested_use_arguments)
@@ -1208,7 +1259,9 @@ impl Compiler {
                 .filter_map(|(_, e)| *e)
                 .chain(computed_inits.iter().filter_map(|e| *e))
                 .any(|e| {
-                    capture::expr_refs_all(e).iter().any(|n| param_names.contains(n))
+                    capture::expr_refs_all(e)
+                        .iter()
+                        .any(|n| param_names.contains(n))
                 });
         if !fields_first {
             if let Some(pa) = params_ast {
@@ -1229,7 +1282,12 @@ impl Compiler {
         // the bound method.) A decorated FIELD or ACCESSOR's callbacks are not in
         // this list: they run right after their own element, below.
         if let Some(d) = dec.filter(|d| d.run_inits) {
-            fc.emit(Instr::DecInits { class_id: d.class_id, which: 0, elem: 0, recv: 0 });
+            fc.emit(Instr::DecInits {
+                class_id: d.class_id,
+                which: 0,
+                elem: 0,
+                recv: 0,
+            });
         }
         // Instance field initializers in SOURCE order (`this.field = expr`, this =
         // reg 0). `arguments` is an early SyntaxError inside an initializer (and
@@ -1240,9 +1298,17 @@ impl Compiler {
             // class-definition time and is stored positionally on the class.
             let (fname, finit, dec_elem) = if which == 0 {
                 let (n, e) = &fields[i];
-                (Some(n), *e, dec.and_then(|d| d.named.get(i).copied().flatten()))
+                (
+                    Some(n),
+                    *e,
+                    dec.and_then(|d| d.named.get(i).copied().flatten()),
+                )
             } else {
-                (None, computed_inits[i], dec.and_then(|d| d.computed.get(i).copied().flatten()))
+                (
+                    None,
+                    computed_inits[i],
+                    dec.and_then(|d| d.computed.get(i).copied().flatten()),
+                )
             };
             let v = match finit {
                 Some(e) => {
@@ -1263,7 +1329,11 @@ impl Compiler {
                     let kr = fc.temp();
                     let idx = fc.add_string_const(fname);
                     fc.emit(Instr::LoadConst { dst: kr, idx });
-                    fc.emit(Instr::SetFnNameFromKey { func: v, key: kr, prefix: 0 });
+                    fc.emit(Instr::SetFnNameFromKey {
+                        func: v,
+                        key: kr,
+                        prefix: 0,
+                    });
                 }
             }
             // A decorated field's value passes through whatever initializers its
@@ -1292,9 +1362,18 @@ impl Compiler {
                 Some(fname) => {
                     let name_idx = fc.string_name(fname);
                     if fname.starts_with('#') {
-                        fc.emit(Instr::SetProp { obj: 0, name: name_idx, val: v, strict: false });
+                        fc.emit(Instr::SetProp {
+                            obj: 0,
+                            name: name_idx,
+                            val: v,
+                            strict: false,
+                        });
                     } else {
-                        fc.emit(Instr::DefineField { obj: 0, name: name_idx, val: v });
+                        fc.emit(Instr::DefineField {
+                            obj: 0,
+                            name: name_idx,
+                            val: v,
+                        });
                     }
                 }
                 None => fc.emit(Instr::FieldInit {
@@ -1357,9 +1436,15 @@ impl Compiler {
             code: fc.code,
             reg_count: fc.max_reg,
             param_count: params.len() as u16,
-            length: params_ast.map(expected_arg_count).unwrap_or(params.len() as u16),
+            length: params_ast
+                .map(expected_arg_count)
+                .unwrap_or(params.len() as u16),
             rest_reg: fc.rest_reg,
-            arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
+            arguments_reg: if fc.uses_arguments {
+                fc.arguments_reg
+            } else {
+                None
+            },
             is_generator,
             is_async,
             // A class method/getter/setter is non-constructable. The class
@@ -1368,7 +1453,7 @@ impl Compiler {
             // is never consulted for it — safe to set uniformly.
             non_constructable: true,
             lexical_this: false, // a concise method gets its own `this`, not lexical
-            super_static, // true for static methods/getters/setters/blocks
+            super_static,        // true for static methods/getters/setters/blocks
             is_strict: true,
             simple_params: false, // strict (class body) — never mapped anyway
             constants: fc.constants,
@@ -1496,24 +1581,54 @@ impl Compiler {
                 // this — it is why react-router could not resolve its own helpers.
                 {
                     let mut lex = std::collections::HashSet::new();
+                    let mut early_cell = std::collections::HashSet::new();
+                    let mut prior_refs = std::collections::HashSet::new();
                     for s in &b.stmts {
                         match s {
                             ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                                let mut declared_here = std::collections::HashSet::new();
                                 for decl in &d.decls {
-                                    capture::collect_pattern_names(&decl.id, &mut lex);
+                                    capture::collect_pattern_names(&decl.id, &mut declared_here);
+                                }
+                                lex.extend(declared_here.iter().cloned());
+
+                                // Multiple declarators and destructuring have
+                                // intra-statement TDZ/order edges. Keep their
+                                // established cell lowering; the hot package
+                                // shape is the common single-identifier case.
+                                let simple_single = d.decls.len() == 1
+                                    && matches!(&d.decls[0].id, ast::Pattern::Ident(_));
+                                for name in declared_here {
+                                    if !simple_single || prior_refs.contains(&name) {
+                                        early_cell.insert(name);
+                                    }
                                 }
                             }
                             ast::Stmt::ClassDecl(c) => {
                                 if let Some(id) = &c.name {
-                                    lex.insert(id.to_string());
+                                    let name = id.to_string();
+                                    lex.insert(name.clone());
+                                    // Class heritage, computed names and static
+                                    // initialization have richer self-TDZ rules.
+                                    early_cell.insert(name);
                                 }
                             }
                             _ => {}
                         }
+                        prior_refs.extend(capture::stmts_refs_all(std::slice::from_ref(s)));
                     }
                     // Sorted: alloc_reg() below, so raw HashSet order would permute cell registers.
                     for name in &crate::compile::helpers::sorted_name_vec(&lex) {
-                        if !fc.scopes[0].iter().any(|(n, _)| n == name) {
+                        // Captures/direct eval need address-stable storage;
+                        // forward references need the early TDZ binding. A
+                        // simple declaration reached before any reference can
+                        // use the ordinary register path. The ablation switch
+                        // keeps the historical eager-cell lowering exactly.
+                        let needs_cell = !arrow_lexical_unbox_enabled()
+                            || fc.captured.contains(name)
+                            || fc.box_all_locals
+                            || early_cell.contains(name);
+                        if needs_cell && !fc.scopes[0].iter().any(|(n, _)| n == name) {
                             let r = fc.alloc_reg();
                             fc.scopes[0].push((name.clone(), r));
                             fc.emit(Instr::MakeCellTdz { reg: r });
@@ -1535,8 +1650,7 @@ impl Compiler {
         }
         fc.cx.in_strict = parent_strict; // restore: nested compiles are done
         fc.cx.dyn_global_zone = saved_dyn_zone_arrow;
-        let upvalues: Vec<UpvalSource> =
-            fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
         fc.check_regs()?;
         Ok(FuncProto {
             name: "<arrow>".to_string(),
@@ -1545,14 +1659,23 @@ impl Compiler {
             param_count: params.len() as u16,
             length: expected_arg_count(&a.params),
             rest_reg: fc.rest_reg,
-            arguments_reg: if fc.uses_arguments { fc.arguments_reg } else { None },
+            arguments_reg: if fc.uses_arguments {
+                fc.arguments_reg
+            } else {
+                None
+            },
             is_generator: false,
             is_async: a.is_async,
             non_constructable: true, // arrow functions have no [[Construct]]
-            lexical_this: true, // arrows capture `this` lexically (see FuncProto)
-            super_static, // inherited from the enclosing method/block
+            lexical_this: true,      // arrows capture `this` lexically (see FuncProto)
+            super_static,            // inherited from the enclosing method/block
             is_strict,
-            simple_params: false, // an arrow has no own `arguments`
+            // IsSimpleParameterList is syntax, independent of whether the
+            // function has an own `arguments` binding (arrows do not). Keeping
+            // every arrow false unnecessarily excluded ordinary `(a, b) => …`
+            // from positional-parameter JIT paths; arguments_reg/lexical_this
+            // already carry the two arrow-specific semantics separately.
+            simple_params: a.params.simple,
             constants: fc.constants,
             string_constants: fc.string_constants,
             bigint_consts: fc.bigint_consts,
@@ -1618,10 +1741,7 @@ mod m1_tests {
             let name = format!("global_{slot}");
             assert_eq!(compiler.global_slot(&name), slot);
         }
-        assert_eq!(
-            compiler.existing_global_slot("global_65536"),
-            Some(65_536)
-        );
+        assert_eq!(compiler.existing_global_slot("global_65536"), Some(65_536));
         compiler.debug_assert_global_indexes();
     }
 
@@ -1648,8 +1768,7 @@ mod m1_tests {
             let bytes = source.len();
             let started = Instant::now();
             drop(
-                crate::compile::compile_program(&ast, &source)
-                    .expect("generated script compiles"),
+                crate::compile::compile_program(&ast, &source).expect("generated script compiles"),
             );
             let elapsed = started.elapsed();
             let rate = elapsed.as_nanos() as f64 * 1_000_000.0 / bytes as f64;

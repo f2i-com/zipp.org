@@ -71,7 +71,11 @@ use std::process::Command;
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -83,7 +87,11 @@ fn node_output(src: &str) -> Vec<String> {
         .arg(src)
         .output()
         .expect("node on PATH (expected values come from `node -e`)");
-    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8(out.stdout)
         .expect("node output is UTF-8")
         .lines()
@@ -152,7 +160,10 @@ fn kernel(inv: &str, depth: usize, pressure: usize, dbl: bool) -> String {
             format!("{ind}h = (h + ((d * 1024) | 0)) | 0;\n"),
         )
     };
-    let extra: String = PRESSURE[..pressure].iter().map(|s| format!("{ind}{s}\n")).collect();
+    let extra: String = PRESSURE[..pressure]
+        .iter()
+        .map(|s| format!("{ind}{s}\n"))
+        .collect();
     format!(
         "function kernel(n) {{\n  {decl}\n  for (i = 0; i < n; i++) {{\n    d = {inv};\n\
          {open}{body_head}{extra}{close}  }}\n  return h;\n}}\nconsole.log(kernel(9));\n"
@@ -363,7 +374,9 @@ fn jitlog_of(src: &str) -> String {
 #[test]
 #[ignore = "worker: spawned by jitlog_of with ZIPP_LIVERANGE_SRC set"]
 fn liverange_jitlog_child() {
-    let Some(src) = std::env::var_os("ZIPP_LIVERANGE_SRC") else { return };
+    let Some(src) = std::env::var_os("ZIPP_LIVERANGE_SRC") else {
+        return;
+    };
     let _ = run_ok(&src.to_string_lossy());
 }
 

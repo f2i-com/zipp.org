@@ -2,8 +2,8 @@
 use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
-    AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap, PropAttr,
-    PromiseState, ReactionPair, Reactions,
+    AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
 
@@ -66,7 +66,11 @@ impl<'p> Vm<'p> {
         this.is_heap()
             && !matches!(
                 self.heap.get(this.heap_index()),
-                HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+                HeapObj::Str(_)
+                    | HeapObj::Cons { .. }
+                    | HeapObj::Symbol { .. }
+                    | HeapObj::BigInt(_)
+                    | HeapObj::BigIntBig(_)
             )
     }
 
@@ -134,7 +138,9 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         let res = self.call_value(next, iter, &[])?;
         if !self.is_object_value(res) {
-            return Err(Thrown("TypeError: iterator.next() returned a non-object".into()));
+            return Err(Thrown(
+                "TypeError: iterator.next() returned a non-object".into(),
+            ));
         }
         let done = self.get_prop(res, "done")?;
         if self.truthy(done) {
@@ -162,9 +168,7 @@ impl<'p> Vm<'p> {
         // IteratorComplete: validate `result` is an object, then read only `done`.
         let complete = |vm: &mut Self, result: Value| -> Result<bool, Thrown> {
             if !vm.is_object_value(result) {
-                return Err(Thrown(
-                    "TypeError: iterator result is not an object".into(),
-                ));
+                return Err(Thrown("TypeError: iterator result is not an object".into()));
             }
             let d = vm.get_prop(result, "done")?;
             Ok(vm.truthy(d))
@@ -193,7 +197,9 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 if !self.is_callable(throw_m) {
-                    return Err(Thrown("TypeError: iterator 'throw' is not a function".into()));
+                    return Err(Thrown(
+                        "TypeError: iterator 'throw' is not a function".into(),
+                    ));
                 }
                 let result = self.call_value(throw_m, iter, &[sent])?;
                 let done = complete(self, result)?;
@@ -211,7 +217,9 @@ impl<'p> Vm<'p> {
                     return Ok((sent, false, true));
                 }
                 if !self.is_callable(ret_m) {
-                    return Err(Thrown("TypeError: iterator 'return' is not a function".into()));
+                    return Err(Thrown(
+                        "TypeError: iterator 'return' is not a function".into(),
+                    ));
                 }
                 let result = self.call_value(ret_m, iter, &[sent])?;
                 let done = complete(self, result)?;
@@ -237,9 +245,15 @@ impl<'p> Vm<'p> {
     ) -> Result<Value, Thrown> {
         if !self.is_object_value(v) {
             let is_str = v.is_heap()
-                && matches!(self.heap.get(v.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. });
+                && matches!(
+                    self.heap.get(v.heap_index()),
+                    HeapObj::Str(_) | HeapObj::Cons { .. }
+                );
             if reject_primitives || !is_str {
-                return Err(Thrown(format!("TypeError: {} is not iterable", self.display(v))));
+                return Err(Thrown(format!(
+                    "TypeError: {} is not iterable",
+                    self.display(v)
+                )));
             }
             // iterate-string-primitives: a String is iterable — fall through.
         }
@@ -250,11 +264,15 @@ impl<'p> Vm<'p> {
             return Ok(v);
         }
         if !self.is_callable(m) {
-            return Err(Thrown("TypeError: [Symbol.iterator] is not a function".into()));
+            return Err(Thrown(
+                "TypeError: [Symbol.iterator] is not a function".into(),
+            ));
         }
         let it = self.call_value(m, v, &[])?;
         if !self.is_object_value(it) {
-            return Err(Thrown("TypeError: [Symbol.iterator]() returned a non-object".into()));
+            return Err(Thrown(
+                "TypeError: [Symbol.iterator]() returned a non-object".into(),
+            ));
         }
         Ok(it)
     }
@@ -327,7 +345,9 @@ impl<'p> Vm<'p> {
                     "TypeError: Iterator.concat argument is not iterable".into(),
                 ));
             }
-            pairs.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![item, method]))));
+            pairs.push(Value::heap(
+                self.heap.alloc(HeapObj::Array(vec![item, method])),
+            ));
         }
         let src = Value::heap(self.heap.alloc(HeapObj::Array(pairs)));
         self.make_iter_helper(src, 6, Value::UNDEFINED, 0)
@@ -350,10 +370,14 @@ impl<'p> Vm<'p> {
         let _gc = self.gc_lock_guard();
         let what = if keyed { "zipKeyed" } else { "zip" };
         if !self.is_object_value(iterables) {
-            return Err(Thrown(format!("TypeError: Iterator.{what} called with a non-object")));
+            return Err(Thrown(format!(
+                "TypeError: Iterator.{what} called with a non-object"
+            )));
         }
         if options != Value::UNDEFINED && !self.is_object_value(options) {
-            return Err(Thrown(format!("TypeError: Iterator.{what} options is not an object")));
+            return Err(Thrown(format!(
+                "TypeError: Iterator.{what} options is not an object"
+            )));
         }
         // mode: shortest (0, default) / longest (1) / strict (2).
         let mode: u8 = if options != Value::UNDEFINED {
@@ -369,7 +393,11 @@ impl<'p> Vm<'p> {
                         self.heap.get(m.heap_index()),
                         HeapObj::Str(_) | HeapObj::Cons { .. }
                     );
-                let s = if is_str_prim { self.to_js_string(m)? } else { String::new() };
+                let s = if is_str_prim {
+                    self.to_js_string(m)?
+                } else {
+                    String::new()
+                };
                 match s.as_str() {
                     "shortest" => 0,
                     "longest" => 1,
@@ -383,7 +411,9 @@ impl<'p> Vm<'p> {
         let padding_option = if mode == 1 && options != Value::UNDEFINED {
             let p = self.get_prop(options, "padding")?;
             if p != Value::UNDEFINED && !self.is_object_value(p) {
-                return Err(Thrown(format!("TypeError: Iterator.{what} padding is not an object")));
+                return Err(Thrown(format!(
+                    "TypeError: Iterator.{what} padding is not an object"
+                )));
             }
             p
         } else {
@@ -670,10 +700,19 @@ impl<'p> Vm<'p> {
     fn iter_zip_next_inner(&mut self, idx: u32) -> Result<Value, Thrown> {
         let _gc = self.gc_lock_guard();
         let (source, arg, inner, mode, done) = match self.heap.get(idx) {
-            HeapObj::IterHelper { source, arg, inner, n, done, .. } => {
-                (*source, *arg, *inner, *n as u8, *done)
+            HeapObj::IterHelper {
+                source,
+                arg,
+                inner,
+                n,
+                done,
+                ..
+            } => (*source, *arg, *inner, *n as u8, *done),
+            _ => {
+                return Err(Thrown(
+                    "TypeError: Iterator Helper next on incompatible receiver".into(),
+                ))
             }
-            _ => return Err(Thrown("TypeError: Iterator Helper next on incompatible receiver".into())),
         };
         if done {
             return Ok(self.iter_result(Value::UNDEFINED, true));
@@ -827,15 +866,23 @@ impl<'p> Vm<'p> {
         Ok(self.iter_result(out, false))
     }
 
-    fn make_iter_helper(&mut self, source: Value, kind: u8, arg: Value, n: i64) -> Result<Value, Thrown> {
+    fn make_iter_helper(
+        &mut self,
+        source: Value,
+        kind: u8,
+        arg: Value,
+        n: i64,
+    ) -> Result<Value, Thrown> {
         // GetIteratorDirect(source): read `next` ONCE now (a getter fires once, and a
         // throwing `next` getter propagates here at creation). Single-source helpers
         // (kinds 0..=5) then step via this cached method; a generator uses the internal
         // step path, and zip/concat (6/7) hold an Array of sub-iterators.
         let next = if kind <= 5
             && source.is_heap()
-            && !matches!(self.heap.get(source.heap_index()), HeapObj::Generator { .. })
-        {
+            && !matches!(
+                self.heap.get(source.heap_index()),
+                HeapObj::Generator { .. }
+            ) {
             self.get_prop(source, "next")?
         } else {
             Value::UNDEFINED
@@ -866,7 +913,8 @@ impl<'p> Vm<'p> {
             running: false,
         });
         if self.iterator_helper_proto != 0 {
-            self.proto_of.insert(idx, Value::heap(self.iterator_helper_proto));
+            self.proto_of
+                .insert(idx, Value::heap(self.iterator_helper_proto));
         }
         Ok(Value::heap(idx))
     }
@@ -916,7 +964,9 @@ impl<'p> Vm<'p> {
         }
         if n.is_infinite() {
             return if n < 0.0 {
-                Err(Thrown("RangeError: take/drop limit must be non-negative".into()))
+                Err(Thrown(
+                    "RangeError: take/drop limit must be non-negative".into(),
+                ))
             } else {
                 Ok(i64::MAX)
             };
@@ -925,7 +975,9 @@ impl<'p> Vm<'p> {
         // `-0.5` → -0 (allowed) but `-1` → -1 (RangeError).
         let int_limit = n.trunc();
         if int_limit < 0.0 {
-            return Err(Thrown("RangeError: take/drop limit must be non-negative".into()));
+            return Err(Thrown(
+                "RangeError: take/drop limit must be non-negative".into(),
+            ));
         }
         Ok(int_limit as i64)
     }
@@ -946,7 +998,8 @@ impl<'p> Vm<'p> {
     /// read `iter.next` ONCE (propagating a throwing getter) so the loop steps via the
     /// cached method. A generator uses the internal step path (UNDEFINED).
     fn iter_direct_next(&mut self, iter: Value) -> Result<Value, Thrown> {
-        if iter.is_heap() && !matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. }) {
+        if iter.is_heap() && !matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. })
+        {
             self.get_prop(iter, "next")
         } else {
             Ok(Value::UNDEFINED)
@@ -990,18 +1043,28 @@ impl<'p> Vm<'p> {
         use native::*;
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         if !self.iter_receiver_ok(this) {
-            return Err(Thrown("TypeError: Iterator helper called on a non-object".into()));
+            return Err(Thrown(
+                "TypeError: Iterator helper called on a non-object".into(),
+            ));
         }
         let needs_fn = matches!(
             id,
-            ITER_MAP | ITER_FILTER | ITER_FLATMAP | ITER_FOREACH | ITER_SOME | ITER_EVERY | ITER_FIND
+            ITER_MAP
+                | ITER_FILTER
+                | ITER_FLATMAP
+                | ITER_FOREACH
+                | ITER_SOME
+                | ITER_EVERY
+                | ITER_FIND
         );
         // GetIteratorDirect(O) precedes the argument checks, so a callback that is not
         // callable (or, for take/drop, a limit that fails ToNumber / is out of range)
         // must IteratorClose the underlying iterator before throwing.
         if needs_fn && !self.is_callable(a0) {
             let _ = self.iterator_close(this);
-            return Err(Thrown("TypeError: the callback argument is not a function".into()));
+            return Err(Thrown(
+                "TypeError: the callback argument is not a function".into(),
+            ));
         }
         match id {
             ITER_MAP => self.make_iter_helper(this, 0, a0, 0),
@@ -1162,9 +1225,17 @@ impl<'p> Vm<'p> {
     fn iter_helper_next_inner(&mut self, idx: u32) -> Result<Value, Thrown> {
         loop {
             let (source, kind, arg, n, cidx, done, inner, next) = match self.heap.get(idx) {
-                HeapObj::IterHelper { source, kind, arg, n, idx, done, inner, next, .. } => {
-                    (*source, *kind, *arg, *n, *idx, *done, *inner, *next)
-                }
+                HeapObj::IterHelper {
+                    source,
+                    kind,
+                    arg,
+                    n,
+                    idx,
+                    done,
+                    inner,
+                    next,
+                    ..
+                } => (*source, *kind, *arg, *n, *idx, *done, *inner, *next),
                 _ => {
                     return Err(Thrown(
                         "TypeError: Iterator Helper next called on incompatible receiver".into(),
@@ -1310,7 +1381,8 @@ impl<'p> Vm<'p> {
                         self.ih_set_done(idx);
                         return Ok(self.iter_result(Value::UNDEFINED, true));
                     }
-                    let (iterable, method) = match self.heap.get(pairs[cidx as usize].heap_index()) {
+                    let (iterable, method) = match self.heap.get(pairs[cidx as usize].heap_index())
+                    {
                         HeapObj::Array(p) => (p[0], p[1]),
                         _ => (Value::UNDEFINED, Value::UNDEFINED),
                     };

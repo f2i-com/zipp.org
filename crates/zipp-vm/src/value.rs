@@ -302,7 +302,15 @@ mod tests {
 
     #[test]
     fn double_roundtrip() {
-        for d in [0.5f64, -1.5, 3.14159, 1e300, -1e-300, f64::INFINITY, f64::NEG_INFINITY] {
+        for d in [
+            0.5f64,
+            -1.5,
+            3.14159,
+            1e300,
+            -1e-300,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
             let val = Value::num(d);
             assert!(val.is_double(), "{d} should be double");
             assert!(val.is_number());

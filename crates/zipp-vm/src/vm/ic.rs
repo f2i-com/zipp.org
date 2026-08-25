@@ -2,7 +2,8 @@
 //! Interpreter inline caches (ICs) for the hot call / property paths.
 //!
 //! Every `CallMethod` / `Call` / `GetProp` / `SetProp` / `SuperMethod` site in
-//! a MAIN-program function (never eval-compiled ones) owns a lazily-allocated
+//! a main-program or loader-recorded ES-module function (never ordinary
+//! eval/new-Function code) owns a lazily-allocated
 //! per-ip cache of up to [`IC_WAYS`] entries. A hit skips the slow machinery
 //! (the `try_builtin_method` probe, the proto/class chain walk with its
 //! per-level string finds, `resolve_callable` + the generator/async flag
@@ -70,6 +71,16 @@ const IC_MISS_LIMIT: u8 = 16;
 /// Maximum proto-chain hops a `Proto*`/`Super*` entry can guard.
 const IC_MAX_HOPS: usize = 6;
 
+/// Let loader-installed module functions retain the same guarded call/property
+/// feedback as main-program functions. Runtime module and eval functions share
+/// one id space, so admission additionally checks the loader's exact immutable
+/// function ranges. Cached because every hot IC probe asks this question.
+#[inline]
+fn module_ic_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_MODULE_IC").is_none())
+}
+
 /// Sentinel `ret_dst` for a frame whose return value is DISCARDED (an
 /// IC-pushed SETTER activation): `pop_frame_with` skips the caller-register
 /// write. Real `ret_dst` values are register indices < `reg_count`, far below
@@ -100,30 +111,71 @@ pub(crate) enum IcEntry {
     /// mapping is proven and the key lookup is SKIPPED — see the fast path in
     /// `ic_get_prop`. When it does not, the entry still validates the old way
     /// (`own == Some(slot)`), so a dictionary-mode receiver loses no ground.
-    OwnData { shape: u32, slot: u32 },
-    OwnAcc { shape: u32, slot: u32 },
+    OwnData {
+        shape: u32,
+        slot: u32,
+    },
+    OwnAcc {
+        shape: u32,
+        slot: u32,
+    },
     /// Method (`is_getter == false`) or getter resolved on the receiver's
     /// class chain. `callee` is the materialized member function (stable for
     /// the life of the class — ClassData is immutable post-definition).
-    ClassMethod { class: u32, ver: u32, callee: Value, fid: u32, closure: u32 },
-    ClassGetter { class: u32, ver: u32, getter: Value },
+    ClassMethod {
+        class: u32,
+        ver: u32,
+        callee: Value,
+        fid: u32,
+        closure: u32,
+    },
+    ClassGetter {
+        class: u32,
+        ver: u32,
+        getter: Value,
+    },
     /// `set key(v)` resolved on the receiver's class chain (SetProp sites).
-    ClassSetter { class: u32, ver: u32, setter: Value },
+    ClassSetter {
+        class: u32,
+        ver: u32,
+        setter: Value,
+    },
     /// Data property / accessor found on the proto_of chain at
     /// `hops[last].slot`, or (`slot == u32::MAX` for `ProtoData`) a full-chain
     /// MISS — the read yields `undefined`.
-    ProtoData { first: u8, hops: IcHops, slot: u32 },
-    ProtoAcc { first: u8, hops: IcHops, slot: u32 },
+    ProtoData {
+        first: u8,
+        hops: IcHops,
+        slot: u32,
+    },
+    ProtoAcc {
+        first: u8,
+        hops: IcHops,
+        slot: u32,
+    },
     /// Plain `Call` site: callee identity (bits) + slot version → resolved
     /// (fid, closure) for a plain (non-generator, non-async) Func/Closure.
-    Callee { bits: u64, ver: u32, fid: u32, closure: u32 },
+    Callee {
+        bits: u64,
+        ver: u32,
+        fid: u32,
+        closure: u32,
+    },
     /// `super.key(…)` / `super.key` site: `home` is the class VALUE the site's
     /// `home_class_id` resolved to at fill; `hops[0]` is the derivation anchor
     /// (the home's synthesized prototype object — or the class itself for a
     /// static member), `hops[1..]` the chain from the super base to the
     /// holder. `slot` indexes the holder's map.
-    SuperData { home: Value, hops: IcHops, slot: u32 },
-    SuperAcc { home: Value, hops: IcHops, slot: u32 },
+    SuperData {
+        home: Value,
+        hops: IcHops,
+        slot: u32,
+    },
+    SuperAcc {
+        home: Value,
+        hops: IcHops,
+        slot: u32,
+    },
 }
 
 /// Read-only resolution of a `super.m()` op for Stage 3 method inlining
@@ -155,7 +207,11 @@ pub(crate) enum GetAct {
     Value(Value),
     /// Accessor hit resolved to a plain user function: push its frame with
     /// `this` = receiver and `ret_dst` = the GetProp `dst`.
-    Accessor { fid: u32, closure: u32, getter: Value },
+    Accessor {
+        fid: u32,
+        closure: u32,
+        getter: Value,
+    },
     /// No usable entry — take the slow path.
     None,
 }
@@ -167,29 +223,61 @@ pub(crate) enum SetAct {
     /// Setter hit resolved to a plain user function: push its frame with
     /// `this` = receiver, the value as the single argument, and
     /// `ret_dst` = [`RET_DISCARD`].
-    Setter { fid: u32, closure: u32, setter: Value },
+    Setter {
+        fid: u32,
+        closure: u32,
+        setter: Value,
+    },
     None,
 }
 
 /// A validated `SetProp` action, produced borrow-free by the shape probe or
 /// [`Vm::ic_validate_set`].
 enum SetPlan {
-    WriteOwn { idx: u32, slot: u32 },
-    Setter { fid: u32, closure: u32, setter: Value },
+    WriteOwn {
+        idx: u32,
+        slot: u32,
+    },
+    Setter {
+        fid: u32,
+        closure: u32,
+        setter: Value,
+    },
 }
 
 /// Side-effect-free provenance of a property resolution (the fill walk).
 pub(crate) enum Walked {
-    OwnData { slot: usize },
-    OwnAcc { slot: usize },
+    OwnData {
+        slot: usize,
+    },
+    OwnAcc {
+        slot: usize,
+    },
     /// Hit on the class chain: methods-before-getters per level, like
     /// `get_member`'s inline walk.
-    ClassMethod { class: u32, callee: Value },
-    ClassGetter { class: u32, getter: Value },
-    ChainData { first: u8, hops: IcHops, slot: u32 },
-    ChainAcc { first: u8, hops: IcHops, slot: u32 },
+    ClassMethod {
+        class: u32,
+        callee: Value,
+    },
+    ClassGetter {
+        class: u32,
+        getter: Value,
+    },
+    ChainData {
+        first: u8,
+        hops: IcHops,
+        slot: u32,
+    },
+    ChainAcc {
+        first: u8,
+        hops: IcHops,
+        slot: u32,
+    },
     /// The whole (guardable) chain misses → `undefined`.
-    ChainMiss { first: u8, hops: IcHops },
+    ChainMiss {
+        first: u8,
+        hops: IcHops,
+    },
     /// Not cacheable (exotic receiver/chain, too deep, non-Object hop, …).
     No,
 }
@@ -199,10 +287,22 @@ pub(crate) enum Walked {
 /// these names are never cached for method-call sites.
 #[inline]
 fn builtin_object_method(key: &str) -> bool {
-    matches!(key, "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf")
+    matches!(
+        key,
+        "hasOwnProperty" | "propertyIsEnumerable" | "isPrototypeOf"
+    )
 }
 
 impl<'p> Vm<'p> {
+    /// Main code and exact loader-recorded module ranges may own IC state.
+    /// Ordinary eval/new-Function gaps remain excluded even when they sit
+    /// between two eligible module ranges in the unified function table.
+    #[inline]
+    fn ic_func_eligible(&self, func_id: u32) -> bool {
+        (func_id as usize) < self.main_func_count
+            || (module_ic_enabled() && self.loader_module_func(func_id))
+    }
+
     /// Exclusions shared with `get_member`'s fast path: objects with live /
     /// exotic slot semantics layered over their ObjMap never take IC paths.
     /// (Also consulted by the JIT region prop-miss helpers in helpers_misc.rs.)
@@ -210,18 +310,16 @@ impl<'p> Vm<'p> {
     pub(crate) fn ic_obj_ok(&self, idx: u32) -> bool {
         !(idx == self.global_this && self.global_this != 0)
             && !(idx == self.arr_proto && self.arr_proto != 0)
-            && (self.module_namespaces.is_empty()
-                || !self.module_namespaces.contains_key(&idx))
-            && (self.realm_global_objs.is_empty()
-                || !self.realm_global_objs.contains_key(&idx))
+            && (self.module_namespaces.is_empty() || !self.module_namespaces.contains_key(&idx))
+            && (self.realm_global_objs.is_empty() || !self.realm_global_objs.contains_key(&idx))
     }
 
-    /// The site cache for `(func_id, ip)`, if this function is IC-eligible
-    /// (a MAIN-program function — eval functions never cache).
+    /// The site cache for `(func_id, ip)`, if this function is IC-eligible.
+    /// Loader-recorded modules cache; ordinary eval/new-Function code does not.
     #[inline]
     fn ic_site(&self, func_id: u32, ip: usize) -> Option<&SiteIc> {
         let f = func_id as usize;
-        if f >= self.main_func_count {
+        if !self.ic_func_eligible(func_id) {
             return None;
         }
         self.site_ics.get(f)?.as_ref()?.get(ip)?.as_deref()
@@ -238,11 +336,12 @@ impl<'p> Vm<'p> {
     /// Mutable access to (and lazy allocation of) the site cache.
     fn ic_site_mut(&mut self, func_id: u32, ip: usize) -> Option<&mut SiteIc> {
         let f = func_id as usize;
-        if f >= self.main_func_count {
+        if !self.ic_func_eligible(func_id) {
             return None;
         }
-        if self.site_ics.len() < self.main_func_count {
-            self.site_ics.resize_with(self.main_func_count, || None);
+        let func_count = self.main_func_count + self.eval_funcs.len();
+        if self.site_ics.len() < func_count {
+            self.site_ics.resize_with(func_count, || None);
         }
         let code_len = self.func(f).code.len();
         let slots = self.site_ics[f].get_or_insert_with(|| {
@@ -256,7 +355,10 @@ impl<'p> Vm<'p> {
                 misses: 0,
                 n: 0,
                 rot: 0,
-                entries: [IcEntry::OwnData { shape: crate::shape::DICT, slot: 0 }; IC_WAYS],
+                entries: [IcEntry::OwnData {
+                    shape: crate::shape::DICT,
+                    slot: 0,
+                }; IC_WAYS],
             })
         }))
     }
@@ -289,7 +391,10 @@ impl<'p> Vm<'p> {
             return;
         }
         let bits = recv.bits();
-        let set = self.mi_recv.entry(((func_id as u64) << 32) | ip as u64).or_default();
+        let set = self
+            .mi_recv
+            .entry(((func_id as u64) << 32) | ip as u64)
+            .or_default();
         if set.len() < IC_WAYS && !set.contains(&bits) {
             set.push(bits);
         }
@@ -399,9 +504,17 @@ impl<'p> Vm<'p> {
             hops.1 += 1;
             if let Some(i) = m2.pos(key) {
                 return if m2.attrs[i].accessor {
-                    Walked::ChainAcc { first, hops, slot: i as u32 }
+                    Walked::ChainAcc {
+                        first,
+                        hops,
+                        slot: i as u32,
+                    }
                 } else {
-                    Walked::ChainData { first, hops, slot: i as u32 }
+                    Walked::ChainData {
+                        first,
+                        hops,
+                        slot: i as u32,
+                    }
                 };
             }
             cur = next;
@@ -589,12 +702,26 @@ impl<'p> Vm<'p> {
                     Some((_, m)) => (m.vals[slot], m.shape()),
                     None => return GetAct::None,
                 };
-                self.ic_install(func_id, ip, IcEntry::OwnData { shape, slot: slot as u32 });
+                self.ic_install(
+                    func_id,
+                    ip,
+                    IcEntry::OwnData {
+                        shape,
+                        slot: slot as u32,
+                    },
+                );
                 GetAct::Value(v)
             }
             Walked::OwnAcc { slot } => {
                 let shape = self.ic_recv_shape(recv);
-                self.ic_install(func_id, ip, IcEntry::OwnAcc { shape, slot: slot as u32 });
+                self.ic_install(
+                    func_id,
+                    ip,
+                    IcEntry::OwnAcc {
+                        shape,
+                        slot: slot as u32,
+                    },
+                );
                 self.ic_own_acc_get(recv, key, slot as u32)
             }
             Walked::ClassMethod { class, callee } => {
@@ -621,7 +748,11 @@ impl<'p> Vm<'p> {
                 self.mi_record_recv(func_id, ip, recv);
                 self.ic_install(func_id, ip, IcEntry::ClassGetter { class, ver, getter });
                 match self.ic_plain_fn(getter) {
-                    Some((fid, closure)) => GetAct::Accessor { fid, closure, getter },
+                    Some((fid, closure)) => GetAct::Accessor {
+                        fid,
+                        closure,
+                        getter,
+                    },
                     None => GetAct::None, // native/generator getter → slow path
                 }
             }
@@ -641,7 +772,11 @@ impl<'p> Vm<'p> {
                 self.ic_install(
                     func_id,
                     ip,
-                    IcEntry::ProtoData { first, hops, slot: u32::MAX },
+                    IcEntry::ProtoData {
+                        first,
+                        hops,
+                        slot: u32::MAX,
+                    },
                 );
                 GetAct::Value(Value::UNDEFINED)
             }
@@ -679,23 +814,23 @@ impl<'p> Vm<'p> {
                     GetAct::None
                 }
             }
-            IcEntry::ClassMethod { class, ver, callee, .. } => {
-                if own.is_none()
-                    && m.class == Some(class)
-                    && self.heap.version_of(class) == ver
-                {
+            IcEntry::ClassMethod {
+                class, ver, callee, ..
+            } => {
+                if own.is_none() && m.class == Some(class) && self.heap.version_of(class) == ver {
                     GetAct::Value(callee)
                 } else {
                     GetAct::None
                 }
             }
             IcEntry::ClassGetter { class, ver, getter } => {
-                if own.is_none()
-                    && m.class == Some(class)
-                    && self.heap.version_of(class) == ver
-                {
+                if own.is_none() && m.class == Some(class) && self.heap.version_of(class) == ver {
                     match self.ic_plain_fn(getter) {
-                        Some((fid, closure)) => GetAct::Accessor { fid, closure, getter },
+                        Some((fid, closure)) => GetAct::Accessor {
+                            fid,
+                            closure,
+                            getter,
+                        },
                         None => GetAct::None,
                     }
                 } else {
@@ -742,7 +877,11 @@ impl<'p> Vm<'p> {
             return GetAct::Value(Value::UNDEFINED);
         }
         match self.ic_plain_fn(g) {
-            Some((fid, closure)) => GetAct::Accessor { fid, closure, getter: g },
+            Some((fid, closure)) => GetAct::Accessor {
+                fid,
+                closure,
+                getter: g,
+            },
             None => GetAct::None,
         }
     }
@@ -751,7 +890,9 @@ impl<'p> Vm<'p> {
     /// re-resolve it (nothing cached survives a slot redefinition).
     #[inline]
     fn ic_own_acc_get(&self, recv: Value, key: &str, slot: u32) -> GetAct {
-        let Some((_, m)) = self.ic_recv_map(recv) else { return GetAct::None };
+        let Some((_, m)) = self.ic_recv_map(recv) else {
+            return GetAct::None;
+        };
         let s = slot as usize;
         if s >= m.keys.len() || m.keys[s] != key || !m.attrs[s].accessor {
             return GetAct::None;
@@ -776,7 +917,11 @@ impl<'p> Vm<'p> {
             return GetAct::Value(Value::UNDEFINED);
         }
         match self.ic_plain_fn(g) {
-            Some((fid, closure)) => GetAct::Accessor { fid, closure, getter: g },
+            Some((fid, closure)) => GetAct::Accessor {
+                fid,
+                closure,
+                getter: g,
+            },
             None => GetAct::None,
         }
     }
@@ -812,7 +957,11 @@ impl<'p> Vm<'p> {
                     // JSON sites made it materially slower.
                     let shape = m.shape();
                     if m.shape_guardable() {
-                        if let IcEntry::OwnData { shape: cached_shape, slot } = site.entries[0] {
+                        if let IcEntry::OwnData {
+                            shape: cached_shape,
+                            slot,
+                        } = site.entries[0]
+                        {
                             if cached_shape == shape {
                                 if let Some(attr) = m.attr_get(slot as usize) {
                                     if !attr.accessor && attr.writable {
@@ -849,7 +998,10 @@ impl<'p> Vm<'p> {
         if key == "__proto__"
             || key == "caller"
             || key == "arguments"
-            || key.as_bytes().first().is_some_and(|b| b.is_ascii_digit() || *b == b'-')
+            || key
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_digit() || *b == b'-')
         {
             self.ic_note_miss(func_id, ip);
             return SetAct::None;
@@ -857,7 +1009,14 @@ impl<'p> Vm<'p> {
         match self.ic_walk(recv, key) {
             Walked::OwnData { slot } => {
                 let shape = self.ic_recv_shape(recv);
-                self.ic_install(func_id, ip, IcEntry::OwnData { shape, slot: slot as u32 });
+                self.ic_install(
+                    func_id,
+                    ip,
+                    IcEntry::OwnData {
+                        shape,
+                        slot: slot as u32,
+                    },
+                );
                 match self.ic_own_set_plan(recv, key, slot as u32) {
                     Some(p) => self.ic_apply_set(p, val),
                     None => SetAct::None,
@@ -865,7 +1024,14 @@ impl<'p> Vm<'p> {
             }
             Walked::OwnAcc { slot } => {
                 let shape = self.ic_recv_shape(recv);
-                self.ic_install(func_id, ip, IcEntry::OwnAcc { shape, slot: slot as u32 });
+                self.ic_install(
+                    func_id,
+                    ip,
+                    IcEntry::OwnAcc {
+                        shape,
+                        slot: slot as u32,
+                    },
+                );
                 self.ic_own_acc_set(recv, key, slot as u32)
             }
             Walked::ClassMethod { .. } | Walked::ClassGetter { .. } => {
@@ -880,13 +1046,13 @@ impl<'p> Vm<'p> {
                     Some(setter) => {
                         let ver = self.heap.version_of(class);
                         self.mi_record_recv(func_id, ip, recv);
-                        self.ic_install(
-                            func_id,
-                            ip,
-                            IcEntry::ClassSetter { class, ver, setter },
-                        );
+                        self.ic_install(func_id, ip, IcEntry::ClassSetter { class, ver, setter });
                         match self.ic_plain_fn(setter) {
-                            Some((fid, closure)) => SetAct::Setter { fid, closure, setter },
+                            Some((fid, closure)) => SetAct::Setter {
+                                fid,
+                                closure,
+                                setter,
+                            },
                             None => SetAct::None,
                         }
                     }
@@ -913,9 +1079,11 @@ impl<'p> Vm<'p> {
                                     IcEntry::ClassSetter { class, ver, setter },
                                 );
                                 return match self.ic_plain_fn(setter) {
-                                    Some((fid, closure)) => {
-                                        SetAct::Setter { fid, closure, setter }
-                                    }
+                                    Some((fid, closure)) => SetAct::Setter {
+                                        fid,
+                                        closure,
+                                        setter,
+                                    },
                                     None => SetAct::None,
                                 };
                             }
@@ -958,18 +1126,23 @@ impl<'p> Vm<'p> {
                 if own == Some(s) && m.attrs[s].accessor {
                     let setter = m.attrs[s].setter;
                     let (fid, closure) = self.ic_plain_fn(setter)?;
-                    Some(SetPlan::Setter { fid, closure, setter })
+                    Some(SetPlan::Setter {
+                        fid,
+                        closure,
+                        setter,
+                    })
                 } else {
                     None
                 }
             }
             IcEntry::ClassSetter { class, ver, setter } => {
-                if own.is_none()
-                    && m.class == Some(class)
-                    && self.heap.version_of(class) == ver
-                {
+                if own.is_none() && m.class == Some(class) && self.heap.version_of(class) == ver {
                     let (fid, closure) = self.ic_plain_fn(setter)?;
-                    Some(SetPlan::Setter { fid, closure, setter })
+                    Some(SetPlan::Setter {
+                        fid,
+                        closure,
+                        setter,
+                    })
                 } else {
                     None
                 }
@@ -980,9 +1153,15 @@ impl<'p> Vm<'p> {
                 }
                 self.ic_chain_ok(idx, first, &hops)?;
                 match self.ic_chain_acc_set(hops, slot) {
-                    SetAct::Setter { fid, closure, setter } => {
-                        Some(SetPlan::Setter { fid, closure, setter })
-                    }
+                    SetAct::Setter {
+                        fid,
+                        closure,
+                        setter,
+                    } => Some(SetPlan::Setter {
+                        fid,
+                        closure,
+                        setter,
+                    }),
                     _ => None,
                 }
             }
@@ -1004,7 +1183,15 @@ impl<'p> Vm<'p> {
                 }
                 SetAct::Done
             }
-            SetPlan::Setter { fid, closure, setter } => SetAct::Setter { fid, closure, setter },
+            SetPlan::Setter {
+                fid,
+                closure,
+                setter,
+            } => SetAct::Setter {
+                fid,
+                closure,
+                setter,
+            },
         }
     }
 
@@ -1014,8 +1201,7 @@ impl<'p> Vm<'p> {
     fn ic_own_set_plan(&self, recv: Value, key: &str, slot: u32) -> Option<SetPlan> {
         let (idx, m) = self.ic_recv_map(recv)?;
         let s = slot as usize;
-        if s < m.keys.len() && m.keys[s] == key && !m.attrs[s].accessor && m.attrs[s].writable
-        {
+        if s < m.keys.len() && m.keys[s] == key && !m.attrs[s].accessor && m.attrs[s].writable {
             Some(SetPlan::WriteOwn { idx, slot })
         } else {
             None
@@ -1026,14 +1212,20 @@ impl<'p> Vm<'p> {
     /// plain user function (getter-only / native → slow path).
     #[inline]
     fn ic_own_acc_set(&self, recv: Value, key: &str, slot: u32) -> SetAct {
-        let Some((_, m)) = self.ic_recv_map(recv) else { return SetAct::None };
+        let Some((_, m)) = self.ic_recv_map(recv) else {
+            return SetAct::None;
+        };
         let s = slot as usize;
         if s >= m.keys.len() || m.keys[s] != key || !m.attrs[s].accessor {
             return SetAct::None;
         }
         let setter = m.attrs[s].setter;
         match self.ic_plain_fn(setter) {
-            Some((fid, closure)) => SetAct::Setter { fid, closure, setter },
+            Some((fid, closure)) => SetAct::Setter {
+                fid,
+                closure,
+                setter,
+            },
             None => SetAct::None,
         }
     }
@@ -1052,7 +1244,11 @@ impl<'p> Vm<'p> {
         }
         let setter = hm.attrs[s].setter;
         match self.ic_plain_fn(setter) {
-            Some((fid, closure)) => SetAct::Setter { fid, closure, setter },
+            Some((fid, closure)) => SetAct::Setter {
+                fid,
+                closure,
+                setter,
+            },
             None => SetAct::None,
         }
     }
@@ -1097,7 +1293,21 @@ impl<'p> Vm<'p> {
                 let shape = m.shape();
                 match self.ic_plain_fn(v) {
                     Some((fid, closure)) => {
-                        self.ic_install(func_id, ip, IcEntry::OwnData { shape, slot: slot as u32 });
+                        // The Tier-C transactional own-method planner runs at
+                        // the caller's next entry, where the receiver register
+                        // has not necessarily been populated yet. Preserve the
+                        // exact receiver observed by this side-effect-free fill;
+                        // emitted code still revalidates identity, version,
+                        // shape/slot descriptor and the live callee value.
+                        self.mi_record_recv(func_id, ip, recv);
+                        self.ic_install(
+                            func_id,
+                            ip,
+                            IcEntry::OwnData {
+                                shape,
+                                slot: slot as u32,
+                            },
+                        );
                         Some((fid, closure, v))
                     }
                     None => {
@@ -1113,7 +1323,13 @@ impl<'p> Vm<'p> {
                     self.ic_install(
                         func_id,
                         ip,
-                        IcEntry::ClassMethod { class, ver, callee, fid, closure },
+                        IcEntry::ClassMethod {
+                            class,
+                            ver,
+                            callee,
+                            fid,
+                            closure,
+                        },
                     );
                     Some((fid, closure, callee))
                 }
@@ -1156,6 +1372,61 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Read-only, allocation-free probe for the hot own-data arm of a
+    /// `CallMethod` site. Unlike [`Self::ic_call_method`], this never fills,
+    /// walks a prototype, hashes `key`, or allocates an owned copy of it. The
+    /// already-filled `OwnData { shape, slot }` way is sufficient because a
+    /// guardable hidden-class shape identifies the complete key/descriptor
+    /// layout. We nevertheless re-check the exact key and data descriptor at
+    /// the slot as a fail-closed audit boundary before reading the LIVE value.
+    ///
+    /// A same-shape method replacement is intentionally observed: the shape
+    /// remains valid, but `m.vals[slot]` is read on every call. Delete,
+    /// defineProperty/accessor transitions, dictionary mode, proxies/exotics,
+    /// namespaces and realm-global objects all miss without effects.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_call_method_own_data_cached(
+        &self,
+        func_id: u32,
+        ip: usize,
+        recv: Value,
+        key: &str,
+    ) -> Option<(u32, u32, Value)> {
+        if !recv.is_heap() {
+            return None;
+        }
+        let idx = recv.heap_index();
+        if idx as usize >= self.heap.len() || !self.ic_obj_ok(idx) {
+            return None;
+        }
+        let m = match self.heap.get(idx) {
+            HeapObj::Object(m) if !m.is_ctor && m.shape_guardable() => m,
+            _ => return None,
+        };
+        let site = self.ic_site(func_id, ip)?;
+        for entry in &site.entries[..site.n as usize] {
+            let IcEntry::OwnData { shape, slot } = *entry else {
+                continue;
+            };
+            if shape != m.shape() {
+                continue;
+            }
+            let slot = slot as usize;
+            if slot >= m.keys.len()
+                || slot >= m.vals.len()
+                || slot >= m.attrs.len()
+                || &*m.keys[slot] != key
+                || m.attrs[slot].accessor
+            {
+                return None;
+            }
+            let callee = m.vals[slot];
+            let (fid, closure) = self.ic_plain_fn(callee)?;
+            return Some((fid, closure, callee));
+        }
+        None
+    }
+
     fn ic_validate_method(
         &self,
         e: &IcEntry,
@@ -1175,11 +1446,14 @@ impl<'p> Vm<'p> {
                     None
                 }
             }
-            IcEntry::ClassMethod { class, ver, callee, fid, closure } => {
-                if own.is_none()
-                    && m.class == Some(class)
-                    && self.heap.version_of(class) == ver
-                {
+            IcEntry::ClassMethod {
+                class,
+                ver,
+                callee,
+                fid,
+                closure,
+            } => {
+                if own.is_none() && m.class == Some(class) && self.heap.version_of(class) == ver {
                     Some((fid, closure, callee))
                 } else {
                     None
@@ -1220,9 +1494,48 @@ impl<'p> Vm<'p> {
             return None;
         }
         match site.entries[0] {
-            IcEntry::Callee { bits, ver, fid, closure } => Some((bits, ver, fid, closure)),
+            IcEntry::Callee {
+                bits,
+                ver,
+                fid,
+                closure,
+            } => Some((bits, ver, fid, closure)),
             _ => None,
         }
+    }
+
+    /// Read-only witness for a rotating closure call site: at least two filled
+    /// `Callee` ways, and every filled way names the same immutable FuncProto.
+    /// Identities / captured cells may differ. This is only a profitability
+    /// signal for planting Tier C's fully dynamic cross-call prefix; generated
+    /// code never trusts the witness and the helper re-resolves the live callee
+    /// Value on every invocation.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn ic_call_same_proto(
+        &self,
+        func_id: u32,
+        ip: usize,
+    ) -> Option<(u64, u32, u32, u32)> {
+        let site = self.ic_site(func_id, ip)?;
+        if site.n < 2 {
+            return None;
+        }
+        let first = match site.entries[0] {
+            IcEntry::Callee {
+                bits,
+                ver,
+                fid,
+                closure,
+            } => (bits, ver, fid, closure),
+            _ => return None,
+        };
+        for entry in &site.entries[1..site.n as usize] {
+            match *entry {
+                IcEntry::Callee { fid, .. } if fid == first.2 => {}
+                _ => return None,
+            }
+        }
+        Some(first)
     }
 
     /// Read-only: the resolved class-method `fid` for a `CallMethod` site whose
@@ -1253,7 +1566,10 @@ impl<'p> Vm<'p> {
     pub(crate) fn ic_class_getter_fid(&self, func_id: u32, ip: usize, class: u32) -> Option<u32> {
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
-            if let IcEntry::ClassGetter { class: c, getter, .. } = *e {
+            if let IcEntry::ClassGetter {
+                class: c, getter, ..
+            } = *e
+            {
                 if c == class {
                     return self.ic_plain_fn(getter).map(|(fid, _)| fid);
                 }
@@ -1268,7 +1584,10 @@ impl<'p> Vm<'p> {
     pub(crate) fn ic_class_setter_fid(&self, func_id: u32, ip: usize, class: u32) -> Option<u32> {
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
-            if let IcEntry::ClassSetter { class: c, setter, .. } = *e {
+            if let IcEntry::ClassSetter {
+                class: c, setter, ..
+            } = *e
+            {
                 if c == class {
                     return self.ic_plain_fn(setter).map(|(fid, _)| fid);
                 }
@@ -1293,10 +1612,19 @@ impl<'p> Vm<'p> {
         home_class_id: u32,
         key: &str,
     ) -> Option<MiSuperResolved> {
-        let home = self.class_values.get(home_class_id as usize).copied().flatten()?;
+        let home = self
+            .class_values
+            .get(home_class_id as usize)
+            .copied()
+            .flatten()?;
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
-            if let IcEntry::SuperData { home: h, hops, slot } = *e {
+            if let IcEntry::SuperData {
+                home: h,
+                hops,
+                slot,
+            } = *e
+            {
                 if h == home && self.ic_super_chain_ok(&hops) {
                     if let HeapObj::Object(hm) = self.heap.get(hops.0[hops.1 as usize - 1].0) {
                         let s = slot as usize;
@@ -1342,10 +1670,19 @@ impl<'p> Vm<'p> {
         home_class_id: u32,
         key: &str,
     ) -> Option<MiSuperResolved> {
-        let home = self.class_values.get(home_class_id as usize).copied().flatten()?;
+        let home = self
+            .class_values
+            .get(home_class_id as usize)
+            .copied()
+            .flatten()?;
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
-            if let IcEntry::SuperAcc { home: h, hops, slot } = *e {
+            if let IcEntry::SuperAcc {
+                home: h,
+                hops,
+                slot,
+            } = *e
+            {
                 if h == home && self.ic_super_chain_ok(&hops) {
                     if let HeapObj::Object(hm) = self.heap.get(hops.0[hops.1 as usize - 1].0) {
                         let s = slot as usize;
@@ -1398,10 +1735,19 @@ impl<'p> Vm<'p> {
         home_class_id: u32,
         key: &str,
     ) -> Option<MiSuperResolved> {
-        let home = self.class_values.get(home_class_id as usize).copied().flatten()?;
+        let home = self
+            .class_values
+            .get(home_class_id as usize)
+            .copied()
+            .flatten()?;
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
-            if let IcEntry::SuperAcc { home: h, hops, slot } = *e {
+            if let IcEntry::SuperAcc {
+                home: h,
+                hops,
+                slot,
+            } = *e
+            {
                 if h == home && self.ic_super_chain_ok(&hops) {
                     if let HeapObj::Object(hm) = self.heap.get(hops.0[hops.1 as usize - 1].0) {
                         let s = slot as usize;
@@ -1413,8 +1759,7 @@ impl<'p> Vm<'p> {
                                 return Some(MiSuperResolved {
                                     fid,
                                     hops: hops.0[..hops.1 as usize].to_vec(),
-                                    holder_vals_ptr: &hm.attrs[s].setter as *const Value
-                                        as u64,
+                                    holder_vals_ptr: &hm.attrs[s].setter as *const Value as u64,
                                     holder_slot: 0,
                                     fn_bits: setter.bits(),
                                 });
@@ -1431,20 +1776,20 @@ impl<'p> Vm<'p> {
     /// closure) for a plain user function, skipping the Proxy/native/bound/
     /// ctor probes and flag loads. `None` ⇒ slow path.
     #[inline]
-    pub(crate) fn ic_call(
-        &mut self,
-        func_id: u32,
-        ip: usize,
-        callee: Value,
-    ) -> Option<(u32, u32)> {
+    pub(crate) fn ic_call(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<(u32, u32)> {
         if !callee.is_heap() {
             return None;
         }
         if let Some(site) = self.ic_site(func_id, ip) {
             for e in &site.entries[..site.n as usize] {
-                if let IcEntry::Callee { bits, ver, fid, closure } = *e {
-                    if callee.bits() == bits && self.heap.version_of(callee.heap_index()) == ver
-                    {
+                if let IcEntry::Callee {
+                    bits,
+                    ver,
+                    fid,
+                    closure,
+                } = *e
+                {
+                    if callee.bits() == bits && self.heap.version_of(callee.heap_index()) == ver {
                         return Some((fid, closure));
                     }
                 }
@@ -1459,7 +1804,12 @@ impl<'p> Vm<'p> {
                 self.ic_install(
                     func_id,
                     ip,
-                    IcEntry::Callee { bits: callee.bits(), ver, fid, closure },
+                    IcEntry::Callee {
+                        bits: callee.bits(),
+                        ver,
+                        fid,
+                        closure,
+                    },
                 );
                 Some((fid, closure))
             }
@@ -1483,10 +1833,19 @@ impl<'p> Vm<'p> {
         is_static: bool,
         key: &str,
     ) -> Option<(u32, u32, Value)> {
-        let home = self.class_values.get(home_class_id as usize).copied().flatten()?;
+        let home = self
+            .class_values
+            .get(home_class_id as usize)
+            .copied()
+            .flatten()?;
         if let Some(site) = self.ic_site(func_id, ip) {
             for e in &site.entries[..site.n as usize] {
-                if let IcEntry::SuperData { home: h, hops, slot } = *e {
+                if let IcEntry::SuperData {
+                    home: h,
+                    hops,
+                    slot,
+                } = *e
+                {
                     if h == home && self.ic_super_chain_ok(&hops) {
                         let hm = match self.heap.get(hops.0[hops.1 as usize - 1].0) {
                             HeapObj::Object(hm) => hm,
@@ -1541,29 +1900,38 @@ impl<'p> Vm<'p> {
         is_static: bool,
         key: &str,
     ) -> GetAct {
-        let Some(home) = self.class_values.get(home_class_id as usize).copied().flatten()
+        let Some(home) = self
+            .class_values
+            .get(home_class_id as usize)
+            .copied()
+            .flatten()
         else {
             return GetAct::None;
         };
         if let Some(site) = self.ic_site(func_id, ip) {
             for e in &site.entries[..site.n as usize] {
                 match *e {
-                    IcEntry::SuperData { home: h, hops, slot } if h == home => {
+                    IcEntry::SuperData {
+                        home: h,
+                        hops,
+                        slot,
+                    } if h == home => {
                         if self.ic_super_chain_ok(&hops) {
                             if let HeapObj::Object(hm) =
                                 self.heap.get(hops.0[hops.1 as usize - 1].0)
                             {
                                 let s = slot as usize;
-                                if s < hm.keys.len()
-                                    && hm.keys[s] == key
-                                    && !hm.attrs[s].accessor
-                                {
+                                if s < hm.keys.len() && hm.keys[s] == key && !hm.attrs[s].accessor {
                                     return GetAct::Value(hm.vals[s]);
                                 }
                             }
                         }
                     }
-                    IcEntry::SuperAcc { home: h, hops, slot } if h == home => {
+                    IcEntry::SuperAcc {
+                        home: h,
+                        hops,
+                        slot,
+                    } if h == home => {
                         if self.ic_super_chain_ok(&hops) {
                             match self.ic_chain_acc_get(hops, slot) {
                                 GetAct::None => {}
@@ -1608,13 +1976,22 @@ impl<'p> Vm<'p> {
         is_static: bool,
         key: &str,
     ) -> SetAct {
-        let Some(home) = self.class_values.get(home_class_id as usize).copied().flatten()
+        let Some(home) = self
+            .class_values
+            .get(home_class_id as usize)
+            .copied()
+            .flatten()
         else {
             return SetAct::None;
         };
         if let Some(site) = self.ic_site(func_id, ip) {
             for e in &site.entries[..site.n as usize] {
-                if let IcEntry::SuperAcc { home: h, hops, slot } = *e {
+                if let IcEntry::SuperAcc {
+                    home: h,
+                    hops,
+                    slot,
+                } = *e
+                {
                     if h == home && self.ic_super_chain_ok(&hops) {
                         match self.ic_chain_acc_set(hops, slot) {
                             SetAct::None => {}

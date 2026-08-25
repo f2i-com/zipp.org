@@ -3,13 +3,11 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
-use crate::vm::{cldr_en, dtf_pattern};
 use crate::vm::*;
-
-
+use crate::vm::{cldr_en, dtf_pattern};
 
 /// IsValidDisplayNamesCode + CanonicalCodeForDisplayNames (ECMA-402 12.5.2):
 /// validate `Intl.DisplayNames.prototype.of`'s argument against the instance's
@@ -56,14 +54,23 @@ pub(crate) fn canonical_display_names_code(ty: &str, code: &str) -> Option<Strin
         }),
         // dateTimeField takes one of the twelve field names, verbatim.
         _ => [
-            "era", "year", "quarter", "month", "weekOfYear", "weekday", "day", "dayPeriod",
-            "hour", "minute", "second", "timeZoneName",
+            "era",
+            "year",
+            "quarter",
+            "month",
+            "weekOfYear",
+            "weekday",
+            "day",
+            "dayPeriod",
+            "hour",
+            "minute",
+            "second",
+            "timeZoneName",
         ]
         .contains(&code)
         .then(|| code.to_string()),
     }
 }
-
 
 /// A Unicode locale extension `type` value: 3-8 alphanumerics, optionally
 /// repeated (`islamic-civil`). Used to range-check the `calendar` /
@@ -71,7 +78,6 @@ pub(crate) fn canonical_display_names_code(ty: &str, code: &str) -> Option<Strin
 /// CalendarCode / IsWellFormedNumberingSystemCode).
 pub(crate) fn is_well_formed_type_code(s: &str) -> bool {
     !s.is_empty()
-        && s.split('-').all(|p| {
-            (3..=8).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric())
-        })
+        && s.split('-')
+            .all(|p| (3..=8).contains(&p.len()) && p.chars().all(|c| c.is_ascii_alphanumeric()))
 }

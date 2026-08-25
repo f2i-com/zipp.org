@@ -50,8 +50,7 @@ fn canonical_module_path(
             return Err(Thrown(MODULE_NOT_FOUND.into()));
         }
     }
-    let path = std::fs::canonicalize(raw_path)
-        .map_err(|_| Thrown(MODULE_NOT_FOUND.into()))?;
+    let path = std::fs::canonicalize(raw_path).map_err(|_| Thrown(MODULE_NOT_FOUND.into()))?;
     if root.is_some_and(|root| !path.starts_with(root)) {
         return Err(Thrown(MODULE_NOT_FOUND.into()));
     }
@@ -165,7 +164,8 @@ impl<'p> Vm<'p> {
                 ))
             })?;
         if !already_seen || observed > previous {
-            self.module_read_bytes.insert(path.to_path_buf(), observed.max(previous));
+            self.module_read_bytes
+                .insert(path.to_path_buf(), observed.max(previous));
             self.module_total_bytes = new_total;
         }
         Ok(bytes)
@@ -215,7 +215,9 @@ impl<'p> Vm<'p> {
             return Ok(s);
         }
         let s = self.alloc_module_shared_slot()?;
-        let idx = self.heap.alloc(HeapObj::Object(Box::new(crate::heap::ObjMap::new())));
+        let idx = self
+            .heap
+            .alloc(HeapObj::Object(Box::new(crate::heap::ObjMap::new())));
         if self.abstractmodulesource_proto != 0 {
             self.proto_of
                 .insert(idx, Value::heap(self.abstractmodulesource_proto));
@@ -238,8 +240,7 @@ impl<'p> Vm<'p> {
         gmap: &[u32],
     ) -> Vec<(String, u32)> {
         let mut full: Vec<(String, u32)> = Vec::with_capacity(exports.len());
-        let mut own_map: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
+        let mut own_map: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         for (exported, local) in exports {
             if let Some(i) = names.iter().position(|n| n == local) {
                 full.push((exported.clone(), gmap[i]));
@@ -356,11 +357,13 @@ impl<'p> Vm<'p> {
                 // not UTF-8).
                 "bytes" => {
                     let bytes = self.read_module_bytes(&path)?;
-                    let buf = self
-                        .heap
-                        .alloc(HeapObj::ArrayBuffer { data: bytes.into(), detached: false });
+                    let buf = self.heap.alloc(HeapObj::ArrayBuffer {
+                        data: bytes.into(),
+                        detached: false,
+                    });
                     if self.arraybuffer_proto != 0 {
-                        self.proto_of.insert(buf, Value::heap(self.arraybuffer_proto));
+                        self.proto_of
+                            .insert(buf, Value::heap(self.arraybuffer_proto));
                     }
                     self.immutable_buffers.insert(buf);
                     // kind 1 = Uint8Array (TA_KINDS); view over the whole buffer.
@@ -373,14 +376,15 @@ impl<'p> Vm<'p> {
                         _ => self.alloc_str(text),
                     }
                 }
-                _ => {
-                    return Err(Thrown(format!(
-                        "TypeError: unsupported module type '{t}'"
-                    )))
-                }
+                _ => return Err(Thrown(format!("TypeError: unsupported module type '{t}'"))),
             };
-            self.globals.push(val);
-            let slot = (self.globals.len() - 1) as u32;
+            // Keep the globals backing allocation immovable. Native code pins
+            // its base for an activation and JIT property ways may point at a
+            // live module slot, so even a cold typed-module import must draw
+            // from the preallocated eval pool rather than `Vec::push`.
+            let slot = self.alloc_module_shared_slot()?;
+            self.globals[slot as usize] = val;
+            self.bump_global_gen(slot);
             let ns_idx = self.alloc_empty_namespace();
             self.populate_module_namespace(ns_idx, &[("default".to_string(), slot)]);
             self.typed_module_cache
@@ -389,13 +393,30 @@ impl<'p> Vm<'p> {
         }
         let code = self.read_module_text(&path)?;
         let ast = crate::front::parse_module(&code).map_err(Thrown)?;
-        let prog = match crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), Vec::new(), Vec::new(), false, false) {
+        let prog = match crate::compile::compile_eval(
+            &ast,
+            &code,
+            true,
+            false,
+            None,
+            false,
+            std::collections::HashSet::new(),
+            true,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        ) {
             Ok(p) => p,
             // Top-level await in an IMPORTED module needs the async-module
             // evaluation pipeline (not built yet): surface a host TypeError —
             // a SyntaxError would misreport a spec-VALID module as malformed.
-            Err(e) if e.contains("only valid inside an async function")
-                || e.contains("only valid in an async function") => {
+            Err(e)
+                if e.contains("only valid inside an async function")
+                    || e.contains("only valid in an async function") =>
+            {
                 return Err(Thrown(
                     "TypeError: top-level await is not supported in imported modules yet".into(),
                 ));
@@ -420,16 +441,15 @@ impl<'p> Vm<'p> {
         // cycles are guarded (no recursion blowup).
         let mut import_aliases: std::collections::HashMap<u32, u32> =
             std::collections::HashMap::new();
-        let mut self_aliases: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut self_aliases: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
         let mut ns_writes: Vec<(u32, Value)> = Vec::new();
         // Own (exported name -> compile slot), for self-import aliasing.
         let own_cslot = |name: &str| -> Option<u32> {
-            exports.iter().find(|(e, _)| e == name).and_then(|(_, local)| {
-                names
-                    .iter()
-                    .position(|n| n == local)
-                    .map(|i| i as u32)
-            })
+            exports
+                .iter()
+                .find(|(e, _)| e == name)
+                .and_then(|(_, local)| names.iter().position(|n| n == local).map(|i| i as u32))
         };
         // Pre-resolved canonical target of an import specifier. The
         // self/in-flight classification below is STABLE for the whole
@@ -475,16 +495,14 @@ impl<'p> Vm<'p> {
         for e in &imports {
             match &e.import {
                 IN::Named(n)
-                    if e.mtype.is_none()
-                        && canon_of(dir.as_deref(), &e.specifier) == path =>
+                    if e.mtype.is_none() && canon_of(dir.as_deref(), &e.specifier) == path =>
                 {
                     if let Some(c) = own_cslot(n) {
                         self_aliases.insert(e.local_slot, c);
                     }
                 }
                 IN::Default
-                    if e.mtype.is_none()
-                        && canon_of(dir.as_deref(), &e.specifier) == path =>
+                    if e.mtype.is_none() && canon_of(dir.as_deref(), &e.specifier) == path =>
                 {
                     if let Some(c) = own_cslot("default") {
                         self_aliases.insert(e.local_slot, c);
@@ -523,10 +541,8 @@ impl<'p> Vm<'p> {
         let decl_set: std::collections::HashSet<u32> =
             prog.module_decl_globals.iter().copied().collect();
         let cap = self.program.global_count + (FIELD_POOL + EVAL_POOL) as u32;
-        let mut prealloc: std::collections::HashMap<u32, u32> =
-            std::collections::HashMap::new();
-        let mut own_pre: std::collections::HashMap<String, u32> =
-            std::collections::HashMap::new();
+        let mut prealloc: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut own_pre: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         if !early_prepare {
             for (exported, local) in &exports {
                 if let Some(i) = names.iter().position(|n| n == local) {
@@ -577,8 +593,16 @@ impl<'p> Vm<'p> {
                 None,
                 false,
                 None,
-                if import_aliases.is_empty() { None } else { Some(&import_aliases) },
-                if self_aliases.is_empty() { None } else { Some(&self_aliases) },
+                if import_aliases.is_empty() {
+                    None
+                } else {
+                    Some(&import_aliases)
+                },
+                if self_aliases.is_empty() {
+                    None
+                } else {
+                    Some(&self_aliases)
+                },
                 None,
             );
             match prepared {
@@ -842,16 +866,27 @@ impl<'p> Vm<'p> {
                     None,
                     false,
                     None,
-                    if import_aliases.is_empty() { None } else { Some(&import_aliases) },
-                    if self_aliases.is_empty() { None } else { Some(&self_aliases) },
-                    if prealloc.is_empty() { None } else { Some(&prealloc) },
+                    if import_aliases.is_empty() {
+                        None
+                    } else {
+                        Some(&import_aliases)
+                    },
+                    if self_aliases.is_empty() {
+                        None
+                    } else {
+                        Some(&self_aliases)
+                    },
+                    if prealloc.is_empty() {
+                        None
+                    } else {
+                        Some(&prealloc)
+                    },
                 );
                 match prepared {
                     Ok((gmap, base_func)) => {
                         let end = (self.main_func_count + self.eval_funcs.len()) as u32;
                         self.module_func_ranges.push((base_func, end, ns_idx));
-                        full =
-                            self.register_module_own(ns_idx, &path, &exports, &names, &gmap);
+                        full = self.register_module_own(ns_idx, &path, &exports, &names, &gmap);
                         (gmap, base_func)
                     }
                     Err(e) => {
@@ -913,9 +948,8 @@ impl<'p> Vm<'p> {
                             this: Value::num(cap as f64),
                             args: Vec::new(),
                         }));
-                        let fail_t = Value::heap(
-                            self.heap.alloc(HeapObj::Native(native::MODULE_DEP_FAIL)),
-                        );
+                        let fail_t =
+                            Value::heap(self.heap.alloc(HeapObj::Native(native::MODULE_DEP_FAIL)));
                         let on_fail = Value::heap(self.heap.alloc(HeapObj::Bound {
                             target: fail_t,
                             this: Value::num(cap as f64),
@@ -924,7 +958,8 @@ impl<'p> Vm<'p> {
                         self.then_internal(bp.heap_index(), on_ok, on_fail, None);
                     }
                     self.pending_module_body = Some(Value::heap(cap));
-                    self.module_body_promise.insert(path.clone(), (Value::heap(cap), true));
+                    self.module_body_promise
+                        .insert(path.clone(), (Value::heap(cap), true));
                     return {
                         self.module_own.remove(&path);
                         self.module_pending_reexports.remove(&path);
@@ -933,18 +968,17 @@ impl<'p> Vm<'p> {
                 }
                 self.executing_modules.insert(path.clone());
                 self.pending_module_body_marker = true;
-                let exec = self
-                    .execute_eval_program(
-                        base_func,
-                        // Module code's top-level `this` is UNDEFINED (never
-                        // the global object).
-                        Some(Value::UNDEFINED),
-                        None,
-                        Value::UNDEFINED,
-                        None,
-                        None,
-                        None,
-                    );
+                let exec = self.execute_eval_program(
+                    base_func,
+                    // Module code's top-level `this` is UNDEFINED (never
+                    // the global object).
+                    Some(Value::UNDEFINED),
+                    None,
+                    Value::UNDEFINED,
+                    None,
+                    None,
+                    None,
+                );
                 self.executing_modules.remove(&path);
                 match exec {
                     Ok(v) => {
@@ -956,9 +990,7 @@ impl<'p> Vm<'p> {
                         // the importer to settle from (stage-1 TLA).
                         let st = if v.is_heap() {
                             match self.heap.get(v.heap_index()) {
-                                HeapObj::Promise { state, result, .. } => {
-                                    Some((*state, *result))
-                                }
+                                HeapObj::Promise { state, result, .. } => Some((*state, *result)),
                                 _ => None,
                             }
                         } else {
@@ -1063,8 +1095,7 @@ impl<'p> Vm<'p> {
                 )));
             }
         }
-        let own: std::collections::HashSet<String> =
-            full.iter().map(|(n, _)| n.clone()).collect();
+        let own: std::collections::HashSet<String> = full.iter().map(|(n, _)| n.clone()).collect();
         let mut star_seen: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
         let mut ambiguous: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1117,7 +1148,11 @@ impl<'p> Vm<'p> {
                 .and_then(|m| m.get(name).copied()));
         }
         let ambiguous_check = |vm: &Self, ns_idx: u32| -> Result<(), Thrown> {
-            if vm.module_ambiguous.get(&ns_idx).is_some_and(|s| s.contains(name)) {
+            if vm
+                .module_ambiguous
+                .get(&ns_idx)
+                .is_some_and(|s| s.contains(name))
+            {
                 return Err(Thrown(format!(
                     "SyntaxError: The requested module contains conflicting star exports for name '{name}'"
                 )));
@@ -1126,8 +1161,10 @@ impl<'p> Vm<'p> {
         };
         if let Some(&ns) = self.module_cache.get(&dep) {
             ambiguous_check(self, ns.heap_index())?;
-            if let Some(slot) =
-                self.module_namespaces.get(&ns.heap_index()).and_then(|m| m.get(name).copied())
+            if let Some(slot) = self
+                .module_namespaces
+                .get(&ns.heap_index())
+                .and_then(|m| m.get(name).copied())
             {
                 return Ok(Some(slot));
             }
@@ -1196,11 +1233,11 @@ impl<'p> Vm<'p> {
         if !non_js {
             let mut seen = std::collections::HashSet::new();
             self.prescan_module_requests(&path, &mut seen)?;
-        // The proposal evaluates a deferred graph's ASYNC subgraphs EAGERLY
-        // at load time (so a later trigger can stay synchronous): import any
-        // reachable module with top-level await now — its own dependencies
-        // evaluate with it; sync-only parts of the graph stay deferred.
-        // DFS request order (deterministic — evaluation logs are observable).
+            // The proposal evaluates a deferred graph's ASYNC subgraphs EAGERLY
+            // at load time (so a later trigger can stay synchronous): import any
+            // reachable module with top-level await now — its own dependencies
+            // evaluate with it; sync-only parts of the graph stay deferred.
+            // DFS request order (deterministic — evaluation logs are observable).
             let mut graph: Vec<std::path::PathBuf> = Vec::new();
             let mut gseen = std::collections::HashSet::new();
             let mut stack = vec![path.clone()];
@@ -1244,7 +1281,8 @@ impl<'p> Vm<'p> {
         let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
         self.proto_of.insert(idx, Value::NULL);
         self.deferred_ns_cache.insert(key, Value::heap(idx));
-        self.deferred_ns_state.insert(idx, (path, mtype.map(str::to_string)));
+        self.deferred_ns_state
+            .insert(idx, (path, mtype.map(str::to_string)));
         Ok(Value::heap(idx))
     }
 
@@ -1333,7 +1371,22 @@ impl<'p> Vm<'p> {
         let Ok(ast) = crate::front::parse_module(&code) else {
             return false;
         };
-        let Ok(prog) = crate::compile::compile_eval(&ast, &code, true, false, None, false, std::collections::HashSet::new(), true, false, Vec::new(), Vec::new(), Vec::new(), false, false) else {
+        let Ok(prog) = crate::compile::compile_eval(
+            &ast,
+            &code,
+            true,
+            false,
+            None,
+            false,
+            std::collections::HashSet::new(),
+            true,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            false,
+        ) else {
             return false;
         };
         prog.functions
@@ -1413,7 +1466,9 @@ impl<'p> Vm<'p> {
             let spec: Option<String> = match s {
                 Stmt::Import(d) => Some(d.source.to_lossy_string()),
                 Stmt::Export(e) => match &**e {
-                    ExportDecl::Named { source: Some(src), .. } => Some(src.to_lossy_string()),
+                    ExportDecl::Named {
+                        source: Some(src), ..
+                    } => Some(src.to_lossy_string()),
                     ExportDecl::All { source, .. } => Some(source.to_lossy_string()),
                     _ => None,
                 },
@@ -1453,10 +1508,8 @@ impl<'p> Vm<'p> {
         target: &std::path::PathBuf,
         seen: &mut std::collections::HashSet<std::path::PathBuf>,
     ) -> bool {
-        self.with_confined_module_depth(|vm| {
-            Ok(vm.module_graph_reaches_inner(from, target, seen))
-        })
-        .unwrap_or(false)
+        self.with_confined_module_depth(|vm| Ok(vm.module_graph_reaches_inner(from, target, seen)))
+            .unwrap_or(false)
     }
 
     fn module_graph_reaches_inner(
@@ -1509,10 +1562,8 @@ impl<'p> Vm<'p> {
         path: &std::path::PathBuf,
         seen: &mut std::collections::HashSet<std::path::PathBuf>,
     ) -> bool {
-        self.with_confined_module_depth(|vm| {
-            Ok(vm.ready_for_sync_execution_inner(path, seen))
-        })
-        .unwrap_or(false)
+        self.with_confined_module_depth(|vm| Ok(vm.ready_for_sync_execution_inner(path, seen)))
+            .unwrap_or(false)
     }
 
     fn ready_for_sync_execution_inner(
@@ -1533,7 +1584,10 @@ impl<'p> Vm<'p> {
             if bp.is_heap()
                 && matches!(
                     self.heap.get(bp.heap_index()),
-                    HeapObj::Promise { state: crate::heap::PromiseState::Pending, .. }
+                    HeapObj::Promise {
+                        state: crate::heap::PromiseState::Pending,
+                        ..
+                    }
                 )
             {
                 return false;
@@ -1581,8 +1635,7 @@ impl<'p> Vm<'p> {
         if let Some(slot) = self.module_own.get(dep).and_then(|m| m.get(name).copied()) {
             return Ok(Some(slot));
         }
-        let Some((reex, stars, nsreex, pdir)) =
-            self.module_pending_reexports.get(dep).cloned()
+        let Some((reex, stars, nsreex, pdir)) = self.module_pending_reexports.get(dep).cloned()
         else {
             // Completed (or never in-flight): normal resolution.
             return self.resolve_export(dep, name, None);
@@ -1590,12 +1643,12 @@ impl<'p> Vm<'p> {
         let module_root = self.module_root.clone();
         let join =
             |pdir: Option<&std::path::Path>, spec: &str| -> Result<std::path::PathBuf, Thrown> {
-            let raw = match pdir {
-                Some(d) => d.join(spec),
-                None => std::path::PathBuf::from(spec),
+                let raw = match pdir {
+                    Some(d) => d.join(spec),
+                    None => std::path::PathBuf::from(spec),
+                };
+                canonical_module_path(module_root.as_deref(), &raw)
             };
-            canonical_module_path(module_root.as_deref(), &raw)
-        };
         for (exported, imported, spec) in &reex {
             if exported == name {
                 let target = join(pdir.as_deref(), spec)?;
@@ -1667,10 +1720,8 @@ mod confined_budget_tests {
     impl TestDir {
         fn new() -> Self {
             let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "zipp-module-budget-{}-{id}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("zipp-module-budget-{}-{id}", std::process::id()));
             std::fs::create_dir(&path).expect("create isolated module fixture directory");
             Self(path)
         }
@@ -1755,7 +1806,8 @@ mod confined_budget_tests {
                 let path = root.join(format!("m{i}.mjs"));
                 std::fs::write(&path, []).expect("write fixture");
                 let path = std::fs::canonicalize(path).expect("canonical fixture");
-                vm.read_module_bytes(&path).expect("within module count budget");
+                vm.read_module_bytes(&path)
+                    .expect("within module count budget");
                 first.get_or_insert(path);
             }
             assert_eq!(vm.module_read_bytes.len(), CONFINED_MODULE_COUNT_LIMIT);
@@ -1791,10 +1843,7 @@ mod confined_budget_tests {
                 .expect_err("aggregate overflow must fail closed");
             assert!(err.0.contains("aggregate module size limit"), "got {err:?}");
             assert!(!vm.module_read_bytes.contains_key(&path));
-            assert_eq!(
-                vm.module_total_bytes,
-                CONFINED_MODULE_TOTAL_BYTES_LIMIT - 2
-            );
+            assert_eq!(vm.module_total_bytes, CONFINED_MODULE_TOTAL_BYTES_LIMIT - 2);
         });
     }
 
@@ -1816,7 +1865,10 @@ mod confined_budget_tests {
                 .prescan_module_requests(&entry, &mut seen)
                 .expect_err("deep request graph must fail closed");
             assert!(err.0.contains("module recursion limit"), "got {err:?}");
-            assert_eq!(vm.module_load_depth, 0, "error path must unwind the counter");
+            assert_eq!(
+                vm.module_load_depth, 0,
+                "error path must unwind the counter"
+            );
         });
     }
 }

@@ -24,7 +24,11 @@ impl<'p> Vm<'p> {
     /// 1=GeneratorFunction, 2=AsyncFunction, 3=AsyncGeneratorFunction — selecting
     /// the `function` / `function*` / `async function` / `async function*` wrapper
     /// keyword so the eval completion value is a function of the right kind.
-    pub(crate) fn build_function_kind(&mut self, args: &[Value], kind: u8) -> Result<Value, Thrown> {
+    pub(crate) fn build_function_kind(
+        &mut self,
+        args: &[Value],
+        kind: u8,
+    ) -> Result<Value, Thrown> {
         let (parts, body) = if args.is_empty() {
             (Vec::new(), String::new())
         } else {
@@ -53,11 +57,14 @@ impl<'p> Vm<'p> {
         const NAME_OPEN: &str = "anonymous(";
         const PARAM_BODY_SEP: &str = "\n) {\n";
         const SOURCE_CLOSE: &str = "\n})";
-        let params_len = parts.iter().enumerate().try_fold(0usize, |total, (i, part)| {
-            total
-                .checked_add(usize::from(i != 0))
-                .and_then(|n| n.checked_add(part.len()))
-        });
+        let params_len = parts
+            .iter()
+            .enumerate()
+            .try_fold(0usize, |total, (i, part)| {
+                total
+                    .checked_add(usize::from(i != 0))
+                    .and_then(|n| n.checked_add(part.len()))
+            });
         let source_len = params_len.and_then(|params_len| {
             SOURCE_OPEN
                 .len()
@@ -71,9 +78,8 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "instrument")]
         self.instrument_dynamic_code_attempt(source_len.unwrap_or(usize::MAX))
             .map_err(|message| Thrown(message.into()))?;
-        let source_len = source_len.ok_or_else(|| {
-            Thrown("RangeError: dynamic code source length overflow".into())
-        })?;
+        let source_len = source_len
+            .ok_or_else(|| Thrown("RangeError: dynamic code source length overflow".into()))?;
 
         let mut params = String::with_capacity(params_len.expect("source length checked above"));
         for (i, part) in parts.into_iter().enumerate() {
@@ -89,7 +95,11 @@ impl<'p> Vm<'p> {
         // (invalid-parameter-list.js). Lexer-level messages carry no
         // "SyntaxError:" prefix — add it so the error classifies correctly.
         crate::parse::stmt::parse_standalone_params(&params).map_err(|e| {
-            Thrown(if e.msg.starts_with("SyntaxError") { e.msg } else { format!("SyntaxError: {}", e.msg) })
+            Thrown(if e.msg.starts_with("SyntaxError") {
+                e.msg
+            } else {
+                format!("SyntaxError: {}", e.msg)
+            })
         })?;
         // The newline before `)` defends against a `//` comment in the last
         // parameter; the wrapper parens make the body a function EXPRESSION whose
@@ -111,13 +121,34 @@ impl<'p> Vm<'p> {
         // above; setting it only after standalone parsing means a parse failure
         // cannot leak the exemption into a later, unrelated eval.
         self.pending_fn_ctor_eval = true;
-        self.do_eval(&source, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None, None)
+        self.do_eval(
+            &source,
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+            Value::UNDEFINED,
+            None,
+            false,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+        )
     }
 
     /// `ShadowRealm.prototype.evaluate` / `.importValue`. NOTE: not truly isolated
     /// (evaluate reuses the shared global eval path), so cross-realm isolation is
     /// not enforced; argument/return-type validation and primitive results are.
-    pub(crate) fn shadowrealm_op(&mut self, op: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+    pub(crate) fn shadowrealm_op(
+        &mut self,
+        op: u16,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
         if !(this.is_heap() && self.shadow_realms.contains(&this.heap_index())) {
             return Err(Thrown("TypeError: receiver is not a ShadowRealm".into()));
         }
@@ -125,7 +156,10 @@ impl<'p> Vm<'p> {
         match op {
             native::SHADOWREALM_EVALUATE => {
                 let is_str = a0.is_heap()
-                    && matches!(self.heap.get(a0.heap_index()), HeapObj::Str(_) | HeapObj::Cons { .. });
+                    && matches!(
+                        self.heap.get(a0.heap_index()),
+                        HeapObj::Str(_) | HeapObj::Cons { .. }
+                    );
                 if !is_str {
                     return Err(Thrown(
                         "TypeError: ShadowRealm.prototype.evaluate expects a string".into(),
@@ -136,7 +170,23 @@ impl<'p> Vm<'p> {
                 // boundary, so it surfaces as a TypeError in the calling realm.
                 let prev_realm = self.active_realm;
                 self.active_realm = Some(this.heap_index());
-                let evaled = self.do_eval(&code, false, false, None, None, false, false, Value::UNDEFINED, None, false, None, Vec::new(), None, None, None);
+                let evaled = self.do_eval(
+                    &code,
+                    false,
+                    false,
+                    None,
+                    None,
+                    false,
+                    false,
+                    Value::UNDEFINED,
+                    None,
+                    false,
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                );
                 self.active_realm = prev_realm;
                 let result = match evaled {
                     Ok(r) => r,
@@ -160,17 +210,23 @@ impl<'p> Vm<'p> {
                         // Remember the callable's HOME realm: a later call
                         // through the wrapper re-enters with this realm active
                         // (its `globalThis.x` binds the realm slots).
-                        self.shadow_fn_realm.insert(result.heap_index(), this.heap_index());
+                        self.shadow_fn_realm
+                            .insert(result.heap_index(), this.heap_index());
                         return self.wrapped_function_create(result);
                     }
                     if matches!(
                         self.heap.get(result.heap_index()),
-                        HeapObj::Str(_) | HeapObj::Cons { .. } | HeapObj::Symbol { .. } | HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
+                        HeapObj::Str(_)
+                            | HeapObj::Cons { .. }
+                            | HeapObj::Symbol { .. }
+                            | HeapObj::BigInt(_)
+                            | HeapObj::BigIntBig(_)
                     ) {
                         return Ok(result);
                     }
                     return Err(Thrown(
-                        "TypeError: ShadowRealm evaluate result is not a primitive or callable".into(),
+                        "TypeError: ShadowRealm evaluate result is not a primitive or callable"
+                            .into(),
                     ));
                 }
                 Ok(result)
@@ -200,75 +256,78 @@ impl<'p> Vm<'p> {
                 // TypeError. EVERY failure after argument validation REJECTS
                 // the returned promise (never throws synchronously).
                 let export_name = self.display(a1);
-                let settle: Result<Value, Value> =
-                    match self.module_base_dir.as_ref().map(|d| d.join(&spec)) {
-                        None => {
-                            let e = self.alloc_error_from_message(
-                                "TypeError: ShadowRealm.prototype.importValue: no module base",
-                            );
-                            Err(e)
-                        }
-                        Some(path) => {
-                            let prev_realm = self.active_realm;
-                            self.active_realm = Some(this.heap_index());
-                            let imported = self.import_module(&path, None);
-                            self.active_realm = prev_realm;
-                            // A TLA module body promise is not awaited here
-                            // (boundary: sync-completing modules only).
-                            self.pending_module_body = None;
-                            match imported {
-                                Ok(ns) => {
-                                    if !self.has_own_property(ns, &export_name) {
-                                        let e = self.alloc_error_from_message(&format!(
+                let settle: Result<Value, Value> = match self
+                    .module_base_dir
+                    .as_ref()
+                    .map(|d| d.join(&spec))
+                {
+                    None => {
+                        let e = self.alloc_error_from_message(
+                            "TypeError: ShadowRealm.prototype.importValue: no module base",
+                        );
+                        Err(e)
+                    }
+                    Some(path) => {
+                        let prev_realm = self.active_realm;
+                        self.active_realm = Some(this.heap_index());
+                        let imported = self.import_module(&path, None);
+                        self.active_realm = prev_realm;
+                        // A TLA module body promise is not awaited here
+                        // (boundary: sync-completing modules only).
+                        self.pending_module_body = None;
+                        match imported {
+                            Ok(ns) => {
+                                if !self.has_own_property(ns, &export_name) {
+                                    let e = self.alloc_error_from_message(&format!(
                                             "TypeError: ShadowRealm.prototype.importValue: no export named '{export_name}'"
                                         ));
-                                        Err(e)
-                                    } else {
-                                        match self.get_prop(ns, &export_name) {
-                                            Ok(v) if v.is_heap() && self.is_callable(v) => {
-                                                self.shadow_fn_realm
-                                                    .insert(v.heap_index(), this.heap_index());
-                                                match self.wrapped_function_create(v) {
-                                                    Ok(w) => Ok(w),
-                                                    Err(Thrown(msg)) => {
-                                                        let e = match self.pending_throw.take() {
-                                                            Some(t) => t,
-                                                            None => self.alloc_error_from_message(&msg),
-                                                        };
-                                                        Err(e)
-                                                    }
+                                    Err(e)
+                                } else {
+                                    match self.get_prop(ns, &export_name) {
+                                        Ok(v) if v.is_heap() && self.is_callable(v) => {
+                                            self.shadow_fn_realm
+                                                .insert(v.heap_index(), this.heap_index());
+                                            match self.wrapped_function_create(v) {
+                                                Ok(w) => Ok(w),
+                                                Err(Thrown(msg)) => {
+                                                    let e = match self.pending_throw.take() {
+                                                        Some(t) => t,
+                                                        None => self.alloc_error_from_message(&msg),
+                                                    };
+                                                    Err(e)
                                                 }
                                             }
-                                            Ok(v) if self.is_object_value(v) => {
-                                                let e = self.alloc_error_from_message(
+                                        }
+                                        Ok(v) if self.is_object_value(v) => {
+                                            let e = self.alloc_error_from_message(
                                                     "TypeError: ShadowRealm.prototype.importValue: export is not a primitive or callable",
                                                 );
-                                                Err(e)
-                                            }
-                                            Ok(v) => Ok(v),
-                                            Err(Thrown(msg)) => {
-                                                let e = match self.pending_throw.take() {
-                                                    Some(t) => t,
-                                                    None => self.alloc_error_from_message(&msg),
-                                                };
-                                                Err(e)
-                                            }
+                                            Err(e)
+                                        }
+                                        Ok(v) => Ok(v),
+                                        Err(Thrown(msg)) => {
+                                            let e = match self.pending_throw.take() {
+                                                Some(t) => t,
+                                                None => self.alloc_error_from_message(&msg),
+                                            };
+                                            Err(e)
                                         }
                                     }
                                 }
-                                Err(Thrown(_)) => {
-                                    // The module failed to load/evaluate: the
-                                    // error cannot cross the boundary — reject
-                                    // with a caller-realm TypeError.
-                                    self.pending_throw.take();
-                                    let e = self.alloc_error_from_message(
+                            }
+                            Err(Thrown(_)) => {
+                                // The module failed to load/evaluate: the
+                                // error cannot cross the boundary — reject
+                                // with a caller-realm TypeError.
+                                self.pending_throw.take();
+                                let e = self.alloc_error_from_message(
                                         "TypeError: ShadowRealm.prototype.importValue: module evaluation failed",
                                     );
-                                    Err(e)
-                                }
+                                Err(e)
                             }
                         }
-                    };
+                    }
+                };
                 let _gc = self.gc_lock_guard(); // settle value held across alloc
                 let p = self.alloc_promise();
                 match settle {
@@ -309,7 +368,8 @@ impl<'p> Vm<'p> {
         m.define("suppressed", suppressed, attr);
         let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
         if self.suppressederror_proto != 0 {
-            self.proto_of.insert(idx, Value::heap(self.suppressederror_proto));
+            self.proto_of
+                .insert(idx, Value::heap(self.suppressederror_proto));
         }
         self.error_data.insert(idx); // [[ErrorData]] internal slot
         Ok(Value::heap(idx))
@@ -388,7 +448,9 @@ impl<'p> Vm<'p> {
         // hold GC for the synchronous stretch (dropped at each suspension).
         let _gc = self.gc_lock_guard();
         loop {
-            let Some(st) = self.dispose_async_state.get_mut(&cap) else { return };
+            let Some(st) = self.dispose_async_state.get_mut(&cap) else {
+                return;
+            };
             match st.remaining.pop() {
                 None => {
                     let st = self.dispose_async_state.remove(&cap).unwrap();
@@ -399,12 +461,7 @@ impl<'p> Vm<'p> {
                             // resolve. then_internal(into: cap) chains it.
                             let p = self.alloc_promise();
                             self.resolve(p, Value::UNDEFINED);
-                            self.then_internal(
-                                p,
-                                Value::UNDEFINED,
-                                Value::UNDEFINED,
-                                Some(cap),
-                            );
+                            self.then_internal(p, Value::UNDEFINED, Value::UNDEFINED, Some(cap));
                         }
                         None => self.resolve(cap, Value::UNDEFINED),
                     }
@@ -453,9 +510,10 @@ impl<'p> Vm<'p> {
                             this: Value::num(cap as f64),
                             args: Vec::new(),
                         }));
-                        let rej_t = Value::heap(self.heap.alloc(HeapObj::Native(
-                            native::DISPOSE_ASYNC_STEP_REJECT,
-                        )));
+                        let rej_t = Value::heap(
+                            self.heap
+                                .alloc(HeapObj::Native(native::DISPOSE_ASYNC_STEP_REJECT)),
+                        );
                         let on_rej = Value::heap(self.heap.alloc(HeapObj::Bound {
                             target: rej_t,
                             this: Value::num(cap as f64),
@@ -516,7 +574,10 @@ impl<'p> Vm<'p> {
             let attrs = match self.get_prop(ov, key) {
                 Ok(v) => v,
                 Err(_) => {
-                    return Err(self.pending_throw.take().unwrap_or_else(|| self.make_error(1, None)))
+                    return Err(self
+                        .pending_throw
+                        .take()
+                        .unwrap_or_else(|| self.make_error(1, None)))
                 }
             };
             if attrs == Value::UNDEFINED {
@@ -528,14 +589,16 @@ impl<'p> Vm<'p> {
             let names_v = match self.object_own_property_names(attrs) {
                 Ok(v) => v,
                 Err(_) => {
-                    return Err(self.pending_throw.take().unwrap_or_else(|| self.make_error(1, None)))
+                    return Err(self
+                        .pending_throw
+                        .take()
+                        .unwrap_or_else(|| self.make_error(1, None)))
                 }
             };
             let names = self.array_snapshot(names_v.heap_index());
             for nv in names {
                 // EnumerableOwnPropertyNames operates on STRING keys only.
-                if nv.is_heap()
-                    && matches!(self.heap.get(nv.heap_index()), HeapObj::Symbol { .. })
+                if nv.is_heap() && matches!(self.heap.get(nv.heap_index()), HeapObj::Symbol { .. })
                 {
                     continue;
                 }
@@ -600,7 +663,8 @@ impl<'p> Vm<'p> {
         let m = ObjMap::new();
         let idx = self.heap.alloc(HeapObj::Object(Box::new(m)));
         self.proto_of.insert(idx, Value::NULL);
-        self.module_namespaces.insert(idx, std::collections::HashMap::new());
+        self.module_namespaces
+            .insert(idx, std::collections::HashMap::new());
         idx
     }
 
@@ -662,7 +726,12 @@ impl<'p> Vm<'p> {
         self.module_namespaces.insert(idx, slot_map);
     }
 
-    pub(crate) fn disposable_op(&mut self, op: u16, this: Value, args: &[Value]) -> Result<Value, Thrown> {
+    pub(crate) fn disposable_op(
+        &mut self,
+        op: u16,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
         use native::*;
         // Normalize an AsyncDisposableStack method to its shared behaviour op, and
         // record the required stack KIND: a sync method (DisposableStack.*) needs a
@@ -685,7 +754,9 @@ impl<'p> Vm<'p> {
             if op == DISPOSABLE_DISPOSE_ASYNC {
                 return Ok(self.reject_with_type_error("receiver is not an AsyncDisposableStack"));
             }
-            return Err(Thrown("TypeError: receiver is not a DisposableStack".into()));
+            return Err(Thrown(
+                "TypeError: receiver is not a DisposableStack".into(),
+            ));
         }
         let ti = this.heap_index();
         if let Some(want) = want_async {
@@ -700,12 +771,21 @@ impl<'p> Vm<'p> {
                 ));
             }
         }
-        let disposed = self.dispose_stacks.get(&ti).map(|(_, d)| *d).unwrap_or(true);
+        let disposed = self
+            .dispose_stacks
+            .get(&ti)
+            .map(|(_, d)| *d)
+            .unwrap_or(true);
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         // Mutating methods reject a disposed stack with a ReferenceError.
-        if matches!(op, DISPOSABLE_USE | DISPOSABLE_ADOPT | DISPOSABLE_DEFER | DISPOSABLE_MOVE) && disposed
+        if matches!(
+            op,
+            DISPOSABLE_USE | DISPOSABLE_ADOPT | DISPOSABLE_DEFER | DISPOSABLE_MOVE
+        ) && disposed
         {
-            return Err(Thrown("ReferenceError: the DisposableStack has been disposed".into()));
+            return Err(Thrown(
+                "ReferenceError: the DisposableStack has been disposed".into(),
+            ));
         }
         match op {
             DISPOSABLE_DISPOSED_GET => Ok(Value::bool(disposed)),
@@ -810,7 +890,11 @@ impl<'p> Vm<'p> {
                 // AWAITED before the next runs (spec Dispose step 3a), so the
                 // loop is a continuation-driven state machine keyed by the
                 // capability promise (see dispose_async_drive).
-                let already = self.dispose_stacks.get(&ti).map(|(_, d)| *d).unwrap_or(true);
+                let already = self
+                    .dispose_stacks
+                    .get(&ti)
+                    .map(|(_, d)| *d)
+                    .unwrap_or(true);
                 let disposers = if already {
                     Vec::new()
                 } else if let Some((d, dd)) = self.dispose_stacks.get_mut(&ti) {
@@ -851,5 +935,4 @@ impl<'p> Vm<'p> {
             _ => Ok(Value::UNDEFINED),
         }
     }
-
 }

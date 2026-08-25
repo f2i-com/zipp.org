@@ -883,7 +883,12 @@ where
 
             // Check for a dash; we may have a range.
             if !self.try_consume('-') {
-                add_class_atom(&mut result, first, self.flags.icase, self.flags.unicode_mode());
+                add_class_atom(
+                    &mut result,
+                    first,
+                    self.flags.icase,
+                    self.flags.unicode_mode(),
+                );
                 continue;
             }
 
@@ -1748,7 +1753,10 @@ where
                         // non-participating branch would empty-succeed and shadow a later
                         // participating group.
                         ir::Node::NamedBackRef {
-                            groups: group_indices.iter().map(|group_index| group_index + 1).collect(),
+                            groups: group_indices
+                                .iter()
+                                .map(|group_index| group_index + 1)
+                                .collect(),
                             icase: self.flags.icase,
                         }
                     }
@@ -1894,7 +1902,9 @@ where
             if c == '\\' && self.try_consume('u') {
                 // RegExpIdentifierStart :: \ RegExpUnicodeEscapeSequence[+UnicodeMode]
                 // — a group NAME always gets the full grammar, flags or not.
-                if let Some(escaped) = self.try_escape_unicode_sequence(true).and_then(char::from_u32)
+                if let Some(escaped) = self
+                    .try_escape_unicode_sequence(true)
+                    .and_then(char::from_u32)
                 {
                     c = escaped;
                 } else {
@@ -1918,8 +1928,9 @@ where
             if let Some(mut c) = self.next().and_then(char::from_u32) {
                 if c == '\\' && self.try_consume('u') {
                     // RegExpIdentifierPart :: \ RegExpUnicodeEscapeSequence[+UnicodeMode]
-                    if let Some(escaped) =
-                        self.try_escape_unicode_sequence(true).and_then(char::from_u32)
+                    if let Some(escaped) = self
+                        .try_escape_unicode_sequence(true)
+                        .and_then(char::from_u32)
                     {
                         c = escaped;
                     } else {

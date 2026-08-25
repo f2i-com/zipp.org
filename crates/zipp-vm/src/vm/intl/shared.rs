@@ -3,11 +3,11 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
-use crate::vm::{cldr_en, dtf_pattern};
 use crate::vm::*;
+use crate::vm::{cldr_en, dtf_pattern};
 
 impl<'p> Vm<'p> {
     /// Read an internal slot stored on an Intl instance's `resolved` object.
@@ -20,7 +20,6 @@ impl<'p> Vm<'p> {
         Value::UNDEFINED
     }
 
-
     /// An object's own property (attr + value) if present — used to resolve and
     /// invoke prototype accessor getters for Intl instances.
     pub(crate) fn own_member(&self, idx: u32, key: &str) -> Option<(PropAttr, Value)> {
@@ -32,7 +31,6 @@ impl<'p> Vm<'p> {
         None
     }
 
-
     /// Brand-check `this` as an Intl instance of `kind`; return its `resolved` idx.
     pub(crate) fn intl_this(&self, this: Value, kind: u8, m: &str) -> Result<u32, Thrown> {
         if this.is_heap() {
@@ -42,9 +40,10 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        Err(Thrown(format!("TypeError: {m} called on an incompatible receiver")))
+        Err(Thrown(format!(
+            "TypeError: {m} called on an incompatible receiver"
+        )))
     }
-
 
     /// Shallow-copy an object's own enumerable data properties into a fresh object
     /// (preserving insertion order) — used by resolvedOptions().
@@ -73,7 +72,6 @@ impl<'p> Vm<'p> {
         Value::heap(self.heap.alloc(HeapObj::Object(Box::new(o))))
     }
 
-
     /// `%Intl%.[[FallbackSymbol]]` — one per realm, described
     /// "IntlLegacyConstructedSymbol" (ECMA-402 "The Intl Object"). Created
     /// lazily; `make_symbol` registers it in `symbol_keys`, which the collector
@@ -92,7 +90,6 @@ impl<'p> Vm<'p> {
         self.intl_fallback_syms.insert(realm, v);
         v
     }
-
 
     /// ChainDateTimeFormat / ChainNumberFormat (ECMA-402 normative optional):
     /// `Intl.DateTimeFormat.call(obj)` — the constructor invoked WITHOUT `new`
@@ -122,7 +119,6 @@ impl<'p> Vm<'p> {
         Ok(this)
     }
 
-
     /// UnwrapDateTimeFormat / UnwrapNumberFormat: a receiver that is not itself
     /// an initialized service but DOES inherit from the constructor yields the
     /// service stashed by `intl_chain_legacy`. The read is a real [[Get]] with
@@ -146,7 +142,6 @@ impl<'p> Vm<'p> {
         self.get_member(this, &key, this)
     }
 
-
     /// The `[[Locale]]` slot of an Intl.Locale instance, if `v` is one.
     /// CanonicalizeLocaleList and the Locale constructor both take the FULL
     /// canonical tag from a Locale argument, extensions included — not its
@@ -155,12 +150,15 @@ impl<'p> Vm<'p> {
         if !v.is_heap() {
             return None;
         }
-        if let HeapObj::Intl { kind: native::INTL_LOCALE, resolved } = *self.heap.get(v.heap_index()) {
+        if let HeapObj::Intl {
+            kind: native::INTL_LOCALE,
+            resolved,
+        } = *self.heap.get(v.heap_index())
+        {
             return Some(self.display(self.intl_slot(resolved, "@@tag")));
         }
         None
     }
-
 
     /// CanonicalizeLocaleList(locales) (ECMA-402 9.2.1). `undefined` → empty; a
     /// String or Intl.Locale → a one-element list; anything else is ToObject'd
@@ -171,7 +169,10 @@ impl<'p> Vm<'p> {
     /// TypeError), and a hole is skipped via HasProperty rather than being
     /// coerced. Reading a non-heap element's `heap_index()` used to index the
     /// heap directly, which panicked outright on `[0.1]`.
-    pub(crate) fn canonicalize_locale_list(&mut self, locales: Value) -> Result<Vec<String>, Thrown> {
+    pub(crate) fn canonicalize_locale_list(
+        &mut self,
+        locales: Value,
+    ) -> Result<Vec<String>, Thrown> {
         let mut out: Vec<String> = vec![];
         if locales == Value::UNDEFINED {
             return Ok(out);
@@ -181,9 +182,15 @@ impl<'p> Vm<'p> {
             return Ok(out);
         }
         if locales.is_heap() && self.heap.is_str_like(locales.heap_index()) {
-            let s = self.heap.str_cow(locales.heap_index()).unwrap().into_owned();
+            let s = self
+                .heap
+                .str_cow(locales.heap_index())
+                .unwrap()
+                .into_owned();
             out.push(canonicalize_locale(&s).ok_or_else(|| {
-                Thrown(format!("RangeError: Incorrect locale information provided: {s}"))
+                Thrown(format!(
+                    "RangeError: Incorrect locale information provided: {s}"
+                ))
             })?);
             return Ok(out);
         }
@@ -204,7 +211,11 @@ impl<'p> Vm<'p> {
             len_v
         };
         let len_f = self.to_number(len_v)?;
-        let len = if len_f.is_nan() || len_f <= 0.0 { 0u64 } else { len_f.min(9.007e15) as u64 };
+        let len = if len_f.is_nan() || len_f <= 0.0 {
+            0u64
+        } else {
+            len_f.min(9.007e15) as u64
+        };
         for i in 0..len {
             let key = Value::num(i as f64);
             if !self.has_property_dyn(obj, key)? {
@@ -225,7 +236,9 @@ impl<'p> Vm<'p> {
             }
             let s = self.to_js_string(el)?;
             let c = canonicalize_locale(&s).ok_or_else(|| {
-                Thrown(format!("RangeError: Incorrect locale information provided: {s}"))
+                Thrown(format!(
+                    "RangeError: Incorrect locale information provided: {s}"
+                ))
             })?;
             if !out.contains(&c) {
                 out.push(c);
@@ -233,7 +246,6 @@ impl<'p> Vm<'p> {
         }
         Ok(out)
     }
-
 
     /// Read + ToString-cast a string option (returns `default` if undefined),
     /// WITHOUT any allowed-list validation. The Temporal GetDifferenceSettings
@@ -256,16 +268,16 @@ impl<'p> Vm<'p> {
         self.to_js_string(v)
     }
 
-
     /// RangeError if `s` is not in `allowed` (when non-empty) — the deferred
     /// validation half of `opt_string_raw`.
     pub(crate) fn unit_allowed(&self, s: &str, key: &str, allowed: &[&str]) -> Result<(), Thrown> {
         if !allowed.is_empty() && !allowed.contains(&s) {
-            return Err(Thrown(format!("RangeError: Value {s} out of range for option {key}")));
+            return Err(Thrown(format!(
+                "RangeError: Value {s} out of range for option {key}"
+            )));
         }
         Ok(())
     }
-
 
     /// Read a string option (returns `default` if undefined); validates against
     /// `allowed` when non-empty (→ RangeError) — read and validate in one step.
@@ -293,7 +305,6 @@ impl<'p> Vm<'p> {
         Ok(s)
     }
 
-
     /// GetOption(options, key, string, values, undefined) — `None` when the option
     /// is absent. Distinct from `opt_string`, which folds "absent" into a default
     /// string: ECMA-402 needs the two apart (an absent `currency` is a TypeError
@@ -316,11 +327,14 @@ impl<'p> Vm<'p> {
         Ok(Some(s))
     }
 
-
     /// GetOption(options, key, boolean, empty, undefined) — ToBoolean of a present
     /// value, `None` when absent (DateTimeFormat's `hour12` distinguishes the two:
     /// only a PRESENT hour12 overrides hourCycle).
-    pub(crate) fn opt_bool_opt(&mut self, options: Value, key: &str) -> Result<Option<bool>, Thrown> {
+    pub(crate) fn opt_bool_opt(
+        &mut self,
+        options: Value,
+        key: &str,
+    ) -> Result<Option<bool>, Thrown> {
         if options == Value::UNDEFINED {
             return Ok(None);
         }
@@ -330,7 +344,6 @@ impl<'p> Vm<'p> {
         }
         Ok(Some(self.truthy(v)))
     }
-
 
     /// GetNumberOption(options, key, min, max, undefined) — `None` when absent.
     /// DefaultNumberOption floors the coerced value, so 1.9 → 1.
@@ -347,7 +360,6 @@ impl<'p> Vm<'p> {
         let v = self.get_prop(options, key)?;
         self.default_number_option(v, key, min, max)
     }
-
 
     /// DefaultNumberOption(value, min, max, undefined): ToNumber then a NaN/range
     /// check, floored. Split out because SetNumberFormatDigitOptions reads the four
@@ -374,7 +386,6 @@ impl<'p> Vm<'p> {
         Ok(Some(n.floor() as i64))
     }
 
-
     /// Read an integer option clamped to [min,max] (returns `default` if undefined).
     pub(crate) fn opt_int(
         &mut self,
@@ -399,7 +410,6 @@ impl<'p> Vm<'p> {
         Ok(n as i64)
     }
 
-
     /// Read a Temporal round() options bag (or a bare smallestUnit string):
     /// returns (smallestUnit, roundingIncrement, roundingMode), validated.
     pub(crate) fn read_round_options(
@@ -410,18 +420,19 @@ impl<'p> Vm<'p> {
     ) -> Result<(String, i128, String), Thrown> {
         // A bare string argument is shorthand for { smallestUnit: <string> }; any
         // other non-object (a number/boolean/etc.) is a TypeError, not options.
-        let (su_string, options) =
-            if arg.is_heap() && self.heap.is_str_like(arg.heap_index()) {
-                (Some(arg), Value::UNDEFINED)
-            } else if arg == Value::UNDEFINED {
-                return Err(Thrown("TypeError: round() requires an options argument".into()));
-            } else if !self.is_object_value(arg) {
-                return Err(Thrown(
-                    "TypeError: round() options must be an object or a string".into(),
-                ));
-            } else {
-                (None, arg)
-            };
+        let (su_string, options) = if arg.is_heap() && self.heap.is_str_like(arg.heap_index()) {
+            (Some(arg), Value::UNDEFINED)
+        } else if arg == Value::UNDEFINED {
+            return Err(Thrown(
+                "TypeError: round() requires an options argument".into(),
+            ));
+        } else if !self.is_object_value(arg) {
+            return Err(Thrown(
+                "TypeError: round() options must be an object or a string".into(),
+            ));
+        } else {
+            (None, arg)
+        };
         // Spec order: read + coerce ALL options BEFORE any algorithmic validation —
         // roundingIncrement, then roundingMode, then smallestUnit (the observable
         // get/valueOf/toString sequence the order-of-operations tests assert).
@@ -465,7 +476,6 @@ impl<'p> Vm<'p> {
         Ok((su, inc, mode))
     }
 
-
     /// Read until()/since() options for time-only types (PlainTime/Instant):
     /// largestUnit (default `default_largest`), smallestUnit (default nanosecond),
     /// roundingIncrement, roundingMode (default trunc). Returns the resolved
@@ -475,24 +485,49 @@ impl<'p> Vm<'p> {
         options: Value,
         default_largest: &str,
     ) -> Result<(String, String, i128, String), Thrown> {
-        let units = ["hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
+        let units = [
+            "hour",
+            "minute",
+            "second",
+            "millisecond",
+            "microsecond",
+            "nanosecond",
+        ];
         let rank = |u: &str| units.iter().position(|&x| x == u).unwrap_or(5) as i32;
         if options == Value::UNDEFINED {
-            return Ok((default_largest.to_string(), "nanosecond".to_string(), 1, "trunc".to_string()));
+            return Ok((
+                default_largest.to_string(),
+                "nanosecond".to_string(),
+                1,
+                "trunc".to_string(),
+            ));
         }
         if !self.is_object_value(options) {
-            return Err(Thrown("TypeError: options must be an object or undefined".into()));
+            return Err(Thrown(
+                "TypeError: options must be an object or undefined".into(),
+            ));
         }
         let largest_allowed = [
-            "auto", "hour", "hours", "minute", "minutes", "second", "seconds", "millisecond",
-            "milliseconds", "microsecond", "microseconds", "nanosecond", "nanoseconds",
+            "auto",
+            "hour",
+            "hours",
+            "minute",
+            "minutes",
+            "second",
+            "seconds",
+            "millisecond",
+            "milliseconds",
+            "microsecond",
+            "microseconds",
+            "nanosecond",
+            "nanoseconds",
         ];
         let small_allowed = &largest_allowed[1..]; // same minus "auto"
-        // GetDifferenceSettings reads the options in this exact order: largestUnit,
-        // roundingIncrement, roundingMode, then smallestUnit — and only AFTER all four
-        // are read does it resolve an "auto" largestUnit and run the range validations.
-        // Read+cast all four with no validation, THEN validate the unit lists — so a
-        // disallowed largestUnit does not throw before smallestUnit is even read.
+                                                   // GetDifferenceSettings reads the options in this exact order: largestUnit,
+                                                   // roundingIncrement, roundingMode, then smallestUnit — and only AFTER all four
+                                                   // are read does it resolve an "auto" largestUnit and run the range validations.
+                                                   // Read+cast all four with no validation, THEN validate the unit lists — so a
+                                                   // disallowed largestUnit does not throw before smallestUnit is even read.
         let lu_raw = self.opt_string_raw(options, "largestUnit", "auto")?;
         let inc = self.read_rounding_increment(options)?;
         let mode = self.read_rounding_mode(options, "trunc")?;
@@ -504,7 +539,11 @@ impl<'p> Vm<'p> {
         // smallestUnit) — the lower rank — so e.g. smallestUnit "hour" yields
         // largestUnit "hour" instead of wrongly defaulting to the (smaller) default.
         let lu = if normalize_unit(&lu_raw, "auto") == "auto" {
-            if rank(default_largest) <= rank(&su) { default_largest.to_string() } else { su.clone() }
+            if rank(default_largest) <= rank(&su) {
+                default_largest.to_string()
+            } else {
+                su.clone()
+            }
         } else {
             normalize_unit(&lu_raw, default_largest)
         };
@@ -522,7 +561,6 @@ impl<'p> Vm<'p> {
         }
         Ok((lu, su, inc, mode))
     }
-
 
     /// `new Intl.Locale(tag, options)` (ECMA-402 14.1.1).
     ///
@@ -544,7 +582,9 @@ impl<'p> Vm<'p> {
                 if !(tag.is_heap() && self.heap.is_str_like(tag.heap_index()))
                     && !self.is_object_value(tag)
                 {
-                    return Err(Thrown("TypeError: Locale tag must be a string or an object".into()));
+                    return Err(Thrown(
+                        "TypeError: Locale tag must be a string or an object".into(),
+                    ));
                 }
                 self.to_js_string(tag)?
             }
@@ -599,13 +639,17 @@ impl<'p> Vm<'p> {
         // subject to the registries (`{region: "554"}` on "en" is "en-NZ").
         crate::vm::cldr_alias::canonicalize(&mut t);
         // ── ApplyUnicodeExtensionToTag: the relevant extension keys, in key order ──
-        for (opt_name, key) in
-            [("calendar", "ca"), ("collation", "co"), ("firstDayOfWeek", "fw"), ("hourCycle", "hc")]
-        {
+        for (opt_name, key) in [
+            ("calendar", "ca"),
+            ("collation", "co"),
+            ("firstDayOfWeek", "fw"),
+            ("hourCycle", "hc"),
+        ] {
             let raw = if key == "fw" {
                 // firstDayOfWeek also accepts the numeric weekday spellings
                 // (and `true`, which ToString's to "true" → the bare `-u-fw-`).
-                self.opt_string_opt(options, opt_name, &[])?.map(|s| lt::weekday_to_string(&s))
+                self.opt_string_opt(options, opt_name, &[])?
+                    .map(|s| lt::weekday_to_string(&s))
             } else {
                 self.opt_string_opt(options, opt_name, &[])?
             };
@@ -614,7 +658,9 @@ impl<'p> Vm<'p> {
                     return Err(Thrown(format!("RangeError: invalid hourCycle option: {v}")));
                 }
                 if key != "hc" && !lt::is_type_sequence(&v) {
-                    return Err(Thrown(format!("RangeError: invalid {opt_name} option: {v}")));
+                    return Err(Thrown(format!(
+                        "RangeError: invalid {opt_name} option: {v}"
+                    )));
                 }
                 t.set_u(key, Some(canon_ext_value(&v)));
             }
@@ -625,11 +671,20 @@ impl<'p> Vm<'p> {
         // `numeric` is a BOOLEAN option: only its presence matters, and `true`
         // canonicalizes to the bare `-u-kn`.
         if let Some(n) = self.opt_bool_opt(options, "numeric")? {
-            t.set_u("kn", Some(if n { String::new() } else { "false".to_string() }));
+            t.set_u(
+                "kn",
+                Some(if n {
+                    String::new()
+                } else {
+                    "false".to_string()
+                }),
+            );
         }
         if let Some(ns) = self.opt_string_opt(options, "numberingSystem", &[])? {
             if !lt::is_type_sequence(&ns) {
-                return Err(Thrown(format!("RangeError: invalid numberingSystem option: {ns}")));
+                return Err(Thrown(format!(
+                    "RangeError: invalid numberingSystem option: {ns}"
+                )));
             }
             t.set_u("nu", Some(canon_ext_value(&ns)));
         }
@@ -641,7 +696,6 @@ impl<'p> Vm<'p> {
         crate::vm::cldr_alias::canonicalize(&mut t);
         Ok(self.alloc_locale(&t))
     }
-
 
     /// Materialize a parsed tag as an `Intl.Locale` instance. The `resolved`
     /// object doubles as the accessor backing store, so every getter's value is
@@ -656,10 +710,12 @@ impl<'p> Vm<'p> {
         r.set("baseName", bn);
         let lv = self.alloc_str(t.language.clone());
         r.set("language", lv);
-        for (key, val) in
-            [("script", t.script.clone()), ("region", t.region.clone())]
-        {
-            let v = if val.is_empty() { Value::UNDEFINED } else { self.alloc_str(val) };
+        for (key, val) in [("script", t.script.clone()), ("region", t.region.clone())] {
+            let v = if val.is_empty() {
+                Value::UNDEFINED
+            } else {
+                self.alloc_str(val)
+            };
             r.set(key, v);
         }
         let variants = if t.variants.is_empty() {
@@ -697,18 +753,26 @@ impl<'p> Vm<'p> {
         r.set("numberingSystem", ns);
         // The 1..7 weekday `getWeekInfo` reports, when `-u-fw-` names one.
         let fw_idx = t.u_value("fw").and_then(lt::weekday_index);
-        r.set("@@fwindex", match fw_idx {
-            Some(i) => Value::num(i as f64),
-            None => Value::UNDEFINED,
-        });
+        r.set(
+            "@@fwindex",
+            match fw_idx {
+                Some(i) => Value::num(i as f64),
+                None => Value::UNDEFINED,
+            },
+        );
         let resolved = self.heap.alloc(HeapObj::Object(Box::new(r)));
-        let idx = self.heap.alloc(HeapObj::Intl { kind: native::INTL_LOCALE, resolved });
+        let idx = self.heap.alloc(HeapObj::Intl {
+            kind: native::INTL_LOCALE,
+            resolved,
+        });
         if self.intl_protos[native::INTL_LOCALE as usize] != 0 {
-            self.proto_of.insert(idx, Value::heap(self.intl_protos[native::INTL_LOCALE as usize]));
+            self.proto_of.insert(
+                idx,
+                Value::heap(self.intl_protos[native::INTL_LOCALE as usize]),
+            );
         }
         Value::heap(idx)
     }
-
 
     /// StringListFromIterable (ECMA-402 13.5.1) — Intl.ListFormat's argument
     /// coercion. `undefined` is an empty list (NOT a TypeError), and a yielded
@@ -716,7 +780,10 @@ impl<'p> Vm<'p> {
     /// after IteratorClose. Draining first and checking after would run the
     /// iterator past the offending element, which `iterable-iteratorclose`
     /// observes through the iterator's own step counter.
-    pub(crate) fn string_list_from_iterable(&mut self, iterable: Value) -> Result<Vec<String>, Thrown> {
+    pub(crate) fn string_list_from_iterable(
+        &mut self,
+        iterable: Value,
+    ) -> Result<Vec<String>, Thrown> {
         if iterable == Value::UNDEFINED {
             return Ok(vec![]);
         }
@@ -751,7 +818,9 @@ impl<'p> Vm<'p> {
         loop {
             let res = self.call_value(next, iter, &[])?;
             if !self.is_object_value(res) {
-                return Err(Thrown("TypeError: iterator.next() returned a non-object".into()));
+                return Err(Thrown(
+                    "TypeError: iterator.next() returned a non-object".into(),
+                ));
             }
             let done = self.get_prop(res, "done")?;
             if self.truthy(done) {
@@ -766,7 +835,6 @@ impl<'p> Vm<'p> {
         }
         Ok(out)
     }
-
 
     /// The Intl.Locale-info methods (`getCalendars` … `getWeekInfo`).
     ///
@@ -787,7 +855,9 @@ impl<'p> Vm<'p> {
             // CreateArrayFromListAndPreferred: a `-u-ca-` request that this
             // engine supports leads the list.
             "getCalendars" => {
-                let pref = self.display(self.intl_slot(resolved, "calendar")).to_ascii_lowercase();
+                let pref = self
+                    .display(self.intl_slot(resolved, "calendar"))
+                    .to_ascii_lowercase();
                 let mut list: Vec<&str> = AVAILABLE_CALENDARS.to_vec();
                 if let Some(p) = list.iter().position(|c| *c == pref) {
                     let c = list.remove(p);
@@ -839,7 +909,8 @@ impl<'p> Vm<'p> {
                 let mut o = ObjMap::new();
                 o.set("firstDay", Value::num(first));
                 let weekend = Value::heap(
-                    self.heap.alloc(HeapObj::Array(vec![Value::num(6.0), Value::num(7.0)])),
+                    self.heap
+                        .alloc(HeapObj::Array(vec![Value::num(6.0), Value::num(7.0)])),
                 );
                 o.set("weekend", weekend);
                 let _ = tag;
@@ -848,13 +919,11 @@ impl<'p> Vm<'p> {
         })
     }
 
-
     /// Wrap a (type, value[, source]) part list as the Array of plain objects the
     /// *ToParts methods return.
     pub(crate) fn intl_parts_array(&mut self, parts: &[(String, String, &str)]) -> Value {
         self.intl_parts_array_keyed(parts, "source")
     }
-
 
     /// As `intl_parts_array`, but the third tuple slot lands under `key` —
     /// `source` for the range formatters, `unit` for RelativeTimeFormat and
@@ -880,9 +949,7 @@ impl<'p> Vm<'p> {
         }
         Value::heap(self.heap.alloc(HeapObj::Array(out)))
     }
-
 }
-
 
 /// ResolveLocale for ONE [[RelevantExtensionKeys]] entry. The *option* wins
 /// only when the implementation supports its value; otherwise the `-u-` value
@@ -916,11 +983,12 @@ pub(crate) fn resolve_ext_key(
     let ok = |v: &String| available.is_empty() || available.contains(&v.as_str());
     let opt = option.map(|s| canon(s.to_ascii_lowercase())).filter(&ok);
     let ext_ok = ext.map(|s| canon(s.to_ascii_lowercase())).filter(&ok);
-    let value = opt.or_else(|| ext_ok.clone()).unwrap_or_else(|| default.to_string());
+    let value = opt
+        .or_else(|| ext_ok.clone())
+        .unwrap_or_else(|| default.to_string());
     let reflect = ext_ok.as_deref() == Some(value.as_str());
     (value, reflect)
 }
-
 
 /// ResolveLocale's [[locale]]: the requested tag reduced to its language id plus
 /// `-u-` keywords for exactly the relevant extension keys the extension
@@ -940,14 +1008,16 @@ pub(crate) fn resolved_locale_tag(tag: &str, keys: &[(&str, String)]) -> String 
     t.canonical()
 }
 
-
 /// A `-u-` keyword value as it is stored: lowercased, with the redundant
 /// explicit "true" dropped (`-u-kn-true` canonicalizes to `-u-kn`).
 fn canon_ext_value(v: &str) -> String {
     let l = v.to_ascii_lowercase();
-    if l == "true" { String::new() } else { l }
+    if l == "true" {
+        String::new()
+    } else {
+        l
+    }
 }
-
 
 /// The ISO 15924 script codes written right-to-left. This is a Unicode fact
 /// about the scripts themselves (their characters' Bidi_Class), not per-locale
@@ -956,13 +1026,45 @@ fn canon_ext_value(v: &str) -> String {
 fn is_rtl_script(script: &str) -> bool {
     matches!(
         script,
-        "Adlm" | "Arab" | "Aran" | "Armi" | "Avst" | "Cprt" | "Egyp" | "Elym" | "Gara" | "Hatr"
-            | "Hebr" | "Hung" | "Khar" | "Lydi" | "Mand" | "Mani" | "Mend" | "Merc" | "Mero"
-            | "Narb" | "Nbat" | "Nkoo" | "Orkh" | "Palm" | "Phli" | "Phlp" | "Phnx" | "Prti"
-            | "Rohg" | "Samr" | "Sarb" | "Sogd" | "Sogo" | "Syrc" | "Thaa" | "Todr" | "Yezi"
+        "Adlm"
+            | "Arab"
+            | "Aran"
+            | "Armi"
+            | "Avst"
+            | "Cprt"
+            | "Egyp"
+            | "Elym"
+            | "Gara"
+            | "Hatr"
+            | "Hebr"
+            | "Hung"
+            | "Khar"
+            | "Lydi"
+            | "Mand"
+            | "Mani"
+            | "Mend"
+            | "Merc"
+            | "Mero"
+            | "Narb"
+            | "Nbat"
+            | "Nkoo"
+            | "Orkh"
+            | "Palm"
+            | "Phli"
+            | "Phlp"
+            | "Phnx"
+            | "Prti"
+            | "Rohg"
+            | "Samr"
+            | "Sarb"
+            | "Sogd"
+            | "Sogo"
+            | "Syrc"
+            | "Thaa"
+            | "Todr"
+            | "Yezi"
     )
 }
-
 
 /// Whether a canonical tag carries a `-u-<key>` keyword at all, with or without
 /// a value — `-u-kn` (the canonical form of `-u-kn-true`) has no value subtag,
@@ -980,10 +1082,8 @@ fn is_rtl_script(script: &str) -> bool {
 /// on both.
 pub(crate) const AVAILABLE_LOCALES: &[&str] = &["en", "en-US"];
 
-
 /// DefaultLocale(). Must itself be in [[AvailableLocales]].
 pub(crate) const DEFAULT_LOCALE: &str = "en";
-
 
 /// A tag with its `-u-`, `-t-` and `-x-` extension sequences removed — the
 /// "noExtensionsLocale" every matcher works on.
@@ -1004,7 +1104,6 @@ pub(crate) fn strip_extensions(tag: &str) -> String {
     out.join("-")
 }
 
-
 /// The `-u-` extension subtags of a tag ("ca-buddhist-nu-arab"), or `None`.
 pub(crate) fn unicode_extension_of(tag: &str) -> Option<String> {
     let rest = tag.split("-u-").nth(1)?;
@@ -1018,7 +1117,6 @@ pub(crate) fn unicode_extension_of(tag: &str) -> Option<String> {
     }
     (!out.is_empty()).then(|| out.join("-"))
 }
-
 
 /// ResolveLocale's LookupMatcher (ECMA-402 9.2.3): the first requested tag
 /// whose no-extension form has a BestAvailableLocale match, carrying that tag's
@@ -1047,7 +1145,6 @@ pub(crate) fn lookup_matcher(requested: &[String]) -> String {
         .unwrap_or_else(|| DEFAULT_LOCALE.to_string())
 }
 
-
 /// BestAvailableLocale (ECMA-402 9.2.2): the longest prefix of `locale` that is
 /// in [[AvailableLocales]], truncating one subtag at a time and never leaving a
 /// trailing single-character subtag behind. `locale` must already have its
@@ -1055,13 +1152,22 @@ pub(crate) fn lookup_matcher(requested: &[String]) -> String {
 pub(crate) fn best_available_locale(locale: &str) -> Option<String> {
     let mut candidate = locale.to_string();
     loop {
-        if AVAILABLE_LOCALES.iter().any(|a| a.eq_ignore_ascii_case(&candidate)) {
+        if AVAILABLE_LOCALES
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case(&candidate))
+        {
             return Some(candidate);
         }
-        let Some(pos) = candidate.rfind('-') else { return None };
+        let Some(pos) = candidate.rfind('-') else {
+            return None;
+        };
         // Step 2c: if the truncation would leave a one-character subtag
         // dangling ("en-a-bbb" → "en-a"), drop that too.
-        let cut = if pos >= 2 && candidate.as_bytes()[pos - 2] == b'-' { pos - 2 } else { pos };
+        let cut = if pos >= 2 && candidate.as_bytes()[pos - 2] == b'-' {
+            pos - 2
+        } else {
+            pos
+        };
         candidate.truncate(cut);
         if candidate.is_empty() {
             return None;
@@ -1069,14 +1175,12 @@ pub(crate) fn best_available_locale(locale: &str) -> Option<String> {
     }
 }
 
-
 pub(crate) fn unicode_ext_has_key(tag: &str, key: &str) -> bool {
     match tag.split("-u-").nth(1) {
         Some(ext) => ext.split('-').any(|t| t == key),
         None => false,
     }
 }
-
 
 /// Read a Unicode `-u-` extension keyword out of a canonical language tag
 /// (`"en-u-ca-buddhist"`, key "ca" → `Some("buddhist")`). Keys are two
@@ -1092,9 +1196,12 @@ pub(crate) fn unicode_ext_value(tag: &str, key: &str) -> Option<String> {
         }
         out.push(t);
     }
-    if out.is_empty() { None } else { Some(out.join("-")) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.join("-"))
+    }
 }
-
 
 /// Accept a time-zone argument for Intl.DateTimeFormat: an offset identifier
 /// (`±HH:MM`, canonicalized) or a Zone/Link name from the bundled IANA table,
@@ -1113,7 +1220,6 @@ pub(crate) fn canonicalize_time_zone(s: &str) -> Option<String> {
     }
     crate::vm::temporal::tzdb::lookup(s).map(|z| z.canonical.to_string())
 }
-
 
 /// Parse an offset time zone identifier to signed minutes, or `None` if it is
 /// not one. The grammar is `UTCOffset[~SubMinutePrecision]` (ECMA-402
@@ -1144,7 +1250,6 @@ pub(crate) fn offset_time_zone_minutes(s: &str) -> Option<i64> {
     Some(sign * (h * 60 + m))
 }
 
-
 /// FormatOffsetTimeZoneIdentifier: always `±HH:MM`, and always `+` for zero —
 /// `-00` and `-00:00` both canonicalize to `+00:00`.
 fn format_offset_time_zone(minutes: i64) -> String {
@@ -1152,7 +1257,6 @@ fn format_offset_time_zone(minutes: i64) -> String {
     let a = minutes.abs();
     format!("{sign}{:02}:{:02}", a / 60, a % 60)
 }
-
 
 /// The UTC offset a time zone identifier has AT an instant, in minutes: fixed
 /// for an offset identifier, and the tz database's answer for a named zone.
@@ -1166,15 +1270,16 @@ pub(crate) fn time_zone_offset_minutes_at(tz: &str, ms: i128) -> Option<i64> {
     Some(crate::vm::temporal::tzdb::offset_seconds(z.zone, ms.div_euclid(1000) as i64) as i64 / 60)
 }
 
-
 /// AvailableCanonicalTimeZones: the primary identifiers of the bundled IANA
 /// table, sorted and unique. "Etc/UTC" and "Etc/GMT" are absent because both
 /// carry the primary identifier "UTC" (ECMA-402
 /// sec-availablenamedtimezoneidentifiers step 5.c).
 pub(crate) fn available_time_zones() -> Vec<String> {
-    crate::vm::temporal::tzdb::primary_ids().into_iter().map(str::to_string).collect()
+    crate::vm::temporal::tzdb::primary_ids()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
-
 
 #[cfg(test)]
 mod locale_matcher_tests {
@@ -1196,7 +1301,10 @@ mod locale_matcher_tests {
         assert_eq!(strip_extensions("en-US-u-ca-gregory-nu-latn"), "en-US");
         assert_eq!(strip_extensions("en-u-hc-h11-x-priv"), "en");
         assert_eq!(strip_extensions("en-Latn-US"), "en-Latn-US");
-        assert_eq!(unicode_extension_of("en-u-ca-gregory-x-p").as_deref(), Some("ca-gregory"));
+        assert_eq!(
+            unicode_extension_of("en-u-ca-gregory-x-p").as_deref(),
+            Some("ca-gregory")
+        );
         assert_eq!(unicode_extension_of("en-US").as_deref(), None);
     }
 

@@ -675,6 +675,105 @@ pub(crate) fn plan_region_cold_ex(
     admit_dv: bool,
     boxref: BoxRefAdmit,
 ) -> Option<RegionPlan> {
+    plan_region_cold_ex_with_home_last(
+        proto,
+        start,
+        end,
+        ta_plan,
+        admit_bitwise,
+        admit_split,
+        admit_wt_share,
+        share_homes,
+        cold,
+        admit_dv,
+        boxref,
+        HOME_XMM_LAST,
+    )
+}
+
+/// Build a GPR-only plan with a bounded set of symbolic numeric-home colours.
+/// Ordinary plans are capped at the fourteen physical XMM homes above.  This
+/// entry point exists solely so the already flattened, call-free dense-computed
+/// splice can reach the GPR mapper/spill allocator when its proven permanent
+/// values exceed fourteen.  The returned plan must never reach an XMM emitter.
+///
+/// The cap is intentionally small: the current GPR pool plus the verified spill
+/// budget can consume at most eighteen colours.  A broader request fails closed
+/// here rather than manufacturing arbitrary `Home::Xmm` ids.
+fn gpr_virtual_home_last(home_count: usize) -> Option<u8> {
+    const PHYSICAL_HOME_COUNT: usize = (HOME_XMM_LAST - HOME_XMM_FIRST + 1) as usize;
+    const MAX_VIRTUAL_HOME_COUNT: usize = 18;
+    if home_count <= PHYSICAL_HOME_COUNT || home_count > MAX_VIRTUAL_HOME_COUNT {
+        return None;
+    }
+    HOME_XMM_FIRST.checked_add(home_count as u8 - 1)
+}
+
+#[cfg(test)]
+mod gpr_virtual_home_tests {
+    use super::*;
+
+    #[test]
+    fn virtual_home_cap_fails_closed_for_physical_and_malformed_requests() {
+        assert_eq!(gpr_virtual_home_last(14), None);
+        assert_eq!(gpr_virtual_home_last(15), Some(HOME_XMM_LAST + 1));
+        assert_eq!(gpr_virtual_home_last(18), Some(HOME_XMM_LAST + 4));
+        assert_eq!(gpr_virtual_home_last(19), None);
+        assert_eq!(gpr_virtual_home_last(usize::MAX), None);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn plan_region_cold_gpr_virtual(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    ta_plan: &TaPinPlan,
+    admit_bitwise: bool,
+    admit_split: bool,
+    admit_wt_share: bool,
+    share_homes: bool,
+    cold: &FxHashSet<usize>,
+    admit_dv: bool,
+    home_count: usize,
+) -> Option<RegionPlan> {
+    if !share_homes {
+        return None;
+    }
+    let last = gpr_virtual_home_last(home_count)?;
+    debug_assert!(last > HOME_XMM_LAST && last <= HOME_XMM_FIRST + 63);
+    plan_region_cold_ex_with_home_last(
+        proto,
+        start,
+        end,
+        ta_plan,
+        admit_bitwise,
+        admit_split,
+        admit_wt_share,
+        share_homes,
+        cold,
+        admit_dv,
+        BoxRefAdmit::NONE,
+        last,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_region_cold_ex_with_home_last(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    ta_plan: &TaPinPlan,
+    admit_bitwise: bool,
+    admit_split: bool,
+    admit_wt_share: bool,
+    share_homes: bool,
+    cold: &FxHashSet<usize>,
+    admit_dv: bool,
+    boxref: BoxRefAdmit,
+    home_last: u8,
+) -> Option<RegionPlan> {
+    debug_assert!(home_last >= HOME_XMM_LAST);
     set_decline_region(proto, start, end);
     match plan_region_cold_inner(
         proto,
@@ -689,6 +788,7 @@ pub(crate) fn plan_region_cold_ex(
         true,
         admit_dv,
         boxref,
+        home_last,
     ) {
         PlanOutcome::Plan(p) => Some(*p),
         PlanOutcome::RetryNoHoist => {
@@ -705,6 +805,7 @@ pub(crate) fn plan_region_cold_ex(
                 false,
                 admit_dv,
                 boxref,
+                home_last,
             ) {
                 PlanOutcome::Plan(p) => Some(*p),
                 _ => None,
@@ -758,6 +859,9 @@ fn plan_region_cold_inner(
     // W20 — see `BoxRefAdmit`. `BoxRefAdmit::NONE` for every caller but the
     // regalloc tier, and the passes below are no-ops under it.
     boxref: BoxRefAdmit,
+    // Inclusive numeric-home colour ceiling. `HOME_XMM_LAST` for every normal
+    // plan; a small virtual value only for the computed-splice GPR retry.
+    home_last: u8,
 ) -> PlanOutcome {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
@@ -801,7 +905,7 @@ fn plan_region_cold_inner(
     let mut boxref_gets: FxHashSet<usize> = FxHashSet::default();
     if boxref.any() && !admit_bitwise {
         // Candidate receivers: every `GetProp` in the region not already served
-        // by a pin (a `.length` read rides `pinned_arr_len`/`pinned_str` and must
+        // by a pin (a `.length` read rides `pinned_len`/`pinned_str` and must
         // keep doing so -- its dst is the snapshot length, not a probe result).
         let mut cand_recv: FxHashSet<u16> = FxHashSet::default();
         let mut gp_of: Vec<(usize, u16)> = Vec::new();
@@ -909,7 +1013,6 @@ fn plan_region_cold_inner(
             }
         }
     }
-    let pin_kind: u8 = if admit_bitwise { 5 } else { 8 };
     let pinned_elem = |ip: usize| -> bool {
         ta_plan.access.get(&ip).map_or(false, |&j| {
             let k = ta_plan.pins[j as usize].kind;
@@ -918,8 +1021,24 @@ fn plan_region_cold_inner(
             // element unboxed into an i64 home under a per-access tag guard. This is
             // what admits `for (i < a.length) s += a[i]` — the most common hot loop
             // in JS, and previously demoted to the boxed memory path in full.
-            if k == pin_kind || (admit_bitwise && k == ARR_INT_PIN_KIND) {
-                return true;
+            match code[ip] {
+                Instr::GetIndex { .. } => {
+                    if (!admit_bitwise && k == 8)
+                        || (admit_bitwise
+                            && (int_ta_load_kind(k).is_some() || k == ARR_INT_PIN_KIND))
+                    {
+                        return true;
+                    }
+                }
+                Instr::SetIndex { .. } => {
+                    // This widening is deliberately read-only. Direct narrow
+                    // stores need per-dtype wrap/clamp emission; only the landed
+                    // Int32 and Float64 store arms qualify here.
+                    if (!admit_bitwise && k == 8) || (admit_bitwise && k == 5) {
+                        return true;
+                    }
+                }
+                _ => {}
             }
             // B95: the DOUBLE path admits a dense ordinary Array READ on the same
             // terms — receiver via the pin, index via `key`'s home — but the
@@ -984,13 +1103,14 @@ fn plan_region_cold_inner(
                 .get(&ip)
                 .map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND)
     };
-    // `arr.length` on a dense all-Int Array pin — like `str.length`, the receiver is
-    // read from the pin snapshot rather than a register, so its reg must be excluded
-    // from typing/homing too.
-    let pinned_arr_len = |ip: usize| -> bool {
+    // `arr.length` on an ordinary dense Array pin, or pristine `ta.length` on a
+    // distinct TypedArray length-only marker. Like `str.length`, the receiver
+    // is read from the pin snapshot rather than a register, so its reg must be
+    // excluded from typing/homing too. The marker does not admit TA elements.
+    let pinned_len = |ip: usize| -> bool {
         admit_bitwise
             && ta_plan.access.get(&ip).map_or(false, |&j| {
-                ta_plan.pins[j as usize].kind == ARR_INT_PIN_KIND
+                int_length_pin_kind(ta_plan.pins[j as usize].kind)
             })
     };
     // A pinned DataView `get*` CallMethod (kind DV_PIN_KIND), DOUBLE path only.
@@ -1063,7 +1183,7 @@ fn plan_region_cold_inner(
                 }
             }
             if pinned_str(s + off)
-                || pinned_arr_len(s + off)
+                || pinned_len(s + off)
                 || pinned_dv(s + off)
                 || pinned_arr_push(s + off)
             {
@@ -1117,7 +1237,7 @@ fn plan_region_cold_inner(
                     }
                     Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
                         if pinned_str(s + off)
-                            || pinned_arr_len(s + off)
+                            || pinned_len(s + off)
                             || pinned_dv(s + off)
                             || pinned_arr_push(s + off) =>
                     {
@@ -1192,7 +1312,7 @@ fn plan_region_cold_inner(
                             Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
                                 if crate::codegen::multi_split_enabled()
                                     && (pinned_str(s + off)
-                                        || pinned_arr_len(s + off)
+                                        || pinned_len(s + off)
                                         || pinned_arr_push(s + off)) =>
                             {
                                 Some((obj, false))
@@ -1249,7 +1369,7 @@ fn plan_region_cold_inner(
                             }
                             Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
                                 if pinned_str(ip)
-                                    || pinned_arr_len(ip)
+                                    || pinned_len(ip)
                                     || pinned_dv(ip)
                                     || pinned_arr_push(ip) =>
                             {
@@ -1536,39 +1656,38 @@ fn plan_region_cold_inner(
     // implements per-def write-through: the exit contract is write-through's.
     // Every other planner caller sees an empty map and plans byte-identically,
     // which is what makes the 13 `bench/real` rows unchanged by construction.
-    let ty_splits: FxHashMap<u16, TySplit> = if admit_bitwise
-        && (admit_dv || share_homes)
-        && admit_wt_share
-        && cold.is_empty()
-    {
-        let mut excluded: FxHashSet<u16> = ta_recv_regs.clone();
-        excluded.extend(split_recvs.iter().copied());
-        excluded.extend(box_regs.iter().copied());
-        for pin in &ta_plan.pins {
-            if let TaPinSrc::Reg(r) = pin.src {
-                excluded.insert(r);
+    let ty_splits: FxHashMap<u16, TySplit> =
+        if admit_bitwise && (admit_dv || share_homes) && admit_wt_share && cold.is_empty() {
+            let mut excluded: FxHashSet<u16> = ta_recv_regs.clone();
+            excluded.extend(split_recvs.iter().copied());
+            excluded.extend(box_regs.iter().copied());
+            for pin in &ta_plan.pins {
+                if let TaPinSrc::Reg(r) = pin.src {
+                    excluded.insert(r);
+                }
             }
-        }
-        let dv_flag_reg = |ip: usize| -> Option<u16> {
-            match code[ip] {
-                Instr::CallMethod { arg_base, argc: 2, .. } if pinned_dv(ip) => Some(arg_base + 1),
-                _ => None,
-            }
+            let dv_flag_reg = |ip: usize| -> Option<u16> {
+                match code[ip] {
+                    Instr::CallMethod {
+                        arg_base, argc: 2, ..
+                    } if pinned_dv(ip) => Some(arg_base + 1),
+                    _ => None,
+                }
+            };
+            plan_type_splits(
+                code,
+                s,
+                e,
+                &jump_targets,
+                &excluded,
+                &split_recv_lg,
+                &dv_flag_elide,
+                &dv_flag_fuse,
+                &dv_flag_reg,
+            )
+        } else {
+            FxHashMap::default()
         };
-        plan_type_splits(
-            code,
-            s,
-            e,
-            &jump_targets,
-            &excluded,
-            &split_recv_lg,
-            &dv_flag_elide,
-            &dv_flag_fuse,
-            &dv_flag_reg,
-        )
-    } else {
-        FxHashMap::default()
-    };
     if !ty_splits.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
         let mut v: Vec<(u16, TySplit)> = ty_splits.iter().map(|(&r, &sp)| (r, sp)).collect();
         v.sort_unstable_by_key(|x| x.0);
@@ -1631,6 +1750,10 @@ fn plan_region_cold_inner(
         // element is a VTy::Num xmm home; receiver/index handled specially below).
         match *instr {
             Instr::Call { .. } => decline!("Call"),
+            // The computed-call helper can run arbitrary user code after its
+            // pure dense-slot guard succeeds. Keep it off every register tier;
+            // the boxed MEMORY emitter owns the helper/refetch protocol.
+            Instr::CallMethodComputed { .. } => decline!("CallMethodComputed"),
             // A pinned-STRING charCodeAt is admitted on the int path (inlines to a
             // byte load, runs no user code, allocates nothing — the no-call
             // invariant that keeps BOOL_GPRS alive holds), and a pinned-DataView
@@ -1779,7 +1902,8 @@ fn plan_region_cold_inner(
                     } else {
                         VTy::Num
                     };
-                    want == t && ty.get(&d) == Some(&if t == VTy::Bool { VTy::Num } else { VTy::Bool })
+                    want == t
+                        && ty.get(&d) == Some(&if t == VTy::Bool { VTy::Num } else { VTy::Bool })
                 });
                 if !ok {
                     decline!("type conflict on a reused register");
@@ -2905,9 +3029,7 @@ fn plan_region_cold_inner(
                 (ip >= sp.bool_lo && ip <= sp.bool_hi) || (ip >= sp.num_lo && ip <= sp.num_hi)
             };
             let touch_ok = str_imul_touch.iter().all(|&(ip, rr, is_def)| {
-                rr != r
-                    || (in_range(ip)
-                        && (!is_def || (ip >= sp.num_lo && ip <= sp.num_hi)))
+                rr != r || (in_range(ip) && (!is_def || (ip >= sp.num_lo && ip <= sp.num_hi)))
             });
             if !live_in(r)
                 && shareable(r)
@@ -2980,7 +3102,7 @@ fn plan_region_cold_inner(
     // allocation (distinct home each — best ILP, what loop.js relies on). Only
     // when it would OVERFLOW do we linear-scan-reuse homes for non-overlapping
     // live ranges (lets bigger loops JIT, and is required for object SROA).
-    const POOL: usize = (HOME_XMM_LAST - HOME_XMM_FIRST + 1) as usize;
+    let pool = (home_last - HOME_XMM_FIRST + 1) as usize;
     let n_numeric = reg_order.iter().filter(|r| ty[r] == VTy::Num).count() + glob_order.len();
     // DISABLED (soundness): linear-scan reuse gives two registers with
     // non-overlapping IN-REGION live ranges the same home, but `flush_exit`
@@ -3003,7 +3125,7 @@ fn plan_region_cold_inner(
     // `share_homes` (B119) forces reuse below the overflow point: the caller is
     // refitting this region to the GPR emitter's much smaller pool, where the
     // ILP cost of sharing is not the trade — staying on xmm homes is.
-    let reuse = share_homes || n_numeric > POOL;
+    let reuse = share_homes || n_numeric > pool;
 
     // ── stored-global live-range narrowing + mixed-role temp splitting ──
     // B96 permanence forces every `glob_order` member onto a whole-region
@@ -3265,12 +3387,16 @@ fn plan_region_cold_inner(
                 eprintln!("[globrange] [{s},{e}] {name}: {segs:?}");
             }
         }
-        let mut assigned = alloc_value_homes(&values);
+        let mut assigned = if home_last == HOME_XMM_LAST {
+            alloc_value_homes(&values)
+        } else {
+            alloc_value_homes_with_last(&values, home_last)
+        };
         if let Some(h) = &assigned {
             // The shared hoist-const index must stay inside the xmm range —
             // out of it, fail exactly like an exhausted pool.
             let top = h.iter().copied().max().map_or(HOME_XMM_FIRST, |m| m + 1);
-            if !hoist_const_regs.is_empty() && top > HOME_XMM_LAST {
+            if !hoist_const_regs.is_empty() && top > home_last {
                 assigned = None;
             }
         }
@@ -3359,7 +3485,11 @@ fn plan_region_cold_inner(
             intervals.push((s, e, NumVal::Glob(gi)));
         }
         intervals.sort_by_key(|&(a, _, _)| a);
-        let mut alloc = XmmAlloc::new();
+        let mut alloc = if home_last == HOME_XMM_LAST {
+            XmmAlloc::new()
+        } else {
+            XmmAlloc::with_last(home_last)
+        };
         for (a, b, v) in intervals {
             let x = match alloc.alloc(a, b) {
                 Some(x) => x,
@@ -3411,7 +3541,7 @@ fn plan_region_cold_inner(
         let mut next_xmm = HOME_XMM_FIRST;
         for &r in &reg_order {
             if ty[&r] == VTy::Num && !slot_consts.contains_key(&r) {
-                if next_xmm > HOME_XMM_LAST {
+                if next_xmm > home_last {
                     decline!("xmm pool exhausted (registers)");
                 }
                 reg_home.insert(r, Home::Xmm(next_xmm));
@@ -3419,7 +3549,7 @@ fn plan_region_cold_inner(
             }
         }
         for &gi in &glob_order {
-            if next_xmm > HOME_XMM_LAST {
+            if next_xmm > home_last {
                 decline!("xmm pool exhausted (globals)");
             }
             glob_home.insert(gi, next_xmm);
@@ -3978,7 +4108,6 @@ pub(crate) fn runs_every_iteration(code: &[Instr], s: usize, e: usize, d: usize)
     }
     true
 }
-
 
 /// W28 — candidate TYPE SPLITS for `[s, e]`: VM registers the bytecode
 /// compiler recycled ACROSS A `VTy` BOUNDARY, whose two ranges are each
@@ -4741,7 +4870,6 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::OpenUsingScope { .. }
         | Instr::TemplateGetCached { .. }
         | Instr::ImportMeta { .. }
-        | Instr::Random { .. }
         | Instr::Now { .. }
         | Instr::Jump { .. }
         | Instr::JumpFinally { .. }
@@ -4752,6 +4880,877 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::GenStart
         | Instr::ReturnUndefined => vec![],
     }
+}
+
+/// One own data field of a fresh object scalar-replaced inside a loop.
+/// `scratch` is a register that is otherwise unmentioned by the whole function,
+/// so it remains a normal GC root and cannot alias a nested activation.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalSroaField {
+    pub(crate) name: u32,
+    pub(crate) scratch: u16,
+    pub(crate) append_ip: u32,
+}
+
+/// Runtime information needed to materialize a fresh object after a native
+/// guard bail. A clean loop exit needs no materialization because the planner
+/// proves the allocation reference dead outside its construction/use window.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalSroaObject {
+    pub(crate) alloc_ip: u32,
+    pub(crate) dst: u16,
+    pub(crate) hint: u16,
+    pub(crate) fields: Vec<LocalSroaField>,
+}
+
+/// Runtime information needed to materialize a dense array after a native
+/// guard bail. Eligibility proves the argument registers are not overwritten
+/// between `NewArray` and the end of the region.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalSroaArray {
+    pub(crate) alloc_ip: u32,
+    pub(crate) dst: u16,
+    pub(crate) arg_base: u16,
+    pub(crate) argc: u16,
+}
+
+/// A string concat whose result is virtual inside a local-SROA region because
+/// its only observation is `.length`. The native clone keeps the proved i32 in
+/// `scratch`; an internal bail recreates the exact primitive string before the
+/// original bytecode resumes.
+#[derive(Clone, Debug)]
+pub(crate) struct LocalSroaConcatLen {
+    pub(crate) prefix_const: u32,
+    pub(crate) prefix_load_ip: u32,
+    pub(crate) prefix_reg: u16,
+    pub(crate) add_ip: u32,
+    pub(crate) add_dst: u16,
+    pub(crate) add_live_until: u32,
+    pub(crate) get_ip: u32,
+    pub(crate) get_dst: u16,
+    pub(crate) get_live_until: u32,
+    pub(crate) scratch: u16,
+}
+
+/// Deopt/materialization half of a local aggregate scalar-replacement plan.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LocalSroaPlan {
+    pub(crate) objects: Vec<LocalSroaObject>,
+    pub(crate) arrays: Vec<LocalSroaArray>,
+    pub(crate) concat_lens: Vec<LocalSroaConcatLen>,
+    pub(crate) scratch: Vec<u16>,
+}
+
+/// Compile-time half of [`LocalSroaPlan`]. The rewritten proto has identical
+/// instruction indices, so every native bail ip remains an ip in the original
+/// bytecode and the interpreter can resume after materialization.
+pub(crate) struct LocalSroaCompilePlan {
+    pub(crate) proto: FuncProto,
+    pub(crate) runtime: LocalSroaPlan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalScalarTy {
+    Unknown,
+    Num,
+    Str,
+    Object(usize),
+    Array(usize),
+}
+
+/// Destination cover for the deliberately narrow local-SROA input language.
+/// Returning `None` is ambiguous (an instruction may genuinely have no dst),
+/// so `local_sroa_supported_instr` is the fail-closed companion gate.
+fn local_sroa_dst(i: &Instr) -> Option<u16> {
+    match *i {
+        Instr::LoadInt { dst, .. }
+        | Instr::LoadConst { dst, .. }
+        | Instr::LoadUndefined { dst }
+        | Instr::Move { dst, .. }
+        | Instr::AddInt { dst, .. }
+        | Instr::Add { dst, .. }
+        | Instr::Mul { dst, .. }
+        | Instr::Bitwise { dst, .. }
+        | Instr::GetProp { dst, .. }
+        | Instr::GetIndex { dst, .. }
+        | Instr::NewObject { dst, .. }
+        | Instr::NewArray { dst, .. } => Some(dst),
+        _ => None,
+    }
+}
+
+/// The first local-SROA lane is intentionally a closed, audit-friendly loop
+/// language. In particular it excludes calls, handlers, dynamic property keys,
+/// accessors, spreads, stores and closure ops. Widening this list requires a
+/// corresponding escape/type/materialization proof below.
+fn local_sroa_supported_instr(i: &Instr) -> bool {
+    matches!(
+        i,
+        Instr::LoadInt { .. }
+            | Instr::LoadConst { .. }
+            | Instr::LoadUndefined { .. }
+            | Instr::Move { .. }
+            | Instr::AddInt { .. }
+            | Instr::Add { .. }
+            | Instr::Mul { .. }
+            | Instr::Bitwise { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::Jump { .. }
+            | Instr::NewObject { .. }
+            | Instr::AppendDataProp { .. }
+            | Instr::GetProp { .. }
+            | Instr::NewArray { .. }
+            | Instr::GetIndex { .. }
+            | Instr::Print { .. }
+            | Instr::ReturnUndefined
+    )
+}
+
+fn local_const_ty(proto: &FuncProto, idx: u32) -> LocalScalarTy {
+    let Some(&v) = proto.constants.get(idx as usize) else {
+        return LocalScalarTy::Unknown;
+    };
+    if v.is_number() {
+        return LocalScalarTy::Num;
+    }
+    if v.is_heap() && (v.heap_index() & crate::vm::STRING_CONST_BIT) != 0 {
+        let si = (v.heap_index() & !crate::vm::STRING_CONST_BIT) as usize;
+        if si < proto.string_constants.len() {
+            return LocalScalarTy::Str;
+        }
+    }
+    LocalScalarTy::Unknown
+}
+
+/// Find the last `LoadInt` reaching `reg` at `ip` in a straight-line region.
+fn reaching_int(code: &[Instr], start: usize, ip: usize, reg: u16) -> Option<i32> {
+    for j in (start..ip).rev() {
+        if local_sroa_dst(&code[j]) == Some(reg) {
+            return match code[j] {
+                Instr::LoadInt { val, .. } => Some(val),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Plan scalar replacement for fresh, non-escaping object/array literals in a
+/// single straight-line loop body.
+///
+/// This is deliberately narrower than general escape analysis:
+///
+/// * one fused numeric header test and one canonical back-edge, with no inner
+///   branches or handlers;
+/// * a fresh object is used only by unique-name `AppendDataProp` followed by
+///   matching own `GetProp` reads;
+/// * a fresh dense array is used only by constant, in-range `GetIndex` reads,
+///   and its element registers remain unchanged through every possible bail;
+/// * every remaining potentially observable heap read is exactly `.length` on
+///   a statically-proved primitive string, and every `Add` operand is a proved
+///   number/string primitive, so native helpers cannot invoke user code;
+/// * scalar homes are registers unmentioned anywhere in the function. This
+///   keeps them rooted for GC and activation-local across nested execution.
+///
+/// The rewritten proto preserves bytecode indices. On an internal native bail,
+/// `Vm::try_run_osr` materializes allocations whose original allocation ip has
+/// already executed, then resumes the untouched interpreter bytecode.
+pub(crate) fn plan_local_sroa(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+) -> Option<LocalSroaCompilePlan> {
+    if proto.param_count != 0
+        || proto.arguments_reg.is_some()
+        || proto.is_generator
+        || proto.is_async
+        || !proto.eval_sites.is_empty()
+    {
+        return None;
+    }
+    let code = &proto.code;
+    let (s, e) = (start as usize, end as usize);
+    if e <= s || e >= code.len() {
+        return None;
+    }
+    match code[s] {
+        Instr::JumpIfNotLt { target, .. } if target as usize == e + 1 => {}
+        _ => return None,
+    }
+    match code[e] {
+        Instr::Jump { target } if target == start => {}
+        _ => return None,
+    }
+    if code[s + 1..e].iter().any(|i| {
+        matches!(
+            i,
+            Instr::Jump { .. }
+                | Instr::JumpIfFalse { .. }
+                | Instr::JumpIfTrue { .. }
+                | Instr::JumpIfNotLt { .. }
+                | Instr::JumpIfNotLe { .. }
+                | Instr::PushHandler { .. }
+                | Instr::PopHandler
+                | Instr::PushFinally { .. }
+                | Instr::PopFinally
+        )
+    }) || code.iter().any(|i| !local_sroa_supported_instr(i))
+    {
+        return None;
+    }
+
+    // A completely-unmentioned register is an activation-local, GC-scanned
+    // scalar home. Restricting the WHOLE function (not merely the region)
+    // prevents a clean exit or catch continuation from observing our scratch.
+    let mut mentioned = FxHashSet::default();
+    mentioned.insert(0u16); // `this` is implicit even when no opcode names it.
+    mentioned.insert(1u16); // return/temporary convention; keep it untouched.
+    for instr in code {
+        mentioned.extend(instr_uses(instr));
+        if let Some(dst) = local_sroa_dst(instr) {
+            mentioned.insert(dst);
+        }
+    }
+    let spare: Vec<u16> = (2..proto.reg_count)
+        .filter(|r| !mentioned.contains(r))
+        .collect();
+
+    // Discover fresh object lifetimes and prove every reference use belongs to
+    // the literal builder or an own-field read. A prior iteration's reference
+    // must be killed before the allocation register's first prefix use.
+    let mut objects = Vec::new();
+    for alloc_ip in s + 1..e {
+        let (dst, hint) = match code[alloc_ip] {
+            Instr::NewObject { dst, hint } => (dst, hint),
+            _ => continue,
+        };
+        let mut prefix_killed = false;
+        for instr in &code[s..alloc_ip] {
+            let used = instr_uses(instr).contains(&dst);
+            let wrote = local_sroa_dst(instr) == Some(dst);
+            if used && !prefix_killed {
+                return None;
+            }
+            prefix_killed |= wrote;
+        }
+        let mut fields: Vec<(u32, u32)> = Vec::new(); // (name, append ip)
+        for (ip, instr) in code.iter().enumerate().take(e + 1).skip(alloc_ip + 1) {
+            if local_sroa_dst(instr) == Some(dst) {
+                return None;
+            }
+            if !instr_uses(instr).contains(&dst) {
+                continue;
+            }
+            match *instr {
+                Instr::AppendDataProp { obj, name, val } if obj == dst && val != dst => {
+                    let key = proto.string_constants.get(name as usize)?;
+                    if fields
+                        .iter()
+                        .any(|&(n, _)| proto.string_constants.get(n as usize) == Some(key))
+                    {
+                        return None;
+                    }
+                    fields.push((name, ip as u32));
+                }
+                Instr::GetProp { obj, name, .. } if obj == dst => {
+                    let key = proto.string_constants.get(name as usize)?;
+                    if !fields
+                        .iter()
+                        .any(|&(n, _)| proto.string_constants.get(n as usize) == Some(key))
+                    {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        // A clean loop exit does not materialize the object. Its original
+        // register therefore must be dead until a post-region definition (or
+        // function end), not merely unused by the loop body itself.
+        for instr in &code[e + 1..] {
+            if instr_uses(instr).contains(&dst) {
+                return None;
+            }
+            if local_sroa_dst(instr) == Some(dst) {
+                break;
+            }
+        }
+        if fields.is_empty() || fields.len() != hint as usize {
+            return None;
+        }
+        objects.push((alloc_ip as u32, dst, hint, fields));
+    }
+
+    // Dense arrays may forward an element read directly to its construction
+    // argument only while that argument register is unchanged. A reaching
+    // `LoadHole` (or any value we cannot prove user-visible) is rejected by the
+    // scalar type walk below.
+    let mut arrays: Vec<(u32, u16, u16, u16, Vec<(u32, u16)>)> = Vec::new();
+    for alloc_ip in s + 1..e {
+        let (dst, arg_base, argc) = match code[alloc_ip] {
+            Instr::NewArray {
+                dst,
+                arg_base,
+                argc,
+            } if argc != 0 => (dst, arg_base, argc),
+            _ => continue,
+        };
+        let mut prefix_killed = false;
+        for instr in &code[s..alloc_ip] {
+            let used = instr_uses(instr).contains(&dst);
+            let wrote = local_sroa_dst(instr) == Some(dst);
+            if used && !prefix_killed {
+                return None;
+            }
+            prefix_killed |= wrote;
+        }
+        let mut reads = Vec::new();
+        for (ip, instr) in code.iter().enumerate().take(e + 1).skip(alloc_ip + 1) {
+            if local_sroa_dst(instr) == Some(dst) {
+                return None;
+            }
+            if !instr_uses(instr).contains(&dst) {
+                continue;
+            }
+            let (key, get_dst) = match *instr {
+                Instr::GetIndex {
+                    dst: get_dst,
+                    obj,
+                    key,
+                } if obj == dst => (key, get_dst),
+                _ => return None,
+            };
+            let idx = reaching_int(code, s, ip, key)?;
+            if idx < 0 || idx >= argc as i32 {
+                return None;
+            }
+            let src = arg_base.checked_add(idx as u16)?;
+            if src == get_dst
+                || code[alloc_ip + 1..=e]
+                    .iter()
+                    .any(|i| local_sroa_dst(i) == Some(src))
+            {
+                return None;
+            }
+            reads.push((ip as u32, src));
+        }
+        // As for objects, a clean exit leaves no real array in `dst`.
+        for instr in &code[e + 1..] {
+            if instr_uses(instr).contains(&dst) {
+                return None;
+            }
+            if local_sroa_dst(instr) == Some(dst) {
+                break;
+            }
+        }
+        if reads.is_empty() {
+            return None;
+        }
+        arrays.push((alloc_ip as u32, dst, arg_base, argc, reads));
+    }
+    if objects.is_empty() && arrays.is_empty() {
+        return None;
+    }
+    let nfields: usize = objects.iter().map(|o| o.3.len()).sum();
+    if spare.len() < nfields {
+        return None;
+    }
+
+    // Assign the otherwise-unused frame homes, then build ip lookup maps for
+    // both the scalar type proof and the index-preserving rewrite.
+    let mut runtime = LocalSroaPlan::default();
+    let mut field_slot: FxHashMap<(usize, u32), u16> = FxHashMap::default();
+    let mut obj_by_reg: FxHashMap<u16, usize> = FxHashMap::default();
+    let mut scratch_i = 0usize;
+    for (oid, (alloc_ip, dst, hint, fields)) in objects.iter().enumerate() {
+        obj_by_reg.insert(*dst, oid);
+        let mut out = Vec::with_capacity(fields.len());
+        for &(name, append_ip) in fields {
+            let scratch = spare[scratch_i];
+            scratch_i += 1;
+            field_slot.insert((oid, name), scratch);
+            out.push(LocalSroaField {
+                name,
+                scratch,
+                append_ip,
+            });
+            runtime.scratch.push(scratch);
+        }
+        runtime.objects.push(LocalSroaObject {
+            alloc_ip: *alloc_ip,
+            dst: *dst,
+            hint: *hint,
+            fields: out,
+        });
+    }
+    let mut arr_by_reg: FxHashMap<u16, usize> = FxHashMap::default();
+    let mut arr_reads: FxHashMap<u32, u16> = FxHashMap::default();
+    for (aid, &(alloc_ip, dst, arg_base, argc, ref reads)) in arrays.iter().enumerate() {
+        arr_by_reg.insert(dst, aid);
+        for &(ip, src) in reads {
+            arr_reads.insert(ip, src);
+        }
+        runtime.arrays.push(LocalSroaArray {
+            alloc_ip,
+            dst,
+            arg_base,
+            argc,
+        });
+    }
+
+    // Static primitive proof. This is what makes the shared MEM emitter's
+    // remaining Add/GetProp helpers non-reentrant: every Add is number/string
+    // primitive-only, and every non-virtual property read is string `.length`.
+    let mut tys = vec![LocalScalarTy::Unknown; proto.reg_count as usize];
+    for instr in &code[..s] {
+        match *instr {
+            Instr::LoadInt { dst, .. } => tys[dst as usize] = LocalScalarTy::Num,
+            Instr::LoadConst { dst, idx } => tys[dst as usize] = local_const_ty(proto, idx),
+            Instr::Move { dst, src } => tys[dst as usize] = tys[src as usize],
+            _ => return None,
+        }
+    }
+    let mut field_ty: FxHashMap<(usize, u32), LocalScalarTy> = FxHashMap::default();
+    let mut array_ty: Vec<Vec<LocalScalarTy>> = vec![Vec::new(); arrays.len()];
+    for (ip, instr) in code.iter().enumerate().take(e + 1).skip(s) {
+        match *instr {
+            Instr::JumpIfNotLt { a, b, .. } => {
+                if tys[a as usize] != LocalScalarTy::Num || tys[b as usize] != LocalScalarTy::Num {
+                    return None;
+                }
+            }
+            Instr::LoadInt { dst, .. } => tys[dst as usize] = LocalScalarTy::Num,
+            Instr::LoadConst { dst, idx } => tys[dst as usize] = local_const_ty(proto, idx),
+            Instr::LoadUndefined { dst } => tys[dst as usize] = LocalScalarTy::Unknown,
+            Instr::Move { dst, src } => tys[dst as usize] = tys[src as usize],
+            Instr::AddInt { dst, a, .. } => {
+                if tys[a as usize] != LocalScalarTy::Num {
+                    return None;
+                }
+                tys[dst as usize] = LocalScalarTy::Num;
+            }
+            Instr::Mul { dst, a, b } | Instr::Bitwise { dst, a, b, .. } => {
+                if tys[a as usize] != LocalScalarTy::Num || tys[b as usize] != LocalScalarTy::Num {
+                    return None;
+                }
+                tys[dst as usize] = LocalScalarTy::Num;
+            }
+            Instr::Add { dst, a, b } => {
+                tys[dst as usize] = match (tys[a as usize], tys[b as usize]) {
+                    (LocalScalarTy::Num, LocalScalarTy::Num) => LocalScalarTy::Num,
+                    (LocalScalarTy::Str, LocalScalarTy::Num)
+                    | (LocalScalarTy::Num, LocalScalarTy::Str)
+                    | (LocalScalarTy::Str, LocalScalarTy::Str) => LocalScalarTy::Str,
+                    _ => return None,
+                };
+            }
+            Instr::NewObject { dst, .. } => {
+                let oid = *obj_by_reg.get(&dst)?;
+                tys[dst as usize] = LocalScalarTy::Object(oid);
+            }
+            Instr::AppendDataProp { obj, name, val } => {
+                let LocalScalarTy::Object(oid) = tys[obj as usize] else {
+                    return None;
+                };
+                let ty = tys[val as usize];
+                if !matches!(ty, LocalScalarTy::Num | LocalScalarTy::Str) {
+                    return None;
+                }
+                field_ty.insert((oid, name), ty);
+            }
+            Instr::GetProp { dst, obj, name } => match tys[obj as usize] {
+                LocalScalarTy::Object(oid) => {
+                    let key = proto.string_constants.get(name as usize)?;
+                    let (&(_, stored_name), &ty) =
+                        field_ty.iter().find(|((field_oid, field_name), _)| {
+                            *field_oid == oid
+                                && proto.string_constants.get(*field_name as usize) == Some(key)
+                        })?;
+                    let _ = stored_name;
+                    tys[dst as usize] = ty;
+                }
+                LocalScalarTy::Str
+                    if proto
+                        .string_constants
+                        .get(name as usize)
+                        .map(String::as_str)
+                        == Some("length") =>
+                {
+                    tys[dst as usize] = LocalScalarTy::Num;
+                }
+                _ => return None,
+            },
+            Instr::NewArray {
+                dst,
+                arg_base,
+                argc,
+            } => {
+                let aid = *arr_by_reg.get(&dst)?;
+                let elems: Vec<_> = (0..argc).map(|i| tys[(arg_base + i) as usize]).collect();
+                if elems
+                    .iter()
+                    .any(|t| !matches!(t, LocalScalarTy::Num | LocalScalarTy::Str))
+                {
+                    return None;
+                }
+                array_ty[aid] = elems;
+                tys[dst as usize] = LocalScalarTy::Array(aid);
+            }
+            Instr::GetIndex { dst, obj, .. } => {
+                let LocalScalarTy::Array(aid) = tys[obj as usize] else {
+                    return None;
+                };
+                let src = *arr_reads.get(&(ip as u32))?;
+                let (_, _, arg_base, _, _) = &arrays[aid];
+                let idx = src.checked_sub(*arg_base)? as usize;
+                tys[dst as usize] = *array_ty.get(aid)?.get(idx)?;
+            }
+            Instr::Jump { .. } => {}
+            _ => return None,
+        }
+    }
+
+    let mut rewritten = proto.clone();
+    for object in &runtime.objects {
+        rewritten.code[object.alloc_ip as usize] = Instr::LoadInt {
+            dst: object.dst,
+            val: 0,
+        };
+        for field in &object.fields {
+            let val = match code[field.append_ip as usize] {
+                Instr::AppendDataProp { val, .. } => val,
+                _ => return None,
+            };
+            rewritten.code[field.append_ip as usize] = Instr::Move {
+                dst: field.scratch,
+                src: val,
+            };
+        }
+        for ip in s..=e {
+            let Instr::GetProp { dst, obj, name } = code[ip] else {
+                continue;
+            };
+            if obj != object.dst {
+                continue;
+            }
+            let key = proto.string_constants.get(name as usize)?;
+            let field = object
+                .fields
+                .iter()
+                .find(|f| proto.string_constants.get(f.name as usize) == Some(key))?;
+            rewritten.code[ip] = Instr::Move {
+                dst,
+                src: field.scratch,
+            };
+        }
+    }
+    for array in &runtime.arrays {
+        rewritten.code[array.alloc_ip as usize] = Instr::LoadInt {
+            dst: array.dst,
+            val: 0,
+        };
+    }
+    for (&ip, &src) in &arr_reads {
+        let dst = match code[ip as usize] {
+            Instr::GetIndex { dst, .. } => dst,
+            _ => return None,
+        };
+        rewritten.code[ip as usize] = Instr::Move { dst, src };
+    }
+    Some(LocalSroaCompilePlan {
+        proto: rewritten,
+        runtime,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct LocalConcatLenCandidate {
+    runtime: LocalSroaConcatLen,
+    append_ip: u32,
+    number_reg: u16,
+    shift_reg: u16,
+    length_ip: u32,
+    length_dst: u16,
+    length_bias: i32,
+}
+
+fn next_local_def(code: &[Instr], after: usize, reg: u16) -> u32 {
+    code.iter()
+        .enumerate()
+        .skip(after + 1)
+        .find_map(|(ip, instr)| (local_sroa_dst(instr) == Some(reg)).then_some(ip as u32))
+        .unwrap_or(u32::MAX)
+}
+
+/// Every use after `after` and before the next definition of `reg` must be one
+/// of `allowed`. The defining instruction is checked for a read-before-write as
+/// well (for example `r = r + 1`), which is the conservative deopt-safe rule.
+fn local_uses_until_def_are(code: &[Instr], after: usize, reg: u16, allowed: &[usize]) -> bool {
+    for (ip, instr) in code.iter().enumerate().skip(after + 1) {
+        if instr_uses(instr).contains(&reg) && !allowed.contains(&ip) {
+            return false;
+        }
+        if local_sroa_dst(instr) == Some(reg) {
+            break;
+        }
+    }
+    true
+}
+
+/// Return the UTF-16 length of a compile-time string only for the deliberately
+/// tiny ASCII subset used by the virtual concat-length lane. WTF-8 marker
+/// constants and non-ASCII text decline: their lengths are computable, but
+/// widening this proof is unnecessary for the measured allocation kernel.
+fn local_ascii_const_units(proto: &FuncProto, const_idx: u32) -> Option<usize> {
+    let &v = proto.constants.get(const_idx as usize)?;
+    if !v.is_heap() || (v.heap_index() & crate::vm::STRING_CONST_BIT) == 0 {
+        return None;
+    }
+    let si = v.heap_index() & !crate::vm::STRING_CONST_BIT;
+    if proto.wtf8_consts.binary_search(&si).is_ok() {
+        return None;
+    }
+    let text = proto.string_constants.get(si as usize)?;
+    text.is_ascii().then_some(text.len())
+}
+
+/// Fold one exact, locally scalar-replaced `"ascii" + (x & MASK)` field when
+/// the produced string is observed solely through `.length`.
+///
+/// For `0 <= n <= 99`, decimal length is one below 10 and two otherwise. With
+/// `L = prefix.len()` this is exactly:
+///
+/// `((n + ((L + 2) * 256 - 10)) >> 8)`.
+///
+/// Five already-elided/virtual instruction slots are reused, preserving every
+/// bytecode ip for native guards. The field's otherwise-unused SROA scratch
+/// holds `n` while native code runs. On an internal bail, `try_run_osr`
+/// recreates the real concat and restores any still-live original destinations
+/// before resuming the untouched interpreter bytecode.
+///
+/// This intentionally accepts exactly one candidate. Multiple virtual strings
+/// could share ordinary compiler temporaries and need interference analysis;
+/// declining them keeps the first lane small and fail-closed.
+pub(crate) fn plan_local_concat_len(
+    proto: &FuncProto,
+    start: u32,
+    end: u32,
+    plan: &mut LocalSroaCompilePlan,
+) -> bool {
+    let code = &proto.code;
+    let (s, e) = (start as usize, end as usize);
+    if e >= code.len() || plan.runtime.objects.is_empty() {
+        return false;
+    }
+
+    let mut candidates = Vec::new();
+    for object in &plan.runtime.objects {
+        for field in &object.fields {
+            let append_ip = field.append_ip as usize;
+            if append_ip < s + 4 || append_ip > e {
+                continue;
+            }
+            let add_ip = append_ip - 1;
+            let bit_ip = add_ip - 1;
+            let mask_ip = add_ip - 2;
+            let prefix_ip = add_ip - 3;
+
+            let Instr::AppendDataProp { obj, name, val } = code[append_ip] else {
+                continue;
+            };
+            if obj != object.dst || name != field.name {
+                continue;
+            }
+            let Instr::Add {
+                dst: add_dst,
+                a: prefix_reg,
+                b: number_reg,
+            } = code[add_ip]
+            else {
+                continue;
+            };
+            if add_dst != val {
+                continue;
+            }
+            let Instr::Bitwise {
+                dst: bit_dst,
+                b: mask_reg,
+                op: crate::bytecode::BitwiseOp::And,
+                ..
+            } = code[bit_ip]
+            else {
+                continue;
+            };
+            let Instr::LoadInt {
+                dst: mask_dst,
+                val: mask,
+            } = code[mask_ip]
+            else {
+                continue;
+            };
+            let Instr::LoadConst {
+                dst: prefix_dst,
+                idx: prefix_const,
+            } = code[prefix_ip]
+            else {
+                continue;
+            };
+            if bit_dst != number_reg
+                || mask_reg != mask_dst
+                || prefix_reg != prefix_dst
+                || !(0..=99).contains(&mask)
+            {
+                continue;
+            }
+            let Some(prefix_units) = local_ascii_const_units(proto, prefix_const) else {
+                continue;
+            };
+            let bias = (prefix_units as i64 + 2)
+                .checked_mul(256)
+                .and_then(|v| v.checked_sub(10));
+            let Some(bias) = bias else {
+                continue;
+            };
+            if bias > i32::MAX as i64 || bias + mask as i64 > i32::MAX as i64 {
+                continue;
+            }
+
+            // The scalarized field must have exactly one read, immediately
+            // projected to primitive-string `.length`.
+            let Some(field_key) = proto.string_constants.get(field.name as usize) else {
+                continue;
+            };
+            let reads: Vec<(usize, u16)> = code[s..=e]
+                .iter()
+                .enumerate()
+                .filter_map(|(off, instr)| match *instr {
+                    Instr::GetProp { dst, obj, name }
+                        if obj == object.dst
+                            && proto.string_constants.get(name as usize) == Some(field_key) =>
+                    {
+                        Some((s + off, dst))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let [(get_ip, get_dst)] = reads.as_slice() else {
+                continue;
+            };
+            let (get_ip, get_dst) = (*get_ip, *get_dst);
+            let length_ip = get_ip + 1;
+            if length_ip > e {
+                continue;
+            }
+            let Instr::GetProp {
+                dst: length_dst,
+                obj: length_obj,
+                name: length_name,
+            } = code[length_ip]
+            else {
+                continue;
+            };
+            if length_obj != get_dst
+                || length_dst == get_dst
+                || proto
+                    .string_constants
+                    .get(length_name as usize)
+                    .map(String::as_str)
+                    != Some("length")
+            {
+                continue;
+            }
+
+            // Reused temporaries must not interfere. `length_dst == number_reg`
+            // is the useful exact shape: the final projection consumes then
+            // overwrites `n`. All other working registers stay distinct.
+            let distinct = [
+                prefix_reg,
+                number_reg,
+                mask_reg,
+                add_dst,
+                get_dst,
+                field.scratch,
+            ];
+            if distinct
+                .iter()
+                .enumerate()
+                .any(|(i, r)| distinct[..i].contains(r))
+                || length_dst != number_reg
+            {
+                continue;
+            }
+
+            // The prefix and concat result have no observation beyond the Add
+            // and field append respectively. The projected string is observed
+            // only by `.length`. The mask register is dead after the And, so
+            // its slot can safely carry shift-count 8 until the projection.
+            if !local_uses_until_def_are(code, prefix_ip, prefix_reg, &[add_ip])
+                || !local_uses_until_def_are(code, add_ip, add_dst, &[append_ip])
+                || !local_uses_until_def_are(code, get_ip, get_dst, &[length_ip])
+                || !local_uses_until_def_are(code, bit_ip, mask_reg, &[])
+                || code[bit_ip + 1..length_ip]
+                    .iter()
+                    .any(|instr| local_sroa_dst(instr) == Some(number_reg))
+                || code[bit_ip + 1..length_ip]
+                    .iter()
+                    .any(|instr| local_sroa_dst(instr) == Some(mask_reg))
+            {
+                continue;
+            }
+
+            candidates.push(LocalConcatLenCandidate {
+                runtime: LocalSroaConcatLen {
+                    prefix_const,
+                    prefix_load_ip: prefix_ip as u32,
+                    prefix_reg,
+                    add_ip: add_ip as u32,
+                    add_dst,
+                    add_live_until: next_local_def(code, add_ip, add_dst),
+                    get_ip: get_ip as u32,
+                    get_dst,
+                    get_live_until: next_local_def(code, get_ip, get_dst),
+                    scratch: field.scratch,
+                },
+                append_ip: append_ip as u32,
+                number_reg,
+                shift_reg: mask_reg,
+                length_ip: length_ip as u32,
+                length_dst,
+                length_bias: bias as i32,
+            });
+        }
+    }
+    let [candidate] = candidates.as_slice() else {
+        return false;
+    };
+    let candidate = candidate.clone();
+
+    plan.proto.code[candidate.runtime.prefix_load_ip as usize] = Instr::LoadInt {
+        dst: candidate.runtime.prefix_reg,
+        val: 0,
+    };
+    plan.proto.code[candidate.runtime.add_ip as usize] = Instr::Move {
+        dst: candidate.runtime.scratch,
+        src: candidate.number_reg,
+    };
+    plan.proto.code[candidate.append_ip as usize] = Instr::LoadInt {
+        dst: candidate.shift_reg,
+        val: 8,
+    };
+    plan.proto.code[candidate.runtime.get_ip as usize] = Instr::AddInt {
+        dst: candidate.runtime.get_dst,
+        a: candidate.number_reg,
+        imm: candidate.length_bias,
+        upd: false,
+    };
+    plan.proto.code[candidate.length_ip as usize] = Instr::Bitwise {
+        dst: candidate.length_dst,
+        a: candidate.runtime.get_dst,
+        b: candidate.shift_reg,
+        op: crate::bytecode::BitwiseOp::Shr,
+    };
+    plan.runtime.concat_lens.push(candidate.runtime);
+    true
 }
 
 /// Plan for promoting a single stable object's fields to registers (SROA-lite,
@@ -4924,4 +5923,208 @@ pub(crate) fn plan_field_promotion(
         obj_idx,
         obj_version: heap.version_of(obj_idx),
     })
+}
+
+#[cfg(test)]
+mod local_sroa_tests {
+    use super::*;
+
+    const BODY: &str = r#"
+        function main() {
+          const rounds = 100;
+          let checksum = 0;
+          for (let i = 0; i < rounds; i++) {
+            const point = { x: i & 15, y: (i * 3) & 31, tag: "p" + (i & 7) };
+            const pair = [point.x + point.y, point.tag.length];
+            checksum = (checksum + pair[0] + pair[1]) | 0;
+          }
+          console.log(checksum);
+        }
+        main();
+    "#;
+
+    fn main_proto(src: &str) -> FuncProto {
+        let ast = crate::front::parse_script(src).expect("parse");
+        let program = crate::compile::compile_program(&ast, src).expect("compile");
+        program
+            .functions
+            .into_iter()
+            .find(|f| f.name == "main")
+            .expect("main proto")
+    }
+
+    fn loop_bounds(proto: &FuncProto) -> (u32, u32) {
+        proto
+            .code
+            .iter()
+            .enumerate()
+            .find_map(|(ip, instr)| match *instr {
+                Instr::Jump { target } if (target as usize) < ip => Some((target, ip as u32)),
+                _ => None,
+            })
+            .expect("loop backedge")
+    }
+
+    #[test]
+    fn local_sroa_rewrites_the_exact_fresh_object_and_dense_array_lane() {
+        let proto = main_proto(BODY);
+        let (start, end) = loop_bounds(&proto);
+        let plan = plan_local_sroa(&proto, start, end).expect("eligible local aggregate lane");
+        assert_eq!(plan.runtime.objects.len(), 1);
+        assert_eq!(plan.runtime.arrays.len(), 1);
+        assert_eq!(plan.runtime.objects[0].fields.len(), 3);
+        assert_eq!(plan.runtime.scratch.len(), 3);
+        assert!(!plan.proto.code[start as usize..=end as usize]
+            .iter()
+            .any(|i| matches!(
+                i,
+                Instr::NewObject { .. } | Instr::NewArray { .. } | Instr::AppendDataProp { .. }
+            )));
+        // `point.tag.length` remains a real primitive-string length read; the
+        // three point reads and two pair reads have become Move instructions.
+        assert_eq!(
+            plan.proto.code[start as usize..=end as usize]
+                .iter()
+                .filter(|i| matches!(i, Instr::GetProp { .. }))
+                .count(),
+            1
+        );
+        assert!(!plan.proto.code[start as usize..=end as usize]
+            .iter()
+            .any(|i| matches!(i, Instr::GetIndex { .. })));
+    }
+
+    #[test]
+    fn local_concat_length_virtualizes_only_the_exact_single_observation() {
+        let proto = main_proto(BODY);
+        let (start, end) = loop_bounds(&proto);
+        let mut plan = plan_local_sroa(&proto, start, end).expect("eligible local aggregate lane");
+        assert!(plan_local_concat_len(&proto, start, end, &mut plan));
+        assert_eq!(plan.runtime.concat_lens.len(), 1);
+        let concat = &plan.runtime.concat_lens[0];
+        assert!(matches!(
+            plan.proto.code[concat.add_ip as usize],
+            Instr::Move { dst, .. } if dst == concat.scratch
+        ));
+        assert!(matches!(
+            plan.proto.code[concat.get_ip as usize],
+            Instr::AddInt { imm: 758, .. }
+        ));
+        assert!(matches!(
+            plan.proto.code[concat.get_ip as usize + 1],
+            Instr::Bitwise {
+                op: crate::bytecode::BitwiseOp::Shr,
+                ..
+            }
+        ));
+        assert!(!plan.proto.code[start as usize..=end as usize]
+            .iter()
+            .any(|i| matches!(i, Instr::GetProp { .. })));
+
+        // Two reads mean two separately-live primitive strings. The aggregate
+        // lane remains valid, but the intentionally single-candidate concat
+        // fold declines without partially rewriting it.
+        let repeated = BODY.replace(
+            "point.tag.length];",
+            "point.tag.length + point.tag.length];",
+        );
+        let proto = main_proto(&repeated);
+        let (start, end) = loop_bounds(&proto);
+        let mut plan = plan_local_sroa(&proto, start, end).expect("base SROA remains eligible");
+        assert!(!plan_local_concat_len(&proto, start, end, &mut plan));
+        assert!(plan.runtime.concat_lens.is_empty());
+        assert!(plan.proto.code[start as usize..=end as usize]
+            .iter()
+            .any(|i| matches!(i, Instr::GetProp { .. })));
+    }
+
+    #[test]
+    fn local_concat_length_declines_wide_masks_and_non_ascii_prefixes() {
+        for src in [
+            BODY.replace("i & 7)", "i & 127)"),
+            BODY.replace("tag: \"p\"", "tag: \"\u{00e9}\""),
+        ] {
+            let proto = main_proto(&src);
+            let (start, end) = loop_bounds(&proto);
+            let mut plan =
+                plan_local_sroa(&proto, start, end).expect("base local SROA remains eligible");
+            assert!(!plan_local_concat_len(&proto, start, end, &mut plan));
+            assert!(plan.runtime.concat_lens.is_empty());
+        }
+    }
+
+    #[test]
+    fn local_sroa_declines_alias_escape_holes_and_reentrant_initializers() {
+        let escaped = BODY.replace(
+            "const pair = [point.x + point.y, point.tag.length];",
+            "const alias = point; const pair = [alias.x + point.y, point.tag.length];",
+        );
+        let proto = main_proto(&escaped);
+        let (start, end) = loop_bounds(&proto);
+        assert!(plan_local_sroa(&proto, start, end).is_none());
+
+        let hole = BODY.replace(
+            "const pair = [point.x + point.y, point.tag.length];",
+            "const pair = [, point.tag.length];",
+        );
+        let proto = main_proto(&hole);
+        let (start, end) = loop_bounds(&proto);
+        assert!(plan_local_sroa(&proto, start, end).is_none());
+
+        let call = BODY.replace("tag: \"p\" + (i & 7)", "tag: String(i)");
+        let proto = main_proto(&call);
+        let (start, end) = loop_bounds(&proto);
+        assert!(plan_local_sroa(&proto, start, end).is_none());
+    }
+
+    #[test]
+    fn local_sroa_declines_an_array_element_register_overwrite() {
+        let mut proto = main_proto(BODY);
+        let (start, end) = loop_bounds(&proto);
+        let (new_ip, arg_base) = proto.code[start as usize..=end as usize]
+            .iter()
+            .enumerate()
+            .find_map(|(off, instr)| match *instr {
+                Instr::NewArray { arg_base, .. } => Some((start as usize + off, arg_base)),
+                _ => None,
+            })
+            .expect("new array");
+        let clobber = proto.code[new_ip + 1..=end as usize]
+            .iter()
+            .position(|i| matches!(i, Instr::LoadInt { .. }))
+            .map(|off| new_ip + 1 + off)
+            .expect("post-allocation constant");
+        proto.code[clobber] = Instr::LoadInt {
+            dst: arg_base,
+            val: 0,
+        };
+        assert!(plan_local_sroa(&proto, start, end).is_none());
+    }
+
+    #[test]
+    fn local_sroa_declines_a_clean_exit_that_observes_the_elided_reference() {
+        let mut proto = main_proto(BODY);
+        let (start, end) = loop_bounds(&proto);
+        let object_dst = proto.code[start as usize..=end as usize]
+            .iter()
+            .find_map(|instr| match *instr {
+                Instr::NewObject { dst, .. } => Some(dst),
+                _ => None,
+            })
+            .expect("new object");
+        let post_move = proto.code[end as usize + 1..]
+            .iter()
+            .position(|i| matches!(i, Instr::Move { .. }))
+            .map(|off| end as usize + 1 + off)
+            .expect("post-loop move");
+        let dst = match proto.code[post_move] {
+            Instr::Move { dst, .. } => dst,
+            _ => unreachable!(),
+        };
+        proto.code[post_move] = Instr::Move {
+            dst,
+            src: object_dst,
+        };
+        assert!(plan_local_sroa(&proto, start, end).is_none());
+    }
 }

@@ -42,7 +42,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -144,7 +148,10 @@ fn m2_hole_and_oob_reads_agree_between_the_tiers() {
         console.log(cold + "|" + hot(a, 1) + "/" + hot(a, 9) + "/" + hot(a, 0));
         "#,
     );
-    assert_eq!(out[0], "undefined/undefined/undefined|undefined/undefined/0");
+    assert_eq!(
+        out[0],
+        "undefined/undefined/undefined|undefined/undefined/0"
+    );
 }
 
 #[test]
@@ -295,7 +302,10 @@ fn m4_a_non_canonical_numeric_key_is_never_answered_by_an_element() {
         console.log(s1.join(",") + "|" + s2.join(","));
         "#,
     );
-    assert_eq!(out[0], "1=e1,01=n01,05=n05,1.0=f,-0=m|01=n01,05=n05,1.0=f,-0=m");
+    assert_eq!(
+        out[0],
+        "1=e1,01=n01,05=n05,1.0=f,-0=m|01=n01,05=n05,1.0=f,-0=m"
+    );
 }
 
 #[test]

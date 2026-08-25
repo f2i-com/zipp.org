@@ -22,7 +22,10 @@ use crate::parse::parser::ParseOptions;
 use crate::parse::stmt::{parse, parse_exact};
 
 fn err_str(e: crate::parse::parser::SyntaxError) -> String {
-    format!("SyntaxError: {}", e.msg.strip_prefix("SyntaxError: ").unwrap_or(&e.msg))
+    format!(
+        "SyntaxError: {}",
+        e.msg.strip_prefix("SyntaxError: ").unwrap_or(&e.msg)
+    )
 }
 
 /// Conformance mode: parse a top-level script under the PURE Script goal.
@@ -47,7 +50,14 @@ pub(crate) fn pure_script_goal() -> bool {
 
 pub(crate) fn parse_script(src: &str) -> Result<Program, String> {
     let allow_return = !pure_script_goal();
-    parse(src, ParseOptions { allow_return, ..ParseOptions::script() }).map_err(err_str)
+    parse(
+        src,
+        ParseOptions {
+            allow_return,
+            ..ParseOptions::script()
+        },
+    )
+    .map_err(err_str)
 }
 
 pub(crate) fn parse_module(src: &str) -> Result<Program, String> {

@@ -184,9 +184,17 @@ impl<'p> Vm<'p> {
         self.materialize_regexp_result_prop_for_key(idx, key);
         // Module Namespace exotic [[GetOwnProperty]]: the descriptor's value is
         // the LIVE binding (the ObjMap snapshot may be stale).
-        if let Some(slot) = self.module_namespaces.get(&idx).and_then(|m| m.get(key)).copied()
+        if let Some(slot) = self
+            .module_namespaces
+            .get(&idx)
+            .and_then(|m| m.get(key))
+            .copied()
         {
-            let live = self.globals.get(slot as usize).copied().unwrap_or(Value::UNDEFINED);
+            let live = self
+                .globals
+                .get(slot as usize)
+                .copied()
+                .unwrap_or(Value::UNDEFINED);
             // A TDZ binding: this infallible path reports absent; the fallible
             // reflective entry points (Object/Reflect.getOwnPropertyDescriptor)
             // throw ReferenceError via ns_tdz_check BEFORE calling here.
@@ -205,7 +213,10 @@ impl<'p> Vm<'p> {
         // %ThrowTypeError% is born frozen), which makes them non-configurable.
         if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
             if let Some(v) = self.callable_intrinsic_value(obj, key) {
-                let cfg = !self.arr_props.get(&idx).map_or(false, |m| m.frozen || m.sealed);
+                let cfg = !self
+                    .arr_props
+                    .get(&idx)
+                    .map_or(false, |m| m.frozen || m.sealed);
                 return self.make_data_descriptor(v, false, false, cfg);
             }
         }
@@ -238,7 +249,9 @@ impl<'p> Vm<'p> {
             }
             if let Ok(i) = key.parse::<usize>() {
                 if i.to_string() == key && i < len {
-                    let ch = self.get_index(sval, Value::num(i as f64)).unwrap_or(Value::UNDEFINED);
+                    let ch = self
+                        .get_index(sval, Value::num(i as f64))
+                        .unwrap_or(Value::UNDEFINED);
                     return self.make_data_descriptor(ch, false, true, false);
                 }
             }
@@ -264,7 +277,12 @@ impl<'p> Vm<'p> {
                     // which materializes the same descriptor before applying a partial
                     // one over it.
                     if let Some((v, a)) = self.global_slot_binding_descriptor(key) {
-                        return self.make_data_descriptor(v, a.writable, a.enumerable, a.configurable);
+                        return self.make_data_descriptor(
+                            v,
+                            a.writable,
+                            a.enumerable,
+                            a.configurable,
+                        );
                     }
                     None
                 } else {
@@ -289,8 +307,10 @@ impl<'p> Vm<'p> {
                 // A special index override (defineProperty'd attrs/accessor) OR a
                 // named own property in arr_props wins; else a dense in-range index
                 // is a default { writable, enumerable, configurable } data property.
-                let ovr =
-                    self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|p| (m.attrs[p], m.vals[p])));
+                let ovr = self
+                    .arr_props
+                    .get(&idx)
+                    .and_then(|m| m.pos(key).map(|p| (m.attrs[p], m.vals[p])));
                 if ovr.is_some() {
                     ovr.map(|(a, v)| (a, mapped_v.unwrap_or(v)))
                 } else {
@@ -305,7 +325,12 @@ impl<'p> Vm<'p> {
                                 .arr_props
                                 .get(&idx)
                                 .map_or((false, false), |m| (m.frozen, m.sealed));
-                            return self.make_data_descriptor(v, !frozen, true, !(frozen || sealed));
+                            return self.make_data_descriptor(
+                                v,
+                                !frozen,
+                                true,
+                                !(frozen || sealed),
+                            );
                         }
                         _ => None,
                     }
@@ -346,13 +371,21 @@ impl<'p> Vm<'p> {
                 }
             }
             // A function's assigned own properties (`fn.x = y`).
-            HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => {
                 // A legacy sloppy function's own `caller`/`arguments`: a LIVE
                 // value read from the stack, reported with the fixed attributes
                 // engines give them (nothing about them is writable or
                 // configurable), so hasOwnProperty/gOPD agree with the read.
                 if self.fn_has_legacy_caller_prop(idx, key)
-                    && self.fn_props.get(&idx).map_or(true, |m| m.pos(key).is_none())
+                    && self
+                        .fn_props
+                        .get(&idx)
+                        .map_or(true, |m| m.pos(key).is_none())
                 {
                     let v = if key == "caller" {
                         self.legacy_fn_caller(idx)
@@ -361,7 +394,9 @@ impl<'p> Vm<'p> {
                     };
                     return self.make_data_descriptor(v, false, false, false);
                 }
-                self.fn_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i])))
+                self.fn_props
+                    .get(&idx)
+                    .and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i])))
             }
             // A TypedArray's integer-indexed element: a data descriptor
             // { writable:true, enumerable:true, configurable:true }. A named own
@@ -371,17 +406,24 @@ impl<'p> Vm<'p> {
                     let v = self.ta_element_get(idx, i);
                     return self.make_data_descriptor(v, true, true, true);
                 }
-                self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i])))
+                self.arr_props
+                    .get(&idx)
+                    .and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i])))
             }
             // Exotic objects (Map/Set/Date/Promise/…) keep defineProperty'd own
             // properties in the generic arr_props side table.
-            _ => self.arr_props.get(&idx).and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
+            _ => self
+                .arr_props
+                .get(&idx)
+                .and_then(|m| m.pos(key).map(|i| (m.attrs[i], m.vals[i]))),
         };
         match own {
             Some((a, raw)) if a.accessor => {
                 self.make_accessor_descriptor(raw, a.setter, a.enumerable, a.configurable)
             }
-            Some((a, raw)) => self.make_data_descriptor(raw, a.writable, a.enumerable, a.configurable),
+            Some((a, raw)) => {
+                self.make_data_descriptor(raw, a.writable, a.enumerable, a.configurable)
+            }
             None => Value::UNDEFINED,
         }
     }
@@ -451,7 +493,10 @@ impl<'p> Vm<'p> {
                     // global surface is its OWN binding table, and a
                     // ShadowRealm's globalThis must expose only configurable
                     // properties.)
-                    if idx == self.global_this && self.global_this != 0 && self.active_realm.is_none() {
+                    if idx == self.global_this
+                        && self.global_this != 0
+                        && self.active_realm.is_none()
+                    {
                         let mut seen: std::collections::HashSet<String> =
                             keys.iter().cloned().collect();
                         for n in ["NaN", "Infinity", "undefined"] {
@@ -460,8 +505,7 @@ impl<'p> Vm<'p> {
                             }
                         }
                         for (i, name) in self.program.global_names.iter().enumerate() {
-                            let v =
-                                self.globals.get(i).copied().unwrap_or(Value::UNINITIALIZED);
+                            let v = self.globals.get(i).copied().unwrap_or(Value::UNINITIALIZED);
                             if v.is_uninitialized()
                                 || is_hidden_key(name)
                                 || name == crate::vm::native::ANNEXB_REF_ERROR_NAME
@@ -606,7 +650,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::Bound { .. }
                 | HeapObj::BoundResolver { .. }
                 | HeapObj::CombinatorResolver { .. }
-                | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. } => {
                     // length, name, then prototype are created at function-definition
                     // time, so they keep their chronological-FIRST position even after
                     // a defineProperty moves the override into the fn_props bag (which
@@ -616,7 +661,9 @@ impl<'p> Vm<'p> {
                     // `prototype` is an ordinary property and stays in chronological
                     // order. (Matters for Object.keys once one is made enumerable.)
                     let fp_has = |k: &str| {
-                        self.fn_props.get(&idx).map_or(false, |m| m.pos(k).is_some())
+                        self.fn_props
+                            .get(&idx)
+                            .map_or(false, |m| m.pos(k).is_some())
                     };
                     let has_proto_early = self.callable_has_prototype(obj);
                     if has_length || fp_has("length") {
@@ -750,23 +797,40 @@ impl<'p> Vm<'p> {
         // in property-creation (insertion) order.
         if obj.is_heap() {
             let sym_keys: Vec<String> = match self.heap.get(obj.heap_index()) {
-                HeapObj::Object(m) => {
-                    m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect()
-                }
+                HeapObj::Object(m) => m
+                    .keys
+                    .iter()
+                    .filter(|k| k.starts_with("@@"))
+                    .cloned()
+                    .collect(),
                 // Callables keep their own props in fn_props; every other exotic
                 // heap kind (TypedArray, DataView, Map, Date, ...) keeps them in
                 // arr_props — surface their "@@" symbol keys too.
-                HeapObj::Func(_) | HeapObj::Closure { .. } | HeapObj::Bound { .. } | HeapObj::Wrapped { .. } | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => self
-                    .fn_props
-                    .get(&obj.heap_index())
-                    .map_or(Vec::new(), |m| {
-                        m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect()
-                    }),
+                HeapObj::Func(_)
+                | HeapObj::Closure { .. }
+                | HeapObj::Bound { .. }
+                | HeapObj::Wrapped { .. }
+                | HeapObj::Native(_)
+                | HeapObj::NativeClosure { .. } => {
+                    self.fn_props
+                        .get(&obj.heap_index())
+                        .map_or(Vec::new(), |m| {
+                            m.keys
+                                .iter()
+                                .filter(|k| k.starts_with("@@"))
+                                .cloned()
+                                .collect()
+                        })
+                }
                 _ => self
                     .arr_props
                     .get(&obj.heap_index())
                     .map_or(Vec::new(), |m| {
-                        m.keys.iter().filter(|k| k.starts_with("@@")).cloned().collect()
+                        m.keys
+                            .iter()
+                            .filter(|k| k.starts_with("@@"))
+                            .cloned()
+                            .collect()
                     }),
             };
             for k in sym_keys {
@@ -868,7 +932,9 @@ impl<'p> Vm<'p> {
                 return Value::NULL;
             }
             if let Ok(Some(trap)) = self.proxy_trap(handler, "getPrototypeOf") {
-                return self.call_value(trap, handler, &[target]).unwrap_or(Value::NULL);
+                return self
+                    .call_value(trap, handler, &[target])
+                    .unwrap_or(Value::NULL);
             }
             return self.object_get_prototype_of(target);
         }
@@ -928,7 +994,8 @@ impl<'p> Vm<'p> {
             | HeapObj::Bound { .. }
             | HeapObj::BoundResolver { .. }
             | HeapObj::CombinatorResolver { .. }
-            | HeapObj::Native(_) | HeapObj::NativeClosure { .. } => (None, false, 1),
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => (None, false, 1),
             HeapObj::Array(_) => (None, false, 2),
             _ => (None, false, 3),
         };
@@ -974,7 +1041,11 @@ impl<'p> Vm<'p> {
     /// success; the immutable-prototype exotic %Object.prototype% rejects any real
     /// change; a non-extensible target rejects a real change; and a new prototype
     /// chain that loops back to the target (a cycle) is rejected.
-    pub(crate) fn ordinary_set_prototype_of(&mut self, o: Value, proto: Value) -> Result<bool, Thrown> {
+    pub(crate) fn ordinary_set_prototype_of(
+        &mut self,
+        o: Value,
+        proto: Value,
+    ) -> Result<bool, Thrown> {
         // A Proxy routes through its [[SetPrototypeOf]] trap.
         if let Some(b) = self.proxy_set_prototype_of(o, proto)? {
             return Ok(b);
@@ -997,7 +1068,10 @@ impl<'p> Vm<'p> {
             | HeapObj::Symbol { .. }
             | HeapObj::BigInt(_)
             | HeapObj::BigIntBig(_) => false,
-            _ => self.arr_props.get(&o.heap_index()).map_or(true, |m| m.extensible),
+            _ => self
+                .arr_props
+                .get(&o.heap_index())
+                .map_or(true, |m| m.extensible),
         };
         if !extensible {
             return Ok(false);
@@ -1064,7 +1138,8 @@ impl<'p> Vm<'p> {
                 let handler_proto = self.call_value(trap, handler, &[target])?;
                 if handler_proto != Value::NULL && !self.is_object_value(handler_proto) {
                     return Err(Thrown(
-                        "TypeError: proxy 'getPrototypeOf' trap must return an object or null".into(),
+                        "TypeError: proxy 'getPrototypeOf' trap must return an object or null"
+                            .into(),
                     ));
                 }
                 // Non-extensible target: the trap result must equal the target's
@@ -1113,7 +1188,14 @@ impl<'p> Vm<'p> {
     pub(crate) fn is_compatible_property_descriptor(
         &mut self,
         extensible: bool,
-        desc: (Option<Value>, Option<Value>, Option<Value>, Option<bool>, Option<bool>, Option<bool>),
+        desc: (
+            Option<Value>,
+            Option<Value>,
+            Option<Value>,
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
+        ),
         current: Value,
     ) -> Result<bool, Thrown> {
         let (value, get, set, writable, enumerable, configurable) = desc;
@@ -1141,7 +1223,8 @@ impl<'p> Vm<'p> {
         }
         let d_accessor = get.is_some() || set.is_some();
         let d_data = value.is_some() || writable.is_some();
-        let c_accessor = self.has_own_property(current, "get") || self.has_own_property(current, "set");
+        let c_accessor =
+            self.has_own_property(current, "get") || self.has_own_property(current, "set");
         // A GENERIC descriptor (neither data nor accessor fields) may narrow
         // either kind; anything else must keep the existing kind.
         if (d_accessor || d_data) && d_accessor != c_accessor {
@@ -1185,13 +1268,24 @@ impl<'p> Vm<'p> {
     pub(crate) fn read_descriptor(
         &mut self,
         desc: Value,
-    ) -> Result<(Option<Value>, Option<Value>, Option<Value>, Option<bool>, Option<bool>, Option<bool>), Thrown>
-    {
+    ) -> Result<
+        (
+            Option<Value>,
+            Option<Value>,
+            Option<Value>,
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
+        ),
+        Thrown,
+    > {
         // ToPropertyDescriptor only requires Type(Obj) is Object — a Function (or
         // any other object) carrying value/get/set/... own props is a valid
         // descriptor, so accept any object, not just a plain HeapObj::Object.
         if !self.is_object_value(desc) {
-            return Err(Thrown("TypeError: Property description must be an object".into()));
+            return Err(Thrown(
+                "TypeError: Property description must be an object".into(),
+            ));
         }
         // Presence uses [[HasProperty]] (walks the prototype chain), so a
         // descriptor whose value/writable/enumerable/configurable/get/set is
@@ -1221,8 +1315,11 @@ impl<'p> Vm<'p> {
         } else {
             None
         };
-        let value =
-            if self.has_property_str_dyn(desc, "value")? { Some(self.get_prop(desc, "value")?) } else { None };
+        let value = if self.has_property_str_dyn(desc, "value")? {
+            Some(self.get_prop(desc, "value")?)
+        } else {
+            None
+        };
         let writable = if self.has_property_str_dyn(desc, "writable")? {
             let v = self.get_prop(desc, "writable")?;
             Some(self.truthy(v))
@@ -1299,7 +1396,11 @@ impl<'p> Vm<'p> {
     /// property is non-configurable (and, for `freeze`, that a data property is
     /// non-writable). Drives the isExtensible / ownKeys / getOwnPropertyDescriptor
     /// traps via the existing helpers.
-    pub(crate) fn proxy_test_integrity(&mut self, proxy: Value, freeze: bool) -> Result<bool, Thrown> {
+    pub(crate) fn proxy_test_integrity(
+        &mut self,
+        proxy: Value,
+        freeze: bool,
+    ) -> Result<bool, Thrown> {
         if self.proxy_is_extensible(proxy)? == Some(true) {
             return Ok(false);
         }
@@ -1319,8 +1420,8 @@ impl<'p> Vm<'p> {
                     return Ok(false);
                 }
                 if freeze {
-                    let is_data =
-                        self.has_own_property(desc, "value") || self.has_own_property(desc, "writable");
+                    let is_data = self.has_own_property(desc, "value")
+                        || self.has_own_property(desc, "writable");
                     let wr = self.get_prop(desc, "writable")?;
                     if is_data && self.truthy(wr) {
                         return Ok(false);
@@ -1330,5 +1431,4 @@ impl<'p> Vm<'p> {
         }
         Ok(true)
     }
-
 }

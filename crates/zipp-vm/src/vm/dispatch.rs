@@ -216,11 +216,10 @@ impl<'p> Vm<'p> {
             if ip == 0
                 && self.jit_enabled
                 && self.jit_recurse_depth == 0
-                // Runtime `eval`/`new Function` functions live past the program's
-                // function table (leaked boxes addressed via `func()`); the JIT
-                // indexes `program.functions` directly, so never JIT them â€” they
-                // always interpret.
-                && (func_id as usize) < self.main_func_count
+                // Main-program functions and loader-recorded ES-module ranges
+                // are immutable and JIT-safe. Ordinary `eval`/`new Function`
+                // ids share the runtime table but remain interpreter-only.
+                && self.jit_func_eligible(func_id)
                 // Dense tier check first: a known-ineligible (FN_DEAD) function
                 // pays ONE array read per call here, not 2-3 hash probes.
                 && self.jit.fn_state(func_id) != crate::codegen::FN_DEAD
@@ -296,7 +295,7 @@ impl<'p> Vm<'p> {
                             Instr::StoreGlobal { idx, .. }
                             | Instr::StoreGlobalStrict { idx, .. }
                             | Instr::StoreGlobalResolved { idx, .. } => {
-                                self.global_slot_directly_routable(idx)
+                                self.global_store_slot_directly_routable(idx)
                             }
                             _ => true,
                         });
@@ -327,6 +326,17 @@ impl<'p> Vm<'p> {
                             } else {
                                 rustc_hash::FxHashMap::default()
                             };
+                            let method_plan =
+                                if crate::codegen::tierc_method_global_inline_enabled() {
+                                    self.build_tierc_method_global_plan(
+                                        func_id,
+                                        0,
+                                        (proto_ref.code.len() - 1) as u32,
+                                        base,
+                                    )
+                                } else {
+                                    rustc_hash::FxHashMap::default()
+                                };
                             // Tier-C cross-call plan (B83) — also built before &mut self.jit.
                             let cross_plan = self.build_cross_call_plan(func_id);
                             self.jit.compile(
@@ -338,6 +348,7 @@ impl<'p> Vm<'p> {
                                 heap_helper_addrs,
                                 &const_strs,
                                 &leaf_plan,
+                                &method_plan,
                                 &cross_plan,
                             );
                         }
@@ -352,7 +363,7 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "aarch64"))]
             if ip == 0
                 && self.jit_enabled
-                && (func_id as usize) < self.main_func_count
+                && self.jit_func_eligible(func_id)
                 && self.jit.fn_state(func_id) != crate::codegen::FN_DEAD
                 && !self.func(func_id as usize).is_generator
                 && !self.func(func_id as usize).is_async
@@ -391,10 +402,10 @@ impl<'p> Vm<'p> {
                 }
                 match *instr {
                     Instr::LoadConst { dst, idx } => {
-                        let v = self.func(func_id as usize).constants[idx as usize];
-                        // String constants are stored with a sentinel; resolve
-                        // to a freshly-interned heap string the first time.
-                        let resolved = self.resolve_const(func_id, v);
+                        // String constants are sentinels. Short, immutable-safe
+                        // slots use the bounded rooted interpreter cache; every
+                        // ineligible/capped case is the historical fresh resolve.
+                        let resolved = self.resolve_const_slot(func_id, idx as u32);
                         self.set(base, dst, resolved);
                         ip += 1;
                     }
@@ -2807,7 +2818,7 @@ impl<'p> Vm<'p> {
                         let m = self.get(base, method);
                         if m.is_heap() {
                             let h = self.get(base, home);
-                            self.closure_home.insert(m.heap_index(), h);
+                            self.record_closure_home(m.heap_index(), h);
                         }
                         ip += 1;
                     }
@@ -3747,7 +3758,7 @@ impl<'p> Vm<'p> {
                         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
                         if self.jit_enabled
                             && self.jit_recurse_depth == 0
-                            && (func_id as usize) < self.main_func_count
+                            && self.jit_func_eligible(func_id)
                             && t < ip
                             // Dense region-state check first: a permanently
                             // blacklisted loop pays two array reads per
@@ -3827,7 +3838,7 @@ impl<'p> Vm<'p> {
                                         Instr::StoreGlobal { idx, .. }
                                         | Instr::StoreGlobalStrict { idx, .. }
                                         | Instr::StoreGlobalResolved { idx, .. } => {
-                                            self.global_slot_directly_routable(idx)
+                                            self.global_store_slot_directly_routable(idx)
                                         }
                                         _ => true,
                                     })
@@ -4004,6 +4015,17 @@ impl<'p> Vm<'p> {
                                     t as u32,
                                     region_end as u32,
                                 );
+                                // Bounded dense `array[key](args...)` leaves for
+                                // the INTEGER splice. Built from the same live
+                                // frame snapshot as TA/method plans; emitted code
+                                // independently revalidates every identity/version
+                                // tuple before running any region instruction.
+                                let computed_leaf_plan = self.build_dense_computed_leaf_plan(
+                                    func_id,
+                                    t as u32,
+                                    region_end as u32,
+                                    base,
+                                );
                                 // Q7 method-call inline plan (reads the live receiver
                                 // exemplar at each CallMethod's obj reg — needs `base`).
                                 let method_plan = self.build_method_inline_plan(
@@ -4011,6 +4033,7 @@ impl<'p> Vm<'p> {
                                     t as u32,
                                     region_end as u32,
                                     base,
+                                    false,
                                 );
                                 // Nursery: a baked trivial-setter arm stores
                                 // `this.<field>` CALL-FREE (`emit_mi_body`'s
@@ -4092,6 +4115,7 @@ impl<'p> Vm<'p> {
                                     &const_strs,
                                     &ta_plan,
                                     &leaf_plan,
+                                    &computed_leaf_plan,
                                     &method_plan,
                                     &cross_plan,
                                 );
@@ -4326,7 +4350,7 @@ impl<'p> Vm<'p> {
                         let callee = self.frames[frame_idx].callee;
                         if callee.is_heap() {
                             if let Some(&home) = self.closure_home.get(&callee.heap_index()) {
-                                self.closure_home.insert(v.heap_index(), home);
+                                self.record_closure_home(v.heap_index(), home);
                             }
                         }
                         // ... and the defining activation's `new.target` (an arrow
@@ -4347,7 +4371,7 @@ impl<'p> Vm<'p> {
                             }
                         };
                         if nt != Value::UNDEFINED {
-                            self.closure_new_target.insert(v.heap_index(), nt);
+                            self.record_closure_new_target(v.heap_index(), nt);
                         }
                         // ... and any dynamic EvalScope of the defining frame.
                         if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
@@ -5515,9 +5539,9 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
                         let ks = self.to_property_key(k)?; // ToPropertyKey (symbol â†’ prop_key, object â†’ ToString)
-                        // `delete obj[k]` does ToObject(base) after ToPropertyKey â€”
-                        // null/undefined throw a TypeError (other primitives box and
-                        // delete returns true).
+                                                           // `delete obj[k]` does ToObject(base) after ToPropertyKey â€”
+                                                           // null/undefined throw a TypeError (other primitives box and
+                                                           // delete returns true).
                         self.require_object_coercible(o)?;
                         let r = self.delete_property(o, &ks)?;
                         if strict && r == Value::bool(false) {
@@ -6128,13 +6152,9 @@ impl<'p> Vm<'p> {
                         // spreadability protocol is pristine. A failed proof is
                         // read-only and falls through to the unchanged call path.
                         if matches!(key, "slice" | "concat") {
-                            if let Some(exit) = self.try_array_copy_len_reduce(
-                                func_id,
-                                ip,
-                                base,
-                                recv,
-                                key,
-                            ) {
+                            if let Some(exit) =
+                                self.try_array_copy_len_reduce(func_id, ip, base, recv, key)
+                            {
                                 ip = exit;
                                 continue;
                             }
@@ -6857,18 +6877,6 @@ impl<'p> Vm<'p> {
                         }
                         let a = self.iter_to_array(s, count)?;
                         self.set(base, dst, a);
-                        ip += 1;
-                    }
-                    Instr::Random { dst } => {
-                        // xorshift64* â†’ a uniform double in [0, 1) (top 53 bits).
-                        let mut x = self.rng_state;
-                        x ^= x >> 12;
-                        x ^= x << 25;
-                        x ^= x >> 27;
-                        self.rng_state = x;
-                        let r = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
-                        let f = (r >> 11) as f64 / (1u64 << 53) as f64;
-                        self.set(base, dst, Value::num(f));
                         ip += 1;
                     }
                     Instr::DateNew {
@@ -7831,12 +7839,15 @@ impl<'p> Vm<'p> {
             str_append: jit_str_append as usize,
             str_append_index: crate::vm::coerce::jit_str_append_index_ascii as usize,
             call_method_ic: jit_call_method_ic as usize,
+            call_method_computed_dense: crate::vm::helpers_misc::jit_call_method_computed_dense
+                as usize,
             regexp_call_direct: crate::vm::helpers_misc::jit_regexp_call_direct as usize,
             string_regexp_call_direct: crate::vm::helpers_misc::jit_string_regexp_call_direct
                 as usize,
             has_own_call: crate::vm::helpers_misc::jit_has_own_call as usize,
             call_ic: jit_call_ic as usize,
             cross_call: crate::vm::helpers_misc::jit_cross_call as usize,
+            cross_call_same_proto2: crate::vm::helpers_misc::jit_cross_call_same_proto2 as usize,
             get_prop_slow: jit_get_prop_slow as usize,
             set_prop_slow: jit_set_prop_slow as usize,
             get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as usize,
@@ -7852,8 +7863,13 @@ impl<'p> Vm<'p> {
             str_index_of: crate::vm::helpers_misc::jit_str_index_of as usize,
             str_substring: crate::vm::helpers_misc::jit_str_substring as usize,
             coll_lookup: crate::vm::helpers_misc::jit_coll_lookup as usize,
+            coll_mutate: crate::vm::helpers_misc::jit_coll_mutate as usize,
+            str_upper_case: crate::vm::helpers_misc::jit_str_upper_case as usize,
             cell_set: jit_cell_set as usize,
             upval_set: jit_upval_set as usize,
+            tierc_upval_get: crate::vm::helpers_misc::jit_tierc_upval_get as usize,
+            tierc_upval_set: crate::vm::helpers_misc::jit_tierc_upval_set as usize,
+            tierc_upval_inc_i32: crate::vm::helpers_misc::jit_tierc_upval_inc_i32 as usize,
             get_index_concat: jit_get_index_concat as usize,
             upval_get: jit_upval_get as usize,
             forin_live: jit_forin_live as usize,
@@ -7980,7 +7996,30 @@ impl<'p> Vm<'p> {
         let outer_steps = self.jit_steps;
         #[cfg(feature = "instrument")]
         let _ = self.meter_lend();
+        // Tier C may access captures even when entered through a real frame.
+        // Install this activation's closure explicitly so the same native body
+        // also works for frame-free cross-calls; restore it before any bail is
+        // resumed in the interpreter.
+        let (active_closure, active_callee) = self
+            .frames
+            .last()
+            .filter(|f| f.func == func_id && f.base == base)
+            .map(|f| {
+                (
+                    f.closure,
+                    if f.callee.is_heap() {
+                        f.callee.heap_index()
+                    } else {
+                        NO_CLOSURE
+                    },
+                )
+            })
+            .unwrap_or((NO_CLOSURE, NO_CLOSURE));
+        let prior_tierc_closure = std::mem::replace(&mut self.jit_tierc_closure, active_closure);
+        let prior_tierc_callee = std::mem::replace(&mut self.jit_tierc_callee, active_callee);
         let (bits, bail) = unsafe { (*jitfn).run(regs_ptr, vm_ptr) };
+        self.jit_tierc_callee = prior_tierc_callee;
+        self.jit_tierc_closure = prior_tierc_closure;
         #[cfg(feature = "instrument")]
         {
             self.meter_return();
@@ -8055,11 +8094,13 @@ impl<'p> Vm<'p> {
         // which may compile NEW regions (rehashing `jit.regions` — any &Region
         // would dangle) or even evict THIS region (parked in `Jit::retired`,
         // so the mmap'd code stays alive for the in-flight run).
-        let (entry, field_plan, is_mem) = {
+        let (entry, field_plan, local_sroa, bounds, is_mem) = {
             let region = self.jit.get_region(func_id, entry_ip)?;
             (
                 region.entry(),
                 region.field_plan().cloned(),
+                region.local_sroa_plan().cloned(),
+                region.bounds(),
                 region.is_mem(),
             )
         };
@@ -8132,6 +8173,112 @@ impl<'p> Vm<'p> {
         }
         #[cfg(not(feature = "instrument"))]
         let meter_exit = false;
+
+        // A LOCAL-SROA native body ran over an index-preserving clone in which
+        // fresh aggregates were scalar homes. A clean exit proved those refs
+        // dead; an internal guard bail resumes ORIGINAL bytecode, so recreate
+        // every allocation that logically preceded the resume ip first. The
+        // planner keeps array inputs stable and object fields in otherwise-
+        // unused frame registers, all of which remain ordinary GC roots.
+        if let Some(ref p) = local_sroa {
+            let internal = resume >= bounds.0 && resume <= bounds.1;
+            if internal {
+                // The concat-length sub-lane carries only its proved bounded
+                // integer in `scratch`. Restore the exact original primitive
+                // string before materializing fields or resuming bytecode. A
+                // bail between the original LoadConst and Add also needs the
+                // prefix register restored; later bails need any Add/GetProp
+                // destination whose next original definition has not run yet.
+                for c in &p.concat_lens {
+                    let raw_prefix = self.func(func_id as usize).constants[c.prefix_const as usize];
+                    if c.prefix_load_ip < resume && resume <= c.add_ip {
+                        let prefix = self.resolve_const(func_id, raw_prefix);
+                        self.set(base, c.prefix_reg, prefix);
+                    } else if c.add_ip < resume {
+                        let number = self.get(base, c.scratch);
+                        let prefix = self.resolve_const(func_id, raw_prefix);
+                        let string = match self.add_values(prefix, number) {
+                            Ok(v) => v,
+                            Err(t) => {
+                                // Eligibility proves primitive string + Int, so
+                                // this is an invariant fallback rather than a
+                                // reachable coercion path. Preserve normal JIT
+                                // throw plumbing instead of panicking if that
+                                // invariant is ever widened incorrectly.
+                                let _ = self.jit_thrown_to_sentinel(t);
+                                Value::UNDEFINED
+                            }
+                        };
+                        self.set(base, c.scratch, string);
+                        if resume <= c.add_live_until {
+                            self.set(base, c.add_dst, string);
+                        }
+                        if c.get_ip < resume && resume <= c.get_live_until {
+                            self.set(base, c.get_dst, string);
+                        }
+                    }
+                }
+
+                enum PendingAlloc {
+                    Object(usize),
+                    Array(usize),
+                }
+                let mut pending = Vec::new();
+                for (i, o) in p.objects.iter().enumerate() {
+                    if o.alloc_ip < resume {
+                        pending.push((o.alloc_ip, PendingAlloc::Object(i)));
+                    }
+                }
+                for (i, a) in p.arrays.iter().enumerate() {
+                    if a.alloc_ip < resume {
+                        pending.push((a.alloc_ip, PendingAlloc::Array(i)));
+                    }
+                }
+                pending.sort_by_key(|(ip, _)| *ip);
+                for (_, alloc) in pending {
+                    match alloc {
+                        PendingAlloc::Object(i) => {
+                            let o = &p.objects[i];
+                            let completed: Vec<(String, Value)> = o
+                                .fields
+                                .iter()
+                                .filter(|f| f.append_ip < resume)
+                                .map(|f| {
+                                    (
+                                        self.func(func_id as usize).string_constants
+                                            [f.name as usize]
+                                            .clone(),
+                                        self.get(base, f.scratch),
+                                    )
+                                })
+                                .collect();
+                            let mut map = ObjMap::with_capacity(o.hint as usize);
+                            for (name, value) in completed {
+                                map.push_data(name, value);
+                            }
+                            let idx = self.heap.alloc(HeapObj::Object(Box::new(map)));
+                            self.realm_born(idx, self.obj_proto);
+                            self.set(base, o.dst, Value::heap(idx));
+                        }
+                        PendingAlloc::Array(i) => {
+                            let a = &p.arrays[i];
+                            let items: Vec<Value> = (0..a.argc)
+                                .map(|j| self.get(base, a.arg_base + j))
+                                .collect();
+                            let idx = self.heap.alloc(HeapObj::Array(items));
+                            self.realm_born(idx, self.arr_proto);
+                            self.set(base, a.dst, Value::heap(idx));
+                        }
+                    }
+                }
+            }
+            // Scratch is dead on a clean exit and has been copied into any
+            // materialized object on a bail. Clear it to avoid retaining the
+            // last iteration's heap values until this activation returns.
+            for &r in &p.scratch {
+                self.set(base, r, Value::UNDEFINED);
+            }
+        }
 
         // â”€â”€ post-run sync â”€â”€ flush the pool globals back to the object's fields,
         // so the interpreter (which resumes on the ORIGINAL bytecode, reading the

@@ -15,7 +15,11 @@
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
-    assert!(out.error.is_none(), "unexpected runtime error: {:?}", out.error);
+    assert!(
+        out.error.is_none(),
+        "unexpected runtime error: {:?}",
+        out.error
+    );
     out.output
 }
 
@@ -61,13 +65,22 @@ fn bounded_quantifier_matches_inside_failed_run() {
 #[test]
 fn unbounded_kv_hits_and_misses() {
     assert_eq!(
-        all_matches(r"/([a-z]+)=(\d+)/", r#""key=123 plainword abc= =5 a1b=2 z=0""#),
+        all_matches(
+            r"/([a-z]+)=(\d+)/",
+            r#""key=123 plainword abc= =5 a1b=2 z=0""#
+        ),
         r#"[[0,"key=123","key","123"],[28,"b=2","b","2"],[32,"z=0","z","0"]]"#
     );
-    assert_eq!(all_matches(r"/([a-z]+)=(\d+)/", r#""no equals here at all""#), "[]");
+    assert_eq!(
+        all_matches(r"/([a-z]+)=(\d+)/", r#""no equals here at all""#),
+        "[]"
+    );
     // Run ends exactly at string end (skip hint == end of input).
     assert_eq!(all_matches(r"/([a-z]+)=(\d+)/", r#""trailingword""#), "[]");
-    assert_eq!(all_matches(r"/([a-z]+)=(\d+)/", r#""x=1trailingword""#), r#"[[0,"x=1","x","1"]]"#);
+    assert_eq!(
+        all_matches(r"/([a-z]+)=(\d+)/", r#""x=1trailingword""#),
+        r#"[[0,"x=1","x","1"]]"#
+    );
     // Empty string.
     assert_eq!(all_matches(r"/([a-z]+)=(\d+)/", r#""""#), "[]");
 }
@@ -81,7 +94,10 @@ fn min_greater_than_one_unbounded() {
         all_matches(r"/(\d{2,})!/", r#""1! 12! 12345 999!""#),
         r#"[[3,"12!","12"],[13,"999!","999"]]"#
     );
-    assert_eq!(all_matches(r"/([a-z]{3,})=/", r#""ab=cd= xyz=""#), r#"[[7,"xyz=","xyz"]]"#);
+    assert_eq!(
+        all_matches(r"/([a-z]{3,})=/", r#""ab=cd= xyz=""#),
+        r#"[[7,"xyz=","xyz"]]"#
+    );
 }
 
 /// Overlapping classes: 'e' is inside [a-z], so /([a-z]+)e/ must NOT be
@@ -93,7 +109,10 @@ fn overlapping_follow_still_backtracks() {
         r#"[[0,"tree","tre"],[5,"bee","be"]]"#
     );
     // \w includes digits: /(\w+)(\d)/ needs backtracking.
-    assert_eq!(all_matches(r"/(\w+)(\d)/", r#""abc123""#), r#"[[0,"abc123","abc12","3"]]"#);
+    assert_eq!(
+        all_matches(r"/(\w+)(\d)/", r#""abc123""#),
+        r#"[[0,"abc123","abc12","3"]]"#
+    );
 }
 
 /// Patterns with lookaround or backreferences are excluded from the pass
@@ -224,9 +243,17 @@ fn corpus_matches_node() {
         .arg(CORPUS_JS)
         .output()
         .expect("node on PATH");
-    assert!(node.status.success(), "node failed: {}", String::from_utf8_lossy(&node.stderr));
+    assert!(
+        node.status.success(),
+        "node failed: {}",
+        String::from_utf8_lossy(&node.stderr)
+    );
     let theirs = String::from_utf8_lossy(&node.stdout);
-    assert_eq!(ours.trim(), theirs.trim(), "corpus match sets diverge from node");
+    assert_eq!(
+        ours.trim(),
+        theirs.trim(),
+        "corpus match sets diverge from node"
+    );
 }
 
 /// The whole file again with `ZIPP_NO_RX_POSSESS=1`. The switch latches into

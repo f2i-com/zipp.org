@@ -109,14 +109,26 @@ impl<'a> FnCompiler<'a> {
         let mut end_jumps = Vec::new();
         for &obj in objs {
             let flag = self.temp();
-            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            self.emit(Instr::WithHas {
+                dst: flag,
+                obj,
+                name: nidx,
+            });
             let jf = self.here();
-            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.emit(Instr::JumpIfFalse {
+                cond: flag,
+                target: 0,
+            });
             self.next_reg -= 1; // reclaim the flag temp (dead after the branch)
-            // GetBindingValue re-checks HasProperty (the WithHas @@unscopables
-            // getter may delete the binding); strictness is the REFERENCE
-            // site's, not the with statement's.
-            self.emit(Instr::WithGet { dst, obj, name: nidx, strict: self.cx.in_strict });
+                                // GetBindingValue re-checks HasProperty (the WithHas @@unscopables
+                                // getter may delete the binding); strictness is the REFERENCE
+                                // site's, not the with statement's.
+            self.emit(Instr::WithGet {
+                dst,
+                obj,
+                name: nidx,
+                strict: self.cx.in_strict,
+            });
             let je = self.here();
             self.emit(Instr::Jump { target: 0 });
             end_jumps.push(je);
@@ -140,9 +152,16 @@ impl<'a> FnCompiler<'a> {
         let mut chain_done = Vec::new();
         for &obj in objs {
             let flag = self.temp();
-            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            self.emit(Instr::WithHas {
+                dst: flag,
+                obj,
+                name: nidx,
+            });
             let jf = self.here();
-            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.emit(Instr::JumpIfFalse {
+                cond: flag,
+                target: 0,
+            });
             self.next_reg -= 1; // reclaim the flag temp
             self.emit(Instr::WithGet {
                 dst: callee_reg,
@@ -150,7 +169,10 @@ impl<'a> FnCompiler<'a> {
                 name: nidx,
                 strict: self.cx.in_strict,
             });
-            self.emit(Instr::Move { dst: this_reg, src: obj });
+            self.emit(Instr::Move {
+                dst: this_reg,
+                src: obj,
+            });
             let jd = self.here();
             self.emit(Instr::Jump { target: 0 });
             chain_done.push(jd);
@@ -161,7 +183,10 @@ impl<'a> FnCompiler<'a> {
         let b = self.resolve(name);
         let r = self.load_binding(&b, callee_reg);
         if r != callee_reg {
-            self.emit(Instr::Move { dst: callee_reg, src: r });
+            self.emit(Instr::Move {
+                dst: callee_reg,
+                src: r,
+            });
         }
         self.emit(Instr::LoadUndefined { dst: this_reg });
         let end = self.here();
@@ -198,11 +223,23 @@ impl<'a> FnCompiler<'a> {
         let mut end_jumps = Vec::new();
         for &obj in objs {
             let flag = self.temp();
-            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            self.emit(Instr::WithHas {
+                dst: flag,
+                obj,
+                name: nidx,
+            });
             let jf = self.here();
-            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.emit(Instr::JumpIfFalse {
+                cond: flag,
+                target: 0,
+            });
             self.next_reg -= 1;
-            self.emit(Instr::WithSet { obj, name: nidx, val: src, strict: self.cx.in_strict });
+            self.emit(Instr::WithSet {
+                obj,
+                name: nidx,
+                val: src,
+                strict: self.cx.in_strict,
+            });
             let je = self.here();
             self.emit(Instr::Jump { target: 0 });
             end_jumps.push(je);
@@ -233,11 +270,21 @@ impl<'a> FnCompiler<'a> {
         let mut end_jumps = Vec::new();
         for &obj in objs {
             let flag = self.temp();
-            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            self.emit(Instr::WithHas {
+                dst: flag,
+                obj,
+                name: nidx,
+            });
             let jf = self.here();
-            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.emit(Instr::JumpIfFalse {
+                cond: flag,
+                target: 0,
+            });
             self.next_reg -= 1;
-            self.emit(Instr::Move { dst: target, src: obj });
+            self.emit(Instr::Move {
+                dst: target,
+                src: obj,
+            });
             let je = self.here();
             self.emit(Instr::Jump { target: 0 });
             end_jumps.push(je);
@@ -259,8 +306,16 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn with_store_resolved(&mut self, name: &str, target: Reg, src: Reg) {
         let nidx = self.string_name(name);
         let jf = self.here();
-        self.emit(Instr::JumpIfFalse { cond: target, target: 0 });
-        self.emit(Instr::WithSet { obj: target, name: nidx, val: src, strict: self.cx.in_strict });
+        self.emit(Instr::JumpIfFalse {
+            cond: target,
+            target: 0,
+        });
+        self.emit(Instr::WithSet {
+            obj: target,
+            name: nidx,
+            val: src,
+            strict: self.cx.in_strict,
+        });
         let je = self.here();
         self.emit(Instr::Jump { target: 0 });
         let stat = self.here();
@@ -330,11 +385,23 @@ impl<'a> FnCompiler<'a> {
         let mut end_jumps = Vec::new();
         for &obj in objs {
             let flag = self.temp();
-            self.emit(Instr::WithHas { dst: flag, obj, name: nidx });
+            self.emit(Instr::WithHas {
+                dst: flag,
+                obj,
+                name: nidx,
+            });
             let jf = self.here();
-            self.emit(Instr::JumpIfFalse { cond: flag, target: 0 });
+            self.emit(Instr::JumpIfFalse {
+                cond: flag,
+                target: 0,
+            });
             self.next_reg -= 1;
-            self.emit(Instr::DeleteProp { dst, obj, name: nidx, strict: false });
+            self.emit(Instr::DeleteProp {
+                dst,
+                obj,
+                name: nidx,
+                strict: false,
+            });
             let je = self.here();
             self.emit(Instr::Jump { target: 0 });
             end_jumps.push(je);
@@ -351,5 +418,4 @@ impl<'a> FnCompiler<'a> {
         }
         dst
     }
-
 }

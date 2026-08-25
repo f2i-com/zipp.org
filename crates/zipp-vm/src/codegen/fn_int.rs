@@ -179,7 +179,8 @@ pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
         // aliased counter could never reach its bound, and an `xh` panic when
         // the register had no home at all.
         | Instr::MathOp { dst, .. }
-        | Instr::CallMethod { dst, .. } => Some(dst),
+        | Instr::CallMethod { dst, .. }
+        | Instr::CallMethodComputed { dst, .. } => Some(dst),
         // ToPropKey DEFINES its dst (for a numeric key it is the identity — the
         // regalloc tier emits it as a register copy). Absent from this list, the
         // dst looked never-defined, landed in `ro_live_in`, and one `x[i] *= v`

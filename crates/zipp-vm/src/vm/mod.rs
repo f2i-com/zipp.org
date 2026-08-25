@@ -228,6 +228,15 @@ pub(crate) enum Microtask {
         activation: u32,
         input: Resume,
     },
+    /// A native intrinsic-`Promise.all` resolve-element job. This is the same
+    /// FIFO job as the `CombinatorResolver` callback path, represented directly
+    /// so the unobservable resolver does not need a heap object of its own.
+    CombinatorStep {
+        combinator: u32,
+        index: u32,
+        kind: ReactionKind,
+        arg: Value,
+    },
     /// PromiseResolveThenableJob: resolving `promise` with a thenable defers
     /// `then.call(thenable, resolveFn, rejectFn)` to this microtask (spec ordering).
     ThenableJob {
@@ -293,6 +302,231 @@ pub(crate) struct RegexpLastLazy {
 pub(crate) struct RegexpResultProps {
     /// `index`, `input`, `groups`, and optional `indices`, in creation order.
     pub values: [Value; 4],
+}
+
+/// Storage for object-method `[[HomeObject]]` edges.
+///
+/// Heap indices are dense slot ids, so the default uses a direct vector plus an
+/// authoritative presence bitmap. An absent slot's value is cleared as well,
+/// but the bitmap (rather than a `Value` sentinel) distinguishes absence: every
+/// possible `Value`, including `undefined`, remains a valid strong edge. The
+/// vectors grow only to the heap's own high-water slot id and, like the heap,
+/// retain that capacity after collection.
+///
+/// The HashMap variant is retained behind `ZIPP_NO_DENSE_CLOSURE_HOME=1` for
+/// same-binary A/B and as a simple differential oracle. Both variants expose
+/// the same operations and preserve the edge's GC semantics exactly.
+#[derive(Default)]
+struct DenseClosureHomes {
+    values: Vec<Value>,
+    present: Vec<u64>,
+    len: usize,
+}
+
+impl DenseClosureHomes {
+    #[inline]
+    fn position(key: u32) -> (usize, u64) {
+        let slot = key as usize;
+        (slot >> 6, 1u64 << (slot & 63))
+    }
+
+    #[inline]
+    fn contains(&self, key: u32) -> bool {
+        let (word, mask) = Self::position(key);
+        self.present
+            .get(word)
+            .is_some_and(|present| present & mask != 0)
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    fn retain_scan_cost(&self) -> usize {
+        // `retain` reads each high-water bitmap word and invokes `keep` once
+        // per populated slot. Include both pieces so a very sparse old table
+        // prefers direct removals during a minor.
+        self.present.len().saturating_add(self.len)
+    }
+
+    #[inline]
+    fn get(&self, key: &u32) -> Option<&Value> {
+        if self.contains(*key) {
+            // `insert` grows `values` before publishing the presence bit.
+            Some(&self.values[*key as usize])
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, key: u32, value: Value) -> Option<Value> {
+        let slot = key as usize;
+        let needed = slot
+            .checked_add(1)
+            .expect("closure-home slot index overflow");
+        if self.values.len() < needed {
+            self.values.resize(needed, Value::UNDEFINED);
+        }
+        let (word, mask) = Self::position(key);
+        if self.present.len() <= word {
+            self.present.resize(word + 1, 0);
+        }
+
+        let old = if self.present[word] & mask != 0 {
+            Some(self.values[slot])
+        } else {
+            self.present[word] |= mask;
+            self.len += 1;
+            None
+        };
+        self.values[slot] = value;
+        old
+    }
+
+    #[inline]
+    fn remove(&mut self, key: &u32) -> Option<Value> {
+        let slot = *key as usize;
+        let (word, mask) = Self::position(*key);
+        let present = self.present.get_mut(word)?;
+        if *present & mask == 0 {
+            return None;
+        }
+        *present &= !mask;
+        self.len -= 1;
+        Some(std::mem::replace(&mut self.values[slot], Value::UNDEFINED))
+    }
+
+    fn retain<F: FnMut(&u32, &mut Value) -> bool>(&mut self, mut keep: F) {
+        for word_idx in 0..self.present.len() {
+            // Walk only populated slots. Keep a snapshot because removals update
+            // the authoritative word while the iteration is in progress.
+            let mut occupied = self.present[word_idx];
+            while occupied != 0 {
+                let bit = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
+                let slot = (word_idx << 6) + bit;
+                let key = slot as u32;
+                if !keep(&key, &mut self.values[slot]) {
+                    self.present[word_idx] &= !(1u64 << bit);
+                    self.values[slot] = Value::UNDEFINED;
+                    self.len -= 1;
+                }
+            }
+        }
+    }
+}
+
+enum ClosureHomeTable {
+    Dense(DenseClosureHomes),
+    Map(std::collections::HashMap<u32, Value>),
+}
+
+impl Default for ClosureHomeTable {
+    fn default() -> Self {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        let dense = match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var_os("ZIPP_NO_DENSE_CLOSURE_HOME").is_none();
+                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        };
+        if dense {
+            Self::Dense(DenseClosureHomes::default())
+        } else {
+            Self::Map(std::collections::HashMap::new())
+        }
+    }
+}
+
+impl ClosureHomeTable {
+    #[inline]
+    fn get(&self, key: &u32) -> Option<&Value> {
+        match self {
+            Self::Dense(table) => table.get(key),
+            Self::Map(table) => table.get(key),
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, key: u32, value: Value, heap_slots: usize) -> Option<Value> {
+        // All production callers pass a freshly allocated or otherwise live
+        // heap holder. Keep that invariant explicit so a corrupt u32 can never
+        // turn the direct-index backend into an attacker-sized allocation.
+        assert!(
+            (key as usize) < heap_slots,
+            "closure-home holder is outside the VM heap"
+        );
+        match self {
+            Self::Dense(table) => table.insert(key, value),
+            Self::Map(table) => table.insert(key, value),
+        }
+    }
+
+    #[inline]
+    fn remove(&mut self, key: &u32) -> Option<Value> {
+        match self {
+            Self::Dense(table) => table.remove(key),
+            Self::Map(table) => table.remove(key),
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn contains_key(&self, key: &u32) -> bool {
+        self.get(key).is_some()
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(table) => table.len(),
+            Self::Map(table) => table.len(),
+        }
+    }
+
+    fn retain<F: FnMut(&u32, &mut Value) -> bool>(&mut self, keep: F) {
+        match self {
+            Self::Dense(table) => table.retain(keep),
+            Self::Map(table) => table.retain(keep),
+        }
+    }
+
+    /// Drop entries whose holder slot was reclaimed by a minor. The dense
+    /// backend's retain scans its high-water bitmap and visits populated entries;
+    /// HashMap's retain walks bucket capacity. Choose between a table scan and
+    /// O(1) removals using the appropriate cost.
+    fn prune_freed(&mut self, freed: &[u32], freed_bits: &[bool]) {
+        let scan_cost = match self {
+            Self::Dense(table) => table.retain_scan_cost(),
+            Self::Map(table) => table.capacity(),
+        };
+        if scan_cost <= freed.len() {
+            self.retain(|&key, _| !freed_bits[key as usize]);
+        } else {
+            for key in freed {
+                self.remove(key);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn dense_for_test() -> Self {
+        Self::Dense(DenseClosureHomes::default())
+    }
+
+    #[cfg(test)]
+    fn map_for_test() -> Self {
+        Self::Map(std::collections::HashMap::new())
+    }
 }
 
 pub struct Vm<'p> {
@@ -361,12 +595,26 @@ pub struct Vm<'p> {
     /// the serializer skip the per-value `get_prop(v,"toJSON")` chain walk for a
     /// plain object/array when no default prototype carries `toJSON`.
     json_default_tj: Option<(u32, u32, bool)>,
-    /// Interpreter inline caches: per MAIN-program function (outer index =
-    /// func_id), per instruction (inner index = ip), a lazily-allocated
+    /// Interpreter inline caches: per main-program or loader-recorded module
+    /// function (outer index = func_id), per instruction (inner index = ip), a lazily-allocated
     /// per-site cache for the hot call/property paths. See `vm/ic.rs` for the
     /// guard model; intentionally NOT a GC root (entries are validated or
     /// re-read against live, guard-checked objects before any use).
     site_ics: Vec<Option<Box<[Option<Box<ic::SiteIc>>]>>>,
+    /// Bounded interpreter `LoadConst` memo for short string literals, keyed by
+    /// the immutable unified `(func_id, constant-slot)` pair. JavaScript strings
+    /// are primitives, so repeated loads may share a representation; entries
+    /// are explicit GC roots because the map is VM-internal. See
+    /// `const_cache.rs` for the mutation exclusion and resource bounds.
+    const_string_cache: rustc_hash::FxHashMap<u64, Value>,
+    /// Per-function result of the conservative in-place-string-op scan. A
+    /// function that can mutate a compiler-proved-unique string buffer must keep
+    /// receiving a fresh literal representation, so none of its literals enter
+    /// the shared cache.
+    const_string_cache_funcs: rustc_hash::FxHashMap<u32, bool>,
+    /// Latched at VM construction so `ZIPP_NO_CONST_STRING_CACHE=1` is a
+    /// same-binary ablation with no environment lookup in the dispatch loop.
+    const_string_cache_enabled: bool,
     heap: Heap,
     globals: Vec<Value>,
     /// One contiguous register file shared by all live frames; each frame owns
@@ -469,7 +717,8 @@ pub struct Vm<'p> {
     /// per source call site, keyed by (function id, per-function site index). The
     /// cached objects are permanent GC roots (they live as long as the realm).
     template_cache: std::collections::HashMap<(u32, u32), Value>,
-    /// `(JIT ic site, receiver shape) -> slot`, for the JIT's GetProp MISS path.
+    /// `(JIT ic site, receiver shape) -> slot`, for the JIT's named-property
+    /// Get/Set MISS paths.
     ///
     /// The JIT's cache ways are keyed on receiver IDENTITY, so a site reading one
     /// property from many objects of the SAME shape thrashes all eight ways and
@@ -477,11 +726,12 @@ pub struct Vm<'p> {
     /// 100% miss thereafter. Every one of those misses then re-ran `map.pos(key)`,
     /// a string scan, to rediscover a slot the shape already determines.
     ///
-    /// Sound for the same reason the interpreter's shape guard is: a JIT GetProp
-    /// site's key is a compile-time constant (`string_constants[name]`), and a
-    /// shape fixes the whole key -> slot mapping, so `(site, shape)` names one
-    /// slot for all time. Bounded, because shapes are bounded (`shape::SHAPE_MAX`)
-    /// and sites are finite; entries are pure memo and may be dropped freely.
+    /// Sound for the same reason the interpreter's shape guard is: a named
+    /// property's key is a compile-time constant (`string_constants[name]`),
+    /// and a shape fixes the whole key -> slot mapping. Both helpers still
+    /// revalidate live bounds, key and descriptor before reading/writing.
+    /// Bounded because shapes and sites are bounded; pure memo entries may be
+    /// dropped freely.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_shape_slot: rustc_hash::FxHashMap<(u32, u32), u32>,
     /// Prototype objects known to contribute NOTHING to a `for-in`: no own key
@@ -729,8 +979,8 @@ pub struct Vm<'p> {
     /// execution — sound only for slots NO bytecode store can ever hit (see
     /// `bytecode_stored_slots`), which makes the enumerated Rust writers
     /// exhaustive. Sized with `globals` at boot and NEVER reallocated (the JIT
-    /// bakes element addresses); late `globals.push` module slots have no
-    /// generation and are never keyable.
+    /// bakes element addresses); module bookkeeping draws from that same
+    /// preallocated pool.
     global_gens: Vec<u32>,
     /// Global slots ANY bytecode store op targets (StoreGlobal / -Strict /
     /// -Resolved / -Dyn / EvalScopeSet), collected over the main program at
@@ -1190,15 +1440,16 @@ pub struct Vm<'p> {
     /// `[[HomeObject]]` for OBJECT-LITERAL methods/accessors (and arrows nested in
     /// them), keyed by the closure's heap index → the object the method was defined
     /// in. `super.x` in such a method resolves via GetPrototypeOf(home). Class
-    /// methods use the compile-time `home_class_id` path instead. Values are GC roots;
-    /// dead closure keys are pruned on sweep.
-    closure_home: std::collections::HashMap<u32, Value>,
+    /// methods use the compile-time `home_class_id` path instead. GC treats each
+    /// entry as a strong edge FROM the keyed closure to the value; dead closure/home
+    /// cycles are collectible, and dead keys are pruned on sweep.
+    closure_home: ClosureHomeTable,
     /// Lexically-captured `new.target` for ARROW closures created inside a
     /// constructed activation (and arrows nested in those), keyed by the
     /// closure's heap index. An arrow's own frame has no [[NewTarget]];
     /// `new.target` inside it must observe the enclosing function's. Only
-    /// non-undefined values are recorded. Values are GC roots; dead closure
-    /// keys are pruned on sweep (mirrors `closure_home`).
+    /// non-undefined values are recorded. GC traces the value from a reachable
+    /// keyed closure; dead keys are pruned on sweep (mirrors `closure_home`).
     closure_new_target: std::collections::HashMap<u32, Value>,
     /// The lazily-compiled `Array.fromAsync` JS polyfill (an async function value).
     /// Compiled on first call via `do_eval`, then cached + GC-rooted. `None` until
@@ -1423,18 +1674,12 @@ pub struct Vm<'p> {
     /// Native JIT tier (`feature = "jit"`): the mature x86-64 multi-tier backend
     /// and the guarded ARM64 integer baseline. Both share this VM's register
     /// window and bail to the interpreter at an exact bytecode ip.
-    #[cfg(all(
-        feature = "jit",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     jit: crate::codegen::Jit,
     /// JIT on/off (set from `ZIPP_NOJIT` env var at construction) — lets a
     /// single binary A/B the JIT against the pure interpreter for honest
     /// measurement.
-    #[cfg(all(
-        feature = "jit",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
+    #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
     jit_enabled: bool,
     /// Current native self-recursion depth (guards `jit_self_call`).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1448,6 +1693,21 @@ pub struct Vm<'p> {
     /// pointers after every call helper).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_call_depth: u32,
+    /// Closure heap index for the currently executing Tier-C native activation.
+    /// A frame-free cross-call has no `Frame` for UpvalGet/Set to consult, so
+    /// the entry helper installs this value for exactly the native call's
+    /// dynamic extent and restores the previous value on return/re-entry. The
+    /// GC scans it as an explicit root while native code is suspended in a
+    /// re-entrant helper.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_tierc_closure: u32,
+    /// Heap index of the callable whose Tier-C body is currently executing.
+    /// Unlike `jit_tierc_closure`, this is populated for both plain `Func` and
+    /// captureful `Closure` values. Allocation helpers use it to preserve the
+    /// active callee's realm and inherited EvalScope during frame-free native
+    /// cross-calls. Explicitly rooted while native code is active.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    jit_tierc_callee: u32,
     /// One-shot flag a region call helper sets when its bail is NOT a
     /// region-quality signal (depth-cap deopt, or a throw the call legitimately
     /// produced): `try_run_osr` consumes it and skips the deopt-eviction count
@@ -1537,11 +1797,14 @@ mod cldr_alias_data;
 mod cldr_en;
 mod coerce;
 mod collections;
+mod const_cache;
 mod construct;
 mod dtf_pattern;
 mod enum_stream;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod field_stream;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod function_literal_jit;
 mod gc;
 mod helpers_datetime;
 mod helpers_json;
@@ -1553,6 +1816,8 @@ mod iterhelpers;
 mod locale_tag;
 mod misc_methods;
 pub(crate) mod native;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+mod object_literal_jit;
 mod proxy_regexp;
 mod segmenter;
 mod special_casing;
@@ -1560,6 +1825,7 @@ mod string_ops;
 mod temporal;
 mod typedarray;
 mod values;
+
 pub(crate) use async_runtime::async_inline_await_stats;
 pub(crate) use async_runtime::async_stats;
 pub(crate) use coerce::concat_pair_stats;
@@ -1572,6 +1838,7 @@ pub(crate) use gc::gc_nursery_stats;
 pub(crate) use gc::gc_stats;
 pub(crate) use gc::gc_young_budget_stats;
 pub(crate) use helpers_misc::call_inline_stats;
+pub(crate) use helpers_misc::computed_call_stats;
 pub(crate) use helpers_misc::concat_set_stats;
 pub(crate) use helpers_misc::cross_fill_stats;
 pub(crate) use helpers_misc::ic_stats;
@@ -1596,9 +1863,13 @@ mod ic;
 pub(crate) use bigint::*;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use field_stream::*;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use function_literal_jit::*;
 pub(crate) use helpers_datetime::*;
 pub(crate) use helpers_json::*;
 pub(crate) use helpers_misc::*;
 pub(crate) use helpers_num2::*;
 pub(crate) use helpers_numeric::*;
 pub(crate) use ic::{GetAct, SetAct, RET_DISCARD};
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use object_literal_jit::*;

@@ -6,6 +6,333 @@ claim below is an entry there with its measurements. This file is the map.
 
 ---
 
+## Continuation snapshot — 2026-08-25, Wave 39 hostile parity campaign
+
+Read this first. This continuation closes a large fraction of Wave 30's hostile
+gap, hardens the new native paths, and leaves an exact, full-corpus development
+capture. The tree is still deliberately dirty on top of `e166220`; the result
+is directional evidence with `publishable:false`, not a clean release result.
+
+### Post-Wave-39 commit checkpoint
+
+Two additional default-on mechanisms cleared focused, same-binary gates after
+the full Wave 39 capture. They are not folded into the Wave 39 corpus numbers:
+
+- `closure_home` now uses a direct heap-slot-indexed `Vec<Value>` plus an
+  authoritative `u64` presence bitmap instead of a `HashMap`. It does **not**
+  elide `[[HomeObject]]`: every strong edge and write barrier remains, major and
+  minor pruning clear both the bit and the value, and recycled slots cannot
+  inherit stale homes. Growth is asserted below the real heap slot count and
+  retained memory follows heap high-water at about 8.125 bytes per slot.
+  `ZIPP_NO_DENSE_CLOSURE_HOME=1` restores the map oracle. On
+  `allocation-survival`, 15 paired runs of one release binary measured
+  **301 ms map -> 260 ms dense**, **14.1% faster**, paired 95% CI
+  **11.2%..15.5% faster**, with `ALL_CORRECT=1`.
+- A narrow same-prototype cross-call descriptor now specializes rotating
+  two-argument lexical arrows. Generated code embeds only immutable function
+  and register-count integers; every invocation still resolves the live
+  closure and live Tier-C entry, so mutable captures and lexical `this` stay
+  dynamic. Different functions, non-closures, invalid windows, child realms,
+  live EvalScopes, route changes, and other mismatches decline before effects;
+  GC, depth, metering, throw, bail, and replay remain in the shared cross-call
+  core. `ZIPP_NO_SAME_PROTO_CROSS2=1` restores the generic helper. Thirty
+  counterbalanced pairs on `calls-closures` measured **92.438 ms enabled vs
+  97.340 ms disabled**; paired mean saving **4.836 ms**, bootstrap 95% CI
+  **3.548..6.439 ms**, with 27/30 pairs favouring the specialization.
+- A pointer-free object-literal shape-transition cache was correct in focused
+  tests but decisively failed its performance gate and was fully reverted.
+  Twenty-five paired runs found stable shapes **1.915x slower** and
+  megamorphic shapes **1.865x slower**; per-append thread/cache lookup cost
+  overwhelmed the existing cheap shape transition. A zero-symbol audit confirms
+  no cache fields, helper signature changes, transition commit path, switch, or
+  test remain. The earlier unsafe raw shape-way remains reverted too.
+
+### Final hostile checkpoint
+
+`bench/hostile/w39_final_cleanenv_dirty_2026-08-25.json` is the canonical
+development checkpoint for this continuation: 15 counterbalanced repetitions,
+10,000 bootstrap samples, an empty inherited benchmark-control environment,
+`ALL_CORRECT=1`, no health/correctness failure, and no source, input, harness,
+or engine drift. Publication fails closed because the measured engine and
+publication sources are dirty/untracked.
+
+- Cold category-balanced Zipp/Node is **1.3564×** (95% CI
+  **1.350–1.363**); the ordinary 17-row geomean is **1.2866×**
+  (**1.281–1.293**). Wave 30 was 3.1023× / 2.7173×. This is a large gain, but
+  the hostile parity gate is not met.
+- Rows at or below Node include allocation-ephemeral **0.368×**,
+  module-hot-graph **0.396×**, types-stable **0.464×**, async-burst **0.635×**,
+  throw-catch **0.527×**, bytecode-vm **0.895×**, and branch-control **0.975×**.
+  Async, endurance, errors, modules, scope, and types are at or below Node by
+  their cold category geomeans.
+- The honest remaining gaps are allocation-survival **4.623×**, stable and
+  megamorphic shapes **3.871× / 3.848×**, warm-router **3.792×**,
+  reactish-reconcile **3.272×**, exact vendored NanoID **2.566×**, mutable
+  closures **1.976×**, and mixed locals **1.686×**.
+- Graceful degradation is still the key signal. Relative cold degradation is
+  object shape **0.984×** (now effectively Node-like), calls **4.250×**, mixed
+  locals **3.679×**, object lifetime **12.539×**, async lifetime **1.695×**,
+  and exception control flow **0.526×**. Launch-adjusted data remains diagnostic
+  only; use the cold metric as the gate.
+
+### Performance mechanisms landed
+
+- Loader ICs, live module-namespace reads, and module JIT eligibility moved the
+  ESM graph below Node. Narrow lexical-arrow unboxing, Tier-C captured-state
+  operations, polymorphic/native cross-calls, same-prototype/default leaves,
+  widened typed leaves, direct method/global lanes, and function/object literal
+  support cut the closure and exact-NanoID gaps materially.
+- Local object/array SROA plus virtual concat length moved ephemeral allocation
+  below Node. It is deliberately fail-closed for escaping, re-entrant, metered,
+  and GC-stress shapes; surviving graphs remain slow and are the next GC/object
+  target.
+- Tier-C negation and bounded captured/global xorshift fusion moved the hostile
+  branch control below Node and reduced NanoID further. All skipped bytecode
+  destinations are reconstructed before a final commit; metered execution
+  declines so sandbox instruction accounting cannot shrink.
+- TypedArray narrow reads/length, dense Array length, dense computed integer
+  leaves, GPR spill homes, MEM integer compare-jumps, first/reserved string
+  append, transactional method/global lanes, and direct `Promise.all` reactions
+  broaden the native coverage. The hostile bytecode VM is now **0.895× Node**.
+- The chronology and focused A/Bs are recorded as B153–B159 in
+  `PERF_ROADMAP.md`. Do not attribute a cross-artifact delta to one mechanism;
+  only same-binary switch results are causal evidence.
+
+### Correctness, sandbox, and security closure
+
+- A real tier divergence was found after the first full gate: a generic inlined
+  callee could raw-load/store its globals after `defineProperty` changed their
+  live route, because only the caller's globals were revalidated. Every direct-
+  global leaf now carries an independent, VM-relative route-epoch proof used by
+  generic MEM, typed, and flattened INT emission. Root realm, EvalScope,
+  nested-callee, direct-slot, mutability, and epoch-zero conditions fail closed;
+  `StoreGlobalResolved` remains on the real-call path.
+- The regression is non-vacuous at the normal threshold: it proves the generic
+  MEM leaf compiled, then checks accessors, non-writable overlays, deletion, and
+  recreation across default, typed-off, eager, and interpreter modes. A second
+  test moves a hot persistent `ScriptState` in memory and exercises both MEM and
+  INT global-store leaves after accessor/delete mutation.
+- Replay spans now use a pure-op allowlist; nested `SuperSet`, metered off-frame
+  shortcuts, and effectful helper panic boundaries were audited. A possible
+  panic after allocation/mutation/user code aborts rather than returning a
+  replay sentinel. The old generic effectful-panic debt is therefore closed for
+  the routed helpers.
+- Sandbox children clear inherited environment, use a trusted working
+  directory, disable native JIT, canonicalise confined imports, cap entry and
+  graph source, output, wall time, instruction count, approximate heap, dynamic
+  code, functions, and classes, and fail terminally after resource exhaustion.
+  This is language/process/resource containment, not an OS/kernel or memory-
+  safety boundary; genuinely hostile code still needs an outer restricted
+  account/container/VM.
+
+### Final verification
+
+- `cargo test --locked --workspace --all-targets --quiet`: every harness passed;
+  the VM library alone was **449 passed, 2 ignored, 0 failed**.
+- Focused route/INT/GPR gates: leaf global route **3/3**, INT splice **23/23**,
+  GPR write-through **10/10**, and the moved persistent-state regression pass.
+- `cargo check --locked --workspace --all-targets`, VM no-default-features, and
+  nightly all-features pass. Windows ARM64 and Android ARM64 VM all-target
+  checks pass with `RUSTFLAGS=-Dwarnings`; the wasm32 VM release all-target
+  check also passes. ARM timings remain unclaimed.
+- CLI sandbox **15/15**; RustSec scanned 57 locked dependencies with no advisory;
+  npm audit reports zero vulnerabilities; the landing production build passes.
+  The only external CI action is pinned to a full SHA and workflow permissions
+  are `contents: read`.
+- Benchmark harness unit tests **72/72**, full Rust formatting check, and
+  `git diff --check` pass. No scratch `.codex-*` / `.tmp_*` / `tmp_*` files
+  remain.
+
+### What remains
+
+Do not claim hostile-corpus parity yet. The next measured work should attack
+safe ordinary-object property storage/creation, survivor tracing and medium-
+lived graphs, closure/frame dispatch, and mixed local representation. Preserve
+the per-row gate (every row ≤1.50× and every category ≤1.15×); an improved suite
+geomean alone is not enough. Keep `StoreGlobalResolved` conservative until it
+has an explicit same-slot dominating-load/CFG proof.
+
+---
+
+## Continuation snapshot — 2026-08-25, Wave 30 hostile application gate
+
+Read this first. Wave 30 adds a deliberately anti-benchmark-friendly corpus and
+uses it as a separate generalisation gate. The final combined development
+capture is complete. The measurements below came from a dirty working tree
+based on `e166220`; they are directional evidence, not a replacement for the
+clean retained-ten publication and not a hostile-corpus parity claim.
+
+### The hostile corpus now exists
+
+- `bench/hostile/manifest.json` defines 17 deterministic cases. Six paired
+  families cover ordinary versus hostile call shapes, object shapes, local
+  types, error control flow, object lifetime, and async lifetime. Five
+  standalones cover a React-shaped reconciliation kernel, a warm router, a
+  long-running JavaScript bytecode VM, a multi-file ESM graph, and exact
+  vendored `nanoid@3.3.17/non-secure` source with its licence and provenance.
+- `tools/bench_hostile.py` runs classic scripts and modules, counterbalances
+  Node/Zipp order, pairs every full run with an empty launch, requires exact and
+  repeatable output, and reports cold, startup-adjusted, category-balanced, and
+  baseline-to-stressor degradation metrics. The adjusted metric is diagnostic:
+  several Node kernels have only 2–20 ms of work after launch subtraction, so
+  the cold category-balanced result is the parity gate until those intervals
+  become stable.
+- Publication state now fails closed. All provenance violations remain in the
+  artifact even when a matching diagnostic override permits the run, and an
+  override, dirty/non-HEAD engine, source or harness drift, output mismatch, or
+  unhealthy process keeps `publishable:false`. Publication also requires the
+  canonical default manifest, all cases with no filters, at least 15 repetitions,
+  and at least 10,000 bootstrap samples. The manifest, both harnesses, and every
+  declared input must be tracked and byte-clean against `HEAD` before and after
+  measurement. Actual working content is compared with the `HEAD` blob rather
+  than trusting `git status`, so `assume-unchanged`/`skip-worktree` cannot hide a
+  stationary edit. The hostile runner hashes those sources and the engine before
+  and after the run; it atomically publishes only a fully written JSON file
+  without overwriting by default.
+- Benchmark environment capture no longer serializes raw prefix-wide values.
+  Only an explicit allowlist of numeric/boolean engine controls remains
+  reproducible; unknown keys, credential-shaped values, private paths, and
+  arbitrary runtime values are redacted before an artifact can be committed. Any
+  inherited Zipp/allocator/JS-runtime control makes a hostile capture
+  diagnostic-only because it changes the canonical comparison environment.
+- Module dependencies are deliberately explicit, not discovered. The runner
+  confines and hashes the reviewed files named in `inputs`; that is not a
+  security boundary for arbitrary imports. This is trusted measurement
+  infrastructure, never a substitute for `zipp sandbox` or an outer OS
+  sandbox around unreviewed code.
+
+### Historical first sweep
+
+All 17 rows produced exact Node/Zipp output, but the seven-repetition dirty-tree
+diagnostic measured a **3.0076× cold category-balanced ratio to Node** (ordinary
+row geomean **2.6501×**). This is nowhere near hostile-corpus parity. The largest
+cold gaps were exact vendored `nanoid` **9.775×**, allocation survival **7.717×**,
+allocation ephemeral **7.424×**, mutable closures **7.246×**, megamorphic
+properties **5.565×**, and the warm router **4.588×**. Stable numeric locals
+were **0.491×**, throw/catch **0.520×**, and async burst **0.614×** Node, proving
+that the corpus is not simply scaled to make every row red.
+
+The degradation ratios are the more important signal. Relative to each
+engine's paired baseline, messy calls hurt Zipp **15.283×** more than Node and
+local type churn **7.611×** more; async lifetime was **1.763×**, object shape
+**1.509×**, and object lifetime **1.056×**. Exception-heavy code degraded only
+**0.176×** as much as it did on Node. This first sweep remains useful historical
+context, but it is superseded by the final combined development diagnostic
+below and was not retained as publication evidence.
+
+### Final combined development diagnostic
+
+`bench/hostile/w30_combined_dirty_2026-08-25.json` is the final Wave 30 combined
+artifact: seven repetitions, `ALL_CORRECT=1`, no health or output failures, and
+all source/harness/input/engine drift checks clear. It correctly records the
+dirty source identity and `publishable:false`. The cold category-balanced ratio
+is **3.1023× Node** and the ordinary 17-row geomean is **2.7173×**. This is not
+Node parity.
+
+Notable cold rows are exact vendored `nanoid` **10.237×**, allocation ephemeral
+**7.870×**, mutable closures **7.576×**, allocation survival **5.336×**, the
+JavaScript bytecode VM **4.000×**, and the ESM graph **3.914×**. Stable numeric
+locals **0.497×**, throw/catch **0.548×**, and async burst **0.635×** remain
+useful controls that beat Node. Cold relative degradation is calls **15.722×**,
+local types **7.941×**, async lifetime **1.826×**, object shape **1.542×**, object
+lifetime **0.680×**, and errors **0.171×**. The lifetime result is now graceful
+relative to Node because the directed-edge GC fix below removed an accidental
+retention catastrophe; allocation is still absolutely slow.
+
+Do not quote an adjusted aggregate. Immediately paired launch subtraction is
+too noisy on the shortest Node kernels, and one non-positive adjusted pair makes
+the final suite/category-balanced adjusted aggregate unavailable. Per-row and
+per-category adjusted values remain diagnostics only. A future clean capture
+would be a new publication artifact; the final Wave 30 development capture is
+not pending.
+
+### Guarded engine work and one rejected experiment
+
+- Ordinary `Math.random()` is no longer replaced by a syntax-only random
+  bytecode operation. It follows dynamic property-call semantics and observes a
+  replacement function, which is required by the deterministic vendored npm
+  driver and ordinary JavaScript semantics.
+- A saturated eight-way plain-call IC now resolves live ordinary functions and
+  closures dynamically instead of repeatedly deoptimising and evicting the
+  region. Native, bound, proxy/exotic, and non-callable values retain the
+  existing path; live replacements and lexical-`this` preserve ordinary
+  semantics. On `calls-closures`, nine one-binary paired repetitions measured
+  **398.11 → 354.14 ms**, default/off **0.8896×**
+  (**11.0% faster**, 95% CI **−12.1%..−10.4%**), exact output.
+  `ZIPP_NO_POLY_CALL_FALLBACK=1`; diagnostic artifact
+  `bench/hostile/w30_poly_call_abenv_2026-08-24.json` is deliberately
+  `publishable:false` because its source was dirty.
+- x86 MEM/Tier-C regions now have a guarded dense-array
+  `CallMethodComputed` helper for canonical numeric keys whose own, non-hole
+  element is a live ordinary function or closure. Holes/prototypes, index
+  overrides/accessors, mapped arguments, natives, bound/proxy functions and
+  non-callables fail without side effects to the ordinary path. The
+  `bytecode-vm` row measured **915.75 → 202.11 ms**, default/off **0.2212×**
+  (**77.9% faster**, 95% CI **−78.1%..−77.7%**), exact output.
+  `ZIPP_NO_COMPUTED_CALL_DENSE=1`; the dirty diagnostic is
+  `bench/hostile/w30_computed_call_abenv_2026-08-24.json`.
+- Functions belonging to loader-recorded module ranges are now eligible for
+  x86 function/OSR JIT and the guarded ARM64 whole-function tier. The ranges are
+  half-open and do not admit intervening `eval`/`new Function` functions. With
+  `ZIPP_NO_MODULE_JIT=1` as the comparator, the module graph moved
+  **234.655 → 188.504 ms (1.245× faster)** and `nanoid`
+  **1742.314 → 925.523 ms (1.883× faster)**. The profile moved the module graph
+  from 100% interpreted to 17.9% JIT-fast, and `nanoid` to 70.7% JIT-MEM plus
+  4.4% JIT-fast; both still lose badly to Node, so this is eligibility progress,
+  not module parity.
+- `closure_home` and `closure_new_target` used to make every side-table value an
+  unconditional root. A dead object-literal method therefore kept its home
+  object, which kept the method, making the cycle immortal; arrows did the same
+  for lexical `new.target`. They are now directed internal edges: the value is
+  traced only from a reachable keyed closure, dead keys are pruned, and writes
+  carry the old-holder-to-young-value nursery barrier. On the allocation-survival
+  profile this cut peak slots **81.4%**, average live slots **88.6%**, and GC time
+  **45.6%**; the workload now completes inside the sandbox's 128 MiB approximate
+  heap limit. Major/minor unit cases prove dead-cycle collection and the
+  remembered-set edge, while real-bytecode tests keep extracted-method `super`,
+  lexical `new.target`, and nested arrows correct through repeated GC.
+- A native shape-keyed property way was built and measured at
+  about **10.6% faster** on the stable-shape row, then rejected. Independent
+  security review found that VM-exotic objects can collide with ordinary object
+  shape IDs and that the raw metadata/pointer view had stale refresh and
+  mutation paths. Those assumptions could select the wrong slot or dereference
+  obsolete storage, so
+  the experiment was fully reverted rather than patched around. A zero-symbol
+  audit confirms its metadata view, native gate, helper and counters are gone:
+  **no experimental unsafe shape-way code ships** and its timing is a refutation,
+  not a landed result.
+
+### Honest remaining targets and security debt
+
+- The broad cost is no longer mysterious: object creation/property append,
+  closure/upvalue cells, allocation construction, modulo/loose equality/delete,
+  mixed local homes, and general property access still spend too much time in
+  boxed helpers or the interpreter. Current hostile gaps remain roughly
+  7–10× on closures/ephemeral allocation/npm and 3–6× on
+  object/application/module kernels.
+- The next two measured design targets are a safe **prototype-keyed closure JIT
+  lane** (without raw shape-metadata assumptions) and **local-allocation SROA**
+  for provably non-escaping aggregates. The former attacks closure/property
+  dispatch; the latter attacks the 7.870× ephemeral-allocation row. Both need
+  exact fallback, GC/barrier, and sandbox gates before performance evidence.
+- The x86 helper ABI has a low-priority pre-existing audit debt: generic helper
+  wrappers can convert a caught Rust panic into a deopt. If a future helper can
+  panic after a user-observable effect, interpreter replay could duplicate that
+  effect. Release builds use `panic=abort`, and the Wave 30 paths were not found
+  to introduce such a case, but each effectful helper should eventually prove
+  panic-before-effect or return a non-replay outcome instead of relying on the
+  generic convention.
+- Keep any future clean hostile result separate from the retained-ten headline
+  and continue to say plainly that Node parity is not reached on this corpus.
+  The retained dirty artifact is diagnostic evidence only.
+- Treat each paired degradation as a whole-scenario signal, not the isolated
+  cost of closures, shapes, types, exceptions, lifetime, or async by itself.
+  Some stressors also change iteration mix or construction work. Category names
+  and membership are frozen by the canonical manifest for a publication series;
+  changing that taxonomy starts a new series.
+
+---
+
 ## Windows ARM64 CI follow-up — 2026-08-24
 
 The first native `windows-11-arm` run after Wave 29 built successfully, then

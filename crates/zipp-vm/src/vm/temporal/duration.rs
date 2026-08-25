@@ -13,9 +13,14 @@ impl<'p> Vm<'p> {
     /// patterns, i.e. obvious garbage, not subtle drift.
     pub(crate) fn make_duration(&mut self, f: [f64; 10]) -> Value {
         // Canonicalize -0.0 so sign probes and toString never see it.
-        let bits =
-            f.iter().map(|&x| (if x == 0.0 { 0.0f64 } else { x }).to_bits() as i64).collect();
-        let idx = self.heap.alloc(HeapObj::Temporal { kind: 0, fields: bits });
+        let bits = f
+            .iter()
+            .map(|&x| (if x == 0.0 { 0.0f64 } else { x }).to_bits() as i64)
+            .collect();
+        let idx = self.heap.alloc(HeapObj::Temporal {
+            kind: 0,
+            fields: bits,
+        });
         if self.duration_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.duration_proto));
         }
@@ -45,11 +50,15 @@ impl<'p> Vm<'p> {
                 HeapObj::BigInt(_) | HeapObj::BigIntBig(_)
             )
         {
-            return Err(Thrown("TypeError: Cannot convert a BigInt value to a number".into()));
+            return Err(Thrown(
+                "TypeError: Cannot convert a BigInt value to a number".into(),
+            ));
         }
         let n = self.to_number_coerce(v)?;
         if !n.is_finite() || n.fract() != 0.0 {
-            return Err(Thrown("RangeError: Temporal.Duration fields must be integers".into()));
+            return Err(Thrown(
+                "RangeError: Temporal.Duration fields must be integers".into(),
+            ));
         }
         Ok(n)
     }
@@ -79,7 +88,11 @@ impl<'p> Vm<'p> {
     /// to ±i64::MAX so saturated magnitudes stay symmetric.
     pub(crate) fn dur_to_i64(x: f64) -> i64 {
         let v = x as i64;
-        if v == i64::MIN { i64::MIN + 1 } else { v }
+        if v == i64::MIN {
+            i64::MIN + 1
+        } else {
+            v
+        }
     }
 
     /// `new Temporal.Duration(y, mo, w, d, h, mi, s, ms, us, ns)` — integer fields.
@@ -92,7 +105,9 @@ impl<'p> Vm<'p> {
             }
         }
         if !is_valid_duration(&ff) {
-            return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+            return Err(Thrown(
+                "RangeError: Temporal.Duration value out of range".into(),
+            ));
         }
         Ok(self.make_duration(ff))
     }
@@ -115,7 +130,9 @@ impl<'p> Vm<'p> {
                 // A parsed duration must also be in range (e.g. a days/seconds value
                 // whose total exceeds 2^53 seconds is a RangeError).
                 if !is_valid_duration(&ff) {
-                    return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+                    return Err(Thrown(
+                        "RangeError: Temporal.Duration value out of range".into(),
+                    ));
                 }
                 return Ok(ff);
             }
@@ -137,12 +154,16 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 if !is_valid_duration(&ff) {
-                    return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+                    return Err(Thrown(
+                        "RangeError: Temporal.Duration value out of range".into(),
+                    ));
                 }
                 return Ok(ff);
             }
         }
-        Err(Thrown("TypeError: cannot convert value to a Temporal.Duration".into()))
+        Err(Thrown(
+            "TypeError: cannot convert value to a Temporal.Duration".into(),
+        ))
     }
 
     /// ToTemporalDuration narrowed to the interim i64 record (saturating
@@ -159,7 +180,12 @@ impl<'p> Vm<'p> {
     }
 
     /// Dispatch a Temporal instance method to the per-kind handler.
-    pub(crate) fn temporal_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn temporal_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
         match self.heap.get(idx) {
             HeapObj::Temporal { kind: 0, .. } => self.duration_method(idx, name, args),
             HeapObj::Temporal { kind: 1, .. } => self.plain_date_method(idx, name, args),
@@ -174,7 +200,12 @@ impl<'p> Vm<'p> {
     }
 
     /// `Temporal.Duration.prototype` methods + getters not handled inline.
-    pub(crate) fn duration_method(&mut self, idx: u32, name: &str, args: &[Value]) -> Result<Option<Value>, Thrown> {
+    pub(crate) fn duration_method(
+        &mut self,
+        idx: u32,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, Thrown> {
         let f = match self.duration_fields(idx) {
             Some(f) => f,
             None => return Ok(None),
@@ -196,10 +227,14 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if !any {
-                    return Err(Thrown("TypeError: with() requires a partial Duration object".into()));
+                    return Err(Thrown(
+                        "TypeError: with() requires a partial Duration object".into(),
+                    ));
                 }
                 if !is_valid_duration(&nf) {
-                    return Err(Thrown("RangeError: Temporal.Duration value out of range".into()));
+                    return Err(Thrown(
+                        "RangeError: Temporal.Duration value out of range".into(),
+                    ));
                 }
                 Ok(Some(self.make_duration(nf)))
             }
@@ -208,7 +243,8 @@ impl<'p> Vm<'p> {
                 let (_unit, digits, omit, mode) = self.time_precision(a0)?;
                 if omit {
                     return Err(Thrown(
-                        "RangeError: smallestUnit 'minute' is not valid for Duration.toString".into(),
+                        "RangeError: smallestUnit 'minute' is not valid for Duration.toString"
+                            .into(),
                     ));
                 }
                 match duration_to_string_opts(&f, digits, &mode) {
@@ -218,28 +254,43 @@ impl<'p> Vm<'p> {
                     )),
                 }
             }
-            "valueOf" => {
-                Err(Thrown("TypeError: Called Temporal.Duration.prototype.valueOf".into()))
-            }
+            "valueOf" => Err(Thrown(
+                "TypeError: Called Temporal.Duration.prototype.valueOf".into(),
+            )),
             "total" => {
                 // arg: a unit string, or { unit, relativeTo }. GetTemporalRelativeToOption
                 // is read BEFORE the unit (spec order).
                 if a0 == Value::UNDEFINED {
-                    return Err(Thrown("TypeError: total() requires an options argument".into()));
+                    return Err(Thrown(
+                        "TypeError: total() requires an options argument".into(),
+                    ));
                 }
                 let is_string = a0.is_heap() && self.heap.is_str_like(a0.heap_index());
                 if !is_string && !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: total() argument must be a string or object".into()));
+                    return Err(Thrown(
+                        "TypeError: total() argument must be a string or object".into(),
+                    ));
                 }
-                let rel = if is_string { Value::UNDEFINED } else { self.get_prop(a0, "relativeTo")? };
+                let rel = if is_string {
+                    Value::UNDEFINED
+                } else {
+                    self.get_prop(a0, "relativeTo")?
+                };
                 // GetTemporalRelativeToOption resolves the anchor (the full
                 // ToRelativeTemporalObject read sequence) at the relativeTo slot,
                 // BEFORE options.unit is read — even for a time unit, so
                 // total({unit:"ns"}) against a ZonedDateTime at the limit still
                 // throws on overflow.
-                let anchor =
-                    if rel != Value::UNDEFINED { Some(self.relative_to_dt(rel)?) } else { None };
-                let unit_v = if is_string { a0 } else { self.get_prop(a0, "unit")? };
+                let anchor = if rel != Value::UNDEFINED {
+                    Some(self.relative_to_dt(rel)?)
+                } else {
+                    None
+                };
+                let unit_v = if is_string {
+                    a0
+                } else {
+                    self.get_prop(a0, "unit")?
+                };
                 if unit_v == Value::UNDEFINED {
                     return Err(Thrown("RangeError: unit is required".into()));
                 }
@@ -268,7 +319,9 @@ impl<'p> Vm<'p> {
                     if let Some(id) = tz {
                         let ns1 = dt_epoch_ns(start) - off as i128;
                         let ns2 = add_zoned(cal, &id, ns1, &f)?;
-                        return Ok(Some(Value::num(diff_zoned_total(cal, &id, ns1, ns2, &unit)?)));
+                        return Ok(Some(Value::num(diff_zoned_total(
+                            cal, &id, ns1, ns2, &unit,
+                        )?)));
                     }
                     check_relative_target(cal, start, &f, false, off, true)?;
                     if needs_cal {
@@ -290,12 +343,20 @@ impl<'p> Vm<'p> {
             }
             "round" => {
                 // round(roundTo): a bare string is shorthand for { smallestUnit }.
-                let (su_string, options) = if a0.is_heap() && self.heap.is_str_like(a0.heap_index()) {
-                    (Some(normalize_unit(&self.to_js_string(a0)?, "")), Value::UNDEFINED)
+                let (su_string, options) = if a0.is_heap() && self.heap.is_str_like(a0.heap_index())
+                {
+                    (
+                        Some(normalize_unit(&self.to_js_string(a0)?, "")),
+                        Value::UNDEFINED,
+                    )
                 } else if a0 == Value::UNDEFINED {
-                    return Err(Thrown("TypeError: round() requires an options argument".into()));
+                    return Err(Thrown(
+                        "TypeError: round() requires an options argument".into(),
+                    ));
                 } else if !self.is_object_value(a0) {
-                    return Err(Thrown("TypeError: round() argument must be a string or object".into()));
+                    return Err(Thrown(
+                        "TypeError: round() argument must be a string or object".into(),
+                    ));
                 } else {
                     (None, a0)
                 };
@@ -328,8 +389,11 @@ impl<'p> Vm<'p> {
                 } else {
                     self.get_prop(options, "relativeTo")?
                 };
-                let anchor =
-                    if rel != Value::UNDEFINED { Some(self.relative_to_dt(rel)?) } else { None };
+                let anchor = if rel != Value::UNDEFINED {
+                    Some(self.relative_to_dt(rel)?)
+                } else {
+                    None
+                };
                 let inc = self.read_rounding_increment(options)?;
                 let mode = if options == Value::UNDEFINED {
                     "halfExpand".to_string()
@@ -354,7 +418,9 @@ impl<'p> Vm<'p> {
                         } else {
                             let s = normalize_unit(&self.to_js_string(su_v)?, "");
                             if !DURATION_UNITS.contains(&s.as_str()) {
-                                return Err(Thrown(format!("RangeError: invalid smallestUnit: {s}")));
+                                return Err(Thrown(format!(
+                                    "RangeError: invalid smallestUnit: {s}"
+                                )));
                             }
                             Some(s)
                         }
@@ -365,19 +431,31 @@ impl<'p> Vm<'p> {
                 // not absent), so test the resolved smallestUnit / raw largestUnit.
                 if su.is_none() && lu_v == Value::UNDEFINED {
                     return Err(Thrown(
-                        "RangeError: at least one of smallestUnit or largestUnit is required".into(),
+                        "RangeError: at least one of smallestUnit or largestUnit is required"
+                            .into(),
                     ));
                 }
                 let smallest = su.unwrap_or_else(|| "nanosecond".to_string());
                 // largestUnit "auto" → the larger of smallestUnit and the duration's
                 // own largest non-zero unit.
                 let all = [
-                    "year", "month", "week", "day", "hour", "minute", "second", "millisecond",
-                    "microsecond", "nanosecond",
+                    "year",
+                    "month",
+                    "week",
+                    "day",
+                    "hour",
+                    "minute",
+                    "second",
+                    "millisecond",
+                    "microsecond",
+                    "nanosecond",
                 ];
                 let urank = |u: &str| all.iter().position(|&x| x == u).unwrap_or(9);
-                let dur_largest =
-                    all.iter().find(|&&u| f[urank(u)] != 0.0).copied().unwrap_or("nanosecond");
+                let dur_largest = all
+                    .iter()
+                    .find(|&&u| f[urank(u)] != 0.0)
+                    .copied()
+                    .unwrap_or("nanosecond");
                 let largest = lu.unwrap_or_else(|| {
                     if urank(dur_largest) < urank(&smallest) {
                         dur_largest.to_string()
@@ -440,7 +518,8 @@ impl<'p> Vm<'p> {
                 let cal = |u: &str| matches!(u, "year" | "month" | "week");
                 if f[0] != 0.0 || f[1] != 0.0 || f[2] != 0.0 || cal(&smallest) || cal(&largest) {
                     return Err(Thrown(
-                        "RangeError: a relativeTo option is required for years, months, or weeks".into(),
+                        "RangeError: a relativeTo option is required for years, months, or weeks"
+                            .into(),
                     ));
                 }
                 let total_ns = dur_day_time_ns(&f);
@@ -464,7 +543,8 @@ impl<'p> Vm<'p> {
                     || other[2] != 0.0
                 {
                     return Err(Thrown(
-                        "RangeError: a relativeTo option is required for years, months, or weeks".into(),
+                        "RangeError: a relativeTo option is required for years, months, or weeks"
+                            .into(),
                     ));
                 }
                 let o_ns = (other[3] as i128) * DAY_NS
@@ -475,10 +555,22 @@ impl<'p> Vm<'p> {
                     + (other[8] as i128) * 1_000
                     + (other[9] as i128);
                 let total_ns = dur_day_time_ns(&f) + sign as i128 * o_ns;
-                let existing_f =
-                    |g: &[f64; 10]| (3..10).filter(|&i| g[i] != 0.0).map(|i| (i - 3) as i32).min().unwrap_or(6);
-                let day_units =
-                    ["day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond"];
+                let existing_f = |g: &[f64; 10]| {
+                    (3..10)
+                        .filter(|&i| g[i] != 0.0)
+                        .map(|i| (i - 3) as i32)
+                        .min()
+                        .unwrap_or(6)
+                };
+                let day_units = [
+                    "day",
+                    "hour",
+                    "minute",
+                    "second",
+                    "millisecond",
+                    "microsecond",
+                    "nanosecond",
+                ];
                 let largest = day_units[existing_f(&f).min(existing_f(&other)) as usize];
                 // BalanceDuration → the result must be a valid Duration (its total
                 // time, in seconds, below 2^53); balance_duration_ns enforces it.
@@ -490,5 +582,4 @@ impl<'p> Vm<'p> {
     }
 
     // ── Temporal.PlainDate ──
-
 }

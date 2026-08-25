@@ -3,14 +3,13 @@ use super::*;
 use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
-    PropAttr, PromiseState, ReactionPair, Reactions,
+    PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
-use crate::vm::{cldr_en, dtf_pattern};
 use crate::vm::*;
+use crate::vm::{cldr_en, dtf_pattern};
 
 impl<'p> Vm<'p> {
-
     /// CompareStrings for a resolved `Intl.Collator`.
     ///
     /// **There is still no DUCET/CLDR collation here.** What this DOES implement
@@ -60,7 +59,11 @@ impl<'p> Vm<'p> {
                     sec
                 } else if sens == "case" || sens == "variant" {
                     let t = ka.2.cmp(&kb.2);
-                    if upper_first { t.reverse() } else { t }
+                    if upper_first {
+                        t.reverse()
+                    } else {
+                        t
+                    }
                 } else {
                     std::cmp::Ordering::Equal
                 }
@@ -73,9 +76,7 @@ impl<'p> Vm<'p> {
             std::cmp::Ordering::Equal => 0.0,
         }
     }
-
 }
-
 
 /// The characters CLDR's root collation gives *variable* (shifted) weights —
 /// whitespace, punctuation and general symbols. `Intl.Collator`'s
@@ -87,7 +88,6 @@ impl<'p> Vm<'p> {
 pub(crate) fn is_variable_collation_char(c: char) -> bool {
     !c.is_alphanumeric() && !unicode_normalization::char::is_combining_mark(c)
 }
-
 
 /// The (primary, secondary, tertiary) sort key `collator_compare` documents:
 /// NFD, then split each scalar into its base-letter, accent and case
