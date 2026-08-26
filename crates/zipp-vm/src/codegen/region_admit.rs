@@ -1461,6 +1461,10 @@ pub(crate) struct HeapHelpers {
     pub(crate) cross_call: usize,
     /// Same-prototype lexical-arrow/two-argument cross-call specialization.
     pub(crate) cross_call_same_proto2: usize,
+    /// B189b emitted-lane window open/close and the mid-body-bail completion.
+    pub(crate) window_open: usize,
+    pub(crate) window_close: usize,
+    pub(crate) cross3_finish: usize,
     /// `PROP_VIA_IC` continuation for GetProp (accessor / class receiver).
     pub(crate) get_prop_slow: usize,
     /// `PROP_VIA_IC` continuation for SetProp.

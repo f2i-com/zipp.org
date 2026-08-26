@@ -993,7 +993,79 @@ impl<'p> Vm<'p> {
             if poly_fid && std::env::var_os("ZIPP_JITLOG").is_some() {
                 eprintln!("[cross] fn{func_id}@{ip} POLY-FID generic live-resolution");
             }
-            plan.insert(ip, crate::codegen::CrossCallSitePlan { same_proto2 });
+            // B189b: the fully-emitted lane. Admitted only for the exactly
+            // guardable shape — same-proto site, argc == params, arrow or
+            // strict-plain `this`, a live cross entry with an inline (≤64
+            // reg) fill mask and no reducer plans, unmetered VM. Everything
+            // baked here is revalidated per call by the epoch/fid/env/GC
+            // guards; any mismatch takes the helper.
+            #[cfg(feature = "instrument")]
+            let cross3_unmetered = self.instr_rec.is_none();
+            #[cfg(not(feature = "instrument"))]
+            let cross3_unmetered = true;
+            if same_proto && std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!(
+                    "[cross] fn{func_id}@{ip} CROSS3 gate: en={} unmet={} params={} argc={} lex={} strict={}",
+                    crate::codegen::cross3_enabled(),
+                    cross3_unmetered,
+                    callee.param_count,
+                    argc,
+                    callee.lexical_this,
+                    callee.is_strict
+                );
+            }
+            let cross3 = (same_proto
+                && crate::codegen::cross3_enabled()
+                && cross3_unmetered
+                && usize::from(callee.param_count) == usize::from(argc)
+                && argc <= 6
+                && (callee.lexical_this || callee.is_strict))
+                .then(|| {
+                    let Some((entry, uninit_mask, json_walk, markdown_inline)) =
+                        self.jit.cross_entry(fid)
+                    else {
+                        if std::env::var_os("ZIPP_JITLOG").is_some() {
+                            eprintln!("[cross] fn{func_id}@{ip} CROSS3 decline: no entry yet");
+                        }
+                        return None;
+                    };
+                    let reg_count = callee.reg_count.max(1);
+                    if json_walk.is_some()
+                        || markdown_inline.is_some()
+                        || uninit_mask == u64::MAX
+                        || reg_count > 64
+                    {
+                        if std::env::var_os("ZIPP_JITLOG").is_some() {
+                            eprintln!(
+                                "[cross] fn{func_id}@{ip} CROSS3 decline: plans={} mask_max={} regs={}",
+                                json_walk.is_some() || markdown_inline.is_some(),
+                                uninit_mask == u64::MAX,
+                                reg_count
+                            );
+                        }
+                        return None;
+                    }
+                    Some(crate::codegen::SameProtoCross3Plan {
+                        fid,
+                        callee_regs: reg_count,
+                        argc,
+                        arrow_this: callee.lexical_this,
+                        entry: entry as usize,
+                        uninit_mask,
+                        epoch: self.jit.cross_code_epoch,
+                    })
+                })
+                .flatten();
+            if cross3.is_some() && std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!("[cross] fn{func_id}@{ip} CROSS3 fn{fid} native-emitted lane");
+            }
+            plan.insert(
+                ip,
+                crate::codegen::CrossCallSitePlan {
+                    same_proto2,
+                    cross3,
+                },
+            );
         }
         plan
     }

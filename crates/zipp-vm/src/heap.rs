@@ -3973,6 +3973,16 @@ pub struct Heap {
     /// `mirror[callee_idx] == baked_fid` and needs nothing else about the
     /// callee to be true.
     fid_mirror: Vec<u32>,
+    /// ARROW-`this` MIRROR (B189b), parallel to `objs`: a Closure occupant's
+    /// captured `this_val` bits (UNDEFINED bits otherwise). Immutable per
+    /// occupant like the fid — settling refresh + `free_slot` clear only.
+    this_mirror: Vec<u64>,
+    /// UPVALUE-BASE MIRROR (B189b), parallel to `objs`: a Closure occupant's
+    /// `upvalues` base pointer (0 when none). The pointer is fixed at closure
+    /// creation and the box never moves while live, so the same settling
+    /// discipline as `fid_mirror` keeps it exact; the emitted call lane
+    /// installs it as the activation's `upvals_raw`.
+    upvals_mirror: Vec<u64>,
     /// CELL-VALUE MIRROR (B189), parallel to `objs`: a live copy of
     /// `HeapObj::Cell` payloads (UNDEFINED bits everywhere else), so the
     /// emitted Tier-C `UpvalGet` reads a captured variable in three loads
@@ -3991,6 +4001,8 @@ pub struct Heap {
     pub(crate) vals_ptr_mirror_raw: u64,
     pub(crate) fid_mirror_raw: u64,
     pub(crate) cell_vals_mirror_raw: u64,
+    pub(crate) this_mirror_raw: u64,
+    pub(crate) upvals_mirror_raw: u64,
     /// Dead payloads collected by the CURRENT sweep, shipped to the courier
     /// thread at `note_gc_done`/`note_minor_done` (see [`gc_courier`]).
     courier_batch: Vec<gc_courier::Item>,
@@ -4006,7 +4018,7 @@ pub struct Heap {
     live: usize,
     /// `alloc` sets this once the live count passes `gc_threshold`; the interpreter
     /// dispatch loop polls it at a safe point and runs a collection.
-    gc_requested: bool,
+    pub(crate) gc_requested: bool,
     /// Live-count at which the next collection is requested (grown adaptively after
     /// each GC to amortise; never below `GC_MIN_THRESHOLD`).
     gc_threshold: usize,
@@ -4324,10 +4336,14 @@ impl Heap {
             vals_ptr_mirror: vec![0; versions.len()],
             fid_mirror: vec![FID_MIRROR_NONE; versions.len()],
             cell_vals_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
+            this_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
+            upvals_mirror: vec![0; versions.len()],
             shape_mirror_raw: 0,
             vals_ptr_mirror_raw: 0,
             fid_mirror_raw: 0,
             cell_vals_mirror_raw: 0,
+            this_mirror_raw: 0,
+            upvals_mirror_raw: 0,
             versions,
             free: Vec::new(),
             live,
@@ -4375,6 +4391,8 @@ impl Heap {
         self.vals_ptr_mirror_raw = self.vals_ptr_mirror.as_ptr() as u64;
         self.fid_mirror_raw = self.fid_mirror.as_ptr() as u64;
         self.cell_vals_mirror_raw = self.cell_vals_mirror.as_ptr() as u64;
+        self.this_mirror_raw = self.this_mirror.as_ptr() as u64;
+        self.upvals_mirror_raw = self.upvals_mirror.as_ptr() as u64;
     }
 
     /// Pin slot `idx`'s mirrors permanently unmatchable. For the receivers
@@ -4391,6 +4409,8 @@ impl Heap {
         self.vals_ptr_mirror[idx as usize] = 0;
         self.fid_mirror[idx as usize] = FID_MIRROR_NONE;
         self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
+        self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+        self.upvals_mirror[idx as usize] = 0;
     }
 
     /// B187 stage 2: allocate a FINALIZE-BORN literal with its values in the
@@ -4451,6 +4471,21 @@ impl Heap {
             HeapObj::Cell(v) => v.bits(),
             _ => Value::UNDEFINED.bits(),
         };
+        let (tv, uv) = match &self.objs[idx as usize] {
+            HeapObj::Closure {
+                this_val, upvalues, ..
+            } => (
+                this_val.bits(),
+                if upvalues.is_empty() {
+                    0
+                } else {
+                    upvalues.as_ptr() as u64
+                },
+            ),
+            _ => (Value::UNDEFINED.bits(), 0),
+        };
+        self.this_mirror[idx as usize] = tv;
+        self.upvals_mirror[idx as usize] = uv;
     }
 
     /// W9: enter a static-pretenure scope (NURSERY_DESIGN.md §4) — until the
@@ -4538,6 +4573,8 @@ impl Heap {
         self.vals_ptr_mirror.push(0);
         self.fid_mirror.push(FID_MIRROR_NONE);
         self.cell_vals_mirror.push(Value::UNDEFINED.bits());
+        self.this_mirror.push(Value::UNDEFINED.bits());
+        self.upvals_mirror.push(0);
         self.recache_mirror_raws();
         self.refresh_mirror(idx);
         if self.nursery {
@@ -4955,6 +4992,8 @@ impl Heap {
         self.vals_ptr_mirror[idx as usize] = 0;
         self.fid_mirror[idx as usize] = FID_MIRROR_NONE;
         self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
+        self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+        self.upvals_mirror[idx as usize] = 0;
         let payload = self.resident_payload_charged[idx as usize].replace(0);
         self.resident_payload_current
             .set(self.resident_payload_current.get().saturating_sub(payload));

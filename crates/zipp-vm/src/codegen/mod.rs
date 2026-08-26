@@ -241,6 +241,20 @@ pub(crate) fn poly_crosscall_enabled() -> bool {
 /// resolves the live closure and live Tier-C entry on every invocation.
 /// `ZIPP_NO_SAME_PROTO_CROSS2=1` restores the generic cross-call helper for a
 /// same-binary A/B.
+pub(crate) fn cross3_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CROSS3").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 pub(crate) fn same_proto_cross2_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -538,6 +552,31 @@ pub type CrossCallPlan = FxHashMap<usize, CrossCallSitePlan>;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CrossCallSitePlan {
     pub same_proto2: Option<SameProtoCross2Plan>,
+    /// B189b: the fully-emitted native call lane for this site (rotating
+    /// closures of ONE FuncProto). `None` keeps the helper-only route.
+    pub cross3: Option<SameProtoCross3Plan>,
+}
+
+/// B189b: everything the emitted same-proto call lane bakes. All of it is
+/// validated at runtime by cheap guards: the callee by `fid_mirror`, the
+/// entry/mask pair by `Jit::cross_code_epoch`, the environment by the three
+/// nonempty bytes, GC/depth/route by their scalars — any mismatch falls back
+/// to the unchanged cross-call helper, a pure prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SameProtoCross3Plan {
+    pub fid: u32,
+    /// Callee frame size (`reg_count.max(1)`).
+    pub callee_regs: u16,
+    /// Site argc — admitted only when it equals the callee's `param_count`.
+    pub argc: u16,
+    /// `this` policy: true = arrow (captured `this` via the heap's
+    /// this-mirror); false = strict plain function (`this = undefined`).
+    pub arrow_this: bool,
+    /// Baked native entry + the may-read-before-write register mask, both
+    /// valid only while `epoch` matches `Jit::cross_code_epoch`.
+    pub entry: usize,
+    pub uninit_mask: u64,
+    pub epoch: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -956,6 +995,9 @@ pub struct HeapHelperAddrs {
     /// Exact rotating same-prototype lexical-arrow/two-argument sibling of
     /// `cross_call`; it shares the same live-resolution and fallback protocol.
     pub cross_call_same_proto2: usize,
+    pub window_open: usize,
+    pub window_close: usize,
+    pub cross3_finish: usize,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
     /// class-instance receiver): interpreter-IC resolution + getter frame
     /// call. Returns the value bits / `SELF_CALL_DEOPT` / `CALL_THREW`.
@@ -1139,6 +1181,9 @@ impl HeapHelperAddrs {
             call_ic: self.call_ic,
             cross_call: self.cross_call,
             cross_call_same_proto2: self.cross_call_same_proto2,
+            window_open: self.window_open,
+            window_close: self.window_close,
+            cross3_finish: self.cross3_finish,
             get_prop_slow: self.get_prop_slow,
             set_prop_slow: self.set_prop_slow,
             get_prop_acc: self.get_prop_acc,
@@ -2837,6 +2882,14 @@ pub struct Jit {
     /// in the wide case `cross_wide_uninit` may supply the owned multi-word
     /// mask, otherwise calls use the pre-W7 full zero-fill behaviour.
     /// The third and fourth elements are the optional exact JSON-tree and
+    /// Bumped on EVERY cross-entry table mutation (install, replace, clear /
+    /// eviction, wholesale reset). The B189b emitted call lane bakes an entry
+    /// pointer at emission and guards `epoch == baked` per call through the
+    /// VM — any recompile, eviction, or plan attachment sends the call to the
+    /// helper, which re-resolves the live table. Wrapping is a non-issue: a
+    /// false match needs exactly 2^32 mutations between two executions of one
+    /// site.
+    pub(crate) cross_code_epoch: u32,
     /// Markdown-inline plans described by [`JsonWalkPlan`] and
     /// [`MarkdownInlinePlan`]. They never change native code generation; the
     /// cross-call helper consumes each as a guarded prefix and otherwise runs
@@ -2945,6 +2998,7 @@ impl Jit {
         self.fn_state.clear();
         self.self_cache = None;
         self.cross_entries.clear();
+        self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
         self.cross_wide_uninit.clear();
         self.map_kernels.clear();
         self.reduce_kernels.clear();
@@ -3041,6 +3095,7 @@ impl Jit {
         }
         self.cross_entries[i] = (entry, uninit_mask, json_walk, markdown_inline);
         self.cross_wide_uninit[i] = wide_uninit_mask;
+        self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
     }
 
     fn clear_cross_entry(&mut self, func_id: u32) {
@@ -3050,6 +3105,7 @@ impl Jit {
         if let Some(mask) = self.cross_wide_uninit.get_mut(func_id as usize) {
             *mask = None;
         }
+        self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
     }
 
     /// Dense tier state of `func_id` — the frame-entry fast path.

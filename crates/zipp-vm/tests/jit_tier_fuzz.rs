@@ -461,6 +461,11 @@ const MODES: &[Mode] = &[
         name: "noupvalinline",
         env: &[("ZIPP_NO_TIERC_UPVAL_INLINE", "1")],
     },
+    // B189b: the emitted same-proto call lane vs the helper route.
+    Mode {
+        name: "nocross3",
+        env: &[("ZIPP_NO_CROSS3", "1")],
+    },
     Mode {
         name: "upvalmin12",
         env: &[("ZIPP_TIERC_UPVAL_MIN", "12")],

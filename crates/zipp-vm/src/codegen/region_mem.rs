@@ -216,7 +216,15 @@ pub(crate) fn compile_region_mem(
     // 8B 5th-arg slot. 32*n keeps the frame's 16-alignment. The leaf-inline
     // headroom flag adds one more 16B slot at the top of the frame.
     let n_ta = ta_plan.pins.len();
-    let frame = 40 + 32 * n_ta as i32 + if do_leaf || do_method { 16 } else { 0 };
+    // B189b: 48 bytes of emitted-call scratch (prior activation 24B, window
+    // base|flag 8B, result 8B, bail slot 8B) between the TA pins and the leaf
+    // flag; 48 keeps the frame's 16-alignment. `c3_off` is its base.
+    let do_cross3 = cross_plan.values().any(|site| site.cross3.is_some());
+    let c3_off = 40 + 32 * n_ta as i32;
+    let frame = 40
+        + 32 * n_ta as i32
+        + if do_cross3 { 48 } else { 0 }
+        + if do_leaf || do_method { 16 } else { 0 };
     // Byte offset (from post-prologue rsp) of the headroom flag slot (1 = the
     // scratch window fits → inline; 0 = fall back to the per-call helper).
     let leaf_flag_off = frame - 8;
@@ -2811,6 +2819,28 @@ pub(crate) fn compile_region_mem(
                 let cross_done = ops.new_dynamic_label();
                 if cross {
                     let site = cross_site.expect("cross site disappeared during emission");
+                    // B189b: the fully-emitted lane first; every guard miss
+                    // falls through to the unchanged helper block below (a
+                    // pure prefix). Metered regions keep the helper route so
+                    // the interpreter-parity charging stays exact.
+                    if let Some(c3plan) = site.cross3 {
+                        if blocks.is_none() {
+                            emit_cross3_call(
+                                &mut ops,
+                                c3plan,
+                                callee,
+                                arg_base,
+                                dst,
+                                proto.reg_count.max(1),
+                                c3_off,
+                                &heap,
+                                bail,
+                                cross_done,
+                                refetch_pinned,
+                                ta_refetch,
+                            );
+                        }
+                    }
                     let same_proto2 = site.same_proto2;
                     let packed_cross: u64 = match same_proto2 {
                         Some(plan) => {
@@ -3618,3 +3648,208 @@ pub(crate) fn chain_capacity_hint(code: &[Instr], ip: usize, acc: u16, end: usiz
         _ => 0,
     }
 }
+
+/// B189b: the fully-emitted same-proto cross call. Every baked datum
+/// (`plan.entry`/`uninit_mask` via `epoch`, the callee by `fid_mirror`, the
+/// call environment by the three nonempty bytes, GC/depth/route by their
+/// scalars) is revalidated by a cheap guard whose miss falls through to the
+/// UNCHANGED helper block emitted right after -- a pure prefix. The 48-byte
+/// stack scratch at `c3` holds: prior activation (24B) @ +0, window base|flag
+/// @ +24, result @ +32, bail slot @ +40.
+///
+/// On the mid-body-bail path the `cross3_finish` helper COMPLETES the call
+/// (B184: effects have happened; interpreter resume over the same window,
+/// never a replay); `CALL_THREW` unwinds via the region bail label exactly
+/// like the helper route.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_cross3_call(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: crate::codegen::SameProtoCross3Plan,
+    callee: u16,
+    arg_base: u16,
+    dst: u16,
+    caller_regs: u16,
+    c3: i32,
+    heap: &crate::codegen::HeapHelpers,
+    bail: dynasmrt::DynamicLabel,
+    cross_done: dynasmrt::DynamicLabel,
+    refetch_pinned: bool,
+    ta_refetch: Option<(usize, &crate::codegen::TaPinPlan)>,
+) {
+    use crate::vm::host_api::{
+        JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_EPOCH_OFFSET,
+        JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_FID_MIRROR_RAW_OFFSET, JIT_GC_REQUESTED_OFFSET,
+        JIT_GC_STRESS_OFFSET, JIT_GLOBAL_ROUTE_EPOCH_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
+        JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_THIS_MIRROR_RAW_OFFSET,
+        JIT_UPVALS_MIRROR_RAW_OFFSET,
+    };
+    let fb = ops.new_dynamic_label();
+    let zeroed = ops.new_dynamic_label();
+    let slow = ops.new_dynamic_label();
+    let act = JIT_ACTIVATION_OFFSET as i32;
+    let depth = JIT_CALL_DEPTH_OFFSET as i32;
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(callee)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => fb
+        ; mov r10d, eax
+        ; mov r11, [rdi + JIT_FID_MIRROR_RAW_OFFSET as i32]
+        ; cmp DWORD [r11 + r10 * 4], plan.fid as i32
+        ; jne => fb
+        ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
+        ; jne => fb
+        ; cmp BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32], 0
+        ; jne => fb
+        ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+        ; jne => fb
+        ; cmp DWORD [rdi + depth], crate::vm::JIT_REGION_CALL_MAX as i32
+        ; jae => fb
+        ; cmp DWORD [rdi + JIT_CROSS_EPOCH_OFFSET as i32], plan.epoch as i32
+        ; jne => fb
+        ; cmp DWORD [rdi + JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], 0
+        ; jne => fb
+        ; cmp BYTE [rdi + JIT_GC_REQUESTED_OFFSET as i32], 0
+        ; jne => fb
+        ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
+        ; jne => fb
+        // A suspended frame-free prior would need the activation root stack --
+        // helper territory (active@0 == 1 && frame_free@1 == 1).
+        ; cmp WORD [rdi + act], 0x0101
+        ; je => fb
+        // -- window open --
+        ; mov rcx, rdi
+        ; lea rdx, [rbx + dreg(caller_regs)]
+        ; mov r8d, plan.callee_regs as i32
+        ; mov rax, QWORD heap.window_open as i64
+        ; call rax
+        ; test rax, rax
+        ; jz => fb
+        ; mov [rsp + c3 + 24], rax
+        // Reload the callee (no user code ran; the register is unchanged).
+        ; mov rax, [rbx + dreg(callee)]
+        ; mov r10d, eax
+        // -- save prior activation, install the callee state --
+        ; mov r11, [rdi + act]
+        ; mov [rsp + c3], r11
+        ; mov r11, [rdi + act + 8]
+        ; mov [rsp + c3 + 8], r11
+        ; mov r11, [rdi + act + 16]
+        ; mov [rsp + c3 + 16], r11
+        ; mov DWORD [rdi + act], 0x0101
+        ; mov [rdi + act + 4], r10d
+        ; mov [rdi + act + 8], r10d
+        ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+        ; mov r11, [r11 + r10 * 8]
+        ; mov [rdi + act + 16], r11
+        // -- window fill: this, args, then the may-read-before-write mask --
+        ; mov r9, [rsp + c3 + 24]
+        ; and r9, -2
+    );
+    if plan.arrow_this {
+        dynasm!(ops
+            ; mov r11, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
+            ; mov r11, [r11 + r10 * 8]
+            ; mov [r9], r11
+        );
+    } else {
+        dynasm!(ops
+            ; mov r11, QWORD Value::UNDEFINED.bits() as i64
+            ; mov [r9], r11
+        );
+    }
+    for i in 0..plan.argc as i32 {
+        dynasm!(ops
+            ; mov r11, [rbx + dreg(arg_base) + i * 8]
+            ; mov [r9 + (1 + i) * 8], r11
+        );
+    }
+    dynasm!(ops
+        ; test BYTE [rsp + c3 + 24], 1
+        ; jnz => zeroed
+        ; mov r11, QWORD Value::UNDEFINED.bits() as i64
+    );
+    {
+        // Registers [0 ..= argc] were just written; zero only the remaining
+        // may-read-before-write set (baked; `epoch` guards its staleness).
+        let mut m = plan.uninit_mask;
+        while m != 0 {
+            let r = m.trailing_zeros() as i32;
+            m &= m - 1;
+            if r <= plan.argc as i32 {
+                continue;
+            }
+            dynasm!(ops ; mov [r9 + r * 8], r11);
+        }
+    }
+    dynasm!(ops
+        ; => zeroed
+        // -- depth++, direct native call --
+        ; inc DWORD [rdi + depth]
+        ; mov DWORD [rsp + c3 + 40], crate::codegen::NO_BAIL as i32
+        ; mov rcx, r9
+        ; lea rdx, [rsp + c3 + 40]
+        ; mov r8, rdi
+        ; mov rax, QWORD plan.entry as i64
+        ; call rax
+        ; mov [rsp + c3 + 32], rax
+        // -- restore the caller activation --
+        ; mov r11, [rsp + c3]
+        ; mov [rdi + act], r11
+        ; mov r11, [rsp + c3 + 8]
+        ; mov [rdi + act + 8], r11
+        ; mov r11, [rsp + c3 + 16]
+        ; mov [rdi + act + 16], r11
+        ; mov r10d, [rsp + c3 + 40]
+        ; cmp r10d, crate::codegen::NO_BAIL as i32
+        ; jne => slow
+        // -- clean native return --
+        ; dec DWORD [rdi + depth]
+        ; mov rcx, rdi
+        ; mov rdx, [rsp + c3 + 24]
+        ; and rdx, -2
+        ; mov rax, QWORD heap.window_close as i64
+        ; call rax
+        ; mov rax, [rsp + c3 + 32]
+        ; mov [rbx + dreg(dst)], rax
+    );
+    if refetch_pinned {
+        emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));
+    }
+    if let Some((snap, plan_ta)) = ta_refetch {
+        emit_refetch_ta(ops, snap, plan_ta);
+    }
+    dynasm!(ops
+        ; jmp => cross_done
+        // -- mid-body bail: COMPLETE via the finish helper --
+        ; => slow
+        ; mov rcx, rdi
+        ; mov rdx, [rsp + c3 + 24]
+        ; and rdx, -2
+        ; mov r8, r10
+        ; shl r8, 32
+        ; mov r11, QWORD (((plan.argc as u64) << 24) | plan.fid as u64) as i64
+        ; or r8, r11
+        ; mov r9, [rbx + dreg(callee)]
+        ; lea r11, [rbx + dreg(arg_base)]
+        ; mov [rsp + 32], r11
+        ; mov rax, QWORD heap.cross3_finish as i64
+        ; call rax
+        ; mov r10, QWORD CALL_THREW as i64
+        ; cmp rax, r10
+        ; je => bail
+        ; mov [rbx + dreg(dst)], rax
+    );
+    if refetch_pinned {
+        emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));
+    }
+    if let Some((snap, plan_ta)) = ta_refetch {
+        emit_refetch_ta(ops, snap, plan_ta);
+    }
+    dynasm!(ops
+        ; jmp => cross_done
+        ; => fb
+    );
+}
+

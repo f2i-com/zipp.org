@@ -4837,6 +4837,142 @@ fn jit_tierc_cell(vm: &Vm<'_>, idx: u32) -> Option<u32> {
         .then_some(cell)
 }
 
+/// B189b: open a cross-call callee window for the EMITTED call lane.
+/// `new_base_ptr` is the caller's window top (`rbx + caller_regs*8`);
+/// `reg_count` the callee frame size. Returns the window base pointer with
+/// bit 0 set when the slots were freshly zero-filled (the resize path — the
+/// emitted mask stores may be skipped), or 0 when the emitted lane must fall
+/// back to the full helper (non-contiguous top / overflow) — in which case NO
+/// state was changed, so the helper replays from scratch as a pure prefix.
+///
+/// # Safety
+/// `vm` is the live VM; `new_base_ptr` points into its pinned register file.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_window_open(
+    vm: *mut core::ffi::c_void,
+    new_base_ptr: *mut u64,
+    reg_count: u32,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let regs_base = vm.regs.as_ptr() as usize;
+    let nb = (new_base_ptr as usize - regs_base) / 8;
+    if nb != vm.regs.len() {
+        return 0;
+    }
+    let needed = nb + reg_count as usize;
+    if vm.regs_would_overflow(needed) {
+        return 0;
+    }
+    if needed <= vm.regs_hw {
+        // SAFETY: needed ≤ regs_hw ≤ capacity; [0..regs_hw] was initialized by
+        // an earlier resize and the pinned buffer never reallocates, so these
+        // slots hold valid (stale) `Value`s the emitted mask stores overwrite.
+        unsafe { vm.regs.set_len(needed) };
+        crossstats::fill_fast();
+        new_base_ptr as u64
+    } else {
+        vm.regs.resize(needed, Value::UNDEFINED);
+        vm.regs_hw = needed;
+        crossstats::fill_full();
+        new_base_ptr as u64 | 1
+    }
+}
+
+/// B189b: close the emitted lane's callee window (the `regs.truncate` the
+/// full helper performs on every completed call).
+///
+/// # Safety
+/// As [`jit_window_open`]; `new_base_ptr` is the pointer it validated.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_window_close(
+    vm: *mut core::ffi::c_void,
+    new_base_ptr: *mut u64,
+) {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let nb = (new_base_ptr as usize - vm.regs.as_ptr() as usize) / 8;
+    vm.regs.truncate(nb);
+}
+
+/// B189b: COMPLETE an emitted cross call whose callee bailed mid-body — the
+/// exact tail of `jit_cross_call_impl` (B184's completion rule: effects have
+/// happened; the activation must finish on the interpreter over the same
+/// window, never replay). The emitted code has already restored the caller's
+/// activation state; depth is still elevated and every path here drops it
+/// exactly once. `packed` = `(bail_ip << 32) | (argc << 24) | fid`.
+///
+/// # Safety
+/// Arguments are the emitted lane's own live values (window base it opened,
+/// callee bits its guards validated, caller-staged args pointer).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_cross3_finish(
+    vm: *mut core::ffi::c_void,
+    new_base_ptr: *mut u64,
+    packed: u64,
+    callee_bits: u64,
+    args: *const u64,
+) -> u64 {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let bail = (packed >> 32) as u32;
+    let argc = ((packed >> 24) & 0xFF) as usize;
+    let fid = (packed & 0x00FF_FFFF) as u32;
+    let regs_base = vm.regs.as_ptr() as usize;
+    let new_base = (new_base_ptr as usize - regs_base) / 8;
+    if vm.pending_throw.is_some() {
+        // The callee's own deeper call threw and its native code signalled
+        // unwind via a bail with the throw pending: unwind, never resume.
+        vm.regs.truncate(new_base);
+        vm.jit_call_depth -= 1;
+        vm.osr_deopt_exempt = true;
+        return crate::codegen::CALL_THREW;
+    }
+    if vm.frames.len() >= crate::vm::MAX_FRAMES {
+        let e = vm.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
+        vm.pending_throw = Some(e);
+        vm.regs.truncate(new_base);
+        vm.jit_call_depth -= 1;
+        vm.osr_deopt_exempt = true;
+        return crate::codegen::CALL_THREW;
+    }
+    let cv = Value::from_bits(callee_bits);
+    let closure = match vm.heap.get(cv.heap_index()) {
+        crate::heap::HeapObj::Closure { .. } => cv.heap_index(),
+        _ => NO_CLOSURE,
+    };
+    let arg_win = ((args as usize).saturating_sub(regs_base) / 8) as u32;
+    let new_target = std::mem::replace(&mut vm.pending_new_target, Value::UNDEFINED);
+    vm.frames.push(Frame {
+        super_done: false,
+        args_obj: u32::MAX,
+        eval_scope: u32::MAX,
+        arg_win,
+        argc: argc as u16,
+        is_eval: false,
+        func: fid,
+        base: new_base,
+        ip: bail as usize,
+        ret_dst: 0,
+        closure,
+        handlers: Vec::new(),
+        new_target,
+        callee: cv,
+    });
+    let stop = vm.frames.len() - 1;
+    let out = match vm.run_loop(stop) {
+        Ok(v) => {
+            vm.regs.truncate(new_base);
+            v.bits()
+        }
+        Err(_) => {
+            // pending_throw is set; the native chain unwinds and the
+            // enclosing interpreter dispatches it to a handler.
+            vm.osr_deopt_exempt = true;
+            crate::codegen::CALL_THREW
+        }
+    };
+    vm.jit_call_depth -= 1;
+    out
+}
+
 /// Tier-C captured read. Pure and allocation-free; malformed/TDZ state declines
 /// at the exact `UpvalGet` ip so the interpreter supplies the throw semantics.
 ///

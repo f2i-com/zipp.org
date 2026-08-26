@@ -97,6 +97,11 @@ const NO_CLOSURE: u32 = u32::MAX;
 /// Closure identity while still suspending an outer frame-free activation.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+// repr(C): the B189b emitted call lane saves/installs/restores this state as
+// three raw qwords through `JIT_ACTIVATION_OFFSET`; the layout below is the
+// contract (active@0, frame_free@1, closure@4, callee@8, upvals_raw@16 — 24
+// bytes, compile-checked in host_api.rs).
+#[repr(C)]
 struct TiercActivationState {
     active: bool,
     frame_free: bool,
