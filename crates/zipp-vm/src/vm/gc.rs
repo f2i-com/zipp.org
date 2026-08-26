@@ -639,6 +639,11 @@ impl Vm<'_> {
         let t_trace = gcstats::now(stats);
 
         // --- Sweep + prune -------------------------------------------------
+        // B196a: the major's dead walk restocks the recycle pool too (the
+        // sorted, demand-trimmed pool made that safe; the pre-sort balloon
+        // and scatter costs are the B194/B196 ledger rows' story).
+        #[cfg(not(feature = "safe-sandbox"))]
+        self.heap.obj_pool_refill_scope(major_refill_enabled());
         let mut swept = 0usize;
         if oracle {
             // B6 oracle: split the swept walk by generation. `alloc_log`-style
@@ -691,6 +696,8 @@ impl Vm<'_> {
                 }
             }
         }
+        #[cfg(not(feature = "safe-sandbox"))]
+        self.heap.obj_pool_refill_scope(false);
         let t_sweep = gcstats::now(stats);
         // Drop side-table entries whose keyed object was reclaimed.
         self.proto_of.retain(|&k, _| marks[k as usize]);
@@ -1913,3 +1920,23 @@ pub use gcstats::dump as gc_stats;
 pub use gcstats::dump_budget as gc_young_budget_stats;
 pub use gcstats::dump_gen as gc_gen_stats;
 pub use gcstats::dump_nursery as gc_nursery_stats;
+
+
+/// `ZIPP_NO_OBJ_POOL_MAJOR=1` keeps MAJOR sweeps off the recycle pool
+/// (minor-only refill, the B194-landed behavior) — the single-binary A/B
+/// for the B196a major-refill widening. Latched on first use.
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn major_refill_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_OBJ_POOL_MAJOR").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}

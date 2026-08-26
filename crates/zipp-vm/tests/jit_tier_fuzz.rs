@@ -478,6 +478,17 @@ const MODES: &[Mode] = &[
         name: "noobjpool",
         env: &[("ZIPP_NO_OBJ_POOL", "1")],
     },
+    // B196a: the pool's serve-order and major-refill fallbacks (LIFO-only
+    // serve; minor-only refill) — pure fallbacks by contract, so the
+    // differential checks them for free.
+    Mode {
+        name: "noobjpoolsort",
+        env: &[("ZIPP_NO_OBJ_POOL_SORT", "1")],
+    },
+    Mode {
+        name: "noobjpoolmajor",
+        env: &[("ZIPP_NO_OBJ_POOL_MAJOR", "1")],
+    },
     Mode {
         name: "upvalmin12",
         env: &[("ZIPP_TIERC_UPVAL_MIN", "12")],

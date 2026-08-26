@@ -627,6 +627,25 @@ fn obj_pool_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_OBJ_POOL_SORT=1` skips the address sort at trim (LIFO serve in
+/// push order, the pre-B196a behavior) — the single-binary A/B separating
+/// the sort's own cost from the locality it buys. Latched on first use.
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn obj_pool_sort_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_OBJ_POOL_SORT").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Retained-shell FLOOR for the recycle pool (~450 KiB of shells): the trim
 /// at each collection-done note keeps `max(2 * served, floor)` shells, so a
 /// steady literal-churn loop ramps the pool to its whole inter-sweep window
@@ -4072,6 +4091,15 @@ pub struct Heap {
     /// signal `courier_flush`'s trim sizes the pool by.
     #[cfg(not(feature = "safe-sandbox"))]
     obj_pool_pops: usize,
+    /// Serve order: false = LIFO push order (recently-swept shells first,
+    /// cache-warm — what a warm server's fast turnover wants; the address
+    /// sort measured +2.5% on the router purely by breaking it), true =
+    /// address order (packed spans for a workload that STREAMS a retained
+    /// set — allocation-survival needs it at -5.6%, and +11.3% without
+    /// within-span order). Flipped once the FIRST MAJOR completes: majors
+    /// are what deep retention causes, and no-major workloads keep warmth.
+    #[cfg(not(feature = "safe-sandbox"))]
+    obj_pool_addr_order: bool,
     /// True only while a MINOR sweep runs: the recycle arm refills the pool
     /// from young deaths (the literal churn it exists for) and never from a
     /// major's burst — a promotion-heavy workload retires its whole live set
@@ -4079,15 +4107,6 @@ pub struct Heap {
     /// it back out (allocation-survival +4.4% even with decay trimming).
     #[cfg(not(feature = "safe-sandbox"))]
     obj_pool_refill: bool,
-    /// Whether the NEXT minor may refill the pool: the previous minor's
-    /// survivor fraction must be low (< 1/16). A retaining workload reads
-    /// its survivors later, and serving its allocations from recycled
-    /// shells scatters what fresh sequential blocks would have packed —
-    /// allocation-survival measured +8.7% MUTATOR-side (GC time equal)
-    /// from exactly that locality loss. Churn workloads (survivors ~0)
-    /// never re-read, so recycling stays a pure allocator win there.
-    #[cfg(not(feature = "safe-sandbox"))]
-    obj_pool_refill_ok: bool,
     /// `ZIPP_GCSTATS=1` pool telemetry (pushed, popped, trimmed), printed
     /// when the heap drops. Plain counters — bumped only under the latch.
     #[cfg(not(feature = "safe-sandbox"))]
@@ -4420,9 +4439,9 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_pops: 0,
             #[cfg(not(feature = "safe-sandbox"))]
-            obj_pool_refill: false,
+            obj_pool_addr_order: false,
             #[cfg(not(feature = "safe-sandbox"))]
-            obj_pool_refill_ok: true,
+            obj_pool_refill: false,
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_stats: [0; 3],
             hot_mirror: vec![HotMirror::CLEAR; versions.len()],
@@ -4814,6 +4833,16 @@ impl Heap {
         self.invalidate_nonyoung_cache();
     }
 
+    /// B196a: scope the recycle-pool refill flag from OUTSIDE (the major
+    /// sweep loops live in `vm/gc.rs`). Callers must pair on/off exactly
+    /// around a sweep's `free_slot` loop; the sorted trim at the next
+    /// collection-done note demand-sizes whatever the sweep stocked.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn obj_pool_refill_scope(&mut self, on: bool) {
+        self.obj_pool_refill = on;
+    }
+
     /// MINOR sweep: walk ONLY the young log, freeing the unmarked entries —
     /// `free_slot` exactly as the major does (tombstone + version bump + free
     /// list), so every stale inline cache misses identically. Survivors are
@@ -4832,7 +4861,7 @@ impl Heap {
         let mut swept = 0;
         #[cfg(not(feature = "safe-sandbox"))]
         {
-            self.obj_pool_refill = self.obj_pool_refill_ok;
+            self.obj_pool_refill = true;
         }
         for &idx in &log {
             if !marks[idx as usize] {
@@ -4848,9 +4877,6 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         {
             self.obj_pool_refill = false;
-            // This minor's survivor fraction gates the NEXT minor's refill
-            // (phases are sticky; the first minor defaults to refilling).
-            self.obj_pool_refill_ok = (log.len() - swept).saturating_mul(16) <= log.len();
         }
         log.clear();
         self.young = log;
@@ -5252,6 +5278,17 @@ impl Heap {
                 }
                 self.courier_batch.push(gc_courier::Item::Obj(m));
             }
+            // Address-sort what stays: consecutive pops then hand out
+            // ADJACENT boxes, so co-allocated objects (the survivors a
+            // retaining workload re-reads) sit packed the way fresh
+            // sequential mallocs would have packed them. This is what
+            // retires the survivor-fraction refill gate: the +8.7%
+            // mutator-side scatter on allocation-survival was that gate's
+            // whole reason to exist.
+            if self.obj_pool_addr_order && obj_pool_sort_enabled() {
+                self.obj_pool
+                    .sort_unstable_by_key(|b| &**b as *const ObjMap as usize);
+            }
         }
         if !self.courier_batch.is_empty() {
             gc_courier::ship(std::mem::take(&mut self.courier_batch));
@@ -5271,6 +5308,12 @@ impl Heap {
     /// from the free list, so peak memory is unchanged.
     #[inline]
     pub fn note_gc_done(&mut self, live: usize) {
+        // A major completed: retention is real — serve the pool in address
+        // order from here on (see the `obj_pool_addr_order` field docs).
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            self.obj_pool_addr_order = true;
+        }
         self.courier_flush();
         self.live = live;
         // A MAJOR completed: nothing unreachable survived it, so `live` is
