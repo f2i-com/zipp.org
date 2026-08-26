@@ -262,18 +262,12 @@ pub(crate) extern "win64" fn jit_finalize_object_baked(
         // len agreement a stale pointer could not satisfy by accident.
         let plan = unsafe { &*(plan_ptr as usize as *const crate::bytecode::StaticKeyPlan) };
         debug_assert!(plan.runtime_valid() && plan.len() == count);
-        let mut vals = Vec::with_capacity(count);
+        let mut buf = [Value::UNDEFINED; 16];
         for offset in 0..count {
             let bits = unsafe { *regs.add(val_base + offset) };
-            vals.push(Value::from_bits(bits));
+            buf[offset] = Value::from_bits(bits);
         }
-        let idx = vm
-            .heap
-            .alloc(HeapObj::Object(Box::new(ObjMap::finalized_from_plan(
-                plan.clone(),
-                vals,
-                shape,
-            ))));
+        let idx = vm.heap.alloc_finalized(plan.clone(), &buf[..count], shape);
         vm.realm_born(idx, vm.obj_proto);
         crate::heap::note_static_key_jit_object();
         Value::heap(idx).bits()
@@ -328,17 +322,13 @@ pub(crate) extern "win64" fn jit_finalize_object(
         if !regs_window_valid(vm, regs, reg_count) {
             return crate::codegen::SELF_CALL_DEOPT;
         }
-        let mut vals = Vec::with_capacity(count);
+        let mut buf = [Value::UNDEFINED; 256];
         for offset in 0..count {
             let bits = unsafe { *regs.add(val_base + offset) };
-            vals.push(Value::from_bits(bits));
+            buf[offset] = Value::from_bits(bits);
         }
         let shape = vm.finalize_shape(func_id, plan_idx as u16, &plan);
-        let idx = vm
-            .heap
-            .alloc(HeapObj::Object(Box::new(ObjMap::finalized_from_plan(
-                plan, vals, shape,
-            ))));
+        let idx = vm.heap.alloc_finalized(plan, &buf[..count], shape);
         vm.realm_born(idx, vm.obj_proto);
         crate::heap::note_static_key_jit_object();
         Value::heap(idx).bits()

@@ -4690,13 +4690,18 @@ impl<'p> Vm<'p> {
                             ));
                         }
                         let shape = self.finalize_shape(func_id, plan_idx, &plan);
-                        let mut vals = Vec::with_capacity(count as usize);
+                        // B187: values staged in a stack buffer (count <= 16 by
+                        // the compile gate), the map's storage comes from the
+                        // literal slab — no per-object Vec round-trip.
+                        let mut buf = [Value::UNDEFINED; 16];
                         for i in 0..count {
-                            vals.push(self.get(base, val_base + i));
+                            buf[i as usize] = self.get(base, val_base + i);
                         }
-                        let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(
-                            ObjMap::finalized_from_plan(plan, vals, shape),
-                        ))));
+                        let v = Value::heap(self.heap.alloc_finalized(
+                            plan,
+                            &buf[..count as usize],
+                            shape,
+                        ));
                         self.realm_born(v.heap_index(), self.obj_proto);
                         self.set(base, dst, v);
                         // Historical metering cost: the legacy sequence charged

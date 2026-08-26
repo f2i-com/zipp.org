@@ -583,6 +583,25 @@ fn sparse_num_index_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_VAL_SLAB=1` makes every finalize-born literal carry an owned
+/// `Vec<Value>` (the pre-B187 representation) — the single-binary A/B for
+/// the literal value slab. Latched on first use.
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn val_slab_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_VAL_SLAB").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// `ZIPP_NO_ATTRS_ELIDE=1` makes every map carry the explicit attribute
 /// vector from birth (`PropAttrs::Mixed`), the pre-elision representation —
 /// the single-binary A/B for the all-default elision. Latched on first use.
@@ -852,7 +871,7 @@ pub struct ObjMap {
     /// change underneath — the planned literal-born representation keeps the
     /// contiguity the JIT's scale-8 loads require while dropping the per-
     /// object `Vec` header round-trip.
-    vals: Vec<Value>,
+    vals: ValStore,
     /// Per-property attributes, parallel to `keys`/`vals` (a property descriptor's
     /// writable/enumerable/configurable + accessor get/set). For a DATA property
     /// `vals[i]` is the value; for an ACCESSOR `vals[i]` is the getter and
@@ -926,6 +945,251 @@ pub struct ObjMap {
     /// was deleted, or an existing property's attributes were redefined. Nothing
     /// depends on a shape being present, only on it being correct when it is.
     shape: u32,
+}
+
+/// The VALUE column of an [`ObjMap`] (B187 stage 2). Ordinary objects own a
+/// `Vec<Value>`; a FINALIZE-BORN literal instead borrows a fixed-capacity
+/// cell from the heap's stable-chunk [`ValSlab`], which removes the
+/// per-object `Vec` allocation, its 24-byte header initialization, and its
+/// eventual free — the attributed bulk of the object build floor
+/// (B187-scout: 80ns/object of pure construction against node's ~4).
+///
+/// CONTAINMENT INVARIANT (what makes the raw base sound): the `Slab` variant
+/// is ONLY ever constructed by [`Heap::alloc_finalized`] and only ever lives
+/// inside a heap slot; every path that removes such an object from its slot
+/// (`free_slot`, `replace`) returns the cell to the slab first, the courier
+/// never ships it, and VM teardown frees the chunks wholesale. The base
+/// pointer aims into a `Box<[Value; VAL_SLAB_CHUNK]>` the heap owns for its
+/// whole life — chunk boxes never move or shrink. A structural growth
+/// (key add) SPILLS to the `Vec` form before pushing; the key-add version
+/// bump already invalidates every cached `vals` pointer, which is exactly
+/// the discipline the mirrors and identity ways rely on today.
+enum ValStore {
+    Vec(Vec<Value>),
+    /// `base` is a `*mut Value` stored as `usize` (the containment invariant
+    /// above is the Send/aliasing argument; the heap is single-threaded and
+    /// slab objects never cross threads). Compiled OUT of the hardened
+    /// `safe-sandbox` build, which forbids `unsafe` — that build always
+    /// takes the `Vec` form.
+    #[cfg(not(feature = "safe-sandbox"))]
+    Slab { base: usize, len: u16, class: u8 },
+}
+
+impl ValStore {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            ValStore::Vec(v) => v.len(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            ValStore::Slab { len, .. } => *len as usize,
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[Value] {
+        match self {
+            ValStore::Vec(v) => v,
+            // SAFETY: the containment invariant — base aims at a live,
+            // heap-owned, immovable chunk with at least `len` initialized
+            // slots (alloc_finalized wrote them before publishing).
+            #[cfg(not(feature = "safe-sandbox"))]
+            ValStore::Slab { base, len, .. } => unsafe {
+                std::slice::from_raw_parts(*base as *const Value, *len as usize)
+            },
+        }
+    }
+
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [Value] {
+        match self {
+            ValStore::Vec(v) => v,
+            // SAFETY: as `as_slice`, plus exclusive access via `&mut self`.
+            #[cfg(not(feature = "safe-sandbox"))]
+            ValStore::Slab { base, len, .. } => unsafe {
+                std::slice::from_raw_parts_mut(*base as *mut Value, *len as usize)
+            },
+        }
+    }
+
+    #[inline]
+    fn as_ptr(&self) -> *const Value {
+        match self {
+            ValStore::Vec(v) => v.as_ptr(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            ValStore::Slab { base, .. } => *base as *const Value,
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> Option<&Value> {
+        self.as_slice().get(i)
+    }
+
+    /// Structural growth: a `Slab` store SPILLS to the `Vec` form first (the
+    /// caller's key-add version bump invalidates every cached pointer, per
+    /// the field doc). The vacated cell is returned by the HEAP-level caller
+    /// (`Heap`-routed mutations), not here — `ValStore` cannot reach the
+    /// slab's free lists; see `Heap::note_object_grew`.
+    fn push(&mut self, v: Value) {
+        match self {
+            ValStore::Vec(vec) => vec.push(v),
+            #[cfg(not(feature = "safe-sandbox"))]
+            ValStore::Slab { .. } => {
+                // SPILL: structural growth materializes the Vec form. The
+                // vacated cell is deliberately LEAKED WITHIN ITS HEAP'S OWN
+                // CHUNKS (reclaimed wholesale at teardown): the store has no
+                // route to its owning slab, and any out-of-band parking is
+                // unsound the moment two VMs share a thread — a drained cell
+                // could enter the WRONG heap's free list and dangle when the
+                // first heap drops. Spills are rare (a finalize-born literal
+                // gaining a key), so the retention is bounded and safe.
+                let mut vec = self.as_slice().to_vec();
+                vec.reserve(1);
+                vec.push(v);
+                *self = ValStore::Vec(vec);
+            }
+        }
+    }
+
+    fn remove(&mut self, i: usize) -> Value {
+        match self {
+            ValStore::Vec(vec) => vec.remove(i),
+            #[cfg(not(feature = "safe-sandbox"))]
+            ValStore::Slab { .. } => {
+                // As `push`: spill and leak the cell (see there for why).
+                let mut vec = self.as_slice().to_vec();
+                let out = vec.remove(i);
+                *self = ValStore::Vec(vec);
+                out
+            }
+        }
+    }
+
+    #[inline]
+    fn capacity_bytes(&self) -> usize {
+        match self {
+            ValStore::Vec(v) => vec_capacity_bytes(v),
+            // Slab memory is owned and counted WHOLESALE at the heap level
+            // (`Heap::resident_bytes` adds every chunk), which over-counts
+            // unused cells rather than under-counting — the safe direction
+            // for the sandbox ceilings.
+            #[cfg(not(feature = "safe-sandbox"))]
+            ValStore::Slab { .. } => 0,
+        }
+    }
+}
+
+impl std::ops::Index<usize> for ValStore {
+    type Output = Value;
+    #[inline]
+    fn index(&self, i: usize) -> &Value {
+        &self.as_slice()[i]
+    }
+}
+
+impl std::ops::IndexMut<usize> for ValStore {
+    #[inline]
+    fn index_mut(&mut self, i: usize) -> &mut Value {
+        &mut self.as_mut_slice()[i]
+    }
+}
+
+impl Clone for ValStore {
+    /// A clone always materializes the `Vec` form: the containment invariant
+    /// ties each slab cell to exactly ONE heap slot, so a copy must not
+    /// alias it.
+    fn clone(&self) -> Self {
+        ValStore::Vec(self.as_slice().to_vec())
+    }
+}
+
+impl std::fmt::Debug for ValStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.as_slice()).finish()
+    }
+}
+
+impl Default for ValStore {
+    fn default() -> Self {
+        ValStore::Vec(Vec::new())
+    }
+}
+
+/// Capacity classes for the literal slab: FinalizeObject admits 1..=16 keys.
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn val_slab_class(count: usize) -> Option<u8> {
+    match count {
+        1..=4 => Some(0),
+        5..=8 => Some(1),
+        9..=16 => Some(2),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn val_slab_class_cap(class: u8) -> usize {
+    match class {
+        0 => 4,
+        1 => 8,
+        _ => 16,
+    }
+}
+
+/// One capacity class of the literal value slab: heap-owned, never-moving
+/// chunk boxes carved into fixed-`cap` cells, with a base-pointer free list.
+/// Freeing and allocating are a Vec push/pop; chunks are only ever released
+/// wholesale when the heap itself drops.
+#[cfg(not(feature = "safe-sandbox"))]
+struct ValSlabClass {
+    chunks: Vec<Box<[Value; VAL_SLAB_CHUNK]>>,
+    /// Bases of returned cells, ready for reuse.
+    free: Vec<usize>,
+    /// Next unused offset (in `Value`s) within the LAST chunk.
+    cursor: usize,
+}
+
+/// Values per chunk box (32 KiB of `Value`s): big enough that chunk
+/// allocation is rare, small enough that a mostly-dead slab is not a large
+/// retained overhead.
+#[cfg(not(feature = "safe-sandbox"))]
+const VAL_SLAB_CHUNK: usize = 4096;
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl ValSlabClass {
+    const fn new() -> Self {
+        ValSlabClass {
+            chunks: Vec::new(),
+            free: Vec::new(),
+            cursor: VAL_SLAB_CHUNK, // forces the first chunk on first use
+        }
+    }
+
+    fn alloc_cell(&mut self, cap: usize) -> usize {
+        if let Some(base) = self.free.pop() {
+            return base;
+        }
+        if self.cursor + cap > VAL_SLAB_CHUNK {
+            self.chunks
+                .push(Box::new([Value::UNDEFINED; VAL_SLAB_CHUNK]));
+            self.cursor = 0;
+        }
+        let chunk = self.chunks.last_mut().expect("chunk just ensured");
+        let base = unsafe { chunk.as_mut_ptr().add(self.cursor) } as usize;
+        self.cursor += cap;
+        base
+    }
+
+    #[inline]
+    fn free_cell(&mut self, base: usize) {
+        self.free.push(base);
+    }
+
+    fn resident_bytes(&self) -> usize {
+        self.chunks.len() * VAL_SLAB_CHUNK * std::mem::size_of::<Value>()
+            + vec_capacity_bytes(&self.free)
+    }
 }
 
 /// The attribute column of an [`ObjMap`], with the all-default case elided.
@@ -1095,7 +1359,7 @@ impl ObjMap {
         let mut n = self
             .keys
             .resident_bytes()
-            .saturating_add(vec_capacity_bytes(&self.vals))
+            .saturating_add(self.vals.capacity_bytes())
             .saturating_add(self.attrs.capacity_bytes());
         if let Some(index) = &self.index {
             n = n.saturating_add(index.resident_bytes());
@@ -1187,7 +1451,7 @@ impl ObjMap {
     /// read API that cannot be invalidated by it.
     #[inline]
     pub fn vals_slice(&self) -> &[Value] {
-        &self.vals
+        self.vals.as_slice()
     }
 
     /// Raw base for value-mirror maintenance and IC fills (the non-cfg'd twin
@@ -1403,7 +1667,11 @@ impl ObjMap {
         let mut m = ObjMap::new();
         if n > 0 {
             m.keys.reserve_exact(n);
-            m.vals.reserve_exact(n);
+            {
+                #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
+                let ValStore::Vec(v) = &mut m.vals else { unreachable!("ctor stores are Vec-born") };
+                v.reserve_exact(n);
+            }
             m.attrs.reserve_exact(n);
         }
         m
@@ -1420,7 +1688,11 @@ impl ObjMap {
         let mut m = ObjMap::new();
         m.keys = PropKeys::planned(plan);
         if n > 0 {
-            m.vals.reserve_exact(n);
+            {
+                #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
+                let ValStore::Vec(v) = &mut m.vals else { unreachable!("ctor stores are Vec-born") };
+                v.reserve_exact(n);
+            }
             m.attrs.reserve_exact(n);
         }
         static_key_stats::object();
@@ -1446,6 +1718,13 @@ impl ObjMap {
     /// The caller guarantees `plan.runtime_valid()` and `vals.len() ==
     /// plan.len()`; both are debug-asserted here.
     pub(crate) fn finalized_from_plan(plan: StaticKeyPlan, vals: Vec<Value>, shape: u32) -> ObjMap {
+        Self::finalized_from_store(plan, ValStore::Vec(vals), shape)
+    }
+
+    /// Store-generic finalize constructor (B187 stage 2): identical to
+    /// `finalized_from_plan` in every observable respect, over either value
+    /// representation. Only [`Heap::alloc_finalized`] passes a `Slab` store.
+    fn finalized_from_store(plan: StaticKeyPlan, vals: ValStore, shape: u32) -> ObjMap {
         debug_assert!(plan.runtime_valid());
         debug_assert_eq!(vals.len(), plan.len());
         let n = plan.len();
@@ -1507,7 +1786,11 @@ impl ObjMap {
         let mut m = ObjMap::new_side_table();
         if n > 0 {
             m.keys.reserve_exact(n);
-            m.vals.reserve_exact(n);
+            {
+                #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
+                let ValStore::Vec(v) = &mut m.vals else { unreachable!("ctor stores are Vec-born") };
+                v.reserve_exact(n);
+            }
             m.attrs.reserve_exact(n);
         }
         m
@@ -1516,7 +1799,7 @@ impl ObjMap {
     pub fn new() -> ObjMap {
         ObjMap {
             keys: PropKeys::default(),
-            vals: Vec::new(),
+            vals: ValStore::Vec(Vec::new()),
             attrs: if attrs_elide_enabled() {
                 PropAttrs::AllData { len: 0 }
             } else {
@@ -3685,6 +3968,9 @@ pub struct Heap {
     /// Dead payloads collected by the CURRENT sweep, shipped to the courier
     /// thread at `note_gc_done`/`note_minor_done` (see [`gc_courier`]).
     courier_batch: Vec<gc_courier::Item>,
+    /// The literal value slab (B187 stage 2), one class per capacity bucket.
+    #[cfg(not(feature = "safe-sandbox"))]
+    val_slab: [ValSlabClass; 3],
     /// Free list of reclaimed slot indices (filled by the mark-sweep GC's sweep,
     /// drained by `alloc`). A reused slot is overwritten and its version bumped so
     /// any stale JIT inline-cache entry misses. Empty until the first collection.
@@ -4006,6 +4292,8 @@ impl Heap {
             resident_payload_charged,
             payload_accounting: Cell::new(false),
             courier_batch: Vec::new(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            val_slab: [ValSlabClass::new(), ValSlabClass::new(), ValSlabClass::new()],
             shape_mirror: vec![crate::shape::DICT; versions.len()],
             vals_ptr_mirror: vec![0; versions.len()],
             shape_mirror_raw: 0,
@@ -4069,6 +4357,45 @@ impl Heap {
     pub fn pin_mirror_dict(&mut self, idx: u32) {
         self.shape_mirror[idx as usize] = crate::shape::DICT;
         self.vals_ptr_mirror[idx as usize] = 0;
+    }
+
+    /// B187 stage 2: allocate a FINALIZE-BORN literal with its values in the
+    /// slab — one call fusing cell allocation, map construction and the
+    /// ordinary slot allocation (whose bookkeeping, mirrors included, stays
+    /// authoritative). `ZIPP_NO_VAL_SLAB=1` keeps the historical `Vec` form.
+    pub fn alloc_finalized(
+        &mut self,
+        plan: crate::bytecode::StaticKeyPlan,
+        vals: &[Value],
+        shape: u32,
+    ) -> u32 {
+        #[cfg(not(feature = "safe-sandbox"))]
+        let store = match val_slab_class(vals.len()) {
+            Some(class) if val_slab_enabled() => {
+                let cap = val_slab_class_cap(class);
+                let base = self.val_slab[class as usize].alloc_cell(cap);
+                // SAFETY: the cell has `cap >= vals.len()` slots inside a
+                // live, immovable chunk this heap owns; no other reference
+                // aims at it (fresh from the free list or the cursor).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        vals.as_ptr(),
+                        base as *mut Value,
+                        vals.len(),
+                    );
+                }
+                ValStore::Slab {
+                    base,
+                    len: vals.len() as u16,
+                    class,
+                }
+            }
+            _ => ValStore::Vec(vals.to_vec()),
+        };
+        #[cfg(feature = "safe-sandbox")]
+        let store = ValStore::Vec(vals.to_vec());
+        let map = ObjMap::finalized_from_store(plan, store, shape);
+        self.alloc(HeapObj::Object(Box::new(map)))
     }
 
     /// Refresh slot `idx`'s shape/vals mirrors from the live object — the
@@ -4520,6 +4847,16 @@ impl Heap {
     pub fn resident_bytes(&self) -> usize {
         vec_capacity_bytes(&self.objs)
             .saturating_add(vec_capacity_bytes(&self.resident_payload_charged))
+            .saturating_add({
+                #[cfg(not(feature = "safe-sandbox"))]
+                {
+                    self.val_slab.iter().map(|c| c.resident_bytes()).sum::<usize>()
+                }
+                #[cfg(feature = "safe-sandbox")]
+                {
+                    0
+                }
+            })
             .saturating_add(vec_capacity_bytes(&self.versions))
             .saturating_add(vec_capacity_bytes(&self.free))
             .saturating_add(vec_capacity_bytes(&self.born))
@@ -4581,6 +4918,23 @@ impl Heap {
         // here exactly as before. The bookkeeping around it never leaves the
         // mutator.
         let dead = std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN));
+        // A slab-born object's cell goes home FIRST (the courier must never
+        // see it — the invariant that keeps the raw base single-owner); the
+        // EMPTIED shell then takes the ordinary path below, so the courier
+        // still carries its keys-plan Arc decrement and Box free off-thread
+        // (dropping shells inline measured survival +5.8% — exactly B185's
+        // win handed back).
+        #[cfg(not(feature = "safe-sandbox"))]
+        let dead = match dead {
+            HeapObj::Object(mut m) => {
+                if let ValStore::Slab { base, class, .. } = m.vals {
+                    self.val_slab[class as usize].free_cell(base);
+                    m.vals = ValStore::Vec(Vec::new());
+                }
+                HeapObj::Object(m)
+            }
+            other => other,
+        };
         if gc_courier::active() {
             match dead {
                 HeapObj::Object(m) => self.courier_batch.push(gc_courier::Item::Obj(m)),
@@ -4716,7 +5070,17 @@ impl Heap {
         // is re-traced at the next minor (holder-grain — the value set is a
         // full HeapObj, not a single Value).
         self.write_barrier(idx);
-        self.objs[idx as usize] = obj;
+        #[cfg_attr(feature = "safe-sandbox", allow(unused_variables))]
+        let old = std::mem::replace(&mut self.objs[idx as usize], obj);
+        // The OLD occupant is discarded; a slab-born one hands its cell home
+        // first (the strip makes the shell's drop cell-blind).
+        #[cfg(not(feature = "safe-sandbox"))]
+        if let HeapObj::Object(mut m) = old {
+            if let ValStore::Slab { base, class, .. } = m.vals {
+                self.val_slab[class as usize].free_cell(base);
+                m.vals = ValStore::Vec(Vec::new());
+            }
+        }
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
         self.refresh_mirror(idx);
     }
@@ -5249,7 +5613,7 @@ mod tests {
         assert!(!duplicate.planned_next_static_key("b"));
         duplicate.push_static_data("b", Value::int(2));
         assert_eq!(duplicate.keys.as_ref(), &["a".to_string(), "b".to_string()]);
-        assert_eq!(duplicate.vals, &[Value::int(9), Value::int(2)]);
+        assert_eq!(duplicate.vals_slice(), &[Value::int(9), Value::int(2)]);
         duplicate.verify_shape().expect("duplicate-safe shape");
 
         let mut reordered = ObjMap::with_static_key_plan_mode(plan, true);
@@ -5259,7 +5623,7 @@ mod tests {
         reordered.push_static_data("a", Value::int(1));
         reordered.push_static_data("b", Value::int(7));
         assert_eq!(reordered.keys.as_ref(), &["b".to_string(), "a".to_string()]);
-        assert_eq!(reordered.vals, &[Value::int(7), Value::int(1)]);
+        assert_eq!(reordered.vals_slice(), &[Value::int(7), Value::int(1)]);
         reordered.verify_shape().expect("reorder-safe shape");
     }
 
@@ -5421,7 +5785,7 @@ mod tests {
                 assert!(a.remove(&key));
                 b.remove_at(i);
                 assert_eq!(a.keys, b.keys, "n={n} victim={victim}: keys diverged");
-                assert_eq!(a.vals, b.vals, "n={n} victim={victim}: vals diverged");
+                assert_eq!(a.vals_slice(), b.vals_slice(), "n={n} victim={victim}: vals diverged");
                 assert_map_consistent(&a);
                 assert_map_consistent(&b);
                 for j in 0..n {
