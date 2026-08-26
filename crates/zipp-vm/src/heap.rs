@@ -847,7 +847,12 @@ impl PropKeys {
 #[derive(Clone, Debug, Default)]
 pub struct ObjMap {
     pub keys: PropKeys,
-    pub vals: Vec<Value>,
+    /// PRIVATE since the B187 stage-1 migration (like `attrs`/`index`): all
+    /// access goes through the `val_*`/`vals_*` methods so the storage can
+    /// change underneath — the planned literal-born representation keeps the
+    /// contiguity the JIT's scale-8 loads require while dropping the per-
+    /// object `Vec` header round-trip.
+    vals: Vec<Value>,
     /// Per-property attributes, parallel to `keys`/`vals` (a property descriptor's
     /// writable/enumerable/configurable + accessor get/set). For a DATA property
     /// `vals[i]` is the value; for an ACCESSOR `vals[i]` is the getter and
@@ -1147,6 +1152,50 @@ impl ObjMap {
     #[inline]
     pub fn attr_get(&self, i: usize) -> Option<PropAttr> {
         self.attrs.get(i)
+    }
+
+    /// Number of value slots (parallel to `keys`/attrs; can disagree
+    /// transiently mid-append, which some callers deliberately check).
+    #[inline]
+    pub fn vals_len(&self) -> usize {
+        self.vals.len()
+    }
+
+    /// Append one value slot — the raw parallel-vec push; the caller owns the
+    /// key/attr pushes and shape maintenance, as with the field access this
+    /// replaces.
+    #[allow(dead_code)] // total-API member; callers are configuration- and test-dependent
+    #[inline]
+    pub fn push_val(&mut self, v: Value) {
+        self.vals.push(v);
+    }
+
+    #[allow(dead_code)] // total-API member; callers are configuration- and test-dependent
+    #[inline]
+    pub fn val_get(&self, i: usize) -> Option<Value> {
+        self.vals.get(i).copied()
+    }
+
+    #[inline]
+    pub fn val_get_ref(&self, i: usize) -> Option<&Value> {
+        self.vals.get(i)
+    }
+
+    /// Every value slot, contiguously. This shape survives the planned store
+    /// change: any future representation must stay contiguous (the JIT bakes
+    /// scale-8 indexed loads through `vals_ptr`), so a slice view is the one
+    /// read API that cannot be invalidated by it.
+    #[inline]
+    pub fn vals_slice(&self) -> &[Value] {
+        &self.vals
+    }
+
+    /// Raw base for value-mirror maintenance and IC fills (the non-cfg'd twin
+    /// of [`ObjMap::vals_ptr`]).
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
+    #[inline]
+    pub fn vals_ptr_raw(&self) -> *const Value {
+        self.vals.as_ptr()
     }
 
     /// Mutable access to one slot's attributes. Prefer [`ObjMap::set_attr_at`]

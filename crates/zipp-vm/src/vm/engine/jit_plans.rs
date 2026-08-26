@@ -2291,7 +2291,7 @@ impl<'p> Vm<'p> {
         // (measured 21ns/call against 3.8ns for the same method on a class).
         let (recv_class, vals_ptr, shape_guardable) = match self.heap.get(ridx) {
             HeapObj::Object(m) if !m.is_ctor => {
-                (m.class, m.vals.as_ptr() as u64, m.shape_guardable())
+                (m.class, m.vals_ptr_raw() as u64, m.shape_guardable())
             }
             _ => return None,
         };
@@ -2331,7 +2331,7 @@ impl<'p> Vm<'p> {
                 }
                 let holder = hops.0[n - 1].0;
                 let (fv, hvals) = match self.heap.get(holder) {
-                    HeapObj::Object(hm) => (hm.vals[slot as usize], hm.vals.as_ptr() as u64),
+                    HeapObj::Object(hm) => (hm.val_at(slot as usize), hm.vals_ptr_raw() as u64),
                     _ => return None,
                 };
                 if !fv.is_heap() {
@@ -2362,7 +2362,7 @@ impl<'p> Vm<'p> {
                 // captures — an upvalue read has no frame to resolve against in
                 // an inlined body.
                 let (fv, is_data) = match self.heap.get(ridx) {
-                    HeapObj::Object(m) => (m.vals[slot], !m.attr_at(slot).accessor),
+                    HeapObj::Object(m) => (m.val_at(slot), !m.attr_at(slot).accessor),
                     _ => return None,
                 };
                 if !is_data || !fv.is_heap() {
@@ -2643,7 +2643,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let (recv_class, vals_ptr, own_slot) = match self.heap.get(ridx) {
-            HeapObj::Object(m) if !m.is_ctor => (m.class, m.vals.as_ptr() as u64, m.pos(name)),
+            HeapObj::Object(m) if !m.is_ctor => (m.class, m.vals_ptr_raw() as u64, m.pos(name)),
             _ => return None,
         };
         // Resolution splits on whether the receiver carries an OWN property of
@@ -2926,7 +2926,7 @@ impl<'p> Vm<'p> {
         };
         let mut out = rustc_hash::FxHashMap::default();
         for (&name, &slot) in slots.iter() {
-            let v = *m.vals.get(slot as usize)?;
+            let v = *m.val_get_ref(slot as usize)?;
             if !v.is_number() {
                 return None;
             }

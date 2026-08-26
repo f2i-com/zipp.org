@@ -270,7 +270,7 @@ impl<'p> Vm<'p> {
         let own = match self.heap.get(idx) {
             HeapObj::Object(m) => {
                 if let Some(i) = m.pos(key) {
-                    Some((m.attr_at(i), m.vals[i]))
+                    Some((m.attr_at(i), m.val_at(i)))
                 } else if idx == self.global_this && self.global_this != 0 {
                     // A binding that lives only in a global SLOT still presents as an
                     // own property of the global object. `global_slot_binding_descriptor`
@@ -311,7 +311,7 @@ impl<'p> Vm<'p> {
                 let ovr = self
                     .arr_props
                     .get(&idx)
-                    .and_then(|m| m.pos(key).map(|p| (m.attr_at(p), m.vals[p])));
+                    .and_then(|m| m.pos(key).map(|p| (m.attr_at(p), m.val_at(p))));
                 if ovr.is_some() {
                     ovr.map(|(a, v)| (a, mapped_v.unwrap_or(v)))
                 } else {
@@ -342,7 +342,7 @@ impl<'p> Vm<'p> {
             HeapObj::Class(c) if is_private_key(key) => None,
             HeapObj::Class(c) => {
                 if let Some(i) = c.statics.pos(key) {
-                    Some((c.statics.attr_at(i), c.statics.vals[i]))
+                    Some((c.statics.attr_at(i), c.statics.val_at(i)))
                 } else if let Some((_, g)) = c.static_getters.iter().find(|(n, _)| n == key) {
                     let setter = c
                         .static_setters
@@ -397,7 +397,7 @@ impl<'p> Vm<'p> {
                 }
                 self.fn_props
                     .get(&idx)
-                    .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.vals[i])))
+                    .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.val_at(i))))
             }
             // A TypedArray's integer-indexed element: a data descriptor
             // { writable:true, enumerable:true, configurable:true }. A named own
@@ -409,14 +409,14 @@ impl<'p> Vm<'p> {
                 }
                 self.arr_props
                     .get(&idx)
-                    .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.vals[i])))
+                    .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.val_at(i))))
             }
             // Exotic objects (Map/Set/Date/Promise/…) keep defineProperty'd own
             // properties in the generic arr_props side table.
             _ => self
                 .arr_props
                 .get(&idx)
-                .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.vals[i]))),
+                .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.val_at(i)))),
         };
         match own {
             Some((a, raw)) if a.accessor => {
@@ -877,7 +877,7 @@ impl<'p> Vm<'p> {
                 if let Some(i) = m.pos(key) {
                     let attr = m.attr_at(i);
                     if attr.accessor {
-                        return Ok(if want_setter { attr.setter } else { m.vals[i] });
+                        return Ok(if want_setter { attr.setter } else { m.val_at(i) });
                     }
                     return Ok(Value::UNDEFINED);
                 }

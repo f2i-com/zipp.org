@@ -719,7 +719,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(mm) => mm
                         .keys
                         .iter()
-                        .zip(mm.vals.iter())
+                        .zip(mm.vals_slice().iter())
                         .zip(mm.attrs_iter())
                         .filter(|((k, _), _)| {
                             k.as_str() != "prototype"
@@ -750,7 +750,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(mm) => mm
                         .keys
                         .iter()
-                        .zip(mm.vals.iter())
+                        .zip(mm.vals_slice().iter())
                         .zip(mm.attrs_iter())
                         .filter(|((k, _), _)| k.as_str() != "constructor")
                         .map(|((k, v), a)| (k.clone(), *v, a))
@@ -835,7 +835,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(mm) => mm
                         .keys
                         .iter()
-                        .zip(mm.vals.iter())
+                        .zip(mm.vals_slice().iter())
                         .zip(mm.attrs_iter())
                         .filter(|((k, _), _)| {
                             let k = k.as_str();
@@ -949,7 +949,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(mm) => mm
                         .keys
                         .iter()
-                        .zip(mm.vals.iter())
+                        .zip(mm.vals_slice().iter())
                         .zip(mm.attrs_iter())
                         .filter(|((k, _), _)| {
                             k.as_str() != "constructor" && k.as_str() != "prototype"
@@ -1003,7 +1003,7 @@ impl<'p> Vm<'p> {
                             HeapObj::Object(mm) => mm
                                 .keys
                                 .iter()
-                                .zip(mm.vals.iter())
+                                .zip(mm.vals_slice().iter())
                                 .zip(mm.attrs_iter())
                                 .filter(|((k, _), _)| k.as_str() != "constructor")
                                 .map(|((k, v), a)| (k.clone(), *v, a))
@@ -1053,7 +1053,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(mm) => mm
                         .keys
                         .iter()
-                        .zip(mm.vals.iter())
+                        .zip(mm.vals_slice().iter())
                         .zip(mm.attrs_iter())
                         .map(|((k, v), a)| (k.clone(), *v, a))
                         .collect(),
@@ -1130,7 +1130,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(mm) => mm
                     .keys
                     .iter()
-                    .zip(mm.vals.iter())
+                    .zip(mm.vals_slice().iter())
                     .zip(mm.attrs_iter())
                     .filter(|((k, _), _)| k.as_str() != "global" && k.as_str() != "evalScript")
                     .map(|((k, v), a)| (k.clone(), *v, a))

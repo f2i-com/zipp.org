@@ -193,9 +193,9 @@ impl<'p> Vm<'p> {
             HeapObj::Object(map) => ["charCodeAt", "substring"].iter().all(|name| {
                 map.pos(name).is_some_and(|slot| {
                     !map.attr_at(slot).accessor
-                        && map.vals[slot].is_heap()
+                        && map.val_at(slot).is_heap()
                         && matches!(
-                            self.heap.get(map.vals[slot].heap_index()),
+                            self.heap.get(map.val_at(slot).heap_index()),
                             HeapObj::Native(id)
                                 if native::proto_method(*id)
                                     .is_some_and(|(n, kind, _)| n == *name && kind == 1)
@@ -3090,7 +3090,7 @@ impl<'p> Vm<'p> {
                     return;
                 }
                 out.push_str("{ ");
-                for (i, (key, value)) in map.keys.iter().zip(map.vals.iter()).enumerate() {
+                for (i, (key, value)) in map.keys.iter().zip(map.vals_slice().iter()).enumerate() {
                     if i != 0 {
                         out.push_str(", ");
                     }

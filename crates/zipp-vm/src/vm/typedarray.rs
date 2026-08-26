@@ -58,8 +58,8 @@ impl<'p> Vm<'p> {
         };
         match self.heap.get(owner) {
             HeapObj::Object(m) => match m.pos(key) {
-                Some(s) if m.attr_at(s).accessor && m.vals[s].is_heap() => matches!(
-                    self.heap.get(m.vals[s].heap_index()),
+                Some(s) if m.attr_at(s).accessor && m.val_at(s).is_heap() => matches!(
+                    self.heap.get(m.val_at(s).heap_index()),
                     HeapObj::Native(id) if *id == want
                 ),
                 _ => false,
@@ -168,8 +168,8 @@ impl<'p> Vm<'p> {
         // … and the base prototype's slot must still be the built-in getter.
         match self.heap.get(self.ta_base_proto) {
             HeapObj::Object(m) => match m.pos("length") {
-                Some(s) if m.attr_at(s).accessor && m.vals[s].is_heap() => matches!(
-                    self.heap.get(m.vals[s].heap_index()),
+                Some(s) if m.attr_at(s).accessor && m.val_at(s).is_heap() => matches!(
+                    self.heap.get(m.val_at(s).heap_index()),
                     HeapObj::Native(id) if *id == crate::vm::native::TA_GET_LENGTH
                 ),
                 _ => false,

@@ -84,7 +84,7 @@ impl<'p> Vm<'p> {
             if let Some(m) = self.arr_props.get(&idx) {
                 for (i, k) in m.keys.iter().enumerate() {
                     if m.attr_at(i).enumerable && !is_hidden_key(k) {
-                        pairs.push((k.clone(), m.vals[i]));
+                        pairs.push((k.clone(), m.val_at(i)));
                     }
                 }
             }
@@ -427,7 +427,7 @@ impl<'p> Vm<'p> {
                     if let Some(m) = self.arr_props.get(&obj.heap_index()) {
                         for (i, k) in m.keys.iter().enumerate() {
                             if m.attr_at(i).enumerable && !is_hidden_key(k) {
-                                v.push((k.clone(), m.vals[i]));
+                                v.push((k.clone(), m.val_at(i)));
                             }
                         }
                     }
@@ -445,7 +445,7 @@ impl<'p> Vm<'p> {
                     Some(m) => spec_key_order(&m.keys)
                         .into_iter()
                         .filter(|&i| m.attr_at(i).enumerable && !is_hidden_key(&m.keys[i]))
-                        .map(|i| (m.keys[i].clone(), m.vals[i]))
+                        .map(|i| (m.keys[i].clone(), m.val_at(i)))
                         .collect(),
                     None => Vec::new(),
                 },
@@ -459,7 +459,7 @@ impl<'p> Vm<'p> {
                             && !is_hidden_key(&c.statics.keys[i])
                             && !c.statics.keys[i].starts_with('#')
                     })
-                    .map(|i| (c.statics.keys[i].clone(), c.statics.vals[i]))
+                    .map(|i| (c.statics.keys[i].clone(), c.statics.val_at(i)))
                     .collect(),
                 _ => Vec::new(),
             }

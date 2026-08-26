@@ -782,7 +782,7 @@ impl<'p> Vm<'p> {
         if map.attr_at(slot).accessor {
             return None;
         }
-        let value = map.vals[slot];
+        let value = map.val_at(slot);
         value.is_int().then(|| value.as_int())
     }
 
@@ -809,9 +809,9 @@ impl<'p> Vm<'p> {
             };
             if let Some(slot) = map.pos(key) {
                 if map.attr_at(slot).accessor {
-                    return self.passthrough_getter_int(receiver, map.vals[slot]);
+                    return self.passthrough_getter_int(receiver, map.val_at(slot));
                 }
-                let value = map.vals[slot];
+                let value = map.val_at(slot);
                 return value.is_int().then(|| value.as_int());
             }
             match self.proto_of.get(&cur).copied() {
@@ -859,7 +859,7 @@ impl<'p> Vm<'p> {
                 if !attr.accessor {
                     return None;
                 }
-                (map.vals[slot], attr.setter)
+                (map.val_at(slot), attr.setter)
             }
             _ => return None,
         };
@@ -918,7 +918,7 @@ impl<'p> Vm<'p> {
         };
         let hidden = map.pos(getter_name)?;
         let attr = map.attr_at(hidden);
-        (!attr.accessor && attr.writable && map.vals[hidden].is_int())
+        (!attr.accessor && attr.writable && map.val_at(hidden).is_int())
             .then_some((receiver_idx, hidden))
     }
 
@@ -1255,7 +1255,7 @@ impl<'p> Vm<'p> {
             let HeapObj::Object(map) = self.heap.get_mut(obj) else {
                 unreachable!("mixed-field preflight object changed without a call or GC")
             };
-            map.vals[slot] = Value::int(value);
+            map.set_val_at(slot, Value::int(value));
         }
         let final_lane = ((limit as u32 - 1) & p.object_mask as u32) as usize;
         self.globals[p.receiver_global as usize] = receivers[final_lane];
@@ -1354,7 +1354,7 @@ impl<'p> Vm<'p> {
             let (obj, slot) = slots[pos as usize];
             let value = Value::int(i + t as i32);
             match self.heap.get_mut(obj) {
-                HeapObj::Object(map) => map.vals[slot] = value,
+                HeapObj::Object(map) => map.set_val_at(slot, value),
                 _ => return false, // impossible after the no-GC preflight
             }
         }

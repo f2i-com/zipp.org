@@ -306,7 +306,7 @@ impl<'p> Vm<'p> {
                     if m.attr_at(s).accessor {
                         return None;
                     }
-                    regs[dst as usize] = m.vals[s];
+                    regs[dst as usize] = m.val_at(s);
                 }
                 I::Add { dst, a, b } => {
                     let (va, vb) = (regs[a as usize], regs[b as usize]);

@@ -86,7 +86,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn intl_slot(&self, resolved: u32, key: &str) -> Value {
         if let HeapObj::Object(m) = self.heap.get(resolved) {
             if let Some(i) = m.pos(key) {
-                return m.vals[i];
+                return m.val_at(i);
             }
         }
         Value::UNDEFINED
@@ -97,7 +97,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn own_member(&self, idx: u32, key: &str) -> Option<(PropAttr, Value)> {
         if let HeapObj::Object(m) = self.heap.get(idx) {
             if let Some(i) = m.pos(key) {
-                return Some((m.attr_at(i), m.vals[i]));
+                return Some((m.attr_at(i), m.val_at(i)));
             }
         }
         None
@@ -123,7 +123,7 @@ impl<'p> Vm<'p> {
         let pairs: Vec<(String, Value)> = match self.heap.get(src) {
             HeapObj::Object(m) => (0..m.keys.len())
                 .filter(|&i| !m.attr_at(i).accessor && !is_hidden_key(&m.keys[i]))
-                .map(|i| (m.keys[i].clone(), m.vals[i]))
+                .map(|i| (m.keys[i].clone(), m.val_at(i)))
                 .collect(),
             _ => vec![],
         };

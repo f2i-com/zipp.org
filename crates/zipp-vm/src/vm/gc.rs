@@ -510,7 +510,7 @@ impl Vm<'_> {
             }
         }
         for m in self.fn_props.values().chain(self.arr_props.values()) {
-            for &v in &m.vals {
+            for &v in m.vals_slice() {
                 root_val!(v);
             }
             if m.may_deviate_attrs() {
@@ -1157,7 +1157,7 @@ impl Vm<'_> {
         macro_rules! m_objmap {
             ($map:expr) => {{
                 let map = $map;
-                for &v in &map.vals {
+                for &v in map.vals_slice() {
                     m_val!(v);
                 }
                 if map.may_deviate_attrs() {

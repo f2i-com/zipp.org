@@ -1084,13 +1084,13 @@ impl<'p> Vm<'p> {
         };
         let method_ok = ap.pos(method).is_some_and(|slot| {
             !ap.attr_at(slot).accessor
-                && ap.vals[slot].is_heap()
-                && matches!(self.heap.get(ap.vals[slot].heap_index()), HeapObj::Native(id)
+                && ap.val_at(slot).is_heap()
+                && matches!(self.heap.get(ap.val_at(slot).heap_index()), HeapObj::Native(id)
                     if native::proto_method(*id)
                         .is_some_and(|(name, kind, _)| name == method && kind == 0))
         });
         let constructor_ok = ap.pos("constructor").is_some_and(|slot| {
-            !ap.attr_at(slot).accessor && ap.vals[slot] == Value::heap(self.array_ctor)
+            !ap.attr_at(slot).accessor && ap.val_at(slot) == Value::heap(self.array_ctor)
         });
         if !method_ok || !constructor_ok {
             return None;
@@ -1112,8 +1112,8 @@ impl<'p> Vm<'p> {
         let species_ok = ctor.pos("@@species").is_some_and(|slot| {
             ctor.attr_at(slot).accessor
                 && ctor.attr_at(slot).setter == Value::UNDEFINED
-                && ctor.vals[slot].is_heap()
-                && matches!(self.heap.get(ctor.vals[slot].heap_index()),
+                && ctor.val_at(slot).is_heap()
+                && matches!(self.heap.get(ctor.val_at(slot).heap_index()),
                     HeapObj::Native(id) if *id == native::SPECIES_GET)
         });
         species_ok.then_some(len)
@@ -1222,7 +1222,7 @@ impl<'p> Vm<'p> {
             if !attr.enumerable {
                 continue;
             }
-            let value = side.vals[slot];
+            let value = side.val_at(slot);
             if attr.accessor || !value.is_number() {
                 return None;
             }
@@ -1598,10 +1598,10 @@ impl<'p> Vm<'p> {
             if is_hidden_key(key) || !attr.enumerable {
                 continue;
             }
-            if attr.accessor || !map.vals[slot].is_int() {
+            if attr.accessor || !map.val_at(slot).is_int() {
                 return None;
             }
-            cycle = cycle.wrapping_add(map.vals[slot].as_int() as u32);
+            cycle = cycle.wrapping_add(map.val_at(slot).as_int() as u32);
             last_key = Some(key.clone());
         }
         // Drop immutable map borrows before allocating the final key string.

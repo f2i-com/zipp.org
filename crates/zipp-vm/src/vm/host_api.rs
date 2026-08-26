@@ -389,7 +389,7 @@ impl<'p> Vm<'p> {
                         continue;
                     }
                     budget.charge_string(&m.keys[i])?;
-                    pairs.push((m.keys[i].clone(), m.vals[i]));
+                    pairs.push((m.keys[i].clone(), m.val_at(i)));
                 }
                 Shape::Object(pairs)
             }
@@ -459,7 +459,7 @@ impl<'p> Vm<'p> {
         let old_props: Vec<(String, Value)> = match self.heap.get(old.heap_index()) {
             HeapObj::Object(m) => (0..m.keys.len())
                 .filter(|&i| !m.attr_at(i).accessor)
-                .map(|i| (m.keys[i].clone(), m.vals[i]))
+                .map(|i| (m.keys[i].clone(), m.val_at(i)))
                 .collect(),
             _ => return self.host_in(hv, depth),
         };

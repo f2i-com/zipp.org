@@ -690,7 +690,7 @@ mod tests {
             panic!("result was not a plain object")
         };
         map.verify_shape().expect("malformed sequence shape");
-        (map.keys.as_ref().to_vec(), map.vals.clone())
+        (map.keys.as_ref().to_vec(), map.vals_slice().to_vec())
     }
 
     #[test]
@@ -841,7 +841,7 @@ mod tests {
             panic!("planned helper did not allocate an object")
         };
         assert_eq!(map.keys.as_ref(), &["a".to_string()]);
-        assert_eq!(map.vals, &[Value::int(1)]);
+        assert_eq!(map.vals_slice(), &[Value::int(1)]);
 
         // Exact-IP interpreter replay owns malformed duplicate semantics.
         vm.heap.write_barrier_val(duplicate_idx, Value::int(9));
@@ -850,7 +850,7 @@ mod tests {
         };
         map.push_static_data("a", Value::int(9));
         assert_eq!(map.keys.as_ref(), &["a".to_string()]);
-        assert_eq!(map.vals, &[Value::int(9)]);
+        assert_eq!(map.vals_slice(), &[Value::int(9)]);
 
         let reordered_bits = jit_new_planned_object(vm_ptr, alloc);
         assert_ne!(reordered_bits, crate::codegen::SELF_CALL_DEOPT);
@@ -874,7 +874,7 @@ mod tests {
         };
         map.push_static_data("b", Value::int(7));
         assert_eq!(map.keys.as_ref(), &["b".to_string(), "a".to_string()]);
-        assert_eq!(map.vals, &[Value::int(7), Value::int(1)]);
+        assert_eq!(map.vals_slice(), &[Value::int(7), Value::int(1)]);
         map.verify_shape().expect("native malformed append shape");
     }
 

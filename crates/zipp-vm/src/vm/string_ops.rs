@@ -190,8 +190,8 @@ impl<'p> Vm<'p> {
                 let data_native = |k: &str, id: u16| {
                     m.pos(k).is_some_and(|i| {
                         !m.attr_at(i).accessor
-                            && m.vals[i].is_heap()
-                            && matches!(self.heap.get(m.vals[i].heap_index()),
+                            && m.val_at(i).is_heap()
+                            && matches!(self.heap.get(m.val_at(i).heap_index()),
                                         HeapObj::Native(n) if *n == id)
                     })
                 };

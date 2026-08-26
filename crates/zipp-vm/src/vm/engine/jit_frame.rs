@@ -280,13 +280,13 @@ impl<'p> Vm<'p> {
                 HeapObj::Object(m) if !m.is_ctor => m,
                 _ => return None,
             };
-            if slot >= m.vals.len() || !m.attr_at(slot).accessor {
+            if slot >= m.vals_len() || !m.attr_at(slot).accessor {
                 return None;
             }
             if is_set {
                 m.attr_at(slot).setter
             } else {
-                m.vals[slot]
+                m.val_at(slot)
             }
         };
         if live.bits() != ((e.hops[3].0 as u64) | ((e.hops[3].1 as u64) << 32)) {

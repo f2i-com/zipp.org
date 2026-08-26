@@ -40,7 +40,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let p = m.element_pos(i)?;
-        Some((m.attr_at(p), m.vals[p]))
+        Some((m.attr_at(p), m.val_at(p)))
     }
 
     /// Can anything outside the dense `Vec` shadow, hide, or constrain an ELEMENT

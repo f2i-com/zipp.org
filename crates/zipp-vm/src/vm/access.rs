@@ -1056,7 +1056,7 @@ impl<'p> Vm<'p> {
                 match existing {
                     Some((i, false, true)) => {
                         if let HeapObj::Object(m) = self.heap.get_mut(oi) {
-                            m.vals[i] = val;
+                            m.set_val_at(i, val);
                         }
                         return Ok(true);
                     }
@@ -2077,7 +2077,7 @@ impl<'p> Vm<'p> {
                     if is_setter {
                         m.attr_mut(i).setter = func;
                     } else {
-                        m.vals[i] = func;
+                        m.set_val_at(i, func);
                     }
                     return;
                 }

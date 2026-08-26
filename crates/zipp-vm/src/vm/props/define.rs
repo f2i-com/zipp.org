@@ -401,7 +401,7 @@ impl<'p> Vm<'p> {
                 let cur = self
                     .arr_props
                     .get(&idx)
-                    .and_then(|m| m.pos("length").map(|i| (m.attr_at(i), m.vals[i])));
+                    .and_then(|m| m.pos("length").map(|i| (m.attr_at(i), m.val_at(i))));
                 if let Some((a, curv)) = cur {
                     if !a.configurable {
                         let changes = d_cf == Some(true)
@@ -652,24 +652,24 @@ impl<'p> Vm<'p> {
         // The existing descriptor lives wherever `target` writes (below).
         let mut existing = match target {
             0 => match self.heap.get(idx) {
-                HeapObj::Object(m) => m.pos(key).map(|i| (m.attr_at(i), m.vals[i])),
+                HeapObj::Object(m) => m.pos(key).map(|i| (m.attr_at(i), m.val_at(i))),
                 _ => None,
             },
             1 => match self.heap.get(idx) {
                 HeapObj::Class(c) => c
                     .statics
                     .pos(key)
-                    .map(|i| (c.statics.attr_at(i), c.statics.vals[i])),
+                    .map(|i| (c.statics.attr_at(i), c.statics.val_at(i))),
                 _ => None,
             },
             3 => self
                 .arr_props
                 .get(&idx)
-                .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.vals[i]))),
+                .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.val_at(i)))),
             _ => self
                 .fn_props
                 .get(&idx)
-                .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.vals[i]))),
+                .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.val_at(i)))),
         };
         // A RegExp's `lastIndex` is a struct-backed own data property (default
         // {writable:true, enumerable:false, configurable:false}; only attr

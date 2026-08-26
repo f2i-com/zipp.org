@@ -863,7 +863,7 @@ impl<'p> Vm<'p> {
                     m.keys
                         .iter()
                         .position(|k| k == key)
-                        .is_some_and(|i| !m.attr_at(i).accessor && pred(m.vals[i]))
+                        .is_some_and(|i| !m.attr_at(i).accessor && pred(m.val_at(i)))
                 };
                 (
                     check("then", &|v: Value| {
@@ -885,7 +885,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => match m.pos("@@species") {
                 None => true,
                 Some(i) => {
-                    let v = m.vals[i];
+                    let v = m.val_at(i);
                     m.attr_at(i).accessor
                         && v.is_heap()
                         && matches!(self.heap.get(v.heap_index()),
@@ -937,8 +937,8 @@ impl<'p> Vm<'p> {
                 let intrinsic = |key: &str, target: u32| {
                     m.pos(key).is_some_and(|i| {
                         !m.attr_at(i).accessor
-                            && m.vals[i].is_heap()
-                            && m.vals[i].heap_index() == target
+                            && m.val_at(i).is_heap()
+                            && m.val_at(i).heap_index() == target
                     })
                 };
                 intrinsic("then", self.promise_then_intrinsic)
@@ -953,7 +953,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => match m.pos("@@species") {
                 None => true,
                 Some(i) => {
-                    let v = m.vals[i];
+                    let v = m.val_at(i);
                     m.attr_at(i).accessor
                         && v.is_heap()
                         && matches!(self.heap.get(v.heap_index()),
@@ -999,11 +999,11 @@ impl<'p> Vm<'p> {
             return None;
         }
         if m.attr_at(ts).accessor
-            || !m.vals[ts].is_heap()
-            || m.vals[ts].heap_index() != self.promise_then_intrinsic
+            || !m.val_at(ts).is_heap()
+            || m.val_at(ts).heap_index() != self.promise_then_intrinsic
             || m.attr_at(cs).accessor
-            || !m.vals[cs].is_heap()
-            || m.vals[cs].heap_index() != self.promise_ctor_intrinsic
+            || !m.val_at(cs).is_heap()
+            || m.val_at(cs).heap_index() != self.promise_ctor_intrinsic
         {
             // The slots provably still name `then`/`constructor`, so this IS
             // the full proof's answer: an in-place overwrite (or an attr
@@ -1026,8 +1026,8 @@ impl<'p> Vm<'p> {
                     return None;
                 }
                 if mc.attr_at(s).accessor
-                    && mc.vals[s].is_heap()
-                    && mc.vals[s].heap_index() == getter
+                    && mc.val_at(s).is_heap()
+                    && mc.val_at(s).heap_index() == getter
                     && self.heap.version_of(getter) == getter_version
                 {
                     // The same getter object, un-replaced since fill proved
@@ -1056,7 +1056,7 @@ impl<'p> Vm<'p> {
         };
         let intrinsic_slot = |key: &str, target: u32| {
             m.pos(key).filter(|&i| {
-                !m.attr_at(i).accessor && m.vals[i].is_heap() && m.vals[i].heap_index() == target
+                !m.attr_at(i).accessor && m.val_at(i).is_heap() && m.val_at(i).heap_index() == target
             })
         };
         let then_slot = intrinsic_slot("then", self.promise_then_intrinsic)?;
@@ -1068,7 +1068,7 @@ impl<'p> Vm<'p> {
         let species = match mc.pos("@@species") {
             None => None,
             Some(i) => {
-                let v = mc.vals[i];
+                let v = mc.val_at(i);
                 let pristine = mc.attr_at(i).accessor
                     && v.is_heap()
                     && matches!(self.heap.get(v.heap_index()),

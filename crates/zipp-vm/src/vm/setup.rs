@@ -435,7 +435,7 @@ impl<'p> Vm<'p> {
             if let Some(cf) = canon_fn {
                 if let HeapObj::Object(p) = self.heap.get_mut(str_proto) {
                     if let Some(i) = p.pos(alias) {
-                        p.vals[i] = cf;
+                        p.set_val_at(i, cf);
                     }
                 }
             }
@@ -470,7 +470,7 @@ impl<'p> Vm<'p> {
         if let Some(vfn) = set_values_fn {
             if let HeapObj::Object(p) = self.heap.get_mut(set_proto) {
                 if let Some(i) = p.pos("keys") {
-                    p.vals[i] = vfn;
+                    p.set_val_at(i, vfn);
                 }
             }
         }
@@ -489,7 +489,7 @@ impl<'p> Vm<'p> {
         if let Some(ufn) = date_utc_fn {
             if let HeapObj::Object(p) = self.heap.get_mut(date_proto) {
                 if let Some(i) = p.pos("toGMTString") {
-                    p.vals[i] = ufn;
+                    p.set_val_at(i, ufn);
                 }
             }
         }
@@ -1508,7 +1508,7 @@ impl<'p> Vm<'p> {
             if let Some(vf) = ta_values_fn {
                 if let HeapObj::Object(p) = self.heap.get_mut(ta_base_proto) {
                     if let Some(i) = p.pos("@@iterator") {
-                        p.vals[i] = vf;
+                        p.set_val_at(i, vf);
                     }
                 }
             }
@@ -1519,7 +1519,7 @@ impl<'p> Vm<'p> {
             if let Some(ts) = arr_tostring {
                 if let HeapObj::Object(p) = self.heap.get_mut(ta_base_proto) {
                     if let Some(i) = p.pos("toString") {
-                        p.vals[i] = ts;
+                        p.set_val_at(i, ts);
                     }
                 }
             }

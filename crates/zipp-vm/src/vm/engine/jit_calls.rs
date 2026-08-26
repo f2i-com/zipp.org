@@ -1069,7 +1069,7 @@ impl<'p> Vm<'p> {
                 if m.is_ctor {
                     if let Some(i) = m.pos(key) {
                         if !m.attr_at(i).accessor {
-                            let f = m.vals[i];
+                            let f = m.val_at(i);
                             if f.is_heap()
                                 && matches!(self.heap.get(f.heap_index()), HeapObj::Native(_))
                             {
@@ -1239,9 +1239,9 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => {
                 let s = slot as usize;
                 !m.attr_at(s).accessor
-                    && m.vals[s].is_heap()
+                    && m.val_at(s).is_heap()
                     && matches!(
-                        self.heap.get(m.vals[s].heap_index()),
+                        self.heap.get(m.val_at(s).heap_index()),
                         HeapObj::Native(id) if *id == want
                     )
             }
@@ -1371,7 +1371,7 @@ impl<'p> Vm<'p> {
         if m.attr_at(s).accessor {
             return None;
         }
-        Some(m.vals[s].bits())
+        Some(m.val_at(s).bits())
     }
 
     /// Q7 S-ACC: if the setter `fid` is the trivial shape `this.<field> = arg`
@@ -1435,7 +1435,7 @@ impl<'p> Vm<'p> {
                 if m.attr_at(s).accessor || !m.attr_at(s).writable {
                     return None;
                 }
-                m.vals[s] = stored; // in-place data store — shape unchanged
+                m.set_val_at(s, stored); // in-place data store — shape unchanged
                 Some(0)
             }
             _ => None,

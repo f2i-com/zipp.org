@@ -494,7 +494,7 @@ impl<'p> Vm<'p> {
                     json_quote_bounded(out, &map.keys[slot])?;
                     json_push_str_bounded(out, separator)
                 })();
-                (map.vals[slot], appended)
+                (map.val_at(slot), appended)
             }
             // Unreachable — no user code has run since the slot plan was made.
             _ => (Value::UNDEFINED, Ok(())),
@@ -680,7 +680,7 @@ impl<'p> Vm<'p> {
                         active.pop();
                         return false;
                     }
-                    if !self.json_plain_value_into(map.vals[i], depth + 1, active, out) {
+                    if !self.json_plain_value_into(map.val_at(i), depth + 1, active, out) {
                         active.pop();
                         return false;
                     }
@@ -853,7 +853,7 @@ impl<'p> Vm<'p> {
                         if map.attr_at(i).accessor || canonical_index_str(key).is_some() {
                             return None;
                         }
-                        work.push((map.vals[i], false, depth + 1));
+                        work.push((map.val_at(i), false, depth + 1));
                     }
                 }
                 _ => return None,
@@ -1332,7 +1332,7 @@ impl<'p> Vm<'p> {
                 slots.retain(|&i| map.attr_at(i).enumerable && !is_hidden_key(&map.keys[i]));
                 slots
                     .iter()
-                    .all(|&i| !map.attr_at(i).accessor && !map.vals[i].is_heap())
+                    .all(|&i| !map.attr_at(i).accessor && !map.val_at(i).is_heap())
             }
             _ => return Ok(None),
         };
@@ -1804,14 +1804,14 @@ impl<'p> Vm<'p> {
                             let direct = if self.heap.version_of(idx) == v0 {
                                 match self.heap.get(idx) {
                                     HeapObj::Object(m) if !m.attr_at(*slot).accessor => {
-                                        Some(m.vals[*slot])
+                                        Some(m.val_at(*slot))
                                     }
                                     _ => None,
                                 }
                             } else {
                                 match self.heap.get(idx) {
                                     HeapObj::Object(m) => match m.pos(k) {
-                                        Some(i) if !m.attr_at(i).accessor => Some(m.vals[i]),
+                                        Some(i) if !m.attr_at(i).accessor => Some(m.val_at(i)),
                                         _ => None,
                                     },
                                     _ => None,
@@ -1918,7 +1918,7 @@ impl<'p> Vm<'p> {
                     let direct = if use_fast {
                         match self.heap.get(idx) {
                             HeapObj::Object(m) => match m.pos(&k) {
-                                Some(i) if !m.attr_at(i).accessor => Some(m.vals[i]),
+                                Some(i) if !m.attr_at(i).accessor => Some(m.val_at(i)),
                                 _ => None,
                             },
                             _ => None,

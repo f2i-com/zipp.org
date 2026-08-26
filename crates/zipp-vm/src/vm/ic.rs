@@ -699,7 +699,7 @@ impl<'p> Vm<'p> {
                 // Deliver from the freshly-validated walk (same read the
                 // entry would perform).
                 let (v, shape) = match self.ic_recv_map(recv) {
-                    Some((_, m)) => (m.vals[slot], m.shape()),
+                    Some((_, m)) => (m.val_at(slot), m.shape()),
                     None => return GetAct::None,
                 };
                 self.ic_install(
@@ -762,7 +762,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(hm) => hm,
                     _ => return GetAct::None,
                 };
-                GetAct::Value(hm.vals[slot as usize])
+                GetAct::Value(hm.val_at(slot as usize))
             }
             Walked::ChainAcc { first, hops, slot } => {
                 self.ic_install(func_id, ip, IcEntry::ProtoAcc { first, hops, slot });
@@ -801,7 +801,7 @@ impl<'p> Vm<'p> {
             IcEntry::OwnData { slot, .. } => {
                 let s = slot as usize;
                 if own == Some(s) && !m.attr_at(s).accessor {
-                    GetAct::Value(m.vals[s])
+                    GetAct::Value(m.val_at(s))
                 } else {
                     GetAct::None
                 }
@@ -849,7 +849,7 @@ impl<'p> Vm<'p> {
                 }
                 let s = slot as usize;
                 if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
-                    GetAct::Value(hm.vals[s])
+                    GetAct::Value(hm.val_at(s))
                 } else {
                     GetAct::None
                 }
@@ -871,7 +871,7 @@ impl<'p> Vm<'p> {
     /// re-resolve it (nothing cached survives a slot redefinition).
     #[inline]
     fn ic_acc_get_from(&self, m: &ObjMap, s: usize) -> GetAct {
-        let g = m.vals[s];
+        let g = m.val_at(s);
         if g == Value::UNDEFINED {
             // No getter ⇒ undefined (matches the fast path).
             return GetAct::Value(Value::UNDEFINED);
@@ -909,10 +909,10 @@ impl<'p> Vm<'p> {
             _ => return GetAct::None,
         };
         let s = slot as usize;
-        if s >= hm.vals.len() || !hm.attr_at(s).accessor {
+        if s >= hm.vals_len() || !hm.attr_at(s).accessor {
             return GetAct::None;
         }
-        let g = hm.vals[s];
+        let g = hm.val_at(s);
         if g == Value::UNDEFINED {
             return GetAct::Value(Value::UNDEFINED);
         }
@@ -1179,7 +1179,7 @@ impl<'p> Vm<'p> {
                 // route), so it carries its own.
                 self.heap.write_barrier_val(idx, val);
                 if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                    m.vals[slot as usize] = val;
+                    m.set_val_at(slot as usize, val);
                 }
                 SetAct::Done
             }
@@ -1239,7 +1239,7 @@ impl<'p> Vm<'p> {
             _ => return SetAct::None,
         };
         let s = slot as usize;
-        if s >= hm.vals.len() || !hm.attr_at(s).accessor {
+        if s >= hm.vals_len() || !hm.attr_at(s).accessor {
             return SetAct::None;
         }
         let setter = hm.attr_at(s).setter;
@@ -1289,7 +1289,7 @@ impl<'p> Vm<'p> {
         match self.ic_walk(recv, key) {
             Walked::OwnData { slot } => {
                 let (_, m) = self.ic_recv_map(recv)?;
-                let v = m.vals[slot];
+                let v = m.val_at(slot);
                 let shape = m.shape();
                 match self.ic_plain_fn(v) {
                     Some((fid, closure)) => {
@@ -1343,7 +1343,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(hm) => hm,
                     _ => return None,
                 };
-                let v = hm.vals[slot as usize];
+                let v = hm.val_at(slot as usize);
                 match self.ic_plain_fn(v) {
                     Some((fid, closure)) => {
                         // B78: the method inliner now bakes arms for INHERITED
@@ -1381,7 +1381,7 @@ impl<'p> Vm<'p> {
     /// the slot as a fail-closed audit boundary before reading the LIVE value.
     ///
     /// A same-shape method replacement is intentionally observed: the shape
-    /// remains valid, but `m.vals[slot]` is read on every call. Delete,
+    /// remains valid, but `m.val_at(slot)` is read on every call. Delete,
     /// defineProperty/accessor transitions, dictionary mode, proxies/exotics,
     /// namespaces and realm-global objects all miss without effects.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1413,14 +1413,14 @@ impl<'p> Vm<'p> {
             }
             let slot = slot as usize;
             if slot >= m.keys.len()
-                || slot >= m.vals.len()
+                || slot >= m.vals_len()
                 || slot >= m.attrs_len()
                 || &*m.keys[slot] != key
                 || m.attr_at(slot).accessor
             {
                 return None;
             }
-            let callee = m.vals[slot];
+            let callee = m.val_at(slot);
             let (fid, closure) = self.ic_plain_fn(callee)?;
             return Some((fid, closure, callee));
         }
@@ -1439,7 +1439,7 @@ impl<'p> Vm<'p> {
             IcEntry::OwnData { slot, .. } => {
                 let s = slot as usize;
                 if own == Some(s) && !m.attr_at(s).accessor {
-                    let v = m.vals[s];
+                    let v = m.val_at(s);
                     let (fid, closure) = self.ic_plain_fn(v)?;
                     Some((fid, closure, v))
                 } else {
@@ -1466,7 +1466,7 @@ impl<'p> Vm<'p> {
                 let hm = self.ic_chain_ok(idx, first, &hops)?;
                 let s = slot as usize;
                 if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
-                    let v = hm.vals[s];
+                    let v = hm.val_at(s);
                     let (fid, closure) = self.ic_plain_fn(v)?;
                     Some((fid, closure, v))
                 } else {
@@ -1675,12 +1675,12 @@ impl<'p> Vm<'p> {
                     if let HeapObj::Object(hm) = self.heap.get(hops.0[hops.1 as usize - 1].0) {
                         let s = slot as usize;
                         if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
-                            let v = hm.vals[s];
+                            let v = hm.val_at(s);
                             if let Some((fid, _closure)) = self.ic_plain_fn(v) {
                                 return Some(MiSuperResolved {
                                     fid,
                                     hops: hops.0[..hops.1 as usize].to_vec(),
-                                    holder_vals_ptr: hm.vals.as_ptr() as u64,
+                                    holder_vals_ptr: hm.vals_ptr_raw() as u64,
                                     holder_slot: s as u32,
                                     fn_bits: v.bits(),
                                 });
@@ -1736,7 +1736,7 @@ impl<'p> Vm<'p> {
                         // accessor: a `delete` + re-add shifts slots, and a
                         // redefine to a data property changes what `vals[s]` means.
                         if s < hm.keys.len() && hm.keys[s] == key && hm.attr_at(s).accessor {
-                            let g = hm.vals[s];
+                            let g = hm.val_at(s);
                             // A getter-less accessor (`set` only) reads as
                             // `undefined` rather than calling anything — not
                             // inlinable as a body, so decline to the helper.
@@ -1744,7 +1744,7 @@ impl<'p> Vm<'p> {
                                 return Some(MiSuperResolved {
                                     fid,
                                     hops: hops.0[..hops.1 as usize].to_vec(),
-                                    holder_vals_ptr: hm.vals.as_ptr() as u64,
+                                    holder_vals_ptr: hm.vals_ptr_raw() as u64,
                                     holder_slot: s as u32,
                                     fn_bits: g.bits(),
                                 });
@@ -1899,7 +1899,7 @@ impl<'p> Vm<'p> {
                         };
                         let s = slot as usize;
                         if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
-                            let v = hm.vals[s];
+                            let v = hm.val_at(s);
                             if let Some((fid, closure)) = self.ic_plain_fn(v) {
                                 return Some((fid, closure, v));
                             }
@@ -1917,7 +1917,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Object(hm) => hm,
                     _ => return None,
                 };
-                let v = hm.vals[slot as usize];
+                let v = hm.val_at(slot as usize);
                 match self.ic_plain_fn(v) {
                     Some((fid, closure)) => {
                         self.ic_install(func_id, ip, IcEntry::SuperData { home, hops, slot });
@@ -1968,7 +1968,7 @@ impl<'p> Vm<'p> {
                             {
                                 let s = slot as usize;
                                 if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
-                                    return GetAct::Value(hm.vals[s]);
+                                    return GetAct::Value(hm.val_at(s));
                                 }
                             }
                         }
@@ -2000,7 +2000,7 @@ impl<'p> Vm<'p> {
                 } else {
                     self.ic_install(func_id, ip, IcEntry::SuperData { home, hops, slot });
                     match self.heap.get(hops.0[hops.1 as usize - 1].0) {
-                        HeapObj::Object(hm) => GetAct::Value(hm.vals[slot as usize]),
+                        HeapObj::Object(hm) => GetAct::Value(hm.val_at(slot as usize)),
                         _ => GetAct::None,
                     }
                 }

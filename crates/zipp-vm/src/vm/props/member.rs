@@ -74,7 +74,7 @@ impl<'p> Vm<'p> {
             }
             let pi = p.heap_index();
             let entry = match self.heap.get(pi) {
-                HeapObj::Object(m) => m.pos(key).map(|i| (m.vals[i], m.attr_at(i))),
+                HeapObj::Object(m) => m.pos(key).map(|i| (m.val_at(i), m.attr_at(i))),
                 _ => None,
             };
             if let Some((raw, attr)) = entry {
@@ -456,18 +456,18 @@ impl<'p> Vm<'p> {
         if obj.is_heap() {
             let idx = obj.heap_index();
             let name_ovr = match self.heap.get(idx) {
-                HeapObj::Class(c) => c.statics.pos("name").map(|i| c.statics.vals[i]),
+                HeapObj::Class(c) => c.statics.pos("name").map(|i| c.statics.val_at(i)),
                 _ => self
                     .fn_props
                     .get(&idx)
-                    .and_then(|m| m.pos("name").map(|i| m.vals[i])),
+                    .and_then(|m| m.pos("name").map(|i| m.val_at(i))),
             };
             let len_ovr = match self.heap.get(idx) {
-                HeapObj::Class(c) => c.statics.pos("length").map(|i| c.statics.vals[i]),
+                HeapObj::Class(c) => c.statics.pos("length").map(|i| c.statics.val_at(i)),
                 _ => self
                     .fn_props
                     .get(&idx)
-                    .and_then(|m| m.pos("length").map(|i| m.vals[i])),
+                    .and_then(|m| m.pos("length").map(|i| m.val_at(i))),
             };
             if let Some(v) = name_ovr {
                 name = if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
@@ -677,7 +677,7 @@ impl<'p> Vm<'p> {
         let found = self
             .arr_props
             .get(&obj.heap_index())
-            .and_then(|m| m.pos(key).map(|i| (m.attr_at(i).accessor, m.vals[i])));
+            .and_then(|m| m.pos(key).map(|i| (m.attr_at(i).accessor, m.val_at(i))));
         if let Some((is_accessor, v)) = found {
             if is_accessor {
                 return if v == Value::UNDEFINED {
@@ -750,7 +750,7 @@ impl<'p> Vm<'p> {
                         _ => break,
                     };
                     match m.pos(key) {
-                        Some(i) => Ok((m.attr_at(i), m.vals[i])),
+                        Some(i) => Ok((m.attr_at(i), m.val_at(i))),
                         None => Err(m.class),
                     }
                 };
@@ -1014,7 +1014,7 @@ impl<'p> Vm<'p> {
                 let entry = self
                     .arr_props
                     .get(&obj.heap_index())
-                    .and_then(|m| m.pos(key).map(|i| (m.vals[i], m.attr_at(i))));
+                    .and_then(|m| m.pos(key).map(|i| (m.val_at(i), m.attr_at(i))));
                 if let Some((raw, attr)) = entry {
                     if attr.accessor {
                         return if raw == Value::UNDEFINED {
@@ -1149,7 +1149,7 @@ impl<'p> Vm<'p> {
         let arr_entry = self
             .arr_props
             .get(&obj.heap_index())
-            .and_then(|m| m.pos(key).map(|i| (m.vals[i], m.attr_at(i))));
+            .and_then(|m| m.pos(key).map(|i| (m.val_at(i), m.attr_at(i))));
         if let Some((raw, attr)) = arr_entry {
             if attr.accessor {
                 return if raw == Value::UNDEFINED {
@@ -1608,7 +1608,7 @@ impl<'p> Vm<'p> {
             let own = self
                 .arr_props
                 .get(&obj.heap_index())
-                .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.vals[i])));
+                .and_then(|m| m.pos(key).map(|i| (m.attr_at(i), m.val_at(i))));
             if let Some((attr, raw)) = own {
                 if attr.accessor {
                     return if raw == Value::UNDEFINED {
@@ -1631,7 +1631,7 @@ impl<'p> Vm<'p> {
         // Own data/accessor property on a plain object. Extracted BEFORE the type
         // match so an accessor's getter can be invoked outside the heap borrow.
         let own = match self.heap.get(obj.heap_index()) {
-            HeapObj::Object(m) => m.pos(key).map(|i| (m.attr_at(i), m.vals[i])),
+            HeapObj::Object(m) => m.pos(key).map(|i| (m.attr_at(i), m.val_at(i))),
             _ => None,
         };
         if let Some((a, raw)) = own {
@@ -1936,7 +1936,7 @@ impl<'p> Vm<'p> {
                 if let Some((accessor, raw)) = self
                     .fn_props
                     .get(&obj.heap_index())
-                    .and_then(|m| m.pos(key).map(|i| (m.attr_at(i).accessor, m.vals[i])))
+                    .and_then(|m| m.pos(key).map(|i| (m.attr_at(i).accessor, m.val_at(i))))
                 {
                     if accessor {
                         return if raw == Value::UNDEFINED {

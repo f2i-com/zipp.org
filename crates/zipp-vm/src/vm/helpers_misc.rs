@@ -482,9 +482,9 @@ pub(crate) extern "win64" fn jit_has_own_call(
     let pristine_call = match vm.heap.get(vm.fn_proto) {
         HeapObj::Object(m) => m.pos("call").is_some_and(|slot| {
             !m.attr_at(slot).accessor
-                && m.vals[slot].is_heap()
+                && m.val_at(slot).is_heap()
                 && matches!(
-                    vm.heap.get(m.vals[slot].heap_index()),
+                    vm.heap.get(m.val_at(slot).heap_index()),
                     HeapObj::Native(id) if *id == native::FN_CALL
                 )
         }),
@@ -1010,7 +1010,7 @@ fn jit_default_array_proto_index(vm: &Vm<'_>, i: usize) -> Option<Value> {
             if m.attr_at(p).accessor {
                 return None; // invoking the getter is observable user code
             }
-            return Some(m.vals[p]);
+            return Some(m.val_at(p));
         }
     }
     Some(Value::UNDEFINED)
@@ -1054,7 +1054,7 @@ pub(crate) extern "win64" fn jit_get_index(
                     if let HeapObj::Object(m) = vm.heap.get(oidx) {
                         if let Some(i) = m.pos(k) {
                             if !m.attr_at(i).accessor {
-                                let v = m.vals[i];
+                                let v = m.val_at(i);
                                 if !v.is_uninitialized() {
                                     return v.bits();
                                 }
@@ -1245,7 +1245,7 @@ pub(crate) extern "win64" fn jit_set_index(
                     if let HeapObj::Object(m) = vm.heap.get(oidx) {
                         if let Some(i) = m.pos(k) {
                             let a = m.attr_at(i);
-                            if !a.accessor && a.writable && !m.vals[i].is_uninitialized() {
+                            if !a.accessor && a.writable && !m.val_at(i).is_uninitialized() {
                                 writable_slot = Some(i);
                             }
                         }
@@ -1255,7 +1255,7 @@ pub(crate) extern "win64" fn jit_set_index(
             // End the immutable key/object borrows before updating the slot.
             if let Some(i) = writable_slot {
                 if let HeapObj::Object(m) = vm.heap.get_mut(oidx) {
-                    m.vals[i] = Value::from_bits(val_bits);
+                    m.set_val_at(i, Value::from_bits(val_bits));
                     return 0;
                 }
             }
@@ -3290,7 +3290,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                     return crate::codegen::SELF_CALL_DEOPT;
                 }
                 if gate == crate::codegen::AccWayGate::Fill {
-                    let getter = map.vals[s];
+                    let getter = map.val_at(s);
                     // Bake direct dispatch only for a plain user fn without
                     // lexical `this` (an arrow accessor must deopt so
                     // `setup_call` rebinds — see jit_prop_slow_impl); the
@@ -3311,7 +3311,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                 }
                 return crate::codegen::PROP_VIA_IC;
             }
-            Some(s) => (map.vals[s], map.vals.as_ptr() as u64, s as u32),
+            Some(s) => (map.val_at(s), map.vals_ptr_raw() as u64, s as u32),
             // Missing own key: a CLASS instance resolves methods/getters on
             // its class chain — the interpreter-IC slow helper serves those
             // (polymorphic, guard-validated); a plain object walks the PROTO
@@ -3362,7 +3362,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                                     }
                                     if gate == crate::codegen::AccWayGate::Fill {
                                         hops[n_hops] = (next, vm.heap.version_of(next));
-                                        let getter = m2.vals[i];
+                                        let getter = m2.val_at(i);
                                         let baked = vm
                                             .ic_plain_fn(getter)
                                             .filter(|&(fid, _)| !vm.func(fid as usize).lexical_this)
@@ -3379,7 +3379,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                                     }
                                     return crate::codegen::PROP_VIA_IC;
                                 }
-                                let v = m2.vals[i];
+                                let v = m2.val_at(i);
                                 // A chain DATA hit within JIT_IC_MAX_HOPS fills
                                 // a hop-version-guarded way (receiver identity
                                 // + receiver version + every hop's version —
@@ -3390,7 +3390,7 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                                     hops[n_hops] = (next, vm.heap.version_of(next));
                                     if let Some(e) = crate::codegen::IcEntry::chain(
                                         obj_bits,
-                                        m2.vals.as_ptr() as u64,
+                                        m2.vals_ptr_raw() as u64,
                                         vm.heap.version_of(idx),
                                         i as u32,
                                         &hops[..=n_hops],
@@ -3553,7 +3553,7 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
                 if map.attr_at(s).accessor {
                     return crate::codegen::SELF_CALL_DEOPT; // getter runs user code
                 }
-                return map.vals[s].bits();
+                return map.val_at(s).bits();
             }
             // Not own. Walk a PROVABLY clean prototype chain so a legitimately
             // inherited read (or a provably absent one) does not deopt on every
@@ -3586,7 +3586,7 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
                             if m2.attr_at(i).accessor {
                                 return crate::codegen::SELF_CALL_DEOPT;
                             }
-                            return m2.vals[i].bits();
+                            return m2.val_at(i).bits();
                         }
                     }
                     _ => return crate::codegen::SELF_CALL_DEOPT, // exotic link
@@ -3852,13 +3852,13 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     let (added, vals_ptr, slot) = match vm.heap.get_mut(idx) {
         HeapObj::Object(map) => match own {
             Some(s) => {
-                map.vals[s] = Value::from_bits(val_bits);
-                (false, map.vals.as_ptr() as u64, s as u32)
+                map.set_val_at(s, Value::from_bits(val_bits));
+                (false, map.vals_ptr_raw() as u64, s as u32)
             }
             None => {
                 let added = map.set(key, Value::from_bits(val_bits));
                 let s = map.pos(key).unwrap() as u32;
-                (added, map.vals.as_ptr() as u64, s)
+                (added, map.vals_ptr_raw() as u64, s)
             }
         },
         _ => return crate::codegen::SELF_CALL_DEOPT, // unreachable (checked above)
@@ -4114,7 +4114,7 @@ pub(crate) extern "win64" fn jit_get_index_concat(
     vm.build_concat_key(&mut scratch, name, key.as_int(), func_id);
     let hit = match vm.heap.get(oidx) {
         HeapObj::Object(m) => match m.pos(&scratch) {
-            Some(i) if !m.attr_at(i).accessor && !m.vals[i].is_uninitialized() => Some(m.vals[i]),
+            Some(i) if !m.attr_at(i).accessor && !m.val_at(i).is_uninitialized() => Some(m.val_at(i)),
             _ => None,
         },
         _ => None,

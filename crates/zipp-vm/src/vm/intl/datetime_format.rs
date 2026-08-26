@@ -437,7 +437,7 @@ impl<'p> Vm<'p> {
     fn dtf_request(&self, resolved: u32, mask: u16) -> (dtf_pattern::Request, bool) {
         let slot = |k: &str| -> Option<String> {
             match self.heap.get(resolved) {
-                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.vals[i])),
+                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.val_at(i))),
                 _ => None,
             }
         };
@@ -668,7 +668,7 @@ impl<'p> Vm<'p> {
     ) -> (Vec<dtf_pattern::Item>, Vec<dtf_pattern::Item>, usize) {
         let slot = |k: &str| -> Option<String> {
             match self.heap.get(resolved) {
-                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.vals[i])),
+                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.val_at(i))),
                 _ => None,
             }
         };
@@ -767,7 +767,7 @@ impl<'p> Vm<'p> {
     ) -> Vec<(&'static str, String)> {
         let slot = |k: &str| -> Option<String> {
             match self.heap.get(resolved) {
-                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.vals[i])),
+                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.val_at(i))),
                 _ => None,
             }
         };
@@ -978,7 +978,7 @@ impl<'p> Vm<'p> {
     fn dtf_zone_name(&self, resolved: u32, c: char, n: usize, tz_minutes: i64) -> String {
         let slot = |k: &str| -> Option<String> {
             match self.heap.get(resolved) {
-                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.vals[i])),
+                HeapObj::Object(m) => m.pos(k).map(|i| self.display(m.val_at(i))),
                 _ => None,
             }
         };

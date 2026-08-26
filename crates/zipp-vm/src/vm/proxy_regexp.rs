@@ -391,8 +391,8 @@ impl<'p> Vm<'p> {
                 let intrinsic = |k: &str, id: u16| {
                     m.pos(k).is_some_and(|i| {
                         !m.attr_at(i).accessor
-                            && m.vals[i].is_heap()
-                            && matches!(self.heap.get(m.vals[i].heap_index()),
+                            && m.val_at(i).is_heap()
+                            && matches!(self.heap.get(m.val_at(i).heap_index()),
                                         HeapObj::Native(n) if *n == id)
                     })
                 };
@@ -447,9 +447,9 @@ impl<'p> Vm<'p> {
                 let accessor = |name: &str, want: u16| {
                     m.pos(name).is_some_and(|i| {
                         m.attr_at(i).accessor
-                            && m.vals[i].is_heap()
+                            && m.val_at(i).is_heap()
                             && matches!(
-                                self.heap.get(m.vals[i].heap_index()),
+                                self.heap.get(m.val_at(i).heap_index()),
                                 HeapObj::Native(id) if *id == want
                             )
                     })
@@ -507,20 +507,20 @@ impl<'p> Vm<'p> {
             HeapObj::Object(m) => {
                 let flags_ok = m.pos("flags").is_some_and(|i| {
                     m.attr_at(i).accessor
-                        && m.vals[i].is_heap()
-                        && matches!(self.heap.get(m.vals[i].heap_index()),
+                        && m.val_at(i).is_heap()
+                        && matches!(self.heap.get(m.val_at(i).heap_index()),
                                     HeapObj::Native(n) if *n == native::REGEXP_GET_FLAGS)
                 });
                 let exec_ok = m.pos("exec").is_some_and(|i| {
                     !m.attr_at(i).accessor
-                        && m.vals[i].is_heap()
-                        && matches!(self.heap.get(m.vals[i].heap_index()),
+                        && m.val_at(i).is_heap()
+                        && matches!(self.heap.get(m.val_at(i).heap_index()),
                                     HeapObj::Native(n) if *n == native::REGEXP_EXEC)
                 });
                 let ctor_ok = m.pos("constructor").is_some_and(|i| {
                     !m.attr_at(i).accessor
-                        && m.vals[i].is_heap()
-                        && m.vals[i].heap_index() == self.regexp_ctor
+                        && m.val_at(i).is_heap()
+                        && m.val_at(i).heap_index() == self.regexp_ctor
                 });
                 // `@@match` still the intrinsic data property. Replacing it with
                 // a GETTER makes the construction the fast path elides observable
@@ -528,8 +528,8 @@ impl<'p> Vm<'p> {
                 // changes what IsRegExp answers inside the RegExp constructor.
                 let match_ok = m.pos("@@match").is_some_and(|i| {
                     !m.attr_at(i).accessor
-                        && m.vals[i].is_heap()
-                        && matches!(self.heap.get(m.vals[i].heap_index()),
+                        && m.val_at(i).is_heap()
+                        && matches!(self.heap.get(m.val_at(i).heap_index()),
                                     HeapObj::Native(n) if *n == native::REGEXP_SYM_MATCH)
                 });
                 flags_ok && exec_ok && ctor_ok && match_ok
@@ -543,8 +543,8 @@ impl<'p> Vm<'p> {
         match self.heap.get(self.regexp_ctor) {
             HeapObj::Object(m) => m.pos("@@species").is_some_and(|i| {
                 m.attr_at(i).accessor
-                    && m.vals[i].is_heap()
-                    && matches!(self.heap.get(m.vals[i].heap_index()),
+                    && m.val_at(i).is_heap()
+                    && matches!(self.heap.get(m.val_at(i).heap_index()),
                                 HeapObj::Native(n) if *n == native::SPECIES_GET)
             }),
             _ => false,
@@ -615,8 +615,8 @@ impl<'p> Vm<'p> {
             let s = slot as usize;
             m.keys.get(s).is_some_and(|k| k == key)
                 && m.attr_at(s).accessor == accessor
-                && m.vals[s].is_heap()
-                && m.vals[s].heap_index() == idx
+                && m.val_at(s).is_heap()
+                && m.val_at(s).heap_index() == idx
                 // The same object, un-replaced since fill proved it the right
                 // `Native` — no `heap.get` needed.
                 && self.heap.version_of(idx) == ver
@@ -635,8 +635,8 @@ impl<'p> Vm<'p> {
         let cs = c.ctor_slot as usize;
         if m.keys.get(cs).map_or(true, |k| k != "constructor")
             || m.attr_at(cs).accessor
-            || !m.vals[cs].is_heap()
-            || m.vals[cs].heap_index() != self.regexp_ctor
+            || !m.val_at(cs).is_heap()
+            || m.val_at(cs).heap_index() != self.regexp_ctor
         {
             return false;
         }
@@ -654,7 +654,7 @@ impl<'p> Vm<'p> {
     fn matchall_fast_resolve_slots(&self) -> Option<MatchallFastSlots> {
         let pin = |m: &ObjMap, key: &str, accessor: bool, id: u16| {
             let i = m.pos(key)?;
-            let v = m.vals[i];
+            let v = m.val_at(i);
             (m.attr_at(i).accessor == accessor
                 && v.is_heap()
                 && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == id))
@@ -675,8 +675,8 @@ impl<'p> Vm<'p> {
         let matchsym = pin(m, "@@match", false, native::REGEXP_SYM_MATCH)?;
         let ctor_slot = m.pos("constructor").filter(|&i| {
             !m.attr_at(i).accessor
-                && m.vals[i].is_heap()
-                && m.vals[i].heap_index() == self.regexp_ctor
+                && m.val_at(i).is_heap()
+                && m.val_at(i).heap_index() == self.regexp_ctor
         })? as u32;
         let mc = match self.heap.get(self.regexp_ctor) {
             HeapObj::Object(mc) => mc,
@@ -2442,9 +2442,9 @@ impl<'p> Vm<'p> {
         };
         let flags_ok = proto.pos("flags").is_some_and(|p| {
             proto.attr_at(p).accessor
-                && proto.vals[p].is_heap()
+                && proto.val_at(p).is_heap()
                 && matches!(
-                    self.heap.get(proto.vals[p].heap_index()),
+                    self.heap.get(proto.val_at(p).heap_index()),
                     HeapObj::Native(n) if *n == native::REGEXP_GET_FLAGS
                 )
         });
@@ -2452,8 +2452,8 @@ impl<'p> Vm<'p> {
             && Self::FLAG_ACCESSORS.iter().all(|(name, want)| {
                 let ok = proto.pos(name).is_some_and(|p| {
                     proto.attr_at(p).accessor
-                        && proto.vals[p].is_heap()
-                        && matches!(self.heap.get(proto.vals[p].heap_index()),
+                        && proto.val_at(p).is_heap()
+                        && matches!(self.heap.get(proto.val_at(p).heap_index()),
                                 HeapObj::Native(n) if n == want)
                 });
                 ok
@@ -2519,8 +2519,8 @@ impl<'p> Vm<'p> {
         match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => m.pos(name).is_some_and(|i| {
                 !m.attr_at(i).accessor
-                    && m.vals[i].is_heap()
-                    && matches!(self.heap.get(m.vals[i].heap_index()),
+                    && m.val_at(i).is_heap()
+                    && matches!(self.heap.get(m.val_at(i).heap_index()),
                                 HeapObj::Native(n) if *n == want)
             }),
             _ => false,
@@ -2543,8 +2543,8 @@ impl<'p> Vm<'p> {
         match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => m.pos("exec").is_some_and(|i| {
                 !m.attr_at(i).accessor
-                    && m.vals[i].is_heap()
-                    && matches!(self.heap.get(m.vals[i].heap_index()),
+                    && m.val_at(i).is_heap()
+                    && matches!(self.heap.get(m.val_at(i).heap_index()),
                                 HeapObj::Native(n) if *n == native::REGEXP_EXEC)
             }),
             _ => false,
@@ -2775,7 +2775,7 @@ impl<'p> Vm<'p> {
         if p.attr_at(slot).accessor {
             return None;
         }
-        let v = p.vals[slot];
+        let v = p.val_at(slot);
         (v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Native(n) if *n == native))
             .then_some(v)
     }

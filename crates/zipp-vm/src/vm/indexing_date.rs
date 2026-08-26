@@ -99,7 +99,7 @@ impl<'p> Vm<'p> {
                     {
                         if let Some(i) = m.pos(k) {
                             if !m.attr_at(i).accessor {
-                                let v = m.vals[i];
+                                let v = m.val_at(i);
                                 if !v.is_uninitialized() {
                                     return Ok(v);
                                 }
@@ -459,7 +459,7 @@ impl<'p> Vm<'p> {
             };
             if let Some(i) = hit {
                 if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                    m.vals[i] = val;
+                    m.set_val_at(i, val);
                     return Ok(());
                 }
             }
@@ -704,8 +704,8 @@ impl<'p> Vm<'p> {
                 self.build_concat_key(&mut scratch, name, key.as_int(), func_id);
                 let hit = match self.heap.get(oidx) {
                     HeapObj::Object(m) => match m.pos(&scratch) {
-                        Some(i) if !m.attr_at(i).accessor && !m.vals[i].is_uninitialized() => {
-                            Some(m.vals[i])
+                        Some(i) if !m.attr_at(i).accessor && !m.val_at(i).is_uninitialized() => {
+                            Some(m.val_at(i))
                         }
                         _ => None,
                     },
@@ -774,7 +774,7 @@ impl<'p> Vm<'p> {
         if let Some(i) = hit {
             self.heap.write_barrier_val(idx, val);
             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                m.vals[i] = val;
+                m.set_val_at(i, val);
                 return ConcatSetFast::Hit;
             }
         }
