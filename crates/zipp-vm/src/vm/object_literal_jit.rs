@@ -374,7 +374,7 @@ pub(crate) extern "win64" fn jit_new_array(
             return crate::codegen::SELF_CALL_DEOPT;
         }
 
-        let mut items = Vec::with_capacity(argc);
+        let mut items = vm.heap.take_arr_buf(argc);
         for offset in 0..argc {
             let bits = unsafe { *regs.add(arg_base + offset) };
             items.push(Value::from_bits(bits));

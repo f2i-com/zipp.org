@@ -4619,7 +4619,7 @@ impl<'p> Vm<'p> {
                         arg_base,
                         argc,
                     } => {
-                        let mut items = Vec::with_capacity(argc as usize);
+                        let mut items = self.heap.take_arr_buf(argc as usize);
                         for i in 0..argc {
                             items.push(self.get(base, arg_base + i));
                         }

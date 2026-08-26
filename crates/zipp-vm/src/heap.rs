@@ -646,6 +646,11 @@ fn obj_pool_sort_enabled() -> bool {
     }
 }
 
+/// Largest element-buffer CAPACITY the array pool retains: bounds both the
+/// per-entry memory and the waste when a pop's capacity exceeds the ask.
+#[cfg(not(feature = "safe-sandbox"))]
+const ARR_POOL_MAX_CAP: usize = 32;
+
 /// Retained-shell FLOOR for the recycle pool (~450 KiB of shells): the trim
 /// at each collection-done note keeps `max(2 * served, floor)` shells, so a
 /// steady literal-churn loop ramps the pool to its whole inter-sweep window
@@ -4091,6 +4096,16 @@ pub struct Heap {
     /// signal `courier_flush`'s trim sizes the pool by.
     #[cfg(not(feature = "safe-sandbox"))]
     obj_pool_pops: usize,
+    /// B196b: recycled dense-array element buffers (small-capacity class,
+    /// <= ARR_POOL_MAX_CAP), the array twin of `obj_pool`: the sweep pushes
+    /// a dying array's Vec here instead of couriering it, and the NewArray
+    /// paths pop one (cleared at pop; the retained stale bits are plain
+    /// `Value` words nobody dereferences). Demand-trimmed and addr-ordered
+    /// by the same notes and flag as the shell pool.
+    #[cfg(not(feature = "safe-sandbox"))]
+    arr_pool: Vec<Vec<Value>>,
+    #[cfg(not(feature = "safe-sandbox"))]
+    arr_pool_pops: usize,
     /// Serve order: false = LIFO push order (recently-swept shells first,
     /// cache-warm — what a warm server's fast turnover wants; the address
     /// sort measured +2.5% on the router purely by breaking it), true =
@@ -4441,6 +4456,10 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_addr_order: false,
             #[cfg(not(feature = "safe-sandbox"))]
+            arr_pool: Vec::new(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            arr_pool_pops: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_refill: false,
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_stats: [0; 3],
@@ -4523,6 +4542,25 @@ impl Heap {
         self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
         self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
         self.upvals_mirror[idx as usize] = 0;
+    }
+
+    /// B196b: an element buffer for a small dense array being built —
+    /// recycled when the pool has one (cleared here; capacity retained),
+    /// fresh otherwise. Callers push up to `cap` elements.
+    #[inline]
+    pub fn take_arr_buf(&mut self, cap: usize) -> Vec<Value> {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if cap <= ARR_POOL_MAX_CAP {
+            if let Some(mut v) = self.arr_pool.pop() {
+                self.arr_pool_pops += 1;
+                v.clear();
+                if v.capacity() < cap {
+                    v.reserve(cap - v.capacity());
+                }
+                return v;
+            }
+        }
+        Vec::with_capacity(cap)
     }
 
     /// B187 stage 2: allocate a FINALIZE-BORN literal with its values in the
@@ -5226,6 +5264,18 @@ impl Heap {
             }
             other => other,
         };
+        #[cfg(not(feature = "safe-sandbox"))]
+        let dead = match dead {
+            HeapObj::Array(v)
+                if self.obj_pool_refill
+                    && obj_pool_enabled()
+                    && (1..=ARR_POOL_MAX_CAP).contains(&v.capacity()) =>
+            {
+                self.arr_pool.push(v);
+                HeapObj::Date(f64::NAN)
+            }
+            other => other,
+        };
         if gc_courier::active() {
             match dead {
                 HeapObj::Object(m) => self.courier_batch.push(gc_courier::Item::Obj(m)),
@@ -5288,6 +5338,19 @@ impl Heap {
             if self.obj_pool_addr_order && obj_pool_sort_enabled() {
                 self.obj_pool
                     .sort_unstable_by_key(|b| &**b as *const ObjMap as usize);
+            }
+            let keep = self
+                .arr_pool_pops
+                .saturating_mul(2)
+                .max(self.arr_pool.len() / 2)
+                .max(OBJ_POOL_FLOOR);
+            self.arr_pool_pops = 0;
+            while self.arr_pool.len() > keep {
+                let v = self.arr_pool.pop().expect("len checked");
+                self.courier_batch.push(gc_courier::Item::Arr(v));
+            }
+            if self.obj_pool_addr_order && obj_pool_sort_enabled() {
+                self.arr_pool.sort_unstable_by_key(|v| v.as_ptr() as usize);
             }
         }
         if !self.courier_batch.is_empty() {
