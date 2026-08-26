@@ -940,7 +940,11 @@ impl<'p> Vm<'p> {
     /// says the callee is a native/bound/exotic (or is still unfilled). Off
     /// switch: `ZIPP_NO_CROSSCALL=1` (empty plan ⇒ byte-identical Tier C code).
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn build_cross_call_plan(&self, func_id: u32) -> crate::codegen::CrossCallPlan {
+    pub(crate) fn build_cross_call_plan(
+        &self,
+        func_id: u32,
+        exemplar_base: Option<usize>,
+    ) -> crate::codegen::CrossCallPlan {
         let mut plan = crate::codegen::CrossCallPlan::default();
         if std::env::var_os("ZIPP_NO_CROSSCALL").is_some() {
             return plan;
@@ -1084,9 +1088,115 @@ impl<'p> Vm<'p> {
                 crate::codegen::CrossCallSitePlan {
                     same_proto2,
                     cross3,
+                    cross3m: None,
                 },
             );
         }
+        // -- B193: the CallMethod lane -- admitted only with a LIVE receiver
+        // exemplar (an in-flight frame at `exemplar_base`): a settled
+        // non-DICT shape whose `name` slot holds plain own DATA -- a user
+        // Func/Closure with a live cross entry -- under the same callee
+        // conditions as the Call lane. Everything baked is revalidated per
+        // call (shape mirror, fid mirror, epoch, env bytes, GC/depth/route);
+        // any miss takes the unchanged method-IC helper as a pure prefix.
+        #[cfg(feature = "instrument")]
+        let c3m_unmetered = self.instr_rec.is_none();
+        #[cfg(not(feature = "instrument"))]
+        let c3m_unmetered = true;
+        if let Some(base) = exemplar_base {
+            if c3m_unmetered && crate::codegen::cross3_enabled() && crate::codegen::cross3m_enabled() {
+                for (ip, instr) in caller.code.iter().enumerate() {
+                    let Instr::CallMethod { obj, name, argc, .. } = *instr else {
+                        continue;
+                    };
+                    if argc > 6 {
+                        continue;
+                    }
+                    let Some(recv) = self.regs.get(base + obj as usize).copied() else {
+                        continue;
+                    };
+                    if !recv.is_heap() || !self.ic_obj_ok(recv.heap_index()) {
+                        continue;
+                    }
+                    let crate::heap::HeapObj::Object(map) = self.heap.get(recv.heap_index())
+                    else {
+                        continue;
+                    };
+                    let sh = map.shape();
+                    if sh == crate::shape::DICT {
+                        continue;
+                    }
+                    let Some(key) = caller.string_constants.get(name as usize) else {
+                        continue;
+                    };
+                    let Some(slot) = map.pos(key) else {
+                        continue;
+                    };
+                    if map.attr_at(slot).accessor {
+                        continue;
+                    }
+                    let fnv = map.val_at(slot);
+                    if !fnv.is_heap() {
+                        continue;
+                    }
+                    let fid = match self.heap.get(fnv.heap_index()) {
+                        crate::heap::HeapObj::Func(id) => *id,
+                        crate::heap::HeapObj::Closure { func, .. } => *func,
+                        _ => continue,
+                    };
+                    if (fid as usize)
+                        >= self
+                            .main_func_count
+                            .checked_add(self.eval_funcs.len())
+                            .unwrap_or(usize::MAX)
+                    {
+                        continue;
+                    }
+                    let callee = self.func(fid as usize);
+                    if callee.is_generator
+                        || callee.is_async
+                        || callee.rest_reg.is_some()
+                        || callee.arguments_reg.is_some()
+                        || usize::from(callee.param_count) != usize::from(argc)
+                    {
+                        continue;
+                    }
+                    let Some((entry, uninit_mask, json_walk, markdown_inline)) =
+                        self.jit.cross_entry(fid)
+                    else {
+                        continue;
+                    };
+                    let reg_count = callee.reg_count.max(1);
+                    if json_walk.is_some()
+                        || markdown_inline.is_some()
+                        || uninit_mask == u64::MAX
+                        || reg_count > 64
+                    {
+                        continue;
+                    }
+                    let c3m = crate::codegen::Cross3MethodPlan {
+                        shape: sh,
+                        slot: slot as u32,
+                        fid,
+                        callee_regs: reg_count,
+                        argc,
+                        arrow_this: callee.lexical_this,
+                        entry: entry as usize,
+                        uninit_mask,
+                        epoch: self.jit.cross_code_epoch,
+                    };
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!(
+                            "[cross] fn{func_id}@{ip} CROSS3M fn{fid} shape={sh} slot={slot}"
+                        );
+                    }
+                    plan.entry(ip)
+                        .or_insert_with(crate::codegen::CrossCallSitePlan::default)
+                        .cross3m = Some(c3m);
+                }
+            }
+        }
+
         plan
     }
 

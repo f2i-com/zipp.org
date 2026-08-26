@@ -219,11 +219,13 @@ pub(crate) fn compile_region_mem(
     // B189b: 48 bytes of emitted-call scratch (prior activation 24B, window
     // base|flag 8B, result 8B, bail slot 8B) between the TA pins and the leaf
     // flag; 48 keeps the frame's 16-alignment. `c3_off` is its base.
-    let do_cross3 = cross_plan.values().any(|site| site.cross3.is_some());
+    let do_cross3 = cross_plan
+        .values()
+        .any(|site| site.cross3.is_some() || site.cross3m.is_some());
     let c3_off = 40 + 32 * n_ta as i32;
     let frame = 40
         + 32 * n_ta as i32
-        + if do_cross3 { 48 } else { 0 }
+        + if do_cross3 { 64 } else { 0 }
         + if do_leaf || do_method { 16 } else { 0 };
     // Byte offset (from post-prologue rsp) of the headroom flag slot (1 = the
     // scratch window fits → inline; 0 = fall back to the per-call helper).
@@ -2782,6 +2784,37 @@ pub(crate) fn compile_region_mem(
                     }
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 } else {
+                    // B193: the emitted CallMethod cross lane first — every
+                    // guard miss falls through to the unchanged helper block
+                    // below (a pure prefix). Metered regions keep the helper
+                    // route so interpreter-parity charging stays exact.
+                    let mc_done = ops.new_dynamic_label();
+                    let c3m = cross_plan.get(&ip).and_then(|site| site.cross3m);
+                    if let Some(mp) = c3m {
+                        if blocks.is_none() {
+                            // The lane owns its bail stub: the arm-level
+                            // `bail` label is only DEFINED by the generic
+                            // helper's `emit_region_bail`, which an mi-plan
+                            // site never emits (its fallback uses a private
+                            // label) — referencing it from here dangled.
+                            let mc_bail = ops.new_dynamic_label();
+                            emit_cross3_method_call(
+                                &mut ops,
+                                mp,
+                                obj,
+                                arg_base,
+                                dst,
+                                proto.reg_count.max(1),
+                                c3_off,
+                                &heap,
+                                mc_bail,
+                                mc_done,
+                                refetch_pinned,
+                                ta_refetch,
+                            );
+                            emit_region_bail(&mut ops, ip, mc_bail, epilogue);
+                        }
+                    }
                     // Generic `obj.m(args…)`: the interpreter-IC call helper
                     // (see `emit_region_call_ic`). Packing: r9 = (name<<32) |
                     // (obj<<16) | arg_base; argc via the stack.
@@ -2824,6 +2857,7 @@ pub(crate) fn compile_region_mem(
                             ta_refetch,
                         );
                     }
+                    dynasm!(ops ; => mc_done);
                 }
             }
             Instr::Call {
@@ -3677,21 +3711,26 @@ pub(crate) fn chain_capacity_hint(code: &[Instr], ip: usize, acc: u16, end: usiz
     }
 }
 
-/// B189b: the fully-emitted same-proto cross call. Every baked datum
-/// (`plan.entry`/`uninit_mask` via `epoch`, the callee by `fid_mirror`, the
-/// call environment by the three nonempty bytes, GC/depth/route by their
-/// scalars) is revalidated by a cheap guard whose miss falls through to the
-/// UNCHANGED helper block emitted right after -- a pure prefix. The 48-byte
-/// stack scratch at `c3` holds: prior activation (24B) @ +0, window
-/// base|flags @ +24, result @ +32, bail slot @ +40.
-///
-/// `jit_cross3_enter` opens the window AND installs the callee's activation
-/// (duplicating a frame-free-active prior on the GC root stack -- bit 1 of
-/// its return says so, and `jit_cross3_unroot` pops the duplicate after the
-/// inline restore). On the mid-body-bail path the `cross3_finish` helper
-/// COMPLETES the call (B184: effects have happened; interpreter resume over
-/// the same window, never a replay); `CALL_THREW` unwinds via the region
-/// bail label exactly like the helper route.
+/// How the emitted cross lane binds `this` (see the two guard-prefix fns).
+#[derive(Clone, Copy)]
+pub(crate) enum Cross3This {
+    /// Arrow callee: captured `this` via the heap's this-mirror (indexed by
+    /// the CALLEE heap slot, in `r10` at invoke time).
+    ArrowMirror,
+    /// Strict plain function at a plain `Call` site: canonical undefined.
+    Undefined,
+    /// Method call: the receiver register's bits (reloaded — no user code has
+    /// run since the guards read it).
+    Receiver(u16),
+}
+
+/// B189b: the fully-emitted same-proto cross call at a plain `Call` site.
+/// Every baked datum (`plan.entry`/`uninit_mask` via `epoch`, the callee by
+/// `fid_mirror`, the call environment by the three nonempty bytes,
+/// GC/depth/route by their scalars) is revalidated by a cheap guard whose
+/// miss falls through to the UNCHANGED helper block emitted right after --
+/// a pure prefix. See `emit_cross3_invoke` for the stack-scratch layout and
+/// the completion contract.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_cross3_call(
     ops: &mut dynasmrt::x64::Assembler,
@@ -3707,18 +3746,10 @@ pub(crate) fn emit_cross3_call(
     refetch_pinned: bool,
     ta_refetch: Option<(usize, &crate::codegen::TaPinPlan)>,
 ) {
-    use crate::vm::host_api::{
-        JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_EPOCH_OFFSET,
-        JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_FID_MIRROR_RAW_OFFSET, JIT_GC_REQUESTED_OFFSET,
-        JIT_GC_STRESS_OFFSET, JIT_GLOBAL_ROUTE_EPOCH_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
-        JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_THIS_MIRROR_RAW_OFFSET,
-    };
+    use crate::vm::host_api::JIT_FID_MIRROR_RAW_OFFSET;
     let fb = ops.new_dynamic_label();
-    let zeroed = ops.new_dynamic_label();
-    let noroot = ops.new_dynamic_label();
-    let slow = ops.new_dynamic_label();
-    let act = JIT_ACTIVATION_OFFSET as i32;
-    let depth = JIT_CALL_DEPTH_OFFSET as i32;
+    // -- callee guard: tag + identity-free fid match; leaves callee idx in
+    // r10d and the callee BITS in rax (the invoke stashes them). --
     dynasm!(ops
         ; mov rax, [rbx + dreg(callee)]
         ; mov r10, rax
@@ -3729,6 +3760,173 @@ pub(crate) fn emit_cross3_call(
         ; mov r11, [rdi + JIT_FID_MIRROR_RAW_OFFSET as i32]
         ; cmp DWORD [r11 + r10 * 4], plan.fid as i32
         ; jne => fb
+    );
+    let this_src = if plan.arrow_this {
+        Cross3This::ArrowMirror
+    } else {
+        Cross3This::Undefined
+    };
+    emit_cross3_invoke(
+        ops,
+        Cross3Invoke {
+            fid: plan.fid,
+            callee_regs: plan.callee_regs,
+            argc: plan.argc,
+            entry: plan.entry,
+            uninit_mask: plan.uninit_mask,
+            epoch: plan.epoch,
+            this_src,
+            arg_base,
+            dst,
+            caller_regs,
+            c3,
+        },
+        heap,
+        bail,
+        cross_done,
+        fb,
+        refetch_pinned,
+        ta_refetch,
+    );
+}
+
+/// B193: the emitted cross call at a `CallMethod` site over ROTATING
+/// same-shape receivers (survival's `node.apply(...)`: a fresh receiver per
+/// call, one method fid). The method value is loaded natively through the
+/// B178 mirrors — `shape_mirror[obj] == baked shape` proves the receiver
+/// settled with the baked layout since its last version bump (any bump pins
+/// the mirror to DICT until the miss path re-settles it, and an accessor
+/// flip or method redefinition bumps), so `vals_ptr_mirror[obj] + slot*8`
+/// is the live own DATA slot the plan resolved; the loaded value then takes
+/// the same fid guard as a plain callee. Any miss falls through to the
+/// unchanged method-IC helper block as a pure prefix.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_cross3_method_call(
+    ops: &mut dynasmrt::x64::Assembler,
+    plan: crate::codegen::Cross3MethodPlan,
+    obj: u16,
+    arg_base: u16,
+    dst: u16,
+    caller_regs: u16,
+    c3: i32,
+    heap: &crate::codegen::HeapHelpers,
+    bail: dynasmrt::DynamicLabel,
+    cross_done: dynasmrt::DynamicLabel,
+    refetch_pinned: bool,
+    ta_refetch: Option<(usize, &crate::codegen::TaPinPlan)>,
+) {
+    use crate::vm::host_api::{
+        JIT_FID_MIRROR_RAW_OFFSET, JIT_SHAPE_MIRROR_RAW_OFFSET, JIT_VALS_MIRROR_RAW_OFFSET,
+    };
+    let fb = ops.new_dynamic_label();
+    dynasm!(ops
+        // -- receiver: tag + settled-shape guard --
+        ; mov rax, [rbx + dreg(obj)]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => fb
+        ; mov r10d, eax
+        ; mov r11, [rdi + JIT_SHAPE_MIRROR_RAW_OFFSET as i32]
+        ; cmp DWORD [r11 + r10 * 4], plan.shape as i32
+        ; jne => fb
+        // -- method: live own-slot load via the vals mirror --
+        ; mov r11, [rdi + JIT_VALS_MIRROR_RAW_OFFSET as i32]
+        ; mov r11, [r11 + r10 * 8]
+        ; mov rax, [r11 + (plan.slot as i32) * 8]
+        ; mov r10, rax
+        ; shr r10, 48
+        ; cmp r10d, TAG_HEAP_HI as i32
+        ; jne => fb
+        ; mov r10d, eax
+        ; mov r11, [rdi + JIT_FID_MIRROR_RAW_OFFSET as i32]
+        ; cmp DWORD [r11 + r10 * 4], plan.fid as i32
+        ; jne => fb
+    );
+    let this_src = if plan.arrow_this {
+        Cross3This::ArrowMirror
+    } else {
+        Cross3This::Receiver(obj)
+    };
+    emit_cross3_invoke(
+        ops,
+        Cross3Invoke {
+            fid: plan.fid,
+            callee_regs: plan.callee_regs,
+            argc: plan.argc,
+            entry: plan.entry,
+            uninit_mask: plan.uninit_mask,
+            epoch: plan.epoch,
+            this_src,
+            arg_base,
+            dst,
+            caller_regs,
+            c3,
+        },
+        heap,
+        bail,
+        cross_done,
+        fb,
+        refetch_pinned,
+        ta_refetch,
+    );
+}
+
+/// The baked half every cross3 site shares.
+pub(crate) struct Cross3Invoke {
+    pub fid: u32,
+    pub callee_regs: u16,
+    pub argc: u16,
+    pub entry: usize,
+    pub uninit_mask: u64,
+    pub epoch: u32,
+    pub this_src: Cross3This,
+    pub arg_base: u16,
+    pub dst: u16,
+    pub caller_regs: u16,
+    pub c3: i32,
+}
+
+/// The shared cross3 INVOKE tail. ENTRY CONTRACT: the callee's heap index is
+/// in `r10d` and its Value bits in `rax`; the caller's guard prefix has
+/// already proven the fid. The 64-byte stack scratch at `c3` holds: prior
+/// activation (24B) @ +0, window base|flags @ +24, result @ +32, bail slot
+/// @ +40, callee bits @ +48.
+///
+/// `jit_cross3_enter` opens the window AND installs the callee's activation
+/// (duplicating a frame-free-active prior on the GC root stack -- bit 1 of
+/// its return says so, and `jit_cross3_unroot` pops the duplicate after the
+/// inline restore). On the mid-body-bail path the `cross3_finish` helper
+/// COMPLETES the call (B184: effects have happened; interpreter resume over
+/// the same window, never a replay); `CALL_THREW` unwinds via the region
+/// bail label exactly like the helper route.
+#[allow(clippy::too_many_arguments)]
+fn emit_cross3_invoke(
+    ops: &mut dynasmrt::x64::Assembler,
+    iv: Cross3Invoke,
+    heap: &crate::codegen::HeapHelpers,
+    bail: dynasmrt::DynamicLabel,
+    cross_done: dynasmrt::DynamicLabel,
+    fb: dynasmrt::DynamicLabel,
+    refetch_pinned: bool,
+    ta_refetch: Option<(usize, &crate::codegen::TaPinPlan)>,
+) {
+    use crate::vm::host_api::{
+        JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_EPOCH_OFFSET,
+        JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_GC_REQUESTED_OFFSET, JIT_GC_STRESS_OFFSET,
+        JIT_GLOBAL_ROUTE_EPOCH_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
+        JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_THIS_MIRROR_RAW_OFFSET,
+    };
+    let zeroed = ops.new_dynamic_label();
+    let noroot = ops.new_dynamic_label();
+    let slow = ops.new_dynamic_label();
+    let act = JIT_ACTIVATION_OFFSET as i32;
+    let depth = JIT_CALL_DEPTH_OFFSET as i32;
+    let c3 = iv.c3;
+    dynasm!(ops
+        // Stash the callee bits (the finish helper needs them; r10/rax die at
+        // the enter call).
+        ; mov [rsp + c3 + 48], rax
         ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
         ; jne => fb
         ; cmp BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32], 0
@@ -3737,7 +3935,7 @@ pub(crate) fn emit_cross3_call(
         ; jne => fb
         ; cmp DWORD [rdi + depth], crate::vm::JIT_REGION_CALL_MAX as i32
         ; jae => fb
-        ; cmp DWORD [rdi + JIT_CROSS_EPOCH_OFFSET as i32], plan.epoch as i32
+        ; cmp DWORD [rdi + JIT_CROSS_EPOCH_OFFSET as i32], iv.epoch as i32
         ; jne => fb
         ; cmp DWORD [rdi + JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], 0
         ; jne => fb
@@ -3754,36 +3952,46 @@ pub(crate) fn emit_cross3_call(
         ; mov r11, [rdi + act + 16]
         ; mov [rsp + c3 + 16], r11
         ; mov rcx, rdi
-        ; lea rdx, [rbx + dreg(caller_regs)]
-        ; mov r8d, plan.callee_regs as i32
+        ; lea rdx, [rbx + dreg(iv.caller_regs)]
+        ; mov r8d, iv.callee_regs as i32
         ; mov r9d, r10d
         ; mov rax, QWORD heap.cross3_enter as i64
         ; call rax
         ; test rax, rax
         ; jz => fb
         ; mov [rsp + c3 + 24], rax
-        // Reload the callee (no user code ran; the register is unchanged).
-        ; mov rax, [rbx + dreg(callee)]
+        // Re-derive the callee idx from the stashed bits (r10 died).
+        ; mov rax, [rsp + c3 + 48]
         ; mov r10d, eax
         // -- window fill: this, args, then the may-read-before-write mask --
         ; mov r9, [rsp + c3 + 24]
         ; and r9, -4
     );
-    if plan.arrow_this {
-        dynasm!(ops
-            ; mov r11, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
-            ; mov r11, [r11 + r10 * 8]
-            ; mov [r9], r11
-        );
-    } else {
-        dynasm!(ops
-            ; mov r11, QWORD Value::UNDEFINED.bits() as i64
-            ; mov [r9], r11
-        );
+    match iv.this_src {
+        Cross3This::ArrowMirror => {
+            dynasm!(ops
+                ; mov r11, [rdi + JIT_THIS_MIRROR_RAW_OFFSET as i32]
+                ; mov r11, [r11 + r10 * 8]
+                ; mov [r9], r11
+            );
+        }
+        Cross3This::Undefined => {
+            dynasm!(ops
+                ; mov r11, QWORD Value::UNDEFINED.bits() as i64
+                ; mov [r9], r11
+            );
+        }
+        Cross3This::Receiver(obj) => {
+            // No user code has run since the guards read the receiver reg.
+            dynasm!(ops
+                ; mov r11, [rbx + dreg(obj)]
+                ; mov [r9], r11
+            );
+        }
     }
-    for i in 0..plan.argc as i32 {
+    for i in 0..iv.argc as i32 {
         dynasm!(ops
-            ; mov r11, [rbx + dreg(arg_base) + i * 8]
+            ; mov r11, [rbx + dreg(iv.arg_base) + i * 8]
             ; mov [r9 + (1 + i) * 8], r11
         );
     }
@@ -3795,11 +4003,11 @@ pub(crate) fn emit_cross3_call(
     {
         // Registers [0 ..= argc] were just written; zero only the remaining
         // may-read-before-write set (baked; `epoch` guards its staleness).
-        let mut m = plan.uninit_mask;
+        let mut m = iv.uninit_mask;
         while m != 0 {
             let r = m.trailing_zeros() as i32;
             m &= m - 1;
-            if r <= plan.argc as i32 {
+            if r <= iv.argc as i32 {
                 continue;
             }
             dynasm!(ops ; mov [r9 + r * 8], r11);
@@ -3813,7 +4021,7 @@ pub(crate) fn emit_cross3_call(
         ; mov rcx, r9
         ; lea rdx, [rsp + c3 + 40]
         ; mov r8, rdi
-        ; mov rax, QWORD plan.entry as i64
+        ; mov rax, QWORD iv.entry as i64
         ; call rax
         ; mov [rsp + c3 + 32], rax
         // -- restore the caller activation inline; pop the root-stack
@@ -3841,7 +4049,7 @@ pub(crate) fn emit_cross3_call(
         ; mov rax, QWORD heap.window_close as i64
         ; call rax
         ; mov rax, [rsp + c3 + 32]
-        ; mov [rbx + dreg(dst)], rax
+        ; mov [rbx + dreg(iv.dst)], rax
     );
     if refetch_pinned {
         emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));
@@ -3858,17 +4066,17 @@ pub(crate) fn emit_cross3_call(
         ; and rdx, -4
         ; mov r8, r10
         ; shl r8, 32
-        ; mov r11, QWORD (((plan.argc as u64) << 24) | plan.fid as u64) as i64
+        ; mov r11, QWORD (((iv.argc as u64) << 24) | iv.fid as u64) as i64
         ; or r8, r11
-        ; mov r9, [rbx + dreg(callee)]
-        ; lea r11, [rbx + dreg(arg_base)]
+        ; mov r9, [rsp + c3 + 48]
+        ; lea r11, [rbx + dreg(iv.arg_base)]
         ; mov [rsp + 32], r11
         ; mov rax, QWORD heap.cross3_finish as i64
         ; call rax
         ; mov r10, QWORD CALL_THREW as i64
         ; cmp rax, r10
         ; je => bail
-        ; mov [rbx + dreg(dst)], rax
+        ; mov [rbx + dreg(iv.dst)], rax
     );
     if refetch_pinned {
         emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));

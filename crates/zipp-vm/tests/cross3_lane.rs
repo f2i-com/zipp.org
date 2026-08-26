@@ -177,3 +177,49 @@ fn cross3_nested_frame_free_prior_roots_and_answers() {
         );
     }
 }
+
+/// B193: the CallMethod lane — a fresh same-shape receiver per call, one
+/// method fid (survival-class). Mid-run the factory is swapped so later
+/// receivers carry a DIFFERENT method fid at the same shape/slot: the fid
+/// guard must route them to the new body (an in-place same-shape world where
+/// no version bumps help). The value is node's, byte for byte. The mi-inline
+/// co-emission path (an mi plan and the lane at one site) is covered by the
+/// lib test `plain_object_method_inline_guards_the_slot`, whose fourth case
+/// caught the lane's original dangling-bail-label defect.
+#[test]
+fn cross3m_rotating_receivers_and_mid_run_fid_swap() {
+    let out = run_ok(
+        r#"
+        "use strict";
+        (function main() {
+          function makeNode(k) {
+            return {
+              serial: k,
+              vals: [k & 7, (k * 3) & 15],
+              apply(d) {
+                return (this.serial + this.vals[d & 1] + d) | 0;
+              },
+            };
+          }
+          let acc = 0;
+          for (let i = 0; i < 400000; i++) {
+            const node = makeNode(i);
+            acc = (acc + node.apply(i & 31)) | 0;
+            if (i === 300000) {
+              makeNode = function (k) {
+                return {
+                  serial: k,
+                  vals: [1, 2],
+                  apply(d) {
+                    return (this.serial - d) | 0;
+                  },
+                };
+              };
+            }
+          }
+          console.log("acc=" + acc);
+        })();
+        "#,
+    );
+    assert_eq!(out, vec!["acc=-1599828624".to_string()]);
+}

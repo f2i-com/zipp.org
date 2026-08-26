@@ -339,7 +339,7 @@ impl<'p> Vm<'p> {
                                     rustc_hash::FxHashMap::default()
                                 };
                             // Tier-C cross-call plan (B83) — also built before &mut self.jit.
-                            let cross_plan = self.build_cross_call_plan(func_id);
+                            let cross_plan = self.build_cross_call_plan(func_id, Some(base));
                             self.jit.compile(
                                 func_id,
                                 proto_ref,
@@ -4172,7 +4172,7 @@ impl<'p> Vm<'p> {
                                 // copy of a cross-tier fact is the whole point of B66.
                                 // Tier-C cross-call plan (B83) — the region's Call
                                 // sites get the native→native attempt too.
-                                let cross_plan = self.build_cross_call_plan(func_id);
+                                let cross_plan = self.build_cross_call_plan(func_id, Some(base));
                                 self.jit.compile_region(
                                     func_id,
                                     proto_ref,

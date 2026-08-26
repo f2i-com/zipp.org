@@ -1967,7 +1967,7 @@ pub(crate) fn compile_proto_mem(
         .chain(method_plan.values().map(|p| p.win_top as u64))
         .max()
         .unwrap_or(0);
-    // 32B shadow + 8B 5th-arg slot = 40; + the B189b 48B emitted-call scratch
+    // 32B shadow + 8B 5th-arg slot = 40; + the B189b/B193 64B emitted-call scratch
     // when a Call site carries a cross3 plan (region_mem's layout: prior
     // activation 24B @ c3, window base|flags @ c3+24, result @ c3+32, bail
     // slot @ c3+40); + a 16B leaf-headroom-flag slot when inlining (48 and 16
@@ -1975,7 +1975,7 @@ pub(crate) fn compile_proto_mem(
     let do_cross3 = meter.is_none() && cross_plan.values().any(|site| site.cross3.is_some());
     let c3_off: i32 = 40;
     let frame: i32 = 40
-        + if do_cross3 { 48 } else { 0 }
+        + if do_cross3 { 64 } else { 0 }
         + if do_leaf || method_needs_headroom {
             16
         } else {

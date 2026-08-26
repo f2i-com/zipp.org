@@ -269,6 +269,20 @@ pub(crate) fn quick_len_enabled() -> bool {
     }
 }
 
+pub(crate) fn cross3m_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CROSS3M").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 pub(crate) fn cross3_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -583,6 +597,10 @@ pub struct CrossCallSitePlan {
     /// B189b: the fully-emitted native call lane for this site (rotating
     /// closures of ONE FuncProto). `None` keeps the helper-only route.
     pub cross3: Option<SameProtoCross3Plan>,
+    /// B193: the emitted lane for a `CallMethod` site (rotating same-shape
+    /// receivers, one method fid). Keyed in the same per-ip map — Call and
+    /// CallMethod ips never collide.
+    pub cross3m: Option<Cross3MethodPlan>,
 }
 
 /// B189b: everything the emitted same-proto call lane bakes. All of it is
@@ -590,6 +608,27 @@ pub struct CrossCallSitePlan {
 /// entry/mask pair by `Jit::cross_code_epoch`, the environment by the three
 /// nonempty bytes, GC/depth/route by their scalars — any mismatch falls back
 /// to the unchanged cross-call helper, a pure prefix.
+/// B193: the emitted cross call at a `CallMethod` site over rotating
+/// same-SHAPE receivers — the method loads natively through the B178
+/// mirrors (`shape_mirror[obj] == shape` proves the baked layout settled
+/// since the receiver's last version bump; any bump — including accessor
+/// flips and method redefinitions — pins the mirror to DICT until the miss
+/// path re-settles it), and the loaded value takes the same fid guard as a
+/// plain callee. Everything else is revalidated exactly as
+/// [`SameProtoCross3Plan`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cross3MethodPlan {
+    pub shape: u32,
+    pub slot: u32,
+    pub fid: u32,
+    pub callee_regs: u16,
+    pub argc: u16,
+    pub arrow_this: bool,
+    pub entry: usize,
+    pub uninit_mask: u64,
+    pub epoch: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SameProtoCross3Plan {
     pub fid: u32,

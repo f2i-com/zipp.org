@@ -1,0 +1,2473 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-08-26T13:15:05.314773+00:00",
+  "workspace_commit": "e01d4419ebf99ae188f031a3f00b1a02f2a42423",
+  "publishable": false,
+  "provenance_reasons": [
+    "zipp: built from a DIRTY tree (e01d4419ebf99ae188f031a3f00b1a02f2a42423+dirty.8541424cccb8fecd); the commit it names is the parent it was based on, not the code that ran"
+  ],
+  "publication_reasons": [
+    "filtered corpus (all default cases required)"
+  ],
+  "publication_sources_head_before": true,
+  "publication_sources_head_after": true,
+  "manifest": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\manifest.json",
+  "manifest_sha256_before": "7ada4c9fe96ad17d32a21a365e48332dca98e85257b650db839afd09568c9411",
+  "manifest_sha256_after": "7ada4c9fe96ad17d32a21a365e48332dca98e85257b650db839afd09568c9411",
+  "harness_sha256_before": {
+    "tools/bench_hostile.py": "4f6d451b778f00d873fede9fb1c9b9c562095d723f75351f89d15354e6e22b36",
+    "tools/bench.py": "1fd21925127036e95549ea1ca055bbbc6aad963029c942bb35e84a68f52619a5"
+  },
+  "harness_sha256_after": {
+    "tools/bench_hostile.py": "4f6d451b778f00d873fede9fb1c9b9c562095d723f75351f89d15354e6e22b36",
+    "tools/bench.py": "1fd21925127036e95549ea1ca055bbbc6aad963029c942bb35e84a68f52619a5"
+  },
+  "input_sha256_before": {
+    "allocation/survival.js": "eabf490390b21f67748344a3041e622bfd98c51ff065166be0f5b86910690000",
+    "apps/reactish-reconcile.js": "8520ee91d83a1645ef704385dc36882bd7c28813339b0aafcd01511572baf20f"
+  },
+  "input_sha256_after": {
+    "allocation/survival.js": "eabf490390b21f67748344a3041e622bfd98c51ff065166be0f5b86910690000",
+    "apps/reactish-reconcile.js": "8520ee91d83a1645ef704385dc36882bd7c28813339b0aafcd01511572baf20f"
+  },
+  "source_drift": [],
+  "cases": [
+    {
+      "id": "allocation-survival",
+      "entry": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js",
+      "entry_rel": "allocation/survival.js",
+      "category": "allocation",
+      "goal": "script",
+      "family": "object-lifetime",
+      "variant": "survivors",
+      "inputs": [
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "input_rels": [
+        "allocation/survival.js"
+      ],
+      "timeout_s": 300.0,
+      "features": [
+        "objects",
+        "arrays",
+        "methods",
+        "allocation",
+        "gc-pressure",
+        "medium-lived"
+      ],
+      "description": "Objects survive several allocation epochs before old cohorts are discarded."
+    },
+    {
+      "id": "reactish-reconcile",
+      "entry": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js",
+      "entry_rel": "apps/reactish-reconcile.js",
+      "category": "applications",
+      "goal": "script",
+      "family": null,
+      "variant": null,
+      "inputs": [
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "input_rels": [
+        "apps/reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "features": [
+        "reactish",
+        "function-components",
+        "closures",
+        "objects",
+        "mixed-shapes",
+        "allocation",
+        "medium-lived"
+      ],
+      "description": "A host-free React-shaped reconciliation kernel exercises components, state, props, handlers, and patches."
+    }
+  ],
+  "selection": {
+    "cases": [
+      "allocation-survival",
+      "reactish-reconcile"
+    ],
+    "categories": [],
+    "families": [],
+    "features": []
+  },
+  "reps": 15,
+  "seed": 1511464998,
+  "bootstrap_samples": 10000,
+  "timeout_override_s": null,
+  "engines_before": [
+    {
+      "name": "node",
+      "argv": [
+        "node"
+      ],
+      "executable": "C:\\Program Files\\nodejs\\node.exe",
+      "version": "v24.12.0",
+      "version_probe_error": null,
+      "size": 89935872,
+      "mtime_ns": 1765317568000000000,
+      "sha256": "2ffe3acc0458fdde999f50d11809bbe7c9b7ef204dcf17094e325d26ace101d8",
+      "build_identity": null
+    },
+    {
+      "name": "zipp",
+      "argv": [
+        "target/release/zipp.exe"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7585792,
+      "mtime_ns": 1787748700676358600,
+      "sha256": "b2d6e03e7e002a6eb38dc24e58c1d2d2738ef2b351cd2dde34882270d6d7cdfd",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "e01d4419ebf99ae188f031a3f00b1a02f2a42423+dirty.8541424cccb8fecd",
+        "commit": "e01d4419ebf99ae188f031a3f00b1a02f2a42423",
+        "dirty": true,
+        "diff_digest": "8541424cccb8fecd",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      }
+    }
+  ],
+  "engines_after": [
+    {
+      "name": "node",
+      "argv": [
+        "node"
+      ],
+      "executable": "C:\\Program Files\\nodejs\\node.exe",
+      "version": "v24.12.0",
+      "version_probe_error": null,
+      "size": 89935872,
+      "mtime_ns": 1765317568000000000,
+      "sha256": "2ffe3acc0458fdde999f50d11809bbe7c9b7ef204dcf17094e325d26ace101d8",
+      "build_identity": null
+    },
+    {
+      "name": "zipp",
+      "argv": [
+        "target/release/zipp.exe"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7585792,
+      "mtime_ns": 1787748700676358600,
+      "sha256": "b2d6e03e7e002a6eb38dc24e58c1d2d2738ef2b351cd2dde34882270d6d7cdfd",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "e01d4419ebf99ae188f031a3f00b1a02f2a42423+dirty.8541424cccb8fecd",
+        "commit": "e01d4419ebf99ae188f031a3f00b1a02f2a42423",
+        "dirty": true,
+        "diff_digest": "8541424cccb8fecd",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      }
+    }
+  ],
+  "engine_drift": [],
+  "host": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "python": "3.11.6",
+    "power_mode": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "environment": {},
+  "schedules": [
+    {
+      "rep": 0,
+      "case_order": [
+        "reactish-reconcile",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 1,
+      "case_order": [
+        "allocation-survival",
+        "reactish-reconcile"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 2,
+      "case_order": [
+        "reactish-reconcile",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 3,
+      "case_order": [
+        "reactish-reconcile",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 4,
+      "case_order": [
+        "allocation-survival",
+        "reactish-reconcile"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 5,
+      "case_order": [
+        "allocation-survival",
+        "reactish-reconcile"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 6,
+      "case_order": [
+        "allocation-survival",
+        "reactish-reconcile"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 7,
+      "case_order": [
+        "reactish-reconcile",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 8,
+      "case_order": [
+        "reactish-reconcile",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 9,
+      "case_order": [
+        "allocation-survival",
+        "reactish-reconcile"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 10,
+      "case_order": [
+        "reactish-reconcile",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 11,
+      "case_order": [
+        "reactish-reconcile",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 12,
+      "case_order": [
+        "allocation-survival",
+        "reactish-reconcile"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 13,
+      "case_order": [
+        "reactish-reconcile",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 14,
+      "case_order": [
+        "reactish-reconcile",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "rep": 0,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03201259998604655,
+      "cold_s": 0.047545399982482195,
+      "adjusted_s": 0.015532799996435642,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0111445999937132,
+      "cold_s": 0.13300789997447282,
+      "adjusted_s": 0.12186329998075962,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030683699995279312,
+      "cold_s": 0.061523100011982024,
+      "adjusted_s": 0.03083940001670271,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009555199998430908,
+      "cold_s": 0.2512962999753654,
+      "adjusted_s": 0.2417410999769345,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010284299962222576,
+      "cold_s": 0.24937600002158433,
+      "adjusted_s": 0.23909170005936176,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0316543000517413,
+      "cold_s": 0.05888789996970445,
+      "adjusted_s": 0.027233599917963147,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009805500041693449,
+      "cold_s": 0.13054629997350276,
+      "adjusted_s": 0.1207407999318093,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03130739997141063,
+      "cold_s": 0.04647210007533431,
+      "adjusted_s": 0.015164700103923678,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03064850007649511,
+      "cold_s": 0.05220529995858669,
+      "adjusted_s": 0.021556799882091582,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009147000033408403,
+      "cold_s": 0.12807299999985844,
+      "adjusted_s": 0.11892599996645004,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03143630002159625,
+      "cold_s": 0.061603100039064884,
+      "adjusted_s": 0.03016680001746863,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009549399954266846,
+      "cold_s": 0.25432700000237674,
+      "adjusted_s": 0.2447776000481099,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008790499996393919,
+      "cold_s": 0.12703129998408258,
+      "adjusted_s": 0.11824079998768866,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030513999983668327,
+      "cold_s": 0.04661740001756698,
+      "adjusted_s": 0.01610340003389865,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009661699994467199,
+      "cold_s": 0.25346899998839945,
+      "adjusted_s": 0.24380729999393225,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03096410003490746,
+      "cold_s": 0.05839999997988343,
+      "adjusted_s": 0.027435899944975972,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03093600005377084,
+      "cold_s": 0.05851490003988147,
+      "adjusted_s": 0.027578899986110628,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009243099950253963,
+      "cold_s": 0.25261690001934767,
+      "adjusted_s": 0.2433738000690937,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031269899918697774,
+      "cold_s": 0.04535819997545332,
+      "adjusted_s": 0.014088300056755543,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00924819998908788,
+      "cold_s": 0.1310649000806734,
+      "adjusted_s": 0.12181670009158552,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009088699938729405,
+      "cold_s": 0.24614870001096278,
+      "adjusted_s": 0.23706000007223338,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031198700075037777,
+      "cold_s": 0.06642270006705076,
+      "adjusted_s": 0.03522399999201298,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009473499958403409,
+      "cold_s": 0.12830590002704412,
+      "adjusted_s": 0.11883240006864071,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031647900003008544,
+      "cold_s": 0.046403100015595555,
+      "adjusted_s": 0.01475520001258701,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03009859996382147,
+      "cold_s": 0.05981120001524687,
+      "adjusted_s": 0.029712600051425397,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010487299994565547,
+      "cold_s": 0.24765549995936453,
+      "adjusted_s": 0.237168199964799,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03123810002580285,
+      "cold_s": 0.0456214000005275,
+      "adjusted_s": 0.01438329997472465,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009341800003312528,
+      "cold_s": 0.1282491999445483,
+      "adjusted_s": 0.11890739994123578,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008861699956469238,
+      "cold_s": 0.13339580001775175,
+      "adjusted_s": 0.12453410006128252,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03140729991719127,
+      "cold_s": 0.04985950002446771,
+      "adjusted_s": 0.01845220010727644,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009220500010997057,
+      "cold_s": 0.25326819997280836,
+      "adjusted_s": 0.2440476999618113,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030491200042888522,
+      "cold_s": 0.061921700020320714,
+      "adjusted_s": 0.03143049997743219,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.032123500015586615,
+      "cold_s": 0.04631529992911965,
+      "adjusted_s": 0.014191799913533032,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009400199982337654,
+      "cold_s": 0.12755289999768138,
+      "adjusted_s": 0.11815270001534373,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0313120000064373,
+      "cold_s": 0.059260700014419854,
+      "adjusted_s": 0.027948700007982552,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009326400002464652,
+      "cold_s": 0.2510896000312641,
+      "adjusted_s": 0.24176320002879947,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008970300084911287,
+      "cold_s": 0.25514030002523214,
+      "adjusted_s": 0.24616999994032085,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03632409998681396,
+      "cold_s": 0.058663200004957616,
+      "adjusted_s": 0.022339100018143654,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009210099931806326,
+      "cold_s": 0.13094369997270405,
+      "adjusted_s": 0.12173360004089773,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030414800043217838,
+      "cold_s": 0.04494119994342327,
+      "adjusted_s": 0.014526399900205433,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03066299995407462,
+      "cold_s": 0.045900599914602935,
+      "adjusted_s": 0.015237599960528314,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009162800037302077,
+      "cold_s": 0.12765989999752492,
+      "adjusted_s": 0.11849709996022284,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03187290008645505,
+      "cold_s": 0.06049810000695288,
+      "adjusted_s": 0.028625199920497835,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008989699999801815,
+      "cold_s": 0.25531819998286664,
+      "adjusted_s": 0.24632849998306483,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008797299931757152,
+      "cold_s": 0.12736380007117987,
+      "adjusted_s": 0.11856650013942271,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03203659993596375,
+      "cold_s": 0.04570950008928776,
+      "adjusted_s": 0.013672900153324008,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009227499947883189,
+      "cold_s": 0.2536752000451088,
+      "adjusted_s": 0.2444477000972256,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0321568000363186,
+      "cold_s": 0.059738799929618835,
+      "adjusted_s": 0.027581999893300235,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030551800038665533,
+      "cold_s": 0.058924400014802814,
+      "adjusted_s": 0.02837259997613728,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009245799970813096,
+      "cold_s": 0.2609736999729648,
+      "adjusted_s": 0.2517279000021517,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031139899976551533,
+      "cold_s": 0.046099600032903254,
+      "adjusted_s": 0.014959700056351721,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009118700050748885,
+      "cold_s": 0.1290529000107199,
+      "adjusted_s": 0.11993419995997101,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009223299915902317,
+      "cold_s": 0.1291266999905929,
+      "adjusted_s": 0.11990340007469058,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03268439997918904,
+      "cold_s": 0.04874070000369102,
+      "adjusted_s": 0.01605630002450198,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009602500009350479,
+      "cold_s": 0.2530495999380946,
+      "adjusted_s": 0.24344709992874414,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03168570005800575,
+      "cold_s": 0.06070719996932894,
+      "adjusted_s": 0.02902149991132319,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03113450005184859,
+      "cold_s": 0.0463416000129655,
+      "adjusted_s": 0.01520709996111691,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009469799930229783,
+      "cold_s": 0.1306033000582829,
+      "adjusted_s": 0.12113350012805313,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03171960008330643,
+      "cold_s": 0.061360100051388144,
+      "adjusted_s": 0.029640499968081713,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-syd9nyai.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009789499919861555,
+      "cold_s": 0.24707030004356056,
+      "adjusted_s": 0.237280800123699,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    }
+  ],
+  "all_correct": true,
+  "health_failures": [],
+  "correctness_failures": [],
+  "summary": {
+    "case_summaries": {
+      "allocation-survival": {
+        "category": "allocation",
+        "family": "object-lifetime",
+        "variant": "survivors",
+        "metrics": {
+          "startup": {
+            "median_ms": {
+              "node": 31.3120000064373,
+              "zipp": 9.326400002464652
+            },
+            "paired_ratio": 0.30262701245464624,
+            "paired_ratio_ci95": [
+              0.29785385796331365,
+              0.3114096409462019
+            ],
+            "nonpositive_pairs": 0
+          },
+          "cold": {
+            "median_ms": {
+              "node": 59.81120001524687,
+              "zipp": 253.04959993809462
+            },
+            "paired_ratio": 4.220268073766343,
+            "paired_ratio_ci95": [
+              4.090136412432053,
+              4.24640602663555
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "node": 28.625199920497835,
+              "zipp": 243.44709992874414
+            },
+            "paired_ratio": 8.605302344340126,
+            "paired_ratio_ci95": [
+              7.982074929636505,
+              8.824637682854007
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      },
+      "reactish-reconcile": {
+        "category": "applications",
+        "family": null,
+        "variant": null,
+        "metrics": {
+          "startup": {
+            "median_ms": {
+              "node": 31.269899918697774,
+              "zipp": 9.223299915902317
+            },
+            "paired_ratio": 0.29844853779397196,
+            "paired_ratio_ci95": [
+              0.28808088094313306,
+              0.302816389347267
+            ],
+            "nonpositive_pairs": 0
+          },
+          "cold": {
+            "median_ms": {
+              "node": 46.3416000129655,
+              "zipp": 129.0529000107199
+            },
+            "paired_ratio": 2.7863748197287372,
+            "paired_ratio_ci95": [
+              2.72497608052386,
+              2.8091327863788957
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "node": 15.164700103923678,
+              "zipp": 119.90340007469058
+            },
+            "paired_ratio": 7.965588471028653,
+            "paired_ratio_ci95": [
+              7.467685574616661,
+              8.267045820513252
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      }
+    },
+    "suite_summaries": {
+      "startup": {
+        "overall": {
+          "benches": [
+            "allocation-survival",
+            "reactish-reconcile"
+          ],
+          "geomean_paired_ratio": 0.3005305131996538,
+          "ci95": [
+            0.295150315742928,
+            0.30516800879943373
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "allocation": [
+              "allocation-survival"
+            ],
+            "applications": [
+              "reactish-reconcile"
+            ]
+          },
+          "geomean_paired_ratio": 0.3005305131996538,
+          "ci95": [
+            0.2951529959873331,
+            0.30516800879943373
+          ]
+        },
+        "categories": {
+          "allocation": {
+            "benches": [
+              "allocation-survival"
+            ],
+            "geomean_paired_ratio": 0.30262701245464624,
+            "ci95": [
+              0.29131662270766584,
+              0.3086262088472429
+            ]
+          },
+          "applications": {
+            "benches": [
+              "reactish-reconcile"
+            ],
+            "geomean_paired_ratio": 0.29844853779397196,
+            "ci95": [
+              0.28808088094313306,
+              0.302816389347267
+            ]
+          }
+        }
+      },
+      "cold": {
+        "overall": {
+          "benches": [
+            "allocation-survival",
+            "reactish-reconcile"
+          ],
+          "geomean_paired_ratio": 3.429176095397791,
+          "ci95": [
+            3.37026518155663,
+            3.4550456253733635
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "allocation": [
+              "allocation-survival"
+            ],
+            "applications": [
+              "reactish-reconcile"
+            ]
+          },
+          "geomean_paired_ratio": 3.429176095397791,
+          "ci95": [
+            3.37026518155663,
+            3.455059300074602
+          ]
+        },
+        "categories": {
+          "allocation": {
+            "benches": [
+              "allocation-survival"
+            ],
+            "geomean_paired_ratio": 4.220268073766343,
+            "ci95": [
+              4.090136412432053,
+              4.317138025480243
+            ]
+          },
+          "applications": {
+            "benches": [
+              "reactish-reconcile"
+            ],
+            "geomean_paired_ratio": 2.7863748197287372,
+            "ci95": [
+              2.754012177247837,
+              2.811163180942834
+            ]
+          }
+        }
+      },
+      "adjusted": {
+        "overall": {
+          "benches": [
+            "allocation-survival",
+            "reactish-reconcile"
+          ],
+          "geomean_paired_ratio": 8.279269118937464,
+          "ci95": [
+            7.914716939792269,
+            8.541292880681585
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "allocation": [
+              "allocation-survival"
+            ],
+            "applications": [
+              "reactish-reconcile"
+            ]
+          },
+          "geomean_paired_ratio": 8.279269118937464,
+          "ci95": [
+            7.914716939792269,
+            8.541292880681585
+          ]
+        },
+        "categories": {
+          "allocation": {
+            "benches": [
+              "allocation-survival"
+            ],
+            "geomean_paired_ratio": 8.605302344340124,
+            "ci95": [
+              8.00529007200331,
+              8.86258070636143
+            ]
+          },
+          "applications": {
+            "benches": [
+              "reactish-reconcile"
+            ],
+            "geomean_paired_ratio": 7.965588471028653,
+            "ci95": [
+              7.467685574616662,
+              8.267045820513252
+            ]
+          }
+        }
+      }
+    },
+    "degradations": [
+      {
+        "family": "object-lifetime",
+        "available": false,
+        "reason": "selected cases do not include baseline and stressor"
+      }
+    ]
+  }
+}
