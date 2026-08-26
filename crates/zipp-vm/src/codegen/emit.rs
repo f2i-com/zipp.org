@@ -635,8 +635,19 @@ pub(crate) fn emit_ic_probe(
                 ; bts r11, 32                         // compose (1<<32)|shape
                 ; lea r9, [r14 + ic_off]              // way 0 of this site
                 ; mov r8d, JIT_IC_WAYS as i32
+                // B188: the 4-pair walk, identical to the GET form.
                 ; => ways
                 ; cmp r11, [r9]
+                ; mov edx, [r9 + 20]
+                ; je => hit
+                ; cmp r11, [r9 + 8]
+                ; mov edx, [r9 + 16]
+                ; je => hit
+                ; cmp r11, [r9 + 24]
+                ; mov edx, [r9 + 32]
+                ; je => hit
+                ; cmp r11, [r9 + 40]
+                ; mov edx, [r9 + 48]
                 ; je => hit
                 ; add r9, JIT_IC_STRIDE as i32
                 ; dec r8d
@@ -645,7 +656,6 @@ pub(crate) fn emit_ic_probe(
                 ; => hit
                 ; mov r10, [rdi + vals_off]
                 ; mov rcx, [r10 + rcx*8]              // live vals base
-                ; mov edx, [r9 + 20]
                 ; and edx, 0x00FF_FFFF                // slot (low 24)
                 ; mov r10, [rbx + dreg(val)]          // val_bits
                 ; mov [rcx + rdx*8], r10              // vals[slot] = val (COMMIT)
@@ -697,8 +707,20 @@ pub(crate) fn emit_ic_probe(
                 ; bts r11, 32                         // compose (1<<32)|shape
                 ; lea r9, [r14 + ic_off]              // way 0 of this site
                 ; mov r8d, JIT_IC_WAYS as i32
+                // B188: FOUR (pattern, slot) pairs per way — offsets are the
+                // `fill_shape_pair` layout; edx receives the matched slot.
                 ; => ways
                 ; cmp r11, [r9]
+                ; mov edx, [r9 + 20]
+                ; je => hit
+                ; cmp r11, [r9 + 8]
+                ; mov edx, [r9 + 16]
+                ; je => hit
+                ; cmp r11, [r9 + 24]
+                ; mov edx, [r9 + 32]
+                ; je => hit
+                ; cmp r11, [r9 + 40]
+                ; mov edx, [r9 + 48]
                 ; je => hit
                 ; add r9, JIT_IC_STRIDE as i32
                 ; dec r8d
@@ -707,7 +729,6 @@ pub(crate) fn emit_ic_probe(
                 ; => hit
                 ; mov r10, [rdi + vals_off]
                 ; mov rcx, [r10 + rcx*8]              // live vals base
-                ; mov edx, [r9 + 20]
                 ; and edx, 0x00FF_FFFF                // slot (low 24)
                 ; mov rax, [rcx + rdx*8]              // vals[slot] (CALL-FREE)
                 ; mov [rbx + dreg(dst)], rax

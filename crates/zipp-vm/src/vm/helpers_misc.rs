@@ -3240,13 +3240,8 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
                 // append-built literals whose mirror stayed at EMPTY.
                 if crate::codegen::shape_ways_enabled() {
                     vm.heap.refresh_mirror(idx);
-                    if !vm.jit.ic_thrashing(site_idx) {
-                        if let Some(e) = crate::codegen::IcEntry::shape_way(sh, slot) {
-                            vm.jit.set_ic(site_idx, e);
-                        }
-                    } else if crate::codegen::ic_refill_gate_enabled() {
-                        vm.jit.ic_rot_bump(site_idx);
-                    }
+                    // B188: pack into the 4-pair form (32 shapes per site).
+                    vm.jit.fill_shape_pair(site_idx, sh, slot);
                 }
                 return val.bits();
             }
@@ -3726,13 +3721,8 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
         // a shape way serves receivers unknown at fill time.
         if gate == crate::codegen::DirectMissGate::Direct && crate::codegen::shape_ways_enabled() {
             vm.heap.refresh_mirror(idx);
-            if vm.jit.ic_thrashing(site_idx) {
-                if crate::codegen::ic_refill_gate_enabled() {
-                    vm.jit.ic_rot_bump(site_idx);
-                }
-            } else if let Some(e) = crate::codegen::IcEntry::shape_way(shape, slot) {
-                vm.jit.set_ic(site_idx, e);
-            }
+            // B188: pack into the 4-pair form (32 shapes per site).
+            vm.jit.fill_shape_pair(site_idx, shape, slot);
         }
         if gate == crate::codegen::DirectMissGate::Probe {
             let version = vm.heap.version_of(idx);

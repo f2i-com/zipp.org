@@ -2629,27 +2629,6 @@ impl IcEntry {
         })
     }
 
-    /// A SHAPE way (B178), fillable only at a site compiled in the
-    /// direct-miss GET form: `obj_bits` holds `(1 << 32) | shape` — a marker
-    /// pattern no real receiver bits can equal (live heap Values carry the
-    /// 0x7FFD NaN tag in the high word, and empty ways are all-zero) — and
-    /// the probe compares it against the SAME pattern composed from the
-    /// receiver's live shape mirror. `vals_ptr`/`version` are unused (the
-    /// hit reads the live vals mirror; the mirror discipline replaces the
-    /// version guard).
-    pub fn shape_way(shape: u32, slot: u32) -> Option<IcEntry> {
-        if slot > 0x00FF_FFFF || shape == crate::shape::DICT {
-            return None;
-        }
-        Some(IcEntry {
-            obj_bits: (1u64 << 32) | shape as u64,
-            vals_ptr: 0,
-            version: 0,
-            slot_nhops: slot,
-            hops: [(0, 0); JIT_IC_MAX_HOPS],
-        })
-    }
-
     /// A PROTO-CHAIN way: the holder is `hops.len()` (1..=5) hops from the
     /// receiver; every hop is version-guarded.
     pub fn chain(
@@ -4162,6 +4141,68 @@ impl Jit {
         if let Some(r) = self.ic_rot.get_mut(site as usize) {
             *r = r.wrapping_add(1);
         }
+    }
+
+    /// B188: pack a SHAPE PAIR into a direct-form site's ways — four
+    /// `(pattern, slot)` pairs per 64-byte way at the fixed offsets the
+    /// emitted 4-pair probe reads: (pat@0, slot@20), (pat@8, slot@16),
+    /// (pat@24, slot@32), (pat@40, slot@48) — i.e. `obj_bits/slot_nhops`,
+    /// `vals_ptr/version`, `hops[0..2)/hops[1].0`, `hops[2..4)/hops[3].0`.
+    /// Every pattern carries bit 32 (the B178 marker convention), so a zero
+    /// word is FREE and real receiver bits can never collide. Update an
+    /// existing pair for the shape, else claim the first free pair, else
+    /// overwrite round-robin. Direct sites hold ONLY shape pairs, so the
+    /// packing never coexists with identity fields.
+    pub fn fill_shape_pair(&mut self, site: u32, shape: u32, slot: u32) {
+        const PAIR_OFFS: [(usize, usize); 4] = [(0, 20), (8, 16), (24, 32), (40, 48)];
+        if slot > 0x00FF_FFFF || shape == crate::shape::DICT {
+            return;
+        }
+        let pat = (1u64 << 32) | shape as u64;
+        let base = (site as usize).wrapping_mul(JIT_IC_WAYS);
+        let Some(ways) = self.ic_table.get_mut(base..base + JIT_IC_WAYS) else {
+            return;
+        };
+        // The ways as raw bytes: the pair layout is byte-offset addressed on
+        // purpose (the emitted probe reads the same offsets), and `IcEntry`
+        // is `repr(C)` with a compile-checked 64-byte stride.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                ways.as_mut_ptr() as *mut u8,
+                JIT_IC_WAYS * JIT_IC_STRIDE,
+            )
+        };
+        let read_pat = |bytes: &[u8], w: usize, k: usize| {
+            let off = w * JIT_IC_STRIDE + PAIR_OFFS[k].0;
+            u64::from_le_bytes(bytes[off..off + 8].try_into().expect("8 bytes"))
+        };
+        let write_pair = |bytes: &mut [u8], w: usize, k: usize, pat: u64, slot: u32| {
+            let (po, so) = PAIR_OFFS[k];
+            let off = w * JIT_IC_STRIDE;
+            bytes[off + po..off + po + 8].copy_from_slice(&pat.to_le_bytes());
+            bytes[off + so..off + so + 4].copy_from_slice(&slot.to_le_bytes());
+        };
+        let mut free: Option<(usize, usize)> = None;
+        for w in 0..JIT_IC_WAYS {
+            for k in 0..4 {
+                let cur = read_pat(bytes, w, k);
+                if cur == pat {
+                    write_pair(bytes, w, k, pat, slot);
+                    return;
+                }
+                if cur == 0 && free.is_none() {
+                    free = Some((w, k));
+                }
+            }
+        }
+        if let Some((w, k)) = free {
+            write_pair(bytes, w, k, pat, slot);
+            return;
+        }
+        let r = &mut self.ic_rot[site as usize];
+        let n = *r as usize % (JIT_IC_WAYS * 4);
+        write_pair(bytes, n / 4, n % 4, pat, slot);
+        *r = r.wrapping_add(1);
     }
 
     pub fn set_ic(&mut self, site: u32, e: IcEntry) {
