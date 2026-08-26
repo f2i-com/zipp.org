@@ -241,6 +241,20 @@ pub(crate) fn poly_crosscall_enabled() -> bool {
 /// resolves the live closure and live Tier-C entry on every invocation.
 /// `ZIPP_NO_SAME_PROTO_CROSS2=1` restores the generic cross-call helper for a
 /// same-binary A/B.
+pub(crate) fn quick_len_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_QUICK_LEN").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 pub(crate) fn cross3_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -995,6 +1009,7 @@ pub struct HeapHelperAddrs {
     /// Exact rotating same-prototype lexical-arrow/two-argument sibling of
     /// `cross_call`; it shares the same live-resolution and fallback protocol.
     pub cross_call_same_proto2: usize,
+    pub quick_len: usize,
     pub cross3_enter: usize,
     pub window_close: usize,
     pub cross3_unroot: usize,
@@ -1182,6 +1197,7 @@ impl HeapHelperAddrs {
             call_ic: self.call_ic,
             cross_call: self.cross_call,
             cross_call_same_proto2: self.cross_call_same_proto2,
+            quick_len: self.quick_len,
             cross3_enter: self.cross3_enter,
             window_close: self.window_close,
             cross3_unroot: self.cross3_unroot,

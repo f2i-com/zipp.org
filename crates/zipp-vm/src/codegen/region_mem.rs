@@ -1510,6 +1510,34 @@ pub(crate) fn compile_region_mem(
                     acc,
                     site_emit.direct_miss,
                 );
+                // ── B190a: quick `.length` prefix ── Str/Cons/dense-Array
+                // lengths are deliberately uncachable in the IC, so a length
+                // read in a loop CONDITION missed to the FULL property helper
+                // per iteration (~14ns; two-thirds of the nanoid checksum
+                // gap). One tiny helper answers those kinds; the sentinel
+                // falls through to the unchanged miss path (objects with an
+                // own `length`, TypedArrays, Boxed receivers).
+                if quick_len_enabled()
+                    && proto
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|s| s == "length")
+                {
+                    let ql_miss = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, rax                    // obj_bits from the probe
+                        ; mov rax, QWORD heap.quick_len as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => ql_miss
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => cont
+                        ; => ql_miss
+                        ; mov rax, [rbx + dreg(obj)]      // reload for the miss helper
+                    );
+                }
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, rax                        // obj_bits (rax survives the probe)

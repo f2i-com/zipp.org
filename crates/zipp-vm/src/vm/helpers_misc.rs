@@ -2002,6 +2002,50 @@ pub(crate) extern "win64" fn jit_array_push3_pinned(
     1
 }
 
+/// B190a: the QUICK `.length` read — Str/Cons/dense-Array receivers answer
+/// in one match, skipping the full property-miss helper's private-name /
+/// module-ns / shape-memo / key-scan preamble (~14ns per read measured on
+/// the nanoid-class checksum loop; `.length` in a loop CONDITION pays it
+/// per iteration because these lengths are deliberately uncached). The
+/// answers replicate `jit_get_prop_miss`'s own arms exactly: a virtual
+/// (sparse) array length comes from the side table, an `arguments` object
+/// defers (its `length` is an ordinary writable prop), and everything else
+/// — TypedArrays with their intrinsic-proof, Boxed strings, objects with an
+/// own `length` — returns the sentinel and takes the unchanged miss path.
+/// Instance `length` on strings/arrays is EXOTIC OWN data (not a prototype
+/// method), so the B191 shadow protocol does not apply here.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_quick_len(vm: *mut core::ffi::c_void, obj_bits: u64) -> u64 {
+    let v = Value::from_bits(obj_bits);
+    if !v.is_heap() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: read-only view; the running region holds no conflicting borrow.
+    let vm = unsafe { &*(vm as *const Vm) };
+    let idx = v.heap_index();
+    match vm.heap.get(idx) {
+        HeapObj::Str(s) => len_value(s.units()).bits(),
+        HeapObj::Cons { len, .. } => len_value(*len).bits(),
+        HeapObj::Array(items) => {
+            if !vm.arguments_objs.is_empty() && vm.arguments_objs.contains_key(&idx) {
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
+            let n = if vm.array_js_len.is_empty() {
+                items.len()
+            } else {
+                vm.array_js_len
+                    .get(&idx)
+                    .map_or(items.len(), |&n| n as usize)
+            };
+            len_value(n).bits()
+        }
+        _ => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
 /// Win64 helper for a JIT'd `str.charCodeAt(i)` in a region. Returns the
 /// UTF-16 code unit at `i` (Int bits), NaN bits for an out-of-range index, or
 /// `SELF_CALL_DEOPT` for a non-int index / non-flat-string receiver (a rope or

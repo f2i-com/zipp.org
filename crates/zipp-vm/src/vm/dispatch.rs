@@ -8027,6 +8027,7 @@ impl<'p> Vm<'p> {
             call_ic: jit_call_ic as usize,
             cross_call: crate::vm::helpers_misc::jit_cross_call as usize,
             cross_call_same_proto2: crate::vm::helpers_misc::jit_cross_call_same_proto2 as usize,
+            quick_len: crate::vm::helpers_misc::jit_quick_len as usize,
             cross3_enter: crate::vm::helpers_misc::jit_cross3_enter as usize,
             window_close: crate::vm::helpers_misc::jit_window_close as usize,
             cross3_unroot: crate::vm::helpers_misc::jit_cross3_unroot as usize,
