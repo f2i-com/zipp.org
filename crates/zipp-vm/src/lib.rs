@@ -61,6 +61,37 @@ mod compile;
 /// Persistent-VM embedding API, for hosts that keep a script alive across many
 /// re-entries rather than running it once (see the module docs).
 pub mod embed;
+
+/// B187 scouting support: expose the exact object-construction floor to the
+/// `build_floor_micro` bench test without widening any real API. Not for
+/// embedders; hidden from docs.
+#[doc(hidden)]
+pub mod bench_support {
+    use crate::bytecode::StaticKeyPlan;
+    use crate::heap::ObjMap;
+    use crate::value::Value;
+
+    pub fn make_plan(keys: &[&str]) -> StaticKeyPlan {
+        StaticKeyPlan::new(keys.iter().map(|k| k.to_string()).collect())
+    }
+
+    /// One finalized `Box<ObjMap>` exactly as the JIT helper builds it (vals
+    /// copy included); returns a value derived from the box so the optimizer
+    /// keeps the construction. The shape fold mirrors `finalize_shape`.
+    pub fn finalized_box(plan: &StaticKeyPlan, vals: &[u64], salt: u32) -> usize {
+        let data = crate::shape::attr_bits(true, true, true, false);
+        let mut shape = crate::shape::EMPTY;
+        for key in plan.keys() {
+            shape = crate::shape::add(shape, key, data);
+        }
+        let mut v: Vec<Value> = Vec::with_capacity(vals.len());
+        for (i, &bits) in vals.iter().enumerate() {
+            v.push(Value::num((bits ^ (salt as u64 ^ i as u64)) as f64));
+        }
+        let m = Box::new(ObjMap::finalized_from_plan(plan.clone(), v, shape));
+        (m.len() as usize).wrapping_add(m.shape() as usize & 1)
+    }
+}
 mod front;
 pub use front::set_pure_script_goal;
 mod heap;
