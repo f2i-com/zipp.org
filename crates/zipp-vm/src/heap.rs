@@ -4625,66 +4625,49 @@ impl Heap {
     /// `bump_version` must NOT use this).
     #[inline]
     pub fn refresh_mirror(&mut self, idx: u32) {
-        // One pass over the occupant: this runs on EVERY allocation (and
-        // every wholesale replace), and three separate matches were three
-        // tag loads + branch trees on the same slot.
-        let (hot, cell, tv, uv) = match &self.objs[idx as usize] {
-            HeapObj::Object(m) => (
-                HotMirror {
-                    shape: m.shape(),
-                    fid: FID_MIRROR_NONE,
-                    vals: m.vals.as_ptr() as u64,
-                },
-                Value::UNDEFINED.bits(),
-                Value::UNDEFINED.bits(),
-                0,
-            ),
-            HeapObj::Func(f) => (
-                HotMirror {
-                    shape: crate::shape::DICT,
-                    fid: *f,
-                    vals: 0,
-                },
-                Value::UNDEFINED.bits(),
-                Value::UNDEFINED.bits(),
-                0,
-            ),
+        // One pass over the occupant, and — B198 — the cold mirrors
+        // (cell/this/upvals) are written ONLY for the occupant kinds that
+        // set them. The invariant, maintained by induction with
+        // `free_slot`'s matching kind-conditional clears: a cold mirror
+        // field is at its default unless the CURRENT occupant owns it. The
+        // plain-object mass (every literal, every instance) thus touches
+        // one mirror line here instead of four.
+        let hot = match &self.objs[idx as usize] {
+            HeapObj::Object(m) => HotMirror {
+                shape: m.shape(),
+                fid: FID_MIRROR_NONE,
+                vals: m.vals.as_ptr() as u64,
+            },
+            HeapObj::Func(f) => HotMirror {
+                shape: crate::shape::DICT,
+                fid: *f,
+                vals: 0,
+            },
             HeapObj::Closure {
                 func,
                 this_val,
                 upvalues,
                 ..
-            } => (
+            } => {
+                self.this_mirror[idx as usize] = this_val.bits();
+                self.upvals_mirror[idx as usize] = if upvalues.is_empty() {
+                    0
+                } else {
+                    upvalues.as_ptr() as u64
+                };
                 HotMirror {
                     shape: crate::shape::DICT,
                     fid: *func,
                     vals: 0,
-                },
-                Value::UNDEFINED.bits(),
-                this_val.bits(),
-                if upvalues.is_empty() {
-                    0
-                } else {
-                    upvalues.as_ptr() as u64
-                },
-            ),
-            HeapObj::Cell(v) => (
-                HotMirror::CLEAR,
-                v.bits(),
-                Value::UNDEFINED.bits(),
-                0,
-            ),
-            _ => (
-                HotMirror::CLEAR,
-                Value::UNDEFINED.bits(),
-                Value::UNDEFINED.bits(),
-                0,
-            ),
+                }
+            }
+            HeapObj::Cell(v) => {
+                self.cell_vals_mirror[idx as usize] = v.bits();
+                HotMirror::CLEAR
+            }
+            _ => HotMirror::CLEAR,
         };
         self.hot_mirror[idx as usize] = hot;
-        self.cell_vals_mirror[idx as usize] = cell;
-        self.this_mirror[idx as usize] = tv;
-        self.upvals_mirror[idx as usize] = uv;
     }
 
     /// W9: enter a static-pretenure scope (NURSERY_DESIGN.md §4) — until the
@@ -5218,9 +5201,6 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         let was_settled = self.hot_mirror[idx as usize].shape != crate::shape::DICT;
         self.hot_mirror[idx as usize] = HotMirror::CLEAR;
-        self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
-        self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
-        self.upvals_mirror[idx as usize] = 0;
         // B197: the charge cell is touched only under accounting — with it
         // off (the default) every charge is 0 and the replace was a pure
         // extra cache line on the sweep's per-dead path.
@@ -5234,6 +5214,20 @@ impl Heap {
         // here exactly as before. The bookkeeping around it never leaves the
         // mutator.
         let dead = std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN));
+        // B198: clear only the cold mirrors the dying occupant OWNED — the
+        // induction with `refresh_mirror`'s kind-conditional writes keeps
+        // every other slot's cold fields at their defaults already, and the
+        // plain-object sweep mass stops touching those three lines.
+        match &dead {
+            HeapObj::Cell(_) => {
+                self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
+            }
+            HeapObj::Closure { .. } => {
+                self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                self.upvals_mirror[idx as usize] = 0;
+            }
+            _ => {}
+        }
         // A slab-born object's cell goes home FIRST (the courier must never
         // see it — the invariant that keeps the raw base single-owner); the
         // EMPTIED shell then takes the ordinary path below, so the courier
@@ -5479,6 +5473,19 @@ impl Heap {
         self.write_barrier(idx);
         #[cfg_attr(feature = "safe-sandbox", allow(unused_variables))]
         let old = std::mem::replace(&mut self.objs[idx as usize], obj);
+        // B198: a replace can change occupant KIND, so the old occupant's
+        // cold mirrors are cleared here under the same induction free_slot
+        // maintains (refresh below writes the new occupant's own fields).
+        match &old {
+            HeapObj::Cell(_) => {
+                self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
+            }
+            HeapObj::Closure { .. } => {
+                self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+                self.upvals_mirror[idx as usize] = 0;
+            }
+            _ => {}
+        }
         // The OLD occupant is discarded; a slab-born one hands its cell home
         // first (the strip makes the shell's drop cell-blind).
         #[cfg(not(feature = "safe-sandbox"))]
