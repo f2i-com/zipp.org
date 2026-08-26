@@ -944,10 +944,12 @@ impl<'p> Vm<'p> {
         &self,
         func_id: u32,
         exemplar_base: Option<usize>,
-    ) -> crate::codegen::CrossCallPlan {
+    ) -> (crate::codegen::CrossCallPlan, Vec<u32>) {
         let mut plan = crate::codegen::CrossCallPlan::default();
+        // B199: callee fids whose entry was missing at plan time.
+        let mut pending: Vec<u32> = Vec::new();
         if std::env::var_os("ZIPP_NO_CROSSCALL").is_some() {
-            return plan;
+            return (plan, pending);
         }
         let caller = self.func(func_id as usize);
         for (ip, instr) in caller.code.iter().enumerate() {
@@ -1045,12 +1047,13 @@ impl<'p> Vm<'p> {
                 && argc <= 6
                 && (callee.lexical_this || callee.is_strict))
                 .then(|| {
-                    let Some((entry, uninit_mask, json_walk, markdown_inline)) =
+                    let Some((_entry, uninit_mask, json_walk, markdown_inline)) =
                         self.jit.cross_entry(fid)
                     else {
                         if std::env::var_os("ZIPP_JITLOG").is_some() {
                             eprintln!("[cross] fn{func_id}@{ip} CROSS3 decline: no entry yet");
                         }
+                        pending.push(fid);
                         return None;
                     };
                     let reg_count = callee.reg_count.max(1);
@@ -1074,9 +1077,9 @@ impl<'p> Vm<'p> {
                         callee_regs: reg_count,
                         argc,
                         arrow_this: callee.lexical_this,
-                        entry: entry as usize,
+                        mask_gen: self.jit.cross_mask_gen(fid),
                         uninit_mask,
-                        epoch: self.jit.cross_code_epoch,
+                        
                     })
                 })
                 .flatten();
@@ -1161,9 +1164,10 @@ impl<'p> Vm<'p> {
                     {
                         continue;
                     }
-                    let Some((entry, uninit_mask, json_walk, markdown_inline)) =
+                    let Some((_entry, uninit_mask, json_walk, markdown_inline)) =
                         self.jit.cross_entry(fid)
                     else {
+                        pending.push(fid);
                         continue;
                     };
                     let reg_count = callee.reg_count.max(1);
@@ -1181,9 +1185,8 @@ impl<'p> Vm<'p> {
                         callee_regs: reg_count,
                         argc,
                         arrow_this: callee.lexical_this,
-                        entry: entry as usize,
+                        mask_gen: self.jit.cross_mask_gen(fid),
                         uninit_mask,
-                        epoch: self.jit.cross_code_epoch,
                     };
                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                         eprintln!(
@@ -1197,7 +1200,7 @@ impl<'p> Vm<'p> {
             }
         }
 
-        plan
+        (plan, pending)
     }
 
     /// Recognise the caller half of an adjacent

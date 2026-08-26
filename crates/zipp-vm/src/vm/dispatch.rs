@@ -339,7 +339,9 @@ impl<'p> Vm<'p> {
                                     rustc_hash::FxHashMap::default()
                                 };
                             // Tier-C cross-call plan (B83) — also built before &mut self.jit.
-                            let cross_plan = self.build_cross_call_plan(func_id, Some(base));
+                            let (cross_plan, cross_pending) =
+                                self.build_cross_call_plan(func_id, Some(base));
+                            self.jit.note_cross_pending(func_id, &cross_pending);
                             self.jit.compile(
                                 func_id,
                                 proto_ref,
@@ -4172,7 +4174,23 @@ impl<'p> Vm<'p> {
                                 // copy of a cross-tier fact is the whole point of B66.
                                 // Tier-C cross-call plan (B83) — the region's Call
                                 // sites get the native→native attempt too.
-                                let cross_plan = self.build_cross_call_plan(func_id, Some(base));
+                                let (cross_plan, cross_pending) =
+                                    self.build_cross_call_plan(func_id, Some(base));
+                                // B199: a "no entry yet" decline at a REGION is
+                                // deferred (capped) instead of baked — the callee
+                                // is being called from this very loop, so its
+                                // entry lands within a threshold window and the
+                                // region then compiles WITH the lane. An evicted
+                                // live region cannot recompile mid-run, so
+                                // prevention beats the whole-fn retry here.
+                                if !cross_pending.is_empty()
+                                    && self.jit.cross_defer_allowed(func_id, t as u32)
+                                {
+                                    self.jit.region_defer(func_id, t as u32);
+                                    ip = t;
+                                    continue;
+                                }
+                                self.jit.note_cross_pending(func_id, &cross_pending);
                                 self.jit.compile_region(
                                     func_id,
                                     proto_ref,

@@ -3775,9 +3775,8 @@ pub(crate) fn emit_cross3_call(
             fid: plan.fid,
             callee_regs: plan.callee_regs,
             argc: plan.argc,
-            entry: plan.entry,
+            mask_gen: plan.mask_gen,
             uninit_mask: plan.uninit_mask,
-            epoch: plan.epoch,
             this_src,
             arg_base,
             dst,
@@ -3858,9 +3857,8 @@ pub(crate) fn emit_cross3_method_call(
             fid: plan.fid,
             callee_regs: plan.callee_regs,
             argc: plan.argc,
-            entry: plan.entry,
+            mask_gen: plan.mask_gen,
             uninit_mask: plan.uninit_mask,
-            epoch: plan.epoch,
             this_src,
             arg_base,
             dst,
@@ -3881,9 +3879,8 @@ pub(crate) struct Cross3Invoke {
     pub fid: u32,
     pub callee_regs: u16,
     pub argc: u16,
-    pub entry: usize,
     pub uninit_mask: u64,
-    pub epoch: u32,
+    pub mask_gen: u32,
     pub this_src: Cross3This,
     pub arg_base: u16,
     pub dst: u16,
@@ -3916,7 +3913,7 @@ fn emit_cross3_invoke(
     ta_refetch: Option<(usize, &crate::codegen::TaPinPlan)>,
 ) {
     use crate::vm::host_api::{
-        JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_EPOCH_OFFSET,
+        JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_TABLE_RAW_OFFSET,
         JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_GC_REQUESTED_OFFSET, JIT_GC_STRESS_OFFSET,
         JIT_GLOBAL_ROUTE_EPOCH_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
         JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_THIS_MIRROR_RAW_OFFSET,
@@ -3939,7 +3936,17 @@ fn emit_cross3_invoke(
         ; jne => fb
         ; cmp DWORD [rdi + depth], crate::vm::JIT_REGION_CALL_MAX as i32
         ; jae => fb
-        ; cmp DWORD [rdi + JIT_CROSS_EPOCH_OFFSET as i32], iv.epoch as i32
+        // B199: the live entry table replaces the baked-entry/global-epoch
+        // pair — a null entry routes to the helper (and RESUMES if a
+        // same-mask recompile re-sets it); the mask generation proves the
+        // baked zeroing mask still matches the live callee.
+        ; mov r11, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
+        ; mov r11, [r11 + (iv.fid as i32) * 16]
+        ; test r11, r11
+        ; jz => fb
+        ; mov [rsp + iv.c3 + 56], r11
+        ; mov r11, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
+        ; cmp DWORD [r11 + (iv.fid as i32) * 16 + 8], iv.mask_gen as i32
         ; jne => fb
         ; cmp DWORD [rdi + JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], 0
         ; jne => fb
@@ -4025,7 +4032,7 @@ fn emit_cross3_invoke(
         ; mov rcx, r9
         ; lea rdx, [rsp + c3 + 40]
         ; mov r8, rdi
-        ; mov rax, QWORD iv.entry as i64
+        ; mov rax, [rsp + iv.c3 + 56]
         ; call rax
         ; mov [rsp + c3 + 32], rax
         // -- restore the caller activation inline; pop the root-stack

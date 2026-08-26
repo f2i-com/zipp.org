@@ -283,6 +283,22 @@ pub(crate) fn cross3m_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_CROSS_RETRY=1` keeps compile-order "no entry yet" declines
+/// permanent (the pre-B199 behavior) — the single-binary A/B for the retry.
+pub(crate) fn cross_retry_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS_RETRY").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub(crate) fn cross3_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -624,9 +640,19 @@ pub struct Cross3MethodPlan {
     pub callee_regs: u16,
     pub argc: u16,
     pub arrow_this: bool,
-    pub entry: usize,
+    pub mask_gen: u32,
     pub uninit_mask: u64,
-    pub epoch: u32,
+}
+
+/// B199: one live cross-entry record — `entry` (0 = none) and the mask
+/// generation the emitted lanes guard. `#[repr(C)]`, 16 bytes, addressed
+/// as `table_base + fid*16` (constant displacement — the fid is baked).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CrossEntryRec {
+    pub entry: u64,
+    pub mask_gen: u32,
+    pub _pad: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -639,11 +665,11 @@ pub struct SameProtoCross3Plan {
     /// `this` policy: true = arrow (captured `this` via the heap's
     /// this-mirror); false = strict plain function (`this = undefined`).
     pub arrow_this: bool,
-    /// Baked native entry + the may-read-before-write register mask, both
-    /// valid only while `epoch` matches `Jit::cross_code_epoch`.
-    pub entry: usize,
+    /// The may-read-before-write register mask, valid while the callee's
+    /// live `CrossEntryRec::mask_gen` equals `mask_gen`; the entry itself
+    /// is loaded from the live table per call (B199), never baked.
+    pub mask_gen: u32,
     pub uninit_mask: u64,
-    pub epoch: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2866,6 +2892,29 @@ pub struct Jit {
     /// otherwise tax each call to a never-compiled function.
     fn_state: Vec<u8>,
     regions: FxHashMap<(u32, u32), Region>,
+    /// B199: the JIT-facing live cross-entry table, parallel to
+    /// `cross_entries` — one 16-byte record per fid the emitted lanes read
+    /// THROUGH the VM on every call (`entry` null routes to the helper; a
+    /// recompiled callee is picked up with no eviction). `mask_gen` bumps
+    /// only when the callee's uninit mask CHANGES on a re-set, so the baked
+    /// mask a lane zeroes with stays provably current across same-shape
+    /// recompiles.
+    pub(crate) cross_table: Vec<CrossEntryRec>,
+    /// Raw base of `cross_table`, re-derived through the VM per access and
+    /// re-cached here on growth (the mirror discipline).
+    pub(crate) cross_table_raw: u64,
+    /// B199 retry: callers whose plan declined a site for "no entry yet",
+    /// keyed by the missing callee. Drained at that callee's first
+    /// `set_cross_entry`: the callers' compiled artifacts are parked and
+    /// their counters reset so the recompile bakes the lane. With the
+    /// live-table lanes the transient entry clear self-heals (null routes
+    /// to the helper; the same-mask re-set resumes dependents), so the
+    /// retry converges without stranding.
+    cross_pending: FxHashMap<u32, Vec<u32>>,
+    /// B199: deferrals spent per region key waiting on a missing callee
+    /// entry — capped so a callee that never compiles (blacklisted) cannot
+    /// keep a region interpreting forever.
+    cross_defer_spent: FxHashMap<(u32, u32), u16>,
     region_counts: FxHashMap<(u32, u32), u32>,
     region_blacklist: FxHashSet<(u32, u32)>,
     /// Loop headers where the INTEGER path was tried and deoptimised; the next
@@ -3164,12 +3213,120 @@ impl Jit {
         if self.cross_wide_uninit.len() <= i {
             self.cross_wide_uninit.resize(i + 1, None);
         }
+        // B199: the mask generation bumps only when the mask CHANGES — a
+        // same-shape recompile keeps every dependent lane's baked mask
+        // valid, which is what lets a re-set entry resume those lanes
+        // instead of stranding them.
+        let prev_mask = self.cross_entries[i].1;
         self.cross_entries[i] = (entry, uninit_mask, json_walk, markdown_inline);
         self.cross_wide_uninit[i] = wide_uninit_mask;
+        if self.cross_table.len() <= i {
+            self.cross_table.resize(i + 1, CrossEntryRec::default());
+            self.cross_table_raw = self.cross_table.as_ptr() as u64;
+        }
+        if prev_mask != uninit_mask {
+            self.cross_table[i].mask_gen = self.cross_table[i].mask_gen.wrapping_add(1);
+        }
+        self.cross_table[i].entry = entry as u64;
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
+        if let Some(callers) = self.cross_pending.remove(&func_id) {
+            for caller in callers {
+                self.evict_for_cross_retry(caller);
+            }
+        }
+    }
+
+    /// B199: whether the region at (`func_id`, `entry_ip`) may defer its
+    /// compile one more back-edge while a callee entry is missing.
+    pub fn cross_defer_allowed(&mut self, func_id: u32, entry_ip: u32) -> bool {
+        if !cross_retry_enabled() {
+            return false;
+        }
+        // One extra threshold-window: both compile thresholds are 8, so a
+        // callee heated by this very loop lands its entry within a couple
+        // of back-edges; a callee that never compiles costs the region at
+        // most 8 deferred iterations before it compiles helper-side.
+        let c = self.cross_defer_spent.entry((func_id, entry_ip)).or_insert(0);
+        if *c >= 8 {
+            return false;
+        }
+        *c += 1;
+        true
+    }
+
+    /// B199 retry: record that `caller`'s plan declined sites because these
+    /// `callees` had no cross entry yet. Bounded and deduplicated.
+    pub fn note_cross_pending(&mut self, caller: u32, callees: &[u32]) {
+        if !cross_retry_enabled() {
+            return;
+        }
+        for &callee in callees {
+            // A SELF-recursive site always sees its own entry missing (the
+            // plan builds before set_cross_entry) — recording it would evict
+            // the fn at its own install, forever. Self-calls have their own
+            // lane (jit_self_call_at); skip them here.
+            if callee == caller {
+                continue;
+            }
+            let v = self.cross_pending.entry(callee).or_default();
+            if v.len() < 16 && !v.contains(&caller) {
+                v.push(caller);
+            }
+        }
+    }
+
+    /// B199 retry: park every compiled artifact of `fid` (regions + whole
+    /// fn) and reset its counters so hotness re-triggers — the yield/deopt
+    /// retire discipline, NO blacklists.
+    fn evict_for_cross_retry(&mut self, fid: u32) {
+        let keys: Vec<(u32, u32)> = self
+            .regions
+            .keys()
+            .filter(|k| k.0 == fid)
+            .copied()
+            .collect();
+        for key in keys {
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!(
+                    "[cross] region fn{} [{}] evicted for cross-entry retry",
+                    key.0, key.1
+                );
+            }
+            if let Some(r) = self.regions.remove(&key) {
+                self.note_reg_region_removed(key.0, &r);
+                self.retired.push(r);
+            }
+            self.region_counts.remove(&key);
+        }
+        if let Some(f) = self.compiled.remove(&fid) {
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!("[cross] Tier C fn{fid} evicted for cross-entry retry");
+            }
+            self.retired_fns.push(f);
+            self.counts.remove(&fid);
+            self.set_fn_state(fid, FN_COLD);
+            self.clear_cross_entry(fid);
+            if self.self_cache.is_some_and(|(id, _)| id == fid) {
+                self.self_cache = None;
+            }
+        }
+    }
+
+    /// B199: the live mask generation for `fid` (0 for a fid the table has
+    /// never seen — consistent with what the first `set_cross_entry` keeps
+    /// when the mask does not change).
+    pub fn cross_mask_gen(&self, fid: u32) -> u32 {
+        self.cross_table
+            .get(fid as usize)
+            .map_or(0, |r| r.mask_gen)
     }
 
     fn clear_cross_entry(&mut self, func_id: u32) {
+        if let Some(r) = self.cross_table.get_mut(func_id as usize) {
+            // Null entry: dependent lanes route to the helper (graceful)
+            // and RESUME when a same-mask recompile re-sets it.
+            r.entry = 0;
+        }
         if let Some(p) = self.cross_entries.get_mut(func_id as usize) {
             *p = (std::ptr::null(), u64::MAX, None, None);
         }

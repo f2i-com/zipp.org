@@ -120,10 +120,20 @@ pub(crate) const JIT_GC_REQUESTED_OFFSET: usize = core::mem::offset_of!(Vm<'stat
     + core::mem::offset_of!(crate::heap::Heap, gc_requested);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_GC_STRESS_OFFSET: usize = core::mem::offset_of!(Vm<'static>, gc_stress);
-/// B189b baked-entry validity guard (see `Jit::cross_code_epoch`).
+/// B199: raw base of the live cross-entry table, derived through the VM per
+/// access (growth re-caches it). Records are 16 bytes: entry @+0 (0 = none),
+/// mask_gen @+8 — the lane addresses `[base + fid*16 (+8)]` with the fid a
+/// baked constant displacement.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const JIT_CROSS_EPOCH_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
-    + core::mem::offset_of!(crate::codegen::Jit, cross_code_epoch);
+pub(crate) const JIT_CROSS_TABLE_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
+    + core::mem::offset_of!(crate::codegen::Jit, cross_table_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    use crate::codegen::CrossEntryRec as R;
+    assert!(core::mem::offset_of!(R, entry) == 0);
+    assert!(core::mem::offset_of!(R, mask_gen) == 8);
+    assert!(core::mem::size_of::<R>() == 16);
+};
 
 /// VM-relative byte offsets of the three call-environment blocker bytes
 /// (B189): each is a [`crate::vm::JitGuardedMap`]'s `nonempty_raw`. The
