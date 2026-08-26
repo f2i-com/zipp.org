@@ -31,9 +31,17 @@ mkdir -p "$PGODIR"
 echo "== stage 1/4: instrumented build =="
 RUSTFLAGS="-Cprofile-generate=$PGODIR" cargo build --release --target "$TRIPLE"
 
-echo "== stage 2/4: training (13 real + 6 micro benches) =="
+echo "== stage 2/4: training (13 real + hostile scripts + 6 micro benches) =="
 BIN="target/$TRIPLE/release/zipp.exe"
 for f in bench/real/*.js; do "$BIN" js "$f" > /dev/null 2>&1; done
+# The hostile corpus became a first-class capture target with its own README
+# table; untrained, its helper-heavy paths (cross-call enter/finish, method-IC
+# megamorphic fallbacks) get whatever layout the retained profile implies, and
+# the 6cbf669 retrain measured that luck at +43% on calls-closures (PGO 100ms
+# vs 72.9 with the lane latched off, vs 71.4 default non-PGO — same source).
+# Scripts only: the two module rows are far under parity and `js` covers the
+# regressed class.
+for f in bench/hostile/*/*.js; do "$BIN" js "$f" > /dev/null 2>&1; done
 for f in bench/fib.js bench/loop.js bench/array.js bench/string.js bench/object.js bench/sort.js; do
   "$BIN" js "$f" > /dev/null 2>&1
 done
