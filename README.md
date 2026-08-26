@@ -93,12 +93,12 @@ On 2026-08-25 the engine took a deliberate security-hardening turn (sandbox
 metering, allocation/iteration ceilings, a hardened allocator build — see
 [SECURITY.md](SECURITY.md)); some of that protection is paid for in hot-path
 time, and the numbers below are the honest post-hardening state, measured on
-the definitive clean PGO capture of `d990d73`.
+the definitive clean PGO capture of `c5ffb5b`.
 
 | | |
 |---|---|
-| **Conformance** | **99.991% of test262** — 95,933 of 95,942 executions on this capture's binary: the six historical expected failures plus three module-code failures that arrived with the security hardening (they reproduce on the pristine hardening commit; ledger B181) — zero from the performance waves |
-| **Performance** | **all-13 geomean 0.69× Node** [0.685, 0.693]; fastest engine on 7 of 13 rows; retained-ten **0.98×** Node |
+| **Conformance** | **99.991% of test262** — 95,933 of 95,942 executions on this capture's binary: the six historical expected failures plus three module-code failures that arrived with the security hardening (they reproduce on the pristine hardening commit; ledger B181) — zero from the performance waves, and the waves' full sweeps have twice CAUGHT wrong-answer classes before landing (B181, and B189a's ctor-receiver find below) |
+| **Performance** | **all-13 geomean 0.70× Node** [0.701, 0.707]; fastest engine on 6 of 13 rows; retained-ten **1.00×** Node [0.997, 1.006] |
 
 ### Speed vs Node, Bun and Deno
 
@@ -106,32 +106,37 @@ Cold wall time including process launch, 21 paired runs per row with
 deterministically shuffled engine and benchmark order. Bold time = fastest
 engine; bold ratio = zipp beats Node. Every output is byte-identical across all
 four engines.
-Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `d990d73` (PGO build).
+Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `c5ffb5b` (PGO build).
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| map-set-heavy | 589ms | 743ms | 1049ms | **560ms** | **0.92×** |
-| typedarray-math | 202ms | 909ms | 137ms | **134ms** | **0.67×** |
-| class-prototype-hot | 296ms | 334ms | 293ms | **237ms** | **0.80×** |
-| parse-large-js | 271ms | **230ms** | 253ms | 325ms | 1.20× |
-| async-promise-chain | 333ms | 370ms | **326ms** | 332ms | **1.00×** |
-| json-large | 258ms | **194ms** | 277ms | 319ms | 1.24× |
-| markdown-render | 270ms | **211ms** | 276ms | 265ms | **0.99×** |
-| regex-log-scan | 455ms | 567ms | **421ms** | 537ms | 1.18× |
-| sparse-array | 81ms | 103ms | 93ms | **74ms** | **0.91×** |
-| polymorphic-objects | 326ms | 333ms | **302ms** | 332ms | 1.02× |
-| **zipp / engine median geomean** | **0.70×** | **0.59×** | **0.68×** | — | |
+| map-set-heavy | **578ms** | 717ms | 1017ms | 609ms | 1.06× |
+| typedarray-math | 203ms | 912ms | 136ms | **135ms** | **0.67×** |
+| class-prototype-hot | 297ms | 335ms | 292ms | **238ms** | **0.80×** |
+| parse-large-js | 271ms | **231ms** | 254ms | 331ms | 1.22× |
+| async-promise-chain | 332ms | 369ms | **324ms** | 372ms | 1.12× |
+| json-large | 257ms | **192ms** | 274ms | 309ms | 1.20× |
+| markdown-render | 269ms | **210ms** | 288ms | 254ms | **0.95×** |
+| regex-log-scan | 449ms | 562ms | **426ms** | 538ms | 1.19× |
+| sparse-array | 81ms | 102ms | 94ms | **74ms** | **0.92×** |
+| polymorphic-objects | 325ms | 333ms | **303ms** | 343ms | 1.05× |
+| **zipp / engine median geomean** | **0.70×** | **0.60×** | **0.69×** | — | |
 
-The paired zipp/Node result across all 13 rows is **0.6888× [0.685, 0.693]**;
-the retained-ten headline is **0.9785× [0.975, 0.986]**. Zipp remains ahead of
-every engine on the all-row geomean (0.69× Node, 0.59× Bun, 0.68× Deno) on the
-strength of the diagnostics and its startup, while four rows currently trail
-Node (json-large 1.24×, parse-large-js 1.20×, regex-log-scan 1.18×,
-polymorphic-objects 1.02×). map-set-heavy — behind after the hardening —
-was recovered to **0.92×** by memoizing the hardened collection-intrinsic
-proof under version+value guards and extending the native mutate lane
-(B183); its remaining allocator cost is absorbed by the same trade the
-paragraph below describes.
+The paired zipp/Node result across all 13 rows is **0.7030× [0.701, 0.707]**;
+the retained-ten headline is **1.0007× [0.997, 1.006]** — statistically at
+parity. Zipp remains ahead of every engine on the all-row geomean (0.70×
+Node, 0.60× Bun, 0.69× Deno) on the strength of the diagnostics and its
+startup, while six rows trail Node on this capture (parse-large-js 1.22×,
+json-large 1.20×, regex-log-scan 1.19×, async-promise-chain 1.12×,
+map-set-heavy 1.06×, polymorphic-objects 1.05×). Two of those movements are
+the series' documented **PGO-retrain variance**, not code: the previous
+capture (`d990d73`) was a favourable retrain on several rows — its async
+1.00×/map-set 0.92× read 1.12×/1.06× here while the same rows' one-binary
+mechanism A/Bs were null across the intervening waves, and the three-capture
+absolute series (`1b4af1d` → `d990d73` → `c5ffb5b`) shows the same ±5-7%
+retrain band on the hostile corpus' react/router rows. json/regex remain
+purely the hardened-allocator trade (secure-off measures parity; ledger
+B182), and parse-large-js is the ongoing boxed-tier campaign.
 
 **Where those five rows went.** The previous capture (`cc0d557`, pre-hardening)
 measured 13/13 fastest and retained-ten 0.786×. The hardening commit
@@ -154,7 +159,7 @@ margin — no snapshot to load:
 
 | zipp | node | deno | bun |
 |---|---|---|---|
-| **9.0ms** | 30.3ms | 49.1ms | 57.4ms |
+| **9.3ms** | 30.4ms | 49.2ms | 57.6ms |
 
 A long-running server would amortize that away; a CLI tool would not.
 
@@ -166,9 +171,9 @@ comparability; zipp is fastest on all three:
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| sparse-array-v2 | 170ms | 369ms | 148ms | **97ms** | **0.57×** |
-| polymorphic-objects-v2 | 82ms | 91ms | 96ms | **30ms** | **0.37×** |
-| property-ic-shapes | 262ms | 160ms | 278ms | **12ms** | **0.05×** |
+| sparse-array-v2 | 170ms | 369ms | 149ms | **98ms** | **0.57×** |
+| polymorphic-objects-v2 | 82ms | 92ms | 96ms | **30ms** | **0.37×** |
+| property-ic-shapes | 262ms | 161ms | 277ms | **13ms** | **0.05×** |
 
 The wins come from guarded, exact-shape stream and reducer paths plus the new
 shape-keyed native ways described below. They are strong evidence for these
@@ -188,19 +193,24 @@ npm source.
 Hostile results are never folded into the retained-ten headline. They are the
 generalisation gate, and Zipp does **not** yet claim Node parity on that
 corpus. The current publishable capture
-([`w61_capture_d990d73_pgo`](bench/hostile/w61_capture_d990d73_pgo_2026-08-26.json),
+([`head_clean_c5ffb5b_pgo`](bench/hostile/head_clean_c5ffb5b_pgo_2026-08-26.json),
 full corpus, 15 counterbalanced repetitions, exact on all 17 rows) measures
-**1.1076× cold ordinary geomean** [1.101, 1.115] — the best full-corpus result recorded, and
-it now carries the full security hardening that the earlier 1.28×-era
-checkpoints did not.
+**1.1112× cold ordinary geomean** [1.104, 1.117] — statistically level with
+the previous capture's 1.1076 [1.101, 1.115] overall, with large opposing
+per-row movements underneath: megamorphic shapes 2.48× → **2.03×** (the
+four-pair shape ways, B188), mutable closures 1.93× → **1.63×** (the B189
+closure campaign below), surviving allocation at its series-best absolute —
+against the react/router rows returning to their pre-`d990d73` levels
+(retrain variance; the mechanism A/Bs for the intervening waves were wins or
+null on those exact rows).
 
-Nine rows beat or sit within 2% of Node cold: ephemeral allocation 0.36×,
-modules 0.40×, throw/catch 0.45×, baseline calls 0.46×, stable numeric locals
-0.47×, async burst 0.66×, bytecode VM 0.91×, branch control 0.98×, sustained
-async 1.02×. The remaining gaps are surviving allocation 4.13×, megamorphic
-shapes 2.53×, vendored NanoID 2.34×, React-shaped reconciliation 2.24×,
-stable shapes 2.09×, the warm router 2.05×, mutable closures 1.94×, and mixed
-locals 1.52×.
+Eight rows beat or sit within 3% of Node cold: ephemeral allocation 0.37×,
+modules 0.41×, throw/catch 0.44×, baseline calls 0.46×, stable numeric locals
+0.47×, async burst 0.71×, bytecode VM 0.93×, branch control 1.03×. The
+remaining gaps are surviving allocation 3.82×, React-shaped reconciliation
+2.47×, vendored NanoID 2.39×, the warm router 2.17×, stable shapes 2.14×,
+megamorphic shapes 2.03×, mutable closures 1.63×, mixed locals 1.59×, and
+sustained async 1.10×.
 
 **Shape-keyed native ways shipped.** An earlier shape-way experiment (B152)
 was reverted after independent review found exotic-shape collisions and
@@ -229,6 +239,22 @@ React-shaped row, and the full-sweep failure list is byte-identical to the
 baseline. Three sloppy-mode module-code test262 failures that reproduce on
 the pristine hardening commit (before any performance work) are recorded in
 the ledger for their own investigation.
+
+**The closure campaign (B189).** New per-reason cross-call decline counters
+showed the mutable-closures row's floor was never dispatch: a B50-era
+admission rule blacklisted every tiny capturing closure from the native
+tier, so eight million calls per run fell back to interpreter frames. The
+rule's price assumption was removed on both ends — a captured read is now
+three emitted loads through a write-through cell-value mirror, and the
+same-prototype cross call itself is emitted (identity-free fid guard, so
+sixteen rotating closures of one function stay monomorphic; window and
+completion kept in Rust helpers; every baked assumption revalidated per
+call). Mutable closures moved 1.93× → 1.63× across the two waves. The
+admission widening also EXPOSED a pre-existing wrong-answer class the full
+test262 sweep caught before landing: the JIT property walks defaulted a
+ctor-map receiver's prototype to `%Object.prototype%`, so a hot
+`Function.arguments` read answered `undefined` instead of throwing — fixed
+fail-closed and pinned by a regression suite (B189a in the ledger).
 
 ---
 
