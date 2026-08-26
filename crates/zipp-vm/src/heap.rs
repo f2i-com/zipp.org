@@ -4568,25 +4568,42 @@ impl Heap {
     /// `bump_version` must NOT use this).
     #[inline]
     pub fn refresh_mirror(&mut self, idx: u32) {
-        let (sh, vp, fid) = match &self.objs[idx as usize] {
-            HeapObj::Object(m) => (m.shape(), m.vals.as_ptr() as u64, FID_MIRROR_NONE),
-            HeapObj::Func(f) => (crate::shape::DICT, 0, *f),
-            HeapObj::Closure { func, .. } => (crate::shape::DICT, 0, *func),
-            _ => (crate::shape::DICT, 0, FID_MIRROR_NONE),
-        };
-        self.hot_mirror[idx as usize] = HotMirror {
-            shape: sh,
-            fid,
-            vals: vp,
-        };
-        self.cell_vals_mirror[idx as usize] = match &self.objs[idx as usize] {
-            HeapObj::Cell(v) => v.bits(),
-            _ => Value::UNDEFINED.bits(),
-        };
-        let (tv, uv) = match &self.objs[idx as usize] {
+        // One pass over the occupant: this runs on EVERY allocation (and
+        // every wholesale replace), and three separate matches were three
+        // tag loads + branch trees on the same slot.
+        let (hot, cell, tv, uv) = match &self.objs[idx as usize] {
+            HeapObj::Object(m) => (
+                HotMirror {
+                    shape: m.shape(),
+                    fid: FID_MIRROR_NONE,
+                    vals: m.vals.as_ptr() as u64,
+                },
+                Value::UNDEFINED.bits(),
+                Value::UNDEFINED.bits(),
+                0,
+            ),
+            HeapObj::Func(f) => (
+                HotMirror {
+                    shape: crate::shape::DICT,
+                    fid: *f,
+                    vals: 0,
+                },
+                Value::UNDEFINED.bits(),
+                Value::UNDEFINED.bits(),
+                0,
+            ),
             HeapObj::Closure {
-                this_val, upvalues, ..
+                func,
+                this_val,
+                upvalues,
+                ..
             } => (
+                HotMirror {
+                    shape: crate::shape::DICT,
+                    fid: *func,
+                    vals: 0,
+                },
+                Value::UNDEFINED.bits(),
                 this_val.bits(),
                 if upvalues.is_empty() {
                     0
@@ -4594,8 +4611,21 @@ impl Heap {
                     upvalues.as_ptr() as u64
                 },
             ),
-            _ => (Value::UNDEFINED.bits(), 0),
+            HeapObj::Cell(v) => (
+                HotMirror::CLEAR,
+                v.bits(),
+                Value::UNDEFINED.bits(),
+                0,
+            ),
+            _ => (
+                HotMirror::CLEAR,
+                Value::UNDEFINED.bits(),
+                Value::UNDEFINED.bits(),
+                0,
+            ),
         };
+        self.hot_mirror[idx as usize] = hot;
+        self.cell_vals_mirror[idx as usize] = cell;
         self.this_mirror[idx as usize] = tv;
         self.upvals_mirror[idx as usize] = uv;
     }
@@ -6957,5 +6987,40 @@ pub fn bench_floor_decompose(
         keep = keep.wrapping_add(b.len());
     }
     lines.push(format!("pooled-box+slab: {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+
+    // (f) the ENGINE path on a real heap: alloc_finalized + free_slot per
+    // iteration (steady-state slot reuse, mirrors, young log, pool), minus
+    // GC (freed by hand each iteration, so no collection ever triggers).
+    let mut h = Heap::new();
+    let t = Instant::now();
+    let mut keep = 0usize;
+    for i in 0..n {
+        let mut buf = [Value::UNDEFINED; 4];
+        for (j, &bits) in vals.iter().enumerate() {
+            buf[j] = Value::num((bits ^ (i as u64 ^ j as u64)) as f64);
+        }
+        let idx = h.alloc_finalized(plan.clone(), &buf[..vals.len()], shape);
+        keep = keep.wrapping_add(idx as usize & 7);
+        h.free_slot(idx);
+    }
+    lines.push(format!("engine alloc+free: {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+
+    // (g) the same engine round-trip with the recycle pool serving (the
+    // refill flag forced, as inside a minor sweep) — the pooled steady state
+    // the B194 sweep discipline produces on churn workloads.
+    let mut h = Heap::new();
+    h.obj_pool_refill = true;
+    let t = Instant::now();
+    let mut keep = 0usize;
+    for i in 0..n {
+        let mut buf = [Value::UNDEFINED; 4];
+        for (j, &bits) in vals.iter().enumerate() {
+            buf[j] = Value::num((bits ^ (i as u64 ^ j as u64)) as f64);
+        }
+        let idx = h.alloc_finalized(plan.clone(), &buf[..vals.len()], shape);
+        keep = keep.wrapping_add(idx as usize & 7);
+        h.free_slot(idx);
+    }
+    lines.push(format!("engine pooled alloc+free: {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
     lines
 }
