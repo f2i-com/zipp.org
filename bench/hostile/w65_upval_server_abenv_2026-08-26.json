@@ -1,0 +1,961 @@
+{
+  "schema_version": 2,
+  "created_utc": "2026-08-26T06:14:23.209483+00:00",
+  "git_commit": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31",
+  "workspace_source": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31",
+  "engine_source_before": {
+    "old": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e",
+    "new": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e"
+  },
+  "engine_source_after": {
+    "old": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e",
+    "new": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e"
+  },
+  "engine_binary_sha_before": {
+    "old": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e",
+    "new": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e"
+  },
+  "engine_binary_sha_after": {
+    "old": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e",
+    "new": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e"
+  },
+  "publishable": false,
+  "provenance_reasons": [
+    "old: built from a DIRTY tree (fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e); the commit it names is the parent it was based on, not the code that ran",
+    "new: built from a DIRTY tree (fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e); the commit it names is the parent it was based on, not the code that ran"
+  ],
+  "engine_drift": [],
+  "harness": {
+    "bench_py_sha256": "1fd21925127036e95549ea1ca055bbbc6aad963029c942bb35e84a68f52619a5",
+    "run_real_sh_sha256": "c74f4c9f8fb862ce62b023b31832604fd8ff896bb73756012980c709875100ea"
+  },
+  "bench_input_sha256": {
+    "warm-router": "bb7340019f893989309a5ca074cfa55ce804abdb0b1904473a5a071f37ae7f58"
+  },
+  "headline_benches": [],
+  "diagnostic_benches": [],
+  "unclassified_benches": [
+    "warm-router"
+  ],
+  "row_set_summaries": {
+    "all_measured": {
+      "benches": [
+        "warm-router"
+      ],
+      "geomean_paired_ratio": 0.9927996412813642,
+      "ci95": [
+        0.9824904494464405,
+        1.0016580663478736
+      ]
+    }
+  },
+  "seed": 1511464998,
+  "reps": 15,
+  "metric": "cold",
+  "report_mode": "modern",
+  "headline_metric": "cold",
+  "timeout_s": 300.0,
+  "bootstrap_samples": 10000,
+  "benches": [
+    "warm-router"
+  ],
+  "bench_dir": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\server",
+  "baseline": "old",
+  "engines": [
+    {
+      "name": "old",
+      "argv": [
+        "target/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7537664,
+      "mtime_ns": 1787724068839751700,
+      "sha256": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e",
+        "commit": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31",
+        "dirty": true,
+        "diff_digest": "6e2ddb367f63368e",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {
+        "ZIPP_NO_TIERC_UPVAL_INLINE": "1",
+        "ZIPP_TIERC_UPVAL_MIN": "12"
+      }
+    },
+    {
+      "name": "new",
+      "argv": [
+        "target/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7537664,
+      "mtime_ns": 1787724068839751700,
+      "sha256": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e",
+        "commit": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31",
+        "dirty": true,
+        "diff_digest": "6e2ddb367f63368e",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {}
+    }
+  ],
+  "host": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "python": "3.11.6",
+    "power_mode": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "environment": {},
+  "schedule": [
+    {
+      "rep": 0,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 1,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 2,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 3,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 4,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 5,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 6,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 7,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 8,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 9,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 10,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 11,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 12,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 13,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 14,
+      "bench_order": [
+        "warm-router"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "rep": 0,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.009475500090047717,
+      "cold_s": 0.1174295999808237,
+      "adjusted_s": 0.10795409989077598,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.014460099977441132,
+      "cold_s": 0.11959769995883107,
+      "adjusted_s": 0.10513759998138994,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.00916230003349483,
+      "cold_s": 0.11449929990340024,
+      "adjusted_s": 0.10533699986990541,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009127199999056756,
+      "cold_s": 0.11489289999008179,
+      "adjusted_s": 0.10576569999102503,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.009058799943886697,
+      "cold_s": 0.1183870000531897,
+      "adjusted_s": 0.109328200109303,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.009207399911247194,
+      "cold_s": 0.11431350000202656,
+      "adjusted_s": 0.10510610009077936,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.008911599987186491,
+      "cold_s": 0.11444370006211102,
+      "adjusted_s": 0.10553210007492453,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.008635199978016317,
+      "cold_s": 0.11782139993738383,
+      "adjusted_s": 0.10918619995936751,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.009327700012363493,
+      "cold_s": 0.12151789991185069,
+      "adjusted_s": 0.1121901998994872,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.009399899980053306,
+      "cold_s": 0.11979479994624853,
+      "adjusted_s": 0.11039489996619523,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.008651599986478686,
+      "cold_s": 0.11611040006391704,
+      "adjusted_s": 0.10745880007743835,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.008929100004024804,
+      "cold_s": 0.11591819999739528,
+      "adjusted_s": 0.10698909999337047,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.009112600004300475,
+      "cold_s": 0.11474430002272129,
+      "adjusted_s": 0.10563170001842082,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.008979499922133982,
+      "cold_s": 0.11391809990163893,
+      "adjusted_s": 0.10493859997950494,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.008818299975246191,
+      "cold_s": 0.11371319997124374,
+      "adjusted_s": 0.10489489999599755,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009125600103288889,
+      "cold_s": 0.11598020000383258,
+      "adjusted_s": 0.10685459990054369,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.008843899937346578,
+      "cold_s": 0.11750080005731434,
+      "adjusted_s": 0.10865690011996776,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.009375800029374659,
+      "cold_s": 0.11847290000878274,
+      "adjusted_s": 0.10909709997940809,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.00908809993416071,
+      "cold_s": 0.11509809992276132,
+      "adjusted_s": 0.10600999998860061,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.00889420008752495,
+      "cold_s": 0.1152870999649167,
+      "adjusted_s": 0.10639289987739176,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.00892659998498857,
+      "cold_s": 0.11554279993288219,
+      "adjusted_s": 0.10661619994789362,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.009095099987462163,
+      "cold_s": 0.11597209994215518,
+      "adjusted_s": 0.10687699995469302,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.008685600012540817,
+      "cold_s": 0.11427609995007515,
+      "adjusted_s": 0.10559049993753433,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.008877199958078563,
+      "cold_s": 0.11630650004372001,
+      "adjusted_s": 0.10742930008564144,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.008892999961972237,
+      "cold_s": 0.11615599994547665,
+      "adjusted_s": 0.10726299998350441,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.011622700025327504,
+      "cold_s": 0.11881489993538707,
+      "adjusted_s": 0.10719219991005957,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.009112300002016127,
+      "cold_s": 0.11423190007917583,
+      "adjusted_s": 0.1051196000771597,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009222100023180246,
+      "cold_s": 0.11540040001273155,
+      "adjusted_s": 0.1061782999895513,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.009052300010807812,
+      "cold_s": 0.11715549998916686,
+      "adjusted_s": 0.10810319997835904,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "bench": "warm-router",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.009291899972595274,
+      "cold_s": 0.11415000003762543,
+      "adjusted_s": 0.10485810006503016,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 37,
+      "stdout_sha256": "23b37a2ce225499d5abb635e5cbd93f96bcea38d956856ba7bc92dd5ab6b158f",
+      "valid_for_stats": true
+    }
+  ],
+  "summary": {
+    "headline_metric": "cold",
+    "rows": {
+      "warm-router": {
+        "median_ms": {
+          "old": 116.15599994547665,
+          "new": 114.49929990340024
+        },
+        "paired_ratio": 0.9927996412813642,
+        "paired_ratio_ci95": [
+          0.9825426773836232,
+          1.003715506370993
+        ],
+        "metrics": {
+          "cold": {
+            "median_ms": {
+              "old": 116.15599994547665,
+              "new": 114.49929990340024
+            },
+            "paired_ratio": 0.9927996412813642,
+            "paired_ratio_ci95": [
+              0.9825426773836232,
+              1.003715506370993
+            ],
+            "nonpositive_pairs": 0
+          },
+          "startup": {
+            "median_ms": {
+              "old": 9.052300010807812,
+              "new": 9.112300002016127
+            },
+            "paired_ratio": 1.0164039352100693,
+            "paired_ratio_ci95": [
+              0.9880938158458343,
+              1.0320085243971002
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "old": 107.26299998350441,
+              "new": 105.53210007492453
+            },
+            "paired_ratio": 0.9900290368889332,
+            "paired_ratio_ci95": [
+              0.9816601259433833,
+              0.9964010766768046
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      }
+    },
+    "geomean_paired_ratio": 0.9927996412813642,
+    "geomean_paired_ratio_ci95": [
+      0.9825426773836232,
+      1.0016580663478736
+    ],
+    "metric_geomean_paired_ratio": {
+      "cold": 0.9927996412813642,
+      "startup": 1.0164039352100693,
+      "adjusted": 0.9900290368889332
+    },
+    "startup_median_ms": {
+      "old": 9.052300010807812,
+      "new": 9.112300002016127
+    }
+  },
+  "all_correct": true,
+  "health_failures": [],
+  "correctness_failures": [],
+  "failures": []
+}

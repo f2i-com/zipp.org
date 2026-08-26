@@ -61,6 +61,11 @@
 //! out of a child's `ZIPP_JITLOG`, so an admission change that quietly drops
 //! these kernels to the MEM tier fails the suite instead of making it vacuous.
 
+// The whole suite drives the x86-64 JIT tiers through a spawned CLI; in a
+// no-JIT config (safe-sandbox) the kernels cannot reach the emitters under
+// test — and the sandbox's own nesting limits reject the generated sources.
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
+
 use std::process::Command;
 
 // ── oracles ─────────────────────────────────────────────────────────────────

@@ -218,6 +218,7 @@ mod tests {
             frame_free: true,
             closure: NO_CLOSURE,
             callee: active,
+            upvals_raw: 0,
         };
         vm.gc_stress = true;
 

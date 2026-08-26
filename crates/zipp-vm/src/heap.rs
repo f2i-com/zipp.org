@@ -53,6 +53,11 @@ fn named_value_vec_payload(v: &Vec<(String, Value)>) -> usize {
 /// rebuilding every time it crosses.
 pub const PROP_INDEX_THRESHOLD: usize = 12;
 
+/// [`Heap`]'s fid-mirror sentinel for "not a plain callable": no real
+/// FuncProto id reaches `u32::MAX` (function tables are bounds-checked far
+/// below it), so the emitted guard can compare against a baked id blindly.
+pub(crate) const FID_MIRROR_NONE: u32 = u32::MAX;
+
 /// Slot sentinel for an empty [`PropIndex`] bucket (a real slot is a `keys`
 /// position, far below `u32::MAX`).
 const PROP_EMPTY: u32 = u32::MAX;
@@ -3959,12 +3964,33 @@ pub struct Heap {
     /// matched, which proves the entry was refreshed after the map's last
     /// version-bumping mutation (key adds are what reallocate `vals`).
     vals_ptr_mirror: Vec<u64>,
+    /// CALLEE-FID MIRROR (B189), parallel to `objs`: the slot's FuncProto id
+    /// when it holds a plain `Func`/`Closure`, else [`FID_MIRROR_NONE`].
+    /// Unlike the shape mirror this needs no invalidation discipline — a
+    /// callable's proto id is immutable for the occupant's lifetime — so the
+    /// only maintenance is the settling refresh (alloc/replace/miss-repair)
+    /// and the clear at `free_slot`. The emitted same-proto call lane guards
+    /// `mirror[callee_idx] == baked_fid` and needs nothing else about the
+    /// callee to be true.
+    fid_mirror: Vec<u32>,
+    /// CELL-VALUE MIRROR (B189), parallel to `objs`: a live copy of
+    /// `HeapObj::Cell` payloads (UNDEFINED bits everywhere else), so the
+    /// emitted Tier-C `UpvalGet` reads a captured variable in three loads
+    /// instead of a helper round-trip. Soundness rests on every Cell-payload
+    /// write flowing through this file's TWO write-through chokepoints
+    /// (`cell_set`, and `cell_write_no_barrier` for the mapped-`arguments`
+    /// aliasing path), with the settling events (alloc/replace via
+    /// `refresh_mirror`) and `free_slot` covering occupancy changes. The mirror carries the
+    /// UNINITIALIZED sentinel verbatim — the emitted TDZ check depends on it.
+    cell_vals_mirror: Vec<u64>,
     /// Raw bases of the two mirrors, re-cached whenever the vectors grow. The
     /// emitted probes load these THROUGH the VM (`[rdi + offset]`) on every
     /// access, so growth during a native run (helper allocations) is safe —
     /// unlike the pinned `r13` versions base, nothing re-derives these.
     pub(crate) shape_mirror_raw: u64,
     pub(crate) vals_ptr_mirror_raw: u64,
+    pub(crate) fid_mirror_raw: u64,
+    pub(crate) cell_vals_mirror_raw: u64,
     /// Dead payloads collected by the CURRENT sweep, shipped to the courier
     /// thread at `note_gc_done`/`note_minor_done` (see [`gc_courier`]).
     courier_batch: Vec<gc_courier::Item>,
@@ -4296,8 +4322,12 @@ impl Heap {
             val_slab: [ValSlabClass::new(), ValSlabClass::new(), ValSlabClass::new()],
             shape_mirror: vec![crate::shape::DICT; versions.len()],
             vals_ptr_mirror: vec![0; versions.len()],
+            fid_mirror: vec![FID_MIRROR_NONE; versions.len()],
+            cell_vals_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
             shape_mirror_raw: 0,
             vals_ptr_mirror_raw: 0,
+            fid_mirror_raw: 0,
+            cell_vals_mirror_raw: 0,
             versions,
             free: Vec::new(),
             live,
@@ -4343,6 +4373,8 @@ impl Heap {
     fn recache_mirror_raws(&mut self) {
         self.shape_mirror_raw = self.shape_mirror.as_ptr() as u64;
         self.vals_ptr_mirror_raw = self.vals_ptr_mirror.as_ptr() as u64;
+        self.fid_mirror_raw = self.fid_mirror.as_ptr() as u64;
+        self.cell_vals_mirror_raw = self.cell_vals_mirror.as_ptr() as u64;
     }
 
     /// Pin slot `idx`'s mirrors permanently unmatchable. For the receivers
@@ -4357,6 +4389,8 @@ impl Heap {
     pub fn pin_mirror_dict(&mut self, idx: u32) {
         self.shape_mirror[idx as usize] = crate::shape::DICT;
         self.vals_ptr_mirror[idx as usize] = 0;
+        self.fid_mirror[idx as usize] = FID_MIRROR_NONE;
+        self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
     }
 
     /// B187 stage 2: allocate a FINALIZE-BORN literal with its values in the
@@ -4404,12 +4438,19 @@ impl Heap {
     /// `bump_version` must NOT use this).
     #[inline]
     pub fn refresh_mirror(&mut self, idx: u32) {
-        let (sh, vp) = match &self.objs[idx as usize] {
-            HeapObj::Object(m) => (m.shape(), m.vals.as_ptr() as u64),
-            _ => (crate::shape::DICT, 0),
+        let (sh, vp, fid) = match &self.objs[idx as usize] {
+            HeapObj::Object(m) => (m.shape(), m.vals.as_ptr() as u64, FID_MIRROR_NONE),
+            HeapObj::Func(f) => (crate::shape::DICT, 0, *f),
+            HeapObj::Closure { func, .. } => (crate::shape::DICT, 0, *func),
+            _ => (crate::shape::DICT, 0, FID_MIRROR_NONE),
         };
         self.shape_mirror[idx as usize] = sh;
         self.vals_ptr_mirror[idx as usize] = vp;
+        self.fid_mirror[idx as usize] = fid;
+        self.cell_vals_mirror[idx as usize] = match &self.objs[idx as usize] {
+            HeapObj::Cell(v) => v.bits(),
+            _ => Value::UNDEFINED.bits(),
+        };
     }
 
     /// W9: enter a static-pretenure scope (NURSERY_DESIGN.md §4) — until the
@@ -4495,6 +4536,8 @@ impl Heap {
         self.versions.push(0);
         self.shape_mirror.push(crate::shape::DICT);
         self.vals_ptr_mirror.push(0);
+        self.fid_mirror.push(FID_MIRROR_NONE);
+        self.cell_vals_mirror.push(Value::UNDEFINED.bits());
         self.recache_mirror_raws();
         self.refresh_mirror(idx);
         if self.nursery {
@@ -4910,6 +4953,8 @@ impl Heap {
     pub fn free_slot(&mut self, idx: u32) {
         self.shape_mirror[idx as usize] = crate::shape::DICT;
         self.vals_ptr_mirror[idx as usize] = 0;
+        self.fid_mirror[idx as usize] = FID_MIRROR_NONE;
+        self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
         let payload = self.resident_payload_charged[idx as usize].replace(0);
         self.resident_payload_current
             .set(self.resident_payload_current.get().saturating_sub(payload));
@@ -5098,6 +5143,8 @@ impl Heap {
         // mutation, and a refresh here would capture the wrong side at a
         // bump-first site — a shape-way hit has no second guard to catch it.
         // The next miss on the object repairs the mirror from the settled map.
+        // (`fid_mirror` deliberately survives the bump: a callable's proto id
+        // is immutable for the occupant's lifetime, so no bump can stale it.)
         self.shape_mirror[idx as usize] = crate::shape::DICT;
         self.vals_ptr_mirror[idx as usize] = 0;
     }
@@ -5453,6 +5500,27 @@ impl Heap {
         }
         if let HeapObj::Cell(slot) = self.get_mut(idx) {
             *slot = v;
+            // Write-through to the cell-value mirror (B189). Payload writes
+            // happen HERE and in `cell_write_no_barrier` (mapped-arguments
+            // aliasing, which carries its own barrier) — both write through,
+            // which is what makes the emitted three-load `UpvalGet` sound.
+            self.cell_vals_mirror[idx as usize] = v.bits();
+        }
+    }
+
+    /// Cell-payload write for a caller that has ALREADY performed the nursery
+    /// barrier (the mapped-`arguments` aliasing path in `values.rs` — the only
+    /// Cell write besides [`Heap::cell_set`]). Returns whether `idx` held a
+    /// cell. Keeping it here keeps the B189 cell-value mirror's write-through
+    /// invariant in one file.
+    #[inline]
+    pub(crate) fn cell_write_no_barrier(&mut self, idx: u32, v: Value) -> bool {
+        if let HeapObj::Cell(slot) = self.get_mut(idx) {
+            *slot = v;
+            self.cell_vals_mirror[idx as usize] = v.bits();
+            true
+        } else {
+            false
         }
     }
 }

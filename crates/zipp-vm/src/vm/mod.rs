@@ -102,6 +102,12 @@ struct TiercActivationState {
     frame_free: bool,
     closure: u32,
     callee: u32,
+    /// Raw base of `closure`'s `upvalues` slice (0 when there is none), cached
+    /// once per entry so the emitted `UpvalGet` needs no closure resolution
+    /// (B189). Valid for exactly the activation's lifetime: the closure is
+    /// rooted for the whole activation, the collector never moves live boxes,
+    /// and a closure's upvalue list is fixed at creation.
+    upvals_raw: u64,
 }
 
 /// By-value restoration record for one Tier-C native entry. A suspended
@@ -122,6 +128,7 @@ impl TiercActivationState {
         frame_free: false,
         closure: NO_CLOSURE,
         callee: NO_CLOSURE,
+        upvals_raw: 0,
     };
 }
 
@@ -622,6 +629,53 @@ impl ClosureHomeTable {
     #[cfg(test)]
     fn map_for_test() -> Self {
         Self::Map(std::collections::HashMap::new())
+    }
+}
+
+/// B189: a slot-keyed side map with an inline `nonempty` byte the emitted
+/// same-proto call preflight reads through the VM pointer (`HashMap` exposes
+/// no field native code could guard on). Reads deref straight to the map;
+/// every mutation goes through the wrapper's own methods so the byte cannot
+/// miss an insert — there is deliberately NO `DerefMut`, which makes any
+/// unrouted mutation a compile error rather than a stale-flag soundness bug.
+/// Shrinking ops re-derive the byte from the map, so a map that empties
+/// re-arms the native lane.
+pub(crate) struct JitGuardedMap {
+    map: std::collections::HashMap<u32, u32>,
+    /// 0 = empty (the native call lane may skip this map's per-callee
+    /// checks), 1 = has entries. Read at `JIT_*_NONEMPTY_OFFSET`.
+    pub(crate) nonempty_raw: u8,
+}
+
+impl JitGuardedMap {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            nonempty_raw: 0,
+        }
+    }
+
+    pub(crate) fn insert(&mut self, k: u32, v: u32) -> Option<u32> {
+        self.nonempty_raw = 1;
+        self.map.insert(k, v)
+    }
+
+    pub(crate) fn remove(&mut self, k: &u32) -> Option<u32> {
+        let out = self.map.remove(k);
+        self.nonempty_raw = u8::from(!self.map.is_empty());
+        out
+    }
+
+    pub(crate) fn retain<F: FnMut(&u32, &mut u32) -> bool>(&mut self, f: F) {
+        self.map.retain(f);
+        self.nonempty_raw = u8::from(!self.map.is_empty());
+    }
+}
+
+impl std::ops::Deref for JitGuardedMap {
+    type Target = std::collections::HashMap<u32, u32>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
     }
 }
 
@@ -1179,7 +1233,7 @@ pub struct Vm<'p> {
     /// EvalScope stamps for closures created in frames that carry one (so
     /// arrows/functions made during or after the eval still see its
     /// bindings). Keyed by the closure value's heap index; pruned at GC.
-    closure_eval_scope: std::collections::HashMap<u32, u32>,
+    closure_eval_scope: JitGuardedMap,
     /// EvalScope → the ENCLOSING EvalScope it was created under (child → parent).
     /// A closure stamped with its creator's scope that then runs a direct eval of
     /// its own gets a fresh scope of its own — which used to REPLACE the stamp,
@@ -1671,7 +1725,7 @@ pub struct Vm<'p> {
     /// `GetFunctionRealm`. Used so `Reflect.construct(C, args, newTargetFromRealmR)`
     /// with a non-object `newTarget.prototype` falls back to realm R's `%C.prototype%`.
     realms: Vec<std::collections::HashMap<u32, u32>>,
-    obj_realm: std::collections::HashMap<u32, u32>,
+    obj_realm: JitGuardedMap,
     /// A realm constructor's heap index → the MAIN-realm constructor it mirrors, so
     /// `new other.Array()` / `other.Symbol('x')` route to the real construction /
     /// call behaviour (with the realm's prototype + realm tag).
@@ -1681,7 +1735,7 @@ pub struct Vm<'p> {
     /// realms (disjoint from ShadowRealm instance indices) and as the gate for
     /// the realm-global property interception in `get_member`/`set_prop`.
     /// Keys are GC roots (gc.rs) so the id mapping never goes stale.
-    realm_global_objs: std::collections::HashMap<u32, u32>,
+    realm_global_objs: JitGuardedMap,
     /// `other.eval` / `realm.evalScript` function objects (per createRealm child):
     /// fn heap index → (the child's global-object index, kind 0=eval 1=evalScript).
     /// `call_value` intercepts these and runs the code with `active_realm` set to
@@ -2000,6 +2054,7 @@ pub(crate) use helpers_misc::jit_shape_set_barrier;
 pub(crate) use helpers_misc::computed_call_stats;
 pub(crate) use helpers_misc::concat_set_stats;
 pub(crate) use helpers_misc::cross_fill_stats;
+pub(crate) use helpers_misc::cross_decline_stats;
 pub(crate) use helpers_misc::ic_stats;
 pub(crate) use helpers_misc::iter_region_stats;
 pub(crate) use proxy_regexp::regexp_call_direct_enabled;

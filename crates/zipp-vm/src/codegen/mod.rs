@@ -195,6 +195,28 @@ pub(crate) fn tierc_upval_enabled() -> bool {
     }
 }
 
+/// B189: minimum count of NON-upval ops a body must rescue from dispatch for
+/// the Tier-C upval admission. B50 set 12 when every `UpvalGet` cost a helper
+/// round-trip on entry-heavy tiny closures; the cross-call lane has since made
+/// native entry the cheap direction, and the blacklisting it caused was the
+/// calls-closures floor (a 5-op capturing body interpreted 8M times).
+/// `ZIPP_TIERC_UPVAL_MIN=<n>` restores a floor for A/B.
+pub(crate) fn tierc_upval_min_other_ops() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static MIN: AtomicUsize = AtomicUsize::new(usize::MAX);
+    match MIN.load(Ordering::Relaxed) {
+        usize::MAX => {
+            let v = std::env::var("ZIPP_TIERC_UPVAL_MIN")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(0);
+            MIN.store(v, Ordering::Relaxed);
+            v
+        }
+        v => v,
+    }
+}
+
 /// Allow a Tier-C cross-call attempt at a call site whose filled IC ways are
 /// multiple closure identities sharing one FuncProto. The runtime helper still
 /// resolves the live callee on every invocation, so a later different/native/

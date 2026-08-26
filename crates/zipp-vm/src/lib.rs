@@ -311,6 +311,23 @@ pub fn cross_fill_stats() -> (u64, u64) {
     vm::cross_fill_stats()
 }
 
+/// `ZIPP_ICSTATS=1` cross-call preflight DECLINE counts, indexed like
+/// [`CROSS_DECLINE_NAMES`]. All zero unless the variable was set.
+pub fn cross_decline_stats() -> [u64; 8] {
+    vm::cross_decline_stats()
+}
+/// Legend for [`cross_decline_stats`].
+pub const CROSS_DECLINE_NAMES: [&str; 8] = [
+    "depth",
+    "callee-kind",
+    "sp2-guard",
+    "no-entry",
+    "routable",
+    "this-bind",
+    "contiguity",
+    "activation",
+];
+
 /// Tier-C activations entered while a frame-free caller was suspended.
 /// Non-zero only with `ZIPP_ICSTATS=1`.
 pub fn tierc_activation_root_stats() -> u64 {

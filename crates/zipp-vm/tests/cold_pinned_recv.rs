@@ -40,6 +40,11 @@
 //! carrying a pinned receiver, or stops taking a native exit after the receiver's
 //! `LoadGlobal` — i.e. if it stops covering the hazard at all.
 
+// The mechanism half drives the x86-64 JIT tiers through a spawned CLI's
+// `ZIPP_JITLOG`; in a no-JIT config (safe-sandbox) those plans cannot exist,
+// so the whole suite is tier-gated (the bool_home_clobber precedent).
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
+
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
     assert!(

@@ -245,6 +245,26 @@ fn tierc_upval_inc_i32_enabled() -> bool {
     }
 }
 
+/// B189: emit `UpvalGet` as three inline loads (activation upvalue base →
+/// cell index → cell-value mirror) instead of the resolving helper call.
+/// `ZIPP_NO_TIERC_UPVAL_INLINE=1` restores the helper for a same-binary A/B.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn tierc_upval_inline_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_UPVAL_INLINE").is_none() as u8;
+            ON.store(on, Ordering::Relaxed);
+            on == 1
+        }
+    }
+}
+
 /// Fuse a bounded straight-line chain of captured i32 xorshift assignments.
 /// This is deliberately a bytecode-shape optimization, not a PRNG intrinsic:
 /// every accepted step may use an arbitrary constant count and any of `<<`,
@@ -713,7 +733,8 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         .count();
     let tierc_upval_ok = upval_ops != 0
         && crate::codegen::tierc_upval_enabled()
-        && proto.code.len().saturating_sub(upval_ops) >= 12;
+        && proto.code.len().saturating_sub(upval_ops)
+            >= crate::codegen::tierc_upval_min_other_ops();
     // Under `ZIPP_JITDUMP` the scan runs to completion and reports EVERY op this
     // tier has no arm for, instead of stopping at the first. Reporting only the
     // first is actively misleading when prioritising: admitting `UpvalGet` here
@@ -2832,6 +2853,31 @@ pub(crate) fn compile_proto_mem(
                     let uninit = Value::UNINITIALIZED.bits();
                     dynasm!(ops
                         ; mov rax, [rbx + dreg(src)]
+                        ; mov r10, QWORD uninit as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else if tierc_upval_inline_enabled() {
+                    // B189 inline captured read — no helper round-trip. The
+                    // activation caches the closure's upvalue base at entry
+                    // (0 = none → bail), the cell index is one u32 load, and
+                    // the cell-value mirror (write-through at `cell_set`, the
+                    // codebase's single Cell-payload write) yields the value.
+                    // The UNINITIALIZED sentinel travels through the mirror
+                    // verbatim, so TDZ still replays at this exact ip and the
+                    // interpreter supplies the ReferenceError.
+                    let act_off = crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32;
+                    let mirror_off = crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32;
+                    let uninit = Value::UNINITIALIZED.bits();
+                    dynasm!(ops
+                        ; mov rax, [rdi + act_off]
+                        ; test rax, rax
+                        ; jz => bail
+                        ; mov eax, [rax + (idx as i32) * 4]
+                        ; mov r10, [rdi + mirror_off]
+                        ; mov rax, [r10 + rax * 8]
                         ; mov r10, QWORD uninit as i64
                         ; cmp rax, r10
                         ; je => bail

@@ -2799,6 +2799,29 @@ pub(crate) mod crossstats {
         }
     }
 
+    /// One cross-call DECLINE (`SELF_CALL_DEOPT` out of the preflight),
+    /// bucketed by reason index — the crate-root `CROSS_DECLINE_NAMES` is the legend. The
+    /// counters answer "why is the native→native lane not engaging" without
+    /// a debugger (B189 diagnosis: the reason distribution IS the finding).
+    #[inline]
+    pub(crate) fn decline(reason: usize) {
+        if enabled() {
+            DECLINES[reason].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) const DECL_DEPTH: usize = 0;
+    pub(crate) const DECL_CALLEE_KIND: usize = 1;
+    pub(crate) const DECL_SP2_GUARD: usize = 2;
+    pub(crate) const DECL_NO_ENTRY: usize = 3;
+    pub(crate) const DECL_ROUTABLE: usize = 4;
+    pub(crate) const DECL_THIS_BIND: usize = 5;
+    pub(crate) const DECL_CONTIG: usize = 6;
+    pub(crate) const DECL_ACTIVATION: usize = 7;
+    const DECLINE_KINDS: usize = 8;
+    static DECLINES: [AtomicU64; DECLINE_KINDS] =
+        [const { AtomicU64::new(0) }; DECLINE_KINDS];
+
     /// `(fast_fills, full_fills)`
     pub fn dump() -> (u64, u64) {
         (
@@ -2806,10 +2829,17 @@ pub(crate) mod crossstats {
             FILL_FULL.load(Ordering::Relaxed),
         )
     }
+
+    /// Per-reason decline counts, indexed like the crate-root `CROSS_DECLINE_NAMES`.
+    pub fn dump_declines() -> [u64; DECLINE_KINDS] {
+        std::array::from_fn(|i| DECLINES[i].load(Ordering::Relaxed))
+    }
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub use crossstats::dump as cross_fill_stats;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub use crossstats::dump_declines as cross_decline_stats;
 
 /// `ZIPP_ICSTATS=1` — universal Tier-C activation-root mechanism counter.
 /// It proves that a nested Tier-C activation suspended a frame-free caller that
@@ -3055,6 +3085,12 @@ pub fn ic_stats() -> (u64, u64, u64, u64, u64, u64, u64, u64, u64) {
 #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
 pub fn cross_fill_stats() -> (u64, u64) {
     (0, 0)
+}
+
+/// Without the JIT there are no cross-call declines either.
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+pub fn cross_decline_stats() -> [u64; 8] {
+    [0; 8]
 }
 
 /// Without x86-64 Tier C there are no suspended frame-free activation roots.
@@ -3312,6 +3348,15 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
             // (polymorphic, guard-validated); a plain object walks the PROTO
             // CHAIN (`Object.create({val})` — the chain may hold the property).
             None if map.class.is_some() => return crate::codegen::PROP_VIA_IC,
+            // A ctor-map receiver (`Function`, builtin constructors) has
+            // [[Prototype]] = %Function.prototype% — NOT the walk's
+            // no-`proto_of`-entry default of %Object.prototype% — and the
+            // restricted `caller`/`arguments` protocol lives there as
+            // throwing accessors. Interpreter replay serves those exactly.
+            // (Hop maps are already `!is_ctor`-guarded; this closes the
+            // receiver side. Found when B189 first compiled `() =>
+            // f.arguments` bodies: `Function.arguments` answered undefined.)
+            None if map.is_ctor => return crate::codegen::SELF_CALL_DEOPT,
             None => {
                 const MAX: usize = crate::codegen::JIT_IC_MAX_HOPS;
                 let mut cur = idx;
@@ -3558,6 +3603,11 @@ pub(crate) extern "win64" fn jit_get_prop_leaf(
             if map.class.is_some() {
                 return crate::codegen::SELF_CALL_DEOPT; // class chain: methods/getters
             }
+            if map.is_ctor {
+                // Ctor maps do not default to %Object.prototype% (see the
+                // matching guard in `jit_get_prop_miss`).
+                return crate::codegen::SELF_CALL_DEOPT;
+            }
             let mut cur = idx;
             let mut hops = 0u32;
             loop {
@@ -3783,6 +3833,13 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
                 // Only a provably-clean chain lets us append the key.
                 if map.class.is_some() {
                     return crate::codegen::PROP_VIA_IC;
+                }
+                if map.is_ctor {
+                    // Ctor maps do not default to %Object.prototype% (see the
+                    // matching guard in `jit_get_prop_miss`), and their chain
+                    // carries the throwing `caller`/`arguments` accessors an
+                    // append would have to consult. Interpreter cases.
+                    return crate::codegen::SELF_CALL_DEOPT;
                 }
                 if !map.extensible {
                     return crate::codegen::SELF_CALL_DEOPT;
@@ -4574,12 +4631,35 @@ impl<'p> Vm<'p> {
     /// BEFORE native entry, so the caller must take its ordinary Frame-backed
     /// interpreter route; it is never safe to overwrite active root ids and
     /// rely on Rust locals across a JS GC safe point.
+    ///
+    /// `upvals_raw` (B189) is `closure`'s live `upvalues` base pointer, or 0
+    /// for none — callers resolve it (usually from a match they already
+    /// perform, see [`Vm::resolve_upvals_raw`]) so the emitted `UpvalGet`
+    /// reads captures without any per-access closure resolution.
+    /// `closure`'s live `upvalues` base (0 = none / not a closure), for
+    /// callers of [`Vm::enter_tierc_activation`] that have not already
+    /// matched the heap object. Bounds-guarded: test fixtures install
+    /// synthetic ids.
+    #[inline]
+    pub(crate) fn resolve_upvals_raw(&self, closure: u32) -> u64 {
+        if closure == NO_CLOSURE || closure as usize >= self.heap.len() {
+            return 0;
+        }
+        match self.heap.get(closure) {
+            crate::heap::HeapObj::Closure { upvalues, .. } if !upvalues.is_empty() => {
+                upvalues.as_ptr() as u64
+            }
+            _ => 0,
+        }
+    }
+
     #[inline(always)]
     pub(crate) fn enter_tierc_activation(
         &mut self,
         closure: u32,
         callee: u32,
         frame_free: bool,
+        upvals_raw: u64,
     ) -> Option<TiercActivationToken> {
         // A frame-backed outer entry is restored from the token and therefore
         // does not consume a root-stack slot. Leave two slots of headroom below
@@ -4609,6 +4689,7 @@ impl<'p> Vm<'p> {
             frame_free,
             closure,
             callee,
+            upvals_raw,
         };
         Some(TiercActivationToken {
             prior,
@@ -4649,6 +4730,7 @@ mod tierc_activation_root_tests {
             frame_free,
             closure,
             callee,
+            upvals_raw: 0,
         }
     }
 
@@ -4659,14 +4741,14 @@ mod tierc_activation_root_tests {
 
         let frame_state = state(10, 11, false);
         let frame_token = vm
-            .enter_tierc_activation(frame_state.closure, frame_state.callee, false)
+            .enter_tierc_activation(frame_state.closure, frame_state.callee, false, 0)
             .expect("first entry");
         assert_eq!(vm.jit_tierc_activation, frame_state);
         assert!(vm.jit_tierc_activation_stack.is_empty());
 
         let cross_state = state(20, 21, true);
         let cross_token = vm
-            .enter_tierc_activation(cross_state.closure, cross_state.callee, true)
+            .enter_tierc_activation(cross_state.closure, cross_state.callee, true, 0)
             .expect("cross entry");
         assert_eq!(vm.jit_tierc_activation, cross_state);
         assert!(
@@ -4676,7 +4758,7 @@ mod tierc_activation_root_tests {
 
         let nested_state = state(30, 31, false);
         let nested_token = vm
-            .enter_tierc_activation(nested_state.closure, nested_state.callee, false)
+            .enter_tierc_activation(nested_state.closure, nested_state.callee, false, 0)
             .expect("nested direct entry");
         assert_eq!(vm.jit_tierc_activation, nested_state);
         assert_eq!(
@@ -4703,12 +4785,12 @@ mod tierc_activation_root_tests {
         let mut tokens = Vec::with_capacity(TIER_C_ACTIVATION_ROOT_STACK_MAX + 1);
 
         tokens.push(
-            vm.enter_tierc_activation(100, 101, true)
+            vm.enter_tierc_activation(100, 101, true, 0)
                 .expect("first frame-free entry"),
         );
         for depth in 0..TIER_C_ACTIVATION_ROOT_STACK_MAX {
             tokens.push(
-                vm.enter_tierc_activation(200 + depth as u32, 300 + depth as u32, true)
+                vm.enter_tierc_activation(200 + depth as u32, 300 + depth as u32, true, 0)
                     .unwrap_or_else(|| panic!("entry {depth} reached the cap too early")),
             );
         }
@@ -4719,7 +4801,7 @@ mod tierc_activation_root_tests {
         let current = vm.jit_tierc_activation;
         let rooted = vm.jit_tierc_activation_stack.clone();
         assert!(
-            vm.enter_tierc_activation(900, 901, true).is_none(),
+            vm.enter_tierc_activation(900, 901, true, 0).is_none(),
             "the frame-free root cap must decline before native entry"
         );
         assert_eq!(vm.jit_tierc_activation, current);
@@ -4736,14 +4818,21 @@ mod tierc_activation_root_tests {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn jit_tierc_cell(vm: &Vm<'_>, idx: u32) -> Option<u32> {
-    let closure = vm.jit_tierc_activation.closure;
-    if closure == NO_CLOSURE || closure as usize >= vm.heap.len() {
+    // B189: the entry resolved the activation's upvalue base once
+    // (`TiercActivationState::upvals_raw`); read the cell index straight from
+    // it instead of re-matching the closure per access. The base is valid for
+    // exactly the activation's extent (the closure is rooted, live boxes never
+    // move, upvalue lists are fixed at creation), and 0 means "no upvalues" —
+    // which also covers every synthetic test activation.
+    let base = vm.jit_tierc_activation.upvals_raw;
+    if base == 0 {
         return None;
     }
-    let cell = match vm.heap.get(closure) {
-        crate::heap::HeapObj::Closure { upvalues, .. } => upvalues.get(idx as usize).copied(),
-        _ => None,
-    }?;
+    // SAFETY: a non-zero base is a live closure's `upvalues` pointer installed
+    // by a real Tier-C entry, and `idx` is a compile-time upvalue index of the
+    // fid whose code is running — the same in-bounds contract the
+    // interpreter's `closure_upvalue` indexes under.
+    let cell = unsafe { *(base as *const u32).add(idx as usize) };
     ((cell as usize) < vm.heap.len() && matches!(vm.heap.get(cell), crate::heap::HeapObj::Cell(_)))
         .then_some(cell)
 }

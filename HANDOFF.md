@@ -6,6 +6,54 @@ claim below is an entry there with its measurements. This file is the map.
 
 ---
 
+## Continuation snapshot — 2026-08-26, Wave 65: B189a — closures unblacklisted
+
+The calls-closures investigation produced a reframing worth reading before any
+further call-path work (full detail in ledger **B189a**):
+
+- **The floor was a blacklist, not a dispatch problem.** Tier-C's B50-era rule
+  "an upval body must rescue ≥12 other ops" silently blacklisted every tiny
+  capturing closure — the single most common JS pattern — so native call sites
+  declined `no-entry` per call into interpreter Frames. New per-reason decline
+  counters under `ZIPP_ICSTATS=1` (`[ic] cross-call declines …`) made this
+  visible in one run; keep using them before theorizing about call cost.
+- **Captured reads are now three emitted loads** via the activation's cached
+  `upvals_raw` and the heap's `cell_vals_mirror` (write-through at `cell_set`,
+  the codebase's only Cell-payload write). `UpvalSet`/inc/xorshift still take
+  their helpers (writes need the barrier + const/TDZ protocol).
+- **B189b is queued and its infrastructure is already in-tree:** `fid_mirror`
+  (guard a callee by PROTO ID, not identity — 16 rotating closures of one fid
+  stay monomorphic), `JitGuardedMap` nonempty bytes for the three
+  call-environment blocker maps, and the host-api offsets. The remaining
+  calls-closures gap (81ms vs node 41ms) is the cross-call helper's ~15ns
+  steady-state cost: preflight + window fill + activation entry as one emitted
+  sequence, falling back to the helper for anything unusual, with the B184
+  completion rule (bail paths must COMPLETE the call, never replay effects).
+- **Self-call lane is structurally safe** for all of this: `self_slot` only
+  exists for hoisted top-level declarations, which cannot capture.
+- **The floor was hiding a wrong-answer class — assume other admission
+  wideners will do the same.** First compile of `() => f.arguments` exposed
+  the JIT property walks' bad default ("no `proto_of` entry ⇒ proto is
+  %Object.prototype%") on ctor-map receivers; `Function.arguments` answered
+  `undefined` instead of throwing. Fixed fail-closed in all three walk
+  helpers; `tests/ctor_restricted_props.rs` pins it. The full test262 sweep
+  (not the suites, not the benches) is what caught it — same lesson as B181:
+  admission changes get the full sweep, every time.
+- **Named follow-up — the safe-sandbox suite was never actually green in
+  full.** A `--no-fail-fast` sweep of `cargo test -p zipp-vm
+  --no-default-features --features safe-sandbox` fails ~44 test binaries, all
+  pre-existing JIT-mechanism suites that assume tiers/JITLOG the no-JIT build
+  cannot provide (some also trip the instrument feature's source-nesting cap).
+  Past waves' "sandbox tests" gate ran the build plus a filtered slice, so
+  this was invisible. Three files are now correctly tier-gated
+  (`bool_home_clobber`, `cold_pinned_recv`, and four tests in
+  `concat_chain` — note concat_chain keeps 14 sandbox-valid tests, which is
+  why wholesale `#![cfg]` gating of every failing file is the WRONG fix).
+  The full inventory is one `--no-fail-fast` run away; a dedicated hygiene
+  pass should gate per-test, keeping every sandbox-meaningful case.
+
+---
+
 ## Continuation snapshot — 2026-08-25, Wave 53: the one-step literal finalizer
 
 ### The static-record candidate is dead

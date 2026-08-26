@@ -8183,7 +8183,9 @@ impl<'p> Vm<'p> {
                 )
             })
             .unwrap_or((NO_CLOSURE, NO_CLOSURE));
-        let activation_token = self.enter_tierc_activation(active_closure, active_callee, false)?;
+        let upvals_raw = self.resolve_upvals_raw(active_closure);
+        let activation_token =
+            self.enter_tierc_activation(active_closure, active_callee, false, upvals_raw)?;
         // Lend the native tier a bounded slice of the step budget, which its
         // compiled body charges directly. Saved and restored around the run
         // because native code re-enters Rust through its call helpers, and that

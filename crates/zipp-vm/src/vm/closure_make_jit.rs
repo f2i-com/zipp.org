@@ -494,6 +494,7 @@ mod tests {
             frame_free: true,
             closure: NO_CLOSURE,
             callee,
+            upvals_raw: 0,
         };
 
         let packed = ((fid as u64) << 32) | ip as u64;
@@ -536,6 +537,7 @@ mod tests {
             frame_free: true,
             closure: NO_CLOSURE,
             callee: cell_callee,
+            upvals_raw: 0,
         };
         let packed_cell = ((cell_fid as u64) << 32) | cell_ip as u64;
         let regs = vm.regs.as_mut_ptr() as *mut u64;

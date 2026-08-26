@@ -451,6 +451,20 @@ const MODES: &[Mode] = &[
         name: "gcstress",
         env: &[("ZIPP_GC_STRESS", "1")],
     },
+    // ── B189 ── the Tier-C captured-read lanes. `noupvalinline` restores the
+    // resolving helper for every emitted `UpvalGet` (differentials the
+    // cell-value mirror + activation-cached base against it); `upvalmin12`
+    // restores the B50-era admission floor (differentials compiled upval
+    // bodies against blacklisted-and-interpreted ones). The generator's
+    // `use_closure` programs (35%) put `up` behind exactly these paths.
+    Mode {
+        name: "noupvalinline",
+        env: &[("ZIPP_NO_TIERC_UPVAL_INLINE", "1")],
+    },
+    Mode {
+        name: "upvalmin12",
+        env: &[("ZIPP_TIERC_UPVAL_MIN", "12")],
+    },
     // ── W17 ── the engine has ~50 `ZIPP_NO_*` switches and this list held 14 of
     // them. Every one is specified as a PURE FALLBACK, which is a claim the
     // differential can check for free: a switch that changes an answer is a bug

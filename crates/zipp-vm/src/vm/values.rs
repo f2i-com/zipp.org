@@ -1664,10 +1664,12 @@ impl<'p> Vm<'p> {
         let cur = self.regs[slot];
         if cur.is_heap() {
             // Nursery barrier: a mapped-arguments write through a captured
-            // CELL bypasses `Heap::cell_set` (which carries the usual one).
+            // CELL bypasses `Heap::cell_set` (which carries the usual one) —
+            // but it must still write through the B189 cell-value mirror, so
+            // the payload store itself goes through the heap's dedicated
+            // barrier-free entry point.
             self.heap.write_barrier_val(cur.heap_index(), val);
-            if let HeapObj::Cell(inner) = self.heap.get_mut(cur.heap_index()) {
-                *inner = val;
+            if self.heap.cell_write_no_barrier(cur.heap_index(), val) {
                 return true;
             }
         }

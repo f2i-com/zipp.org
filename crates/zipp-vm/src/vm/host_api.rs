@@ -63,6 +63,44 @@ pub(crate) const JIT_SHAPE_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_VALS_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
     + core::mem::offset_of!(crate::heap::Heap, vals_ptr_mirror_raw);
+/// VM-relative byte offset of the heap's callee-fid mirror base (B189): same
+/// derive-per-access rule as the shape/vals mirrors above.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[allow(dead_code)] // consumed by the B189b emitted same-proto call lane
+pub(crate) const JIT_FID_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, fid_mirror_raw);
+/// VM-relative byte offset of the heap's cell-value mirror base (B189): same
+/// derive-per-access rule as the mirrors above.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CELL_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, cell_vals_mirror_raw);
+/// VM-relative byte offset of the running Tier-C activation's cached upvalue
+/// base pointer (0 = none). Set per native entry, restored per exit; the
+/// emitted `UpvalGet` derives it from the live VM argument on every access.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ACT_UPVALS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, jit_tierc_activation)
+        + core::mem::offset_of!(crate::vm::TiercActivationState, upvals_raw);
+
+/// VM-relative byte offsets of the three call-environment blocker bytes
+/// (B189): each is a [`crate::vm::JitGuardedMap`]'s `nonempty_raw`. The
+/// same-proto call lane requires all three to read 0 — a non-empty map means
+/// realm transitions or eval scopes may apply to this callee, which only the
+/// helper's full preflight can decide.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[allow(dead_code)] // consumed by the B189b emitted same-proto call lane
+pub(crate) const JIT_OBJ_REALM_NONEMPTY_OFFSET: usize = core::mem::offset_of!(Vm<'static>, obj_realm)
+    + core::mem::offset_of!(crate::vm::JitGuardedMap, nonempty_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[allow(dead_code)] // consumed by the B189b emitted same-proto call lane
+pub(crate) const JIT_EVAL_SCOPE_NONEMPTY_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, closure_eval_scope)
+        + core::mem::offset_of!(crate::vm::JitGuardedMap, nonempty_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[allow(dead_code)] // consumed by the B189b emitted same-proto call lane
+pub(crate) const JIT_REALM_GLOBALS_NONEMPTY_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, realm_global_objs)
+        + core::mem::offset_of!(crate::vm::JitGuardedMap, nonempty_raw);
 
 /// Whether a global slot holds a top-level function/class declaration or an
 /// ordinary variable. Hosts use this to decide what is callable.

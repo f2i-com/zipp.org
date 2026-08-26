@@ -1,0 +1,1271 @@
+{
+  "schema_version": 2,
+  "created_utc": "2026-08-26T06:13:56.886357+00:00",
+  "git_commit": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31",
+  "workspace_source": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31",
+  "engine_source_before": {
+    "old": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e",
+    "new": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e"
+  },
+  "engine_source_after": {
+    "old": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e",
+    "new": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e"
+  },
+  "engine_binary_sha_before": {
+    "old": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e",
+    "new": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e"
+  },
+  "engine_binary_sha_after": {
+    "old": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e",
+    "new": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e"
+  },
+  "publishable": false,
+  "provenance_reasons": [
+    "old: built from a DIRTY tree (fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e); the commit it names is the parent it was based on, not the code that ran",
+    "new: built from a DIRTY tree (fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e); the commit it names is the parent it was based on, not the code that ran"
+  ],
+  "engine_drift": [],
+  "harness": {
+    "bench_py_sha256": "1fd21925127036e95549ea1ca055bbbc6aad963029c942bb35e84a68f52619a5",
+    "run_real_sh_sha256": "c74f4c9f8fb862ce62b023b31832604fd8ff896bb73756012980c709875100ea"
+  },
+  "bench_input_sha256": {
+    "regex-log-scan": "5fb42804f01602f38a31c45f6a74a55f1e01a555169f02a3d6d595763062a74b"
+  },
+  "headline_benches": [
+    "regex-log-scan"
+  ],
+  "diagnostic_benches": [],
+  "unclassified_benches": [],
+  "row_set_summaries": {
+    "headline": {
+      "benches": [
+        "regex-log-scan"
+      ],
+      "geomean_paired_ratio": 0.997784605920464,
+      "ci95": [
+        0.984301981497429,
+        1.0063115769095776
+      ]
+    },
+    "all_measured": {
+      "benches": [
+        "regex-log-scan"
+      ],
+      "geomean_paired_ratio": 0.997784605920464,
+      "ci95": [
+        0.984301981497429,
+        1.0063115769095776
+      ]
+    }
+  },
+  "seed": 1511464998,
+  "reps": 21,
+  "metric": "cold",
+  "report_mode": "modern",
+  "headline_metric": "cold",
+  "timeout_s": 300.0,
+  "bootstrap_samples": 10000,
+  "benches": [
+    "regex-log-scan"
+  ],
+  "bench_dir": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\real",
+  "baseline": "old",
+  "engines": [
+    {
+      "name": "old",
+      "argv": [
+        "target/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7537664,
+      "mtime_ns": 1787724068839751700,
+      "sha256": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e",
+        "commit": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31",
+        "dirty": true,
+        "diff_digest": "6e2ddb367f63368e",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {
+        "ZIPP_NO_TIERC_UPVAL_INLINE": "1",
+        "ZIPP_TIERC_UPVAL_MIN": "12"
+      }
+    },
+    {
+      "name": "new",
+      "argv": [
+        "target/release/zipp.exe",
+        "js"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7537664,
+      "mtime_ns": 1787724068839751700,
+      "sha256": "9b758b2370eb7cfb214471197d713d92d471a41418cddece20995a35598f393e",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31+dirty.6e2ddb367f63368e",
+        "commit": "fb8f0e8d759a5b956b33d5bf2033a61db52f2d31",
+        "dirty": true,
+        "diff_digest": "6e2ddb367f63368e",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      },
+      "environment": {}
+    }
+  ],
+  "host": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "python": "3.11.6",
+    "power_mode": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "environment": {},
+  "schedule": [
+    {
+      "rep": 0,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 1,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 2,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 3,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 4,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 5,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 6,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 7,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 8,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 9,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 10,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 11,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 12,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 13,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 14,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 15,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 16,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 17,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 18,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    },
+    {
+      "rep": 19,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "new",
+        "old"
+      ]
+    },
+    {
+      "rep": 20,
+      "bench_order": [
+        "regex-log-scan"
+      ],
+      "engine_order": [
+        "old",
+        "new"
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "rep": 0,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.009081800002604723,
+      "cold_s": 0.6174558000639081,
+      "adjusted_s": 0.6083740000613034,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.009395799948833883,
+      "cold_s": 0.6115713999606669,
+      "adjusted_s": 0.602175600011833,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.00922600005287677,
+      "cold_s": 0.6029553000116721,
+      "adjusted_s": 0.5937292999587953,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009120799950323999,
+      "cold_s": 0.6162262000143528,
+      "adjusted_s": 0.6071054000640288,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.008886400028131902,
+      "cold_s": 0.6086654999526218,
+      "adjusted_s": 0.5997790999244899,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.00856670003850013,
+      "cold_s": 0.6169343000510707,
+      "adjusted_s": 0.6083676000125706,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.00910419994033873,
+      "cold_s": 0.6456426999066025,
+      "adjusted_s": 0.6365384999662638,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009138200082816184,
+      "cold_s": 0.6129959999816492,
+      "adjusted_s": 0.603857799898833,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.009901199955493212,
+      "cold_s": 0.6089444999815896,
+      "adjusted_s": 0.5990433000260964,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.00916540005709976,
+      "cold_s": 0.6127879000268877,
+      "adjusted_s": 0.6036224999697879,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.009601400000974536,
+      "cold_s": 0.6170122000621632,
+      "adjusted_s": 0.6074108000611886,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009599099983461201,
+      "cold_s": 0.6123391999863088,
+      "adjusted_s": 0.6027401000028476,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.008974399999715388,
+      "cold_s": 0.6007961001014337,
+      "adjusted_s": 0.5918217001017183,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.00892809999641031,
+      "cold_s": 0.5994650999782607,
+      "adjusted_s": 0.5905369999818504,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.008663299959152937,
+      "cold_s": 0.615182299981825,
+      "adjusted_s": 0.6065190000226721,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009145500021986663,
+      "cold_s": 0.613444900023751,
+      "adjusted_s": 0.6042994000017643,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.00917259999550879,
+      "cold_s": 0.6104944000253454,
+      "adjusted_s": 0.6013218000298366,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.00897819991223514,
+      "cold_s": 0.6092463999520987,
+      "adjusted_s": 0.6002682000398636,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.009014599956572056,
+      "cold_s": 0.6013214000267908,
+      "adjusted_s": 0.5923068000702187,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.010391300078481436,
+      "cold_s": 0.6109115000581369,
+      "adjusted_s": 0.6005201999796554,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.009391200030222535,
+      "cold_s": 0.623939499957487,
+      "adjusted_s": 0.6145482999272645,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.008747200015932322,
+      "cold_s": 0.5987960000056773,
+      "adjusted_s": 0.590048799989745,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.008596599916927516,
+      "cold_s": 0.6230352000566199,
+      "adjusted_s": 0.6144386001396924,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 11,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.008938100072555244,
+      "cold_s": 0.5948151999618858,
+      "adjusted_s": 0.5858770998893306,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.00935469998512417,
+      "cold_s": 0.6190564000280574,
+      "adjusted_s": 0.6097017000429332,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 12,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.009511000011116266,
+      "cold_s": 0.6186823999742046,
+      "adjusted_s": 0.6091713999630883,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.009118199930526316,
+      "cold_s": 0.6018892999272794,
+      "adjusted_s": 0.592771099996753,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 13,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.008829300059005618,
+      "cold_s": 0.6086504999548197,
+      "adjusted_s": 0.5998211998958141,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.00883759988937527,
+      "cold_s": 0.6044006999582052,
+      "adjusted_s": 0.59556310006883,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 14,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.008509099949151278,
+      "cold_s": 0.6028637998970225,
+      "adjusted_s": 0.5943546999478713,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 15,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.008696399978362024,
+      "cold_s": 0.6190358999883756,
+      "adjusted_s": 0.6103395000100136,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 15,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009932199958711863,
+      "cold_s": 0.599029399920255,
+      "adjusted_s": 0.5890971999615431,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 16,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.00896809995174408,
+      "cold_s": 0.6183447999646887,
+      "adjusted_s": 0.6093767000129446,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 16,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.008832599967718124,
+      "cold_s": 0.6020237000193447,
+      "adjusted_s": 0.5931911000516266,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 17,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.00923490000423044,
+      "cold_s": 0.6095961999380961,
+      "adjusted_s": 0.6003612999338657,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 17,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.00886900001205504,
+      "cold_s": 0.6207010999787599,
+      "adjusted_s": 0.6118320999667048,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 18,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.008800299954600632,
+      "cold_s": 0.604533699923195,
+      "adjusted_s": 0.5957333999685943,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 18,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.009245399967767298,
+      "cold_s": 0.6123666999628767,
+      "adjusted_s": 0.6031212999951094,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 19,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 0,
+      "startup_s": 0.008988499990664423,
+      "cold_s": 0.6218707000371069,
+      "adjusted_s": 0.6128822000464424,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 19,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 1,
+      "startup_s": 0.009917100076563656,
+      "cold_s": 0.6526852999813855,
+      "adjusted_s": 0.6427681999048218,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 20,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "old",
+      "engine_position": 0,
+      "startup_s": 0.009943400043994188,
+      "cold_s": 0.6685360999545082,
+      "adjusted_s": 0.6585926999105141,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 20,
+      "bench": "regex-log-scan",
+      "bench_position": 0,
+      "engine": "new",
+      "engine_position": 1,
+      "startup_s": 0.009597099968232214,
+      "cold_s": 0.6243235999718308,
+      "adjusted_s": 0.6147265000035986,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 118,
+      "stdout_sha256": "26ce8461e4bab67b4d750de905f7c35892bef9f2b70b6c7433498a47d02da0c8",
+      "valid_for_stats": true
+    }
+  ],
+  "summary": {
+    "headline_metric": "cold",
+    "rows": {
+      "regex-log-scan": {
+        "median_ms": {
+          "old": 612.3391999863088,
+          "new": 612.3666999628767
+        },
+        "paired_ratio": 0.997784605920464,
+        "paired_ratio_ci95": [
+          0.984301981497429,
+          1.0063115769095776
+        ],
+        "metrics": {
+          "cold": {
+            "median_ms": {
+              "old": 612.3391999863088,
+              "new": 612.3666999628767
+            },
+            "paired_ratio": 0.997784605920464,
+            "paired_ratio_ci95": [
+              0.984301981497429,
+              1.0063115769095776
+            ],
+            "nonpositive_pairs": 0
+          },
+          "startup": {
+            "median_ms": {
+              "old": 9.138200082816184,
+              "new": 9.014599956572056
+            },
+            "paired_ratio": 0.9788064361937908,
+            "paired_ratio_ci95": [
+              0.9617927576492105,
+              1.0002396076212663
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "old": 602.7401000028476,
+              "new": 603.1212999951094
+            },
+            "paired_ratio": 0.9979709956496313,
+            "paired_ratio_ci95": [
+              0.9863228582323876,
+              1.007644188564486
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      }
+    },
+    "geomean_paired_ratio": 0.997784605920464,
+    "geomean_paired_ratio_ci95": [
+      0.984301981497429,
+      1.0063115769095776
+    ],
+    "metric_geomean_paired_ratio": {
+      "cold": 0.997784605920464,
+      "startup": 0.9788064361937908,
+      "adjusted": 0.9979709956496313
+    },
+    "startup_median_ms": {
+      "old": 9.138200082816184,
+      "new": 9.014599956572056
+    }
+  },
+  "all_correct": true,
+  "health_failures": [],
+  "correctness_failures": [],
+  "failures": []
+}

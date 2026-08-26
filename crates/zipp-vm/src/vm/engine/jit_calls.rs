@@ -318,6 +318,7 @@ impl<'p> Vm<'p> {
         // first, so a later different-fid value declines without even the
         // internal `osr_deopt_exempt` mutation.
         if !SAME_PROTO_ARROW2 && self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_DEPTH);
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -335,12 +336,34 @@ impl<'p> Vm<'p> {
         let expected_reg_count = (packed & 0xFFFF) as usize;
         let cv = Value::from_bits(callee_bits);
         if !cv.is_heap() {
+            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_CALLEE_KIND);
             return SELF_CALL_DEOPT;
         }
-        let (fid, closure) = match self.heap.get(cv.heap_index()) {
-            HeapObj::Func(id) => (*id, NO_CLOSURE),
-            HeapObj::Closure { func, .. } => (*func, cv.heap_index()),
-            _ => return SELF_CALL_DEOPT,
+        // One match resolves everything the call needs from the callee object:
+        // proto id, arrow `this`, and the B189 activation upvalue base — the
+        // this-bind and activation-entry paths below must NOT re-touch the
+        // heap for what this already read.
+        let (fid, closure, lex_this_val, upvals_raw) = match self.heap.get(cv.heap_index()) {
+            HeapObj::Func(id) => (*id, NO_CLOSURE, Value::UNDEFINED, 0u64),
+            HeapObj::Closure {
+                func,
+                this_val,
+                upvalues,
+                ..
+            } => (
+                *func,
+                cv.heap_index(),
+                *this_val,
+                if upvalues.is_empty() {
+                    0
+                } else {
+                    upvalues.as_ptr() as u64
+                },
+            ),
+            _ => {
+                crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_CALLEE_KIND);
+                return SELF_CALL_DEOPT;
+            }
         };
         // Same FuncProto does not make every dynamic activation equivalent: a
         // closure created under direct eval carries a live EvalScope, and a
@@ -356,21 +379,27 @@ impl<'p> Vm<'p> {
                 || (!self.closure_eval_scope.is_empty()
                     && self.closure_eval_scope.contains_key(&closure)))
         {
+            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_SP2_GUARD);
             return SELF_CALL_DEOPT;
         }
         if SAME_PROTO_ARROW2 && self.jit_call_depth >= JIT_REGION_CALL_MAX {
+            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_DEPTH);
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
         let (entry, uninit_mask, json_walk, markdown_inline) = match self.jit.cross_entry(fid) {
             Some(e) => e,
-            None => return SELF_CALL_DEOPT,
+            None => {
+                crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_NO_ENTRY);
+                return SELF_CALL_DEOPT;
+            }
         };
         // The entry checks `try_run_jit` performs and a direct call would skip:
         // direct global routes can be invalidated by `delete` / defineProperty
         // on globalThis (Tier C never records a self-binding, so that check is
         // structurally unnecessary — asserted at install).
         if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
+            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_ROUTABLE);
             return SELF_CALL_DEOPT;
         }
         // GC safe point — the frame-transition parity point. The route this
@@ -439,10 +468,14 @@ impl<'p> Vm<'p> {
         // OrdinaryCallBindThis for a plain `f()` (`this` = undefined): a strict
         // callee binds undefined; a sloppy one binds its realm's global object.
         let this_v = if lexical_this {
-            match self.heap.get(closure) {
-                HeapObj::Closure { func, this_val, .. } if *func == fid => *this_val,
-                _ => return SELF_CALL_DEOPT,
+            // The callee match above already read the closure's captured
+            // `this` (`closure` IS `cv.heap_index()` whenever it is not
+            // NO_CLOSURE, and that match yielded `fid`).
+            if closure == NO_CLOSURE {
+                crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_THIS_BIND);
+                return SELF_CALL_DEOPT;
             }
+            lex_this_val
         } else if let Some(recv) = method_this {
             // The method-cross prefix admits only heap-object receivers. For an
             // ordinary strict or sloppy function, OrdinaryCallBindThis therefore
@@ -454,6 +487,7 @@ impl<'p> Vm<'p> {
         } else if self.global_this != 0 {
             Value::heap(self.callee_this_global(cv))
         } else {
+            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_THIS_BIND);
             return SELF_CALL_DEOPT;
         };
         // The callee window sits contiguously above the caller's, which must be
@@ -463,6 +497,7 @@ impl<'p> Vm<'p> {
         let caller_base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
         let new_base = caller_base + caller_regs;
         if new_base != self.regs.len() {
+            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_CONTIG);
             return SELF_CALL_DEOPT;
         }
         let needed = new_base + reg_count;
@@ -556,7 +591,7 @@ impl<'p> Vm<'p> {
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
         // SAFETY: `entry` is `fid`'s Tier-C win64 code (mmap'd, never moves);
         // the window has `reg_count` valid slots; vm is valid.
-        let activation_token = match self.enter_tierc_activation(closure, cv.heap_index(), true) {
+        let activation_token = match self.enter_tierc_activation(closure, cv.heap_index(), true, upvals_raw) {
             Some(token) => token,
             None => {
                 // All window writes are scratch above the caller. Keep the
@@ -565,6 +600,7 @@ impl<'p> Vm<'p> {
                 // Frame-backed fallback before native/user effects.
                 self.regs.truncate(new_base);
                 self.jit_call_depth -= 1;
+                crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_ACTIVATION);
                 self.osr_deopt_exempt = true;
                 return SELF_CALL_DEOPT;
             }

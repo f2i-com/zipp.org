@@ -187,6 +187,16 @@ fn main() -> ExitCode {
         eprintln!("[ic] region iter-next  native steps {ins}  deopts {ide}");
         let (cff, cfl) = zipp_vm::cross_fill_stats();
         eprintln!("[ic] cross-call window fills  fast {cff}  full {cfl}");
+        let decl = zipp_vm::cross_decline_stats();
+        if decl.iter().any(|&d| d != 0) {
+            let mut line = String::from("[ic] cross-call declines ");
+            for (name, d) in zipp_vm::CROSS_DECLINE_NAMES.iter().zip(decl) {
+                if d != 0 {
+                    line.push_str(&format!(" {name} {d}"));
+                }
+            }
+            eprintln!("{line}");
+        }
     }
     if std::env::var_os("ZIPP_RXSTATS").is_some() {
         let (att, pushes, retries, elided, skips) = zipp_vm::rx_stats();
