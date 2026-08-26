@@ -295,6 +295,7 @@ impl<'p> Vm<'p> {
         base: usize,
     ) -> crate::codegen::TaPinPlan {
         use crate::codegen::{TaPin, TaPinPlan, TaPinSrc};
+        let b192_log = std::env::var_os("ZIPP_JITLOG").is_some();
         // Conservative "does this instruction write register r" cover. An op
         // missing here only weakens the hint (see above) — never soundness.
         fn writes(i: &Instr, r: u16) -> bool {
@@ -446,12 +447,20 @@ impl<'p> Vm<'p> {
                 Some(&Instr::LoadGlobal { idx, .. }) if !stored_globals.contains(&idx) => {
                     TaPinSrc::Global(idx)
                 }
-                Some(_) => continue,
+                Some(other) => {
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!("[pin] fn{func_id}@{aip} decline: writer {other:?}");
+                    }
+                    continue;
+                }
                 None => {
                     // Live-in receiver: pin only if NOTHING in the region
                     // writes it (so the prologue/refetch reg read stays the
                     // value the accesses see).
                     if proto.code[s..=e].iter().any(|i| writes(i, obj)) {
+                        if std::env::var_os("ZIPP_JITLOG").is_some() {
+                            eprintln!("[pin] fn{func_id}@{aip} decline: live-in reg written in-region");
+                        }
                         continue;
                     }
                     TaPinSrc::Reg(obj)
@@ -466,6 +475,9 @@ impl<'p> Vm<'p> {
                 TaPinSrc::Reg(r) => self.get(base, r),
             };
             if !live.is_heap() {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!("[pin] fn{func_id}@{aip} decline: live value not heap");
+                }
                 continue;
             }
             let kind = match (self.heap.get(live.heap_index()), &recv) {
@@ -566,6 +578,14 @@ impl<'p> Vm<'p> {
                 }
             };
             plan.access.insert(aip, slot as u8);
+        }
+        if b192_log {
+            let mut ips: Vec<_> = plan.access.keys().copied().collect();
+            ips.sort_unstable();
+            eprintln!(
+                "[pin] fn{func_id} [{start},{end}] built pins={} access={ips:?}",
+                plan.pins.len()
+            );
         }
         plan
     }
