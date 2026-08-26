@@ -1162,7 +1162,12 @@ impl ObjMap {
 
     /// Append one slot's attributes — the raw parallel-vec push. The caller
     /// owns the key/val pushes and any shape maintenance, exactly as with the
-    /// direct field access this replaces.
+    /// direct field access this replaces. Part of the total accessor API: its
+    /// callers are configuration-dependent (JIT emitters, tests), so the
+    /// no-JIT sandbox build sees it unused; in the default build its callers
+    /// are test code, so the lint sees none either. Kept: it is the ONLY
+    /// public append, and the representation flip is meaningless without it.
+    #[allow(dead_code)]
     #[inline]
     pub fn push_attr(&mut self, a: PropAttr) {
         self.attrs.push(a);
@@ -1177,14 +1182,10 @@ impl ObjMap {
     /// Number of attribute slots. Equals `len()` for a consistent map; the
     /// parallel vectors can disagree transiently mid-append, which is exactly
     /// what the callers that ask this are checking.
+    #[cfg_attr(not(all(feature = "jit", target_arch = "x86_64")), allow(dead_code))]
     #[inline]
     pub fn attrs_len(&self) -> usize {
         self.attrs.len()
-    }
-
-    #[inline]
-    pub fn attrs_reserve_exact(&mut self, n: usize) {
-        self.attrs.reserve_exact(n);
     }
 
     /// Might any slot hold an accessor (or otherwise deviate from default
@@ -1201,6 +1202,7 @@ impl ObjMap {
     /// stores it and loads through it on later hits (guarded by the object
     /// version, which every key add bumps). Only meaningful for a slot that
     /// holds an accessor — callers check `attr_at(i).accessor` first.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub fn setter_ref(&self, i: usize) -> &Value {
         match &self.attrs {

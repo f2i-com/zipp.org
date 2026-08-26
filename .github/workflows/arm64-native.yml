@@ -1,32 +1,9 @@
 name: ARM64 native JIT
 
+# Manual-trigger only (was: push to main on engine paths) — Actions quota.
+#   gh workflow run arm64-native.yml
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/arm64-native.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/zipp-vm/**"
-      - "crates/zipp-cli/**"
-      - "crates/regress-fork/**"
-  pull_request:
-    paths:
-      - ".github/workflows/arm64-native.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/zipp-vm/**"
-      - "crates/zipp-cli/**"
-      - "crates/regress-fork/**"
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: arm64-native-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   native-arm64:
     name: ${{ matrix.os }}

@@ -1,10 +1,9 @@
 name: Security
 
+# Manual-trigger only (was: every push + PR + weekly cron) — Actions quota.
+# Run from the GitHub UI (Actions -> this workflow -> Run workflow) or:
+#   gh workflow run security.yml
 on:
-  push:
-  pull_request:
-  schedule:
-    - cron: "17 4 * * 1"
   workflow_dispatch:
 
 permissions:
