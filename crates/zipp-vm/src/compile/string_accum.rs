@@ -46,10 +46,21 @@ pub(crate) fn global_inits_string(
 ) -> bool {
     let mut store_ip = None;
     for (ip, instr) in code.iter().enumerate().take(before) {
-        if let Instr::StoreGlobal { idx, .. } = *instr {
-            if idx == g {
-                store_ip = Some(ip);
+        // All three store spellings: a MODULE top-level binding stores with
+        // `StoreGlobalStrict`, which this scan used to miss — so a module's
+        // `let out = ""; loop { out += x }` never proved its seed and the
+        // append lane declined (the nanoid residual, B186). The body-side
+        // matching a few lines down always covered the strict/resolved
+        // variants; only this init scan lagged.
+        match *instr {
+            Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. } => {
+                if idx == g {
+                    store_ip = Some(ip);
+                }
             }
+            _ => {}
         }
     }
     let sp = match store_ip {
@@ -57,7 +68,9 @@ pub(crate) fn global_inits_string(
         _ => return false,
     };
     let src = match code[sp] {
-        Instr::StoreGlobal { src, .. } => src,
+        Instr::StoreGlobal { src, .. }
+        | Instr::StoreGlobalStrict { src, .. }
+        | Instr::StoreGlobalResolved { src, .. } => src,
         _ => return false,
     };
     match code[sp - 1] {
