@@ -3067,6 +3067,85 @@ pub struct CombinatorData {
     pub keys: Vec<String>,
 }
 
+/// B185: the GC FREE COURIER — a single background thread that performs the
+/// DROP of dead heap payloads collected by the sweep, so the allocator's
+/// free-side work (which the hardened `mimalloc` secure mode makes
+/// deliberately expensive) runs off the mutator's critical path. This is the
+/// same division V8 uses (main-thread marking, helper-thread sweeping),
+/// scoped to the payload drop only: every index/generation/remset bookkeeping
+/// step stays on the mutator, and only variants proven `Send` by
+/// construction ship (plain owned data — `Arc` plan handles decrement
+/// atomically by design). Anything else drops inline exactly as before.
+///
+/// One thread per PROCESS (VM-agnostic: batches carry no VM references),
+/// spawned lazily on the first batch; a send failure falls back to an inline
+/// drop, so the courier can never lose or delay a free unboundedly.
+/// `ZIPP_NO_GC_COURIER=1` restores fully-inline drops.
+mod gc_courier {
+    use std::sync::mpsc;
+    use std::sync::OnceLock;
+
+    /// The payloads the courier may drop off-thread. Each variant is plain
+    /// owned data; adding one here is a `Send` proof obligation the spawn
+    /// below makes the compiler check.
+    #[allow(dead_code)] // the fields exist to OWN payloads across the send;
+    // the courier's entire job is dropping them unread.
+    pub(super) enum Item {
+        Obj(Box<super::ObjMap>),
+        Str(super::JsStr),
+        Arr(Vec<super::Value>),
+        MapKv(Vec<super::Value>, Vec<super::Value>),
+        SetV(Vec<super::Value>),
+    }
+
+    fn enabled() -> bool {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        static STATE: AtomicU8 = AtomicU8::new(0);
+        match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var_os("ZIPP_NO_GC_COURIER").is_none();
+                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    fn sender() -> Option<&'static mpsc::Sender<Vec<Item>>> {
+        if !enabled() {
+            return None;
+        }
+        static TX: OnceLock<Option<mpsc::Sender<Vec<Item>>>> = OnceLock::new();
+        TX.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<Vec<Item>>();
+            std::thread::Builder::new()
+                .name("zipp-gc-courier".into())
+                .spawn(move || {
+                    while let Ok(batch) = rx.recv() {
+                        drop(batch);
+                    }
+                })
+                .ok()
+                .map(|_| tx)
+        })
+        .as_ref()
+    }
+
+    /// Ship a sweep's batch; on any failure the batch drops HERE (inline),
+    /// which is exactly the pre-courier behavior.
+    pub(super) fn ship(batch: Vec<Item>) {
+        if let Some(tx) = sender() {
+            let _ = tx.send(batch);
+        }
+    }
+
+    /// Whether shipping is worth attempting at all (latch + channel alive).
+    pub(super) fn active() -> bool {
+        sender().is_some()
+    }
+}
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
@@ -3554,6 +3633,9 @@ pub struct Heap {
     /// unlike the pinned `r13` versions base, nothing re-derives these.
     pub(crate) shape_mirror_raw: u64,
     pub(crate) vals_ptr_mirror_raw: u64,
+    /// Dead payloads collected by the CURRENT sweep, shipped to the courier
+    /// thread at `note_gc_done`/`note_minor_done` (see [`gc_courier`]).
+    courier_batch: Vec<gc_courier::Item>,
     /// Free list of reclaimed slot indices (filled by the mark-sweep GC's sweep,
     /// drained by `alloc`). A reused slot is overwritten and its version bumped so
     /// any stale JIT inline-cache entry misses. Empty until the first collection.
@@ -3874,6 +3956,7 @@ impl Heap {
             resident_payload_high_water: Cell::new(resident_payload_high_water),
             resident_payload_charged,
             payload_accounting: Cell::new(false),
+            courier_batch: Vec::new(),
             shape_mirror: vec![crate::shape::DICT; versions.len()],
             vals_ptr_mirror: vec![0; versions.len()],
             shape_mirror_raw: 0,
@@ -4444,7 +4527,23 @@ impl Heap {
         let payload = self.resident_payload_charged[idx as usize].replace(0);
         self.resident_payload_current
             .set(self.resident_payload_current.get().saturating_sub(payload));
-        self.objs[idx as usize] = HeapObj::Date(f64::NAN);
+        // B185: the payload DROP ships to the courier thread for the plain
+        // owned variants (the sweep's mass); everything else drops inline
+        // here exactly as before. The bookkeeping around it never leaves the
+        // mutator.
+        let dead = std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN));
+        if gc_courier::active() {
+            match dead {
+                HeapObj::Object(m) => self.courier_batch.push(gc_courier::Item::Obj(m)),
+                HeapObj::Str(js) => self.courier_batch.push(gc_courier::Item::Str(js)),
+                HeapObj::Array(v) => self.courier_batch.push(gc_courier::Item::Arr(v)),
+                HeapObj::Map { keys, vals } => {
+                    self.courier_batch.push(gc_courier::Item::MapKv(keys, vals))
+                }
+                HeapObj::Set(v) => self.courier_batch.push(gc_courier::Item::SetV(v)),
+                other => drop(other),
+            }
+        }
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
         if self.nursery {
             // Tombstones read OLD: `gen == GEN_YOUNG ⇔ in the young log`
@@ -4452,6 +4551,16 @@ impl Heap {
             self.gen[idx as usize] = GEN_OLD;
         }
         self.free.push(idx);
+    }
+
+    /// Ship the sweep's collected payloads to the courier (a no-op batch
+    /// stays local). Called from the two collection-complete notes so the
+    /// batch lifetime is exactly one sweep.
+    #[inline]
+    fn courier_flush(&mut self) {
+        if !self.courier_batch.is_empty() {
+            gc_courier::ship(std::mem::take(&mut self.courier_batch));
+        }
     }
 
     /// Record the post-sweep live count and grow the next threshold to ~2x it
@@ -4467,6 +4576,7 @@ impl Heap {
     /// from the free list, so peak memory is unchanged.
     #[inline]
     pub fn note_gc_done(&mut self, live: usize) {
+        self.courier_flush();
         self.live = live;
         // A MAJOR completed: nothing unreachable survived it, so `live` is
         // the TRUE live count — the anchor both schedules grow from. Floats
@@ -4512,6 +4622,7 @@ impl Heap {
     /// one young budget of where today's collector would have collected.
     #[inline]
     pub fn note_minor_done(&mut self, live: usize) {
+        self.courier_flush();
         self.live = live;
         // Refresh the sweep-amortisation floor: the slot vector may have
         // grown since the last major, and a major sweep walks all of it.
