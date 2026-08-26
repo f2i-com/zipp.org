@@ -466,6 +466,11 @@ const MODES: &[Mode] = &[
         name: "nocross3",
         env: &[("ZIPP_NO_CROSS3", "1")],
     },
+    // B192: INT-tier admission of dead-in-region completion writes.
+    Mode {
+        name: "noundefadmit",
+        env: &[("ZIPP_NO_UNDEF_ADMIT", "1")],
+    },
     Mode {
         name: "upvalmin12",
         env: &[("ZIPP_TIERC_UPVAL_MIN", "12")],

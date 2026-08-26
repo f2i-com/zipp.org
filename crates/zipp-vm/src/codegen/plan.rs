@@ -257,6 +257,14 @@ pub(crate) struct RegionPlan {
     ///
     /// Empty under `ZIPP_NO_BOX_HOME=1`, and empty for every non-regalloc plan.
     pub(crate) box_regs: FxHashSet<u16>,
+    /// B192 statement-completion regs: written by in-region `LoadUndefined` /
+    /// `Move`, never READ in-region (module top-level bookkeeping). UNTYPED
+    /// and UNHOMED; the INT emitters write every def through to the frame
+    /// slot (canonical UNDEFINED bits, or the boxed Num source of a `Move`),
+    /// so interpreter-resume state at any bail ip is exact. The admission
+    /// scan (`int_unadmitted_ips`) and the planner enforce that no other op
+    /// defines them and every completion `Move` source is Num-typed.
+    pub(crate) undef_dead: FxHashSet<u16>,
     /// W28 TYPE-AWARE LIVE-RANGE SPLITTING — a VM register the bytecode
     /// compiler recycled ACROSS A TYPE BOUNDARY: a `VTy::Bool` compare result
     /// over one range and a `VTy::Num` value over a disjoint one. Before this

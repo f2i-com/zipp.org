@@ -241,6 +241,20 @@ pub(crate) fn poly_crosscall_enabled() -> bool {
 /// resolves the live closure and live Tier-C entry on every invocation.
 /// `ZIPP_NO_SAME_PROTO_CROSS2=1` restores the generic cross-call helper for a
 /// same-binary A/B.
+pub(crate) fn undef_admit_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_UNDEF_ADMIT").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 pub(crate) fn quick_len_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);

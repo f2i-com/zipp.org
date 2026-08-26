@@ -326,10 +326,18 @@ pub(crate) fn emit_icmp(
 /// if it fits i32 (low 32 masked in), else a double via `cvtsi2sd` (exact since
 /// |x| ≤ 2^53, enforced by the per-op guard). Used by flush_exit.
 pub(crate) fn emit_int_box_from_home(ops: &mut dynasmrt::x64::Assembler, h: u8) {
+    dynasm!(ops ; movq rax, Rx(h));
+    emit_int_box_rax(ops);
+}
+
+/// Box the i64 already in `rax` into a Value in `rax` — the tail of
+/// [`emit_int_box_from_home`], split out (B192) so the GPR tier's
+/// completion-reg write-through can box from a GPR/spill source too.
+/// Scratch: rcx/rdx/xmm0; clobbers FLAGS.
+pub(crate) fn emit_int_box_rax(ops: &mut dynasmrt::x64::Assembler) {
     let big = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops
-        ; movq rax, Rx(h)
         ; cmp rax, 0x7FFFFFFF            // > i32::MAX ?
         ; jg => big
         ; cmp rax, -0x80000000           // < i32::MIN ?

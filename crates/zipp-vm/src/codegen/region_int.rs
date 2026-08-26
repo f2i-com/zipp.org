@@ -406,6 +406,34 @@ pub(crate) fn region_is_int(proto: &FuncProto, start: u32, end: u32, ta_plan: &T
 /// disqualifying the whole region from the integer tier. That matters because a
 /// single `substring`/`+=` in a branch that never runs was demoting an entire
 /// `charCodeAt` scan loop from 1.7 ns/iteration (parity with V8) to 8.0 ns.
+/// B192: registers written by an in-region `LoadUndefined` and NEVER READ
+/// in-region — the module wrapper's statement-completion regs. The admission
+/// scan, the planner, and both INT emitters all consume this ONE definition:
+/// the planner leaves the regs untyped/unhomed, and the emitters write every
+/// def of them through to the frame slot (canonical UNDEFINED bits for the
+/// LoadUndefined; a boxed home store for a Move), keeping interpreter-resume
+/// state exact at every bail ip.
+pub(crate) fn undef_dead_regs(
+    proto: &FuncProto,
+    s: usize,
+    e: usize,
+) -> rustc_hash::FxHashSet<u16> {
+    let mut dsts: rustc_hash::FxHashSet<u16> = rustc_hash::FxHashSet::default();
+    for ins in &proto.code[s..=e] {
+        if let Instr::LoadUndefined { dst } = *ins {
+            dsts.insert(dst);
+        }
+    }
+    if !dsts.is_empty() {
+        for ins in &proto.code[s..=e] {
+            for u in instr_uses(ins) {
+                dsts.remove(&u);
+            }
+        }
+    }
+    dsts
+}
+
 pub(crate) fn int_unadmitted_ips(
     proto: &FuncProto,
     start: u32,
@@ -422,6 +450,20 @@ pub(crate) fn int_unadmitted_ips(
     }
     let mut unadmitted: Vec<usize> = Vec::new();
     let (s, e) = (start as usize, end as usize);
+    // B192: `LoadUndefined` into a reg that is NEVER READ in-region (module
+    // top-level statement-COMPLETION bookkeeping — `LoadUndefined dst` at a
+    // loop head, `Move dst, value` per statement, no in-region reader). Such
+    // a reg is deliberately NOT typed or homed (see `undef_dead_regs` in the
+    // planner, which uses the same definition); every def of it emits as a
+    // write-through store to the frame slot, so an interpreter resume at any
+    // bail ip reads exactly the values it would have computed itself. A
+    // LoadUndefined whose dst IS read in-region stays unadmitted — the region
+    // declines to the MEM tier exactly as before.
+    let undef_dead = if crate::codegen::undef_admit_enabled() {
+        undef_dead_regs(proto, s, e)
+    } else {
+        rustc_hash::FxHashSet::default()
+    };
     // Reads from the exact fixed-width integer kinds whose full range is i32
     // fit the lane; writes remain Int32-only because width/clamp conversion is
     // dtype-specific and is deliberately not part of this read-only widening.
@@ -544,6 +586,8 @@ pub(crate) fn int_unadmitted_ips(
             // rung later. It rides the package's latch for exactly that reason
             // -- it is the third rung of one ladder, not a mechanism.
             Instr::Not { .. } if int_push_enabled() => {}
+            // B192: dead-in-region completion writes (see `undef_dead` above).
+            Instr::LoadUndefined { dst } if undef_dead.contains(&dst) => {}
             // `Math.imul(a, b)` — a 2-arg int32 multiply (ToInt32 of the low 32 of
             // the product); the int path emits a native `imul eax, ecx`.
             Instr::MathOp { op: MathFn::Imul, argc: 2, .. } => {}
@@ -1382,6 +1426,23 @@ pub(crate) fn compile_region_int_maybe_cold(
                 if let Some(d) = writes_reg(&proto.code[ip]) {
                     copy_clobber(&mut lc, xh(&plan, d));
                 }
+            }
+            // ── B192: statement-completion regs (untyped, unhomed) ── every
+            // def writes THROUGH to the frame slot (the GPR emitter's twin
+            // arms carry the full reasoning). `mov` preserves FLAGS for the
+            // LoadUndefined; the Move's boxing clobbers them.
+            Instr::LoadUndefined { dst } => {
+                debug_assert!(plan.undef_dead.contains(&dst));
+                let bits = crate::value::Value::UNDEFINED.bits();
+                dynasm!(ops ; mov rax, QWORD bits as i64 ; mov [rbx + dreg(dst)], rax);
+                flag_cmp = prev_flag;
+            }
+            Instr::Move { dst, src } if plan.undef_dead.contains(&dst) => {
+                let srx = xh(&plan, src);
+                emit_int_box_from_home(&mut ops, srx);
+                dynasm!(ops ; mov [rbx + dreg(dst)], rax);
+                copy_clobber(&mut lc, srx); // rax/flags clobbered; drop any live copy fusion
+                lc = None;
             }
             Instr::Move { dst, src } => match home(&plan, dst) {
                 Home::Xmm(d) => {

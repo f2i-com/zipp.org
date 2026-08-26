@@ -447,6 +447,9 @@ fn hoistable_pins(
             Instr::LoadInt { .. }
             | Instr::LoadConst { .. }
             | Instr::Move { .. }
+            // B192: a completion-reg store of the canonical UNDEFINED bits —
+            // pure, no user code, no allocation, no GC.
+            | Instr::LoadUndefined { .. }
             | Instr::LoadGlobal { .. }
             | Instr::StoreGlobal { .. }
             | Instr::StoreGlobalStrict { .. }
@@ -1656,11 +1659,25 @@ fn plan_region_cold_inner(
     // implements per-def write-through: the exit contract is write-through's.
     // Every other planner caller sees an empty map and plans byte-identically,
     // which is what makes the 13 `bench/real` rows unchanged by construction.
+    // B192: statement-completion regs (in-region `LoadUndefined` dst, never
+    // read in-region) stay UNTYPED and UNHOMED — `LoadUndefined` already
+    // falls to the no-def catch-all below, and the `Move` arm skips them so
+    // a per-statement completion `Move` cannot type the reg Num (a home
+    // would clash with the UNDEFINED write and go stale at exit-flush).
+    // Both INT emitters write every def of these regs through to the frame
+    // slot; the admission scan admits `LoadUndefined` only for this set.
+    let undef_dead = if crate::codegen::undef_admit_enabled() {
+        super::region_int::undef_dead_regs(proto, s, e)
+    } else {
+        FxHashSet::default()
+    };
+
     let ty_splits: FxHashMap<u16, TySplit> =
         if admit_bitwise && (admit_dv || share_homes) && admit_wt_share && cold.is_empty() {
             let mut excluded: FxHashSet<u16> = ta_recv_regs.clone();
             excluded.extend(split_recvs.iter().copied());
             excluded.extend(box_regs.iter().copied());
+            excluded.extend(undef_dead.iter().copied());
             for pin in &ta_plan.pins {
                 if let TaPinSrc::Reg(r) = pin.src {
                     excluded.insert(r);
@@ -1873,11 +1890,24 @@ fn plan_region_cold_inner(
         // so its Bool must not type the register — the remaining defs are Num.
         let is_split_recv_load =
             split_recv_lg.contains(&(s + off)) || dv_flag_elide.contains(&(s + off));
+        // B192: a completion reg (`undef_dead`) may ONLY be defined by the two
+        // ops the INT emitters write through (`LoadUndefined` reaches the
+        // no-def catch-all; `Move` is filtered below). Any other def-op means
+        // this shape is not the statement-completion pattern — decline to the
+        // MEM tier rather than home a reg the write-through contract skips.
+        if let Some(d) = def {
+            if undef_dead.contains(&d) && !matches!(*instr, Instr::Move { .. }) {
+                decline!("undef-dead completion reg defined by unsupported op");
+            }
+        }
         // W20: a `box_regs` member is deliberately UNTYPED and UNHOMED -- its
         // value lives in the frame slot the def writes.
-        if let Some(d) = def
-            .filter(|d| !ta_recv_regs.contains(d) && !is_split_recv_load && !box_regs.contains(d))
-        {
+        if let Some(d) = def.filter(|d| {
+            !ta_recv_regs.contains(d)
+                && !is_split_recv_load
+                && !box_regs.contains(d)
+                && !undef_dead.contains(d)
+        }) {
             // Move's dst type follows its src; default Num is corrected here.
             let t = if let Instr::Move { src, .. } = *instr {
                 *ty.get(&src).unwrap_or(&VTy::Num)
@@ -1966,6 +1996,22 @@ fn plan_region_cold_inner(
     // with a parameter bound (INT declined -> DOUBLE/MEM) vs 52ms with a literal
     // bound (INT compiled).
     //
+    // B192: every completion `Move` must copy a NUM-typed source — the
+    // emitters box the source home as a number. A Bool or untyped (slot-const
+    // / receiver / live-in-unknown) source declines to the MEM tier. Checked
+    // here, after the walk, so in-region defs on the backedge are settled.
+    if !undef_dead.is_empty() {
+        for (off, instr) in code[s..=e].iter().enumerate() {
+            if cold.contains(&(s + off)) {
+                continue;
+            }
+            if let Instr::Move { dst, src } = *instr {
+                if undef_dead.contains(&dst) && ty.get(&src) != Some(&VTy::Num) {
+                    decline!("completion move of a non-Num source");
+                }
+            }
+        }
+    }
     // TA-receiver regs are intentionally untyped (sourced via the pin) — skip them.
     let mut ro_live_in: Vec<u16> = Vec::new();
     for (off, instr) in code[s..=e].iter().enumerate() {
@@ -3860,6 +3906,7 @@ fn plan_region_cold_inner(
         hoist_len_ips,
         strict_entry_globs,
         box_regs,
+        undef_dead,
         getprop_ips,
         ty_splits,
     }))

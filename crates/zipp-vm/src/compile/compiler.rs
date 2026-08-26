@@ -312,7 +312,14 @@ impl Compiler {
         captured: HashSet<String>,
         enclosing: Vec<EnclosingFn>,
     ) -> R<FuncProto> {
-        let eval_completion = is_script && self.eval_mode;
+        // B192: a MODULE's completion value is spec-unobservable (Module
+        // Record Evaluate() resolves undefined; dynamic import resolves the
+        // NAMESPACE), so tracking it bought nothing and planted a
+        // `LoadUndefined` + per-statement `Move` into every module top-level
+        // loop body — which alone demoted such loops off the INT register
+        // tier (3× on the isolated nest). Eval scripts keep it: `eval()`'s
+        // RESULT is the completion value.
+        let eval_completion = is_script && self.eval_mode && !self.module_mode;
         // A real function body leaves any enclosing field-initializer context
         // (the eval ROOT script keeps it: PerformEval's ContainsArguments check
         // spans the eval program's top level and its arrows).

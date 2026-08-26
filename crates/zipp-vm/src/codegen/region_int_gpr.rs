@@ -1810,6 +1810,14 @@ fn lazy_sx_sets(
         }
     }
     for ip in s..=e {
+        // B192: completion regs are unhomed; their `Move`/`LoadUndefined`
+        // defs write through to the frame slot and take no part in the
+        // sign-extension deferral census.
+        if let Some(d) = writes_reg(&proto.code[ip]) {
+            if plan.undef_dead.contains(&d) {
+                continue;
+            }
+        }
         if let Some(d) = writes_reg(&proto.code[ip]) {
             if plan.dead.contains(&d) {
                 continue; // not emitted — no def
@@ -2772,6 +2780,34 @@ pub(crate) fn compile_region_int_gpr(
                         Loc::S(d) => dynasm!(ops ; mov QWORD [rsp + d], v),
                     }
                 }
+            }
+            // ── B192: statement-completion regs (untyped, unhomed) ──
+            // every def writes THROUGH to the frame slot so an interpreter
+            // resume at any bail ip reads exactly the completion value it
+            // would have computed. `mov` preserves FLAGS, so LoadUndefined
+            // keeps a live compare fusion; the Move's boxing does not.
+            Instr::LoadUndefined { dst } => {
+                debug_assert!(plan.undef_dead.contains(&dst));
+                let bits = crate::value::Value::UNDEFINED.bits();
+                dynasm!(ops ; mov rax, QWORD bits as i64 ; mov [rbx + dreg(dst)], rax);
+                flag_cmp = prev_flag;
+            }
+            Instr::Move { dst, src: sr } if plan.undef_dead.contains(&dst) => {
+                match src(sr) {
+                    Src::I(v) => {
+                        let bits = INT_TAG | v as u32 as u64;
+                        dynasm!(ops ; mov rax, QWORD bits as i64);
+                    }
+                    Src::R(g) => {
+                        dynasm!(ops ; mov rax, Rq(g));
+                        emit_int_box_rax(&mut ops);
+                    }
+                    Src::S(d) => {
+                        dynasm!(ops ; mov rax, QWORD [rsp + d]);
+                        emit_int_box_rax(&mut ops);
+                    }
+                }
+                dynasm!(ops ; mov [rbx + dreg(dst)], rax);
             }
             Instr::Move { dst, src: sr } => match home(plan, dst) {
                 Home::Xmm(dx) => {
