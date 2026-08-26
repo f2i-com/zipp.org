@@ -4735,7 +4735,11 @@ impl Heap {
         if let Some(idx) = self.free.pop() {
             self.objs[idx as usize] = obj;
             debug_assert_eq!(self.resident_payload_charged[idx as usize].get(), 0);
-            self.resident_payload_charged[idx as usize].set(payload);
+            // B197: skip the (always-zero) charge-cell write with accounting
+            // off — one less line on the slot-reuse alloc path.
+            if self.payload_accounting.get() {
+                self.resident_payload_charged[idx as usize].set(payload);
+            }
             self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
             self.refresh_mirror(idx);
             if self.nursery {
@@ -5217,9 +5221,14 @@ impl Heap {
         self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
         self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
         self.upvals_mirror[idx as usize] = 0;
-        let payload = self.resident_payload_charged[idx as usize].replace(0);
-        self.resident_payload_current
-            .set(self.resident_payload_current.get().saturating_sub(payload));
+        // B197: the charge cell is touched only under accounting — with it
+        // off (the default) every charge is 0 and the replace was a pure
+        // extra cache line on the sweep's per-dead path.
+        if self.payload_accounting.get() {
+            let payload = self.resident_payload_charged[idx as usize].replace(0);
+            self.resident_payload_current
+                .set(self.resident_payload_current.get().saturating_sub(payload));
+        }
         // B185: the payload DROP ships to the courier thread for the plain
         // owned variants (the sweep's mass); everything else drops inline
         // here exactly as before. The bookkeeping around it never leaves the

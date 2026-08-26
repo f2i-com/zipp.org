@@ -89,7 +89,7 @@ impl Value {
     }
 
     #[inline(always)]
-    pub fn bits(self) -> u64 {
+    pub const fn bits(self) -> u64 {
         self.0
     }
 
