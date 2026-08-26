@@ -98,14 +98,12 @@ const _: () = {
     assert!(core::mem::offset_of!(A, upvals_raw) == 16);
     assert!(core::mem::size_of::<A>() == 24);
 };
-/// B189b mirrors for the emitted call lane: a Closure occupant's captured
-/// `this` bits and its upvalue base (see the heap field docs).
+/// B189b mirror for the emitted call lane: a Closure occupant's captured
+/// `this` bits (the upvalue base travels helper-side through
+/// `jit_cross3_enter`, so it has no emitted offset).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_THIS_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
     + core::mem::offset_of!(crate::heap::Heap, this_mirror_raw);
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const JIT_UPVALS_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
-    + core::mem::offset_of!(crate::heap::Heap, upvals_mirror_raw);
 /// B189b native GC-due guard: the emitted lane calls only when NO collection
 /// is pending (`maybe_gc` would be a no-op); a pending request routes to the
 /// helper, whose safe point runs it.

@@ -995,8 +995,9 @@ pub struct HeapHelperAddrs {
     /// Exact rotating same-prototype lexical-arrow/two-argument sibling of
     /// `cross_call`; it shares the same live-resolution and fallback protocol.
     pub cross_call_same_proto2: usize,
-    pub window_open: usize,
+    pub cross3_enter: usize,
     pub window_close: usize,
+    pub cross3_unroot: usize,
     pub cross3_finish: usize,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
     /// class-instance receiver): interpreter-IC resolution + getter frame
@@ -1181,8 +1182,9 @@ impl HeapHelperAddrs {
             call_ic: self.call_ic,
             cross_call: self.cross_call,
             cross_call_same_proto2: self.cross_call_same_proto2,
-            window_open: self.window_open,
+            cross3_enter: self.cross3_enter,
             window_close: self.window_close,
+            cross3_unroot: self.cross3_unroot,
             cross3_finish: self.cross3_finish,
             get_prop_slow: self.get_prop_slow,
             set_prop_slow: self.set_prop_slow,

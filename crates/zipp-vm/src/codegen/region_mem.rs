@@ -3654,13 +3654,16 @@ pub(crate) fn chain_capacity_hint(code: &[Instr], ip: usize, acc: u16, end: usiz
 /// call environment by the three nonempty bytes, GC/depth/route by their
 /// scalars) is revalidated by a cheap guard whose miss falls through to the
 /// UNCHANGED helper block emitted right after -- a pure prefix. The 48-byte
-/// stack scratch at `c3` holds: prior activation (24B) @ +0, window base|flag
-/// @ +24, result @ +32, bail slot @ +40.
+/// stack scratch at `c3` holds: prior activation (24B) @ +0, window
+/// base|flags @ +24, result @ +32, bail slot @ +40.
 ///
-/// On the mid-body-bail path the `cross3_finish` helper COMPLETES the call
-/// (B184: effects have happened; interpreter resume over the same window,
-/// never a replay); `CALL_THREW` unwinds via the region bail label exactly
-/// like the helper route.
+/// `jit_cross3_enter` opens the window AND installs the callee's activation
+/// (duplicating a frame-free-active prior on the GC root stack -- bit 1 of
+/// its return says so, and `jit_cross3_unroot` pops the duplicate after the
+/// inline restore). On the mid-body-bail path the `cross3_finish` helper
+/// COMPLETES the call (B184: effects have happened; interpreter resume over
+/// the same window, never a replay); `CALL_THREW` unwinds via the region
+/// bail label exactly like the helper route.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_cross3_call(
     ops: &mut dynasmrt::x64::Assembler,
@@ -3681,10 +3684,10 @@ pub(crate) fn emit_cross3_call(
         JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_FID_MIRROR_RAW_OFFSET, JIT_GC_REQUESTED_OFFSET,
         JIT_GC_STRESS_OFFSET, JIT_GLOBAL_ROUTE_EPOCH_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
         JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_THIS_MIRROR_RAW_OFFSET,
-        JIT_UPVALS_MIRROR_RAW_OFFSET,
     };
     let fb = ops.new_dynamic_label();
     let zeroed = ops.new_dynamic_label();
+    let noroot = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
     let act = JIT_ACTIVATION_OFFSET as i32;
     let depth = JIT_CALL_DEPTH_OFFSET as i32;
@@ -3714,15 +3717,19 @@ pub(crate) fn emit_cross3_call(
         ; jne => fb
         ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
         ; jne => fb
-        // A suspended frame-free prior would need the activation root stack --
-        // helper territory (active@0 == 1 && frame_free@1 == 1).
-        ; cmp WORD [rdi + act], 0x0101
-        ; je => fb
-        // -- window open --
+        // -- save the prior activation (three qwords), then enter: window +
+        // callee activation install in one helper (root-stack aware) --
+        ; mov r11, [rdi + act]
+        ; mov [rsp + c3], r11
+        ; mov r11, [rdi + act + 8]
+        ; mov [rsp + c3 + 8], r11
+        ; mov r11, [rdi + act + 16]
+        ; mov [rsp + c3 + 16], r11
         ; mov rcx, rdi
         ; lea rdx, [rbx + dreg(caller_regs)]
         ; mov r8d, plan.callee_regs as i32
-        ; mov rax, QWORD heap.window_open as i64
+        ; mov r9d, r10d
+        ; mov rax, QWORD heap.cross3_enter as i64
         ; call rax
         ; test rax, rax
         ; jz => fb
@@ -3730,22 +3737,9 @@ pub(crate) fn emit_cross3_call(
         // Reload the callee (no user code ran; the register is unchanged).
         ; mov rax, [rbx + dreg(callee)]
         ; mov r10d, eax
-        // -- save prior activation, install the callee state --
-        ; mov r11, [rdi + act]
-        ; mov [rsp + c3], r11
-        ; mov r11, [rdi + act + 8]
-        ; mov [rsp + c3 + 8], r11
-        ; mov r11, [rdi + act + 16]
-        ; mov [rsp + c3 + 16], r11
-        ; mov DWORD [rdi + act], 0x0101
-        ; mov [rdi + act + 4], r10d
-        ; mov [rdi + act + 8], r10d
-        ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
-        ; mov r11, [r11 + r10 * 8]
-        ; mov [rdi + act + 16], r11
         // -- window fill: this, args, then the may-read-before-write mask --
         ; mov r9, [rsp + c3 + 24]
-        ; and r9, -2
+        ; and r9, -4
     );
     if plan.arrow_this {
         dynasm!(ops
@@ -3794,13 +3788,20 @@ pub(crate) fn emit_cross3_call(
         ; mov rax, QWORD plan.entry as i64
         ; call rax
         ; mov [rsp + c3 + 32], rax
-        // -- restore the caller activation --
+        // -- restore the caller activation inline; pop the root-stack
+        // duplicate when enter reported one --
         ; mov r11, [rsp + c3]
         ; mov [rdi + act], r11
         ; mov r11, [rsp + c3 + 8]
         ; mov [rdi + act + 8], r11
         ; mov r11, [rsp + c3 + 16]
         ; mov [rdi + act + 16], r11
+        ; test BYTE [rsp + c3 + 24], 2
+        ; jz => noroot
+        ; mov rcx, rdi
+        ; mov rax, QWORD heap.cross3_unroot as i64
+        ; call rax
+        ; => noroot
         ; mov r10d, [rsp + c3 + 40]
         ; cmp r10d, crate::codegen::NO_BAIL as i32
         ; jne => slow
@@ -3808,7 +3809,7 @@ pub(crate) fn emit_cross3_call(
         ; dec DWORD [rdi + depth]
         ; mov rcx, rdi
         ; mov rdx, [rsp + c3 + 24]
-        ; and rdx, -2
+        ; and rdx, -4
         ; mov rax, QWORD heap.window_close as i64
         ; call rax
         ; mov rax, [rsp + c3 + 32]
@@ -3826,7 +3827,7 @@ pub(crate) fn emit_cross3_call(
         ; => slow
         ; mov rcx, rdi
         ; mov rdx, [rsp + c3 + 24]
-        ; and rdx, -2
+        ; and rdx, -4
         ; mov r8, r10
         ; shl r8, 32
         ; mov r11, QWORD (((plan.argc as u64) << 24) | plan.fid as u64) as i64

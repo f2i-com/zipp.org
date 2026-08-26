@@ -4837,21 +4837,32 @@ fn jit_tierc_cell(vm: &Vm<'_>, idx: u32) -> Option<u32> {
         .then_some(cell)
 }
 
-/// B189b: open a cross-call callee window for the EMITTED call lane.
-/// `new_base_ptr` is the caller's window top (`rbx + caller_regs*8`);
-/// `reg_count` the callee frame size. Returns the window base pointer with
-/// bit 0 set when the slots were freshly zero-filled (the resize path — the
-/// emitted mask stores may be skipped), or 0 when the emitted lane must fall
-/// back to the full helper (non-contiguous top / overflow) — in which case NO
-/// state was changed, so the helper replays from scratch as a pure prefix.
+/// B189b: open a cross-call callee window AND install the callee's activation
+/// for the EMITTED call lane. `new_base_ptr` is the caller's window top
+/// (`rbx + caller_regs*8`); `reg_count` the callee frame size; `callee_idx`
+/// the callee's heap slot (the lane's fid guard already matched it, so it is
+/// a plain Func/Closure). The EMITTED code saves the prior activation's three
+/// qwords BEFORE this call and restores them inline after the callee returns;
+/// this helper additionally duplicates a frame-free-active prior onto the GC
+/// root stack — exactly `enter_tierc_activation`'s contract — and reports it
+/// via bit 1 so the emitted code pops the duplicate (`jit_cross3_unroot`).
+///
+/// Returns the window base pointer with bit 0 = "slots freshly zero-filled"
+/// (the resize path — emitted mask stores may be skipped) and bit 1 =
+/// "prior was duplicated on the root stack"; 0 when the emitted lane must
+/// fall back to the full helper (non-contiguous top / overflow / root-stack
+/// cap) — in which case NO state was changed, so the helper replays from
+/// scratch as a pure prefix.
 ///
 /// # Safety
-/// `vm` is the live VM; `new_base_ptr` points into its pinned register file.
+/// `vm` is the live VM; `new_base_ptr` points into its pinned register file;
+/// `callee_idx` is the live heap slot the lane's guards validated.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_window_open(
+pub(crate) extern "win64" fn jit_cross3_enter(
     vm: *mut core::ffi::c_void,
     new_base_ptr: *mut u64,
     reg_count: u32,
+    callee_idx: u32,
 ) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
     let regs_base = vm.regs.as_ptr() as usize;
@@ -4863,19 +4874,56 @@ pub(crate) extern "win64" fn jit_window_open(
     if vm.regs_would_overflow(needed) {
         return 0;
     }
+    let prior = vm.jit_tierc_activation;
+    let rooted = prior.active && prior.frame_free;
+    if rooted {
+        if vm.jit_tierc_activation_stack.len() >= TIER_C_ACTIVATION_ROOT_STACK_MAX {
+            return 0;
+        }
+        vm.jit_tierc_activation_stack.push(prior);
+        activationrootstats::nested_under_frame_free();
+    }
+    vm.jit_tierc_activation = TiercActivationState {
+        active: true,
+        frame_free: true,
+        closure: callee_idx,
+        callee: callee_idx,
+        upvals_raw: vm.heap.upvals_mirror_of(callee_idx),
+    };
+    let mut out = new_base_ptr as u64;
     if needed <= vm.regs_hw {
         // SAFETY: needed ≤ regs_hw ≤ capacity; [0..regs_hw] was initialized by
         // an earlier resize and the pinned buffer never reallocates, so these
         // slots hold valid (stale) `Value`s the emitted mask stores overwrite.
         unsafe { vm.regs.set_len(needed) };
         crossstats::fill_fast();
-        new_base_ptr as u64
     } else {
         vm.regs.resize(needed, Value::UNDEFINED);
         vm.regs_hw = needed;
         crossstats::fill_full();
-        new_base_ptr as u64 | 1
+        out |= 1;
     }
+    if rooted {
+        out |= 2;
+    }
+    out
+}
+
+/// B189b: pop the root-stack duplicate [`jit_cross3_enter`] pushed for a
+/// frame-free-active prior. The emitted code has ALREADY restored the prior
+/// activation inline; the popped duplicate must equal it.
+///
+/// # Safety
+/// Called exactly once per enter that reported bit 1.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_cross3_unroot(vm: *mut core::ffi::c_void) {
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let popped = vm.jit_tierc_activation_stack.pop();
+    debug_assert_eq!(
+        popped,
+        Some(vm.jit_tierc_activation),
+        "cross3 root-stack imbalance"
+    );
 }
 
 /// B189b: close the emitted lane's callee window (the `regs.truncate` the

@@ -4395,6 +4395,14 @@ impl Heap {
         self.upvals_mirror_raw = self.upvals_mirror.as_ptr() as u64;
     }
 
+    /// The B189b upvalue-base mirror entry for `idx` (0 = none) — the
+    /// emitted call lane's activation install reads it helper-side too.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn upvals_mirror_of(&self, idx: u32) -> u64 {
+        self.upvals_mirror[idx as usize]
+    }
+
     /// Pin slot `idx`'s mirrors permanently unmatchable. For the receivers
     /// `ic_obj_ok` excludes from every property cache (the global object,
     /// %Array.prototype%, realm globals, module namespaces): their live

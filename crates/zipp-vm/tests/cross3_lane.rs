@@ -128,3 +128,52 @@ fn cross3_arrow_this_reads_the_captured_receiver() {
     );
     assert_eq!(out, vec!["acc=-1304178624".to_string()]);
 }
+
+/// The NESTED shape: a whole-fn Tier-C body, itself running FRAME-FREE via a
+/// cross call, executes its own emitted cross3 site. `jit_cross3_enter` must
+/// duplicate the suspended frame-free prior on the GC root stack (bit 1 →
+/// `jit_cross3_unroot`); the activation-root counter proves the branch ran.
+/// The inner arrows are heated FIRST so the outer bodies bake live entries.
+#[test]
+fn cross3_nested_frame_free_prior_roots_and_answers() {
+    let before = zipp_vm::tierc_activation_root_stats();
+    let out = run_ok(
+        r#"
+        "use strict";
+        function makeInner(k) {
+          return (a, b) => (a + b + k) | 0;
+        }
+        var inner = [];
+        for (var i = 0; i < 16; i++) inner.push(makeInner(i * 7));
+        var warm = 0;
+        for (var i = 0; i < 300000; i++) {
+          var g = inner[i & 15];
+          warm = (warm + g(i, 1)) | 0;
+        }
+        function makeOuter(k) {
+          return function outer(a, b) {
+            "use strict";
+            var h = inner[(a + k) & 15];
+            return (h(a, b) + 1) | 0;
+          };
+        }
+        var outer = [];
+        for (var i = 0; i < 16; i++) outer.push(makeOuter(i));
+        var acc = 0;
+        for (var i = 0; i < 400000; i++) {
+          var f = outer[i & 15];
+          acc = (acc + f(i, 3)) | 0;
+        }
+        console.log("warm=" + warm, "acc=" + acc);
+        "#,
+    );
+    assert_eq!(out, vec!["warm=2066227040 acc=-1583378624".to_string()]);
+    // The counter is only maintained under ZIPP_ICSTATS; require the branch
+    // only when the stats are live so the test stays meaningful either way.
+    if std::env::var_os("ZIPP_ICSTATS").is_some() {
+        assert!(
+            zipp_vm::tierc_activation_root_stats() > before,
+            "the frame-free-prior duplication branch never ran"
+        );
+    }
+}

@@ -1967,9 +1967,15 @@ pub(crate) fn compile_proto_mem(
         .chain(method_plan.values().map(|p| p.win_top as u64))
         .max()
         .unwrap_or(0);
-    // 32B shadow + 8B 5th-arg slot = 40; + a 16B leaf-headroom-flag slot when
-    // inlining (keeps the frame's 16-alignment after the 6 pushes).
+    // 32B shadow + 8B 5th-arg slot = 40; + the B189b 48B emitted-call scratch
+    // when a Call site carries a cross3 plan (region_mem's layout: prior
+    // activation 24B @ c3, window base|flags @ c3+24, result @ c3+32, bail
+    // slot @ c3+40); + a 16B leaf-headroom-flag slot when inlining (48 and 16
+    // both keep the frame's 16-alignment after the 6 pushes).
+    let do_cross3 = meter.is_none() && cross_plan.values().any(|site| site.cross3.is_some());
+    let c3_off: i32 = 40;
     let frame: i32 = 40
+        + if do_cross3 { 48 } else { 0 }
         + if do_leaf || method_needs_headroom {
             16
         } else {
@@ -3879,6 +3885,29 @@ pub(crate) fn compile_proto_mem(
                 let cross_done = ops.new_dynamic_label();
                 if cross {
                     let site = cross_site.expect("cross site disappeared during emission");
+                    // B189b: the fully-emitted lane first; every guard miss
+                    // falls through to the unchanged helper block below (a
+                    // pure prefix). Whole-fn callers run under a frame-free
+                    // activation when cross-called themselves; the enter
+                    // helper's root-stack duplication handles exactly that.
+                    if let Some(c3plan) = site.cross3 {
+                        if do_cross3 {
+                            emit_cross3_call(
+                                &mut ops,
+                                c3plan,
+                                callee,
+                                arg_base,
+                                dst,
+                                proto.reg_count.max(1),
+                                c3_off,
+                                &heap,
+                                bail,
+                                cross_done,
+                                refetch.is_some(),
+                                None,
+                            );
+                        }
+                    }
                     let same_proto2 = site.same_proto2;
                     let packed_cross: u64 = match same_proto2 {
                         Some(plan) => {
