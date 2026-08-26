@@ -58,17 +58,25 @@ pub(crate) const JIT_MI_CLASS_EPOCH_OFFSET: usize =
 /// unlike the pinned `r13` versions base nothing re-derives these, so a
 /// baked address would dangle after growth.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const JIT_SHAPE_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
-    + core::mem::offset_of!(crate::heap::Heap, shape_mirror_raw);
+pub(crate) const JIT_HOT_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, hot_mirror_raw);
+/// B195: the hot record's compile-checked layout — the emitted probes
+/// address `base + idx*16` (one `lea` doubling the scale-8 index) and then
+/// read the shape at +0, the fid at +4 and the vals base at +8.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const JIT_VALS_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
-    + core::mem::offset_of!(crate::heap::Heap, vals_ptr_mirror_raw);
-/// VM-relative byte offset of the heap's callee-fid mirror base (B189): same
-/// derive-per-access rule as the shape/vals mirrors above.
+pub(crate) const JIT_HOT_SHAPE_OFF: usize = 0;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-#[allow(dead_code)] // consumed by the B189b emitted same-proto call lane
-pub(crate) const JIT_FID_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
-    + core::mem::offset_of!(crate::heap::Heap, fid_mirror_raw);
+pub(crate) const JIT_HOT_FID_OFF: usize = 4;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_HOT_VALS_OFF: usize = 8;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    use crate::heap::HotMirror as H;
+    assert!(core::mem::offset_of!(H, shape) == JIT_HOT_SHAPE_OFF);
+    assert!(core::mem::offset_of!(H, fid) == JIT_HOT_FID_OFF);
+    assert!(core::mem::offset_of!(H, vals) == JIT_HOT_VALS_OFF);
+    assert!(core::mem::size_of::<H>() == 16);
+};
 /// VM-relative byte offset of the heap's cell-value mirror base (B189): same
 /// derive-per-access rule as the mirrors above.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

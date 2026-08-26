@@ -3746,10 +3746,12 @@ pub(crate) fn emit_cross3_call(
     refetch_pinned: bool,
     ta_refetch: Option<(usize, &crate::codegen::TaPinPlan)>,
 ) {
-    use crate::vm::host_api::JIT_FID_MIRROR_RAW_OFFSET;
+    use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET};
     let fb = ops.new_dynamic_label();
     // -- callee guard: tag + identity-free fid match; leaves callee idx in
-    // r10d and the callee BITS in rax (the invoke stashes them). --
+    // r10d and the callee BITS in rax (the invoke stashes them). B195: the
+    // fid lives in the hot record — one lea doubles the scale-8 index so
+    // [r11 + r10*8 + 4] addresses base + idx*16 + fid. --
     dynasm!(ops
         ; mov rax, [rbx + dreg(callee)]
         ; mov r10, rax
@@ -3757,8 +3759,9 @@ pub(crate) fn emit_cross3_call(
         ; cmp r10d, TAG_HEAP_HI as i32
         ; jne => fb
         ; mov r10d, eax
-        ; mov r11, [rdi + JIT_FID_MIRROR_RAW_OFFSET as i32]
-        ; cmp DWORD [r11 + r10 * 4], plan.fid as i32
+        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r11, [r11 + r10 * 8]
+        ; cmp DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32], plan.fid as i32
         ; jne => fb
     );
     let this_src = if plan.arrow_this {
@@ -3815,32 +3818,33 @@ pub(crate) fn emit_cross3_method_call(
     refetch_pinned: bool,
     ta_refetch: Option<(usize, &crate::codegen::TaPinPlan)>,
 ) {
-    use crate::vm::host_api::{
-        JIT_FID_MIRROR_RAW_OFFSET, JIT_SHAPE_MIRROR_RAW_OFFSET, JIT_VALS_MIRROR_RAW_OFFSET,
-    };
+    use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF};
     let fb = ops.new_dynamic_label();
     dynasm!(ops
-        // -- receiver: tag + settled-shape guard --
+        // -- receiver: tag + settled-shape guard (B195 hot record: one lea
+        // doubles the scale-8 index; shape @ +0, vals @ +8 on the SAME
+        // line, so the method slot load costs no second mirror line) --
         ; mov rax, [rbx + dreg(obj)]
         ; mov r10, rax
         ; shr r10, 48
         ; cmp r10d, TAG_HEAP_HI as i32
         ; jne => fb
         ; mov r10d, eax
-        ; mov r11, [rdi + JIT_SHAPE_MIRROR_RAW_OFFSET as i32]
-        ; cmp DWORD [r11 + r10 * 4], plan.shape as i32
+        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r11, [r11 + r10 * 8]
+        ; cmp DWORD [r11 + r10 * 8], plan.shape as i32
         ; jne => fb
-        // -- method: live own-slot load via the vals mirror --
-        ; mov r11, [rdi + JIT_VALS_MIRROR_RAW_OFFSET as i32]
-        ; mov r11, [r11 + r10 * 8]
+        // -- method: live own-slot load via the hot record's vals half --
+        ; mov r11, [r11 + r10 * 8 + JIT_HOT_VALS_OFF as i32]
         ; mov rax, [r11 + (plan.slot as i32) * 8]
         ; mov r10, rax
         ; shr r10, 48
         ; cmp r10d, TAG_HEAP_HI as i32
         ; jne => fb
         ; mov r10d, eax
-        ; mov r11, [rdi + JIT_FID_MIRROR_RAW_OFFSET as i32]
-        ; cmp DWORD [r11 + r10 * 4], plan.fid as i32
+        ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+        ; lea r11, [r11 + r10 * 8]
+        ; cmp DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32], plan.fid as i32
         ; jne => fb
     );
     let this_src = if plan.arrow_this {

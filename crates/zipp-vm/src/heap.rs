@@ -3512,6 +3512,27 @@ mod gc_courier {
     }
 }
 
+/// B195: one heap slot's hot mirror record — the settled shape, the callee
+/// fid, and the `vals` base — sized and laid out for the JIT's
+/// `base + idx*16` addressing. `#[repr(C)]` pins the field offsets the
+/// `host_api` asserts check.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HotMirror {
+    pub(crate) shape: u32,
+    pub(crate) fid: u32,
+    pub(crate) vals: u64,
+}
+
+impl HotMirror {
+    /// The cleared record: unmatchable shape (`DICT`), no callee, null vals.
+    pub(crate) const CLEAR: HotMirror = HotMirror {
+        shape: crate::shape::DICT,
+        fid: FID_MIRROR_NONE,
+        vals: 0,
+    };
+}
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
@@ -3986,22 +4007,22 @@ pub struct Heap {
     ///    own data on a guardable map (strictly after any mutation settled).
     ///  * `free_slot` clears it; non-`Object` slots hold 0 forever, so a
     ///    string/array receiver can never match a way.
-    shape_mirror: Vec<u32>,
-    /// `vals` base-pointer mirror, parallel to `objs` (0 for non-`Object`
-    /// slots). Maintained by exactly the [`Heap::shape_mirror`] events; a
+    /// B195: the three per-slot facts above and below live in ONE 16-byte
+    /// record (`shape` @+0, `fid` @+4, `vals` @+8) so the guard that reads
+    /// shape and then dereferences vals touches one cache line, and every
+    /// alloc/free settles or clears them with one line of traffic instead
+    /// of three parallel arrays. The JIT addresses it as
+    /// `lea r, [base + idx*8]` then `[r + idx*8 (+off)]` — base + idx*16.
+    /// The vals half: maintained by exactly the shape-mirror events; a
     /// shape-way hit dereferences it only AFTER the mirror-shape guard
     /// matched, which proves the entry was refreshed after the map's last
     /// version-bumping mutation (key adds are what reallocate `vals`).
-    vals_ptr_mirror: Vec<u64>,
-    /// CALLEE-FID MIRROR (B189), parallel to `objs`: the slot's FuncProto id
-    /// when it holds a plain `Func`/`Closure`, else [`FID_MIRROR_NONE`].
-    /// Unlike the shape mirror this needs no invalidation discipline — a
-    /// callable's proto id is immutable for the occupant's lifetime — so the
-    /// only maintenance is the settling refresh (alloc/replace/miss-repair)
-    /// and the clear at `free_slot`. The emitted same-proto call lane guards
-    /// `mirror[callee_idx] == baked_fid` and needs nothing else about the
-    /// callee to be true.
-    fid_mirror: Vec<u32>,
+    /// The fid half (B189): the slot's FuncProto id when it holds a plain
+    /// `Func`/`Closure`, else [`FID_MIRROR_NONE`]. Unlike the shape it needs
+    /// no invalidation discipline — a callable's proto id is immutable for
+    /// the occupant's lifetime — so `bump_version` leaves it alone and only
+    /// the settling refresh and `free_slot` maintain it.
+    hot_mirror: Vec<HotMirror>,
     /// ARROW-`this` MIRROR (B189b), parallel to `objs`: a Closure occupant's
     /// captured `this_val` bits (UNDEFINED bits otherwise). Immutable per
     /// occupant like the fid — settling refresh + `free_slot` clear only.
@@ -4026,9 +4047,7 @@ pub struct Heap {
     /// emitted probes load these THROUGH the VM (`[rdi + offset]`) on every
     /// access, so growth during a native run (helper allocations) is safe —
     /// unlike the pinned `r13` versions base, nothing re-derives these.
-    pub(crate) shape_mirror_raw: u64,
-    pub(crate) vals_ptr_mirror_raw: u64,
-    pub(crate) fid_mirror_raw: u64,
+    pub(crate) hot_mirror_raw: u64,
     pub(crate) cell_vals_mirror_raw: u64,
     pub(crate) this_mirror_raw: u64,
     pub(crate) upvals_mirror_raw: u64,
@@ -4406,15 +4425,11 @@ impl Heap {
             obj_pool_refill_ok: true,
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_stats: [0; 3],
-            shape_mirror: vec![crate::shape::DICT; versions.len()],
-            vals_ptr_mirror: vec![0; versions.len()],
-            fid_mirror: vec![FID_MIRROR_NONE; versions.len()],
+            hot_mirror: vec![HotMirror::CLEAR; versions.len()],
             cell_vals_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
             this_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
             upvals_mirror: vec![0; versions.len()],
-            shape_mirror_raw: 0,
-            vals_ptr_mirror_raw: 0,
-            fid_mirror_raw: 0,
+            hot_mirror_raw: 0,
             cell_vals_mirror_raw: 0,
             this_mirror_raw: 0,
             upvals_mirror_raw: 0,
@@ -4461,9 +4476,7 @@ impl Heap {
     /// VM. Called after any growth of the mirror vectors (and once at boot).
     #[inline]
     fn recache_mirror_raws(&mut self) {
-        self.shape_mirror_raw = self.shape_mirror.as_ptr() as u64;
-        self.vals_ptr_mirror_raw = self.vals_ptr_mirror.as_ptr() as u64;
-        self.fid_mirror_raw = self.fid_mirror.as_ptr() as u64;
+        self.hot_mirror_raw = self.hot_mirror.as_ptr() as u64;
         self.cell_vals_mirror_raw = self.cell_vals_mirror.as_ptr() as u64;
         self.this_mirror_raw = self.this_mirror.as_ptr() as u64;
         self.upvals_mirror_raw = self.upvals_mirror.as_ptr() as u64;
@@ -4487,9 +4500,7 @@ impl Heap {
     /// here instead of an accident of shape non-collision (B178 review).
     #[inline]
     pub fn pin_mirror_dict(&mut self, idx: u32) {
-        self.shape_mirror[idx as usize] = crate::shape::DICT;
-        self.vals_ptr_mirror[idx as usize] = 0;
-        self.fid_mirror[idx as usize] = FID_MIRROR_NONE;
+        self.hot_mirror[idx as usize] = HotMirror::CLEAR;
         self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
         self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
         self.upvals_mirror[idx as usize] = 0;
@@ -4563,9 +4574,11 @@ impl Heap {
             HeapObj::Closure { func, .. } => (crate::shape::DICT, 0, *func),
             _ => (crate::shape::DICT, 0, FID_MIRROR_NONE),
         };
-        self.shape_mirror[idx as usize] = sh;
-        self.vals_ptr_mirror[idx as usize] = vp;
-        self.fid_mirror[idx as usize] = fid;
+        self.hot_mirror[idx as usize] = HotMirror {
+            shape: sh,
+            fid,
+            vals: vp,
+        };
         self.cell_vals_mirror[idx as usize] = match &self.objs[idx as usize] {
             HeapObj::Cell(v) => v.bits(),
             _ => Value::UNDEFINED.bits(),
@@ -4668,9 +4681,7 @@ impl Heap {
         self.objs.push(obj);
         self.resident_payload_charged.push(Cell::new(payload));
         self.versions.push(0);
-        self.shape_mirror.push(crate::shape::DICT);
-        self.vals_ptr_mirror.push(0);
-        self.fid_mirror.push(FID_MIRROR_NONE);
+        self.hot_mirror.push(HotMirror::CLEAR);
         self.cell_vals_mirror.push(Value::UNDEFINED.bits());
         self.this_mirror.push(Value::UNDEFINED.bits());
         self.upvals_mirror.push(0);
@@ -5107,10 +5118,8 @@ impl Heap {
         // keeps the sweep from touching a second cold line per object
         // (survival's minors measured +5.8ms from those field reads).
         #[cfg(not(feature = "safe-sandbox"))]
-        let was_settled = self.shape_mirror[idx as usize] != crate::shape::DICT;
-        self.shape_mirror[idx as usize] = crate::shape::DICT;
-        self.vals_ptr_mirror[idx as usize] = 0;
-        self.fid_mirror[idx as usize] = FID_MIRROR_NONE;
+        let was_settled = self.hot_mirror[idx as usize].shape != crate::shape::DICT;
+        self.hot_mirror[idx as usize] = HotMirror::CLEAR;
         self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
         self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
         self.upvals_mirror[idx as usize] = 0;
@@ -5353,8 +5362,8 @@ impl Heap {
         // The next miss on the object repairs the mirror from the settled map.
         // (`fid_mirror` deliberately survives the bump: a callable's proto id
         // is immutable for the occupant's lifetime, so no bump can stale it.)
-        self.shape_mirror[idx as usize] = crate::shape::DICT;
-        self.vals_ptr_mirror[idx as usize] = 0;
+        self.hot_mirror[idx as usize].shape = crate::shape::DICT;
+        self.hot_mirror[idx as usize].vals = 0;
     }
 
     /// Base pointer of the parallel version array (for the JIT inline cache). The
@@ -6754,28 +6763,28 @@ mod tests {
         assert!(m.shape_guardable());
         let idx = h.alloc(HeapObj::Object(Box::new(m)));
         // Alloc is a settling event: mirror == live shape, vals base captured.
-        assert_eq!(h.shape_mirror[idx as usize], sh);
-        assert_ne!(h.vals_ptr_mirror[idx as usize], 0);
+        assert_eq!(h.hot_mirror[idx as usize].shape, sh);
+        assert_ne!(h.hot_mirror[idx as usize].vals, 0);
 
         // A version bump (every reachable-object shape change) INVALIDATES —
         // order-independence is the point, so no refresh here.
         h.bump_version(idx);
-        assert_eq!(h.shape_mirror[idx as usize], crate::shape::DICT);
-        assert_eq!(h.vals_ptr_mirror[idx as usize], 0);
+        assert_eq!(h.hot_mirror[idx as usize].shape, crate::shape::DICT);
+        assert_eq!(h.hot_mirror[idx as usize].vals, 0);
 
         // The miss helper's repair re-settles from the live map.
         h.refresh_mirror(idx);
-        assert_eq!(h.shape_mirror[idx as usize], sh);
-        assert_ne!(h.vals_ptr_mirror[idx as usize], 0);
+        assert_eq!(h.hot_mirror[idx as usize].shape, sh);
+        assert_ne!(h.hot_mirror[idx as usize].vals, 0);
 
         // Reclaim clears; a recycled slot re-settles from the NEW occupant.
         h.free_slot(idx);
-        assert_eq!(h.shape_mirror[idx as usize], crate::shape::DICT);
-        assert_eq!(h.vals_ptr_mirror[idx as usize], 0);
+        assert_eq!(h.hot_mirror[idx as usize].shape, crate::shape::DICT);
+        assert_eq!(h.hot_mirror[idx as usize].vals, 0);
         let again = h.alloc(HeapObj::Str(JsStr::new("s".into())));
         assert_eq!(again, idx, "free list must hand the slot back");
         assert_eq!(
-            h.shape_mirror[idx as usize],
+            h.hot_mirror[idx as usize].shape,
             crate::shape::DICT,
             "a non-Object occupant must never be matchable by a shape way"
         );

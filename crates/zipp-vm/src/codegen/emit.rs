@@ -627,8 +627,8 @@ pub(crate) fn emit_ic_probe(
             let ways = ops.new_dynamic_label();
             let hit = ops.new_dynamic_label();
             let skip = ops.new_dynamic_label();
-            let shape_off = crate::vm::host_api::JIT_SHAPE_MIRROR_RAW_OFFSET as i32;
-            let vals_off = crate::vm::host_api::JIT_VALS_MIRROR_RAW_OFFSET as i32;
+            let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+            let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
             let IcProbe::Set { val } = probe_kind else {
                 unreachable!()
             };
@@ -638,8 +638,9 @@ pub(crate) fn emit_ic_probe(
                 ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
                 ; jne => skip
                 ; mov ecx, eax                        // heap idx (low 32)
-                ; mov r9, [rdi + shape_off]
-                ; mov r11d, [r9 + rcx*4]              // live mirror shape
+                ; mov r9, [rdi + hot_off]
+                ; lea r9, [r9 + rcx*8]                // hot base + idx*8
+                ; mov r11d, [r9 + rcx*8]              // live mirror shape (idx*16)
                 ; bts r11, 32                         // compose (1<<32)|shape
                 ; lea r9, [r14 + ic_off]              // way 0 of this site
                 ; mov r8d, JIT_IC_WAYS as i32
@@ -662,8 +663,9 @@ pub(crate) fn emit_ic_probe(
                 ; jnz => ways
                 ; jmp => skip
                 ; => hit
-                ; mov r10, [rdi + vals_off]
-                ; mov rcx, [r10 + rcx*8]              // live vals base
+                ; mov r10, [rdi + hot_off]
+                ; lea r10, [r10 + rcx*8]              // hot base + idx*8
+                ; mov rcx, [r10 + rcx*8 + hot_vals]   // live vals base (idx*16 + 8)
                 ; and edx, 0x00FF_FFFF                // slot (low 24)
                 ; mov r10, [rbx + dreg(val)]          // val_bits
                 ; mov [rcx + rdx*8], r10              // vals[slot] = val (COMMIT)
@@ -699,8 +701,8 @@ pub(crate) fn emit_ic_probe(
             let ways = ops.new_dynamic_label();
             let hit = ops.new_dynamic_label();
             let skip = ops.new_dynamic_label();
-            let shape_off = crate::vm::host_api::JIT_SHAPE_MIRROR_RAW_OFFSET as i32;
-            let vals_off = crate::vm::host_api::JIT_VALS_MIRROR_RAW_OFFSET as i32;
+            let hot_off = crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32;
+            let hot_vals = crate::vm::host_api::JIT_HOT_VALS_OFF as i32;
             let IcProbe::Get { dst } = probe_kind else {
                 unreachable!()
             };
@@ -710,8 +712,9 @@ pub(crate) fn emit_ic_probe(
                 ; cmp r10d, 0x7FFD                    // Value TAG_HEAP >> 48
                 ; jne => skip
                 ; mov ecx, eax                        // heap idx (low 32)
-                ; mov r9, [rdi + shape_off]
-                ; mov r11d, [r9 + rcx*4]              // live mirror shape
+                ; mov r9, [rdi + hot_off]
+                ; lea r9, [r9 + rcx*8]                // hot base + idx*8
+                ; mov r11d, [r9 + rcx*8]              // live mirror shape (idx*16)
                 ; bts r11, 32                         // compose (1<<32)|shape
                 ; lea r9, [r14 + ic_off]              // way 0 of this site
                 ; mov r8d, JIT_IC_WAYS as i32
@@ -735,8 +738,9 @@ pub(crate) fn emit_ic_probe(
                 ; jnz => ways
                 ; jmp => skip
                 ; => hit
-                ; mov r10, [rdi + vals_off]
-                ; mov rcx, [r10 + rcx*8]              // live vals base
+                ; mov r10, [rdi + hot_off]
+                ; lea r10, [r10 + rcx*8]              // hot base + idx*8
+                ; mov rcx, [r10 + rcx*8 + hot_vals]   // live vals base (idx*16 + 8)
                 ; and edx, 0x00FF_FFFF                // slot (low 24)
                 ; mov rax, [rcx + rdx*8]              // vals[slot] (CALL-FREE)
                 ; mov [rbx + dreg(dst)], rax
