@@ -93,12 +93,12 @@ On 2026-08-25 the engine took a deliberate security-hardening turn (sandbox
 metering, allocation/iteration ceilings, a hardened allocator build — see
 [SECURITY.md](SECURITY.md)); some of that protection is paid for in hot-path
 time, and the numbers below are the honest post-hardening state, measured on
-the definitive clean PGO capture of `1b4af1d`.
+the definitive clean PGO capture of `d990d73`.
 
 | | |
 |---|---|
 | **Conformance** | **99.991% of test262** — 95,933 of 95,942 executions on this capture's binary: the six historical expected failures plus three module-code failures that arrived with the security hardening (they reproduce on the pristine hardening commit; ledger B181) — zero from the performance waves |
-| **Performance** | **all-13 geomean 0.70× Node** [0.69, 0.70]; fastest engine on 6 of 13 rows; retained-ten **0.99×** Node |
+| **Performance** | **all-13 geomean 0.69× Node** [0.685, 0.693]; fastest engine on 7 of 13 rows; retained-ten **0.98×** Node |
 
 ### Speed vs Node, Bun and Deno
 
@@ -106,28 +106,32 @@ Cold wall time including process launch, 21 paired runs per row with
 deterministically shuffled engine and benchmark order. Bold time = fastest
 engine; bold ratio = zipp beats Node. Every output is byte-identical across all
 four engines.
-Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `1b4af1d` (PGO build).
+Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `d990d73` (PGO build).
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| map-set-heavy | **591ms** | 735ms | 1034ms | 611ms | 1.03× |
-| typedarray-math | 202ms | 910ms | 138ms | **134ms** | **0.67×** |
-| class-prototype-hot | 299ms | 334ms | 293ms | **237ms** | **0.80×** |
-| parse-large-js | 271ms | **230ms** | 253ms | 329ms | 1.22× |
-| async-promise-chain | 332ms | 369ms | **327ms** | 331ms | **1.00×** |
-| json-large | 260ms | **194ms** | 280ms | 323ms | 1.24× |
-| markdown-render | 268ms | **211ms** | 277ms | 266ms | **0.99×** |
-| regex-log-scan | 450ms | 565ms | **426ms** | 533ms | 1.18× |
-| sparse-array | 80ms | 103ms | 95ms | **74ms** | **0.92×** |
-| polymorphic-objects | 327ms | 333ms | **302ms** | 335ms | 1.02× |
+| map-set-heavy | 589ms | 743ms | 1049ms | **560ms** | **0.92×** |
+| typedarray-math | 202ms | 909ms | 137ms | **134ms** | **0.67×** |
+| class-prototype-hot | 296ms | 334ms | 293ms | **237ms** | **0.80×** |
+| parse-large-js | 271ms | **230ms** | 253ms | 325ms | 1.20× |
+| async-promise-chain | 333ms | 370ms | **326ms** | 332ms | **1.00×** |
+| json-large | 258ms | **194ms** | 277ms | 319ms | 1.24× |
+| markdown-render | 270ms | **211ms** | 276ms | 265ms | **0.99×** |
+| regex-log-scan | 455ms | 567ms | **421ms** | 537ms | 1.18× |
+| sparse-array | 81ms | 103ms | 93ms | **74ms** | **0.91×** |
+| polymorphic-objects | 326ms | 333ms | **302ms** | 332ms | 1.02× |
 | **zipp / engine median geomean** | **0.70×** | **0.59×** | **0.68×** | — | |
 
-The paired zipp/Node result across all 13 rows is **0.6960× [0.693, 0.702]**;
-the retained-ten headline is **0.9899× [0.985, 0.994]**. Zipp remains ahead of
+The paired zipp/Node result across all 13 rows is **0.6888× [0.685, 0.693]**;
+the retained-ten headline is **0.9785× [0.975, 0.986]**. Zipp remains ahead of
 every engine on the all-row geomean (0.69× Node, 0.59× Bun, 0.68× Deno) on the
-strength of the diagnostics and its startup, while five rows currently trail
-Node (json-large 1.24×, parse-large-js 1.22×, regex-log-scan 1.18×,
-map-set-heavy 1.03×, polymorphic-objects 1.02×).
+strength of the diagnostics and its startup, while four rows currently trail
+Node (json-large 1.24×, parse-large-js 1.20×, regex-log-scan 1.18×,
+polymorphic-objects 1.02×). map-set-heavy — behind after the hardening —
+was recovered to **0.92×** by memoizing the hardened collection-intrinsic
+proof under version+value guards and extending the native mutate lane
+(B183); its remaining allocator cost is absorbed by the same trade the
+paragraph below describes.
 
 **Where those five rows went.** The previous capture (`cc0d557`, pre-hardening)
 measured 13/13 fastest and retained-ten 0.786×. The hardening commit
@@ -150,7 +154,7 @@ margin — no snapshot to load:
 
 | zipp | node | deno | bun |
 |---|---|---|---|
-| **9.1ms** | 30.3ms | 49.0ms | 57.5ms |
+| **9.0ms** | 30.3ms | 49.1ms | 57.4ms |
 
 A long-running server would amortize that away; a CLI tool would not.
 
@@ -162,9 +166,9 @@ comparability; zipp is fastest on all three:
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| sparse-array-v2 | 171ms | 369ms | 147ms | **97ms** | **0.57×** |
-| polymorphic-objects-v2 | 82ms | 92ms | 97ms | **31ms** | **0.37×** |
-| property-ic-shapes | 264ms | 159ms | 278ms | **12ms** | **0.05×** |
+| sparse-array-v2 | 170ms | 369ms | 148ms | **97ms** | **0.57×** |
+| polymorphic-objects-v2 | 82ms | 91ms | 96ms | **30ms** | **0.37×** |
+| property-ic-shapes | 262ms | 160ms | 278ms | **12ms** | **0.05×** |
 
 The wins come from guarded, exact-shape stream and reducer paths plus the new
 shape-keyed native ways described below. They are strong evidence for these
@@ -184,18 +188,19 @@ npm source.
 Hostile results are never folded into the retained-ten headline. They are the
 generalisation gate, and Zipp does **not** yet claim Node parity on that
 corpus. The current publishable capture
-([`w58_capture_1b4af1d_pgo`](bench/hostile/w58_capture_1b4af1d_pgo_2026-08-26.json),
+([`w61_capture_d990d73_pgo`](bench/hostile/w61_capture_d990d73_pgo_2026-08-26.json),
 full corpus, 15 counterbalanced repetitions, exact on all 17 rows) measures
-**1.1278× cold ordinary geomean** [1.119, 1.133] — the best full-corpus result recorded, and
+**1.1076× cold ordinary geomean** [1.101, 1.115] — the best full-corpus result recorded, and
 it now carries the full security hardening that the earlier 1.28×-era
 checkpoints did not.
 
-Nine rows beat or match Node cold: ephemeral allocation 0.37×, modules 0.40×,
-throw/catch 0.45×, baseline calls 0.46×, stable numeric locals 0.48×, async
-burst 0.66×, bytecode VM 0.95×, branch control 1.00×, sustained async 1.05×.
-The remaining gaps are surviving allocation 3.90×, megamorphic shapes 2.63×,
-vendored NanoID 2.43×, React-shaped reconciliation 2.34×, stable shapes
-2.17×, the warm router 2.15×, mutable closures 1.97×, and mixed locals 1.54×.
+Nine rows beat or sit within 2% of Node cold: ephemeral allocation 0.36×,
+modules 0.40×, throw/catch 0.45×, baseline calls 0.46×, stable numeric locals
+0.47×, async burst 0.66×, bytecode VM 0.91×, branch control 0.98×, sustained
+async 1.02×. The remaining gaps are surviving allocation 4.13×, megamorphic
+shapes 2.53×, vendored NanoID 2.34×, React-shaped reconciliation 2.24×,
+stable shapes 2.09×, the warm router 2.05×, mutable closures 1.94×, and mixed
+locals 1.52×.
 
 **Shape-keyed native ways shipped.** An earlier shape-way experiment (B152)
 was reverted after independent review found exotic-shape collisions and
@@ -216,12 +221,12 @@ the same standard of evidence. The next targets, in evidence order: the
 object build path (allocation bookkeeping), survivor tracing, the closure
 per-op floor, and the NanoID string-append lane.
 
-One Tier-C lane is deliberately parked: the wave-54 closure-creation lane is
-default-off (B181) after test262 revalidation caught a cross-called body
-double-applying an effect when a mid-body miss forced a whole-call replay.
-The numbers on this page are measured with the lane off; it returns once the
-plan-time cross-entry exclusion for effect-then-deopt bodies lands with a
-full gate. Three sloppy-mode module-code test262 failures that reproduce on
+The wave-54 closure-creation lane, parked when test262 revalidation caught
+a cross-called body double-applying an effect, is back on: the two mid-body
+deopt edges that forced whole-call replays now COMPLETE through
+interpreter-equivalent slow paths (B184), the lane measures −13.7% on the
+React-shaped row, and the full-sweep failure list is byte-identical to the
+baseline. Three sloppy-mode module-code test262 failures that reproduce on
 the pristine hardening commit (before any performance work) are recorded in
 the ledger for their own investigation.
 
