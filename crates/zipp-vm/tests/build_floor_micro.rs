@@ -65,4 +65,8 @@ fn attribute_object_build_floor() {
         dt,
         dt.as_nanos() as f64 / n as f64
     );
+    // (d) B187 stage-3 ladder: allocator pair vs init vs value store.
+    for line in zipp_vm::bench_support::floor_decompose(&plan, &vals, n) {
+        println!("rust {line}");
+    }
 }

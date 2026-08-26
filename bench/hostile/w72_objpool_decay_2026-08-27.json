@@ -1,0 +1,3577 @@
+{
+  "schema_version": 1,
+  "created_utc": "2026-08-26T14:26:16.031465+00:00",
+  "workspace_commit": "4c83b9ca540fe175403bb4327434514a4e4d056a",
+  "publishable": false,
+  "provenance_reasons": [
+    "zipp: built from a DIRTY tree (4c83b9ca540fe175403bb4327434514a4e4d056a+dirty.3d3e886f9f37b589); the commit it names is the parent it was based on, not the code that ran"
+  ],
+  "publication_reasons": [
+    "filtered corpus (all default cases required)",
+    "only 11 repetitions (at least 15 required)"
+  ],
+  "publication_sources_head_before": true,
+  "publication_sources_head_after": true,
+  "manifest": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\manifest.json",
+  "manifest_sha256_before": "7ada4c9fe96ad17d32a21a365e48332dca98e85257b650db839afd09568c9411",
+  "manifest_sha256_after": "7ada4c9fe96ad17d32a21a365e48332dca98e85257b650db839afd09568c9411",
+  "harness_sha256_before": {
+    "tools/bench_hostile.py": "4f6d451b778f00d873fede9fb1c9b9c562095d723f75351f89d15354e6e22b36",
+    "tools/bench.py": "1fd21925127036e95549ea1ca055bbbc6aad963029c942bb35e84a68f52619a5"
+  },
+  "harness_sha256_after": {
+    "tools/bench_hostile.py": "4f6d451b778f00d873fede9fb1c9b9c562095d723f75351f89d15354e6e22b36",
+    "tools/bench.py": "1fd21925127036e95549ea1ca055bbbc6aad963029c942bb35e84a68f52619a5"
+  },
+  "input_sha256_before": {
+    "allocation/survival.js": "eabf490390b21f67748344a3041e622bfd98c51ff065166be0f5b86910690000",
+    "apps/reactish-reconcile.js": "8520ee91d83a1645ef704385dc36882bd7c28813339b0aafcd01511572baf20f",
+    "objects/shapes-megamorphic.js": "1342a4b78afe36f81829a44245ca926f56ad969e14162f8c38a588701d1434ee",
+    "objects/shapes-stable.js": "0b461d22fc70f45027d1d05635176cfb0ea3f1802a76297d8e627c9a5ea0e5ca"
+  },
+  "input_sha256_after": {
+    "allocation/survival.js": "eabf490390b21f67748344a3041e622bfd98c51ff065166be0f5b86910690000",
+    "apps/reactish-reconcile.js": "8520ee91d83a1645ef704385dc36882bd7c28813339b0aafcd01511572baf20f",
+    "objects/shapes-megamorphic.js": "1342a4b78afe36f81829a44245ca926f56ad969e14162f8c38a588701d1434ee",
+    "objects/shapes-stable.js": "0b461d22fc70f45027d1d05635176cfb0ea3f1802a76297d8e627c9a5ea0e5ca"
+  },
+  "source_drift": [],
+  "cases": [
+    {
+      "id": "shapes-stable",
+      "entry": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js",
+      "entry_rel": "objects/shapes-stable.js",
+      "category": "objects",
+      "goal": "script",
+      "family": "object-shape",
+      "variant": "baseline",
+      "inputs": [
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "input_rels": [
+        "objects/shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "features": [
+        "objects",
+        "stable-shapes",
+        "property-access",
+        "allocation",
+        "medium-lived"
+      ],
+      "description": "Uniform object layouts and one shared property-access path provide the object-shape control."
+    },
+    {
+      "id": "shapes-megamorphic",
+      "entry": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js",
+      "entry_rel": "objects/shapes-megamorphic.js",
+      "category": "objects",
+      "goal": "script",
+      "family": "object-shape",
+      "variant": "megamorphic",
+      "inputs": [
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "input_rels": [
+        "objects/shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "features": [
+        "objects",
+        "short-lived-shapes",
+        "megamorphic-properties",
+        "dictionary-mode",
+        "allocation",
+        "medium-lived"
+      ],
+      "description": "A shared property site sees sixteen layouts plus shape transitions and dictionary-mode objects."
+    },
+    {
+      "id": "allocation-survival",
+      "entry": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js",
+      "entry_rel": "allocation/survival.js",
+      "category": "allocation",
+      "goal": "script",
+      "family": "object-lifetime",
+      "variant": "survivors",
+      "inputs": [
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "input_rels": [
+        "allocation/survival.js"
+      ],
+      "timeout_s": 300.0,
+      "features": [
+        "objects",
+        "arrays",
+        "methods",
+        "allocation",
+        "gc-pressure",
+        "medium-lived"
+      ],
+      "description": "Objects survive several allocation epochs before old cohorts are discarded."
+    },
+    {
+      "id": "reactish-reconcile",
+      "entry": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js",
+      "entry_rel": "apps/reactish-reconcile.js",
+      "category": "applications",
+      "goal": "script",
+      "family": null,
+      "variant": null,
+      "inputs": [
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "input_rels": [
+        "apps/reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "features": [
+        "reactish",
+        "function-components",
+        "closures",
+        "objects",
+        "mixed-shapes",
+        "allocation",
+        "medium-lived"
+      ],
+      "description": "A host-free React-shaped reconciliation kernel exercises components, state, props, handlers, and patches."
+    }
+  ],
+  "selection": {
+    "cases": [
+      "allocation-survival",
+      "shapes-megamorphic",
+      "shapes-stable",
+      "reactish-reconcile"
+    ],
+    "categories": [],
+    "families": [],
+    "features": []
+  },
+  "reps": 11,
+  "seed": 1511464998,
+  "bootstrap_samples": 10000,
+  "timeout_override_s": null,
+  "engines_before": [
+    {
+      "name": "node",
+      "argv": [
+        "node"
+      ],
+      "executable": "C:\\Program Files\\nodejs\\node.exe",
+      "version": "v24.12.0",
+      "version_probe_error": null,
+      "size": 89935872,
+      "mtime_ns": 1765317568000000000,
+      "sha256": "2ffe3acc0458fdde999f50d11809bbe7c9b7ef204dcf17094e325d26ace101d8",
+      "build_identity": null
+    },
+    {
+      "name": "zipp",
+      "argv": [
+        "target/release/zipp.exe"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7586304,
+      "mtime_ns": 1787754219345334800,
+      "sha256": "0692f598e6aa6cfbffd081b19ac246d411feb015cfcbc61288cc5ab8c17b19df",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "4c83b9ca540fe175403bb4327434514a4e4d056a+dirty.3d3e886f9f37b589",
+        "commit": "4c83b9ca540fe175403bb4327434514a4e4d056a",
+        "dirty": true,
+        "diff_digest": "3d3e886f9f37b589",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      }
+    }
+  ],
+  "engines_after": [
+    {
+      "name": "node",
+      "argv": [
+        "node"
+      ],
+      "executable": "C:\\Program Files\\nodejs\\node.exe",
+      "version": "v24.12.0",
+      "version_probe_error": null,
+      "size": 89935872,
+      "mtime_ns": 1765317568000000000,
+      "sha256": "2ffe3acc0458fdde999f50d11809bbe7c9b7ef204dcf17094e325d26ace101d8",
+      "build_identity": null
+    },
+    {
+      "name": "zipp",
+      "argv": [
+        "target/release/zipp.exe"
+      ],
+      "executable": "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\target\\release\\zipp.exe",
+      "version": "zipp 0.0.1",
+      "version_probe_error": null,
+      "size": 7586304,
+      "mtime_ns": 1787754219345334800,
+      "sha256": "0692f598e6aa6cfbffd081b19ac246d411feb015cfcbc61288cc5ab8c17b19df",
+      "build_identity": {
+        "name": "zipp",
+        "version": "0.0.1",
+        "source": "4c83b9ca540fe175403bb4327434514a4e4d056a+dirty.3d3e886f9f37b589",
+        "commit": "4c83b9ca540fe175403bb4327434514a4e4d056a",
+        "dirty": true,
+        "diff_digest": "3d3e886f9f37b589",
+        "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)",
+        "target": "x86_64-pc-windows-msvc",
+        "profile": "release",
+        "opt_level": "3",
+        "features": "default",
+        "rustflags": "",
+        "jit": true
+      }
+    }
+  ],
+  "engine_drift": [],
+  "host": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "python": "3.11.6",
+    "power_mode": "Power Scheme GUID: 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  (High performance)"
+  },
+  "environment": {},
+  "schedules": [
+    {
+      "rep": 0,
+      "case_order": [
+        "reactish-reconcile",
+        "shapes-stable",
+        "allocation-survival",
+        "shapes-megamorphic"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 1,
+      "case_order": [
+        "shapes-megamorphic",
+        "reactish-reconcile",
+        "shapes-stable",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 2,
+      "case_order": [
+        "reactish-reconcile",
+        "allocation-survival",
+        "shapes-megamorphic",
+        "shapes-stable"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 3,
+      "case_order": [
+        "shapes-megamorphic",
+        "allocation-survival",
+        "reactish-reconcile",
+        "shapes-stable"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 4,
+      "case_order": [
+        "shapes-megamorphic",
+        "shapes-stable",
+        "reactish-reconcile",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 5,
+      "case_order": [
+        "shapes-megamorphic",
+        "reactish-reconcile",
+        "shapes-stable",
+        "allocation-survival"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 6,
+      "case_order": [
+        "shapes-megamorphic",
+        "allocation-survival",
+        "shapes-stable",
+        "reactish-reconcile"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 7,
+      "case_order": [
+        "shapes-megamorphic",
+        "allocation-survival",
+        "reactish-reconcile",
+        "shapes-stable"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 8,
+      "case_order": [
+        "allocation-survival",
+        "shapes-megamorphic",
+        "reactish-reconcile",
+        "shapes-stable"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    },
+    {
+      "rep": 9,
+      "case_order": [
+        "allocation-survival",
+        "shapes-stable",
+        "shapes-megamorphic",
+        "reactish-reconcile"
+      ],
+      "engine_order": [
+        "zipp",
+        "node"
+      ]
+    },
+    {
+      "rep": 10,
+      "case_order": [
+        "shapes-stable",
+        "reactish-reconcile",
+        "allocation-survival",
+        "shapes-megamorphic"
+      ],
+      "engine_order": [
+        "node",
+        "zipp"
+      ]
+    }
+  ],
+  "observations": [
+    {
+      "rep": 0,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031868299935013056,
+      "cold_s": 0.046814800007268786,
+      "adjusted_s": 0.01494650007225573,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.010790199972689152,
+      "cold_s": 0.1305108000524342,
+      "adjusted_s": 0.11972060007974505,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "shapes-stable",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0315223999787122,
+      "cold_s": 0.04855329997371882,
+      "adjusted_s": 0.01703089999500662,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "shapes-stable",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008975800010375679,
+      "cold_s": 0.0919798999093473,
+      "adjusted_s": 0.08300409989897162,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "allocation-survival",
+      "case_position": 2,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.032016600016504526,
+      "cold_s": 0.06455730006564409,
+      "adjusted_s": 0.03254070004913956,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "allocation-survival",
+      "case_position": 2,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009447899996303022,
+      "cold_s": 0.27479850000236183,
+      "adjusted_s": 0.2653506000060588,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "shapes-megamorphic",
+      "case_position": 3,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0317401000065729,
+      "cold_s": 0.05161709990352392,
+      "adjusted_s": 0.01987699989695102,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 0,
+      "case": "shapes-megamorphic",
+      "case_position": 3,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009065599995665252,
+      "cold_s": 0.10943630000110716,
+      "adjusted_s": 0.1003707000054419,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00910439994186163,
+      "cold_s": 0.11776060005649924,
+      "adjusted_s": 0.10865620011463761,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03099510003812611,
+      "cold_s": 0.048425299930386245,
+      "adjusted_s": 0.017430199892260134,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009481400018557906,
+      "cold_s": 0.13083029992412776,
+      "adjusted_s": 0.12134889990556985,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031287599937058985,
+      "cold_s": 0.045918700052425265,
+      "adjusted_s": 0.01463110011536628,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "shapes-stable",
+      "case_position": 2,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00947179994545877,
+      "cold_s": 0.09222180000506341,
+      "adjusted_s": 0.08275000005960464,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "shapes-stable",
+      "case_position": 2,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.035557499970309436,
+      "cold_s": 0.040878199972212315,
+      "adjusted_s": 0.005320700001902878,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "allocation-survival",
+      "case_position": 3,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008973799995146692,
+      "cold_s": 0.26121869997587055,
+      "adjusted_s": 0.25224489998072386,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 1,
+      "case": "allocation-survival",
+      "case_position": 3,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031341099995188415,
+      "cold_s": 0.061214899993501604,
+      "adjusted_s": 0.02987379999831319,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030566700035706162,
+      "cold_s": 0.04621910001151264,
+      "adjusted_s": 0.015652399975806475,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "reactish-reconcile",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008725599967874587,
+      "cold_s": 0.12440510001033545,
+      "adjusted_s": 0.11567950004246086,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03147250006441027,
+      "cold_s": 0.06177419994492084,
+      "adjusted_s": 0.03030169988051057,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009093199972994626,
+      "cold_s": 0.27373130002524704,
+      "adjusted_s": 0.2646381000522524,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "shapes-megamorphic",
+      "case_position": 2,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03227650001645088,
+      "cold_s": 0.049424699973315,
+      "adjusted_s": 0.01714819995686412,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "shapes-megamorphic",
+      "case_position": 2,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00898429995868355,
+      "cold_s": 0.10700710001401603,
+      "adjusted_s": 0.09802280005533248,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "shapes-stable",
+      "case_position": 3,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.037526800064370036,
+      "cold_s": 0.0407328000292182,
+      "adjusted_s": 0.0032059999648481607,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 2,
+      "case": "shapes-stable",
+      "case_position": 3,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008877199958078563,
+      "cold_s": 0.09042569994926453,
+      "adjusted_s": 0.08154849999118596,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008798600058071315,
+      "cold_s": 0.10540309990756214,
+      "adjusted_s": 0.09660449984949082,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031200199970044196,
+      "cold_s": 0.04785139998421073,
+      "adjusted_s": 0.016651200014166534,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009613299975171685,
+      "cold_s": 0.2746048999251798,
+      "adjusted_s": 0.2649915999500081,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03136239992454648,
+      "cold_s": 0.06167009996715933,
+      "adjusted_s": 0.03030770004261285,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "reactish-reconcile",
+      "case_position": 2,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009850900038145483,
+      "cold_s": 0.1283288000850007,
+      "adjusted_s": 0.11847790004685521,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "reactish-reconcile",
+      "case_position": 2,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030446000047959387,
+      "cold_s": 0.04510480002500117,
+      "adjusted_s": 0.014658799977041781,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "shapes-stable",
+      "case_position": 3,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009201699984259903,
+      "cold_s": 0.09142609999980778,
+      "adjusted_s": 0.08222440001554787,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 3,
+      "case": "shapes-stable",
+      "case_position": 3,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03098070004489273,
+      "cold_s": 0.040592100005596876,
+      "adjusted_s": 0.009611399960704148,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.02935500000603497,
+      "cold_s": 0.04906980006489903,
+      "adjusted_s": 0.019714800058864057,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009724200004711747,
+      "cold_s": 0.10475220007356256,
+      "adjusted_s": 0.09502800006885082,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "shapes-stable",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030366400023922324,
+      "cold_s": 0.0412302000913769,
+      "adjusted_s": 0.010863800067454576,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "shapes-stable",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00903019995894283,
+      "cold_s": 0.09067639999557287,
+      "adjusted_s": 0.08164620003663003,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "reactish-reconcile",
+      "case_position": 2,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03238820005208254,
+      "cold_s": 0.04471629997715354,
+      "adjusted_s": 0.012328099925071001,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "reactish-reconcile",
+      "case_position": 2,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00904369994532317,
+      "cold_s": 0.12448619992937893,
+      "adjusted_s": 0.11544249998405576,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "allocation-survival",
+      "case_position": 3,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03321760008111596,
+      "cold_s": 0.06094289990141988,
+      "adjusted_s": 0.027725299820303917,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 4,
+      "case": "allocation-survival",
+      "case_position": 3,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00967339996714145,
+      "cold_s": 0.26365640002768487,
+      "adjusted_s": 0.2539830000605434,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008821900002658367,
+      "cold_s": 0.10312270000576973,
+      "adjusted_s": 0.09430080000311136,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031361800036393106,
+      "cold_s": 0.04857570002786815,
+      "adjusted_s": 0.017213899991475046,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009061200078576803,
+      "cold_s": 0.12280339992139488,
+      "adjusted_s": 0.11374219984281808,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03067230002488941,
+      "cold_s": 0.04456239996943623,
+      "adjusted_s": 0.013890099944546819,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "shapes-stable",
+      "case_position": 2,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00896199990529567,
+      "cold_s": 0.08936510002240539,
+      "adjusted_s": 0.08040310011710972,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "shapes-stable",
+      "case_position": 2,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031132099917158484,
+      "cold_s": 0.04261169990058988,
+      "adjusted_s": 0.011479599983431399,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "allocation-survival",
+      "case_position": 3,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008855200023390353,
+      "cold_s": 0.2717039999552071,
+      "adjusted_s": 0.26284879993181676,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 5,
+      "case": "allocation-survival",
+      "case_position": 3,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.032403099932707846,
+      "cold_s": 0.06695090001448989,
+      "adjusted_s": 0.03454780008178204,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03269800008274615,
+      "cold_s": 0.04888380004558712,
+      "adjusted_s": 0.016185799962840974,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00940789992455393,
+      "cold_s": 0.11159510002471507,
+      "adjusted_s": 0.10218720010016114,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030717400019057095,
+      "cold_s": 0.059710799949243665,
+      "adjusted_s": 0.02899339993018657,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0091709999833256,
+      "cold_s": 0.26011209993157536,
+      "adjusted_s": 0.25094109994824976,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "shapes-stable",
+      "case_position": 2,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03148639993742108,
+      "cold_s": 0.04241500003263354,
+      "adjusted_s": 0.01092860009521246,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "shapes-stable",
+      "case_position": 2,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008814699947834015,
+      "cold_s": 0.09255549998488277,
+      "adjusted_s": 0.08374080003704876,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "reactish-reconcile",
+      "case_position": 3,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031287800054997206,
+      "cold_s": 0.04536240000743419,
+      "adjusted_s": 0.014074599952436984,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 6,
+      "case": "reactish-reconcile",
+      "case_position": 3,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009147800039499998,
+      "cold_s": 0.12364929995965213,
+      "adjusted_s": 0.11450149992015213,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.012425799970515072,
+      "cold_s": 0.10966949991416186,
+      "adjusted_s": 0.09724369994364679,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "shapes-megamorphic",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030766000039875507,
+      "cold_s": 0.04737420007586479,
+      "adjusted_s": 0.016608200035989285,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008786299964413047,
+      "cold_s": 0.2672570999711752,
+      "adjusted_s": 0.25847080000676215,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "allocation-survival",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03173589997459203,
+      "cold_s": 0.059940800070762634,
+      "adjusted_s": 0.028204900096170604,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "reactish-reconcile",
+      "case_position": 2,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009195600054226816,
+      "cold_s": 0.1240151000674814,
+      "adjusted_s": 0.11481950001325458,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "reactish-reconcile",
+      "case_position": 2,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03212409990373999,
+      "cold_s": 0.04843510000500828,
+      "adjusted_s": 0.01631100010126829,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "shapes-stable",
+      "case_position": 3,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009311000001616776,
+      "cold_s": 0.08953320002183318,
+      "adjusted_s": 0.0802222000202164,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 7,
+      "case": "shapes-stable",
+      "case_position": 3,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031600199989043176,
+      "cold_s": 0.04037489998154342,
+      "adjusted_s": 0.008774699992500246,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.02981129998806864,
+      "cold_s": 0.06435260002035648,
+      "adjusted_s": 0.034541300032287836,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009971699910238385,
+      "cold_s": 0.26753790001384914,
+      "adjusted_s": 0.25756620010361075,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "shapes-megamorphic",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03118749998975545,
+      "cold_s": 0.04912849992979318,
+      "adjusted_s": 0.017940999940037727,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "shapes-megamorphic",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008740000077523291,
+      "cold_s": 0.10517399990931153,
+      "adjusted_s": 0.09643399983178824,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "reactish-reconcile",
+      "case_position": 2,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030727299978025258,
+      "cold_s": 0.04512509994674474,
+      "adjusted_s": 0.014397799968719482,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "reactish-reconcile",
+      "case_position": 2,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.0089179000351578,
+      "cold_s": 0.12538799992762506,
+      "adjusted_s": 0.11647009989246726,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "shapes-stable",
+      "case_position": 3,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03251450008247048,
+      "cold_s": 0.04484820005018264,
+      "adjusted_s": 0.012333699967712164,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 8,
+      "case": "shapes-stable",
+      "case_position": 3,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009148300043307245,
+      "cold_s": 0.08933000010438263,
+      "adjusted_s": 0.08018170006107539,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.00893839995842427,
+      "cold_s": 0.27217160002328455,
+      "adjusted_s": 0.2632332000648603,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "allocation-survival",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031770599889568985,
+      "cold_s": 0.060550999944098294,
+      "adjusted_s": 0.02878040005452931,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "shapes-stable",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008806900004856288,
+      "cold_s": 0.09174619999248534,
+      "adjusted_s": 0.08293929998762906,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "shapes-stable",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03164529998321086,
+      "cold_s": 0.04108960006851703,
+      "adjusted_s": 0.009444300085306168,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "shapes-megamorphic",
+      "case_position": 2,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008925899979658425,
+      "cold_s": 0.10599760001059622,
+      "adjusted_s": 0.09707170003093779,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "shapes-megamorphic",
+      "case_position": 2,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030820300104096532,
+      "cold_s": 0.04765749990474433,
+      "adjusted_s": 0.016837199800647795,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "reactish-reconcile",
+      "case_position": 3,
+      "engine": "zipp",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.009009400033392012,
+      "cold_s": 0.13623740000184625,
+      "adjusted_s": 0.12722799996845424,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 9,
+      "case": "reactish-reconcile",
+      "case_position": 3,
+      "engine": "node",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03429670003242791,
+      "cold_s": 0.047133299987763166,
+      "adjusted_s": 0.01283659995533526,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "shapes-stable",
+      "case_position": 0,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.030234499950893223,
+      "cold_s": 0.04075479996390641,
+      "adjusted_s": 0.010520300013013184,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "shapes-stable",
+      "case_position": 0,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-stable.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008413999923504889,
+      "cold_s": 0.09321439999621361,
+      "adjusted_s": 0.08480040007270873,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 38,
+      "stdout_sha256": "b1c8fda2f021a0b5d47a3bf45e7dfe9a4b587cc17400d0d749df641e78fd61a9",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.03235570003744215,
+      "cold_s": 0.0457892999984324,
+      "adjusted_s": 0.01343359996099025,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "reactish-reconcile",
+      "case_position": 1,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\apps\\reactish-reconcile.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008946900023147464,
+      "cold_s": 0.12355880008544773,
+      "adjusted_s": 0.11461190006230026,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 53,
+      "stdout_sha256": "7e278a2cc450ce6b4efe30500e5181427f07d727a98b71dcddd5f64d3edd1cbe",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "allocation-survival",
+      "case_position": 2,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031370900105684996,
+      "cold_s": 0.05847010004799813,
+      "adjusted_s": 0.027099199942313135,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "allocation-survival",
+      "case_position": 2,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\allocation\\survival.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.01041870005428791,
+      "cold_s": 0.2603275999426842,
+      "adjusted_s": 0.24990889988839626,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 44,
+      "stdout_sha256": "22d2dbffe9a43ebe357a94f96b16e8e7ed88150c271f212dae575297ac3b7558",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "shapes-megamorphic",
+      "case_position": 3,
+      "engine": "node",
+      "engine_position": 0,
+      "goal": "script",
+      "startup_argv": [
+        "node",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "node",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.031230199965648353,
+      "cold_s": 0.0470618000254035,
+      "adjusted_s": 0.015831600059755147,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    },
+    {
+      "rep": 10,
+      "case": "shapes-megamorphic",
+      "case_position": 3,
+      "engine": "zipp",
+      "engine_position": 1,
+      "goal": "script",
+      "startup_argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\AppData\\Local\\Temp\\zipp-hostile-empty-gqc4t6g3.js"
+      ],
+      "argv": [
+        "target/release/zipp.exe",
+        "js",
+        "C:\\Users\\User\\Documents\\repos\\zipp-project\\zipp.org\\bench\\hostile\\objects\\shapes-megamorphic.js"
+      ],
+      "timeout_s": 300.0,
+      "startup_s": 0.008849400095641613,
+      "cold_s": 0.10690239991527051,
+      "adjusted_s": 0.0980529998196289,
+      "startup_returncode": 0,
+      "returncode": 0,
+      "startup_timed_out": false,
+      "timed_out": false,
+      "startup_spawn_error": false,
+      "spawn_error": false,
+      "startup_stdout_bytes": 0,
+      "stdout_bytes": 43,
+      "stdout_sha256": "5493454ad9001541b80a6373915a21735507f2b8e8c00ab61665265bcbfe8114",
+      "valid_for_stats": true
+    }
+  ],
+  "all_correct": true,
+  "health_failures": [],
+  "correctness_failures": [],
+  "summary": {
+    "case_summaries": {
+      "shapes-stable": {
+        "category": "objects",
+        "family": "object-shape",
+        "variant": "baseline",
+        "metrics": {
+          "startup": {
+            "median_ms": {
+              "node": 31.5223999787122,
+              "zipp": 8.975800010375679
+            },
+            "paired_ratio": 0.28136062434001136,
+            "paired_ratio_ci95": [
+              0.2782913538233105,
+              0.29465003401387346
+            ],
+            "nonpositive_pairs": 0
+          },
+          "cold": {
+            "median_ms": {
+              "node": 41.08960006851703,
+              "zipp": 91.42609999980778
+            },
+            "paired_ratio": 2.2175460512041267,
+            "paired_ratio_ci95": [
+              2.0971963153520727,
+              2.2523126417998047
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "node": 10.520300013013184,
+              "zipp": 82.22440001554787
+            },
+            "paired_ratio": 8.060644655362877,
+            "paired_ratio_ci95": [
+              7.003998417467174,
+              9.14244362642398
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      },
+      "shapes-megamorphic": {
+        "category": "objects",
+        "family": "object-shape",
+        "variant": "megamorphic",
+        "metrics": {
+          "startup": {
+            "median_ms": {
+              "node": 31.200199970044196,
+              "zipp": 8.98429995868355
+            },
+            "paired_ratio": 0.28561976785794313,
+            "paired_ratio_ci95": [
+              0.2812944407661929,
+              0.2937367497011653
+            ],
+            "nonpositive_pairs": 0
+          },
+          "cold": {
+            "median_ms": {
+              "node": 48.57570002786815,
+              "zipp": 106.90239991527051
+            },
+            "paired_ratio": 2.2027171606753706,
+            "paired_ratio_ci95": [
+              2.1347590561815775,
+              2.28286466929015
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "node": 17.14819995686412,
+              "zipp": 97.24369994364679
+            },
+            "paired_ratio": 5.765311404524822,
+            "paired_ratio_ci95": [
+              5.375062714123472,
+              6.193499043023791
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      },
+      "allocation-survival": {
+        "category": "allocation",
+        "family": "object-lifetime",
+        "variant": "survivors",
+        "metrics": {
+          "startup": {
+            "median_ms": {
+              "node": 31.47250006441027,
+              "zipp": 9.1709999833256
+            },
+            "paired_ratio": 0.29121309015459934,
+            "paired_ratio_ci95": [
+              0.2813418691964627,
+              0.3065230976679059
+            ],
+            "nonpositive_pairs": 0
+          },
+          "cold": {
+            "median_ms": {
+              "node": 61.214899993501604,
+              "zipp": 267.53790001384914
+            },
+            "paired_ratio": 4.356198546204038,
+            "paired_ratio_ci95": [
+              4.256660357898135,
+              4.452804520690138
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "node": 29.87379999831319,
+              "zipp": 258.47080000676215
+            },
+            "paired_ratio": 8.73344073420984,
+            "paired_ratio_ci95": [
+              8.154421988628213,
+              9.160694445386861
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      },
+      "reactish-reconcile": {
+        "category": "applications",
+        "family": null,
+        "variant": null,
+        "metrics": {
+          "startup": {
+            "median_ms": {
+              "node": 31.287800054997206,
+              "zipp": 9.061200078576803
+            },
+            "paired_ratio": 0.29022725854648695,
+            "paired_ratio_ci95": [
+              0.2792282353073111,
+              0.30304018325571674
+            ],
+            "nonpositive_pairs": 0
+          },
+          "cold": {
+            "median_ms": {
+              "node": 45.7892999984324,
+              "zipp": 124.48619992937893
+            },
+            "paired_ratio": 2.778675284389489,
+            "paired_ratio_ci95": [
+              2.698420812060411,
+              2.8451251311139667
+            ],
+            "nonpositive_pairs": 0
+          },
+          "adjusted": {
+            "median_ms": {
+              "node": 14.397799968719482,
+              "zipp": 115.67950004246086
+            },
+            "paired_ratio": 8.13532891216041,
+            "paired_ratio_ci95": [
+              8.00994209353232,
+              8.531733890775449
+            ],
+            "nonpositive_pairs": 0
+          }
+        }
+      }
+    },
+    "suite_summaries": {
+      "startup": {
+        "overall": {
+          "benches": [
+            "shapes-stable",
+            "shapes-megamorphic",
+            "allocation-survival",
+            "reactish-reconcile"
+          ],
+          "geomean_paired_ratio": 0.28707816945428866,
+          "ci95": [
+            0.28355347543188014,
+            0.2938064707342223
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "objects": [
+              "shapes-stable",
+              "shapes-megamorphic"
+            ],
+            "allocation": [
+              "allocation-survival"
+            ],
+            "applications": [
+              "reactish-reconcile"
+            ]
+          },
+          "geomean_paired_ratio": 0.288286935048938,
+          "ci95": [
+            0.28399004096001834,
+            0.2949528131844706
+          ]
+        },
+        "categories": {
+          "allocation": {
+            "benches": [
+              "allocation-survival"
+            ],
+            "geomean_paired_ratio": 0.29121309015459934,
+            "ci95": [
+              0.2813418691964627,
+              0.3065230976679059
+            ]
+          },
+          "applications": {
+            "benches": [
+              "reactish-reconcile"
+            ],
+            "geomean_paired_ratio": 0.29022725854648695,
+            "ci95": [
+              0.2792282353073111,
+              0.30304018325571674
+            ]
+          },
+          "objects": {
+            "benches": [
+              "shapes-stable",
+              "shapes-megamorphic"
+            ],
+            "geomean_paired_ratio": 0.28348219733937435,
+            "ci95": [
+              0.2806227250538084,
+              0.2921196853399256
+            ]
+          }
+        }
+      },
+      "cold": {
+        "overall": {
+          "benches": [
+            "shapes-stable",
+            "shapes-megamorphic",
+            "allocation-survival",
+            "reactish-reconcile"
+          ],
+          "geomean_paired_ratio": 2.7729638740358573,
+          "ci95": [
+            2.6938983089506268,
+            2.8158155609750644
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "objects": [
+              "shapes-stable",
+              "shapes-megamorphic"
+            ],
+            "allocation": [
+              "allocation-survival"
+            ],
+            "applications": [
+              "reactish-reconcile"
+            ]
+          },
+          "geomean_paired_ratio": 2.990797794788541,
+          "ci95": [
+            2.9223438489600113,
+            3.040050642290217
+          ]
+        },
+        "categories": {
+          "allocation": {
+            "benches": [
+              "allocation-survival"
+            ],
+            "geomean_paired_ratio": 4.356198546204038,
+            "ci95": [
+              4.256660357898134,
+              4.452804520690138
+            ]
+          },
+          "applications": {
+            "benches": [
+              "reactish-reconcile"
+            ],
+            "geomean_paired_ratio": 2.778675284389489,
+            "ci95": [
+              2.698420812060411,
+              2.8451251311139667
+            ]
+          },
+          "objects": {
+            "benches": [
+              "shapes-stable",
+              "shapes-megamorphic"
+            ],
+            "geomean_paired_ratio": 2.2101191690891318,
+            "ci95": [
+              2.118883049016735,
+              2.2619020682480815
+            ]
+          }
+        }
+      },
+      "adjusted": {
+        "overall": {
+          "benches": [
+            "shapes-stable",
+            "shapes-megamorphic",
+            "allocation-survival",
+            "reactish-reconcile"
+          ],
+          "geomean_paired_ratio": 7.580332573804206,
+          "ci95": [
+            7.092893009163708,
+            7.906680452324848
+          ]
+        },
+        "category_balanced": {
+          "categories": {
+            "objects": [
+              "shapes-stable",
+              "shapes-megamorphic"
+            ],
+            "allocation": [
+              "allocation-survival"
+            ],
+            "applications": [
+              "reactish-reconcile"
+            ]
+          },
+          "geomean_paired_ratio": 7.853301221361856,
+          "ci95": [
+            7.420517410385488,
+            8.196953738637239
+          ]
+        },
+        "categories": {
+          "allocation": {
+            "benches": [
+              "allocation-survival"
+            ],
+            "geomean_paired_ratio": 8.733440734209838,
+            "ci95": [
+              8.154421988628211,
+              9.160694445386861
+            ]
+          },
+          "applications": {
+            "benches": [
+              "reactish-reconcile"
+            ],
+            "geomean_paired_ratio": 8.13532891216041,
+            "ci95": [
+              8.009942093532318,
+              8.531733890775449
+            ]
+          },
+          "objects": {
+            "benches": [
+              "shapes-stable",
+              "shapes-megamorphic"
+            ],
+            "geomean_paired_ratio": 6.8170467623000555,
+            "ci95": [
+              6.194283388436591,
+              7.3164532063159005
+            ]
+          }
+        }
+      }
+    },
+    "degradations": [
+      {
+        "family": "object-shape",
+        "available": true,
+        "baseline": "shapes-stable",
+        "stressor": "shapes-megamorphic",
+        "variant": "megamorphic",
+        "metrics": {
+          "cold": {
+            "engine_stressor_over_baseline": {
+              "node": {
+                "paired_ratio": 1.1598433624390432,
+                "ci95": [
+                  1.1399615631667328,
+                  1.1846240774619285
+                ],
+                "nonpositive_pairs": 0
+              },
+              "zipp": {
+                "paired_ratio": 1.1773648246548203,
+                "ci95": [
+                  1.153948241314731,
+                  1.205710087924997
+                ],
+                "nonpositive_pairs": 0
+              }
+            },
+            "relative_parity_ratio": {
+              "paired_ratio": 1.0122694296017702,
+              "ci95": [
+                0.9779801967968342,
+                1.074787409825763
+              ],
+              "nonpositive_pairs": 0
+            }
+          },
+          "adjusted": {
+            "engine_stressor_over_baseline": {
+              "node": {
+                "paired_ratio": 1.7324427328218934,
+                "ci95": [
+                  1.4810497064424162,
+                  1.8927370793513565
+                ],
+                "nonpositive_pairs": 0
+              },
+              "zipp": {
+                "paired_ratio": 1.2020184315582398,
+                "ci95": [
+                  1.170394493869814,
+                  1.21217942064841
+                ],
+                "nonpositive_pairs": 0
+              }
+            },
+            "relative_parity_ratio": {
+              "paired_ratio": 0.6781687218950694,
+              "ci95": [
+                0.6404372978542933,
+                0.8239289441993973
+              ],
+              "nonpositive_pairs": 0
+            }
+          }
+        }
+      },
+      {
+        "family": "object-lifetime",
+        "available": false,
+        "reason": "selected cases do not include baseline and stressor"
+      }
+    ]
+  }
+}

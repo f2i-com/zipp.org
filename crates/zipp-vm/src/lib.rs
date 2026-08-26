@@ -91,6 +91,13 @@ pub mod bench_support {
         let m = Box::new(ObjMap::finalized_from_plan(plan.clone(), v, shape));
         (m.len() as usize).wrapping_add(m.shape() as usize & 1)
     }
+
+    /// B187 stage-3: the allocator/init/store decomposition ladder (lives in
+    /// `heap` for private-field access; strings out, no types widened).
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub fn floor_decompose(plan: &StaticKeyPlan, vals: &[u64], n: u32) -> Vec<String> {
+        crate::heap::bench_floor_decompose(plan, vals, n)
+    }
 }
 mod front;
 pub use front::set_pure_script_goal;

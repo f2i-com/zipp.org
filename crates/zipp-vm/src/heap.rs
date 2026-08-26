@@ -607,6 +607,35 @@ fn val_slab_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_OBJ_POOL=1` disables the B187 stage-3 `Box<ObjMap>` recycle pool
+/// (every finalize-born literal takes a fresh allocation and every dead shell
+/// ships to the courier, the stage-2 behavior) — the single-binary A/B for
+/// the pool. Latched on first use.
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn obj_pool_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_OBJ_POOL").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Retained-shell FLOOR for the recycle pool (~450 KiB of shells): the trim
+/// at each collection-done note keeps `max(2 * served, floor)` shells, so a
+/// steady literal-churn loop ramps the pool to its whole inter-sweep window
+/// within a few collections (doubling per sweep) while a phase change decays
+/// it back toward the floor, the excess riding the same courier batch the
+/// shells would have taken untrimmed.
+#[cfg(not(feature = "safe-sandbox"))]
+const OBJ_POOL_FLOOR: usize = 4096;
+
 /// `ZIPP_NO_ATTRS_ELIDE=1` makes every map carry the explicit attribute
 /// vector from birth (`PropAttrs::Mixed`), the pre-elision representation —
 /// the single-binary A/B for the all-default elision. Latched on first use.
@@ -4009,6 +4038,41 @@ pub struct Heap {
     /// The literal value slab (B187 stage 2), one class per capacity bucket.
     #[cfg(not(feature = "safe-sandbox"))]
     val_slab: [ValSlabClass; 3],
+    /// B187 stage 3: recycled `Box<ObjMap>` shells. The sweep pushes a dying
+    /// object's box here (instead of shipping it to the courier) when its
+    /// remaining contents are drop-cheap — Planned keys, all-default attrs,
+    /// no index tables, value cell already returned — and `alloc_finalized`
+    /// pops one and overwrites it wholesale, removing the allocator
+    /// round-trip that is half the literal construction floor (38.6 ->
+    /// 19.2ns/obj in `build_floor_micro`). Shells hold NO heap references
+    /// (the plan Arc owns only strings), so the pool is never traced; the
+    /// deferred drop of a shell's plan Arc happens at overwrite.
+    #[cfg(not(feature = "safe-sandbox"))]
+    obj_pool: Vec<Box<ObjMap>>,
+    /// Pool pops served since the last collection-done note — the demand
+    /// signal `courier_flush`'s trim sizes the pool by.
+    #[cfg(not(feature = "safe-sandbox"))]
+    obj_pool_pops: usize,
+    /// True only while a MINOR sweep runs: the recycle arm refills the pool
+    /// from young deaths (the literal churn it exists for) and never from a
+    /// major's burst — a promotion-heavy workload retires its whole live set
+    /// in one major walk, and pooling that mass ballooned and then dribbled
+    /// it back out (allocation-survival +4.4% even with decay trimming).
+    #[cfg(not(feature = "safe-sandbox"))]
+    obj_pool_refill: bool,
+    /// Whether the NEXT minor may refill the pool: the previous minor's
+    /// survivor fraction must be low (< 1/16). A retaining workload reads
+    /// its survivors later, and serving its allocations from recycled
+    /// shells scatters what fresh sequential blocks would have packed —
+    /// allocation-survival measured +8.7% MUTATOR-side (GC time equal)
+    /// from exactly that locality loss. Churn workloads (survivors ~0)
+    /// never re-read, so recycling stays a pure allocator win there.
+    #[cfg(not(feature = "safe-sandbox"))]
+    obj_pool_refill_ok: bool,
+    /// `ZIPP_GCSTATS=1` pool telemetry (pushed, popped, trimmed), printed
+    /// when the heap drops. Plain counters — bumped only under the latch.
+    #[cfg(not(feature = "safe-sandbox"))]
+    obj_pool_stats: [u64; 3],
     /// Free list of reclaimed slot indices (filled by the mark-sweep GC's sweep,
     /// drained by `alloc`). A reused slot is overwritten and its version bumped so
     /// any stale JIT inline-cache entry misses. Empty until the first collection.
@@ -4332,6 +4396,16 @@ impl Heap {
             courier_batch: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
             val_slab: [ValSlabClass::new(), ValSlabClass::new(), ValSlabClass::new()],
+            #[cfg(not(feature = "safe-sandbox"))]
+            obj_pool: Vec::new(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            obj_pool_pops: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
+            obj_pool_refill: false,
+            #[cfg(not(feature = "safe-sandbox"))]
+            obj_pool_refill_ok: true,
+            #[cfg(not(feature = "safe-sandbox"))]
+            obj_pool_stats: [0; 3],
             shape_mirror: vec![crate::shape::DICT; versions.len()],
             vals_ptr_mirror: vec![0; versions.len()],
             fid_mirror: vec![FID_MIRROR_NONE; versions.len()],
@@ -4457,7 +4531,24 @@ impl Heap {
         #[cfg(feature = "safe-sandbox")]
         let store = ValStore::Vec(vals.to_vec());
         let map = ObjMap::finalized_from_store(plan, store, shape);
-        self.alloc(HeapObj::Object(Box::new(map)))
+        // B187 stage 3: serve the box from the recycle pool when the sweep
+        // has stocked it — the overwrite drops the shell's deferred plan Arc
+        // and costs one 112-byte store in place of an allocator round-trip.
+        #[cfg(not(feature = "safe-sandbox"))]
+        let boxed = match self.obj_pool.pop() {
+            Some(mut b) => {
+                self.obj_pool_pops += 1;
+                if self.oracle {
+                    self.obj_pool_stats[1] += 1;
+                }
+                *b = map;
+                b
+            }
+            None => Box::new(map),
+        };
+        #[cfg(feature = "safe-sandbox")]
+        let boxed = Box::new(map);
+        self.alloc(HeapObj::Object(boxed))
     }
 
     /// Refresh slot `idx`'s shape/vals mirrors from the live object — the
@@ -4698,6 +4789,10 @@ impl Heap {
     pub fn sweep_young(&mut self, marks: &[bool]) -> usize {
         let mut log = std::mem::take(&mut self.young);
         let mut swept = 0;
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            self.obj_pool_refill = self.obj_pool_refill_ok;
+        }
         for &idx in &log {
             if !marks[idx as usize] {
                 self.free_slot(idx);
@@ -4708,6 +4803,13 @@ impl Heap {
                 let g = &mut self.gen[idx as usize];
                 *g = (*g & GEN_SCAN) | GEN_OLD;
             }
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            self.obj_pool_refill = false;
+            // This minor's survivor fraction gates the NEXT minor's refill
+            // (phases are sticky; the first minor defaults to refilling).
+            self.obj_pool_refill_ok = (log.len() - swept).saturating_mul(16) <= log.len();
         }
         log.clear();
         self.young = log;
@@ -4996,6 +5098,16 @@ impl Heap {
     /// live reference remains. Never call on a pinned built-in slot.
     #[inline]
     pub fn free_slot(&mut self, idx: u32) {
+        // B187 stage 3: capture the recycle signal BEFORE the mirror clears.
+        // A settled (non-DICT) shape mirror means the occupant was born
+        // finalized/appended and never structurally bumped without repair —
+        // exactly the drop-cheap literal-shell population — and this read
+        // costs nothing: the line is about to be written anyway. Deciding
+        // from the mirror instead of the dying map's own fields is what
+        // keeps the sweep from touching a second cold line per object
+        // (survival's minors measured +5.8ms from those field reads).
+        #[cfg(not(feature = "safe-sandbox"))]
+        let was_settled = self.shape_mirror[idx as usize] != crate::shape::DICT;
         self.shape_mirror[idx as usize] = crate::shape::DICT;
         self.vals_ptr_mirror[idx as usize] = 0;
         self.fid_mirror[idx as usize] = FID_MIRROR_NONE;
@@ -5023,7 +5135,29 @@ impl Heap {
                     self.val_slab[class as usize].free_cell(base);
                     m.vals = ValStore::Vec(Vec::new());
                 }
-                HeapObj::Object(m)
+                // B187 stage 3: recycle a drop-cheap shell instead of
+                // couriering it. Everything the box still owns is either a
+                // string-only plan Arc (decremented when `alloc_finalized`
+                // overwrites the popped shell) or drop-free, so nothing the
+                // courier would have carried is paid on this thread.
+                // Rich-but-settled shells (an index table, Mixed attrs)
+                // still pool: their contents drop at the overwrite, which is
+                // rare and bounded, and checking for them here would read
+                // the far cache line this arm exists to avoid.
+                if obj_pool_enabled()
+                    && self.obj_pool_refill
+                    && was_settled
+                    && matches!(m.keys, PropKeys::Planned { .. })
+                    && matches!(&m.vals, ValStore::Vec(v) if v.capacity() == 0)
+                {
+                    if self.oracle {
+                        self.obj_pool_stats[0] += 1;
+                    }
+                    self.obj_pool.push(m);
+                    HeapObj::Date(f64::NAN)
+                } else {
+                    HeapObj::Object(m)
+                }
             }
             other => other,
         };
@@ -5053,6 +5187,33 @@ impl Heap {
     /// batch lifetime is exactly one sweep.
     #[inline]
     fn courier_flush(&mut self) {
+        // B187 stage 3: size the recycle pool to the just-ended window's
+        // demand (doubled, so a ramping workload reaches whole-window reuse
+        // within a few sweeps; floored, so short phases don't thrash). The
+        // sweep that just ran refilled the pool uncapped; the excess rides
+        // this same courier batch.
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            // `len/2` bounds the decay at one halving per note: a major
+            // landing right after a minor sees pops≈0 (barely any allocs
+            // between their notes), and snapping to the floor there dumps
+            // the whole pool only for the next window to re-malloc it —
+            // measured +7.6% on allocation-survival, whose promotion rate
+            // makes that minor→major cadence the steady state.
+            let keep = self
+                .obj_pool_pops
+                .saturating_mul(2)
+                .max(self.obj_pool.len() / 2)
+                .max(OBJ_POOL_FLOOR);
+            self.obj_pool_pops = 0;
+            while self.obj_pool.len() > keep {
+                let m = self.obj_pool.pop().expect("len checked");
+                if self.oracle {
+                    self.obj_pool_stats[2] += 1;
+                }
+                self.courier_batch.push(gc_courier::Item::Obj(m));
+            }
+        }
         if !self.courier_batch.is_empty() {
             gc_courier::ship(std::mem::take(&mut self.courier_batch));
         }
@@ -6664,4 +6825,128 @@ mod tests {
             "post-audit allocations are charged eagerly again"
         );
     }
+}
+
+impl Drop for Heap {
+    fn drop(&mut self) {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.oracle {
+            let [pushed, popped, trimmed] = self.obj_pool_stats;
+            eprintln!(
+                "[objpool] pushed={pushed} popped={popped} trimmed={trimmed} resident={}",
+                self.obj_pool.len()
+            );
+        }
+    }
+}
+
+/// B187 stage-3 scouting: decompose the object-construction floor into its
+/// allocator / init / value-store shares, inside this module so the private
+/// `ValStore`/`ValSlabClass` internals are reachable. Called only by the
+/// ignored `build_floor_micro` test through `bench_support`; hidden from docs.
+#[doc(hidden)]
+#[cfg(not(feature = "safe-sandbox"))]
+pub fn bench_floor_decompose(
+    plan: &crate::bytecode::StaticKeyPlan,
+    vals: &[u64],
+    n: u32,
+) -> Vec<String> {
+    use std::time::Instant;
+    let data = crate::shape::attr_bits(true, true, true, false);
+    let mut shape = crate::shape::EMPTY;
+    for key in plan.keys() {
+        shape = crate::shape::add(shape, key, data);
+    }
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "sizeof: ObjMap={} HeapObj={} ValStore={} PropKeys={}",
+        std::mem::size_of::<ObjMap>(),
+        std::mem::size_of::<HeapObj>(),
+        std::mem::size_of::<ValStore>(),
+        std::mem::size_of::<PropKeys>(),
+    ));
+    let per = |dt: std::time::Duration| dt.as_nanos() as f64 / n as f64;
+
+    // (c) allocator pair alone: malloc + 112B default-init + free.
+    let t = Instant::now();
+    let mut keep = 0usize;
+    for _ in 0..n {
+        let b = Box::new(ObjMap::new());
+        keep = keep.wrapping_add((&*b as *const ObjMap as usize) & 7);
+    }
+    lines.push(format!("box-pair(empty): {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+
+    // (b2) fresh box + slab store: today's engine construction minus the
+    // heap-slot/mirror tail.
+    let class = val_slab_class(vals.len()).expect("slab class");
+    let cap = val_slab_class_cap(class);
+    let mut slab = ValSlabClass::new();
+    let t = Instant::now();
+    let mut keep = 0usize;
+    for i in 0..n {
+        let base = slab.alloc_cell(cap);
+        unsafe {
+            let p = base as *mut Value;
+            for (j, &bits) in vals.iter().enumerate() {
+                *p.add(j) = Value::num((bits ^ (i as u64 ^ j as u64)) as f64);
+            }
+        }
+        let store = ValStore::Slab {
+            base,
+            len: vals.len() as u16,
+            class,
+        };
+        let m = Box::new(ObjMap::finalized_from_store(plan.clone(), store, shape));
+        keep = keep.wrapping_add(m.len());
+        if let ValStore::Slab { base, .. } = &m.vals {
+            slab.free_cell(*base);
+        }
+    }
+    lines.push(format!("fresh-box+slab: {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+
+    // (d) pooled box + fresh Vec store: the box malloc/free pair removed.
+    let mut b = Box::new(ObjMap::new());
+    let t = Instant::now();
+    let mut keep = 0usize;
+    for i in 0..n {
+        let mut v: Vec<Value> = Vec::with_capacity(vals.len());
+        for (j, &bits) in vals.iter().enumerate() {
+            v.push(Value::num((bits ^ (i as u64 ^ j as u64)) as f64));
+        }
+        *b = ObjMap::finalized_from_store(plan.clone(), ValStore::Vec(v), shape);
+        keep = keep.wrapping_add(b.len());
+    }
+    lines.push(format!("pooled-box+vec: {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+
+    // (e) pooled box + slab store: the compact-construction candidate floor.
+    let mut slab = ValSlabClass::new();
+    let mut b = Box::new(ObjMap::new());
+    let t = Instant::now();
+    let mut keep = 0usize;
+    for i in 0..n {
+        let base = slab.alloc_cell(cap);
+        unsafe {
+            let p = base as *mut Value;
+            for (j, &bits) in vals.iter().enumerate() {
+                *p.add(j) = Value::num((bits ^ (i as u64 ^ j as u64)) as f64);
+            }
+        }
+        let store = ValStore::Slab {
+            base,
+            len: vals.len() as u16,
+            class,
+        };
+        let prev = if let ValStore::Slab { base, .. } = &b.vals {
+            Some(*base)
+        } else {
+            None
+        };
+        *b = ObjMap::finalized_from_store(plan.clone(), store, shape);
+        if let Some(pb) = prev {
+            slab.free_cell(pb);
+        }
+        keep = keep.wrapping_add(b.len());
+    }
+    lines.push(format!("pooled-box+slab: {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+    lines
 }

@@ -471,6 +471,13 @@ const MODES: &[Mode] = &[
         name: "noundefadmit",
         env: &[("ZIPP_NO_UNDEF_ADMIT", "1")],
     },
+    // B187 stage 3: the `Box<ObjMap>` recycle pool vs fresh allocation +
+    // courier for every finalize-born literal (the generator's literal
+    // churn plus the GC-stress lane drive sweep-refill/pop constantly).
+    Mode {
+        name: "noobjpool",
+        env: &[("ZIPP_NO_OBJ_POOL", "1")],
+    },
     Mode {
         name: "upvalmin12",
         env: &[("ZIPP_TIERC_UPVAL_MIN", "12")],
