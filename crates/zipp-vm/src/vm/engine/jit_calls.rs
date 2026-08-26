@@ -919,8 +919,20 @@ impl<'p> Vm<'p> {
                 // shape. Deopt so `setup_call` does the rebinding, which is what
                 // the two sibling fast paths above already do for the same
                 // reason (`jit_self_call_impl`, `jit_fast_call_impl`).
-                Some((fid, _, _)) if self.func(fid as usize).lexical_this => {
-                    return crate::codegen::SELF_CALL_DEOPT;
+                Some((fid, _, callee)) if self.func(fid as usize).lexical_this => {
+                    // B184: COMPLETE instead of deopting — `call_value` routes
+                    // through `setup_call`, which performs exactly the lexical
+                    // `this` rebinding the deopt used to buy from the
+                    // interpreter, and a mid-body deopt would replay a
+                    // cross-caller's already-run effects (the B181 class).
+                    let _ = fid;
+                    let called = self.with_argv(base, arg_base, argc, |vm, argv| {
+                        vm.call_value(callee, recv, argv)
+                    });
+                    return match called {
+                        Ok(v) => v.bits(),
+                        Err(t) => self.jit_thrown_to_sentinel(t),
+                    };
                 }
                 Some((fid, closure, callee)) => (fid, closure, recv, callee),
                 None => {
@@ -951,7 +963,7 @@ impl<'p> Vm<'p> {
                     // next for this op (`try_builtin_method`, then a
                     // ctor-object native like `Math.floor`) — run to
                     // completion, never deopting after a side effect.
-                    return self.jit_method_builtin_fallback(recv, key, base, arg_base, argc);
+                    return self.jit_method_builtin_fallback(func_id, recv, key, base, arg_base, argc);
                 }
             }
         } else {
@@ -1040,6 +1052,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn jit_method_builtin_fallback(
         &mut self,
+        func_id: u32,
         recv: Value,
         key: &str,
         base: usize,
@@ -1073,7 +1086,50 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        crate::codegen::SELF_CALL_DEOPT
+        // ── B184: COMPLETE the general miss — never deopt past this point ──
+        // A cross-called body has no frame to resume mid-function, so a
+        // SELF_CALL_DEOPT here forces the caller to replay the WHOLE call and
+        // double-apply every effect that already ran (B181's forEach callback
+        // running twice). This tail mirrors the interpreter's CallMethod slow
+        // arm observably: the ordinary property Get (getters run, exactly as
+        // they would interpreted, with the same `(in <fn>)` message wrap), the
+        // ctor-object route (`this = undefined`), then `call_value` with
+        // `this = recv` — which handles natives, bound functions, proxies,
+        // generators and plain user functions uniformly, and throws the
+        // interpreter's TypeError for a non-callable.
+        let prop = match self.get_prop(recv, key) {
+            Ok(v) => v,
+            Err(Thrown(msg)) => {
+                let f = self.func(func_id as usize);
+                let name: &str = if f.name.is_empty() {
+                    "<anonymous>"
+                } else {
+                    &f.name
+                };
+                return self.jit_thrown_to_sentinel(Thrown(format!("{msg} (in {name})")));
+            }
+        };
+        let this_v = if prop.is_heap()
+            && matches!(self.heap.get(prop.heap_index()), HeapObj::Object(m) if m.is_ctor)
+        {
+            Value::UNDEFINED
+        } else {
+            recv
+        };
+        if !self.is_callable(prop) {
+            return self
+                .jit_thrown_to_sentinel(match self.resolve_callable_named(prop, key) {
+                    Err(t) => t,
+                    Ok(_) => Thrown(format!("TypeError: {key} is not a function")),
+                });
+        }
+        let called = self.with_argv(base, arg_base, argc, |vm, argv| {
+            vm.call_value(prop, this_v, argv)
+        });
+        match called {
+            Ok(v) => v.bits(),
+            Err(t) => self.jit_thrown_to_sentinel(t),
+        }
     }
 
     /// B82: inline the TARGET of `f.call(…)` / `f.apply(…)` at a region
