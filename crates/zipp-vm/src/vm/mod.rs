@@ -1298,6 +1298,23 @@ pub struct Vm<'p> {
     /// version cache sound here, exactly as the string-method doc warns).
     /// Pure cache: entries self-validate, nothing invalidates them.
     coll_intrinsic_memo: [[Option<(u32, u32, u64)>; COLL_MEMO_NAMES]; 2],
+    /// B191: boot-time snapshots of %String.prototype% / %Array.prototype%'s
+    /// own method slots (`name` → the installed native's Value bits, captured
+    /// at the end of `setup_globals`, when the native heap slots are pinned
+    /// below the GC floor). The primitive-method dispatch fast paths and the
+    /// JIT's dedicated helpers prove `live slot bits == baseline[name]`
+    /// before serving an intrinsic by name — overwriting, deleting, or
+    /// accessorizing a prototype method sends the call down the generic
+    /// property-Get route, which observes the override (the class the
+    /// string_regexp guard's doc records; B191 completes it).
+    str_proto_baseline: rustc_hash::FxHashMap<Box<str>, u64>,
+    arr_proto_baseline: rustc_hash::FxHashMap<Box<str>, u64>,
+    /// B191 memo over the proof above, exactly the B183 form: per hot name,
+    /// `(proto version, slot, fn bits)` — version+bits BOTH required (an
+    /// in-place overwrite bumps no version). Indexed by the small name enums
+    /// in builtins.rs.
+    str_intrinsic_memo: [Option<(u32, u32, u64)>; STR_MEMO_NAMES],
+    arr_intrinsic_memo: [Option<(u32, u32, u64)>; ARR_MEMO_NAMES],
     date_proto: u32,
     promise_proto: u32,
     /// `Number`/`Boolean`.prototype — number/boolean PRIMITIVES delegate here for
@@ -1952,6 +1969,10 @@ pub struct Vm<'p> {
     gc_lock: std::rc::Rc<std::cell::Cell<u32>>,
     gc_stress: bool,
 }
+
+/// B191 memo widths (hot names; anything else takes the full per-call proof).
+pub(crate) const STR_MEMO_NAMES: usize = 16;
+pub(crate) const ARR_MEMO_NAMES: usize = 8;
 
 /// Method-name arity of [`Vm::coll_intrinsic_memo`]: get/set/has/add/delete/clear.
 pub(crate) const COLL_MEMO_NAMES: usize = 6;

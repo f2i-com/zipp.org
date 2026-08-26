@@ -6472,6 +6472,10 @@ impl<'p> Vm<'p> {
                         if argc == 1
                             && key == "push"
                             && recv.is_heap()
+                            // B191: only while `push` is still the boot intrinsic
+                            // on %Array.prototype% — a shadow must resolve through
+                            // the generic Get and call the override.
+                            && self.array_method_is_intrinsic("push")
                             // A prototype carrying integer indices means push's new
                             // index may resolve to a prototype setter (OrdinarySet) â€”
                             // route through array_method's proto-aware path.

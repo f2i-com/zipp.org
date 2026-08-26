@@ -2849,5 +2849,9 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // B191: snapshot the primitive prototypes' method slots LAST, after
+        // every install above — the name-dispatched fast paths prove against
+        // exactly this state before serving an intrinsic.
+        self.capture_proto_baselines();
     }
 }

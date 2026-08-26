@@ -199,15 +199,15 @@ fn live_string_intrinsic_mutations_are_observed() {
     assert_eq!(
         out,
         [
-            // zipp's pre-existing name-dispatched primitive String builtins do
-            // not yet observe these prototype edits. The reducer still declines
-            // them (its guard is stricter), and the off-switch child below pins
-            // this file's current generic-path parity until that engine-wide
-            // protocol issue is repaired.
-            "char=a&amp;b:0",
-            "sub=<code>a&amp;</code>:0",
-            "accessor=ab:0",
-            "delete=missed",
+            // B191 repaired the engine-wide protocol issue this block used to
+            // pin: the name-dispatched primitive builtins now prove the live
+            // prototype slot against the boot baseline, so these edits route
+            // to the generic Get and the wrappers are OBSERVED — byte-for-byte
+            // node parity (the counts are node's).
+            "char=a&amp;b:3",
+            "sub=<code>a&amp;</code>:3",
+            "accessor=ab:2",
+            "delete=true",
         ]
     );
 }
@@ -304,10 +304,12 @@ fn child_realm_helper_uses_its_own_string_intrinsics() {
             "unexpected runtime error: {:?}",
             out.error
         );
-        // Primitive String prototype overrides are not yet observable through
-        // zipp's generic name-dispatched builtins. These values pin current
-        // generic-path parity; the parent verifies the reducer declined.
-        assert_eq!(out.output, ["helper=<code>a&amp;</code>:false"]);
+        // B191: primitive-prototype overrides are observable through the
+        // name-dispatched builtins (the pristinity proof routes a shadowed
+        // slot to the generic Get) — in every realm. The child realm's
+        // wrapper is therefore HIT; the parent still verifies the reducer
+        // declined rather than bypassing the execution realm.
+        assert_eq!(out.output, ["helper=<code>a&amp;</code>:true"]);
         return;
     }
 

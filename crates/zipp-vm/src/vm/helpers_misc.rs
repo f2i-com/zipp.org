@@ -522,6 +522,11 @@ pub(crate) extern "win64" fn jit_str_index_of(
     needle_bits: u64,
 ) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    // B191: serve only while `indexOf` is still the boot intrinsic on
+    // %String.prototype% — a shadow routes to the generic Get.
+    if !vm.string_method_is_intrinsic("indexOf") {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     let (r, n) = (Value::from_bits(recv_bits), Value::from_bits(needle_bits));
     if !r.is_heap() || !n.is_heap() {
         return crate::codegen::SELF_CALL_DEOPT;
@@ -561,6 +566,11 @@ pub(crate) extern "win64" fn jit_str_substring(
     mode: u64,
 ) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };
+    // B191: `substring`/`slice` share this helper; mode bit 0 says which.
+    let b191_name = if mode & 1 != 0 { "slice" } else { "substring" };
+    if !vm.string_method_is_intrinsic(b191_name) {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     let r = Value::from_bits(recv_bits);
     if !r.is_heap() {
         return crate::codegen::SELF_CALL_DEOPT;
@@ -1513,6 +1523,15 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
             // the (ptr, len) only goes stale if the object is replaced (different
             // bits → guard miss) or GC frees it (only across a user-code helper,
             // after which the region re-snapshots).
+            //
+            // B191: the pin licenses RAW `charCodeAt` byte loads with no per-op
+            // proof, so the snapshot itself requires the boot intrinsic. Only
+            // user code can shadow, and every user-code helper re-snapshots —
+            // so region-pass granularity is exact. A shadow zeroes the
+            // snapshot; the identity guard then misses to the generic route.
+            if !vm.string_method_is_intrinsic("charCodeAt") {
+                return None;
+            }
             return match vm.heap.get(idx) {
                 HeapObj::Str(js) if js.is_ascii() => {
                     let bytes = js.as_bytes();
@@ -1731,6 +1750,11 @@ pub(crate) extern "win64" fn jit_array_push(
     // A SPARSE array's length is NOT items.len() — the virtual-length side table
     // governs (push must place the element AT that length and may throw): deopt
     // so the interpreter's length-aware push runs.
+    // B191: `push` must still be the boot intrinsic — checked per call (the
+    // hoisted eligibility gate below cannot see a mid-region shadow).
+    if !vm.array_method_is_intrinsic("push") {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     if vm.array_js_len.contains_key(&arr.heap_index()) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
@@ -2000,8 +2024,13 @@ pub(crate) extern "win64" fn jit_char_code_at(
         Some(i) => i,
         None => return crate::codegen::SELF_CALL_DEOPT, // negative/fractional
     };
-    // SAFETY: read-only view; the running region holds no conflicting borrow.
-    let vm = unsafe { &*(vm as *const Vm) };
+    // SAFETY: exclusive view (the memo may refill); the running region holds
+    // no conflicting borrow.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    // B191: serve only the boot intrinsic (see `string_method_is_intrinsic`).
+    if !vm.string_method_is_intrinsic("charCodeAt") {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     match vm.heap.get(sv.heap_index()) {
         // The UTF-16 unit at `i` (O(1) ASCII byte fast path inside `unit_at`),
         // matching the interpreter's `charCodeAt`.
@@ -2054,9 +2083,16 @@ pub(crate) extern "win64" fn jit_span_code_unit_pred(
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let i = i.as_int() as usize;
-    // SAFETY: read-only view; the emitted leaf body holds no conflicting heap
-    // borrow and this helper neither allocates nor invokes user code.
-    let vm = unsafe { &*(vm as *const Vm) };
+    // SAFETY: exclusive view (the B191 memo may refill); the emitted leaf body
+    // holds no conflicting heap borrow and this helper neither allocates nor
+    // invokes user code.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    // B191: the fused predicate embodies `source.charCodeAt(...)` — serve only
+    // while that is still the boot intrinsic.
+    if !vm.string_method_is_intrinsic("charCodeAt") {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let vm = &*vm;
     let global = |shift: u32| -> Option<Value> {
         let g = ((packed_globals >> shift) & 0xffff) as usize;
         vm.globals.get(g).copied()

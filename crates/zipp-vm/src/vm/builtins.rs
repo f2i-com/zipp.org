@@ -75,6 +75,44 @@ mod bstats {
 
 pub use bstats::dump as builtin_stats;
 
+/// B191 memo indices for the hot string names (see `STR_MEMO_NAMES`).
+fn str_memo_id(name: &str) -> Option<usize> {
+    Some(match name {
+        "charCodeAt" => 0,
+        "charAt" => 1,
+        "indexOf" => 2,
+        "slice" => 3,
+        "substring" => 4,
+        "split" => 5,
+        "trim" => 6,
+        "replace" => 7,
+        "includes" => 8,
+        "startsWith" => 9,
+        "endsWith" => 10,
+        "padStart" => 11,
+        "padEnd" => 12,
+        "codePointAt" => 13,
+        "repeat" => 14,
+        "lastIndexOf" => 15,
+        _ => return None,
+    })
+}
+
+/// B191 memo indices for the hot array names (see `ARR_MEMO_NAMES`).
+fn arr_memo_id(name: &str) -> Option<usize> {
+    Some(match name {
+        "push" => 0,
+        "pop" => 1,
+        "join" => 2,
+        "indexOf" => 3,
+        "includes" => 4,
+        "slice" => 5,
+        "shift" => 6,
+        "concat" => 7,
+        _ => return None,
+    })
+}
+
 /// Classify a receiver for the [`bstats`] histogram. Deliberately coarse — the
 /// question it answers is "which (kind, name) pairs deserve a region intrinsic",
 /// and that is decided per heap kind.
@@ -274,6 +312,117 @@ impl<'p> Vm<'p> {
     /// builtin shortcut and the native collection helpers.  An own shadow, a
     /// subclass/custom prototype, a deleted/accessor/replaced prototype slot,
     /// or a child-realm prototype sends the caller through ordinary Get+Call.
+    /// B191: snapshot %String.prototype% / %Array.prototype%'s own
+    /// non-accessor heap-valued slots (`name` -> Value bits) at the end of
+    /// boot. The captured natives live in pinned slots below the GC floor,
+    /// so the bits are stable for the VM's lifetime and value-bits equality
+    /// against this table is a tamper-proof "still the boot intrinsic" test.
+    pub(crate) fn capture_proto_baselines(&mut self) {
+        for (proto, out) in [
+            (self.str_proto, 0usize),
+            (self.arr_proto, 1usize),
+        ] {
+            if proto == 0 {
+                continue;
+            }
+            let mut pairs: Vec<(Box<str>, u64)> = Vec::new();
+            if let HeapObj::Object(map) = self.heap.get(proto) {
+                for (i, key) in map.keys.iter().enumerate() {
+                    if map.attr_at(i).accessor {
+                        continue;
+                    }
+                    let v = map.val_at(i);
+                    if v.is_heap() {
+                        pairs.push((key.as_str().into(), v.bits()));
+                    }
+                }
+            }
+            let table = if out == 0 {
+                &mut self.str_proto_baseline
+            } else {
+                &mut self.arr_proto_baseline
+            };
+            for (k, b) in pairs {
+                table.insert(k, b);
+            }
+        }
+    }
+
+    /// B191: is `name` on %String.prototype% still the boot intrinsic — the
+    /// gate every name-dispatched string-builtin fast path (interpreter and
+    /// JIT helper alike) must pass before serving the intrinsic. A false
+    /// answer is a pure read-only prefix: callers fall through to the generic
+    /// property Get, which observes the override/deletion/accessor exactly.
+    /// Hot names take the B183-form memo (version + slot + VALUE bits — an
+    /// in-place overwrite bumps no version, so bits are load-bearing).
+    pub(crate) fn string_method_is_intrinsic(&mut self, name: &str) -> bool {
+        let memo_id = str_memo_id(name);
+        self.proto_method_is_baseline(self.str_proto, name, memo_id, false)
+    }
+
+    /// B191: the %Array.prototype% twin of [`Vm::string_method_is_intrinsic`].
+    pub(crate) fn array_method_is_intrinsic(&mut self, name: &str) -> bool {
+        let memo_id = arr_memo_id(name);
+        self.proto_method_is_baseline(self.arr_proto, name, memo_id, true)
+    }
+
+    fn proto_method_is_baseline(
+        &mut self,
+        proto: u32,
+        name: &str,
+        memo_id: Option<usize>,
+        is_arr: bool,
+    ) -> bool {
+        if proto == 0 || self.active_realm_proto(proto) != proto {
+            return false;
+        }
+        if let Some(nid) = memo_id {
+            let memo = if is_arr {
+                self.arr_intrinsic_memo[nid]
+            } else {
+                self.str_intrinsic_memo[nid]
+            };
+            if let Some((ver, slot, fn_bits)) = memo {
+                if self.heap.version_of(proto) == ver {
+                    if let HeapObj::Object(map) = self.heap.get(proto) {
+                        if map.val_get_ref(slot as usize).map(|v| v.bits()) == Some(fn_bits) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        let baseline = if is_arr {
+            self.arr_proto_baseline.get(name).copied()
+        } else {
+            self.str_proto_baseline.get(name).copied()
+        };
+        let Some(expected_bits) = baseline else {
+            return false;
+        };
+        let proven = match self.heap.get(proto) {
+            HeapObj::Object(map) => map.pos(name).and_then(|slot| {
+                (!map.attr_at(slot).accessor && map.val_at(slot).bits() == expected_bits)
+                    .then_some(slot as u32)
+            }),
+            _ => None,
+        };
+        match proven {
+            Some(slot) => {
+                if let Some(nid) = memo_id {
+                    let entry = Some((self.heap.version_of(proto), slot, expected_bits));
+                    if is_arr {
+                        self.arr_intrinsic_memo[nid] = entry;
+                    } else {
+                        self.str_intrinsic_memo[nid] = entry;
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     pub(crate) fn collection_method_is_intrinsic(&mut self, idx: u32, name: &str, kind: u8) -> bool {
         let proto = match (self.heap.get(idx), kind) {
             (HeapObj::Set(_), 3) => self.set_proto,
@@ -508,6 +657,14 @@ impl<'p> Vm<'p> {
             {
                 return Ok(None);
             }
+            // B191: EVERY name this arm serves must still be the boot
+            // intrinsic — a shadowed/deleted/accessorized prototype slot
+            // routes to the generic Get, which observes the override. (The
+            // regexp/case guards above stay: their proofs carry extra
+            // realm/native-id conditions their lanes rely on.)
+            if !self.string_method_is_intrinsic(name) {
+                return Ok(None);
+            }
             return self.string_method(idx, name, args);
         }
         // ── RegExp `test` / `exec` ──
@@ -705,7 +862,13 @@ impl<'p> Vm<'p> {
             {
                 Ok(None)
             }
-            HeapObj::Array(_) => self.array_method(idx, name, args),
+            HeapObj::Array(_) => {
+                // B191: as for strings above — serve only the boot intrinsic.
+                if !self.array_method_is_intrinsic(name) {
+                    return Ok(None);
+                }
+                self.array_method(idx, name, args)
+            }
             HeapObj::Str(_) | HeapObj::Cons { .. } => self.string_method(idx, name, args),
             HeapObj::Generator { .. } => self.generator_method(idx, name, args),
             HeapObj::AsyncGenerator(_) => Ok(self.async_generator_method(idx, name, args)),
