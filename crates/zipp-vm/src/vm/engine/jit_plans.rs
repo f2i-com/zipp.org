@@ -1421,7 +1421,7 @@ impl<'p> Vm<'p> {
                         self.jit.cross_entry(fid)
                     else {
                         if std::env::var_os("ZIPP_JITLOG").is_some() {
-                            eprintln!("[cross] fn{func_id}@{ip} CROSS3 decline: no entry yet");
+                            eprintln!("[cross] fn{func_id}@{ip} CROSS3 decline: no entry yet for callee fn{fid} (regs={}, params={}, argc={argc})", callee.reg_count, callee.param_count);
                         }
                         pending.push(fid);
                         return None;
