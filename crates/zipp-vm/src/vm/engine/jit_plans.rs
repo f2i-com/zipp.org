@@ -951,7 +951,7 @@ impl<'p> Vm<'p> {
         exemplar_base: Option<usize>,
     ) -> rustc_hash::FxHashMap<usize, crate::codegen::RandomScaleFusePlan> {
         let mut out = rustc_hash::FxHashMap::default();
-        if !crate::codegen::random_fuse_enabled() {
+        if !crate::codegen::random_fuse_enabled() || self.global_route_epoch != 0 {
             return out;
         }
         #[cfg(feature = "instrument")]
@@ -1076,6 +1076,8 @@ impl<'p> Vm<'p> {
                     math_slot,
                     math_bits: mv.bits(),
                     math_shape: sh,
+                    math_ver: self.heap.version_of(math_idx),
+                    random_ver: self.heap.version_of(rv.heap_index()),
                     random_slot: slot as u32,
                     random_bits: rv.bits(),
                     state_slot,
@@ -1257,6 +1259,8 @@ impl<'p> Vm<'p> {
                     math_slot,
                     math_bits: mv.bits(),
                     math_shape: sh,
+                    math_ver: self.heap.version_of(math_idx),
+                    random_ver: self.heap.version_of(rv.heap_index()),
                     random_slot: slot as u32,
                     random_bits: rv.bits(),
                     state_slot,
@@ -1271,6 +1275,7 @@ impl<'p> Vm<'p> {
                     upval_alph: Some(crate::codegen::UpvalAlphabet {
                         upval_idx: ua,
                         alph_bits: av.bits(),
+                        alph_ver: self.heap.version_of(av.heap_index()),
                         dst_alph_b: db,
                     }),
                 },

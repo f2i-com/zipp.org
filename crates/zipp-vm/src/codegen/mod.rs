@@ -699,6 +699,12 @@ pub struct RandomScaleFusePlan {
     pub math_slot: u32,
     pub math_bits: u64,
     pub math_shape: u32,
+    /// B207: heap versions of the Math object and the random-closure slot,
+    /// guarded via the pinned r13 versions base — a recycled heap index
+    /// bumps its version at reuse, so bits-equality can never resurrect a
+    /// stale plan against a DIFFERENT occupant (the review's ABA finding).
+    pub math_ver: u32,
+    pub random_ver: u32,
     pub random_slot: u32,
     pub random_bits: u64,
     pub state_slot: u32,
@@ -724,6 +730,8 @@ pub struct RandomScaleFusePlan {
 pub struct UpvalAlphabet {
     pub upval_idx: u16,
     pub alph_bits: u64,
+    /// B207: the alphabet string's heap version (the ABA guard's third leg).
+    pub alph_ver: u32,
     /// The SECOND UpvalGet's destination (the first sits before the fused
     /// window and runs as an ordinary op).
     pub dst_alph_b: u16,
@@ -3192,6 +3200,13 @@ impl Jit {
         self.fn_state.clear();
         self.self_cache = None;
         self.cross_entries.clear();
+        // B207 (review): the live table must disarm with the entries — a
+        // surviving non-null entry with an unchanged mask_gen would let a
+        // parked lane call into a dropped buffer (set_meter drops Tier-C
+        // bodies; pre-B199 the global-epoch guard covered this resume).
+        for r in self.cross_table.iter_mut() {
+            r.entry = 0;
+        }
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
         self.cross_wide_uninit.clear();
         self.map_kernels.clear();
@@ -3402,7 +3417,13 @@ impl Jit {
             r.entry = 0;
         }
         if let Some(p) = self.cross_entries.get_mut(func_id as usize) {
-            *p = (std::ptr::null(), u64::MAX, None, None);
+            // B207 (review): PRESERVE the recorded mask across the clear.
+            // Resetting it to the MAX sentinel meant every evict+recompile
+            // bumped mask_gen even for an identical mask (the same-mask
+            // resume could never fire), and the one real mask change the
+            // gen guard must observe — a recompile whose analysis declines
+            // to u64::MAX — compared equal to the sentinel and did NOT bump.
+            *p = (std::ptr::null(), p.1, None, None);
         }
         if let Some(mask) = self.cross_wide_uninit.get_mut(func_id as usize) {
             *mask = None;
@@ -3494,6 +3515,10 @@ impl Jit {
                 proto.code.len()
             );
         }
+        // B207 (review): the B206 contract "metered bodies never carry
+        // yield heads" is enforced HERE, not trusted to callers — a
+        // charge-then-bail at a head would double-charge every call.
+        let yield_heads: &[u32] = if self.meter.is_some() { &[] } else { yield_heads };
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if fnjit_mem_enabled() && mem_can_compile(proto, const_strs) {
             // One inline-cache site per GetProp/SetProp in the whole function

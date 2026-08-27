@@ -4567,8 +4567,12 @@ impl Heap {
             if let Some(mut v) = self.arr_pool.pop() {
                 self.arr_pool_pops += 1;
                 v.clear();
+                // B207 (review): `reserve` guarantees capacity >= len +
+                // additional with len == 0 here, so the additional must be
+                // `cap` itself — the old `cap - capacity` under-reserved and
+                // re-grew mid-build, exactly the malloc this pool removes.
                 if v.capacity() < cap {
-                    v.reserve(cap - v.capacity());
+                    v.reserve(cap);
                 }
                 return v;
             }
@@ -5144,7 +5148,18 @@ impl Heap {
             .saturating_add({
                 #[cfg(not(feature = "safe-sandbox"))]
                 {
+                    // B207 (review): the recycle pools are real retained
+                    // memory the heap ceiling must see — 112-byte shells
+                    // plus the array buffers' element capacity.
                     self.val_slab.iter().map(|c| c.resident_bytes()).sum::<usize>()
+                        + self.obj_pool.len() * std::mem::size_of::<ObjMap>()
+                        + vec_capacity_bytes(&self.obj_pool)
+                        + self
+                            .arr_pool
+                            .iter()
+                            .map(|v| v.capacity() * std::mem::size_of::<Value>())
+                            .sum::<usize>()
+                        + vec_capacity_bytes(&self.arr_pool)
                 }
                 #[cfg(feature = "safe-sandbox")]
                 {

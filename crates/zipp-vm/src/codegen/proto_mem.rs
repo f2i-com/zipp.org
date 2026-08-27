@@ -2184,12 +2184,26 @@ pub(crate) fn compile_proto_mem(
                 let fb = ops.new_dynamic_label();
                 let inv = (1.0f64 / 4294967296.0).to_bits();
                 let kf = (fp.k as f64).to_bits();
+                let math_idx = (fp.math_bits & 0xFFFF_FFFF) as i32;
+                let random_idx = (fp.random_bits & 0xFFFF_FFFF) as i32;
                 dynasm!(ops
-                    // Math binding by VALUE, its settled shape, the random
-                    // own-slot by VALUE (the B193 shape->vals->value form).
+                    // B207 (review): the lane raw-accesses the CALLEE's
+                    // state global, which the caller's entry revalidation
+                    // never scans — the route-epoch guard is what declines
+                    // after any globalThis own-property redefinition (the
+                    // same guard the cross3 lane carries).
+                    ; cmp DWORD [rdi + crate::vm::host_api::JIT_GLOBAL_ROUTE_EPOCH_OFFSET as i32], 0
+                    ; jne => fb
+                    // Math binding by VALUE + heap VERSION (a recycled index
+                    // bumps its version, so bits-equality can never match a
+                    // different occupant — the review's ABA finding), its
+                    // settled shape, then the random own-slot by VALUE +
+                    // VERSION (the B193 shape->vals->value form, hardened).
                     ; mov rax, [r12 + (fp.math_slot as i32) * 8]
                     ; mov r10, QWORD fp.math_bits as i64
                     ; cmp rax, r10
+                    ; jne => fb
+                    ; cmp DWORD [r13 + math_idx * 4], fp.math_ver as i32
                     ; jne => fb
                     ; mov r10d, eax
                     ; mov r11, [rdi + crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32]
@@ -2200,6 +2214,8 @@ pub(crate) fn compile_proto_mem(
                     ; mov rax, [r11 + (fp.random_slot as i32) * 8]
                     ; mov r10, QWORD fp.random_bits as i64
                     ; cmp rax, r10
+                    ; jne => fb
+                    ; cmp DWORD [r13 + random_idx * 4], fp.random_ver as i32
                     ; jne => fb
                     // State slot: Int-tagged (the first call after the
                     // double-literal seed bails once and settles it).
@@ -2213,6 +2229,7 @@ pub(crate) fn compile_proto_mem(
                 // the activation upvals and the cell-mirror authority; the
                 // baked k is that immutable string's length.
                 if let Some(ua) = fp.upval_alph {
+                    let alph_idx = (ua.alph_bits & 0xFFFF_FFFF) as i32;
                     dynasm!(ops
                         ; mov rcx, [rdi + crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32]
                         ; test rcx, rcx
@@ -2222,6 +2239,9 @@ pub(crate) fn compile_proto_mem(
                         ; mov rcx, [r11 + rcx * 8]
                         ; mov r10, QWORD ua.alph_bits as i64
                         ; cmp rcx, r10
+                        ; jne => fb
+                        // B207: the alphabet string's version (ABA guard).
+                        ; cmp DWORD [r13 + alph_idx * 4], ua.alph_ver as i32
                         ; jne => fb
                         ; mov [rbx + dreg(ua.dst_alph_b)], r10
                     );
