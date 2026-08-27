@@ -2080,6 +2080,24 @@ pub(crate) fn static_key_plans_enabled() -> bool {
     }
 }
 
+/// Same-binary comparator for the B209 `SetHomeObject` elision: when disabled
+/// (`ZIPP_NO_HOME_ELIDE=1`), every concise method/accessor gets its
+/// [[HomeObject]] wired as before, super-free or not. Compile-time only.
+#[inline]
+pub(crate) fn home_elide_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HOME_ELIDE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Same-binary comparator for the one-step `FinalizeObject` literal lowering.
 /// When disabled, the compiler emits the historical `NewPlannedObject` +
 /// per-field `AppendDataProp` sequence (B167's shipped baseline); runtime

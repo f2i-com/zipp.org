@@ -1,6 +1,14 @@
 //! B187 scouting: attribute the per-object BUILD floor. Ignored by default —
 //! run explicitly for the numbers, on a quiet machine:
 //!   cargo test --release -p zipp-vm --test build_floor_micro -- --ignored --nocapture
+//!
+//! B210 housekeeping: the whole target is gated out under `safe-sandbox` —
+//! `bench_support::floor_decompose` doesn't exist there (the decomposition
+//! reads non-sandbox allocator internals), and the micro's numbers would be
+//! meaningless under the sandbox allocator regime anyway. This was a latent
+//! sandbox-build break that batteries running only the sandbox LIB tests
+//! never surfaced.
+#![cfg(not(feature = "safe-sandbox"))]
 
 use std::time::Instant;
 

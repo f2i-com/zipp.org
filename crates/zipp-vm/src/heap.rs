@@ -2699,7 +2699,7 @@ impl JsStr {
         self.units += 1;
     }
 
-    #[cfg(test)]
+    // (was #[cfg(test)]; the B210 courier size gate reads it at runtime)
     pub(crate) fn byte_capacity(&self) -> usize {
         self.bytes.capacity()
     }
@@ -3470,7 +3470,22 @@ pub struct CombinatorData {
 /// One thread per PROCESS (VM-agnostic: batches carry no VM references),
 /// spawned lazily on the first batch; a send failure falls back to an inline
 /// drop, so the courier can never lose or delay a free unboundedly.
-/// `ZIPP_NO_GC_COURIER=1` restores fully-inline drops.
+///
+/// B210: shipping is SIZE-GATED per item. The B194/B196 recycle pools now
+/// intercept the object/array death mass the courier was built for, leaving
+/// mostly small-string batches — and for those, a cross-thread free lands on
+/// mimalloc-secure's thread-delayed lists that the MUTATOR reclaims in its
+/// own allocation path anyway, so shipping them is pure overhead on top of
+/// the per-flush fixed costs (batch build, an mpsc node alloc + thread wake):
+/// the 21-rep latch matrix priced ship-everything at +6.1% react / +3.9%
+/// router / +2.8% stable / +1.8% megamorphic vs fully-off, while the
+/// retained rows with BULK payloads still want the off-thread drop
+/// (markdown-render +5.7% [+1.9,+10.0] when the courier is disabled
+/// outright, at 0.94x parity headroom). So: only payloads whose buffer
+/// capacity clears `COURIER_MIN_BYTES` ship; everything smaller drops inline
+/// on the mutator, exactly as if the courier were off. `ZIPP_NO_COURIER_GATE=1`
+/// restores ship-everything (the B185 behaviour);
+/// `ZIPP_NO_GC_COURIER=1` still forces fully-inline drops.
 mod gc_courier {
     use std::sync::mpsc;
     use std::sync::OnceLock;
@@ -3502,6 +3517,30 @@ mod gc_courier {
         }
     }
 
+    /// B210: buffer capacity a payload must clear to be worth an off-thread
+    /// free (see the module doc — below it, the mutator reclaims the
+    /// thread-delayed free itself and shipping is pure overhead).
+    pub(super) const COURIER_MIN_BYTES: usize = 4096;
+
+    /// The per-item shipping floor in effect: `COURIER_MIN_BYTES`, or 0 when
+    /// `ZIPP_NO_COURIER_GATE=1` restores B185's ship-everything.
+    pub(super) fn min_ship_bytes() -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static STATE: AtomicUsize = AtomicUsize::new(usize::MAX);
+        match STATE.load(Ordering::Relaxed) {
+            usize::MAX => {
+                let v = if std::env::var_os("ZIPP_NO_COURIER_GATE").is_some() {
+                    0
+                } else {
+                    COURIER_MIN_BYTES
+                };
+                STATE.store(v, Ordering::Relaxed);
+                v
+            }
+            v => v,
+        }
+    }
+
     fn sender() -> Option<&'static mpsc::Sender<Vec<Item>>> {
         if !enabled() {
             return None;
@@ -3530,11 +3569,23 @@ mod gc_courier {
         }
     }
 
-    /// Whether shipping is worth attempting at all (latch + channel alive).
+    /// Whether batches are worth BUILDING at all (the latch only). The
+    /// courier thread itself spawns lazily inside `ship` — B210 measured the
+    /// merely-registered idle thread costing ~3.7% on async-promise-chain
+    /// (mimalloc-secure's cross-thread bookkeeping scales with registered
+    /// threads), so a run that never ships must never spawn it.
     pub(super) fn active() -> bool {
-        sender().is_some()
+        enabled()
     }
 }
+
+/// B210: the per-sweep small-payload mass at or above which the NEXT sweep
+/// runs in BULK regime (ship every shippable payload). Calibrated from the
+/// oracle: markdown-render's teardown waves carry ~2.5MB of small strings per
+/// sweep (shipping pays, +5.7%), while react/router/async steady states run
+/// ~100-240KB per sweep (shipping costs, -3.6..-4.7%). 1MB splits the two
+/// regimes with an order of magnitude on either side.
+const COURIER_BULK_SWEEP_BYTES: usize = 1 << 20;
 
 /// B195: one heap slot's hot mirror record — the settled shape, the callee
 /// fid, and the `vals` base — sized and laid out for the JIT's
@@ -4082,6 +4133,21 @@ pub struct Heap {
     /// Dead payloads collected by the CURRENT sweep, shipped to the courier
     /// thread at `note_gc_done`/`note_minor_done` (see [`gc_courier`]).
     courier_batch: Vec<gc_courier::Item>,
+    /// B210 oracle telemetry: [flushes, shipped items, shipped bytes,
+    /// inline-gated items, inline-gated bytes, max batch len]. Bytes are the
+    /// same buffer-capacity charges the size gate reads (an `Obj` charges its
+    /// shell). Updated only under the `oracle` flag; printed at heap drop.
+    courier_stats: [u64; 6],
+    /// B210: sub-`COURIER_MIN_BYTES` shippable payload bytes seen THIS sweep
+    /// (whether shipped or dropped inline). Reset at `courier_flush`.
+    courier_small_mass: usize,
+    /// B210: the sweep regime the last flush chose. A BULK sweep (last
+    /// window's small mass at or above `COURIER_BULK_SWEEP_BYTES`) ships
+    /// every shippable payload — the markdown-render teardown shape, where
+    /// off-thread frees of even tiny buffers pay (+5.7% measured). A small
+    /// sweep applies the per-item size gate — the react/router steady state,
+    /// where shipping tiny strings costs (-4.7%/-3.6% measured).
+    courier_bulk: bool,
     /// The literal value slab (B187 stage 2), one class per capacity bucket.
     #[cfg(not(feature = "safe-sandbox"))]
     val_slab: [ValSlabClass; 3],
@@ -4451,6 +4517,9 @@ impl Heap {
             resident_payload_charged,
             payload_accounting: Cell::new(false),
             courier_batch: Vec::new(),
+            courier_stats: [0; 6],
+            courier_small_mass: 0,
+            courier_bulk: false,
             #[cfg(not(feature = "safe-sandbox"))]
             val_slab: [ValSlabClass::new(), ValSlabClass::new(), ValSlabClass::new()],
             #[cfg(not(feature = "safe-sandbox"))]
@@ -5306,15 +5375,126 @@ impl Heap {
             }
             other => other,
         };
-        if gc_courier::active() {
+        // B210: check the discriminant BY REFERENCE before the courier match —
+        // moving the fat `HeapObj` enum through a second match costs ~3.5ns
+        // per death, which a sweep of millions of NON-shippable payloads
+        // (async-promise-chain: 3.2M closure/cell/promise deaths, 13.5% -> 8.3%
+        // of samples in the GC phase when this filter is absent vs the courier
+        // latched off) pays for nothing. Non-shippable kinds drop in place.
+        let ship_kind = matches!(
+            &dead,
+            HeapObj::Object(_)
+                | HeapObj::Str(_)
+                | HeapObj::Array(_)
+                | HeapObj::Map { .. }
+                | HeapObj::Set(_)
+        );
+        if ship_kind && gc_courier::active() {
+            // B210: per-item size gate with a per-sweep BULK override (see
+            // the `courier_bulk` field doc). In a small sweep only payloads
+            // clearing the floor ship; the rest drop inline exactly as if
+            // the courier were off. A bulk sweep (and `ZIPP_NO_COURIER_GATE=1`,
+            // which zeroes the floor outright) ships everything shippable.
+            let min = if self.courier_bulk {
+                0
+            } else {
+                gc_courier::min_ship_bytes()
+            };
+            let val8 = std::mem::size_of::<Value>();
+            let small = gc_courier::COURIER_MIN_BYTES;
             match dead {
-                HeapObj::Object(m) => self.courier_batch.push(gc_courier::Item::Obj(m)),
-                HeapObj::Str(js) => self.courier_batch.push(gc_courier::Item::Str(js)),
-                HeapObj::Array(v) => self.courier_batch.push(gc_courier::Item::Arr(v)),
-                HeapObj::Map { keys, vals } => {
+                HeapObj::Object(m) => {
+                    if self.oracle {
+                        self.courier_stats[1] += 1;
+                        self.courier_stats[2] += std::mem::size_of::<ObjMap>() as u64;
+                    }
+                    self.courier_batch.push(gc_courier::Item::Obj(m))
+                }
+                HeapObj::Str(js) if js.byte_capacity() >= min => {
+                    let b = js.byte_capacity();
+                    if b < small {
+                        self.courier_small_mass += b;
+                    }
+                    if self.oracle {
+                        self.courier_stats[1] += 1;
+                        self.courier_stats[2] += b as u64;
+                    }
+                    self.courier_batch.push(gc_courier::Item::Str(js))
+                }
+                HeapObj::Array(v) if v.capacity() * val8 >= min => {
+                    let b = v.capacity() * val8;
+                    if b < small {
+                        self.courier_small_mass += b;
+                    }
+                    if self.oracle {
+                        self.courier_stats[1] += 1;
+                        self.courier_stats[2] += b as u64;
+                    }
+                    self.courier_batch.push(gc_courier::Item::Arr(v))
+                }
+                HeapObj::Map { keys, vals }
+                    if (keys.capacity() + vals.capacity()) * val8 >= min =>
+                {
+                    let b = (keys.capacity() + vals.capacity()) * val8;
+                    if b < small {
+                        self.courier_small_mass += b;
+                    }
+                    if self.oracle {
+                        self.courier_stats[1] += 1;
+                        self.courier_stats[2] += b as u64;
+                    }
                     self.courier_batch.push(gc_courier::Item::MapKv(keys, vals))
                 }
-                HeapObj::Set(v) => self.courier_batch.push(gc_courier::Item::SetV(v)),
+                HeapObj::Set(v) if v.capacity() * val8 >= min => {
+                    let b = v.capacity() * val8;
+                    if b < small {
+                        self.courier_small_mass += b;
+                    }
+                    if self.oracle {
+                        self.courier_stats[1] += 1;
+                        self.courier_stats[2] += b as u64;
+                    }
+                    self.courier_batch.push(gc_courier::Item::SetV(v))
+                }
+                // Shippable kinds the size gate kept on the mutator — their
+                // mass still feeds the bulk-regime signal, and the oracle
+                // shows each row's true split.
+                HeapObj::Str(js) => {
+                    let b = js.byte_capacity();
+                    self.courier_small_mass += b;
+                    if self.oracle {
+                        self.courier_stats[3] += 1;
+                        self.courier_stats[4] += b as u64;
+                    }
+                    drop(js)
+                }
+                HeapObj::Array(v) => {
+                    let b = v.capacity() * val8;
+                    self.courier_small_mass += b;
+                    if self.oracle {
+                        self.courier_stats[3] += 1;
+                        self.courier_stats[4] += b as u64;
+                    }
+                    drop(v)
+                }
+                HeapObj::Map { keys, vals } => {
+                    let b = (keys.capacity() + vals.capacity()) * val8;
+                    self.courier_small_mass += b;
+                    if self.oracle {
+                        self.courier_stats[3] += 1;
+                        self.courier_stats[4] += b as u64;
+                    }
+                    drop((keys, vals))
+                }
+                HeapObj::Set(v) => {
+                    let b = v.capacity() * val8;
+                    self.courier_small_mass += b;
+                    if self.oracle {
+                        self.courier_stats[3] += 1;
+                        self.courier_stats[4] += b as u64;
+                    }
+                    drop(v)
+                }
                 other => drop(other),
             }
         }
@@ -5377,15 +5557,42 @@ impl Heap {
             self.arr_pool_pops = 0;
             while self.arr_pool.len() > keep {
                 let v = self.arr_pool.pop().expect("len checked");
-                self.courier_batch.push(gc_courier::Item::Arr(v));
+                // B210: pool-trim buffers are <= ARR_POOL_MAX_CAP slots, so
+                // under the size gate they drop inline (see the module doc);
+                // a bulk sweep ships them with everything else.
+                let bytes = v.capacity() * std::mem::size_of::<Value>();
+                let min = if self.courier_bulk {
+                    0
+                } else {
+                    gc_courier::min_ship_bytes()
+                };
+                if bytes >= min {
+                    if self.oracle {
+                        self.courier_stats[1] += 1;
+                        self.courier_stats[2] += bytes as u64;
+                    }
+                    self.courier_batch.push(gc_courier::Item::Arr(v));
+                } else if self.oracle {
+                    self.courier_stats[3] += 1;
+                    self.courier_stats[4] += bytes as u64;
+                }
             }
             if self.obj_pool_addr_order && obj_pool_sort_enabled() {
                 self.arr_pool.sort_unstable_by_key(|v| v.as_ptr() as usize);
             }
         }
         if !self.courier_batch.is_empty() {
+            if self.oracle {
+                self.courier_stats[0] += 1;
+                self.courier_stats[5] = self.courier_stats[5].max(self.courier_batch.len() as u64);
+            }
             gc_courier::ship(std::mem::take(&mut self.courier_batch));
         }
+        // B210: pick the NEXT sweep's regime from this window's small-payload
+        // mass — bulk teardown waves ship everything, steady states gate.
+        // One window's misprediction at a regime edge is the bounded cost.
+        self.courier_bulk = self.courier_small_mass >= COURIER_BULK_SWEEP_BYTES;
+        self.courier_small_mass = 0;
     }
 
     /// Record the post-sweep live count and grow the next threshold to ~2x it
@@ -7029,6 +7236,10 @@ impl Drop for Heap {
             eprintln!(
                 "[objpool] pushed={pushed} popped={popped} trimmed={trimmed} resident={}",
                 self.obj_pool.len()
+            );
+            let [fl, si, sb, gi, gb, mb] = self.courier_stats;
+            eprintln!(
+                "[courier] flushes={fl} shipped={si} ({sb}B) inline-gated={gi} ({gb}B) max-batch={mb}"
             );
         }
     }

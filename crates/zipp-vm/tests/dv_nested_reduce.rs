@@ -114,7 +114,16 @@ fn accumulator_dependent_scratch_state_is_not_collapsed() {
     );
 }
 
+// B210 housekeeping: `SharedArrayBuffer` does not exist under `safe-sandbox`
+// (hardening policy), so the shared-buffer guard scenario is ignored there —
+// this also heals `zz_off_switch_agrees_with_node`, whose child re-run was
+// inheriting this failure (both pre-existing at c4666b4; the sandbox matrix
+// over full test targets was first run this wave).
 #[test]
+#[cfg_attr(
+    feature = "safe-sandbox",
+    ignore = "SharedArrayBuffer is excluded by the sandbox hardening policy"
+)]
 fn shared_buffer_runtime_guard_keeps_the_ordinary_backedge() {
     assert_matches_node(
         r#"

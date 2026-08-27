@@ -505,6 +505,12 @@ fn zz_modes_agree() {
     }
 }
 
+// B210 housekeeping: the vacuity proof reads ZIPP_JITLOG compile lines, and
+// under `safe-sandbox` there is no JIT to log — gated with the same cfg the
+// conddef tier-reach proofs use (a latent sandbox-matrix failure; the full
+// sandbox test-target matrix was first run this wave). The semantic matrices
+// in this file still run under the sandbox interpreter.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[test]
 fn mechanism_is_not_vacuous() {
     // Mode-matrix children intentionally disable one or both native prefixes.

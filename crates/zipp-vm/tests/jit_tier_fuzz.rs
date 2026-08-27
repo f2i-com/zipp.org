@@ -489,6 +489,21 @@ const MODES: &[Mode] = &[
         name: "noobjpoolmajor",
         env: &[("ZIPP_NO_OBJ_POOL_MAJOR", "1")],
     },
+    // B210: the courier's per-item size gate (bulk payloads ship, small ones
+    // drop inline). The off-row restores B185's ship-everything, so the full
+    // shipping path — batch build, mpsc send, off-thread drop — stays
+    // exercised as the pure fallback it claims to be.
+    Mode {
+        name: "nocouriergate",
+        env: &[("ZIPP_NO_COURIER_GATE", "1")],
+    },
+    // B209: `SetHomeObject` elision for super-free literal methods is
+    // compile-time; the off-row proves the always-wire fallback answers
+    // identically (the generator's literal methods + prototype walks).
+    Mode {
+        name: "nohomeelide",
+        env: &[("ZIPP_NO_HOME_ELIDE", "1")],
+    },
     // B205: the fused Math.random()*k|0 window vs its ordinary ops, and
     // B199's compile-order retry vs permanent declines.
     Mode {

@@ -44,7 +44,17 @@ fn mutual_recursion_hot() {
     assert_eq!(out, ["evenodd:34286"]); // node v24
 }
 
+// B210 housekeeping: under `safe-sandbox` the hardened frame cap makes depth
+// 5000 throw a RangeError BY POLICY, so the scenario this test pins (deopt to
+// flat frames, then complete) does not exist there — ignored under that
+// feature (pre-existing at c4666b4; the sandbox matrix over full test targets
+// was first run this wave). `runaway_recursion_throws_catchable_rangeerror`
+// below still covers the sandbox's cap behaviour.
 #[test]
+#[cfg_attr(
+    feature = "safe-sandbox",
+    ignore = "the sandbox frame cap forbids depth 5000 by policy"
+)]
 fn deep_recursion_past_native_depth_caps() {
     // Depth 5000 blows through JIT_REGION_CALL_MAX (64): the cross helper
     // deopts, the site falls to call_ic, that deopts too, and the recursion

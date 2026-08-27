@@ -410,6 +410,13 @@ fn conddef_jitlog_child() {
 
 /// The INT matrix really does reach an INT emitter. Without this the whole file
 /// could go green by quietly declining to the memory tier.
+///
+/// B210 housekeeping: both mechanism tests are gated out under `safe-sandbox`
+/// — there is no JIT there, so no tier is reachable by construction (a latent
+/// sandbox-build-matrix failure that batteries running only the sandbox LIB
+/// tests never surfaced; pre-existing at c4666b4). The semantics matrices
+/// above still run under the sandbox interpreter.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[test]
 fn conddef_mechanism_int_matrix_reaches_the_int_tier() {
     for d in DEFS {
@@ -426,7 +433,9 @@ fn conddef_mechanism_int_matrix_reaches_the_int_tier() {
     }
 }
 
-/// The DOUBLE matrix really does reach `regalloc.rs`.
+/// The DOUBLE matrix really does reach `regalloc.rs`. (Sandbox-gated with the
+/// INT twin above.)
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[test]
 fn conddef_mechanism_double_matrix_reaches_the_double_tier() {
     for d in DEFS {

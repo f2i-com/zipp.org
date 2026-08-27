@@ -1650,7 +1650,13 @@ impl<'a> FnCompiler<'a> {
                 }
                 ast::ObjectMember::Method { key, func } => {
                     let name = self.object_finalize_prop(slot, key, PropVal::Func(func), true)?;
-                    method_slots.push(slot);
+                    // B209: wire [[HomeObject]] only when the method (or a
+                    // nested arrow / direct eval) can reference `super`. The
+                    // just-compiled method proto is `functions.len() - 1`
+                    // (nested protos finish and push first).
+                    if self.func_can_ref_super(self.cx.functions.len() - 1) {
+                        method_slots.push(slot);
+                    }
                     name
                 }
                 _ => return Err("non-appendable member reached the finalize path".into()),
@@ -1790,10 +1796,13 @@ impl<'a> FnCompiler<'a> {
             func,
             is_setter,
         });
-        self.emit(Instr::SetHomeObject {
-            method: func,
-            home: obj,
-        });
+        // B209: elide the [[HomeObject]] wire for a super-free accessor.
+        if self.func_can_ref_super(fid) {
+            self.emit(Instr::SetHomeObject {
+                method: func,
+                home: obj,
+            });
+        }
         // SetFunctionName: a getter/setter is named "get k"/"set k"
         // (a Symbol key → "get [desc]"), at runtime so a computed key
         // is handled too.
@@ -1803,6 +1812,64 @@ impl<'a> FnCompiler<'a> {
             prefix: if is_setter { 2 } else { 1 },
         });
         Ok(())
+    }
+
+    /// B209: can `functions[fid]`'s body observe its [[HomeObject]]? True when
+    /// the body — or, transitively, a nested ARROW body (arrows capture `super`
+    /// lexically), or a direct-eval site in any of those (eval code may contain
+    /// `super.x` in a method context) — references `super`. When false the
+    /// internal slot is unobservable (no reflection API exposes it), so eliding
+    /// `SetHomeObject` is exact: it removes a store barrier + `closure_home`
+    /// table insert per method closure. Nested PLAIN functions and class
+    /// bodies establish their own home (or none — `super` there is a parse
+    /// error), so only `lexical_this` protos are traversed.
+    fn func_can_ref_super(&self, fid: usize) -> bool {
+        if !crate::bytecode::home_elide_enabled() {
+            return true; // latch off: always wire, the pre-B209 behaviour
+        }
+        let mut stack = vec![fid];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(f) = stack.pop() {
+            if !seen.insert(f) {
+                continue;
+            }
+            let proto = &self.cx.functions[f];
+            if !proto.eval_sites.is_empty() {
+                return true;
+            }
+            for i in &proto.code {
+                match *i {
+                    Instr::SuperCtorFetch { .. }
+                    | Instr::SuperCtor { .. }
+                    | Instr::SuperCtorSpread { .. }
+                    | Instr::SuperBase { .. }
+                    | Instr::SuperMethod { .. }
+                    | Instr::SuperGet { .. }
+                    | Instr::SuperGetComputed { .. }
+                    | Instr::SuperMethodComputed { .. }
+                    | Instr::SuperSet { .. }
+                    | Instr::SuperSetComputed { .. }
+                    | Instr::SuperGetObj { .. }
+                    | Instr::SuperGetObjComputed { .. }
+                    | Instr::SuperSetObj { .. }
+                    | Instr::SuperSetObjComputed { .. }
+                    | Instr::SuperMethodObj { .. }
+                    | Instr::SuperMethodObjComputed { .. }
+                    | Instr::SuperMethodSpread { .. }
+                    | Instr::SuperMethodComputedSpread { .. } => return true,
+                    Instr::MakeFunc { func_id, .. }
+                    | Instr::MakeClosure { func_id, .. }
+                    | Instr::MakeArrow { func_id, .. } => {
+                        let n = func_id as usize;
+                        if self.cx.functions[n].lexical_this {
+                            stack.push(n);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
     }
 
     /// A data property or concise method: `{k: v}`, `{[k]: v}`, `{m(){}}`,
@@ -1860,7 +1927,8 @@ impl<'a> FnCompiler<'a> {
                 });
             }
             self.emit(Instr::InitDataPropDyn { obj, key, val: v });
-            if is_method {
+            // B209: only a method that can reference `super` needs the wire.
+            if is_method && self.func_can_ref_super(self.cx.functions.len() - 1) {
                 self.emit(Instr::SetHomeObject {
                     method: v,
                     home: obj,
@@ -1920,7 +1988,8 @@ impl<'a> FnCompiler<'a> {
         } else {
             self.emit(Instr::InitDataProp { obj, name, val: v });
         }
-        if is_method {
+        // B209: only a method that can reference `super` needs the wire.
+        if is_method && self.func_can_ref_super(self.cx.functions.len() - 1) {
             self.emit(Instr::SetHomeObject {
                 method: v,
                 home: obj,
