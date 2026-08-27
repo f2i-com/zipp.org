@@ -1296,12 +1296,14 @@ impl<'p> Vm<'p> {
         &self,
         func_id: u32,
         exemplar_base: Option<usize>,
-    ) -> (crate::codegen::CrossCallPlan, Vec<u32>) {
+    ) -> (crate::codegen::CrossCallPlan, Vec<u32>, Vec<u32>) {
         let mut plan = crate::codegen::CrossCallPlan::default();
         // B199: callee fids whose entry was missing at plan time.
         let mut pending: Vec<u32> = Vec::new();
+        // B229: callees this plan BAKES a lane against (see `note_cross_baked`).
+        let mut baked: Vec<u32> = Vec::new();
         if std::env::var_os("ZIPP_NO_CROSSCALL").is_some() {
-            return (plan, pending);
+            return (plan, pending, baked);
         }
         let caller = self.func(func_id as usize);
         for (ip, instr) in caller.code.iter().enumerate() {
@@ -1425,10 +1427,22 @@ impl<'p> Vm<'p> {
                         return None;
                     };
                     let reg_count = callee.reg_count.max(1);
+                    // B228: a wide callee (> 64 registers) always reports the
+                    // inline mask as MAX. When the JIT's own wide mask says
+                    // NOTHING may be read before written there is no fill to
+                    // emit, so zero describes it exactly and the register count
+                    // stops mattering (`callee_regs` is only a window size).
+                    let wide_empty = uninit_mask == u64::MAX
+                        && crate::codegen::cross3_wide_enabled()
+                        && self.jit.cross_wide_uninit_mask(fid).is_some_and(|m| {
+                            m.len() == (reg_count as usize).div_ceil(64)
+                                && m.iter().all(|&w| w == 0)
+                        });
+                    let uninit_mask = if wide_empty { 0 } else { uninit_mask };
                     if json_walk.is_some()
                         || markdown_inline.is_some()
                         || uninit_mask == u64::MAX
-                        || reg_count > 64
+                        || (reg_count > 64 && !wide_empty)
                     {
                         if std::env::var_os("ZIPP_JITLOG").is_some() {
                             eprintln!(
@@ -1440,6 +1454,7 @@ impl<'p> Vm<'p> {
                         }
                         return None;
                     }
+                    baked.push(fid);
                     Some(crate::codegen::SameProtoCross3Plan {
                         fid,
                         callee_regs: reg_count,
@@ -1571,7 +1586,7 @@ impl<'p> Vm<'p> {
             }
         }
 
-        (plan, pending)
+        (plan, pending, baked)
     }
 
     /// Recognise the caller half of an adjacent

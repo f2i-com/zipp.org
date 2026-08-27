@@ -125,6 +125,22 @@ pub const DEOPT_DECAY_RUNS: u32 = 1;
 /// `ZIPP_NO_SUBSTRING1_INTRINSIC=1` restores the generic method-call path for a
 /// same-binary performance comparison. Read only while deciding which native
 /// body to compile, never on the generated hot path.
+/// B228 latch: `ZIPP_NO_CROSS3_WIDE=1` declines a >64-register callee even
+/// when its wide fill mask is entirely empty.
+pub(crate) fn cross3_wide_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS3_WIDE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// B227 latch: `ZIPP_NO_CROSS3_MONO=1` restores the same-proto-only cross3
 /// admission (monomorphic sites back on the helper route).
 pub(crate) fn cross3_mono_enabled() -> bool {
@@ -3041,6 +3057,13 @@ pub struct Jit {
     /// to the helper; the same-mask re-set resumes dependents), so the
     /// retry converges without stranding.
     cross_pending: FxHashMap<u32, Vec<u32>>,
+    /// B229: callee fid -> callers that have BAKED a cross lane against its
+    /// entry. `cross_pending` covers a caller that planned while the entry was
+    /// MISSING; this covers the opposite and more damaging case — the caller
+    /// baked a good lane, then the callee was evicted and recompiled with a
+    /// different fill mask, bumping `mask_gen` and stranding that lane on the
+    /// helper route for the rest of the run.
+    cross_baked: FxHashMap<u32, Vec<u32>>,
     /// B199: deferrals spent per region key waiting on a missing callee
     /// entry — capped so a callee that never compiles (blacklisted) cannot
     /// keep a region interpreting forever.
@@ -3362,7 +3385,11 @@ impl Jit {
         // untouched and every dependent lane's baked fill silently stale.
         // Harmless while no lane could bake a wide mask; a prerequisite the
         // moment one can (see the cross3 wide-empty admission).
-        let wide_changed = self.cross_wide_uninit[i].as_deref() != wide_uninit_mask.as_deref();
+        // Only a change AWAY FROM A LIVE ENTRY can strand a baked lane: with
+        // no previous entry (null pointer) nothing could have baked anything,
+        // so a first `None -> Some` set is not a change and must not bump.
+        let wide_changed = !self.cross_entries[i].0.is_null()
+            && self.cross_wide_uninit[i].as_deref() != wide_uninit_mask.as_deref();
         self.cross_entries[i] = (entry, uninit_mask, json_walk, markdown_inline);
         self.cross_wide_uninit[i] = wide_uninit_mask;
         if self.cross_table.len() <= i {
@@ -3371,6 +3398,16 @@ impl Jit {
         }
         if prev_mask != uninit_mask || wide_changed {
             self.cross_table[i].mask_gen = self.cross_table[i].mask_gen.wrapping_add(1);
+            // B229: every lane baked against the OLD generation now guards
+            // false forever. Re-plan those callers — the B199 discipline:
+            // park the artifacts and let hotness re-trigger, no blacklists.
+            if let Some(callers) = self.cross_baked.remove(&func_id) {
+                for caller in callers {
+                    if caller != func_id {
+                        self.evict_for_cross_retry(caller);
+                    }
+                }
+            }
         }
         self.cross_table[i].entry = entry as u64;
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
@@ -3401,6 +3438,22 @@ impl Jit {
 
     /// B199 retry: record that `caller`'s plan declined sites because these
     /// `callees` had no cross entry yet. Bounded and deduplicated.
+    /// B229: record that `caller` baked a lane against each of `callees`.
+    pub fn note_cross_baked(&mut self, caller: u32, callees: &[u32]) {
+        if !cross_retry_enabled() {
+            return;
+        }
+        for &callee in callees {
+            if callee == caller {
+                continue;
+            }
+            let v = self.cross_baked.entry(callee).or_default();
+            if v.len() < 16 && !v.contains(&caller) {
+                v.push(caller);
+            }
+        }
+    }
+
     pub fn note_cross_pending(&mut self, caller: u32, callees: &[u32]) {
         if !cross_retry_enabled() {
             return;
