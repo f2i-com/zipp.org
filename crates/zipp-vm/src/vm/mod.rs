@@ -387,6 +387,13 @@ pub(crate) enum Microtask {
         then: Value,
         promise: u32,
     },
+    /// B218: the deferred finish for a `Promise.all` whose resolve-element
+    /// jobs all ran EAGERLY at subscription (queue empty, every element
+    /// already fulfilled, no user code in any job). This single job stands
+    /// where the FIRST element job would have been queued, which puts the
+    /// result promise's reactions exactly where the spec's last element job
+    /// would have put them — see `eager_combinator_enabled`.
+    CombinatorFinish { combinator: u32 },
 }
 
 /// Native (built-in) function ids — the discriminant carried by `HeapObj::Native`.

@@ -394,6 +394,11 @@ impl Vm<'_> {
                     root_val!(*then);
                     root_idx!(*promise);
                 }
+                // B218: the deferred settle job roots its combinator, which
+                // owns the element values recorded eagerly.
+                Microtask::CombinatorFinish { combinator } => {
+                    root_idx!(*combinator);
+                }
             }
         }
         if let Some((resolve, reject)) = &self.cap_capture {

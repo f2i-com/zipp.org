@@ -151,6 +151,40 @@ fn async_settled_trampoline_enabled() -> bool {
 /// Keeping a one-binary switch makes the allocation and wall-time result
 /// independently measurable without a fat-LTO layout comparison.
 #[inline]
+/// B218: run the intrinsic `Promise.all` resolve-element job EAGERLY at
+/// subscription when the microtask queue is EMPTY and the element is already
+/// fulfilled, instead of queueing one job per element.
+///
+/// WHY THIS IS ORDER-PRESERVING, which is the whole question (job ordering is
+/// observable): an EMPTY queue means the job being collapsed would have been
+/// the very next one to run anyway, and the job itself runs NO user code — it
+/// records a value into the result array and decrements `remaining`, both of
+/// them combinator-internal. So running it now rather than at the head of the
+/// drain is unobservable. The one event that IS observable — the result
+/// promise settling — is not run eagerly: it is re-queued as a single
+/// `CombinatorFinish` standing where the FIRST element job would have been,
+/// and since the spec's settle happens at the LAST element job (which queues
+/// the result's own reactions behind everything already queued), both
+/// arrangements put those reactions in the same place. `microtasks.is_empty()`
+/// is what carries the argument; the moment anything else is queued (a
+/// thenable's `then` getter, a pending element, an enclosing job) the lane
+/// switches itself off and the ordinary one-job-per-element FIFO runs.
+///
+/// `ZIPP_NO_EAGER_COMB=1` restores that FIFO (the pricing comparator).
+fn eager_combinator_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_EAGER_COMB").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 fn promise_all_direct_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -2150,6 +2184,10 @@ impl<'p> Vm<'p> {
     /// `promise_combine`: constructor/resolve/prototype and iterator are
     /// pristine, and `p` is a plain native promise. Pending and already-settled
     /// inputs both retain the ordinary path's one-job-per-element FIFO shape.
+    /// Returns `true` when the element's resolve-element job ran EAGERLY at
+    /// subscription (already-fulfilled element, empty queue — see
+    /// `eager_combinator_enabled`); the caller then owes the result promise a
+    /// queued `CombinatorFinish` in place of a synchronous settle.
     fn then_combinator_all_direct(
         &mut self,
         p: u32,
@@ -2157,7 +2195,7 @@ impl<'p> Vm<'p> {
         index: u32,
         cap_reject: Value,
         result: u32,
-    ) {
+    ) -> bool {
         debug_assert!(index <= i32::MAX as u32);
         self.store_barrier(
             crate::heap::gcoracle::PROMISE_REACT,
@@ -2167,7 +2205,7 @@ impl<'p> Vm<'p> {
         self.store_barrier(crate::heap::gcoracle::PROMISE_REACT, p, cap_reject);
         let (state, value) = match self.heap.get(p) {
             HeapObj::Promise { state, result, .. } => (*state, *result),
-            _ => return,
+            _ => return false,
         };
         match state {
             PromiseState::Pending => {
@@ -2188,6 +2226,16 @@ impl<'p> Vm<'p> {
                 }
             }
             PromiseState::Fulfilled => {
+                // EAGER lane: the job is a pure internal record (no user code,
+                // no allocation, no queue push — `remaining` stays >= 1 while
+                // the iteration holds its own count, so `combinator_finish`
+                // cannot fire in here). With the queue EMPTY nothing can
+                // observe the collapsed job boundaries; the observable settle
+                // is deferred to a queued CombinatorFinish by the caller.
+                if eager_combinator_enabled() && self.microtasks.is_empty() {
+                    self.combinator_step(combinator, index, ReactionKind::Fulfill, value);
+                    return true;
+                }
                 self.microtasks.push_back(Microtask::CombinatorStep {
                     combinator,
                     index,
@@ -2208,6 +2256,7 @@ impl<'p> Vm<'p> {
                 });
             }
         }
+        false
     }
 
     // ── Promise combinators ──
@@ -2478,6 +2527,10 @@ impl<'p> Vm<'p> {
                 keys: comb_keys,
             })));
         let mut native_work = 0u64;
+        // Whether any resolve-element job ran eagerly at subscription (see
+        // `eager_combinator_enabled`): the result promise then owes its settle
+        // to a queued CombinatorFinish instead of the synchronous tail call.
+        let mut eager_used = false;
         loop {
             // Array iteration does NOT skip holes: it performs Get(array,
             // index), so an inherited numeric property or accessor may supply
@@ -2610,7 +2663,8 @@ impl<'p> Vm<'p> {
                 && index <= i32::MAX as u32
                 && promise_all_direct_enabled()
             {
-                self.then_combinator_all_direct(next.heap_index(), comb, index, cap_reject, result);
+                eager_used |=
+                    self.then_combinator_all_direct(next.heap_index(), comb, index, cap_reject, result);
                 continue;
             }
             // onFulfilled / onRejected per PerformPromise{All,AllSettled,Race,Any}: a
@@ -2670,11 +2724,28 @@ impl<'p> Vm<'p> {
         // Iteration complete: drop the initial count. Race never uses the counter
         // (it settles on the first element), so its empty form stays pending.
         if !matches!(kind, CombKind::Race) {
-            if let HeapObj::Combinator(__c) = self.heap.get_mut(comb) {
+            let now_zero = if let HeapObj::Combinator(__c) = self.heap.get_mut(comb) {
                 let remaining = &mut __c.remaining;
                 *remaining -= 1;
+                *remaining == 0
+            } else {
+                false
+            };
+            // remaining==0 with eager steps used means EVERY element was
+            // recorded eagerly (an un-run queued step would still hold its
+            // count), and the queue is still empty — so the spec's settle
+            // moment is the first element job's queue position. Defer the
+            // observable settle there; a burst-queued job after this return
+            // lands behind it, exactly as it would land behind the spec's
+            // element jobs. Without eager steps (incl. the empty iterable,
+            // which the spec settles synchronously) the tail is unchanged.
+            if now_zero && eager_used {
+                debug_assert!(self.microtasks.is_empty());
+                self.microtasks
+                    .push_back(Microtask::CombinatorFinish { combinator: comb });
+            } else {
+                self.combinator_finish(comb);
             }
-            self.combinator_finish(comb);
         }
         Ok(Value::heap(result))
     }
@@ -3180,6 +3251,10 @@ impl<'p> Vm<'p> {
                 kind,
                 arg,
             } => self.combinator_step(combinator, index, kind, arg),
+            // The deferred finish of an eagerly-recorded Promise.all (see
+            // `eager_combinator_enabled`): all element jobs already ran at
+            // subscription; this job carries only the observable settle.
+            Microtask::CombinatorFinish { combinator } => self.combinator_finish(combinator),
             // PromiseResolveThenableJob: run then.call(thenable, resolveFn, rejectFn).
             // The resolving functions settle `promise` (one-shot via settle's Pending
             // guard, so a thenable that calls both / twice is handled). A throwing

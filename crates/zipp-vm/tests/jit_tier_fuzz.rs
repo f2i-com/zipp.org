@@ -497,6 +497,13 @@ const MODES: &[Mode] = &[
         name: "nocouriergate",
         env: &[("ZIPP_NO_COURIER_GATE", "1")],
     },
+    // B218: the eager Promise.all element-job collapse vs the ordinary
+    // one-job-per-element FIFO. Job ordering is observable, so the two must
+    // agree on every generated async shape.
+    Mode {
+        name: "noeagercomb",
+        env: &[("ZIPP_NO_EAGER_COMB", "1")],
+    },
     // B215: the collection intrinsic proof's receiver-half cache vs the
     // full per-call proof (the generated Map/Set shapes + shadow installs).
     Mode {
