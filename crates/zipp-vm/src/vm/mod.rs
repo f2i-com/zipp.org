@@ -320,10 +320,27 @@ pub(crate) enum Resume {
     Return(Value),
 }
 
+/// B214 latch: `ZIPP_NO_MICROTASK_ROOT=1` restores the pre-B214 whole-task
+/// GC suspension (the pricing comparator; it re-opens the TLA starvation).
+pub(crate) fn microtask_root_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_MICROTASK_ROOT").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// A queued microtask (the whole event loop). `Reaction` runs a promise reaction
 /// — `callback` (a JS fn, a native BoundResolver, or undefined for pass-through)
 /// applied to the settled `arg`, settling `dependent`. `AsyncResume` resumes a
 /// suspended async activation.
+#[derive(Clone)]
 pub(crate) enum Microtask {
     Reaction {
         callback: Value,
@@ -869,6 +886,15 @@ pub struct Vm<'p> {
     /// to empty by `drain_microtasks` after the main script returns; a microtask
     /// may enqueue more, which run in the same drain.
     microtasks: std::collections::VecDeque<Microtask>,
+    /// B214: the microtask currently EXECUTING, kept reachable for the GC.
+    /// `drain_microtasks` used to suspend collection for each task's whole
+    /// scope instead — but a top-level-await module's entire body is ONE
+    /// microtask, so a TLA program ran with GC off (npm-nanoid: 1 minor for
+    /// 240k allocs, peak 241k slots vs the 16k budget; a long-lived TLA
+    /// server shape grows without bound). Rooting the in-flight task lets
+    /// the interpreter's ordinary safepoints work inside resumed bodies.
+    /// Saved/restored around nested drains.
+    current_microtask: Option<Microtask>,
     /// The `.raw` array of a tagged-template strings object, keyed by the cooked
     /// array's heap index. Arrays don't carry named properties here, so a
     /// template object's `raw` lives in this side table (read by `get_prop`).

@@ -360,7 +360,8 @@ impl Vm<'_> {
         if let Some((v, _, _)) = &self.pending_await {
             root_val!(*v);
         }
-        for mt in &self.microtasks {
+        // B214: the queue AND the in-flight task (see `current_microtask`).
+        for mt in self.microtasks.iter().chain(self.current_microtask.iter()) {
             match mt {
                 Microtask::Reaction {
                     callback,

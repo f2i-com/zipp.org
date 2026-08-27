@@ -184,6 +184,7 @@ impl<'p> Vm<'p> {
             pending_await: None,
             cap_capture: None,
             microtasks: std::collections::VecDeque::new(),
+            current_microtask: None,
             template_raws: std::collections::HashMap::new(),
             template_cache: std::collections::HashMap::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

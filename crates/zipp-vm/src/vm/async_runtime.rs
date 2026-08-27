@@ -3220,10 +3220,22 @@ impl<'p> Vm<'p> {
     pub fn drain_microtasks(&mut self) {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Microtask);
         while let Some(t) = self.microtasks.pop_front() {
-            // The popped microtask `t` holds Values (callback/arg/dependent) in a
-            // Rust local that are NOT reachable from the GC roots while
-            // run_microtask re-enters the interpreter — suspend GC for its scope.
-            {
+            // B214: the popped task's Values are kept reachable by ROOTING a
+            // copy in `current_microtask` (traced by mark_roots) instead of
+            // suspending GC for the task's whole scope — a top-level-await
+            // module's entire body is one microtask, and the old whole-scope
+            // lock ran such programs with collection off (the npm-nanoid
+            // starvation; an unbounded-heap hole for long-lived TLA shapes).
+            // Save/restore handles a nested drain. run_microtask's internals
+            // need no more than any other native-to-interpreter path: frame
+            // registers root call arguments exactly as the lockless builtin
+            // callers (map/forEach) rely on.
+            if crate::vm::microtask_root_enabled() {
+                let prev = self.current_microtask.replace(t.clone());
+                self.run_microtask(t);
+                self.current_microtask = prev;
+            } else {
+                // The pre-B214 comparator: suspend GC for the task's scope.
                 let _gc = self.gc_lock_guard();
                 self.run_microtask(t);
             }

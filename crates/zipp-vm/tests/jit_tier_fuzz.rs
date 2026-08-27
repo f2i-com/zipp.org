@@ -497,6 +497,13 @@ const MODES: &[Mode] = &[
         name: "nocouriergate",
         env: &[("ZIPP_NO_COURIER_GATE", "1")],
     },
+    // B214: root-the-in-flight-microtask vs the whole-task GC suspension
+    // (the generated async/promise shapes collect mid-reaction only on the
+    // rooted side — a missed root answers wrong or crashes here).
+    Mode {
+        name: "nomicrotaskroot",
+        env: &[("ZIPP_NO_MICROTASK_ROOT", "1")],
+    },
     // B213: caller-side skip of handler-excluded callees vs the always-
     // attempt planners (pure planning; the generated try/finally shapes
     // exercise both routes).
