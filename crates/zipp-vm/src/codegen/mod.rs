@@ -711,6 +711,22 @@ pub struct RandomScaleFusePlan {
     pub dst_prod: u16,
     pub dst_zero: u16,
     pub dst_res: u16,
+    /// B205 stage 2 (the dynamic-length variant): the scale came from
+    /// `alphabet.length` on a CAPTURED alphabet — guard the closure's upval
+    /// cell (index `upval_idx`) against `alph_bits` through the cell-mirror
+    /// authority, and materialize the two UpvalGet destinations with those
+    /// bits. `None` = the static-k variant (k was a literal).
+    pub upval_alph: Option<UpvalAlphabet>,
+}
+
+/// B205 stage 2: the captured-alphabet identity for the dynamic-length fuse.
+#[derive(Clone, Copy, Debug)]
+pub struct UpvalAlphabet {
+    pub upval_idx: u16,
+    pub alph_bits: u64,
+    /// The SECOND UpvalGet's destination (the first sits before the fused
+    /// window and runs as an ordinary op).
+    pub dst_alph_b: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

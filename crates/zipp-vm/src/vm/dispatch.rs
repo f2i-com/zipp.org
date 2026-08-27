@@ -355,7 +355,8 @@ impl<'p> Vm<'p> {
                             let (cross_plan, cross_pending) =
                                 self.build_cross_call_plan(func_id, Some(base));
                             self.jit.note_cross_pending(func_id, &cross_pending);
-                            let random_fuse = self.build_random_fuse_plan(func_id);
+                            let random_fuse =
+                                self.build_random_fuse_plan(func_id, Some(base));
                             self.jit.compile(
                                 func_id,
                                 proto_ref,

@@ -1950,12 +1950,13 @@ pub(crate) fn compile_proto_mem(
     // order, and the plan builder required them untargeted.
     let mut random_fuse_covered = vec![false; n];
     if meter.is_none() {
-        for (&ip, _) in random_fuse.iter() {
-            if ip + 6 <= n
-                && !targeted[ip + 1..ip + 6].iter().any(|&t| t)
-                && !global_xorshift_covered[ip..ip + 6].iter().any(|&c| c)
+        for (&ip, fp) in random_fuse.iter() {
+            let span = if fp.upval_alph.is_some() { 7 } else { 6 };
+            if ip + span <= n
+                && !targeted[ip + 1..ip + span].iter().any(|&t| t)
+                && !global_xorshift_covered[ip..ip + span].iter().any(|&c| c)
             {
-                random_fuse_covered[ip + 1..ip + 6].fill(true);
+                random_fuse_covered[ip + 1..ip + span].fill(true);
             }
         }
     }
@@ -2208,6 +2209,23 @@ pub(crate) fn compile_proto_mem(
                     ; cmp r10d, 0x7FF9
                     ; jne => fb
                 );
+                // B205 stage 2: the captured alphabet's identity, through
+                // the activation upvals and the cell-mirror authority; the
+                // baked k is that immutable string's length.
+                if let Some(ua) = fp.upval_alph {
+                    dynasm!(ops
+                        ; mov rcx, [rdi + crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32]
+                        ; test rcx, rcx
+                        ; jz => fb
+                        ; mov ecx, [rcx + (ua.upval_idx as i32) * 4]
+                        ; mov r11, [rdi + crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32]
+                        ; mov rcx, [r11 + rcx * 8]
+                        ; mov r10, QWORD ua.alph_bits as i64
+                        ; cmp rcx, r10
+                        ; jne => fb
+                        ; mov [rbx + dreg(ua.dst_alph_b)], r10
+                    );
+                }
                 for &(kind, amt) in fp.shifts.iter() {
                     dynasm!(ops ; mov ecx, eax);
                     match kind {

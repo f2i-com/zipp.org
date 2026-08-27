@@ -948,6 +948,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn build_random_fuse_plan(
         &mut self,
         func_id: u32,
+        exemplar_base: Option<usize>,
     ) -> rustc_hash::FxHashMap<usize, crate::codegen::RandomScaleFusePlan> {
         let mut out = rustc_hash::FxHashMap::default();
         if !crate::codegen::random_fuse_enabled() {
@@ -1086,6 +1087,7 @@ impl<'p> Vm<'p> {
                     dst_prod,
                     dst_zero,
                     dst_res,
+                    upval_alph: None,
                 },
             );
             if std::env::var_os("ZIPP_JITLOG").is_some() {
@@ -1094,6 +1096,192 @@ impl<'p> Vm<'p> {
                 );
             }
             ip += 6;
+        }
+        // -- stage 2: the dynamic-length window over a CAPTURED alphabet --
+        //   UpvalGet A(alph) . LoadGlobal Math . CallMethod random(0) .
+        //   UpvalGet B(alph) . GetProp length . Mul . LoadInt 0 . Or
+        // The alphabet is resolved from the LIVE exemplar frame (the B193
+        // pattern) and identity-guarded per call through the cell mirror;
+        // its immutable string length becomes the baked k.
+        let Some(base) = exemplar_base else {
+            return out;
+        };
+        let mut ip = 0usize;
+        while ip + 8 <= n {
+            let w = &caller.code[ip..ip + 8];
+            let parsed = match (&w[0], &w[1], &w[2], &w[3], &w[4], &w[5], &w[6], &w[7]) {
+                (
+                    Instr::UpvalGet { dst: da, idx: ua },
+                    Instr::LoadGlobal { dst: dm, idx: ms },
+                    Instr::CallMethod {
+                        dst: dr,
+                        obj,
+                        name,
+                        argc: 0,
+                        ..
+                    },
+                    Instr::UpvalGet { dst: db, idx: ub },
+                    Instr::GetProp {
+                        dst: dl,
+                        obj: lo,
+                        name: ln,
+                    },
+                    Instr::Mul { dst: dp, a, b },
+                    Instr::LoadInt { dst: dz, val: 0 },
+                    Instr::Bitwise {
+                        dst: dres,
+                        a: oa,
+                        b: ob,
+                        op: crate::bytecode::BitwiseOp::Or,
+                    },
+                ) if obj == dm
+                    && ub == ua
+                    && lo == db
+                    && ((*a == *dr && *b == *dl) || (*b == *dr && *a == *dl))
+                    && ((*oa == *dp && *ob == *dz) || (*ob == *dp && *oa == *dz)) =>
+                {
+                    Some((*ua, *da, *ms, *dm, *dr, *name, *db, *dl, *ln, *dp, *dz, *dres))
+                }
+                _ => None,
+            };
+            let Some((ua, _da, math_slot, dst_math, dst_random, name, db, dl, ln, dp, dz, dres)) =
+                parsed
+            else {
+                ip += 1;
+                continue;
+            };
+            if out.contains_key(&ip) {
+                ip += 1;
+                continue;
+            }
+            if caller.string_constants.get(name as usize).map(|s| s.as_str()) != Some("random")
+                || caller.string_constants.get(ln as usize).map(|s| s.as_str()) != Some("length")
+                || !self.global_slot_directly_routable(math_slot)
+            {
+                ip += 1;
+                continue;
+            }
+            let mv = self.globals[math_slot as usize];
+            if !mv.is_heap() || !self.ic_obj_ok(mv.heap_index()) {
+                ip += 1;
+                continue;
+            }
+            let math_idx = mv.heap_index();
+            let crate::heap::HeapObj::Object(map) = self.heap.get(math_idx) else {
+                ip += 1;
+                continue;
+            };
+            if map.shape() == crate::shape::DICT {
+                ip += 1;
+                continue;
+            }
+            let Some(slot) = map.pos("random") else {
+                ip += 1;
+                continue;
+            };
+            if map.attr_at(slot).accessor {
+                ip += 1;
+                continue;
+            }
+            let rv = map.val_at(slot);
+            if !rv.is_heap() {
+                ip += 1;
+                continue;
+            }
+            let fid = match self.heap.get(rv.heap_index()) {
+                crate::heap::HeapObj::Func(id) => *id,
+                crate::heap::HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => {
+                    *func
+                }
+                _ => {
+                    ip += 1;
+                    continue;
+                }
+            };
+            if (fid as usize)
+                >= self
+                    .main_func_count
+                    .checked_add(self.eval_funcs.len())
+                    .unwrap_or(usize::MAX)
+            {
+                ip += 1;
+                continue;
+            }
+            let Some((state_slot, shifts)) = recognize_seeded_xorshift(self.func(fid as usize))
+            else {
+                ip += 1;
+                continue;
+            };
+            if !self.global_store_slot_directly_routable(state_slot)
+                || !self.global_slot_directly_routable(state_slot)
+            {
+                ip += 1;
+                continue;
+            }
+            // The live exemplar's captured alphabet: an immutable flat Str
+            // whose length becomes the baked k.
+            let Some(frame) = self.frames.last() else {
+                return out;
+            };
+            let closure = frame.closure;
+            let _ = base;
+            let Some((_, upvals)) = self.heap.as_callable(closure) else {
+                ip += 1;
+                continue;
+            };
+            let Some(&cell) = upvals.get(ua as usize) else {
+                ip += 1;
+                continue;
+            };
+            let av = self.heap.cell_get(cell);
+            if !av.is_heap() {
+                ip += 1;
+                continue;
+            }
+            let k = match self.heap.get(av.heap_index()) {
+                crate::heap::HeapObj::Str(js) => js.units() as i64,
+                _ => {
+                    ip += 1;
+                    continue;
+                }
+            };
+            if !(2..=65536).contains(&k) {
+                ip += 1;
+                continue;
+            }
+            let sh = map.shape();
+            self.heap.refresh_mirror(math_idx);
+            out.insert(
+                ip + 1,
+                crate::codegen::RandomScaleFusePlan {
+                    math_slot,
+                    math_bits: mv.bits(),
+                    math_shape: sh,
+                    random_slot: slot as u32,
+                    random_bits: rv.bits(),
+                    state_slot,
+                    shifts,
+                    k: k as i32,
+                    dst_math,
+                    dst_random,
+                    dst_k: dl,
+                    dst_prod: dp,
+                    dst_zero: dz,
+                    dst_res: dres,
+                    upval_alph: Some(crate::codegen::UpvalAlphabet {
+                        upval_idx: ua,
+                        alph_bits: av.bits(),
+                        dst_alph_b: db,
+                    }),
+                },
+            );
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!(
+                    "[fuse] fn{func_id}@{} RANDOM*len({k})|0 fused (upval alphabet, state g{state_slot}, callee fn{fid})",
+                    ip + 1
+                );
+            }
+            ip += 8;
         }
         out
     }
