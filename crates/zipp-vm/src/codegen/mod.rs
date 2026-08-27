@@ -141,6 +141,23 @@ pub(crate) fn cross3_wide_enabled() -> bool {
     }
 }
 
+/// B229 latch: `ZIPP_NO_CROSS_REBAKE=1` stops re-planning callers whose baked
+/// lane was invalidated by a callee's mask-generation bump (they stay on the
+/// helper route for the rest of the run, the pre-B229 behaviour).
+pub(crate) fn cross_rebake_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS_REBAKE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// B227 latch: `ZIPP_NO_CROSS3_MONO=1` restores the same-proto-only cross3
 /// admission (monomorphic sites back on the helper route).
 pub(crate) fn cross3_mono_enabled() -> bool {
@@ -3440,7 +3457,7 @@ impl Jit {
     /// `callees` had no cross entry yet. Bounded and deduplicated.
     /// B229: record that `caller` baked a lane against each of `callees`.
     pub fn note_cross_baked(&mut self, caller: u32, callees: &[u32]) {
-        if !cross_retry_enabled() {
+        if !cross_retry_enabled() || !cross_rebake_enabled() {
             return;
         }
         for &callee in callees {
