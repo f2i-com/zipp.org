@@ -6,6 +6,90 @@ claim below is an entry there with its measurements. This file is the map.
 
 ---
 
+## Continuation snapshot — 2026-08-29, Waves 72–81: the object-lifecycle campaign, and the recorded frontier
+
+Thirteen mechanism waves landed and pushed in one continuous run (ledger
+B194–B206 + B205 stage 2; four captures, README #6–#9). The week arc:
+surviving allocation 3.67× → **2.91×**, vendored NanoID 2.39× → **1.59×**,
+mutable closures 1.65× → **1.48×**, megamorphic 1.97× → 1.73×, stable
+2.09× → 1.84×, hostile 17-row geomean 1.0798 → **1.0218** (series best),
+and the retained-ten headline **under parity with the whole CI below 1.0
+for four captures running**. What landed, in dependency order:
+
+- **B194/B196a/b — the recycle pool family.** The sweep restocks
+  `alloc_finalized`'s `Box<ObjMap>` shells AND dying dense arrays' element
+  Vecs; demand-trimmed at the collection notes; serve order flips
+  LIFO→address at the FIRST MAJOR (the observable separating a warm
+  server's cache-warm turnover from a streaming retainer — either order
+  alone regresses one of them; both are ledger-measured). `ZIPP_NO_OBJ_POOL`
+  + `_SORT`/`_MAJOR` latches, `[objpool]` GCSTATS telemetry.
+- **B195/B197/B198 — the mirror/alloc-tail rework.** `HotMirror`
+  {shape,fid,vals} is one 16-byte per-slot line the IC guards read with a
+  single `lea`; the payload-charge cell and the cold mirrors leave the
+  plain-object alloc/free paths (kind-conditional maintenance under a
+  stated induction). The COLD-mirror PACKING was measured and REFUTED
+  (calls-closures +4.1% ×2 layouts): pack only fields read together on one
+  path; never pack a field that streams alone.
+- **B199 — the live cross-entry table.** Lanes stopped baking callee
+  addresses against the global epoch: `CrossEntryRec` {entry, mask_gen} is
+  read through the VM per call (null → helper; mask_gen bumps only when
+  the mask CHANGES, so same-shape recompiles resume dependents). Region
+  “no entry yet” declines defer up to 8 back-edges; whole-fn declines
+  retry-evict at the callee's install (self-pends skipped — a
+  self-recursive fn evicted itself at its own install forever until the
+  activation-roots test caught it). Survival −7–9% at two layouts.
+- **B201 — the cell-mirror authority.** `HeapObj::Cell` is a payload-free
+  marker (born via `alloc_cell`); the mirror is the single store;
+  `cell_get` is a blind one-load read (sound by B198's invariant); the
+  fused captured-counter increment emits INLINE (int-tag guard subsumes
+  TDZ; int stores are barrier-exempt). calls-closures −9.6%. NAMED TRADE:
+  retained ~+0.5% diffuse interpreter-cell tax, recorded.
+- **B205 — the random-scale fuse.** `Math.random()*k|0` against a
+  recognized seeded-xorshift override emits fully inline (identity chain
+  → three shifts in registers → int state commit → floor(u·k/2^32) via one
+  64-bit imul → EXACT f64 intermediates), both the static-k and the
+  captured-alphabet/dynamic-length variants. NanoID −7.2%.
+- **B206 — yield-with-entry** (enabler, null in-corpus): W9-yielded fns
+  compile with bails at reg-region heads. React's 130k “no-entry”
+  declines root-caused instead to the handler-ops exclusion (try/catch
+  bodies get no frame-free entry BY DESIGN; those calls run framed-native).
+- **B194a — hostile corpus joins PGO training** after a capture caught
+  calls-closures paying +43% of pure retrain luck. Standing rule: a
+  capture-to-capture row move with no covering mechanism A/B triggers a
+  latch bisect; react's 2.22→2.44 swing at capture #9 bisected NULL on
+  every mechanism and joined async in the retrain band.
+
+**THE RECORDED FRONTIER (charter rows B203/B204/B205 follow-ups).** Every
+remaining behind-node row now decomposes into:
+1. **The hardening policy** — mimalloc-secure costs survival 19%, router
+   16%, react 16%, types-churn 13%, stable 7%, mega 6% (B195a probe;
+   json/regex ≈1.20× are entirely this trade, B182). THE USER'S CALL.
+2. **The non-moving-nursery per-death tax** — react pays ~21ms GC/run
+   where node's scavenger pays ~0; free_slot's ~15-39ns/dead bookkeeping
+   is irreducible per-slot under this architecture. A moving nursery is a
+   campaign-scale rewrite.
+3. **The ObjMap arena (B203)** — repriced to ~4–5%/row (the pool already
+   serves ~71% of survival's ObjMap deaths); route (a) `ObjBox` newtype
+   needs no permission but a half-session of careful unsafe PLUS a
+   panic-guarded `Clone` (the `super()` placeholder swap clones whole
+   `HeapObj`s — 7 sites in construct.rs need `clone_into` refactors
+   first); route (b) a global-allocator 112-byte class cache is 20 lines
+   but EXEMPTS guest object data from the hardening — policy again.
+4. **Parked**: framed cross-call entries for handler-carrying callees
+   (B126's stale-len hazard class); types-churn narrowing (repriced down —
+   its int arms already run 0.6ns/op; the gap is the allocating arms).
+
+Method lessons this run burned in: layout-perturbation replication +
+old-vs-rebuilt-old A/A for two-binary readings; small-cold-row flags die
+by 21 pairs + adjusted + DIRECT interleaved medians; `zipp js <file>` (a
+bare filename errors AND still prints zeroed `[gc]` stats — looks like a
+quiet run); linked protos carry a trailing fall-off `ReturnUndefined`
+(the 24-vs-25 recognizer trap); watch for inserting a fn between another
+fn and its `#[cfg]` attribute (the sandbox gate caught it); bash heredocs
+mangle `×`/`—` — Write-tool python scripts for README/ledger edits.
+
+---
+
 ## Continuation snapshot — 2026-08-26, Wave 65: B189a — closures unblacklisted
 
 The calls-closures investigation produced a reframing worth reading before any
