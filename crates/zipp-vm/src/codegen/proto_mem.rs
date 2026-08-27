@@ -2941,7 +2941,37 @@ pub(crate) fn compile_proto_mem(
             Instr::UpvalSet { idx, src } => {
                 // Pure-prefix failure for immutable/TDZ cells; the interpreter
                 // resumes at this op and supplies the exact PutValue semantics.
+                // B201 stage 3: a NON-HEAP source stores inline through the
+                // cell-mirror authority — activation upvals → cell index, the
+                // sticky const/fn-name nonempty bytes decline, the old value's
+                // UNINITIALIZED check keeps TDZ exact, and a heap-tagged src
+                // takes the helper (it owns the write barrier). Both paths
+                // leave nothing in registers the tail needs.
+                let us_slow = ops.new_dynamic_label();
+                let us_done = ops.new_dynamic_label();
+                let uninit = Value::UNINITIALIZED.bits();
                 dynasm!(ops
+                    ; mov rax, [rdi + crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32]
+                    ; test rax, rax
+                    ; jz => us_slow
+                    ; mov ecx, [rax + (idx as i32) * 4]
+                    ; cmp BYTE [rdi + crate::vm::host_api::JIT_CONST_CELLS_NE_OFFSET as i32], 0
+                    ; jne => us_slow
+                    ; cmp BYTE [rdi + crate::vm::host_api::JIT_FN_NAME_CELLS_NE_OFFSET as i32], 0
+                    ; jne => us_slow
+                    ; mov r8, [rbx + dreg(src)]
+                    ; mov r10, r8
+                    ; shr r10, 48
+                    ; cmp r10d, 0x7FFD
+                    ; je => us_slow
+                    ; mov r11, [rdi + crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32]
+                    ; mov rax, [r11 + rcx * 8]
+                    ; mov r10, QWORD uninit as i64
+                    ; cmp rax, r10
+                    ; je => us_slow
+                    ; mov [r11 + rcx * 8], r8
+                    ; jmp => us_done
+                    ; => us_slow
                     ; mov rcx, rdi
                     ; mov edx, idx as i32
                     ; mov r8, [rbx + dreg(src)]
@@ -2950,6 +2980,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
                     ; cmp rax, r10
                     ; je => bail
+                    ; => us_done
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
