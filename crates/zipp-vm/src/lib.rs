@@ -98,6 +98,13 @@ pub mod bench_support {
     pub fn floor_decompose(plan: &StaticKeyPlan, vals: &[u64], n: u32) -> Vec<String> {
         crate::heap::bench_floor_decompose(plan, vals, n)
     }
+
+    /// B219 follow-up: the dynamic-key append decomposition (owned String vs a
+    /// recycled one vs the planned no-alloc path).
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub fn append_decompose(objs: u32, keys_per: u32) -> Vec<String> {
+        crate::heap::bench_append_decompose(objs, keys_per)
+    }
 }
 mod front;
 pub use front::set_pure_script_goal;

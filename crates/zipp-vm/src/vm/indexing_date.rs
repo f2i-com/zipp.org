@@ -788,6 +788,10 @@ impl<'p> Vm<'p> {
             }
         }
         if add {
+            // B220: a recycled key buffer when the sweep has one.
+            #[cfg(not(feature = "safe-sandbox"))]
+            let owned = self.heap.take_key_buf(key);
+            #[cfg(feature = "safe-sandbox")]
             let owned = key.to_owned();
             self.heap.write_barrier_val(idx, val);
             if let HeapObj::Object(m) = self.heap.get_mut(idx) {

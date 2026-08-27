@@ -353,7 +353,13 @@ impl<'p> Vm<'p> {
             _ => return None,
         };
         if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-            m.remove_at(slot);
+            let freed = m.remove_at(slot);
+            // B220: the delete path is the key pool's best feed (see
+            // `Heap::recycle_key_buf`).
+            #[cfg(not(feature = "safe-sandbox"))]
+            self.heap.recycle_key_buf(freed);
+            #[cfg(feature = "safe-sandbox")]
+            drop(freed);
         }
         self.heap.bump_version(idx); // a key was removed -> slots shifted (IC)
         Some(true)

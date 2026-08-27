@@ -497,6 +497,12 @@ const MODES: &[Mode] = &[
         name: "nocouriergate",
         env: &[("ZIPP_NO_COURIER_GATE", "1")],
     },
+    // B220: the sweep-fed key-buffer pool vs a fresh malloc per append
+    // (the generator's dynamic-key object churn drives both).
+    Mode {
+        name: "nokeypool",
+        env: &[("ZIPP_NO_KEY_POOL", "1")],
+    },
     // B218: the eager Promise.all element-job collapse vs the ordinary
     // one-job-per-element FIFO. Job ordering is observable, so the two must
     // agree on every generated async shape.

@@ -2225,7 +2225,10 @@ impl ObjMap {
     /// body below is `remove`'s former body verbatim, in the same order.
     ///
     /// `i` MUST be a live slot index (`i < self.keys.len()`).
-    pub fn remove_at(&mut self, i: usize) {
+    /// B220: returns the removed key's String so a caller with the Heap in
+    /// hand can recycle the buffer (`Heap::recycle_key_buf`). Callers that do
+    /// not want it simply drop the value, exactly as before.
+    pub fn remove_at(&mut self, i: usize) -> String {
         // A hole in the middle of the sequence: every later property's slot
         // shifts down, so no shape in the tree describes the result.
         self.shape_to_dict();
@@ -2260,6 +2263,7 @@ impl ObjMap {
                 ix.remove(&key, i as u32);
             }
         }
+        key
     }
 }
 
@@ -3696,6 +3700,29 @@ fn concat_memo_slot(li: u32, n: i32) -> usize {
     ((li ^ (n as u32).wrapping_mul(0x9E37_79B1)) as usize) & (CONCAT_MEMO_SLOTS - 1)
 }
 
+/// B220: caps on the recycled key-buffer pool.
+#[cfg(not(feature = "safe-sandbox"))]
+const KEY_POOL_MAX: usize = 4096;
+#[cfg(not(feature = "safe-sandbox"))]
+const KEY_POOL_MAX_CAP: usize = 64;
+
+/// B220 latch: `ZIPP_NO_KEY_POOL=1` mallocs a fresh key String per append and
+/// drops dying keys (the pricing comparator).
+#[cfg(not(feature = "safe-sandbox"))]
+pub(crate) fn key_pool_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_KEY_POOL").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// B212: memo size — 2048 entries x 20B = 40KB, charged in `resident_bytes`.
 #[cfg(not(feature = "safe-sandbox"))]
 const CONCAT_MEMO_SLOTS: usize = 2048;
@@ -4322,6 +4349,19 @@ pub struct Heap {
     /// by the same notes and flag as the shell pool.
     #[cfg(not(feature = "safe-sandbox"))]
     arr_pool: Vec<Vec<Value>>,
+    /// B220: recycled property-key buffers, the third member of the
+    /// B194/B196b pool family. The sweep drains a dying DYNAMIC-keyed
+    /// object's key Strings here and the `obj["prefix" + i] = v` append pops
+    /// one instead of mallocing a fresh String. Measured worth: an owned
+    /// append costs 51.9ns and a pooled one 33.2ns (the bytes are still
+    /// copied; only the malloc/free pair is gone). Bounded by
+    /// `KEY_POOL_MAX` entries and `KEY_POOL_MAX_CAP` bytes each, so a
+    /// pathological key set cannot pin memory.
+    #[cfg(not(feature = "safe-sandbox"))]
+    key_pool: Vec<String>,
+    /// B220 oracle telemetry: [served, missed, recycled].
+    #[cfg(not(feature = "safe-sandbox"))]
+    key_pool_stats: [u64; 3],
     #[cfg(not(feature = "safe-sandbox"))]
     arr_pool_pops: usize,
     /// Serve order: false = LIFO push order (recently-swept shells first,
@@ -4683,6 +4723,10 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             arr_pool: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
+            key_pool: Vec::new(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            key_pool_stats: [0; 3],
+            #[cfg(not(feature = "safe-sandbox"))]
             arr_pool_pops: 0,
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_refill: false,
@@ -4776,6 +4820,46 @@ impl Heap {
         let idx = self.alloc(HeapObj::Cell);
         self.cell_vals_mirror[idx as usize] = initial.bits();
         idx
+    }
+
+    /// B220: hand a freed key buffer back to the pool. DELETES are the pool's
+    /// best feed by far: the sweep only supplies keys at object death, but a
+    /// `delete obj[k]` frees one immediately and the very next append usually
+    /// wants one (measured: sweep-only feed served 16.7% of appends).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn recycle_key_buf(&mut self, k: String) {
+        if key_pool_enabled()
+            && self.key_pool.len() < KEY_POOL_MAX
+            && (1..=KEY_POOL_MAX_CAP).contains(&k.capacity())
+        {
+            if self.oracle {
+                self.key_pool_stats[2] += 1;
+            }
+            self.key_pool.push(k);
+        }
+    }
+
+    /// B220: an owned key buffer for `key`, recycled when the pool has one.
+    /// Identical in every observable way to `key.to_owned()` — same bytes,
+    /// same ownership — it just skips the allocator.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn take_key_buf(&mut self, key: &str) -> String {
+        if key_pool_enabled() && key.len() <= KEY_POOL_MAX_CAP {
+            if let Some(mut k) = self.key_pool.pop() {
+                if self.oracle {
+                    self.key_pool_stats[0] += 1;
+                }
+                k.clear();
+                k.push_str(key);
+                return k;
+            }
+        }
+        if self.oracle {
+            self.key_pool_stats[1] += 1;
+        }
+        key.to_owned()
     }
 
     /// B196b: an element buffer for a small dense array being built —
@@ -5382,6 +5466,12 @@ impl Heap {
                             .sum::<usize>()
                         + vec_capacity_bytes(&self.arr_pool)
             + self.concat_memo.len() * std::mem::size_of::<ConcatMemoEntry>()
+            + self
+                .key_pool
+                .iter()
+                .map(|k| k.capacity())
+                .sum::<usize>()
+            + vec_capacity_bytes(&self.key_pool)
                 }
                 #[cfg(feature = "safe-sandbox")]
                 {
@@ -5489,6 +5579,25 @@ impl Heap {
                 if let ValStore::Slab { base, class, .. } = m.vals {
                     self.val_slab[class as usize].free_cell(base);
                     m.vals = ValStore::Vec(Vec::new());
+                }
+                // B220: recycle this object's key buffers. Only OWNED keys
+                // qualify — a `Planned` map's keys belong to a shared plan
+                // Arc and are not ours to take. The Strings are moved out, so
+                // what the courier still carries is the (now empty) Vec.
+                if key_pool_enabled() && self.key_pool.len() < KEY_POOL_MAX {
+                    if let PropKeys::Owned(v) = &mut m.keys {
+                        for k in v.drain(..) {
+                            if self.key_pool.len() >= KEY_POOL_MAX {
+                                break;
+                            }
+                            if (1..=KEY_POOL_MAX_CAP).contains(&k.capacity()) {
+                                if self.oracle {
+                                    self.key_pool_stats[2] += 1;
+                                }
+                                self.key_pool.push(k);
+                            }
+                        }
+                    }
                 }
                 // B187 stage 3: recycle a drop-cheap shell instead of
                 // couriering it. Everything the box still owns is either a
@@ -7469,6 +7578,8 @@ impl Drop for Heap {
             );
             let [h, m] = self.concat_memo_stats;
             eprintln!("[concatmemo] hits={h} misses={m}");
+            let [ks, km, kr] = self.key_pool_stats;
+            eprintln!("[keypool] served={ks} missed={km} recycled={kr} resident={}", self.key_pool.len());
         }
     }
 }
@@ -7477,6 +7588,91 @@ impl Drop for Heap {
 /// allocator / init / value-store shares, inside this module so the private
 /// `ValStore`/`ValSlabClass` internals are reachable. Called only by the
 /// ignored `build_floor_micro` test through `bench_support`; hidden from docs.
+/// B219 follow-up: decompose the DYNAMIC-key append (`obj["prefix" + i] = v`)
+/// so the remaining terms are priced before any of them is optimised. Each
+/// variant builds `objs` maps of `keys_per` properties, so the per-append cost
+/// is the reported total over `objs * keys_per`.
+#[doc(hidden)]
+#[cfg(not(feature = "safe-sandbox"))]
+pub fn bench_append_decompose(objs: u32, keys_per: u32) -> Vec<String> {
+    use std::time::Instant;
+    let names: Vec<String> = (0..keys_per).map(|i| format!("prop_{i}")).collect();
+    let total = (objs as u64) * (keys_per as u64);
+    let mut lines = Vec::new();
+    let mut keep = 0usize;
+
+    // (a) TODAY: a fresh owned String per append, through push_data_tagged.
+    let t = Instant::now();
+    for _ in 0..objs {
+        let mut m = ObjMap::new();
+        for nm in &names {
+            let tag = prop_tag(nm);
+            m.push_data_tagged(nm.clone(), Value::int(1), tag);
+        }
+        keep = keep.wrapping_add(m.keys.len());
+    }
+    let owned = t.elapsed();
+    lines.push(format!(
+        "append owned-String:      {:?} = {:.1}ns/append",
+        owned,
+        owned.as_nanos() as f64 / total as f64
+    ));
+
+    // (b) the same appends with the key String RECYCLED from a pool — the
+    // upper bound on what a sweep-fed key pool could win (it still copies the
+    // bytes; only the malloc/free pair is gone).
+    let mut pool: Vec<String> = Vec::new();
+    let t = Instant::now();
+    for _ in 0..objs {
+        let mut m = ObjMap::new();
+        for nm in &names {
+            let mut k = pool.pop().unwrap_or_default();
+            k.clear();
+            k.push_str(nm);
+            let tag = prop_tag(&k);
+            m.push_data_tagged(k, Value::int(1), tag);
+        }
+        keep = keep.wrapping_add(m.keys.len());
+        // recycle this object's keys the way a sweep-fed pool would
+        if let PropKeys::Owned(v) = &mut m.keys {
+            for k in v.drain(..) {
+                if pool.len() < 4096 {
+                    pool.push(k);
+                }
+            }
+        }
+    }
+    let pooled = t.elapsed();
+    lines.push(format!(
+        "append pooled-String:     {:?} = {:.1}ns/append  (delta {:+.1}ns)",
+        pooled,
+        pooled.as_nanos() as f64 / total as f64,
+        (pooled.as_nanos() as f64 - owned.as_nanos() as f64) / total as f64
+    ));
+
+    // (c) NO key String at all: the planned path's `advance_if_next` append,
+    // the upper bound on site-learned plan adoption.
+    let plan = crate::bytecode::StaticKeyPlan::new(names.clone());
+    let t = Instant::now();
+    for _ in 0..objs {
+        let mut m = ObjMap::new();
+        m.keys = PropKeys::planned(plan.clone());
+        for nm in &names {
+            m.push_static_data(nm, Value::int(1));
+        }
+        keep = keep.wrapping_add(m.keys.len());
+    }
+    let planned = t.elapsed();
+    lines.push(format!(
+        "append planned (no alloc):{:?} = {:.1}ns/append  (delta {:+.1}ns)",
+        planned,
+        planned.as_nanos() as f64 / total as f64,
+        (planned.as_nanos() as f64 - owned.as_nanos() as f64) / total as f64
+    ));
+    lines.push(format!("(keep {keep})"));
+    lines
+}
+
 #[doc(hidden)]
 #[cfg(not(feature = "safe-sandbox"))]
 pub fn bench_floor_decompose(
