@@ -125,6 +125,22 @@ pub const DEOPT_DECAY_RUNS: u32 = 1;
 /// `ZIPP_NO_SUBSTRING1_INTRINSIC=1` restores the generic method-call path for a
 /// same-binary performance comparison. Read only while deciding which native
 /// body to compile, never on the generated hot path.
+/// B227 latch: `ZIPP_NO_CROSS3_MONO=1` restores the same-proto-only cross3
+/// admission (monomorphic sites back on the helper route).
+pub(crate) fn cross3_mono_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS3_MONO").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// A body containing handler ops mutates the ACTIVE FRAME's handler stack; a
 /// frame-free cross call has no frame to hold them, so such a function can
 /// NEVER hold a cross entry (the compile-complete path clears it). B213: the

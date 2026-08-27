@@ -1397,7 +1397,18 @@ impl<'p> Vm<'p> {
                     callee.is_strict
                 );
             }
-            let cross3 = (same_proto
+            // B227: a MONOMORPHIC site is admitted on the same terms as the
+            // same-proto (rotating-closure) one. `same_proto` is set only by
+            // the `ic_call_same_proto` arm, so a plain monomorphic site — the
+            // MOST predictable call shape there is, one filled way naming one
+            // callee — was excluded from the fully-emitted lane and left on
+            // the ~19ns helper route. Nothing in the lane depends on which arm
+            // supplied the exemplar: it bakes the callee's FID and revalidates
+            // it per call against the hot mirror, exactly as it does for a
+            // same-proto site, so a mono exemplar is strictly the easier case.
+            // `ZIPP_NO_CROSS3_MONO=1` restores the same-proto-only admission.
+            let mono_ok = !same_proto && !poly_fid && crate::codegen::cross3_mono_enabled();
+            let cross3 = ((same_proto || mono_ok)
                 && crate::codegen::cross3_enabled()
                 && cross3_unmetered
                 && usize::from(callee.param_count) == usize::from(argc)
