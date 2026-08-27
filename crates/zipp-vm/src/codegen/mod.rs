@@ -125,6 +125,38 @@ pub const DEOPT_DECAY_RUNS: u32 = 1;
 /// `ZIPP_NO_SUBSTRING1_INTRINSIC=1` restores the generic method-call path for a
 /// same-binary performance comparison. Read only while deciding which native
 /// body to compile, never on the generated hot path.
+/// A body containing handler ops mutates the ACTIVE FRAME's handler stack; a
+/// frame-free cross call has no frame to hold them, so such a function can
+/// NEVER hold a cross entry (the compile-complete path clears it). B213: the
+/// caller-side planners consult the same predicate so a call site whose
+/// exemplar callee is handler-excluded emits the ordinary framed path
+/// directly — the specialized attempt would decline on EVERY call (react's
+/// diff: 130k futile enter-helper prefixes + generic re-dispatches per run),
+/// and its missing entry would sit in the B199 pending set forever.
+pub(crate) fn proto_has_handler_ops(proto: &crate::bytecode::FuncProto) -> bool {
+    proto
+        .code
+        .iter()
+        .any(|i| matches!(i, Instr::PushHandler { .. } | Instr::PushFinally { .. }))
+}
+
+/// B213 latch: `ZIPP_NO_HANDLER_CALLEE_SKIP=1` restores the pre-B213
+/// planners (specialized attempts planned even for handler-excluded callees,
+/// declining on every call) — the pricing comparator.
+pub(crate) fn handler_callee_skip_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HANDLER_CALLEE_SKIP").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub(crate) fn substring1_intrinsic_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -3601,11 +3633,7 @@ impl Jit {
                 // handler stack; a frame-free cross-call has no frame to hold
                 // them, so such functions never receive a cross entry and every
                 // invocation goes through the ordinary framed call path.
-                let has_handler_ops = proto
-                    .code
-                    .iter()
-                    .any(|i| matches!(i, Instr::PushHandler { .. } | Instr::PushFinally { .. }));
-                if has_handler_ops {
+                if proto_has_handler_ops(proto) {
                     self.clear_cross_entry(func_id);
                     return;
                 }

@@ -497,6 +497,13 @@ const MODES: &[Mode] = &[
         name: "nocouriergate",
         env: &[("ZIPP_NO_COURIER_GATE", "1")],
     },
+    // B213: caller-side skip of handler-excluded callees vs the always-
+    // attempt planners (pure planning; the generated try/finally shapes
+    // exercise both routes).
+    Mode {
+        name: "nohandlerskip",
+        env: &[("ZIPP_NO_HANDLER_CALLEE_SKIP", "1")],
+    },
     // B212: the const+int concat memo vs fresh allocation — the generator's
     // string-key shapes plus the frozen-string append/chain fallbacks.
     Mode {

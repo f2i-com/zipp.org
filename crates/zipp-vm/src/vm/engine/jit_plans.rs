@@ -1350,6 +1350,11 @@ impl<'p> Vm<'p> {
                 || callee.is_async
                 || callee.rest_reg.is_some()
                 || callee.arguments_reg.is_some()
+                // B213: handler-op bodies never receive a cross entry, so a
+                // specialized attempt would decline on every call and the
+                // pend below would never resolve — take the framed path.
+                || (crate::codegen::handler_callee_skip_enabled()
+                    && crate::codegen::proto_has_handler_ops(callee))
             {
                 continue; // could never hold a cross entry / needs setup_call
             }
@@ -1513,6 +1518,9 @@ impl<'p> Vm<'p> {
                         || callee.rest_reg.is_some()
                         || callee.arguments_reg.is_some()
                         || usize::from(callee.param_count) != usize::from(argc)
+                        // B213: see the call arm — no entry can ever exist.
+                        || (crate::codegen::handler_callee_skip_enabled()
+                            && crate::codegen::proto_has_handler_ops(callee))
                     {
                         continue;
                     }
