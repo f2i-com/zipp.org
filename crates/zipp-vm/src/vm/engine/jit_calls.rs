@@ -391,6 +391,13 @@ impl<'p> Vm<'p> {
             Some(e) => e,
             None => {
                 crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_NO_ENTRY);
+                if std::env::var_os("ZIPP_DECLLOG").is_some() {
+                    eprintln!(
+                        "[decl] no-entry fid={fid} compiled={} sp2={}",
+                        self.jit.get(fid).is_some(),
+                        SAME_PROTO_ARROW2
+                    );
+                }
                 return SELF_CALL_DEOPT;
             }
         };

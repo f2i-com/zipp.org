@@ -259,7 +259,20 @@ impl<'p> Vm<'p> {
                     // `jmp` — no OSR check). Decline BEFORE any plan building
                     // so the recurring trip costs one dense read, and defer so
                     // the offer re-trips if the region is later evicted.
-                    if self.jit.should_yield_to_region(func_id) {
+                    // B206 yield-with-entry: a fn whose loops own reg-homed
+                    // regions still compiles — with an unconditional bail at
+                    // each region head, so calls get the native lane and
+                    // prologue while the regions keep the loops.
+                    let yield_heads: Vec<u32> = if self.jit.should_yield_to_region(func_id) {
+                        if crate::codegen::yield_entry_enabled() {
+                            self.jit.reg_region_heads(func_id)
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    if self.jit.should_yield_to_region(func_id) && yield_heads.is_empty() {
                         self.jit.compile_defer(func_id);
                     } else {
                         let proto: *const crate::bytecode::FuncProto = self.func(func_id as usize);
@@ -353,6 +366,7 @@ impl<'p> Vm<'p> {
                                 &leaf_plan,
                                 &method_plan,
                                 &cross_plan,
+                                &yield_heads,
                             );
                         }
                     }

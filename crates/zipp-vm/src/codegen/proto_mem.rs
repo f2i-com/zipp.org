@@ -1785,6 +1785,9 @@ pub(crate) fn compile_proto_mem(
     // local site number — see `compile_region_mem`'s twin parameter.
     ic_emit: &[IcSiteEmit],
     meter: Option<crate::codegen::meter::Meter>,
+    // B206: loop-head ips owned by live reg-homed regions; the body bails
+    // unconditionally at each so those loops stay with their regions.
+    yield_heads: &[u32],
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
@@ -2130,6 +2133,19 @@ pub(crate) fn compile_proto_mem(
                 crate::codegen::meter::emit_charge(&mut ops, m, len, stub);
                 meter_stubs.push((stub, ip));
             }
+        }
+        // B206 yield-with-entry: this ip heads a loop a live REG-homed
+        // region owns — exit to the interpreter here (its back-edge OSRs
+        // straight into the region), so the whole-fn body serves calls and
+        // the prologue while the region keeps the loop. Control falls into
+        // the bail; the ops after it still emit (dead but label-linked).
+        // Metered bodies never carry heads (the caller passes none): a
+        // charge-then-bail would double-charge on replay.
+        if !yield_heads.is_empty() && yield_heads.contains(&(ip as u32)) {
+            dynasm!(ops
+                ; mov DWORD [rsi], ip as i32
+                ; jmp => epilogue
+            );
         }
         // These bytecodes were materialized exactly by the fused captured-int
         // helper at their only predecessor. No internal jump may target them

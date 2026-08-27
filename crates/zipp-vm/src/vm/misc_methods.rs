@@ -320,6 +320,7 @@ impl<'p> Vm<'p> {
                 &leaf_plan,
                 &method_plan,
                 &cross_plan,
+                &[],
             );
         }
         let entry = self.jit.get(fid)?.entry();

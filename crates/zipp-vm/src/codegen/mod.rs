@@ -285,6 +285,23 @@ pub(crate) fn cross3m_enabled() -> bool {
 
 /// `ZIPP_NO_CROSS_RETRY=1` keeps compile-order "no entry yet" declines
 /// permanent (the pre-B199 behavior) — the single-binary A/B for the retry.
+/// `ZIPP_NO_YIELD_ENTRY=1` restores the W9 pure decline (a fn with live
+/// reg-homed regions gets NO whole-fn body at all) — the single-binary A/B
+/// for B206's yield-with-entry compile.
+pub(crate) fn yield_entry_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_YIELD_ENTRY").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub(crate) fn cross_retry_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
@@ -3377,6 +3394,9 @@ impl Jit {
         // cross-call attempt with the unchanged `call_ic` helper as fallback.
         // Empty = no cross-call emission (e.g. ZIPP_NO_CROSSCALL).
         cross_plan: &CrossCallPlan,
+        // B206: loop-head ips owned by live reg-homed regions — the emitted
+        // body bails unconditionally at each so the regions keep the loops.
+        yield_heads: &[u32],
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -3439,6 +3459,7 @@ impl Jit {
                 cross_plan,
                 &acc_emit,
                 meter,
+                yield_heads,
             ) {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!(
@@ -3617,6 +3638,16 @@ impl Jit {
     /// dense array read. The caller must `compile_defer` on `true` — declining
     /// without re-arming permanently disarms the offer (B65).
     #[inline]
+    /// B206: the entry ips of `func_id`'s live REG-homed regions — the
+    /// loop heads a yield-with-entry Tier-C body bails at.
+    pub fn reg_region_heads(&self, func_id: u32) -> Vec<u32> {
+        self.regions
+            .iter()
+            .filter(|(&(f, _), r)| f == func_id && !r.is_mem)
+            .map(|(&(_, ip), _)| ip)
+            .collect()
+    }
+
     pub fn should_yield_to_region(&mut self, func_id: u32) -> bool {
         let y = tierc_yield_enabled() && self.has_reg_region(func_id);
         if y && std::env::var_os("ZIPP_JITLOG").is_some() && self.yield_logged.insert(func_id) {
