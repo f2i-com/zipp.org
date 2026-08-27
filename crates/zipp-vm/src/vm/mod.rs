@@ -322,6 +322,24 @@ pub(crate) enum Resume {
 
 /// B214 latch: `ZIPP_NO_MICROTASK_ROOT=1` restores the pre-B214 whole-task
 /// GC suspension (the pricing comparator; it re-opens the TLA starvation).
+pub(crate) const COLL_PROOF_SLOTS: usize = 16;
+
+/// B215 latch: `ZIPP_NO_COLL_PROOF_CACHE=1` disables the receiver-half
+/// proof cache (every lookup runs the full intrinsic proof).
+pub(crate) fn coll_proof_cache_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_COLL_PROOF_CACHE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub(crate) fn microtask_root_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
@@ -885,6 +903,11 @@ pub struct Vm<'p> {
     /// FIFO microtask queue — the entire event loop (no timers/IO exist). Drained
     /// to empty by `drain_microtasks` after the main script returns; a microtask
     /// may enqueue more, which run in the same drain.
+    /// B215: the receiver half of the collection intrinsic proof, cached
+    /// per (idx, method) under the receiver's heap version (see
+    /// `collection_method_is_intrinsic`). Direct-mapped; entries are
+    /// (idx, version, name_id, kind); idx == u32::MAX is empty.
+    pub(crate) coll_proof_cache: [(u32, u32, u8, u8); COLL_PROOF_SLOTS],
     microtasks: std::collections::VecDeque<Microtask>,
     /// B214: the microtask currently EXECUTING, kept reachable for the GC.
     /// `drain_microtasks` used to suspend collection for each task's whole

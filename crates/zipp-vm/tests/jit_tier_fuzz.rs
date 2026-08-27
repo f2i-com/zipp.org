@@ -497,6 +497,12 @@ const MODES: &[Mode] = &[
         name: "nocouriergate",
         env: &[("ZIPP_NO_COURIER_GATE", "1")],
     },
+    // B215: the collection intrinsic proof's receiver-half cache vs the
+    // full per-call proof (the generated Map/Set shapes + shadow installs).
+    Mode {
+        name: "nocollproofcache",
+        env: &[("ZIPP_NO_COLL_PROOF_CACHE", "1")],
+    },
     // B214: root-the-in-flight-microtask vs the whole-task GC suspension
     // (the generated async/promise shapes collect mid-reaction only on the
     // rooted side — a missed root answers wrong or crashes here).
@@ -909,6 +915,15 @@ enum Stmt {
     },
     ALen {
         arr: Arr,
+    },
+    /// B216: rebind a GLOBAL and read `.length` off it in the same region.
+    /// The hoisting predicates ask "is this global stored anywhere in the
+    /// region?", and one of them answered that with a single forward pass
+    /// that only noticed stores AFTER the load — so `style: 0` (store first)
+    /// shipped the region-entry value's length for the whole loop. The
+    /// grammar had no shape that rebinds a `.length`-consumed global at all.
+    RebindLen {
+        style: u8,
     },
     If {
         a: Src,
@@ -2178,6 +2193,14 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
         // same way `Flavor::Scan` does — but the match has to be exhaustive.
         Flavor::DblScan | Flavor::Split => 0,
     };
+    // B216: the global-rebind + `.length` shape. Modest but never zero — a
+    // hoisting predicate that mis-answers "is this global written in the
+    // region?" needs only ONE of these in a compiled region to diverge.
+    let w_rebind = match g.flavor {
+        Flavor::Mem | Flavor::Mixed | Flavor::Scan => 7,
+        Flavor::Double | Flavor::DblScan | Flavor::Split => 0,
+        _ => 4,
+    };
     let w_bool = match g.flavor {
         Flavor::Int | Flavor::Bits => 20,
         Flavor::Pressure | Flavor::Scan => 22,
@@ -2221,7 +2244,7 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
         _ => 5,
     };
 
-    let table: [(u64, u8); 12] = [
+    let table: [(u64, u8); 13] = [
         (w_int, 0),
         (w_bool, 1),
         (w_elem, 2),
@@ -2234,6 +2257,7 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
         (w_if, 9),
         (w_try, 10),
         (w_shape, 11),
+        (w_rebind, 12),
     ];
     let total: u64 = table.iter().map(|(w, _)| *w).sum();
     let mut r = g.rng.next() % total;
@@ -2246,6 +2270,11 @@ fn gen_stmt(g: &mut Gen) -> Stmt {
         r -= w;
     }
 
+    if kind == 12 {
+        return Stmt::RebindLen {
+            style: g.rng.below(3) as u8,
+        };
+    }
     match kind {
         0 => {
             let op = match g.flavor {
@@ -2563,6 +2592,8 @@ struct Used {
     loop2: bool,
     /// W20: `parr`, the growable array `Stmt::Push` appends to.
     push_arr: bool,
+    /// B216: `gstr`, the global `Stmt::RebindLen` reassigns and measures.
+    rebind_str: bool,
     labels: Vec<u32>,
 }
 
@@ -2570,6 +2601,7 @@ impl Used {
     fn everything() -> Used {
         Used {
             push_arr: true,
+            rebind_str: true,
             temps: [true; TEMPS],
             bools: [true; BOOLS],
             dbls: [true; DBLS],
@@ -2727,6 +2759,7 @@ fn collect_stmts(ss: &[Stmt], u: &mut Used) {
                 u.src(*v);
             }
             Stmt::ALen { arr } => u.arrs[arr.ix()] = true,
+            Stmt::RebindLen { .. } => u.rebind_str = true,
             Stmt::Push { v, .. } => {
                 u.push_arr = true;
                 u.src(*v);
@@ -2988,6 +3021,46 @@ fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
                 ind,
                 &format!("{l}h = ({l}h + {p}{}.length) | 0;", arr.name()),
             );
+        }
+        Stmt::RebindLen { style } => {
+            // The shape must form its OWN tight loop. `hoistable_length` only
+            // considers a region with no Call/SetProp/SetIndex anywhere and
+            // exactly ONE `GetProp "length"` — inlined among the generator's
+            // ordinary statements those preconditions essentially never hold,
+            // so a bare store+read pair never reaches the predicate at all
+            // (measured: a 2000-program soak with the bug reintroduced found
+            // 0 divergences until this became a self-contained loop).
+            // `style` picks the STORE/LOAD order and whether the store is
+            // conditional; order 0 is the B216 shape.
+            // The rebound value must VARY IN LENGTH or a stale hoist returns
+            // the right answer anyway (measured: `"k_" + n` for n in 1..8 is
+            // always 3 chars and never diverges). "prop_" + rb over 0..63
+            // gives 6 and 7. The operand must also be the LOOP VARIABLE, not
+            // the accumulator: feeding `h` back in makes the length read part
+            // of its own dependence cycle and no hoistable region forms.
+            let store = format!("{p}gstr = \"prop_\" + {l}rb;");
+            let read = format!("{l}h = ({l}h + {p}gstr.length) | 0;");
+            line(o, ind, &format!("for (var {l}rb = 0; {l}rb < 64; {l}rb++) {{"));
+            match style {
+                0 => {
+                    line(o, ind + 1, &store);
+                    line(o, ind + 1, &read);
+                }
+                1 => {
+                    line(o, ind + 1, &read);
+                    line(o, ind + 1, &store);
+                }
+                _ => {
+                    // Conditional store: illegal on the taken path only, so a
+                    // predicate reasoning per-path rather than per-region is
+                    // wrong here too.
+                    line(o, ind + 1, &format!("if (({l}rb & 3) === 0) {{"));
+                    line(o, ind + 2, &store);
+                    line(o, ind + 1, "}");
+                    line(o, ind + 1, &read);
+                }
+            }
+            line(o, ind, "}");
         }
         Stmt::Push { v, style } => {
             let val = s_txt(p, *v);
@@ -3339,6 +3412,11 @@ fn emit(prog: &Program, gp: &str, tag: &str, iife: bool) -> String {
     let u = collect(prog);
     let mut o = String::new();
 
+    if u.rebind_str {
+        // A SHORT seed on purpose: every rebind below produces a different
+        // length, so a stale hoist of `gstr.length` diverges immediately.
+        line(&mut o, 0, &format!("var {p}gstr = \"s\";"));
+    }
     if u.push_arr {
         // Starts EMPTY on purpose: an empty dense array samples as all-Int, so
         // the pin planner offers it to the INT tier, and the kernel then walks

@@ -1333,25 +1333,93 @@ pub(crate) fn hoistable_length(
 ) -> Option<(usize, u16, u32, u32)> {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
-    // The region must not change any container's length. A generic call
-    // (`Call`, or any `CallMethod` other than the read-only `charCodeAt`)
-    // can run ARBITRARY user code — which may mutate the container's length
-    // or reassign the global holding it — so it rejects the hoist outright
-    // (the per-iteration miss-helper read stays correct, just not hoisted).
+    // The region must not change any container's length, and must not run
+    // ANY user code (which could mutate the container or reassign the global
+    // holding it).
+    //
+    // B217: this is a FAIL-CLOSED WHITELIST, and must be. It used to be a
+    // blacklist of four ops (`SetIndex`, `SetProp`, `Call`, and `CallMethod`
+    // other than `charCodeAt`), which silently went stale as
+    // `region_can_compile` admitted more: `CallMethodComputed`
+    // (`fns[i & 1]()` calling `arr.push`), `DeleteIndex`/`DeleteIndexConcat`
+    // (a Proxy `deleteProperty` trap is user code), `SetIndexConcat`,
+    // `CellSet`/`UpvalSet`, `IterNext`, `ForInLive`, `StaticFn`. Each of
+    // those admitted a hoist over a loop that DOES change the length —
+    // four independently-minimised live wrong answers, the loudest reading
+    // 1999972 where node and the interpreter both say 1300000.
+    //
+    // A blacklist is the wrong shape for this question: every future op
+    // added to region admission would silently re-open it. With a whitelist
+    // a new op costs at most a missed optimisation (the per-iteration
+    // miss-helper read stays correct), never a wrong answer — the same
+    // fail-closed discipline `cross_ud` uses.
     for instr in &code[s..=e] {
         match instr {
-            Instr::SetIndex { .. } | Instr::SetProp { .. } | Instr::Call { .. } => return None,
-            Instr::CallMethod { name, .. } => {
+            // Pure register/immediate producers.
+            Instr::LoadConst { .. }
+            | Instr::LoadInt { .. }
+            | Instr::LoadUndefined { .. }
+            | Instr::LoadNull { .. }
+            | Instr::LoadBool { .. }
+            | Instr::LoadGlobal { .. }
+            | Instr::Move { .. } => {}
+            // Global stores: they cannot run user code. A store to the
+            // hoisted global itself is rejected by the two-pass check below
+            // (B216); a store to any OTHER global is harmless here.
+            Instr::StoreGlobal { .. }
+            | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. } => {}
+            // Arithmetic / bitwise / comparison on the region's values. The
+            // MEM tier reaches these with unknown operand types, so an
+            // `Add` CAN run ToPrimitive on an object — but only on a value
+            // the region itself produced, and a user hook there would have
+            // to reach the hoisted global through a closure it cannot get
+            // without one of the rejected ops. The pre-B217 blacklist
+            // already accepted every op in this group; keeping them is what
+            // preserves the hoist's whole reason to exist.
+            Instr::Add { .. }
+            | Instr::AddInt { .. }
+            | Instr::AddRightPair { .. }
+            | Instr::Sub { .. }
+            | Instr::Mul { .. }
+            | Instr::Div { .. }
+            | Instr::Mod { .. }
+            | Instr::Bitwise { .. }
+            | Instr::Neg { .. }
+            | Instr::Not { .. }
+            | Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. }
+            | Instr::TypeOf { .. }
+            | Instr::TypeOfIs { .. }
+            | Instr::IsArray { .. }
+            | Instr::StrConcatChain { .. }
+            | Instr::StrAppendInPlace { .. }
+            | Instr::Pad2Concat { .. }
+            | Instr::Pad2Conditional { .. } => {}
+            // Control flow inside the region.
+            Instr::Jump { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. } => {}
+            // Reads. `GetIndex` reads an element; `LenOf` reads a length;
+            // `GetProp` is the hoisted read itself (and any sibling read —
+            // the unique-`length` check below still applies).
+            Instr::GetIndex { .. } | Instr::GetProp { .. } | Instr::LenOf { .. } => {}
+            // The ONE call form proven read-only and length-preserving.
+            Instr::CallMethod { name, .. }
                 if proto
                     .string_constants
                     .get(*name as usize)
                     .map(|s| s.as_str())
-                    != Some("charCodeAt")
-                {
-                    return None;
-                }
-            }
-            _ => {}
+                    == Some("charCodeAt") => {}
+            // Everything else — including every op a future wave admits to
+            // region compilation — declines the hoist.
+            _ => return None,
         }
     }
     // Exactly one `GetProp(_, "length")` in the region.
@@ -1388,6 +1456,15 @@ pub(crate) fn hoistable_length(
     }
     // `obj` must be defined in the region only by `LoadGlobal(g)` (same `g`), and
     // `g` never stored in the region.
+    //
+    // B216: this runs as TWO passes, and must. A single forward pass that
+    // compared each `StoreGlobal` against the `g` discovered so far was
+    // ORDER-DEPENDENT: in `g = expr; … g.length` the store is examined while
+    // `g` is still `None`, so the mutation went unseen and the hoist was
+    // admitted for a global the loop reassigns EVERY iteration — the region
+    // then served the entry value's length forever (a live wrong answer:
+    // `s = "prop_" + p; acc += s.length` summed 1229600 where the
+    // interpreter and node both say 1230000).
     let mut g: Option<u32> = None;
     for ip in s..=e {
         match code[ip] {
@@ -1397,13 +1474,9 @@ pub(crate) fn hoistable_length(
                 }
                 g = Some(idx);
             }
-            Instr::StoreGlobal { idx, .. }
-            | Instr::StoreGlobalStrict { idx, .. }
-            | Instr::StoreGlobalResolved { idx, .. } => {
-                if Some(idx) == g {
-                    return None; // g mutated in the loop
-                }
-            }
+            Instr::StoreGlobal { .. }
+            | Instr::StoreGlobalStrict { .. }
+            | Instr::StoreGlobalResolved { .. } => {}
             _ => {
                 // `obj` defined by something other than LoadGlobal → not a global.
                 if writes_reg(&code[ip]) == Some(obj) {
@@ -1412,11 +1485,26 @@ pub(crate) fn hoistable_length(
             }
         }
     }
+    let g_slot = g?;
+    // Pass two: ANY store to `g` anywhere in the region kills the hoist,
+    // whatever its position relative to the load.
+    for ip in s..=e {
+        match code[ip] {
+            Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. } => {
+                if idx == g_slot {
+                    return None; // g mutated in the loop
+                }
+            }
+            _ => {}
+        }
+    }
     let name_idx = match code[get_ip] {
         Instr::GetProp { name, .. } => name,
         _ => return None,
     };
-    g.map(|g| (get_ip, dst, g, name_idx))
+    Some((get_ip, dst, g_slot, name_idx))
 }
 
 /// Addresses of the win64 heap helpers (vm.rs), the COMPILING function's id, and

@@ -185,6 +185,7 @@ impl<'p> Vm<'p> {
             cap_capture: None,
             microtasks: std::collections::VecDeque::new(),
             current_microtask: None,
+            coll_proof_cache: [(u32::MAX, 0, 0, 0); crate::vm::COLL_PROOF_SLOTS],
             template_raws: std::collections::HashMap::new(),
             template_cache: std::collections::HashMap::new(),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
