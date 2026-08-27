@@ -1229,6 +1229,12 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             | Instr::Mod { dst, a, b }
             | Instr::Bitwise { dst, a, b, .. }
             | Instr::StrAppendInPlace { dst, a, b }
+            // B208: same uses/def licence as Add — bytecode.rs declares the op
+            // semantically identical for every operand pair. Its absence (a
+            // W11/B124 staleness: the table was frozen pre-W11) failed closed
+            // as a full window zero-fill on EVERY cross call into a callee
+            // containing a fused chain (243k fills/run on router+react).
+            | Instr::StrConcatChain { dst, a, b }
             | Instr::Lt { dst, a, b }
             | Instr::Le { dst, a, b }
             | Instr::Gt { dst, a, b }
