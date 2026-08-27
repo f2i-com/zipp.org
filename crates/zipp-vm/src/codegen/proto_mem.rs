@@ -1788,6 +1788,8 @@ pub(crate) fn compile_proto_mem(
     // B206: loop-head ips owned by live reg-homed regions; the body bails
     // unconditionally at each so those loops stay with their regions.
     yield_heads: &[u32],
+    // B205: fused random-scale windows (window-start ip -> plan).
+    random_fuse: &FxHashMap<usize, crate::codegen::RandomScaleFusePlan>,
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
@@ -1941,6 +1943,20 @@ pub(crate) fn compile_proto_mem(
             let end = ip + usize::from(plan.count) * 6;
             global_xorshift[ip] = Some(plan);
             global_xorshift_covered[ip + 1..end].fill(true);
+        }
+    }
+    // B205: mark the five ops after each fused random-scale window start as
+    // covered — the fused arm materializes every destination in bytecode
+    // order, and the plan builder required them untargeted.
+    let mut random_fuse_covered = vec![false; n];
+    if meter.is_none() {
+        for (&ip, _) in random_fuse.iter() {
+            if ip + 6 <= n
+                && !targeted[ip + 1..ip + 6].iter().any(|&t| t)
+                && !global_xorshift_covered[ip..ip + 6].iter().any(|&c| c)
+            {
+                random_fuse_covered[ip + 1..ip + 6].fill(true);
+            }
         }
     }
     let n_global_xorshift_chains = global_xorshift.iter().flatten().count();
@@ -2153,6 +2169,90 @@ pub(crate) fn compile_proto_mem(
         // a plan, so sharing their labels with the next live op is safe.
         if upval_inc_covered[ip] || upval_xorshift_covered[ip] || global_xorshift_covered[ip] {
             continue;
+        }
+        if random_fuse_covered[ip] {
+            continue;
+        }
+        // B205: the fused `Math.random()*k|0` window. Guards then commit;
+        // any miss resumes the interpreter at this ip having changed
+        // nothing. Doubles are materialized EXACTLY (u32 -> f64 is exact;
+        // u/2^32 and its *k stay under 2^53), and the Int result is the
+        // integer identity floor(u*k/2^32) via one 64-bit mul.
+        if let Some(fp) = random_fuse.get(&ip).copied() {
+            if meter.is_none() && random_fuse_covered.get(ip + 1) == Some(&true) {
+                let fb = ops.new_dynamic_label();
+                let inv = (1.0f64 / 4294967296.0).to_bits();
+                let kf = (fp.k as f64).to_bits();
+                dynasm!(ops
+                    // Math binding by VALUE, its settled shape, the random
+                    // own-slot by VALUE (the B193 shape->vals->value form).
+                    ; mov rax, [r12 + (fp.math_slot as i32) * 8]
+                    ; mov r10, QWORD fp.math_bits as i64
+                    ; cmp rax, r10
+                    ; jne => fb
+                    ; mov r10d, eax
+                    ; mov r11, [rdi + crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                    ; lea r11, [r11 + r10 * 8]
+                    ; cmp DWORD [r11 + r10 * 8], fp.math_shape as i32
+                    ; jne => fb
+                    ; mov r11, [r11 + r10 * 8 + crate::vm::host_api::JIT_HOT_VALS_OFF as i32]
+                    ; mov rax, [r11 + (fp.random_slot as i32) * 8]
+                    ; mov r10, QWORD fp.random_bits as i64
+                    ; cmp rax, r10
+                    ; jne => fb
+                    // State slot: Int-tagged (the first call after the
+                    // double-literal seed bails once and settles it).
+                    ; mov rax, [r12 + (fp.state_slot as i32) * 8]
+                    ; mov r10, rax
+                    ; shr r10, 48
+                    ; cmp r10d, 0x7FF9
+                    ; jne => fb
+                );
+                for &(kind, amt) in fp.shifts.iter() {
+                    dynasm!(ops ; mov ecx, eax);
+                    match kind {
+                        0 => dynasm!(ops ; shl ecx, amt as i8),
+                        2 => dynasm!(ops ; shr ecx, amt as i8),
+                        _ => dynasm!(ops ; sar ecx, amt as i8),
+                    }
+                    dynasm!(ops ; xor eax, ecx);
+                }
+                dynasm!(ops
+                    // Commit the new state (int-box) — all guards passed.
+                    ; mov ecx, eax
+                    ; mov r10, QWORD INT_TAG as i64
+                    ; or r10, rcx
+                    ; mov [r12 + (fp.state_slot as i32) * 8], r10
+                    // Result: floor(u * k / 2^32), u = state >>> 0.
+                    ; mov ecx, eax
+                    ; imul rcx, rcx, fp.k
+                    ; shr rcx, 32
+                    ; mov r10, QWORD INT_TAG as i64
+                    ; or r10, rcx
+                    ; mov [rbx + dreg(fp.dst_res)], r10
+                    // Materialize the window's intermediates in order.
+                    ; mov r10, QWORD fp.math_bits as i64
+                    ; mov [rbx + dreg(fp.dst_math)], r10
+                    ; mov ecx, eax
+                    ; cvtsi2sd xmm0, rcx
+                    ; mov r10, QWORD inv as i64
+                    ; movq xmm1, r10
+                    ; mulsd xmm0, xmm1
+                    ; movq r10, xmm0
+                    ; mov [rbx + dreg(fp.dst_random)], r10
+                    ; mov r10, QWORD kf as i64
+                    ; movq xmm1, r10
+                    ; mulsd xmm0, xmm1
+                    ; movq r10, xmm0
+                    ; mov [rbx + dreg(fp.dst_prod)], r10
+                    ; mov r10, QWORD (INT_TAG | (fp.k as u32 as u64)) as i64
+                    ; mov [rbx + dreg(fp.dst_k)], r10
+                    ; mov r10, QWORD INT_TAG as i64
+                    ; mov [rbx + dreg(fp.dst_zero)], r10
+                );
+                emit_region_bail(&mut ops, ip, fb, epilogue);
+                continue;
+            }
         }
         // Each op gets its OWN dedicated bail label (records THIS ip); a guard
         // miss resumes the interpreter exactly here, side-effect-free.

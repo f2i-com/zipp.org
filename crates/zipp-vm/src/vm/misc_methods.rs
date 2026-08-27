@@ -321,6 +321,7 @@ impl<'p> Vm<'p> {
                 &method_plan,
                 &cross_plan,
                 &[],
+                &rustc_hash::FxHashMap::default(),
             );
         }
         let entry = self.jit.get(fid)?.entry();

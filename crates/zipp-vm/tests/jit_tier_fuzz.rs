@@ -489,6 +489,20 @@ const MODES: &[Mode] = &[
         name: "noobjpoolmajor",
         env: &[("ZIPP_NO_OBJ_POOL_MAJOR", "1")],
     },
+    // B205: the fused Math.random()*k|0 window vs its ordinary ops, and
+    // B199's compile-order retry vs permanent declines.
+    Mode {
+        name: "norandomfuse",
+        env: &[("ZIPP_NO_RANDOM_FUSE", "1")],
+    },
+    Mode {
+        name: "nocrossretry",
+        env: &[("ZIPP_NO_CROSS_RETRY", "1")],
+    },
+    Mode {
+        name: "noyieldentry",
+        env: &[("ZIPP_NO_YIELD_ENTRY", "1")],
+    },
     Mode {
         name: "upvalmin12",
         env: &[("ZIPP_TIERC_UPVAL_MIN", "12")],

@@ -285,6 +285,22 @@ pub(crate) fn cross3m_enabled() -> bool {
 
 /// `ZIPP_NO_CROSS_RETRY=1` keeps compile-order "no entry yet" declines
 /// permanent (the pre-B199 behavior) — the single-binary A/B for the retry.
+/// `ZIPP_NO_RANDOM_FUSE=1` keeps the `Math.random()*k|0` window on its
+/// ordinary ops (the B205 fused lane off) — the single-binary A/B.
+pub(crate) fn random_fuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_RANDOM_FUSE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// `ZIPP_NO_YIELD_ENTRY=1` restores the W9 pure decline (a fn with live
 /// reg-homed regions gets NO whole-fn body at all) — the single-binary A/B
 /// for B206's yield-with-entry compile.
@@ -670,6 +686,31 @@ pub struct CrossEntryRec {
     pub entry: u64,
     pub mask_gen: u32,
     pub _pad: u32,
+}
+
+/// B205: the fused `Math.random() * k | 0` window against a recognized
+/// seeded-xorshift override. Everything baked is revalidated per run:
+/// the Math binding by VALUE bits, its settled shape, the `random` own
+/// data slot by VALUE bits, and the state slot's Int tag — any miss takes
+/// the ordinary ops as a pure prefix (the window's first op is the bail
+/// ip and the state store happens only after every guard passed).
+#[derive(Clone, Copy, Debug)]
+pub struct RandomScaleFusePlan {
+    pub math_slot: u32,
+    pub math_bits: u64,
+    pub math_shape: u32,
+    pub random_slot: u32,
+    pub random_bits: u64,
+    pub state_slot: u32,
+    /// Three (kind, amount) xorshift steps: kind 0 = Shl, 2 = Ushr.
+    pub shifts: [(u8, u8); 3],
+    pub k: i32,
+    pub dst_math: u16,
+    pub dst_random: u16,
+    pub dst_k: u16,
+    pub dst_prod: u16,
+    pub dst_zero: u16,
+    pub dst_res: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3397,6 +3438,8 @@ impl Jit {
         // B206: loop-head ips owned by live reg-homed regions — the emitted
         // body bails unconditionally at each so the regions keep the loops.
         yield_heads: &[u32],
+        // B205: fused random-scale windows, keyed by the window's first ip.
+        random_fuse: &FxHashMap<usize, RandomScaleFusePlan>,
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -3460,6 +3503,7 @@ impl Jit {
                 &acc_emit,
                 meter,
                 yield_heads,
+                random_fuse,
             ) {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!(

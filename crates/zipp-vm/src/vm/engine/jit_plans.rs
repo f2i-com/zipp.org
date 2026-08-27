@@ -939,6 +939,165 @@ impl<'p> Vm<'p> {
     /// avoid planting a useless extra helper round trip at sites whose live IC
     /// says the callee is a native/bound/exotic (or is still unfilled). Off
     /// switch: `ZIPP_NO_CROSSCALL=1` (empty plan ⇒ byte-identical Tier C code).
+    /// B205: recognize `Math.random() * k | 0` windows whose live `random`
+    /// binding is a seeded global-xorshift override (the exact 24-op shape:
+    /// three `g ^= g SHIFT c` steps then `(g >>> 0) / 4294967296`), and bake
+    /// the fully-inline fused plan. Everything baked is revalidated by the
+    /// emitted guards; a decline here just keeps the ordinary ops.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_random_fuse_plan(
+        &mut self,
+        func_id: u32,
+    ) -> rustc_hash::FxHashMap<usize, crate::codegen::RandomScaleFusePlan> {
+        let mut out = rustc_hash::FxHashMap::default();
+        if !crate::codegen::random_fuse_enabled() {
+            return out;
+        }
+        #[cfg(feature = "instrument")]
+        if self.instr_rec.is_some() {
+            return out;
+        }
+        let caller = self.func(func_id as usize);
+        let n = caller.code.len();
+        let mut ip = 0usize;
+        while ip + 6 <= n {
+            let window = &caller.code[ip..ip + 6];
+            let (math_slot, dst_math, dst_random, name, dst_k, k, dst_prod, dst_zero, dst_res) =
+                match (&window[0], &window[1], &window[2], &window[3], &window[4], &window[5]) {
+                    (
+                        Instr::LoadGlobal { dst: dm, idx: ms },
+                        Instr::CallMethod {
+                            dst: dr,
+                            obj,
+                            name,
+                            argc: 0,
+                            ..
+                        },
+                        Instr::LoadInt { dst: dk, val: k },
+                        Instr::Mul { dst: dp, a, b },
+                        Instr::LoadInt { dst: dz, val: 0 },
+                        Instr::Bitwise {
+                            dst: dres,
+                            a: oa,
+                            b: ob,
+                            op: crate::bytecode::BitwiseOp::Or,
+                        },
+                    ) if obj == dm
+                        && ((*a == *dr && *b == *dk) || (*b == *dr && *a == *dk))
+                        && ((*oa == *dp && *ob == *dz) || (*ob == *dp && *oa == *dz))
+                        && (2..=65536).contains(k) =>
+                    {
+                        (*ms, *dm, *dr, *name, *dk, *k, *dp, *dz, *dres)
+                    }
+                    _ => {
+                        ip += 1;
+                        continue;
+                    }
+                };
+            if caller
+                .string_constants
+                .get(name as usize)
+                .map(|s| s.as_str())
+                != Some("random")
+                || !self.global_slot_directly_routable(math_slot)
+            {
+                ip += 1;
+                continue;
+            }
+            let mv = self.globals[math_slot as usize];
+            if !mv.is_heap() || !self.ic_obj_ok(mv.heap_index()) {
+                ip += 1;
+                continue;
+            }
+            let math_idx = mv.heap_index();
+            let crate::heap::HeapObj::Object(map) = self.heap.get(math_idx) else {
+                ip += 1;
+                continue;
+            };
+            if map.shape() == crate::shape::DICT {
+                ip += 1;
+                continue;
+            }
+            let Some(slot) = map.pos("random") else {
+                ip += 1;
+                continue;
+            };
+            if map.attr_at(slot).accessor {
+                ip += 1;
+                continue;
+            }
+            let rv = map.val_at(slot);
+            if !rv.is_heap() {
+                ip += 1;
+                continue;
+            }
+            let fid = match self.heap.get(rv.heap_index()) {
+                crate::heap::HeapObj::Func(id) => *id,
+                crate::heap::HeapObj::Closure { func, upvalues, .. }
+                    if upvalues.is_empty() =>
+                {
+                    *func
+                }
+                _ => {
+                    ip += 1;
+                    continue;
+                }
+            };
+            if (fid as usize)
+                >= self
+                    .main_func_count
+                    .checked_add(self.eval_funcs.len())
+                    .unwrap_or(usize::MAX)
+            {
+                ip += 1;
+                continue;
+            }
+            let callee = self.func(fid as usize);
+            let Some((state_slot, shifts)) = recognize_seeded_xorshift(callee) else {
+                ip += 1;
+                continue;
+            };
+            if !self.global_store_slot_directly_routable(state_slot)
+                || !self.global_slot_directly_routable(state_slot)
+            {
+                ip += 1;
+                continue;
+            }
+            // Settle the Math mirror NOW (a 4th settle event beside
+            // alloc/replace/miss-repair: the map is read at this same
+            // moment, so the refresh captures the settled state) so the
+            // emitted shape guard can ever match.
+            let sh = map.shape();
+            self.heap.refresh_mirror(math_idx);
+            out.insert(
+                ip,
+                crate::codegen::RandomScaleFusePlan {
+                    math_slot,
+                    math_bits: mv.bits(),
+                    math_shape: sh,
+                    random_slot: slot as u32,
+                    random_bits: rv.bits(),
+                    state_slot,
+                    shifts,
+                    k,
+                    dst_math,
+                    dst_random,
+                    dst_k,
+                    dst_prod,
+                    dst_zero,
+                    dst_res,
+                },
+            );
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!(
+                    "[fuse] fn{func_id}@{ip} RANDOM*{k}|0 fused (state g{state_slot}, callee fn{fid})"
+                );
+            }
+            ip += 6;
+        }
+        out
+    }
+
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn build_cross_call_plan(
         &self,
@@ -3607,6 +3766,92 @@ fn slot_guard_jump_target(i: &Instr) -> Option<u32> {
         | Instr::PushFinally { target, .. }
         | Instr::JumpFinally { target, .. } => Some(target),
         Instr::PushHandler { catch_target, .. } => Some(catch_target),
+        _ => None,
+    }
+}
+
+/// B205: the exact seeded-xorshift body — three `g ^= g SHIFT c` steps over
+/// ONE global slot followed by `return (g >>> 0) / 4294967296`. Returns the
+/// slot and the three (kind, amount) steps (kind 0 = Shl, 2 = Ushr).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn recognize_seeded_xorshift(callee: &crate::bytecode::FuncProto) -> Option<(u32, [(u8, u8); 3])> {
+    use crate::bytecode::{BitwiseOp as B, Instr};
+    let len_ok = callee.code.len() == 24
+        || (callee.code.len() == 25
+            && matches!(callee.code[24], Instr::ReturnUndefined));
+    if !len_ok
+        || callee.param_count != 0
+        || callee.is_generator
+        || callee.is_async
+        || callee.rest_reg.is_some()
+        || callee.arguments_reg.is_some()
+    {
+        return None;
+    }
+    let mut slot = None;
+    let mut shifts = [(0u8, 0u8); 3];
+    for step in 0..3 {
+        let at = step * 6;
+        let [Instr::LoadGlobal { dst: fd, idx }, Instr::LoadGlobal {
+            dst: sd,
+            idx: idx2,
+        }, Instr::LoadInt { dst: ad, val }, Instr::Bitwise {
+            dst: shd,
+            a: sa,
+            b: sb,
+            op,
+        }, Instr::Bitwise {
+            dst: xd,
+            a: xa,
+            b: xb,
+            op: B::Xor,
+        }, Instr::StoreGlobal { idx: si, src }
+        | Instr::StoreGlobalStrict { idx: si, src }
+        | Instr::StoreGlobalResolved { idx: si, src }] = callee.code[at..at + 6]
+        else {
+            return None;
+        };
+        let kind = match op {
+            B::Shl => 0u8,
+            B::Ushr => 2u8,
+            _ => return None,
+        };
+        if idx2 != idx
+            || si != idx
+            || src != xd
+            || sa != sd
+            || sb != ad
+            || !((xa == fd && xb == shd) || (xb == fd && xa == shd))
+            || !(0..32).contains(&val)
+        {
+            return None;
+        }
+        match slot {
+            None => slot = Some(idx),
+            Some(g) if g == idx => {}
+            _ => return None,
+        }
+        shifts[step] = (kind, (val as u32 & 31) as u8);
+    }
+    let g = slot?;
+    let [Instr::LoadGlobal { dst: ld, idx: gi }, Instr::LoadInt { dst: zd, val: 0 }, Instr::Bitwise {
+        dst: ud,
+        a: ua,
+        b: ub,
+        op: B::Ushr,
+    }, Instr::LoadConst { dst: cd, idx: ci }, Instr::Div {
+        dst: dd,
+        a: da,
+        b: db,
+    }, Instr::Return { src }] = callee.code[18..24]
+    else {
+        return None;
+    };
+    if gi != g || ua != ld || ub != zd || da != ud || db != cd || src != dd {
+        return None;
+    }
+    match callee.constants.get(ci as usize) {
+        Some(c) if c.is_number() && c.as_f64() == 4294967296.0 => Some((g, shifts)),
         _ => None,
     }
 }
