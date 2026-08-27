@@ -260,7 +260,7 @@ pub(crate) fn plan_int_splice(
         if def_ip <= prev_end && !sites.is_empty() {
             decline!("@{c} callee-def span overlaps the previous site");
         }
-        span_is_replayable(proto, def_ip, c, s, e)?;
+        span_is_replayable(proto, ta_plan, def_ip, c, s, e)?;
         prev_end = c;
         let win = win_top.max(lp.reg_window as u64);
         win_top = win + lp.callee_reg_count as u64;
@@ -476,7 +476,7 @@ fn plan_int_computed_splice(
     if !(s..=call_ip).contains(&fallback) {
         decline!("@{call_ip} fallback @{fallback} outside pure region prefix");
     }
-    span_is_replayable(proto, fallback, call_ip, s, e)?;
+    span_is_replayable(proto, ta_plan, fallback, call_ip, s, e)?;
 
     // Two dispatch temporaries plus one SHARED callee window. Arms are mutually
     // exclusive and every success jumps to the common continuation, so no arm's
@@ -876,12 +876,58 @@ fn int_op_can_exit(i: &Instr) -> bool {
     )
 }
 
+/// B223: the ONE call form the replay allowlist can admit — `str.charCodeAt(i)`
+/// on a pinned flat-ASCII string. The allowlist above is deliberately closed
+/// because a replayed span must be effect-free, and a `CallMethod` is exactly
+/// the shape that can run user code; but this one provably cannot. Three facts
+/// compose, each checked in code rather than assumed:
+///
+/// 1. `Recv::Str` is produced ONLY for a `CallMethod` whose name constant is
+///    literally `"charCodeAt"` (`jit_plans.rs`), so no other method reaches a
+///    string pin;
+/// 2. `STR_PIN_KIND` is assigned only when the RUNTIME receiver is a flat
+///    ASCII `HeapObj::Str`, and the pin snapshot is re-guarded per execution —
+///    a rope, a non-ASCII string or any other receiver deopts before the load;
+/// 3. the INT emitter's string-pin arm inlines a byte load and, as
+///    `plan_region`'s own admission comment puts it, "runs no user code,
+///    allocates nothing".
+///
+/// So re-running it after a guard exit is a pure re-read of the same byte.
+/// `pinned_arr_push` is deliberately NOT admitted here: it is the other
+/// `CallMethod` the INT tier allows, and it COMMITS an append — the precise
+/// hazard the allowlist's comment names. `ZIPP_NO_SPLICE_CCA=1` restores the
+/// unconditional decline.
+fn span_pinned_charcodeat(proto: &FuncProto, ta_plan: &TaPinPlan, ip: usize) -> bool {
+    splice_charcodeat_enabled()
+        && matches!(proto.code[ip], Instr::CallMethod { .. })
+        && ta_plan
+            .access
+            .get(&ip)
+            .is_some_and(|&j| ta_plan.pins[j as usize].kind == crate::codegen::STR_PIN_KIND)
+}
+
+/// B223 latch: see `span_pinned_charcodeat`.
+fn splice_charcodeat_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SPLICE_CCA").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Every exit inside `[def_ip, call_ip]` resumes at `def_ip`, so the whole span
 /// runs again in the interpreter. Prove that is the same as not having run it:
 /// the span must be effect-free, branch-free, un-enterable from elsewhere, and
 /// must not clobber a register a later op of the span reads.
 fn span_is_replayable(
     proto: &FuncProto,
+    ta_plan: &TaPinPlan,
     def_ip: usize,
     call_ip: usize,
     s: usize,
@@ -925,7 +971,8 @@ fn span_is_replayable(
                     argc: 2,
                     ..
                 }
-        ) {
+        ) && !span_pinned_charcodeat(proto, ta_plan, ip)
+        {
             decline!("@{call_ip} non-replayable op @{ip} in callee-def span");
         }
         if let Some((_, Some(d))) = splice_ud(&proto.code[ip]) {
