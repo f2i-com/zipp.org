@@ -155,7 +155,30 @@ fn json_quoted_code_point_len(cp: u32) -> usize {
     }
 }
 
+/// B234: does every byte stand for itself in the output?
+///
+/// True only for PRINTABLE ASCII with no `"` and no `\\`. Each such byte is a
+/// whole code point (so no decode is needed to find the boundaries), is not
+/// escaped (so it contributes one output byte), and cannot be part of a
+/// multi-byte or lone-surrogate sequence (so nothing later in the buffer can
+/// reinterpret it). The quoted length is then exactly `len + 2` — the two
+/// delimiters — and the exact loop below has nothing to add.
+///
+/// Deliberately NOT extended to multi-byte UTF-8: `wtf8_decode` answers
+/// malformed input with U+FFFD, whose encoded length differs from the bytes
+/// it consumed, so a byte scan could disagree with the writer for input this
+/// predicate cannot rule out. ASCII has no such case.
+#[inline]
+fn json_quote_len_is_plain(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|&c| (0x20..0x80).contains(&c) && c != b'"' && c != b'\\')
+}
+
 fn json_quoted_str_len(text: &str) -> Result<usize, JsonOutputError> {
+    if json_quote_fastlen_enabled() && json_quote_len_is_plain(text.as_bytes()) {
+        return text.len().checked_add(2).ok_or(JsonOutputError);
+    }
     text.chars().try_fold(2usize, |len, ch| {
         len.checked_add(json_quoted_code_point_len(ch as u32))
             .ok_or(JsonOutputError)
@@ -163,10 +186,29 @@ fn json_quoted_str_len(text: &str) -> Result<usize, JsonOutputError> {
 }
 
 fn json_quoted_wtf8_len(bytes: &[u8]) -> Result<usize, JsonOutputError> {
+    if json_quote_fastlen_enabled() && json_quote_len_is_plain(bytes) {
+        return bytes.len().checked_add(2).ok_or(JsonOutputError);
+    }
     crate::heap::wtf8_code_points(bytes).try_fold(2usize, |len, cp| {
         len.checked_add(json_quoted_code_point_len(cp))
             .ok_or(JsonOutputError)
     })
+}
+
+/// B234 latch: `ZIPP_NO_JSON_QUOTE_FASTLEN=1` sizes every quoted string by
+/// decoding it, as before.
+fn json_quote_fastlen_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JSON_QUOTE_FASTLEN").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
 }
 
 fn json_quote_bounded(out: &mut String, text: &str) -> Result<(), JsonOutputError> {
