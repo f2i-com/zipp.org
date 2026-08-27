@@ -172,6 +172,49 @@ pub(crate) fn json_hex4(b: &[u8], pos: usize) -> Result<u32, Thrown> {
     Ok(v)
 }
 
+/// B233 latch: `ZIPP_NO_JSON_PLAIN_KEY=1` reads every member name through the
+/// general string parser again.
+pub(crate) fn json_plain_key_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JSON_PLAIN_KEY").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// B233: read a member name that needs no decoding, borrowing it from the
+/// source instead of allocating it.
+///
+/// `Some(name)` means the bytes between the quotes held no escape and no
+/// control character and are valid UTF-8 — so the name IS those bytes, and
+/// `*i` is left just past the closing quote exactly where `json_parse_string`
+/// would leave it. `None` consumes nothing: `*i` is untouched and the caller
+/// re-reads the name with the general parser, which is where every escape,
+/// lone-surrogate and error rule continues to live. WTF-8-encoded lone
+/// surrogates fail the UTF-8 check and take that path too.
+pub(crate) fn json_scan_plain_key<'a>(src: &'a [u8], i: &mut usize) -> Option<&'a str> {
+    debug_assert_eq!(src.get(*i), Some(&b'"'));
+    let start = *i + 1;
+    let mut j = start;
+    loop {
+        match *src.get(j)? {
+            b'"' => break,
+            b'\\' => return None,
+            c if c < 0x20 => return None,
+            _ => j += 1,
+        }
+    }
+    let name = std::str::from_utf8(&src[start..j]).ok()?;
+    *i = j + 1;
+    Some(name)
+}
+
 /// Parse a JSON string literal starting at the opening `"` (index `*i`),
 /// applying escapes. The result is WTF-8 (a `JsStr`): each `\uXXXX` escape
 /// pushes its CODE UNIT through `wtf8_push_cp`, which combines a high+low

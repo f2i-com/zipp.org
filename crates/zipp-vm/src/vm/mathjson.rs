@@ -2094,7 +2094,22 @@ impl<'p> Vm<'p> {
                         "SyntaxError: Expected property name string in JSON".into(),
                     ));
                 }
-                let key = json_parse_string(src, i)?.to_lossy_string();
+                // B233: an escape-free member name IS its source bytes, so
+                // read it straight into the one `String` the map will own.
+                // The general parser reaches that same string through a
+                // `Vec<u8>` and a `JsStr` first — three allocations per key
+                // where one will do, and object keys are where JSON parsing
+                // spends its allocator time (~440,000 of them on the
+                // json-large corpus). Anything needing decoding still goes
+                // through the parser, which is where the escape,
+                // lone-surrogate and error rules live.
+                let key = match crate::vm::helpers_json::json_plain_key_enabled()
+                    .then(|| crate::vm::helpers_json::json_scan_plain_key(b, i))
+                    .flatten()
+                {
+                    Some(name) => name.to_string(),
+                    None => json_parse_string(src, i)?.to_lossy_string(),
+                };
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b':') {
                     return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));
@@ -2418,7 +2433,15 @@ impl<'p> Vm<'p> {
                         "SyntaxError: Expected property name string in JSON".into(),
                     ));
                 }
-                let key = json_parse_string(src, i)?.to_lossy_string();
+                // B233: same escape-free member-name read as the ordinary
+                // object path — see the comment there.
+                let key = match crate::vm::helpers_json::json_plain_key_enabled()
+                    .then(|| crate::vm::helpers_json::json_scan_plain_key(b, i))
+                    .flatten()
+                {
+                    Some(name) => name.to_string(),
+                    None => json_parse_string(src, i)?.to_lossy_string(),
+                };
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b':') {
                     return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));
