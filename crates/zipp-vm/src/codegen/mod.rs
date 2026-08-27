@@ -3355,13 +3355,21 @@ impl Jit {
         // valid, which is what lets a re-set entry resume those lanes
         // instead of stranding them.
         let prev_mask = self.cross_entries[i].1;
+        // B228: the WIDE mask has to participate in that comparison. A wide
+        // callee's INLINE mask is permanently `u64::MAX`, so `prev_mask !=
+        // uninit_mask` can never fire for it — a recompile that changed which
+        // wide registers may be read-before-written would leave `mask_gen`
+        // untouched and every dependent lane's baked fill silently stale.
+        // Harmless while no lane could bake a wide mask; a prerequisite the
+        // moment one can (see the cross3 wide-empty admission).
+        let wide_changed = self.cross_wide_uninit[i].as_deref() != wide_uninit_mask.as_deref();
         self.cross_entries[i] = (entry, uninit_mask, json_walk, markdown_inline);
         self.cross_wide_uninit[i] = wide_uninit_mask;
         if self.cross_table.len() <= i {
             self.cross_table.resize(i + 1, CrossEntryRec::default());
             self.cross_table_raw = self.cross_table.as_ptr() as u64;
         }
-        if prev_mask != uninit_mask {
+        if prev_mask != uninit_mask || wide_changed {
             self.cross_table[i].mask_gen = self.cross_table[i].mask_gen.wrapping_add(1);
         }
         self.cross_table[i].entry = entry as u64;
