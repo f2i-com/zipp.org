@@ -1369,6 +1369,14 @@ impl<'p> Vm<'p> {
         // built flat in ONE allocation with the int's decimal form written
         // straight into the buffer — no intermediate heap string for the number.
         if vb.is_int() && va.is_heap() {
+            // B212: the hot `"prefix" + i` shape repeats a small key set, and
+            // JS strings have no observable identity — serve a version-guarded
+            // memoized result before formatting anything. A hit skips the
+            // format, the allocation, and the whole GC life of a fresh string.
+            #[cfg(not(feature = "safe-sandbox"))]
+            if let Some(idx) = self.heap.concat_memo_get(va.heap_index(), vb.as_int()) {
+                return Ok(Value::heap(idx));
+            }
             if let Some(lu) = self.heap.str_units(va.heap_index()) {
                 let (buf, start) = fmt_i32_buf(vb.as_int());
                 if lu + (buf.len() - start) <= SMALL_CONCAT_FLAT_UNITS {
@@ -1376,6 +1384,8 @@ impl<'p> Vm<'p> {
                         .heap
                         .alloc_concat_str_ascii(va.heap_index(), &buf[start..])
                     {
+                        #[cfg(not(feature = "safe-sandbox"))]
+                        self.heap.concat_memo_put(va.heap_index(), vb.as_int(), idx);
                         return Ok(Value::heap(idx));
                     }
                 }
@@ -1714,9 +1724,12 @@ impl<'p> Vm<'p> {
         if val.is_heap() && !self.heap.is_str_like(val.heap_index()) {
             return None;
         }
+        // B212: a frozen (memo-served) string is aliased by the memo and by
+        // every consumer it was served to — never grow it in place; the
+        // fresh-buffer fallback below is exactly right for it.
         let mutable = acc.is_heap()
             && acc.heap_index() > crate::heap::INTERN_PINNED_END
-            && matches!(self.heap.get(acc.heap_index()), HeapObj::Str(_));
+            && matches!(self.heap.get(acc.heap_index()), HeapObj::Str(s) if !s.frozen());
         // `Heap::new` permanently pins the single-ASCII-character strings at
         // slots 0..127, with slot == byte. String indexing returns those exact
         // handles, so the ordinary `out += s[i]` loop can append the byte

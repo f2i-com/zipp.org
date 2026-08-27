@@ -2217,6 +2217,13 @@ pub struct JsStr {
     units: usize,
     ascii: bool,
     wellformed: bool,
+    /// B212: set on a string the const+int concat memo hands out. Every
+    /// in-place growth licence (the append/chain accumulators' linearity
+    /// proofs) additionally requires `!frozen` — a memoized result is aliased
+    /// by the memo and by every consumer it was served to, so growing its
+    /// buffer in place would corrupt all of them. Frozen strings take the
+    /// fresh-copy fallback those paths already have.
+    frozen: bool,
 }
 
 /// UTF-16 code units contributed by one Unicode scalar: 1 for BMP, 2 for an
@@ -2545,6 +2552,7 @@ impl JsStr {
             units,
             ascii,
             wellformed: true,
+            frozen: false,
         }
     }
 
@@ -2564,6 +2572,7 @@ impl JsStr {
             bytes,
             ascii: true,
             wellformed: true,
+            frozen: false,
         }
     }
 
@@ -2574,6 +2583,7 @@ impl JsStr {
                 bytes,
                 ascii: true,
                 wellformed: true,
+                frozen: false,
             };
         }
         let wellformed = wtf8_is_wellformed(&bytes);
@@ -2600,6 +2610,7 @@ impl JsStr {
             units,
             ascii: false,
             wellformed,
+            frozen: false,
         }
     }
 
@@ -2689,6 +2700,13 @@ impl JsStr {
     #[inline]
     pub(crate) fn reserve_bytes(&mut self, additional: usize) {
         self.bytes.reserve(additional);
+    }
+
+    /// B212: is this string a memo-served (aliased, never-grow-in-place)
+    /// result? See the field doc.
+    #[inline]
+    pub(crate) fn frozen(&self) -> bool {
+        self.frozen
     }
 
     /// Append one ASCII byte (the `s += digit` fast path), updating metadata.
@@ -3579,6 +3597,56 @@ mod gc_courier {
     }
 }
 
+/// B212: one const+int concat memo entry (see `Heap::concat_memo`).
+#[cfg(not(feature = "safe-sandbox"))]
+#[derive(Clone, Copy)]
+struct ConcatMemoEntry {
+    left_idx: u32,
+    left_ver: u32,
+    int: i32,
+    res_idx: u32,
+    res_ver: u32,
+}
+
+#[cfg(not(feature = "safe-sandbox"))]
+impl ConcatMemoEntry {
+    const EMPTY: ConcatMemoEntry = ConcatMemoEntry {
+        left_idx: u32::MAX,
+        left_ver: 0,
+        int: 0,
+        res_idx: 0,
+        res_ver: 0,
+    };
+}
+
+/// B212: the memo's direct-map slot for a (left, int) key.
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn concat_memo_slot(li: u32, n: i32) -> usize {
+    ((li ^ (n as u32).wrapping_mul(0x9E37_79B1)) as usize) & (CONCAT_MEMO_SLOTS - 1)
+}
+
+/// B212: memo size — 2048 entries x 20B = 40KB, charged in `resident_bytes`.
+#[cfg(not(feature = "safe-sandbox"))]
+const CONCAT_MEMO_SLOTS: usize = 2048;
+
+/// B212 latch: `ZIPP_NO_CONCAT_MEMO=1` disables the memo (every lookup
+/// misses, every insert is skipped, no string is ever frozen).
+#[cfg(not(feature = "safe-sandbox"))]
+fn concat_memo_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CONCAT_MEMO").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// B210: the per-sweep small-payload mass at or above which the NEXT sweep
 /// runs in BULK regime (ship every shippable payload). Calibrated from the
 /// oracle: markdown-render's teardown waves carry ~2.5MB of small strings per
@@ -4133,6 +4201,16 @@ pub struct Heap {
     /// Dead payloads collected by the CURRENT sweep, shipped to the courier
     /// thread at `note_gc_done`/`note_minor_done` (see [`gc_courier`]).
     courier_batch: Vec<gc_courier::Item>,
+    /// B212: the const+int concat memo — direct-mapped, version-guarded on
+    /// both the left string and the cached result (the B207 ABA discipline:
+    /// slot recycling bumps the version, so bit-equal indices can never
+    /// resurrect a stale entry against a different occupant). Never roots
+    /// anything: a collected result's version mismatch is a plain miss.
+    #[cfg(not(feature = "safe-sandbox"))]
+    concat_memo: Vec<ConcatMemoEntry>,
+    /// B212 oracle telemetry: [hits, misses]. Printed at heap drop.
+    #[cfg(not(feature = "safe-sandbox"))]
+    concat_memo_stats: [u64; 2],
     /// B210 oracle telemetry: [flushes, shipped items, shipped bytes,
     /// inline-gated items, inline-gated bytes, max batch len]. Bytes are the
     /// same buffer-capacity charges the size gate reads (an `Obj` charges its
@@ -4518,6 +4596,10 @@ impl Heap {
             payload_accounting: Cell::new(false),
             courier_batch: Vec::new(),
             courier_stats: [0; 6],
+            #[cfg(not(feature = "safe-sandbox"))]
+            concat_memo: vec![ConcatMemoEntry::EMPTY; CONCAT_MEMO_SLOTS],
+            #[cfg(not(feature = "safe-sandbox"))]
+            concat_memo_stats: [0; 2],
             courier_small_mass: 0,
             courier_bulk: false,
             #[cfg(not(feature = "safe-sandbox"))]
@@ -5229,6 +5311,7 @@ impl Heap {
                             .map(|v| v.capacity() * std::mem::size_of::<Value>())
                             .sum::<usize>()
                         + vec_capacity_bytes(&self.arr_pool)
+            + self.concat_memo.len() * std::mem::size_of::<ConcatMemoEntry>()
                 }
                 #[cfg(feature = "safe-sandbox")]
                 {
@@ -5861,6 +5944,7 @@ impl Heap {
                     units,
                     ascii,
                     wellformed: true,
+                    frozen: false,
                 }));
             }
         }
@@ -5889,11 +5973,82 @@ impl Heap {
                     units: l.units + tail.len(),
                     ascii: l.ascii,
                     wellformed: l.wellformed,
+                    frozen: false,
                 }
             }
             _ => return None,
         };
         Some(self.alloc(HeapObj::Str(js)))
+    }
+
+    /// B212: serve a memoized `left + int` result, or None. A hit requires
+    /// the exact (left_idx, int) key AND both versions unchanged — the left's
+    /// version proves the same occupant as at insert (so a non-string or a
+    /// recycled slot can never match), the result's proves the cached string
+    /// is still alive and unmoved. JS strings have no observable identity, so
+    /// serving a shared index is spec-invisible.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub fn concat_memo_get(&mut self, li: u32, n: i32) -> Option<u32> {
+        if !concat_memo_enabled() {
+            return None;
+        }
+        let e = self.concat_memo[concat_memo_slot(li, n)];
+        if e.left_idx == li
+            && e.int == n
+            && e.left_ver == self.versions[li as usize]
+            && e.res_ver == self.versions[e.res_idx as usize]
+        {
+            if self.oracle {
+                self.concat_memo_stats[0] += 1;
+            }
+            return Some(e.res_idx);
+        }
+        if self.oracle {
+            self.concat_memo_stats[1] += 1;
+        }
+        None
+    }
+
+    /// B212: record a freshly allocated `left + int` result and FREEZE it —
+    /// from here on the string is aliased by the memo, so every in-place
+    /// growth licence refuses it (see `JsStr::frozen`).
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub fn concat_memo_put(&mut self, li: u32, n: i32, res: u32) {
+        if !concat_memo_enabled() {
+            return;
+        }
+        match &mut self.objs[res as usize] {
+            HeapObj::Str(js) => js.frozen = true,
+            _ => return,
+        }
+        self.concat_memo[concat_memo_slot(li, n)] = ConcatMemoEntry {
+            left_idx: li,
+            left_ver: self.versions[li as usize],
+            int: n,
+            res_idx: res,
+            res_ver: self.versions[res as usize],
+        };
+    }
+
+    /// B212: is the occupant a frozen (memo-served) flat string? The in-place
+    /// growth predicates call this; non-strings answer false (their arms
+    /// re-match the kind anyway). (Its one caller today is the JIT chain
+    /// helper — the interpreter's predicate reads the flag inline — hence
+    /// the cfg.)
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub fn str_frozen(&self, idx: u32) -> bool {
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            matches!(self.get(idx), HeapObj::Str(s) if s.frozen())
+        }
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let _ = idx;
+            false
+        }
     }
 
     /// See `alloc_concat_str_ascii` — the mirrored `head + right` order.
@@ -5909,6 +6064,7 @@ impl Heap {
                     units: head.len() + r.units,
                     ascii: r.ascii,
                     wellformed: r.wellformed,
+                    frozen: false,
                 }
             }
             _ => return None,
@@ -7241,6 +7397,8 @@ impl Drop for Heap {
             eprintln!(
                 "[courier] flushes={fl} shipped={si} ({sb}B) inline-gated={gi} ({gb}B) max-batch={mb}"
             );
+            let [h, m] = self.concat_memo_stats;
+            eprintln!("[concatmemo] hits={h} misses={m}");
         }
     }
 }

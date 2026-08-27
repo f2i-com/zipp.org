@@ -2507,7 +2507,13 @@ pub(crate) extern "win64" fn jit_concat_chain_fast(
     // The chain's last link asks for the trim; every other hint is a capacity.
     let last = cap_hint & crate::codegen::CHAIN_HINT_LAST as u64 != 0;
     let cap = (cap_hint & !(crate::codegen::CHAIN_HINT_LAST as u64)) as usize;
-    if a.is_heap() && a.heap_index() > crate::heap::INTERN_PINNED_END {
+    // B212: `!str_frozen` joins the in-place licence — a memo-served
+    // accumulator (a frozen chain head) must take the generic fresh-result
+    // tail instead of growing the shared buffer.
+    if a.is_heap()
+        && a.heap_index() > crate::heap::INTERN_PINNED_END
+        && !vm.heap.str_frozen(a.heap_index())
+    {
         let ai = a.heap_index();
         #[cfg(debug_assertions)]
         let heap_len = vm.heap.len();
@@ -6287,6 +6293,13 @@ mod chain_fast_tests {
             .arg("chain_fast_gen_child")
             .arg("--nocapture")
             .env("ZIPP_ICSTATS", "1")
+            // B212: the const+int memo legitimately serves the gen shape's
+            // chain HEADS (a frozen head takes the generic tail, so reseat
+            // never fires for it — the memoized world is priced separately
+            // and won). This census pins the reseat/trim mechanism itself,
+            // which every non-memoized head still uses — so the child runs
+            // the memo latched off.
+            .env("ZIPP_NO_CONCAT_MEMO", "1")
             .output()
             .expect("spawn the test binary");
         assert!(
