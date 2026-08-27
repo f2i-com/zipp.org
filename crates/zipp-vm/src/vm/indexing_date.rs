@@ -755,8 +755,17 @@ impl<'p> Vm<'p> {
             return ConcatSetFast::Slow;
         }
 
+        // B219: hash the key ONCE for both the presence probe below and the
+        // index insert inside `push_data_tagged`. `ZIPP_NO_HASH_ONCE=1`
+        // recomputes it at each site (the pricing comparator).
+        let once = crate::heap::hash_once_enabled();
+        let tag = crate::heap::prop_tag_of(key);
         let (hit, add) = match self.heap.get(idx) {
-            HeapObj::Object(m) if key != "__proto__" => match m.pos(key) {
+            HeapObj::Object(m) if key != "__proto__" => match if once {
+                m.pos_tagged(key, tag)
+            } else {
+                m.pos(key)
+            } {
                 Some(i) if !m.attr_at(i).accessor && m.attr_at(i).writable => (Some(i), false),
                 Some(_) => (None, false),
                 None => (
@@ -782,7 +791,11 @@ impl<'p> Vm<'p> {
             let owned = key.to_owned();
             self.heap.write_barrier_val(idx, val);
             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
-                m.push_data(owned, val);
+                if once {
+                    m.push_data_tagged(owned, val, tag);
+                } else {
+                    m.push_data(owned, val);
+                }
                 self.heap.bump_version(idx);
                 return ConcatSetFast::Add;
             }

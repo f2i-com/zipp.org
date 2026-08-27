@@ -67,6 +67,29 @@ const PROP_EMPTY: u32 = u32::MAX;
 /// the bucket (`tag & mask`), so growth rehashes straight from stored tags —
 /// no key re-reads (same scheme as vm/collections.rs' CollIndex).
 #[inline]
+/// B219 latch: `ZIPP_NO_HASH_ONCE=1` recomputes the property tag at each
+/// site instead of threading one through the probe/insert pair.
+pub(crate) fn hash_once_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HASH_ONCE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// B219: the property tag, exposed for callers that thread one hash through
+/// a probe-then-insert pair (see `ObjMap::pos_tagged`).
+#[inline]
+pub(crate) fn prop_tag_of(key: &str) -> u32 {
+    prop_tag(key)
+}
+
 fn prop_tag(key: &str) -> u32 {
     let mut h: u64 = 0xCBF2_9CE4_8422_2325;
     for &b in key.as_bytes() {
@@ -209,11 +232,23 @@ impl PropIndex {
     /// Position in `keys` of the entry equal to `key`, confirmed by compare.
     #[inline]
     fn find(&self, keys: &[String], key: &str) -> Option<usize> {
+        self.find_tagged(keys, key, prop_tag(key))
+    }
+
+    /// B219: `find` with the key's tag supplied by the caller. The dynamic
+    /// append path (`obj["prefix" + i] = v`) hashes one key for the presence
+    /// probe and then again for the table insert; threading the tag pays for
+    /// exactly one of those. The tag MUST be `prop_tag(key)` — it is only an
+    /// accelerator (every hit is still confirmed by a real string compare), so
+    /// a wrong tag can only cause a miss, never a wrong answer.
+    #[inline]
+    fn find_tagged(&self, keys: &[String], key: &str, tag: u32) -> Option<usize> {
         #[cfg(feature = "safe-sandbox")]
         if let PropIndex::Tree { entries } = self {
+            let _ = tag;
             return entries.get(key).copied().map(|slot| slot as usize);
         }
-        let tag = prop_tag(key);
+        debug_assert_eq!(tag, prop_tag(key), "find_tagged: caller's tag is wrong");
         match self {
             #[cfg(feature = "safe-sandbox")]
             PropIndex::Tree { .. } => unreachable!(),
@@ -291,8 +326,15 @@ impl PropIndex {
     /// Record `slot` under `key`. The caller guarantees the key is absent
     /// (every insertion path misses in `pos()` first).
     fn insert(&mut self, key: &str, slot: u32) {
+        self.insert_tagged(key, slot, prop_tag(key));
+    }
+
+    /// B219: `insert` with the key's tag supplied by the caller (see
+    /// `find_tagged` for why a wrong tag cannot corrupt a lookup).
+    fn insert_tagged(&mut self, key: &str, slot: u32, tag: u32) {
         #[cfg(feature = "safe-sandbox")]
         if let PropIndex::Tree { entries } = self {
+            let _ = tag;
             // The mutation must not live inside `debug_assert!`: its argument
             // is removed in release builds, which would leave every production
             // safe-profile index empty.
@@ -303,7 +345,8 @@ impl PropIndex {
         if (self.len() + 1) * 4 >= self.cap() * 3 {
             self.grow();
         }
-        self.insert_raw(prop_tag(key), slot);
+        debug_assert_eq!(tag, prop_tag(key), "insert_tagged: caller's tag is wrong");
+        self.insert_raw(tag, slot);
         match self {
             #[cfg(feature = "safe-sandbox")]
             PropIndex::Tree { .. } => unreachable!(),
@@ -1945,6 +1988,17 @@ impl ObjMap {
         }
     }
 
+    /// B219: `pos` with the key's tag supplied by the caller, for the append
+    /// path that will re-use the same tag for the table insert. The unindexed
+    /// arm ignores it (a linear scan hashes nothing).
+    #[inline]
+    pub(crate) fn pos_tagged(&self, key: &str, tag: u32) -> Option<usize> {
+        match &self.index {
+            Some(ix) => ix.find_tagged(&self.keys, key, tag),
+            None => self.keys.iter().position(|k| k == key),
+        }
+    }
+
     /// Whether `key` is the exact next entry in an intact compiler key plan.
     ///
     /// This is a PURE absence proof for the Tier-C append helper: a valid plan
@@ -1995,6 +2049,13 @@ impl ObjMap {
     #[inline]
     fn index_appended(&mut self) {
         let slot = self.keys.len() - 1;
+        let tag = prop_tag(&self.keys[slot]);
+        self.index_appended_tagged(tag);
+    }
+
+    /// B219: `index_appended` with the just-pushed key's tag already known.
+    fn index_appended_tagged(&mut self, tag: u32) {
+        let slot = self.keys.len() - 1;
         if sparse_num_index_enabled() {
             if let Some(n) = canonical_array_index_key(&self.keys[slot]) {
                 self.numeric_index
@@ -2003,7 +2064,7 @@ impl ObjMap {
             }
         }
         if let Some(ix) = &mut self.index {
-            ix.insert(&self.keys[slot], slot as u32);
+            ix.insert_tagged(&self.keys[slot], slot as u32, tag);
         } else if self.keys.len() >= PROP_INDEX_THRESHOLD {
             self.index = Some(PropIndex::build(&self.keys));
         }
@@ -2101,13 +2162,22 @@ impl ObjMap {
     /// `pos`); consumes the key, skipping `set`'s re-lookup and re-clone. The
     /// caller MUST bump the object's version (a key add reallocs `vals`).
     pub fn push_data(&mut self, key: String, val: Value) {
+        let tag = prop_tag(&key);
+        self.push_data_tagged(key, val, tag);
+    }
+
+    /// B219: `push_data` with the key's tag already computed by the caller —
+    /// the dynamic-append path hashes the key for its presence probe and then
+    /// hands the same tag here for the table insert.
+    pub(crate) fn push_data_tagged(&mut self, key: String, val: Value, tag: u32) {
+        debug_assert_eq!(tag, prop_tag(&key), "push_data_tagged: caller's tag is wrong");
         self.planned_append_failed |= self.keys.is_planned();
         self.shape_pushed_owned(&key, &PropAttr::data());
         self.has_element_key |= key_names_element(&key);
         self.keys.push(key);
         self.vals.push(val);
         self.attrs.push(PropAttr::data());
-        self.index_appended();
+        self.index_appended_tagged(tag);
     }
 
     /// Append a compiler-proved static data property without allocating or
