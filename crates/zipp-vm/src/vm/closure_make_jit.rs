@@ -125,7 +125,7 @@ fn resolve_upvalues(
                 if !v.is_heap() || v.heap_index() as usize >= vm.heap.len() {
                     return None;
                 }
-                if !matches!(vm.heap.get(v.heap_index()), HeapObj::Cell(_)) {
+                if !matches!(vm.heap.get(v.heap_index()), HeapObj::Cell) {
                     return None;
                 }
                 v.heap_index()
@@ -190,16 +190,17 @@ pub(crate) extern "win64" fn jit_make_cell(
                 // cell is committed, so the safe point precedes the read.
                 vm.maybe_gc();
                 let v = Value::from_bits(unsafe { *regs.add(reg as usize) });
-                let cell = vm.heap.alloc(HeapObj::Cell(v));
+                let cell = vm.heap.alloc_cell(v);
                 if matches!(instr, Instr::MakeCellFnName { .. }) {
                     vm.fn_name_cells.insert(cell);
+                    vm.fn_name_cells_nonempty = 1;
                 }
                 unsafe { *regs.add(reg as usize) = Value::heap(cell).bits() };
                 0
             }
             Instr::MakeCellTdz { reg } if (reg as usize) < reg_count => {
                 vm.maybe_gc();
-                let cell = vm.heap.alloc(HeapObj::Cell(Value::UNINITIALIZED));
+                let cell = vm.heap.alloc_cell(Value::UNINITIALIZED);
                 unsafe { *regs.add(reg as usize) = Value::heap(cell).bits() };
                 0
             }
@@ -209,11 +210,12 @@ pub(crate) extern "win64" fn jit_make_cell(
                 // executed; anything else is malformed and declines.
                 if !v.is_heap()
                     || v.heap_index() as usize >= vm.heap.len()
-                    || !matches!(vm.heap.get(v.heap_index()), HeapObj::Cell(_))
+                    || !matches!(vm.heap.get(v.heap_index()), HeapObj::Cell)
                 {
                     return crate::codegen::SELF_CALL_DEOPT;
                 }
                 vm.const_cells.insert(v.heap_index());
+                vm.const_cells_nonempty = 1;
                 0
             }
             _ => crate::codegen::SELF_CALL_DEOPT,
@@ -346,7 +348,7 @@ pub(crate) extern "win64" fn jit_cell_set_tdz_checked(
             return crate::codegen::SELF_CALL_DEOPT;
         }
         let idx = cell.heap_index();
-        if !matches!(vm.heap.get(idx), HeapObj::Cell(_)) || vm.heap.cell_get(idx).is_uninitialized()
+        if !matches!(vm.heap.get(idx), HeapObj::Cell) || vm.heap.cell_get(idx).is_uninitialized()
         {
             return crate::codegen::SELF_CALL_DEOPT;
         }
@@ -486,7 +488,7 @@ mod tests {
         };
         let outer_regs = vm.func(fid as usize).reg_count.max(1) as usize;
         vm.regs = vec![Value::UNDEFINED; outer_regs];
-        let cell = vm.heap.alloc(HeapObj::Cell(Value::int(41)));
+        let cell = vm.heap.alloc_cell(Value::int(41));
         vm.regs[cell_reg as usize] = Value::heap(cell);
         let callee = vm.heap.alloc(HeapObj::Func(fid));
         vm.jit_tierc_activation = TiercActivationState {
@@ -552,7 +554,7 @@ mod tests {
             Value::int(9)
         };
         match vm.heap.get(boxed.heap_index()) {
-            HeapObj::Cell(v) => assert_eq!(*v, expected),
+            HeapObj::Cell => assert_eq!(vm.heap.cell_get(boxed.heap_index()), expected),
             other => panic!("expected a cell, got {other:?}"),
         }
     }

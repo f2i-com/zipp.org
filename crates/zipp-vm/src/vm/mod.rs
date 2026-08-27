@@ -1437,6 +1437,13 @@ pub struct Vm<'p> {
     /// assignments, since `Binding::Upvalue` carries no const-ness. Pruned on GC
     /// sweep like `fn_name_cells`.
     const_cells: std::collections::HashSet<u32>,
+    /// B201: sticky "a const cell exists" byte for the emitted inline cell
+    /// ops (set at the single insert site, never cleared — GC pruning may
+    /// empty the set but the sticky byte just keeps the inline lane
+    /// declined, which is the safe direction).
+    pub(crate) const_cells_nonempty: u8,
+    /// B201: sticky nonempty byte for `fn_name_cells`, same contract.
+    pub(crate) fn_name_cells_nonempty: u8,
     /// `$262.evalScript` flag: the NEXT eval-program instantiation uses SCRIPT
     /// GlobalDeclarationInstantiation semantics (non-configurable brandNew
     /// bindings, lexical-collision SyntaxErrors, realm-persistent lexicals)

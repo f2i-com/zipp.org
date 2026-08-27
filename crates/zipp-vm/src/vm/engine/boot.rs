@@ -321,6 +321,8 @@ impl<'p> Vm<'p> {
             error_data: std::collections::HashSet::new(),
             fn_name_cells: std::collections::HashSet::new(),
             const_cells: std::collections::HashSet::new(),
+            const_cells_nonempty: 0,
+            fn_name_cells_nonempty: 0,
             typed_module_cache: std::collections::HashMap::new(),
             pending_gen_callee: Value::UNDEFINED,
             gen_callee: std::collections::HashMap::new(),

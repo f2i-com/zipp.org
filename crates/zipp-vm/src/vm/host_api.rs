@@ -82,6 +82,13 @@ const _: () = {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_CELL_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
     + core::mem::offset_of!(crate::heap::Heap, cell_vals_mirror_raw);
+/// B201: the sticky nonempty bytes gating the emitted inline cell ops.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CONST_CELLS_NE_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, const_cells_nonempty);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_FN_NAME_CELLS_NE_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, fn_name_cells_nonempty);
 /// VM-relative byte offset of the running Tier-C activation's cached upvalue
 /// base pointer (0 = none). Set per native entry, restored per exit; the
 /// emitted `UpvalGet` derives it from the live VM argument on every access.

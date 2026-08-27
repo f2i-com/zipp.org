@@ -2796,10 +2796,39 @@ pub(crate) fn compile_proto_mem(
                     // unrelated bail observes the same register file.
                     let add_overflow = ops.new_dynamic_label();
                     let add_done = ops.new_dynamic_label();
+                    let inc_slow = ops.new_dynamic_label();
+                    let inc_have_old = ops.new_dynamic_label();
                     let one = Value::int(1).bits();
                     let zero = Value::int(0).bits();
                     let overflow_sum = Value::num(i32::MAX as f64 + 1.0).bits();
+                    // B201: the mirror is the cell authority, so the whole
+                    // counter increment emits inline when the activation has
+                    // an upvalue base, no const/fn-name cell exists, and the
+                    // cell holds an Int — mirror load, low-32 wrap-inc,
+                    // int-box, mirror store. Every other case takes the
+                    // unchanged helper as a pure prefix. Both paths leave
+                    // the OLD bits in rax for the shared materialization.
                     dynasm!(ops
+                        ; mov rax, [rdi + crate::vm::host_api::JIT_ACT_UPVALS_OFFSET as i32]
+                        ; test rax, rax
+                        ; jz => inc_slow
+                        ; mov ecx, [rax + (plan.idx as i32) * 4]
+                        ; cmp BYTE [rdi + crate::vm::host_api::JIT_CONST_CELLS_NE_OFFSET as i32], 0
+                        ; jne => inc_slow
+                        ; cmp BYTE [rdi + crate::vm::host_api::JIT_FN_NAME_CELLS_NE_OFFSET as i32], 0
+                        ; jne => inc_slow
+                        ; mov r11, [rdi + crate::vm::host_api::JIT_CELL_MIRROR_RAW_OFFSET as i32]
+                        ; mov rax, [r11 + rcx * 8]
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, 0x7FF9
+                        ; jne => inc_slow
+                        ; lea edx, [eax + 1]
+                        ; mov r10, QWORD Value::int(0).bits() as i64
+                        ; or r10, rdx
+                        ; mov [r11 + rcx * 8], r10
+                        ; jmp => inc_have_old
+                        ; => inc_slow
                         ; mov rcx, rdi
                         ; mov edx, plan.idx as i32
                         ; mov rax, QWORD heap.tierc_upval_inc_i32 as i64
@@ -2807,6 +2836,7 @@ pub(crate) fn compile_proto_mem(
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
                         ; je => bail
+                        ; => inc_have_old
                         ; mov r11, rax
                         ; mov [rbx + dreg(plan.old_dst)], rax
                         ; mov rax, QWORD one as i64

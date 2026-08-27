@@ -4469,7 +4469,7 @@ impl<'p> Vm<'p> {
                     }
                     Instr::MakeCell { reg } => {
                         let v = self.get(base, reg);
-                        let cell = self.heap.alloc(HeapObj::Cell(v));
+                        let cell = self.heap.alloc_cell(v);
                         self.set(base, reg, Value::heap(cell));
                         ip += 1;
                     }
@@ -4478,8 +4478,9 @@ impl<'p> Vm<'p> {
                         // immutable so nested-closure / eval writes no-op
                         // (sloppy) or throw (strict).
                         let v = self.get(base, reg);
-                        let cell = self.heap.alloc(HeapObj::Cell(v));
+                        let cell = self.heap.alloc_cell(v);
                         self.fn_name_cells.insert(cell);
+                        self.fn_name_cells_nonempty = 1;
                         self.set(base, reg, Value::heap(cell));
                         ip += 1;
                     }
@@ -4488,12 +4489,13 @@ impl<'p> Vm<'p> {
                         // initialized; record it so a closure's write throws.
                         let cell = self.get(base, reg).heap_index();
                         self.const_cells.insert(cell);
+                        self.const_cells_nonempty = 1;
                         ip += 1;
                     }
                     Instr::MakeCellTdz { reg } => {
                         // A captured lexical pre-created at entry: the cell starts in
                         // its TDZ (UNINITIALIZED) until the textual declaration runs.
-                        let cell = self.heap.alloc(HeapObj::Cell(Value::UNINITIALIZED));
+                        let cell = self.heap.alloc_cell(Value::UNINITIALIZED);
                         self.set(base, reg, Value::heap(cell));
                         ip += 1;
                     }

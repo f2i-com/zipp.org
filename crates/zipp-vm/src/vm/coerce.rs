@@ -2723,7 +2723,10 @@ impl<'p> Vm<'p> {
                 | HeapObj::NativeClosure { .. } => {
                     out.push_str("function");
                 }
-                HeapObj::Cell(inner) => self.display_value_into(out, *inner, depth + 1),
+                HeapObj::Cell => {
+                    let inner = self.heap.cell_get(idx);
+                    self.display_value_into(out, inner, depth + 1);
+                }
                 HeapObj::EvalScope(_) => {
                     out.push_str("[object EvalScope]");
                 }
@@ -3054,8 +3057,9 @@ impl<'p> Vm<'p> {
             HeapObj::Native(_) | HeapObj::NativeClosure { .. } => {
                 out.push_str("[Function (native)]");
             }
-            HeapObj::Cell(inner) => {
-                self.inspect_value_into(out, *inner, true, depth + 1);
+            HeapObj::Cell => {
+                let inner = self.heap.cell_get(idx);
+                self.inspect_value_into(out, inner, true, depth + 1);
             }
             HeapObj::EvalScope(_) => {
                 out.push_str("[object EvalScope]");

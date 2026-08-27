@@ -1417,7 +1417,10 @@ impl<'p> Vm<'p> {
             return None;
         }
         let value = match self.heap.get(cell) {
-            crate::heap::HeapObj::Cell(value) if !value.is_uninitialized() => *value,
+            crate::heap::HeapObj::Cell => match self.heap.cell_get(cell) {
+                value if !value.is_uninitialized() => value,
+                _ => return None,
+            },
             _ => return None,
         };
         if !value.is_heap() || value.heap_index() as usize >= self.heap.len() {

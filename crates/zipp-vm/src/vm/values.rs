@@ -1634,8 +1634,8 @@ impl<'p> Vm<'p> {
         }
         let v = self.regs[m.base + 1 + i];
         if v.is_heap() {
-            if let HeapObj::Cell(inner) = self.heap.get(v.heap_index()) {
-                return Some(*inner);
+            if matches!(self.heap.get(v.heap_index()), HeapObj::Cell) {
+                return Some(self.heap.cell_get(v.heap_index()));
             }
         }
         Some(v)

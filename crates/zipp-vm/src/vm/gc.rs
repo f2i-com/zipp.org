@@ -1208,7 +1208,7 @@ impl Vm<'_> {
                     m_val!(v);
                 }
             }
-            HeapObj::Cell(v) => m_val!(*v),
+            HeapObj::Cell => m_val!(Value::from_bits(self.heap.cell_mirror_bits(idx))),
             HeapObj::EvalScope(m) => {
                 for v in m.values() {
                     m_val!(*v);

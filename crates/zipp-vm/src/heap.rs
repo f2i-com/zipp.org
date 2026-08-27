@@ -3583,7 +3583,11 @@ pub enum HeapObj {
         this_val: Value,
     },
     /// A boxed mutable variable cell (an upvalue's storage).
-    Cell(Value),
+    /// B201: payload-free MARKER — the authoritative value lives in the
+    /// heap's `cell_vals_mirror` (one write-through store, no enum-layout
+    /// dependence, which is what lets Tier-C emit cell reads AND writes
+    /// inline). Cells are born only through [`Heap::alloc_cell`].
+    Cell,
     /// A sloppy direct eval's DYNAMIC variable environment for a FUNCTION
     /// context: name -> value bindings the eval's var/function declarations
     /// created in the caller activation (spec: the caller's varEnv). Reached
@@ -4544,6 +4548,15 @@ impl Heap {
         self.upvals_mirror[idx as usize] = 0;
     }
 
+    /// B201: allocate a captured-variable cell holding `initial` — the only
+    /// birth path for cells: the marker takes the slot, the authoritative
+    /// payload goes straight to the cell-value mirror.
+    pub fn alloc_cell(&mut self, initial: Value) -> u32 {
+        let idx = self.alloc(HeapObj::Cell);
+        self.cell_vals_mirror[idx as usize] = initial.bits();
+        idx
+    }
+
     /// B196b: an element buffer for a small dense array being built —
     /// recycled when the pool has one (cleared here; capacity retained),
     /// fresh otherwise. Callers push up to `cap` elements.
@@ -4661,10 +4674,9 @@ impl Heap {
                     vals: 0,
                 }
             }
-            HeapObj::Cell(v) => {
-                self.cell_vals_mirror[idx as usize] = v.bits();
-                HotMirror::CLEAR
-            }
+            // B201: a Cell's mirror is written by `alloc_cell` (the enum
+            // carries no payload to copy from).
+            HeapObj::Cell => HotMirror::CLEAR,
             _ => HotMirror::CLEAR,
         };
         self.hot_mirror[idx as usize] = hot;
@@ -5219,7 +5231,7 @@ impl Heap {
         // every other slot's cold fields at their defaults already, and the
         // plain-object sweep mass stops touching those three lines.
         match &dead {
-            HeapObj::Cell(_) => {
+            HeapObj::Cell => {
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
             }
             HeapObj::Closure { .. } => {
@@ -5477,7 +5489,7 @@ impl Heap {
         // cold mirrors are cleared here under the same induction free_slot
         // maintains (refresh below writes the new occupant's own fields).
         match &old {
-            HeapObj::Cell(_) => {
+            HeapObj::Cell => {
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
             }
             HeapObj::Closure { .. } => {
@@ -5848,10 +5860,18 @@ impl Heap {
 
     #[inline]
     pub fn cell_get(&self, idx: u32) -> Value {
-        match self.get(idx) {
-            HeapObj::Cell(v) => *v,
-            _ => Value::UNDEFINED,
-        }
+        // B201: a BLIND mirror read — the B198 kind-conditional invariant
+        // guarantees a non-Cell occupant leaves this field at UNDEFINED
+        // bits, so the old kind-match here was a redundant second cache
+        // line (it re-read the objs slot). One load, exact semantics.
+        Value::from_bits(self.cell_vals_mirror[idx as usize])
+    }
+
+    /// B201: the raw authoritative cell bits (the GC tracer's read — the
+    /// mirror IS the storage).
+    #[inline]
+    pub(crate) fn cell_mirror_bits(&self, idx: u32) -> u64 {
+        self.cell_vals_mirror[idx as usize]
     }
 
     #[inline]
@@ -5867,12 +5887,11 @@ impl Heap {
         {
             gcoracle::hit(gcoracle::CELL_SET);
         }
-        if let HeapObj::Cell(slot) = self.get_mut(idx) {
-            *slot = v;
-            // Write-through to the cell-value mirror (B189). Payload writes
-            // happen HERE and in `cell_write_no_barrier` (mapped-arguments
-            // aliasing, which carries its own barrier) — both write through,
-            // which is what makes the emitted three-load `UpvalGet` sound.
+        if matches!(self.get(idx), HeapObj::Cell) {
+            // B201: the mirror IS the payload. Writes happen HERE and in
+            // `cell_write_no_barrier` (mapped-arguments aliasing, which
+            // carries its own barrier) — the single store both the emitted
+            // `UpvalGet` and the emitted cell writes address.
             self.cell_vals_mirror[idx as usize] = v.bits();
         }
     }
@@ -5884,8 +5903,7 @@ impl Heap {
     /// invariant in one file.
     #[inline]
     pub(crate) fn cell_write_no_barrier(&mut self, idx: u32, v: Value) -> bool {
-        if let HeapObj::Cell(slot) = self.get_mut(idx) {
-            *slot = v;
+        if matches!(self.get(idx), HeapObj::Cell) {
             self.cell_vals_mirror[idx as usize] = v.bits();
             true
         } else {
@@ -6722,7 +6740,7 @@ mod tests {
         // clean; the value-BLIND card form still dirties the holder.
         let mut h = Heap::new();
         h.set_nursery(true); // hold even in a suite run under ZIPP_NO_NURSERY=1
-        let holder = h.alloc(HeapObj::Cell(Value::UNDEFINED));
+        let holder = h.alloc_cell(Value::UNDEFINED);
         // Promote: survive a "collection" (everything marked).
         let marks = vec![true; h.len()];
         let free_before = h.free_indices().len();
@@ -6783,7 +6801,7 @@ mod tests {
     fn a_scan_root_persists_across_minors_and_expires_with_its_slot() {
         let mut h = Heap::new();
         h.set_nursery(true);
-        let holder = h.alloc(HeapObj::Cell(Value::UNDEFINED));
+        let holder = h.alloc_cell(Value::UNDEFINED);
         h.register_scan_root(holder);
         h.register_scan_root(holder); // sticky bit dedups
         assert_eq!(h.dirty_for_trace(), vec![holder]);

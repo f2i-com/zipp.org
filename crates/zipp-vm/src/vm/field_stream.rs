@@ -719,7 +719,7 @@ impl<'p> Vm<'p> {
                     return None;
                 }
                 let value = match self.heap.get(cell) {
-                    HeapObj::Cell(value) => *value,
+                    HeapObj::Cell => self.heap.cell_get(cell),
                     _ => return None,
                 };
                 (!value.is_uninitialized()).then_some(value)

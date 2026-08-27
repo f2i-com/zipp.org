@@ -94,8 +94,8 @@ impl<'p> Vm<'p> {
                 | HeapObj::CombinatorResolver { .. } => "function",
                 // Transparent wrappers are guest-chainable. Unwrap them in this
                 // frame instead of recursing once per Proxy/Cell.
-                HeapObj::Cell(inner) => {
-                    v = *inner;
+                HeapObj::Cell => {
+                    v = self.heap.cell_get(v.heap_index());
                     continue;
                 }
                 HeapObj::Proxy { target, .. } => {

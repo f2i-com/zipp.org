@@ -4643,7 +4643,7 @@ pub(crate) extern "win64" fn jit_upval_set(
     // this is an extern helper: never let a corrupt/stale cell index panic (and
     // unwind) across the generated-code ABI boundary. A reclaimed slot also is
     // not a Cell, even if its index remains in range.
-    if cell as usize >= vm.heap.len() || !matches!(vm.heap.get(cell), crate::heap::HeapObj::Cell(_))
+    if cell as usize >= vm.heap.len() || !matches!(vm.heap.get(cell), crate::heap::HeapObj::Cell)
     {
         return crate::codegen::SELF_CALL_DEOPT;
     }
@@ -4687,7 +4687,7 @@ pub(crate) extern "win64" fn jit_upval_get(vm: *mut core::ffi::c_void, idx: u32)
         },
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
-    if cell as usize >= vm.heap.len() || !matches!(vm.heap.get(cell), crate::heap::HeapObj::Cell(_))
+    if cell as usize >= vm.heap.len() || !matches!(vm.heap.get(cell), crate::heap::HeapObj::Cell)
     {
         return crate::codegen::SELF_CALL_DEOPT;
     }
@@ -4913,7 +4913,7 @@ fn jit_tierc_cell(vm: &Vm<'_>, idx: u32) -> Option<u32> {
     // fid whose code is running — the same in-bounds contract the
     // interpreter's `closure_upvalue` indexes under.
     let cell = unsafe { *(base as *const u32).add(idx as usize) };
-    ((cell as usize) < vm.heap.len() && matches!(vm.heap.get(cell), crate::heap::HeapObj::Cell(_)))
+    ((cell as usize) < vm.heap.len() && matches!(vm.heap.get(cell), crate::heap::HeapObj::Cell))
         .then_some(cell)
 }
 
