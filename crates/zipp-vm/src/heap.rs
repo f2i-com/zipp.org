@@ -3723,6 +3723,22 @@ pub(crate) fn key_pool_enabled() -> bool {
     }
 }
 
+/// B238 latch: `ZIPP_NO_SETTLED_ALLOC=1` makes the finalize path settle its
+/// mirror through `refresh_mirror` again, as before.
+fn settled_alloc_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SETTLED_ALLOC").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// B212: memo size — 2048 entries x 20B = 40KB, charged in `resident_bytes`.
 #[cfg(not(feature = "safe-sandbox"))]
 const CONCAT_MEMO_SLOTS: usize = 2048;
@@ -4938,7 +4954,36 @@ impl Heap {
         };
         #[cfg(feature = "safe-sandbox")]
         let boxed = Box::new(map);
-        self.alloc(HeapObj::Object(boxed))
+        // B238: the shape came in as an argument and the store pointer is in
+        // hand, so the mirror needs no rediscovery.
+        self.alloc_object_settled(boxed, shape)
+    }
+
+    /// B238: allocate an object whose hot mirror is ALREADY KNOWN.
+    ///
+    /// `shape` must be the map's own shape and `boxed.vals` its live store —
+    /// i.e. exactly what `refresh_mirror` would have read back out of the
+    /// occupant. `fid` is `FID_MIRROR_NONE` because a plain object has no
+    /// function identity, which is what `refresh_mirror`'s `Object` arm also
+    /// writes. The cold mirrors (cell/this/upvals) are untouched, which is
+    /// correct by the same B198 induction `refresh_mirror` relies on: an
+    /// object owns none of them, and `free_slot` cleared whatever the previous
+    /// occupant owned.
+    ///
+    /// `ZIPP_NO_SETTLED_ALLOC=1` routes back through `refresh_mirror`, so the
+    /// two spellings can be A/B'd on one binary.
+    pub fn alloc_object_settled(&mut self, boxed: Box<ObjMap>, shape: u32) -> u32 {
+        if !settled_alloc_enabled() {
+            return self.alloc(HeapObj::Object(boxed));
+        }
+        let vals = boxed.vals.as_ptr() as u64;
+        let idx = self.alloc_slot(HeapObj::Object(boxed));
+        self.hot_mirror[idx as usize] = HotMirror {
+            shape,
+            fid: FID_MIRROR_NONE,
+            vals,
+        };
+        idx
     }
 
     /// Refresh slot `idx`'s shape/vals mirrors from the live object — the
@@ -5017,6 +5062,30 @@ impl Heap {
 
     #[inline]
     pub fn alloc(&mut self, obj: HeapObj) -> u32 {
+        let idx = self.alloc_slot(obj);
+        self.refresh_mirror(idx);
+        idx
+    }
+
+    /// B238: everything `alloc` does EXCEPT settle the mirrors.
+    ///
+    /// Split out so a caller that already knows the occupant's mirror can
+    /// write it directly instead of paying `refresh_mirror` to rediscover it.
+    /// Both of the old `refresh_mirror` call sites were followed only by
+    /// nursery and oracle bookkeeping, neither of which reads a mirror, so
+    /// moving the write after them is order-independent.
+    ///
+    /// Every caller MUST settle the mirrors before the slot is observable:
+    /// a stale hot mirror is a wrong shape for an inline cache, not a slow
+    /// path. `alloc` and `alloc_object_settled` are the only two.
+    ///
+    /// `inline(always)`: with two callers LLVM stopped inlining this back into
+    /// `alloc`, which turned the generic allocation path -- the one an
+    /// allocation-heavy row that is NOT literal-born uses for everything --
+    /// into a call it never used to make. survival read +0.73% until this was
+    /// forced, against -1.2% to -1.5% on the four literal-born rows.
+    #[inline(always)]
+    fn alloc_slot(&mut self, obj: HeapObj) -> u32 {
         // Sizing every allocation is only worth paying once something reads
         // the figure; `audit_resident_bytes` turns accounting on and backfills
         // (see `payload_accounting`), so lazily-enabled totals stay exact.
@@ -5045,7 +5114,6 @@ impl Heap {
                 self.resident_payload_charged[idx as usize].set(payload);
             }
             self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
-            self.refresh_mirror(idx);
             if self.nursery {
                 if self.pretenure == 0 {
                     self.young.push(idx);
@@ -5081,7 +5149,6 @@ impl Heap {
         self.this_mirror.push(Value::UNDEFINED.bits());
         self.upvals_mirror.push(0);
         self.recache_mirror_raws();
-        self.refresh_mirror(idx);
         if self.nursery {
             if self.pretenure == 0 {
                 self.young.push(idx);
