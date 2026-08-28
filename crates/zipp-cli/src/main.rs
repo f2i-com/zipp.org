@@ -48,6 +48,13 @@ fn main() -> ExitCode {
             eprintln!("[prof] {n:>8}  {pct:>5.1}%  {name}");
         }
     }
+    if std::env::var_os("ZIPP_PROF_PC").is_some() {
+        let (rows, total) = zipp_vm::prof_pc_stats();
+        eprintln!("[profpc] {total} instruction-pointer samples");
+        for (name, n, pct) in rows.iter().take(25) {
+            eprintln!("[profpc] {n:>8}  {pct:>5.1}%  {name}");
+        }
+    }
     if std::env::var_os("ZIPP_GCSTATS").is_some() {
         let (c, r, t, sw, re, slots, live, swept) = zipp_vm::gc_stats();
         eprintln!(

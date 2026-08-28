@@ -36,6 +36,19 @@ rustc-hash = "2"
 dynasm = "5.1"
 dynasmrt = "5.1"
 
+# B237: the release build PLUS symbols, so `ZIPP_PROF_PC=1` can NAME the
+# runtime helper a sampled instruction pointer landed in. Everything that
+# affects codegen -- opt-level, LTO, codegen-units, panic strategy -- is
+# inherited unchanged; only debug info is added, which is metadata. Without it
+# the release PDB carries public symbols only and dbghelp resolves every
+# address to the nearest exported one, which reads as plausible nonsense.
+#
+#   cargo build --profile profiling
+#   ZIPP_PROF_PC=1 ./target/profiling/zipp.exe js <bench>
+[profile.profiling]
+inherits = "release"
+debug = true
+
 [profile.release]
 opt-level = 3
 # MEASURED 2026-07-26: fat LTO + a single codegen unit is worth ~2% geomean

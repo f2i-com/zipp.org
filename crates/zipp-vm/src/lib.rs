@@ -128,6 +128,14 @@ pub fn prof_stats() -> (Vec<(&'static str, u64, f64)>, u64) {
     vm::prof_stats()
 }
 
+/// `ZIPP_PROF_PC=1` instruction-pointer profile: `(emitted body, samples,
+/// percent)` sorted by samples, plus the total. Answers "which compiled body",
+/// which the phase profiler cannot -- see `vm::prof::pc`. Empty off Windows
+/// x86-64 or when the variable is unset.
+pub fn prof_pc_stats() -> (Vec<(String, u64, f64)>, u64) {
+    vm::prof::pc::report()
+}
+
 /// IANA time-zone database release embedded by the Temporal implementation.
 pub fn temporal_tzdb_version() -> &'static str {
     vm::tzdb_version()

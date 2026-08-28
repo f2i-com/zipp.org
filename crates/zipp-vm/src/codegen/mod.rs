@@ -2529,6 +2529,12 @@ pub struct JitFn {
 }
 
 impl JitFn {
+    /// B237: the emitted buffer's address range, for the PC profiler's
+    /// sample-to-body mapping. The buffer is mmap'd and never moves.
+    pub(crate) fn code_span(&self) -> (u64, usize) {
+        (self._buf.as_ptr() as u64, self._buf.len())
+    }
+
     /// Raw native entry pointer (for self-recursive calls that re-enter the
     /// same code through the win64 trampoline).
     pub fn entry(&self) -> *const u8 {
@@ -3624,6 +3630,10 @@ impl Jit {
                         f.self_binding().is_some()
                     );
                 }
+                {
+                    let (a, n) = f.code_span();
+                    crate::vm::prof::pc::register(a, n, format!("fn{func_id} whole-fn"));
+                }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
                 return;
@@ -3713,6 +3723,10 @@ impl Jit {
                         );
                     }
                 }
+                {
+                    let (a, n) = f.code_span();
+                    crate::vm::prof::pc::register(a, n, format!("fn{func_id} whole-fn"));
+                }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
                 let json_walk = meter
@@ -3759,6 +3773,12 @@ impl Jit {
         }
         let compiled = compile_map_kernel(proto);
         let entry = compiled.as_ref().map(|f| f.entry());
+        if let Some(f) = compiled.as_ref() {
+            // B237: array-map kernels are emitted bodies too; without this
+            // their samples land in the profiler's unattributed bucket.
+            let (a, n) = f.code_span();
+            crate::vm::prof::pc::register(a, n, format!("fn{func_id} map-kernel"));
+        }
         self.map_kernels.insert(func_id, compiled);
         entry
     }
@@ -3771,6 +3791,12 @@ impl Jit {
         }
         let compiled = compile_reduce_kernel(proto);
         let entry = compiled.as_ref().map(|f| f.entry());
+        if let Some(f) = compiled.as_ref() {
+            // B237: array-reduce kernels are emitted bodies too; without this
+            // their samples land in the profiler's unattributed bucket.
+            let (a, n) = f.code_span();
+            crate::vm::prof::pc::register(a, n, format!("fn{func_id} reduce-kernel"));
+        }
         self.reduce_kernels.insert(func_id, compiled);
         entry
     }
@@ -3783,6 +3809,12 @@ impl Jit {
         }
         let compiled = compile_filter_kernel(proto);
         let entry = compiled.as_ref().map(|f| f.entry());
+        if let Some(f) = compiled.as_ref() {
+            // B237: array-filter kernels are emitted bodies too; without this
+            // their samples land in the profiler's unattributed bucket.
+            let (a, n) = f.code_span();
+            crate::vm::prof::pc::register(a, n, format!("fn{func_id} filter-kernel"));
+        }
         self.filter_kernels.insert(func_id, compiled);
         entry
     }
@@ -4075,6 +4107,14 @@ impl Jit {
                             if is_mem { "MEM" } else { "DOUBLE" }
                         );
                     }
+                    {
+                        // B237: the PC profiler maps a sampled RIP onto the body
+                        // that contains it; this is where a region body's range
+                        // becomes known.
+                        let (a, n) = code.code_span();
+                        crate::vm::prof::pc::register(
+                            a, n, format!("fn{func_id} region [{start},{end}]"));
+                    }
                     self.regions.insert(
                         key,
                         Region {
@@ -4135,6 +4175,14 @@ impl Jit {
                             obj_idx: fp.obj_idx,
                             obj_version: fp.obj_version,
                         };
+                        {
+                            // B237: the PC profiler maps a sampled RIP onto the body
+                            // that contains it; this is where a region body's range
+                            // becomes known.
+                            let (a, n) = code.code_span();
+                            crate::vm::prof::pc::register(
+                                a, n, format!("fn{func_id} region [{start},{end}]"));
+                        }
                         self.regions.insert(
                             key,
                             Region {
@@ -4194,6 +4242,14 @@ impl Jit {
             ) {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!("[jit] INT region fn{func_id} [{start},{end}] compiled");
+                }
+                {
+                    // B237: the PC profiler maps a sampled RIP onto the body
+                    // that contains it; this is where a region body's range
+                    // becomes known.
+                    let (a, n) = code.code_span();
+                    crate::vm::prof::pc::register(
+                        a, n, format!("fn{func_id} region [{start},{end}]"));
                 }
                 self.regions.insert(
                     key,
@@ -4257,6 +4313,14 @@ impl Jit {
                         acc_emit.len(),
                         acc_emit.iter().filter(|s| s.direct_miss).count()
                     );
+                }
+                {
+                    // B237: the PC profiler maps a sampled RIP onto the body
+                    // that contains it; this is where a region body's range
+                    // becomes known.
+                    let (a, n) = code.code_span();
+                    crate::vm::prof::pc::register(
+                        a, n, format!("fn{func_id} region [{start},{end}]"));
                 }
                 self.regions.insert(
                     key,
