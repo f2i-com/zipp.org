@@ -226,7 +226,7 @@ pub fn dump() -> (Vec<(&'static str, u64, f64)>, u64) {
 /// exactly two system calls and one `u64` read.
 #[cfg(all(windows, target_arch = "x86_64", not(feature = "safe-sandbox")))]
 pub(crate) mod pc {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     type Handle = isize;
 
@@ -249,7 +249,7 @@ pub(crate) mod pc {
 
     extern "system" {
         fn GetModuleHandleW(name: *const u16) -> usize;
-        fn LoadLibraryA(name: *const u8) -> usize;
+        fn LoadLibraryExA(name: *const u8, file: usize, flags: u32) -> usize;
         fn GetProcAddress(module: usize, name: *const u8) -> usize;
     }
 
@@ -272,7 +272,11 @@ pub(crate) mod pc {
         // SAFETY: plain library/symbol lookup by NUL-terminated name; each
         // result is used only through the signature dbghelp documents for it.
         unsafe {
-            let m = LoadLibraryA(b"dbghelp.dll\0".as_ptr());
+            // System32 only: the default search order tries the application
+            // directory first, and a diagnostic tool is no place to pick up a
+            // same-named DLL sitting beside the executable.
+            const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
+            let m = LoadLibraryExA(b"dbghelp.dll\0".as_ptr(), 0, LOAD_LIBRARY_SEARCH_SYSTEM32);
             if m == 0 {
                 return None;
             }
@@ -323,6 +327,10 @@ pub(crate) mod pc {
 
     static THREAD: AtomicUsize = AtomicUsize::new(0);
     static BUF: AtomicUsize = AtomicUsize::new(0);
+    /// Samples being taken right now (0 or 1). `report()` disarms `THREAD`
+    /// and waits for this to reach zero before it reads the buffer, so the
+    /// buffer is quiescent while it is read — no trailing half-written slot.
+    static INFLIGHT: AtomicUsize = AtomicUsize::new(0);
     static COUNT: AtomicUsize = AtomicUsize::new(0);
     static DROPPED: AtomicUsize = AtomicUsize::new(0);
 
@@ -359,19 +367,36 @@ pub(crate) mod pc {
         if ok == 0 || dup == 0 {
             return;
         }
-        let buf = vec![0u64; MAX_SAMPLES].into_boxed_slice();
+        // Atomic slots: the sampler stores and `report()` loads with Relaxed
+        // ordering, which makes the shared buffer well-defined rather than a
+        // formal data race — free on x86-64, where these are plain movs.
+        let buf: Box<[AtomicU64]> = (0..MAX_SAMPLES).map(|_| AtomicU64::new(0)).collect();
         BUF.store(Box::leak(buf).as_mut_ptr() as usize, Ordering::Release);
         THREAD.store(dup as usize, Ordering::Release);
     }
 
     /// One sample. A no-op unless the mode armed, so the phase sampler's loop
     /// pays a single relaxed load when it is not in use.
+    ///
+    /// The armed path announces itself in `INFLIGHT` BEFORE re-reading
+    /// `THREAD` (both SeqCst), and `report()` disarms `THREAD` before waiting
+    /// on `INFLIGHT`: either this sample sees the disarm and backs out, or its
+    /// increment is visible to the wait — so no sample can be mid-write while
+    /// the buffer is read.
     pub(crate) fn sample() {
-        let h = THREAD.load(Ordering::Relaxed);
-        let buf = BUF.load(Ordering::Relaxed);
-        if h == 0 || buf == 0 {
+        if THREAD.load(Ordering::Relaxed) == 0 {
             return;
         }
+        INFLIGHT.fetch_add(1, Ordering::SeqCst);
+        let h = THREAD.load(Ordering::SeqCst);
+        let buf = BUF.load(Ordering::Relaxed);
+        if h != 0 && buf != 0 {
+            sample_armed(h, buf);
+        }
+        INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn sample_armed(h: usize, buf: usize) {
         let mut ctx = Context([0u8; CONTEXT_SIZE]);
         // SAFETY: `ctx` is a live, correctly aligned CONTEXT-sized buffer, and
         // the suspend window below allocates nothing and takes no lock.
@@ -391,7 +416,7 @@ pub(crate) mod pc {
             let rip = std::ptr::read(ctx.0.as_ptr().add(CONTEXT_RIP_OFF) as *const u64);
             let i = COUNT.fetch_add(1, Ordering::Relaxed);
             if i < MAX_SAMPLES {
-                std::ptr::write((buf as *mut u64).add(i), rip);
+                (*(buf as *const AtomicU64).add(i)).store(rip, Ordering::Relaxed);
             } else {
                 COUNT.store(MAX_SAMPLES, Ordering::Relaxed);
                 DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -399,23 +424,35 @@ pub(crate) mod pc {
         }
     }
 
-    /// `(start, end, label)` for every emitted body, newest last. Registered by
-    /// the JIT at install time; buffers are mmap'd and never move, so a range
-    /// stays valid until its body is evicted, and an evicted body's range is
-    /// simply never sampled again.
+    /// `(start, end, label)` for every emitted body, in registration order.
+    ///
+    /// Buffers are mmap'd and never move. Within one VM an evicted body is
+    /// PARKED in the JIT's `retired`/`retired_fns` lists for the VM's life,
+    /// not unmapped, so its range stays live and can keep being sampled
+    /// (attributed to its own label, correctly). The only in-process unmaps
+    /// are `Jit::set_meter` (drops Tier A/C bodies and kernels) and a whole
+    /// VM dropping — `$262.agent` workers run their own VMs on their own
+    /// threads and register here too, under the same Mutex. After an unmap a
+    /// later mapping can reuse the address range, which is why `register`
+    /// evicts every entry the new range overlaps: a live mapping cannot
+    /// overlap another live mapping, so anything it overlaps is stale.
     static RANGES: std::sync::Mutex<Vec<(u64, u64, String)>> = std::sync::Mutex::new(Vec::new());
 
-    /// Record one emitted body's address range. Cheap and only called when PC
-    /// mode armed, so an ordinary run never builds the table.
+    /// Record one emitted body's address range.
+    ///
+    /// Called at every JIT install; the label is a closure so an ordinary run
+    /// (PC mode not armed) pays one relaxed load and builds no `String`.
     ///
     /// Only the JIT calls this, so a build without one leaves it unused.
     #[allow(dead_code)]
-    pub(crate) fn register(start: u64, len: usize, label: String) {
+    pub(crate) fn register(start: u64, len: usize, label: impl FnOnce() -> String) {
         if THREAD.load(Ordering::Relaxed) == 0 {
             return;
         }
+        let end = start + len as u64;
         if let Ok(mut r) = RANGES.lock() {
-            r.push((start, start + len as u64, label));
+            r.retain(|e| e.1 <= start || e.0 >= end);
+            r.push((start, end, label()));
         }
     }
 
@@ -428,27 +465,33 @@ pub(crate) mod pc {
     /// `SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS`.
     const SYMOPT: u32 = 0x0000_0002 | 0x0000_0004;
 
+    /// dbghelp fills `SYMBOL_INFO` through `ULONG`/`ULONG64` fields, so the
+    /// buffer must be 8-aligned; a bare `[u8; N]` is align-1 and the `u32`
+    /// header writes below would be formally misaligned.
+    #[repr(C, align(8))]
+    struct SymBuf([u8; SYMBOL_INFO_SIZE + SYMBOL_NAME_CAP]);
+
     /// Resolve one address to a symbol name, or `None`.
     ///
     /// Rust symbols come back mangled; the mangling still carries the crate and
     /// module path, which is what makes the profile readable, so no demangler
     /// is pulled in for it.
     fn symbolicate(dbg: &DbgHelp, addr: u64) -> Option<String> {
-        let mut buf = [0u8; SYMBOL_INFO_SIZE + SYMBOL_NAME_CAP];
+        let mut buf = SymBuf([0u8; SYMBOL_INFO_SIZE + SYMBOL_NAME_CAP]);
         let mut disp: u64 = 0;
         // SAFETY: `buf` is larger than SYMBOL_INFO plus the name capacity we
         // declare, and dbghelp writes at most that much. Called only after
         // sampling has stopped, on the reporting thread.
         unsafe {
-            std::ptr::write(buf.as_mut_ptr() as *mut u32, SYMBOL_INFO_SIZE as u32);
+            std::ptr::write(buf.0.as_mut_ptr() as *mut u32, SYMBOL_INFO_SIZE as u32);
             std::ptr::write(
-                buf.as_mut_ptr().add(SYMBOL_MAXNAME_OFF) as *mut u32,
+                buf.0.as_mut_ptr().add(SYMBOL_MAXNAME_OFF) as *mut u32,
                 SYMBOL_NAME_CAP as u32 - 1,
             );
-            if (dbg.from_addr)(GetCurrentProcess(), addr, &mut disp, buf.as_mut_ptr()) == 0 {
+            if (dbg.from_addr)(GetCurrentProcess(), addr, &mut disp, buf.0.as_mut_ptr()) == 0 {
                 return None;
             }
-            let name = buf.as_ptr().add(SYMBOL_NAME_OFF);
+            let name = buf.0.as_ptr().add(SYMBOL_NAME_OFF);
             let mut n = 0usize;
             while n < SYMBOL_NAME_CAP - 1 && *name.add(n) != 0 {
                 n += 1;
@@ -464,7 +507,16 @@ pub(crate) mod pc {
     /// helpers, the allocator and the OS — real time, and deliberately kept as
     /// one visible bucket rather than dropped, so the compiled-code shares are
     /// read against the whole run and not against each other.
+    ///
+    /// Stops sampling first: disarms `THREAD` and waits for any in-flight
+    /// sample, so the buffer is quiescent while it is read. A second call
+    /// reports the same data.
     pub(crate) fn report() -> (Vec<(String, u64, f64)>, u64) {
+        if THREAD.swap(0, Ordering::SeqCst) != 0 {
+            while INFLIGHT.load(Ordering::SeqCst) != 0 {
+                std::hint::spin_loop();
+            }
+        }
         let total = COUNT.load(Ordering::Relaxed).min(MAX_SAMPLES);
         let buf = BUF.load(Ordering::Acquire);
         if buf == 0 || total == 0 {
@@ -485,7 +537,7 @@ pub(crate) mod pc {
         let mut outside = 0u64;
         for i in 0..total {
             // SAFETY: `i < total <= MAX_SAMPLES` and the buffer is leaked.
-            let rip = unsafe { std::ptr::read((buf as *const u64).add(i)) };
+            let rip = unsafe { (*(buf as *const AtomicU64).add(i)).load(Ordering::Relaxed) };
             let at = ranges.partition_point(|r| r.0 <= rip);
             if at > 0 && rip < ranges[at - 1].1 {
                 *tally.entry(ranges[at - 1].2.clone()).or_insert(0) += 1;
@@ -525,6 +577,14 @@ pub(crate) mod pc {
                 outside as f64 * 100.0 / total as f64,
             ));
         }
+        let dropped = DROPPED.load(Ordering::Relaxed) as u64;
+        if dropped > 0 {
+            rows.push((
+                "<dropped: sample buffer full>".to_string(),
+                dropped,
+                dropped as f64 * 100.0 / (total as u64 + dropped) as f64,
+            ));
+        }
         rows.sort_by(|a, b| b.1.cmp(&a.1));
         // `ZIPP_PROF_PC_DUMP=<path>` writes every sample as a module-relative
         // offset (or an absolute address when it is outside the image), one
@@ -534,7 +594,7 @@ pub(crate) mod pc {
             let mut out = String::with_capacity(total * 12);
             for i in 0..total {
                 // SAFETY: as above, `i < total <= MAX_SAMPLES`.
-                let rip = unsafe { std::ptr::read((buf as *const u64).add(i)) };
+                let rip = unsafe { (*(buf as *const AtomicU64).add(i)).load(Ordering::Relaxed) };
                 match module {
                     Some((b, n)) if rip >= b && rip < b + n => {
                         out.push_str(&format!("{:x}\n", rip - b))
@@ -556,7 +616,7 @@ pub(crate) mod pc {
     pub(crate) fn sample() {}
     /// Only the JIT registers ranges, so a build without one never calls this.
     #[allow(dead_code)]
-    pub(crate) fn register(_start: u64, _len: usize, _label: String) {}
+    pub(crate) fn register(_start: u64, _len: usize, _label: impl FnOnce() -> String) {}
     pub(crate) fn report() -> (Vec<(String, u64, f64)>, u64) {
         (Vec::new(), 0)
     }

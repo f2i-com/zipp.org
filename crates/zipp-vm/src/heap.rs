@@ -1838,6 +1838,8 @@ impl ObjMap {
     /// `finalized_from_store` overwrites applied on top.
     #[cfg(not(feature = "safe-sandbox"))]
     fn refit_finalized(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
+        debug_assert!(plan.runtime_valid());
+        debug_assert_eq!(vals.len(), plan.len());
         let n = plan.len();
         let ObjMap {
             keys,
@@ -4441,8 +4443,10 @@ pub struct Heap {
     /// pops one and overwrites it wholesale, removing the allocator
     /// round-trip that is half the literal construction floor (38.6 ->
     /// 19.2ns/obj in `build_floor_micro`). Shells hold NO heap references
-    /// (the plan Arc owns only strings), so the pool is never traced; the
-    /// deferred drop of a shell's plan Arc happens at overwrite.
+    /// (the plan Arc owns only strings), so the pool is never traced. B239:
+    /// a popped shell is REFITTED in place, and keeps its plan Arc when the
+    /// next literal uses the same plan (the common case at a hot site) —
+    /// otherwise the Arc is swapped for the new plan's at the refit.
     #[cfg(not(feature = "safe-sandbox"))]
     obj_pool: Vec<Box<ObjMap>>,
     /// Pool pops served since the last collection-done note — the demand
@@ -5029,9 +5033,9 @@ impl Heap {
         #[cfg(feature = "safe-sandbox")]
         let store = ValStore::Vec(vals.to_vec());
 
-        // B187 stage 3: serve the box from the recycle pool when the sweep
-        // has stocked it — the overwrite drops the shell's deferred plan Arc
-        // and costs one 112-byte store in place of an allocator round-trip.
+        // B187 stage 3 / B239: serve the box from the recycle pool when the
+        // sweep has stocked it and REFIT it in place — same plan, same Arc,
+        // no allocator round-trip and no refcount traffic on the hot path.
         #[cfg(not(feature = "safe-sandbox"))]
         let boxed = match self.obj_pool.pop() {
             Some(mut b) => {
@@ -5072,6 +5076,7 @@ impl Heap {
         if !settled_alloc_enabled() {
             return self.alloc(HeapObj::Object(boxed));
         }
+        debug_assert_eq!(boxed.shape(), shape, "settled mirror must carry the map's own shape");
         let vals = boxed.vals.as_ptr() as u64;
         self.alloc_settled(
             HeapObj::Object(boxed),
@@ -5764,8 +5769,8 @@ impl Heap {
                 }
                 // B187 stage 3: recycle a drop-cheap shell instead of
                 // couriering it. Everything the box still owns is either a
-                // string-only plan Arc (decremented when `alloc_finalized`
-                // overwrites the popped shell) or drop-free, so nothing the
+                // string-only plan Arc (kept if the next literal uses the same
+                // plan, swapped otherwise — `refit_finalized`) or drop-free, so nothing the
                 // courier would have carried is paid on this thread.
                 // Rich-but-settled shells (an index table, Mixed attrs)
                 // still pool: their contents drop at the overwrite, which is

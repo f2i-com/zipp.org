@@ -3632,7 +3632,7 @@ impl Jit {
                 }
                 {
                     let (a, n) = f.code_span();
-                    crate::vm::prof::pc::register(a, n, format!("fn{func_id} whole-fn"));
+                    crate::vm::prof::pc::register(a, n, || format!("fn{func_id} whole-fn"));
                 }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
@@ -3725,7 +3725,7 @@ impl Jit {
                 }
                 {
                     let (a, n) = f.code_span();
-                    crate::vm::prof::pc::register(a, n, format!("fn{func_id} whole-fn"));
+                    crate::vm::prof::pc::register(a, n, || format!("fn{func_id} whole-fn"));
                 }
                 self.compiled.insert(func_id, f);
                 self.set_fn_state(func_id, FN_COMPILED);
@@ -3777,7 +3777,7 @@ impl Jit {
             // B237: array-map kernels are emitted bodies too; without this
             // their samples land in the profiler's unattributed bucket.
             let (a, n) = f.code_span();
-            crate::vm::prof::pc::register(a, n, format!("fn{func_id} map-kernel"));
+            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} map-kernel"));
         }
         self.map_kernels.insert(func_id, compiled);
         entry
@@ -3795,7 +3795,7 @@ impl Jit {
             // B237: array-reduce kernels are emitted bodies too; without this
             // their samples land in the profiler's unattributed bucket.
             let (a, n) = f.code_span();
-            crate::vm::prof::pc::register(a, n, format!("fn{func_id} reduce-kernel"));
+            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} reduce-kernel"));
         }
         self.reduce_kernels.insert(func_id, compiled);
         entry
@@ -3813,7 +3813,7 @@ impl Jit {
             // B237: array-filter kernels are emitted bodies too; without this
             // their samples land in the profiler's unattributed bucket.
             let (a, n) = f.code_span();
-            crate::vm::prof::pc::register(a, n, format!("fn{func_id} filter-kernel"));
+            crate::vm::prof::pc::register(a, n, || format!("fn{func_id} filter-kernel"));
         }
         self.filter_kernels.insert(func_id, compiled);
         entry
@@ -4113,7 +4113,7 @@ impl Jit {
                         // becomes known.
                         let (a, n) = code.code_span();
                         crate::vm::prof::pc::register(
-                            a, n, format!("fn{func_id} region [{start},{end}]"));
+                            a, n, || format!("fn{func_id} region [{start},{end}]"));
                     }
                     self.regions.insert(
                         key,
@@ -4181,7 +4181,7 @@ impl Jit {
                             // becomes known.
                             let (a, n) = code.code_span();
                             crate::vm::prof::pc::register(
-                                a, n, format!("fn{func_id} region [{start},{end}]"));
+                                a, n, || format!("fn{func_id} region [{start},{end}]"));
                         }
                         self.regions.insert(
                             key,
@@ -4249,7 +4249,7 @@ impl Jit {
                     // becomes known.
                     let (a, n) = code.code_span();
                     crate::vm::prof::pc::register(
-                        a, n, format!("fn{func_id} region [{start},{end}]"));
+                        a, n, || format!("fn{func_id} region [{start},{end}]"));
                 }
                 self.regions.insert(
                     key,
@@ -4320,7 +4320,7 @@ impl Jit {
                     // becomes known.
                     let (a, n) = code.code_span();
                     crate::vm::prof::pc::register(
-                        a, n, format!("fn{func_id} region [{start},{end}]"));
+                        a, n, || format!("fn{func_id} region [{start},{end}]"));
                 }
                 self.regions.insert(
                     key,

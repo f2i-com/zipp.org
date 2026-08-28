@@ -2155,6 +2155,14 @@ pub(crate) fn static_key_plan_usage(functions: &[FuncProto]) -> Option<(usize, u
     Some((sites, bytes))
 }
 
+/// Stack slots a `FinalizeObject` build stages its values in — the baked
+/// JIT helper, the interpreter arm, and the compiler's admission cap
+/// (`OBJECT_FINALIZE_MAX_FIELDS` is defined FROM this) are one number, so
+/// no compiled program can exceed the buffer. The runtime checks that quote
+/// it exist for a hand-built `Program`: a 17-key plan under the old `> 256`
+/// guard indexed past a 16-slot buffer.
+pub(crate) const FINALIZE_STAGE_SLOTS: usize = 16;
+
 impl StaticKeyPlan {
     pub(crate) fn new(keys: Vec<String>) -> Self {
         let runtime_valid = if keys.len() > 256 {

@@ -9,6 +9,8 @@
 #![allow(unused_imports)]
 use super::*;
 
+use crate::bytecode::FINALIZE_STAGE_SLOTS;
+
 /// Same-binary ablation for the Tier-C object-literal lane.
 ///
 /// Latching once keeps environment access out of both compilation and native
@@ -243,7 +245,7 @@ pub(crate) extern "win64" fn jit_finalize_object_baked(
     let val_base = (packed >> 16) as u16 as usize;
     let count = packed as u16 as usize;
     if count == 0
-        || count > 256
+        || count > FINALIZE_STAGE_SLOTS
         || val_base
             .checked_add(count)
             .is_none_or(|end| end > reg_count as usize)
@@ -262,7 +264,7 @@ pub(crate) extern "win64" fn jit_finalize_object_baked(
         // len agreement a stale pointer could not satisfy by accident.
         let plan = unsafe { &*(plan_ptr as usize as *const crate::bytecode::StaticKeyPlan) };
         debug_assert!(plan.runtime_valid() && plan.len() == count);
-        let mut buf = [Value::UNDEFINED; 16];
+        let mut buf = [Value::UNDEFINED; FINALIZE_STAGE_SLOTS];
         for offset in 0..count {
             let bits = unsafe { *regs.add(val_base + offset) };
             buf[offset] = Value::from_bits(bits);

@@ -19,7 +19,7 @@ const STATIC_KEY_PLAN_MAX_BYTES: usize = 64 * 1024;
 /// Field cap for the one-step `FinalizeObject` lowering. Its staged value block
 /// holds this many registers live at once, so the cap bounds literal register
 /// pressure; wider literals keep the per-field append sequence.
-const OBJECT_FINALIZE_MAX_FIELDS: usize = 16;
+const OBJECT_FINALIZE_MAX_FIELDS: usize = crate::bytecode::FINALIZE_STAGE_SLOTS;
 
 /// Retain at most one plan's admissible name indices while the literal body is
 /// compiled. `static_keys` continues counting the full unique-static run, so a

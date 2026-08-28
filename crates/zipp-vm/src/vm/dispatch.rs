@@ -4717,7 +4717,7 @@ impl<'p> Vm<'p> {
                         // with the authoritative plan is malformed input and
                         // fails closed before allocation.
                         if !plan.runtime_valid()
-                            || plan.len() > 256
+                            || plan.len() > crate::bytecode::FINALIZE_STAGE_SLOTS
                             || plan.is_empty()
                             || plan.len() != count as usize
                             || (val_base as usize)
@@ -4730,9 +4730,9 @@ impl<'p> Vm<'p> {
                         }
                         let shape = self.finalize_shape(func_id, plan_idx, &plan);
                         // B187: values staged in a stack buffer (count <= 16 by
-                        // the compile gate), the map's storage comes from the
-                        // literal slab — no per-object Vec round-trip.
-                        let mut buf = [Value::UNDEFINED; 16];
+                        // the compile gate AND the check above), the map's storage
+                        // comes from the literal slab — no per-object Vec round-trip.
+                        let mut buf = [Value::UNDEFINED; crate::bytecode::FINALIZE_STAGE_SLOTS];
                         for i in 0..count {
                             buf[i as usize] = self.get(base, val_base + i);
                         }
