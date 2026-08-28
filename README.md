@@ -93,12 +93,12 @@ On 2026-08-25 the engine took a deliberate security-hardening turn (sandbox
 metering, allocation/iteration ceilings, a hardened allocator build — see
 [SECURITY.md](SECURITY.md)); some of that protection is paid for in hot-path
 time, and the numbers below are the honest post-hardening state, measured on
-the definitive clean PGO capture of `0467393`.
+the definitive clean PGO capture of `b2db432`.
 
 | | |
 |---|---|
 | **Conformance** | **99.991% of test262** — 95,933 of 95,942 executions on this capture's binary: the six historical expected failures plus three module-code failures that arrived with the security hardening (they reproduce on the pristine hardening commit; ledger B181) — zero from the performance waves, and the waves' full sweeps have twice CAUGHT wrong-answer classes before landing (B181, and B189a's ctor-receiver find below) |
-| **Performance** | **all-13 geomean 0.69× Node**; fastest engine on 6 of 13 rows; the retained-ten headline **0.971×**. The 17-row hostile corpus reaches **0.936×** — a series best by a wide margin (0.961× before it) — after a run of cross-call admission fixes moved five of its eight remaining gaps at once: stable shapes 1.82× → **1.66×**, megamorphic 1.78× → **1.60×**, mixed locals 1.34× → **1.20×**, the warm router 1.78× → **1.70×**, and branch control across to **0.87×** |
+| **Performance** | **all-13 geomean 0.68× Node**; fastest engine on 6 of 13 rows; the retained-ten headline **0.965×**, its best reading of the series. The 17-row hostile corpus reaches **0.920×** — a series best (0.936× before it) — on the first PROFILE-guided waves: an instruction-pointer profiler showed the four biggest hostile rows sharing one object-lifecycle profile, and two bounded fixes to it moved stable shapes 1.66× → **1.53×**, the React-shaped reconciler 1.86× → **1.78×**, megamorphic shapes 1.60× → **1.57×** and the bytecode interpreter 0.96× → **0.92×**; on the real corpus two JSON waves took json-large 1.27× → **1.19×** |
 
 ### Speed vs Node, Bun and Deno
 
@@ -106,25 +106,26 @@ Cold wall time including process launch, 21 paired runs per row with
 deterministically shuffled engine and benchmark order. Bold time = fastest
 engine; bold ratio = zipp beats Node. Every output is byte-identical across all
 four engines.
-Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `0467393` (PGO build).
+Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `b2db432` (PGO build).
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| map-set-heavy | 578ms | 719ms | 1019ms | **577ms** | **1.00×** |
-| typedarray-math | 201ms | 905ms | 136ms | **133ms** | **0.66×** |
-| class-prototype-hot | 294ms | 336ms | 292ms | **235ms** | **0.80×** |
-| parse-large-js | 268ms | **229ms** | 251ms | 241ms | **0.90×** |
-| async-promise-chain | 329ms | 366ms | **323ms** | 361ms | 1.10× |
-| json-large | 254ms | **192ms** | 274ms | 322ms | 1.27× |
-| markdown-render | 266ms | **210ms** | 278ms | 251ms | **0.95×** |
-| regex-log-scan | 442ms | 561ms | **419ms** | 528ms | 1.19× |
-| sparse-array | **80ms** | 102ms | 93ms | 80ms | 1.01× |
-| polymorphic-objects | 322ms | 330ms | **299ms** | 320ms | **0.99×** |
-| **zipp / engine median geomean** | **0.69×** | **0.58×** | **0.67×** | — | |
+| map-set-heavy | 625ms | 784ms | 1105ms | **604ms** | **0.97×** |
+| typedarray-math | 203ms | 916ms | 139ms | **136ms** | **0.67×** |
+| class-prototype-hot | 300ms | 337ms | 295ms | **238ms** | **0.80×** |
+| parse-large-js | 270ms | **231ms** | 255ms | 246ms | **0.91×** |
+| async-promise-chain | 335ms | 370ms | **327ms** | 365ms | 1.09× |
+| json-large | 267ms | **196ms** | 284ms | 316ms | 1.19× |
+| markdown-render | 272ms | **216ms** | 290ms | 254ms | **0.94×** |
+| regex-log-scan | 452ms | 571ms | **423ms** | 554ms | 1.21× |
+| sparse-array | **81ms** | 104ms | 97ms | 82ms | 1.01× |
+| polymorphic-objects | 326ms | 335ms | **304ms** | 326ms | 1.01× |
+| **zipp / engine median geomean** | **0.68×** | **0.58×** | **0.66×** | — | |
 
 The paired zipp/Node result across all 13 rows is **0.682×** and the
-retained-ten headline is **0.9661×** — both series bests, and the headline's
-first move back under parity since the hardening turn was priced in.
+retained-ten headline is **0.9648×** — the headline's best reading of the
+series (0.9661× and 0.971× before it), and its third capture running under
+parity since the hardening turn was priced in.
 
 **Two rows crossed under parity on this capture, and by mechanism rather
 than by luck.** `parse-large-js` went 1.15× → **0.89×** when the INT-splice
@@ -168,7 +169,7 @@ margin — no snapshot to load:
 
 | zipp | node | deno | bun |
 |---|---|---|---|
-| **9.0ms** | 30.2ms | 47.8ms | 57.1ms |
+| **9.3ms** | 31.0ms | 49.1ms | 58.3ms |
 
 A long-running server would amortize that away; a CLI tool would not.
 
@@ -180,9 +181,9 @@ comparability; zipp is fastest on all three:
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| sparse-array-v2 | 170ms | 365ms | 146ms | **97ms** | **0.57×** |
-| polymorphic-objects-v2 | 81ms | 90ms | 95ms | **29ms** | **0.36×** |
-| property-ic-shapes | 260ms | 159ms | 275ms | **12ms** | **0.05×** |
+| sparse-array-v2 | 172ms | 372ms | 150ms | **99ms** | **0.57×** |
+| polymorphic-objects-v2 | 84ms | 92ms | 99ms | **30ms** | **0.36×** |
+| property-ic-shapes | 265ms | 161ms | 279ms | **13ms** | **0.05×** |
 
 The wins come from guarded, exact-shape stream and reducer paths plus the new
 shape-keyed native ways described below. They are strong evidence for these
@@ -201,12 +202,22 @@ npm source.
 
 Hostile results are never folded into the retained-ten headline. They are
 the generalisation gate — and the corpus now holds **under parity for the
-second capture running**: the current publishable capture
-([`head_clean_0467393_pgo`](bench/hostile/head_clean_0467393_pgo_2026-08-28.json),
-zipp at `0467393`, full corpus, 15 counterbalanced repetitions, exact on
-all 17 rows) measures **0.9356× cold ordinary geomean** — the fourth
-capture running under parity and a series best by a wide margin (0.961×,
-0.9637× and 0.961× before it, against 1.0266× five captures ago). The waves that moved it: a
+fifth capture running**: the current publishable capture
+([`head_clean_b2db432_pgo`](bench/hostile/head_clean_b2db432_pgo_2026-08-28.json),
+zipp at `b2db432`, full corpus, 15 counterbalanced repetitions, exact on
+all 17 rows) measures **0.9200× cold ordinary geomean** — a series best
+(0.9356×, 0.961×, 0.9637× and 0.961× before it, against 1.0266× six
+captures ago). This capture's move is the first PROFILE-guided one: the
+engine gained an instruction-pointer profiler (B237) after three
+allocation-side charters had been designed against guesses and measured
+null, and its first profile showed the four biggest hostile rows sharing
+one object-lifecycle profile — freeing, dropping, allocating and
+mirror-settling ~25–30% of each. Two bounded fixes to that path (B238,
+B239) took stable shapes 1.66× → **1.53×**, the React-shaped reconciler
+1.86× → **1.78×**, megamorphic shapes 1.60× → **1.57×** and the bytecode
+interpreter 0.96× → **0.92×**; and the same capture discipline caught a
+fixed +1.5ms startup cost the profiler's own linking had introduced, which
+no latch could see (B240). Earlier waves: a
 25-agent adversarial review of the object-lifecycle campaign confirmed and
 fixed seven defects, two of them wrong-answer classes (B207); a one-line
 W11-era staleness fix converted 243k fail-closed cross-call window
