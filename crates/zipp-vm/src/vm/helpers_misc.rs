@@ -5254,7 +5254,10 @@ pub(crate) extern "win64" fn jit_leaf_same_func_proto(
     if !callee.is_heap()
         || callee.heap_index() as usize >= vm.heap.len()
         || vm.get_function_realm(callee) != 0
-        || vm.closure_eval_scope.contains_key(&callee.heap_index())
+        // B242: a closure carries a dynamic eval scope only if a direct eval
+        // ran; the map is empty otherwise, and the probe is per call.
+        || (!vm.closure_eval_scope.is_empty()
+            && vm.closure_eval_scope.contains_key(&callee.heap_index()))
     {
         // Sloppy call `this` is realm-sensitive. The plan bakes the main-realm
         // global, so a live child-realm instance must take OrdinaryCallBindThis

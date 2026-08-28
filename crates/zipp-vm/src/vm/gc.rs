@@ -125,8 +125,23 @@ impl Vm<'_> {
         #[cfg(not(feature = "safe-sandbox"))]
         let unlocked = self.gc_lock == 0;
         if unlocked && self.gc_floor != 0 && (self.heap.gc_requested() || self.gc_stress) {
-            self.gc();
+            self.gc_from_poll();
         }
+    }
+
+    /// B242: the collector behind the poll, kept OUT OF LINE on purpose.
+    ///
+    /// `maybe_gc` is `#[inline]` and is polled once per object by every JIT
+    /// allocation helper; with `gc()` called directly from it, LLVM inlined
+    /// the whole collector into the poll (the linker map of the `b2db432`
+    /// profiling build has no `Vm::gc` or `sweep_young` symbol at all — only
+    /// `maybe_gc`), so the poll could not itself inline into its callers and
+    /// every allocation paid a call to reach four loads. This shim gives the
+    /// collector one cold body and lets the poll be the loads alone.
+    #[cold]
+    #[inline(never)]
+    fn gc_from_poll(&mut self) {
+        self.gc();
     }
 
     /// Stage-3 write barrier + B6 oracle, one latched call per store
