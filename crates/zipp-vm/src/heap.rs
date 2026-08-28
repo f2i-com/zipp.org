@@ -5073,13 +5073,14 @@ impl Heap {
             return self.alloc(HeapObj::Object(boxed));
         }
         let vals = boxed.vals.as_ptr() as u64;
-        let idx = self.alloc_slot(HeapObj::Object(boxed));
-        self.hot_mirror[idx as usize] = HotMirror {
-            shape,
-            fid: FID_MIRROR_NONE,
-            vals,
-        };
-        idx
+        self.alloc_settled(
+            HeapObj::Object(boxed),
+            Some(HotMirror {
+                shape,
+                fid: FID_MIRROR_NONE,
+                vals,
+            }),
+        )
     }
 
     /// Refresh slot `idx`'s shape/vals mirrors from the live object — the
@@ -5158,30 +5159,21 @@ impl Heap {
 
     #[inline]
     pub fn alloc(&mut self, obj: HeapObj) -> u32 {
-        let idx = self.alloc_slot(obj);
-        self.refresh_mirror(idx);
-        idx
+        self.alloc_settled(obj, None)
     }
 
-    /// B238: everything `alloc` does EXCEPT settle the mirrors.
+    /// B238/B240: the one allocation body, which settles the occupant's hot
+    /// mirror from `hot` when the caller already knows it and by re-reading
+    /// the occupant otherwise.
     ///
-    /// Split out so a caller that already knows the occupant's mirror can
-    /// write it directly instead of paying `refresh_mirror` to rediscover it.
-    /// Both of the old `refresh_mirror` call sites were followed only by
-    /// nursery and oracle bookkeeping, neither of which reads a mirror, so
-    /// moving the write after them is order-independent.
-    ///
-    /// Every caller MUST settle the mirrors before the slot is observable:
-    /// a stale hot mirror is a wrong shape for an inline cache, not a slow
-    /// path. `alloc` and `alloc_object_settled` are the only two.
-    ///
-    /// `inline(always)`: with two callers LLVM stopped inlining this back into
-    /// `alloc`, which turned the generic allocation path -- the one an
-    /// allocation-heavy row that is NOT literal-born uses for everything --
-    /// into a call it never used to make. survival read +0.73% until this was
-    /// forced, against -1.2% to -1.5% on the four literal-born rows.
-    #[inline(always)]
-    fn alloc_slot(&mut self, obj: HeapObj) -> u32 {
+    /// B238 first expressed this as a `alloc_slot` split with the mirror
+    /// written by the caller. That needed `#[inline(always)]` — with two
+    /// callers LLVM stopped inlining the split half back into `alloc`, turning
+    /// the generic path into a call it never used to make (survival read
+    /// +0.73%) — and forcing it grew the binary by 664KB, which is I-cache
+    /// pressure charged to every row. Passing the mirror instead keeps one
+    /// body and one copy: `alloc` is a wrapper LLVM folds away.
+    fn alloc_settled(&mut self, obj: HeapObj, hot: Option<HotMirror>) -> u32 {
         // Sizing every allocation is only worth paying once something reads
         // the figure; `audit_resident_bytes` turns accounting on and backfills
         // (see `payload_accounting`), so lazily-enabled totals stay exact.
@@ -5210,6 +5202,10 @@ impl Heap {
                 self.resident_payload_charged[idx as usize].set(payload);
             }
             self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+            match hot {
+                Some(h) => self.hot_mirror[idx as usize] = h,
+                None => self.refresh_mirror(idx),
+            }
             if self.nursery {
                 if self.pretenure == 0 {
                     self.young.push(idx);
@@ -5245,6 +5241,10 @@ impl Heap {
         self.this_mirror.push(Value::UNDEFINED.bits());
         self.upvals_mirror.push(0);
         self.recache_mirror_raws();
+        match hot {
+            Some(h) => self.hot_mirror[idx as usize] = h,
+            None => self.refresh_mirror(idx),
+        }
         if self.nursery {
             if self.pretenure == 0 {
                 self.young.push(idx);

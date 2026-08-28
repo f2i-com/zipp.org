@@ -247,15 +247,48 @@ pub(crate) mod pc {
         fn GetThreadContext(t: Handle, ctx: *mut u8) -> i32;
     }
 
-    #[link(name = "dbghelp")]
-    extern "system" {
-        fn SymInitialize(process: Handle, search_path: *const u8, invade: i32) -> i32;
-        fn SymSetOptions(options: u32) -> u32;
-        fn SymFromAddr(process: Handle, addr: u64, disp: *mut u64, sym: *mut u8) -> i32;
-    }
-
     extern "system" {
         fn GetModuleHandleW(name: *const u16) -> usize;
+        fn LoadLibraryA(name: *const u8) -> usize;
+        fn GetProcAddress(module: usize, name: *const u8) -> usize;
+    }
+
+    type SymInitializeFn = unsafe extern "system" fn(Handle, *const u8, i32) -> i32;
+    type SymSetOptionsFn = unsafe extern "system" fn(u32) -> u32;
+    type SymFromAddrFn = unsafe extern "system" fn(Handle, u64, *mut u64, *mut u8) -> i32;
+
+    /// dbghelp, resolved at REPORT time rather than linked.
+    ///
+    /// A `#[link(name = "dbghelp")]` block would put the DLL in the import
+    /// table and the loader would map it before `main` in every run —
+    /// measured at +1.1ms of process startup, which is nothing on a 100ms row
+    /// and +8% on a 15ms one. The profiler is the only caller and runs once,
+    /// after sampling stops, so a runtime lookup is free here.
+    struct DbgHelp {
+        from_addr: SymFromAddrFn,
+    }
+
+    fn load_dbghelp() -> Option<DbgHelp> {
+        // SAFETY: plain library/symbol lookup by NUL-terminated name; each
+        // result is used only through the signature dbghelp documents for it.
+        unsafe {
+            let m = LoadLibraryA(b"dbghelp.dll\0".as_ptr());
+            if m == 0 {
+                return None;
+            }
+            let init = GetProcAddress(m, b"SymInitialize\0".as_ptr());
+            let opts = GetProcAddress(m, b"SymSetOptions\0".as_ptr());
+            let from = GetProcAddress(m, b"SymFromAddr\0".as_ptr());
+            if init == 0 || opts == 0 || from == 0 {
+                return None;
+            }
+            let init: SymInitializeFn = std::mem::transmute(init);
+            let set_options: SymSetOptionsFn = std::mem::transmute(opts);
+            let from_addr: SymFromAddrFn = std::mem::transmute(from);
+            set_options(SYMOPT);
+            init(GetCurrentProcess(), std::ptr::null(), 1);
+            Some(DbgHelp { from_addr })
+        }
     }
 
     /// `(base, size)` of the running executable, read from its own PE headers:
@@ -400,7 +433,7 @@ pub(crate) mod pc {
     /// Rust symbols come back mangled; the mangling still carries the crate and
     /// module path, which is what makes the profile readable, so no demangler
     /// is pulled in for it.
-    fn symbolicate(addr: u64) -> Option<String> {
+    fn symbolicate(dbg: &DbgHelp, addr: u64) -> Option<String> {
         let mut buf = [0u8; SYMBOL_INFO_SIZE + SYMBOL_NAME_CAP];
         let mut disp: u64 = 0;
         // SAFETY: `buf` is larger than SYMBOL_INFO plus the name capacity we
@@ -412,7 +445,7 @@ pub(crate) mod pc {
                 buf.as_mut_ptr().add(SYMBOL_MAXNAME_OFF) as *mut u32,
                 SYMBOL_NAME_CAP as u32 - 1,
             );
-            if SymFromAddr(GetCurrentProcess(), addr, &mut disp, buf.as_mut_ptr()) == 0 {
+            if (dbg.from_addr)(GetCurrentProcess(), addr, &mut disp, buf.as_mut_ptr()) == 0 {
                 return None;
             }
             let name = buf.as_ptr().add(SYMBOL_NAME_OFF);
@@ -445,12 +478,9 @@ pub(crate) mod pc {
         let mut tally: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
         let mut sym_cache: std::collections::HashMap<u64, Option<String>> =
             std::collections::HashMap::new();
-        // SAFETY: initialising the symbol handler for our own process, once,
-        // after sampling has stopped. A failure just leaves addresses unnamed.
-        unsafe {
-            SymSetOptions(SYMOPT);
-            SymInitialize(GetCurrentProcess(), std::ptr::null(), 1);
-        }
+        // Resolved once, after sampling has stopped. A failure just leaves
+        // addresses unnamed, which the offset reporting below handles.
+        let dbg = load_dbghelp();
         let module = main_module();
         let mut outside = 0u64;
         for i in 0..total {
@@ -466,7 +496,7 @@ pub(crate) mod pc {
             let name = match sym_cache.entry(rip) {
                 std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    let n = symbolicate(rip);
+                    let n = dbg.as_ref().and_then(|d| symbolicate(d, rip));
                     e.insert(n.clone());
                     n
                 }
