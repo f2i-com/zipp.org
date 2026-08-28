@@ -2175,6 +2175,16 @@ impl StaticKeyPlan {
         }))
     }
 
+    /// B239: do these two handles name the SAME plan? Plans are immutable and
+    /// shared by `Arc`, so pointer equality is a sound (if incomplete) answer
+    /// to "are these key sequences identical", and the only one cheap enough
+    /// to ask on every object construction.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    pub(crate) fn ptr_eq(a: &Self, b: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&a.0, &b.0)
+    }
+
     /// Precomputed "any key names an array element" bit — see the field doc.
     #[inline]
     pub(crate) fn has_element_key(&self) -> bool {

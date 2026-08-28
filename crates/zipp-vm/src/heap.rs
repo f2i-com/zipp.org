@@ -1822,6 +1822,81 @@ impl ObjMap {
         Self::finalized_from_store(plan, ValStore::Vec(vals), shape)
     }
 
+    /// B239: rebuild a POOLED shell in place as a finalized literal.
+    ///
+    /// Observably identical to `finalized_from_store` followed by assigning
+    /// the result over the shell. It exists because that assignment moves all
+    /// fourteen fields and, more importantly, drops the shell's old `keys`
+    /// against a fresh `Arc` clone of what at a hot literal site is the SAME
+    /// plan — two atomic RMWs per object to end where it started. `ptr_eq`
+    /// keeps the `Arc` the shell already holds and that pair disappears.
+    ///
+    /// EVERY field is named rather than `..`-elided, deliberately: a field
+    /// added to `ObjMap` must break this function to compile, because a field
+    /// left holding the previous occupant's state is a wrong answer, not a
+    /// slow path. The values are `ObjMap::new`'s defaults with exactly what
+    /// `finalized_from_store` overwrites applied on top.
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn refit_finalized(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
+        let n = plan.len();
+        let ObjMap {
+            keys,
+            vals: store,
+            attrs,
+            class,
+            extensible,
+            is_ctor,
+            is_raw_json,
+            sealed,
+            frozen,
+            index,
+            numeric_index,
+            has_element_key,
+            planned_append_failed,
+            shape: shape_slot,
+        } = self;
+        match keys {
+            PropKeys::Planned { all, visible_len } if StaticKeyPlan::ptr_eq(all, plan) => {
+                *visible_len = n;
+            }
+            _ => {
+                *keys = PropKeys::Planned {
+                    all: plan.clone(),
+                    visible_len: n,
+                }
+            }
+        }
+        *store = vals;
+        *attrs = PropAttrs::AllData { len: n as u32 };
+        *class = None;
+        *extensible = true;
+        *is_ctor = false;
+        *is_raw_json = false;
+        *sealed = false;
+        *frozen = false;
+        *index = None;
+        *numeric_index = None;
+        *has_element_key = plan.has_element_key();
+        *planned_append_failed = false;
+        *shape_slot = shape;
+        // The same cold tails `finalized_from_store` builds, on the same
+        // conditions.
+        if self.has_element_key && sparse_num_index_enabled() {
+            let mut numeric = Box::new(rustc_hash::FxHashMap::default());
+            for (slot, key) in self.keys.as_ref().iter().enumerate() {
+                if let Some(idx) = canonical_array_index_key(key) {
+                    numeric.insert(idx, slot as u32);
+                }
+            }
+            self.numeric_index = Some(numeric);
+        }
+        if n >= PROP_INDEX_THRESHOLD {
+            self.index = Some(PropIndex::build(&self.keys));
+        }
+        static_key_stats::object();
+        static_key_stats::bulk_appends(n);
+    }
+
     /// Store-generic finalize constructor (B187 stage 2): identical to
     /// `finalized_from_plan` in every observable respect, over either value
     /// representation. Only [`Heap::alloc_finalized`] passes a `Slab` store.
@@ -3723,6 +3798,23 @@ pub(crate) fn key_pool_enabled() -> bool {
     }
 }
 
+/// B239 latch: `ZIPP_NO_SHELL_REFIT=1` builds a fresh `ObjMap` and assigns it
+/// over the pooled shell, as before.
+#[cfg(not(feature = "safe-sandbox"))]
+fn shell_refit_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SHELL_REFIT").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// B238 latch: `ZIPP_NO_SETTLED_ALLOC=1` makes the finalize path settle its
 /// mirror through `refresh_mirror` again, as before.
 fn settled_alloc_enabled() -> bool {
@@ -4907,7 +4999,7 @@ impl Heap {
     /// authoritative). `ZIPP_NO_VAL_SLAB=1` keeps the historical `Vec` form.
     pub fn alloc_finalized(
         &mut self,
-        plan: crate::bytecode::StaticKeyPlan,
+        plan: &crate::bytecode::StaticKeyPlan,
         vals: &[Value],
         shape: u32,
     ) -> u32 {
@@ -4936,7 +5028,7 @@ impl Heap {
         };
         #[cfg(feature = "safe-sandbox")]
         let store = ValStore::Vec(vals.to_vec());
-        let map = ObjMap::finalized_from_store(plan, store, shape);
+
         // B187 stage 3: serve the box from the recycle pool when the sweep
         // has stocked it — the overwrite drops the shell's deferred plan Arc
         // and costs one 112-byte store in place of an allocator round-trip.
@@ -4947,13 +5039,17 @@ impl Heap {
                 if self.oracle {
                     self.obj_pool_stats[1] += 1;
                 }
-                *b = map;
+                if shell_refit_enabled() {
+                    b.refit_finalized(plan, store, shape);
+                } else {
+                    *b = ObjMap::finalized_from_store(plan.clone(), store, shape);
+                }
                 b
             }
-            None => Box::new(map),
+            None => Box::new(ObjMap::finalized_from_store(plan.clone(), store, shape)),
         };
         #[cfg(feature = "safe-sandbox")]
-        let boxed = Box::new(map);
+        let boxed = Box::new(ObjMap::finalized_from_store(plan.clone(), store, shape));
         // B238: the shape came in as an argument and the store pointer is in
         // hand, so the mirror needs no rediscovery.
         self.alloc_object_settled(boxed, shape)
@@ -7856,7 +7952,7 @@ pub fn bench_floor_decompose(
         for (j, &bits) in vals.iter().enumerate() {
             buf[j] = Value::num((bits ^ (i as u64 ^ j as u64)) as f64);
         }
-        let idx = h.alloc_finalized(plan.clone(), &buf[..vals.len()], shape);
+        let idx = h.alloc_finalized(plan, &buf[..vals.len()], shape);
         keep = keep.wrapping_add(idx as usize & 7);
         h.free_slot(idx);
     }
@@ -7874,7 +7970,7 @@ pub fn bench_floor_decompose(
         for (j, &bits) in vals.iter().enumerate() {
             buf[j] = Value::num((bits ^ (i as u64 ^ j as u64)) as f64);
         }
-        let idx = h.alloc_finalized(plan.clone(), &buf[..vals.len()], shape);
+        let idx = h.alloc_finalized(plan, &buf[..vals.len()], shape);
         keep = keep.wrapping_add(idx as usize & 7);
         h.free_slot(idx);
     }

@@ -4737,7 +4737,7 @@ impl<'p> Vm<'p> {
                             buf[i as usize] = self.get(base, val_base + i);
                         }
                         let v = Value::heap(self.heap.alloc_finalized(
-                            plan,
+                            &plan,
                             &buf[..count as usize],
                             shape,
                         ));

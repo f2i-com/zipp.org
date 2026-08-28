@@ -267,7 +267,7 @@ pub(crate) extern "win64" fn jit_finalize_object_baked(
             let bits = unsafe { *regs.add(val_base + offset) };
             buf[offset] = Value::from_bits(bits);
         }
-        let idx = vm.heap.alloc_finalized(plan.clone(), &buf[..count], shape);
+        let idx = vm.heap.alloc_finalized(&plan, &buf[..count], shape);
         vm.realm_born(idx, vm.obj_proto);
         crate::heap::note_static_key_jit_object();
         Value::heap(idx).bits()
@@ -328,7 +328,7 @@ pub(crate) extern "win64" fn jit_finalize_object(
             buf[offset] = Value::from_bits(bits);
         }
         let shape = vm.finalize_shape(func_id, plan_idx as u16, &plan);
-        let idx = vm.heap.alloc_finalized(plan, &buf[..count], shape);
+        let idx = vm.heap.alloc_finalized(&plan, &buf[..count], shape);
         vm.realm_born(idx, vm.obj_proto);
         crate::heap::note_static_key_jit_object();
         Value::heap(idx).bits()
