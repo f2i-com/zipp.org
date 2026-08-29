@@ -38,6 +38,7 @@ benchmark manipulation.
 
 | item | current disposition | measured result |
 |---|---|---|
+| **B247 CAPTURE — current canonical PGO truth, plus bounded whole-repository verification on Windows** | **publishable and exact; literal all-engine/all-row goal NOT met** | [`real13_9151043_pgo_2026-08-29`](bench/real13_9151043_pgo_2026-08-29.json), 15 counterbalanced repetitions, Node 24.12.0 / Bun 1.3.14 / Deno 2.6.10, `publishable:true`, `ALL_CORRECT=1`: retained-ten Zipp/Node **2.1567× [2.150, 2.179]**, diagnostic-three **0.1875× [0.185, 0.190]**, all-13 **1.2274× [1.223, 1.238]**. All-13 is **1.0698× Bun** and **1.0583× Deno**. Zipp wins 20/39 paired medians and 18/39 Bonferroni exact-sign comparisons, so the strict target remains false; startup is **7.7ms** versus Node 31.7ms. The first attempted capture also found the new full-repository byte verifier exceeding Windows' command-line limit at 944 tracked paths. `git ls-tree` pathspecs are now count/length bounded in batches, covered by the 163-test tool suite; the live verifier returns clean on all 944 paths. PGO binary SHA-256 `91ae5e38…c7962e0b`, profile `34ab30dd…746ed273`, source `9151043`. |
 | **B244b LANDED — dense-Array snapshot epochs remove redundant cross-call refreshes** | **mechanism and wall-time win; safe fallbacks retained** | A versioned snapshot lets repeated eligible cross3 entries reuse the same dense-Array state until a mutating/GC boundary invalidates it. The mechanism probe falls from **479,986 helper calls to 2**. Same-binary paired A/B: `calls-closures` **−5.16% [−5.63, −4.13]**, React-shaped hostile work **−0.86% [−2.18, −0.13]**; survival/router/shapes/types/sparse/store-heavy showed no statistically significant regression. Correctness covers mutation, GC stress, kill switch, deopt, and all execution modes. |
 | **B243 LANDED — bounded cross3 inline call window/root-stack fast path** | **`calls-closures` −6.19%; hostile call-heavy rows about −3%** | The proven same-proto cross-call path now avoids the generic call-window/root-stack machinery inside its guarded bound and falls back outside it. The A/B is same-binary, byte-exact, and includes tier/deopt/GC adversaries. Together B243+B244 attack the per-call substrate left after the earlier splice and capture work rather than adding another benchmark-specific reducer. |
 | **B245 LANDED — allocator trust split restores trusted-CLI throughput without weakening the hostile runner** | **all-13 geomean −11.87% [−12.46, −11.37] versus secure allocator in the same source** | The ordinary JIT CLI defaults to mimalloc's throughput mode; `secure-allocator` remains opt-in there, while the separately resolved no-JIT `zipp-sandbox` retains mimalloc secure mode and forbids engine unsafe code. Biggest exact-source non-PGO wins: json −34.7%, regex −24.1%, markdown −18.5%, map/set −15.5%, polymorphic −8.7%; async −1.5% and typed arrays −1.0%. This is a trust-boundary correction, not removal of sandbox hardening. |
@@ -375,16 +376,17 @@ is a `diff`, not a remembered number. It was stale for a long stretch (the
 2,194-line oxc-era list against a 938-failure run), which made that diff
 meaningless — regenerate it in the same commit that moves the number.
 
-### Performance — current all-13 cold result 0.5728× Node (2026-08-24, 21 reps)
+### Historical B138 all-13 result — 0.5728× Node (2026-08-24, 21 reps)
 
-The authoritative current capture is
+This once-authoritative capture is retained as historical evidence; B247 and
+the current README now carry the policy-valid status for `9151043`. The B138
+capture is
 `bench/four_engine_cc0d557_pgo_2026-08-24.json`: all 13 **0.572835× Node
 [0.569491, 0.576240]**, headline ten **0.785991× [0.782006, 0.790530]**,
 diagnostics-only **0.199559× [0.196732, 0.201854]**, and zipp holds the strict
 lowest median against Node, Bun, and Deno on every row. All outputs are exact;
-the clean PGO source is `cc0d557`. The retained-ten/diagnostic classification is
-preserved for historical comparison, not because either set now loses. See
-B138 for provenance and the final two mechanisms.
+the clean PGO source is `cc0d557`. It must not be presented as the current
+tree's performance. See B138 for provenance and the final two mechanisms.
 
 Everything below in this subsection is a retained historical snapshot of how
 the campaign moved from 1.86×; its old “at HEAD” language refers to the commit

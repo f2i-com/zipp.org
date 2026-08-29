@@ -100,84 +100,58 @@ code at compile time.
 
 ## Where it stands
 
-The historical retained-ten headline and the three architecture diagnostics
-are still reported separately so the long-running series remains comparable.
-On 2026-08-25 the engine took a deliberate security-hardening turn (sandbox
-metering, allocation/iteration ceilings, a hardened allocator build — see
-[SECURITY.md](SECURITY.md)); some of that protection is paid for in hot-path
-time, and the numbers below are the honest post-hardening state, measured in
-the retained legacy PGO capture
-[`real13_b2db432_pgo`](bench/real13_b2db432_pgo_2026-08-28.json) at `b2db432`.
-That capture predates the stricter per-process environment and PGO-provenance
-publication envelope documented below, so it is historical evidence rather
-than a current-policy artifact.
+The current measurement is the policy-valid PGO capture
+[`real13_9151043_pgo_2026-08-29`](bench/real13_9151043_pgo_2026-08-29.json) at
+`9151043`. It records `publishable:true`, `ALL_CORRECT=1`, a clean repository
+before and after measurement, 15 complete counterbalanced repetitions, and no
+engine, source, input, or process-health drift. The retained ten and the three
+architecture diagnostics are reported separately so the long-running series
+does not silently change meaning.
 
 | | |
 |---|---|
-| **Conformance** | **99.991% of test262** — 95,933 of 95,942 executions on this capture's binary: the six historical expected failures plus three module-code failures that arrived with the security hardening (they reproduce on the pristine hardening commit; ledger B181) — zero from the performance waves, and the waves' full sweeps have twice CAUGHT wrong-answer classes before landing (B181, and B189a's ctor-receiver find below) |
-| **Performance** | **all-13 geomean 0.68× Node**; fastest engine on 6 of 13 rows; the retained-ten headline **0.965×**, its best reading of the series. The 17-row hostile corpus reached **0.920×** — a series best (0.936× before it) — on the first PROFILE-guided waves: an instruction-pointer profiler showed the four biggest hostile rows sharing one object-lifecycle profile, and two bounded fixes to it moved stable shapes 1.66× → **1.53×**, the React-shaped reconciler 1.86× → **1.78×**, megamorphic shapes 1.60× → **1.57×** and the bytecode interpreter 0.96× → **0.92×**; on the real corpus two JSON waves took json-large 1.27× → **1.19×** |
+| **Conformance** | The latest full test262 figure remains the historical **99.991%** capture (95,933 of 95,942 executions at `b2db432`); test262 was not rerun for `9151043`, so that number is not attributed to the current binary. The current Rust/Python/sandbox/wasm regression gates are green. |
+| **Security** | Root, standalone-sandbox, and wasm dependency audits report zero known advisories; the landing package reports zero npm vulnerabilities. The separately resolved `zipp-sandbox` remains no-JIT, secure-allocator, unsafe-forbidden, metered, and resource-bounded. Regex transient limits, realm/call guards, exact deopt replay tests, and fuzz differentials remain enabled. |
+| **Performance** | Current all-13 Zipp/Node geomean **1.227×** [1.223, 1.238]; retained-ten headline **2.157×** [2.150, 2.179]; diagnostic-three **0.188×** [0.185, 0.190]. Zipp is the lowest median engine on 5 of 13 rows and starts in **7.7ms**, but the literal all-engine/all-row target is **not yet met**: 20/39 median comparisons and 18/39 Bonferroni exact-sign comparisons are wins. |
 
 ### Speed vs Node, Bun and Deno
 
 Cold wall time including process launch, 15 paired runs per row with
-deterministically shuffled engine and benchmark order. Bold time = fastest
-engine; bold ratio = zipp beats Node. Every stdout result is byte-identical
-across all four engines.
-Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `b2db432` (PGO build).
+deterministically shuffled engine and benchmark order. Bold time is the lowest
+median; bold ratio means the paired Zipp/Node median is below one. Every stdout
+result is byte-identical across all four engines.
+
+Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · Zipp at `9151043` (canonical PGO).
+The Zipp executable SHA-256 is
+`91ae5e38a792478f5f86515836876672b7dded8a29d8c45c75ce8ab0c7962e0b`.
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| map-set-heavy | 625ms | 784ms | 1105ms | **604ms** | **0.97×** |
-| typedarray-math | 203ms | 916ms | 139ms | **136ms** | **0.67×** |
-| class-prototype-hot | 300ms | 337ms | 295ms | **238ms** | **0.80×** |
-| parse-large-js | 270ms | **231ms** | 255ms | 246ms | **0.91×** |
-| async-promise-chain | 335ms | 370ms | **327ms** | 365ms | 1.09× |
-| json-large | 267ms | **196ms** | 284ms | 316ms | 1.19× |
-| markdown-render | 272ms | **216ms** | 290ms | 254ms | **0.94×** |
-| regex-log-scan | 452ms | 571ms | **423ms** | 554ms | 1.21× |
-| sparse-array | **81ms** | 104ms | 97ms | 82ms | 1.01× |
-| polymorphic-objects | 326ms | 335ms | **304ms** | 326ms | 1.01× |
-| **zipp / engine median geomean** | **0.68×** | **0.58×** | **0.66×** | — | |
+| async-promise-chain | **332ms** | 365ms | 354ms | 464ms | 1.39× |
+| class-prototype-hot | 298ms | 330ms | 325ms | **222ms** | **0.74×** |
+| json-large | 258ms | **189ms** | 307ms | 1150ms | 4.43× |
+| map-set-heavy | **720ms** | 805ms | 1177ms | 810ms | 1.10× |
+| markdown-render | 267ms | **209ms** | 307ms | 1334ms | 5.01× |
+| parse-large-js | 272ms | **226ms** | 287ms | 2668ms | 9.81× |
+| polymorphic-objects | 326ms | 329ms | 339ms | **305ms** | **0.94×** |
+| regex-log-scan | 459ms | 559ms | **454ms** | 2385ms | 5.21× |
+| sparse-array | **82ms** | 108ms | 128ms | 104ms | 1.27× |
+| typedarray-math | 204ms | 910ms | **171ms** | 290ms | 1.42× |
+| **Zipp / engine paired geomean** | **2.157×** [2.150, 2.179] | **1.856×** [1.842, 1.863] | **1.897×** [1.887, 1.914] | — | |
 
-The paired zipp/Node result across all 13 rows is **0.682×** and the
-retained-ten headline is **0.9648×** — the headline's best reading of the
-series (0.9661× and 0.971× before it), and its third capture running under
-parity since the hardening turn was priced in.
+Across all 13 measured rows, including the three diagnostics below, the paired
+Zipp/engine geomeans are **1.227× Node** [1.223, 1.238], **1.070× Bun**
+[1.064, 1.074], and **1.058× Deno** [1.053, 1.066]. Zipp has a sub-one paired
+median on 5/13 Node comparisons, 8/13 Bun comparisons, and 7/13 Deno
+comparisons: **20/39** point wins. The Bonferroni-adjusted exact one-sided sign
+gate proves **18/39** (5 Node, 6 Bun, 7 Deno) at 5% family-wise alpha. Therefore
+`FASTER_THAN_EVERY_ENGINE_ON_EVERY_ROW=0`; the remaining gaps are work to do,
+not wins hidden by an aggregate.
 
-**Two rows crossed under parity on this capture, and by mechanism rather
-than by luck.** `parse-large-js` went 1.15× → **0.89×** when the INT-splice
-planner learned to admit one call form inside its replay span (B223: a
-`charCodeAt` on a pinned flat-ASCII string is provably a guarded byte load,
-so re-running it after a deopt is a pure re-read — admitted by proof, never
-by method name, and the effectful `arr.push` sibling stays excluded). That
-single admission is worth −22.5% on the row, more than double the floor a
-hand-inlined twin had predicted, because the splice lets the whole enclosing
-region reach the register tier instead of merely inlining the callee.
-`polymorphic-objects` went 1.05× → **0.99×** on two append-path waves —
-hashing each dynamic key once instead of twice (B219) and recycling key
-buffers freed by `delete` (B220).
-
-Zipp remains ahead of every engine on the all-row geomean (0.68× Node,
-0.58× Bun, 0.67× Deno). Three rows still trail Node meaningfully:
-json-large 1.27× and regex-log-scan 1.14× are purely the hardened-allocator
-trade (secure-off measures parity; ledger B182), and async-promise-chain
-1.08×, whose remaining deficit is attributed to one loop shape the register
-tier declines by design (ledger B218 and the `SetIndex` charter).
-map-set-heavy (1.01×) and sparse-array (1.01×) sit at parity within noise.
-
-**Where those five rows went.** The previous capture (`cc0d557`, pre-hardening)
-measured 13/13 fastest and retained-ten 0.786×. The hardening commit
-intentionally spends time for safety: allocation and iteration ceilings on the
-string/array builtins, spec-live (per-element, interleaved-observation) array
-stringification, fallible allocation on guest-controlled growth, and a
-guarded-allocator CLI build (`mimalloc` secure mode, measured at tens of
-percent on allocation-heavy workloads, ~85% of that attributable to the
-allocator feature itself). One outright defect in that commit — a full-heap
-audit walk on every guarded string append even with no meter attached, which
-took markdown-render from 0.3s to 258s+ — was found and fixed (`6e8898d`;
-B180 in the ledger records why every relative A/B gate was blind to it).
-Recovering the five rows *under the hardened semantics* is the active
-campaign; the hardening itself is a deliberate trade and stays.
+The earlier [`real13_b2db432_pgo`](bench/real13_b2db432_pgo_2026-08-28.json)
+capture remains useful historical evidence, but it predates the current
+source and stricter publication envelope. Its faster figures are not presented
+as the current engine's result.
 
 ### Startup
 
@@ -186,7 +160,7 @@ margin — no snapshot to load:
 
 | zipp | node | deno | bun |
 |---|---|---|---|
-| **9.3ms** | 31.0ms | 49.1ms | 58.3ms |
+| **7.7ms** | 31.7ms | 81.9ms | 44.3ms |
 
 A long-running server would amortize that away; a CLI tool would not.
 
@@ -198,13 +172,14 @@ comparability; zipp is fastest on all three:
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
 |---|---|---|---|---|---|
-| sparse-array-v2 | 172ms | 372ms | 150ms | **99ms** | **0.57×** |
-| polymorphic-objects-v2 | 84ms | 92ms | 99ms | **30ms** | **0.36×** |
-| property-ic-shapes | 265ms | 161ms | 279ms | **13ms** | **0.05×** |
+| polymorphic-objects-v2 | 84ms | 87ms | 128ms | **24ms** | **0.29×** |
+| property-ic-shapes | 263ms | 155ms | 306ms | **10ms** | **0.04×** |
+| sparse-array-v2 | 171ms | 367ms | 186ms | **101ms** | **0.59×** |
+| **Zipp / engine paired geomean** | **0.188×** [0.185, 0.190] | **0.170×** [0.168, 0.173] | **0.151×** [0.148, 0.155] | — | |
 
-The wins come from guarded, exact-shape stream and reducer paths plus the new
-shape-keyed native ways described below. They are strong evidence for these
-workloads, not proof that broad object-model parity is complete.
+The wins come from guarded exact-shape paths. They are strong evidence for
+these workloads, not proof of broad object-model parity; this is why their
+0.188× Node geomean is kept out of the retained-ten headline.
 
 ### Hostile application diagnostics
 
@@ -428,7 +403,7 @@ back in ([`DOC.md`](DOC.md#embedding)).
 ```
 
 ```sh
-python tools/bench.py --zipp target/x86_64-pc-windows-msvc/release/zipp.exe --engines node,bun,deno,zipp --reps 21
+python tools/bench.py --zipp target/x86_64-pc-windows-msvc/release/zipp.exe --engines node,bun,deno,zipp --reps 15 --bootstrap-samples 10000 --json bench/real13_<commit>_pgo_<date>.json
 python tools/bench_hostile.py --zipp target/x86_64-pc-windows-msvc/release/zipp.exe --reps 15  # separate generalisation gate
 ```
 
