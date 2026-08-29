@@ -418,10 +418,14 @@ pub enum Instr {
         dst: Reg,
         a: Reg,
     },
-    /// `dst = Array.isArray(a)` — true iff `a` is a heap array.
+    /// Guarded `Array.isArray(a)`. `callee`/`this_v` snapshot the live member
+    /// reference before `a` was evaluated; an intrinsic-identity miss performs
+    /// an ordinary call with those values.
     IsArray {
         dst: Reg,
         a: Reg,
+        callee: Reg,
+        this_v: Reg,
     },
     /// `dst = JSON.stringify(val, _, space)` — `space` is the indentation arg
     /// (a number → that many spaces, a string → that string, else compact).
@@ -429,11 +433,15 @@ pub enum Instr {
         dst: Reg,
         val: Reg,
         space: Reg,
+        callee: Reg,
+        this_v: Reg,
     },
     /// `dst = JSON.parse(a)` — parse a JSON string; throws SyntaxError on invalid.
     JsonParse {
         dst: Reg,
         a: Reg,
+        callee: Reg,
+        this_v: Reg,
     },
     /// Append to array `arr`: when `spread`, append every element of `val` (an
     /// array, or a string's chars); otherwise push `val` as one element. Used to
@@ -753,6 +761,7 @@ pub enum Instr {
     /// `dst = super.<name>(args…)`: call the named method found from the
     /// captured super base (`base`, a SuperBase register) up its chain, with
     /// `this` = the current frame's `this` (reg 0).
+    #[allow(dead_code)] // sealed legacy op: source calls now capture GetValue before arguments
     SuperMethod {
         dst: Reg,
         base: Reg,
@@ -775,7 +784,28 @@ pub enum Instr {
         home_class_id: u32,
         key: Reg,
     },
+    /// Call/tag reference form of `super.<name>`. Unlike `SuperGet`, the
+    /// compile-site receiver and static/instance home selection are explicit;
+    /// inline static-field initializers do not share the enclosing frame's
+    /// reg-0 `this` or its FuncProto-level `super_static` flag.
+    SuperGetRef {
+        dst: Reg,
+        home_class_id: u32,
+        name: u32,
+        receiver: Reg,
+        is_static: bool,
+    },
+    /// Computed call/tag-reference form of `SuperGetRef`.
+    SuperGetRefComputed {
+        dst: Reg,
+        home_class_id: u32,
+        key: Reg,
+        receiver: Reg,
+        is_static: bool,
+    },
     /// `dst = super[key](args…)`: computed form of SuperMethod.
+    #[allow(dead_code)]
+    // retained only while its interpreter/codegen support is retired safely
     SuperMethodComputed {
         dst: Reg,
         base: Reg,
@@ -832,6 +862,7 @@ pub enum Instr {
     /// `dst = super.name(args…)` inside an OBJECT method: resolve `name` on
     /// GetPrototypeOf the executing closure's [[HomeObject]], call it with
     /// `this` = the current receiver.
+    #[allow(dead_code)] // sealed legacy op; `SuperGetObj` + `CallWithThis` replaced it
     SuperMethodObj {
         dst: Reg,
         name: u32,
@@ -839,6 +870,7 @@ pub enum Instr {
         argc: u16,
     },
     /// `dst = super[key](args…)` inside an object method (computed form).
+    #[allow(dead_code)] // sealed legacy op; exact captured callable dispatch supersedes it
     SuperMethodObjComputed {
         dst: Reg,
         key: Reg,
@@ -887,51 +919,65 @@ pub enum Instr {
     },
     /// `dst = Array(args…)` / `new Array(args…)`: a single numeric arg makes an
     /// array of that length (holes → undefined); otherwise an array of the args.
+    /// A syntactic user call/construct carries the exact `callee` captured before
+    /// argument evaluation and takes this fast path only while it is the main
+    /// realm's intrinsic Array constructor. `None` is reserved for internal array
+    /// creation sites which are not observable calls.
     ArrayCtor {
         dst: Reg,
+        callee: Option<Reg>,
         arg_base: Reg,
         argc: u16,
+        is_construct: bool,
     },
     /// `dst = new Map(src?)` — build a Map from an optional iterable of [k,v]
     /// entries (`src` register, or `None` for an empty map).
+    #[allow(dead_code)] // internal legacy op; syntactic `new Map` uses generic New
     NewMap {
         dst: Reg,
         src: Option<Reg>,
     },
     /// `dst = new Set(src?)` — build a Set from an optional iterable of values.
+    #[allow(dead_code)] // internal legacy op; syntactic `new Set` uses generic New
     NewSet {
         dst: Reg,
         src: Option<Reg>,
     },
     /// `dst = new WeakMap(src?)` / `new WeakSet(src?)` — like NewMap/NewSet but a
     /// distinct WeakMap/WeakSet type, and keys/values must be objects.
+    #[allow(dead_code)]
     NewWeakMap {
         dst: Reg,
         src: Option<Reg>,
     },
+    #[allow(dead_code)]
     NewWeakSet {
         dst: Reg,
         src: Option<Reg>,
     },
     /// `dst = new WeakRef(target)` — target must be an object.
+    #[allow(dead_code)]
     NewWeakRef {
         dst: Reg,
         target: Reg,
     },
     /// `dst = new String/Number/Boolean(arg?)` — a boxed primitive wrapper.
     /// `kind` 0=String/1=Number/2=Boolean; `arg` is the (optional) argument register.
+    #[allow(dead_code)]
     NewBox {
         dst: Reg,
         kind: u8,
         arg: Option<Reg>,
     },
     /// `dst = new FinalizationRegistry(cleanupCallback)` — callback must be callable.
+    #[allow(dead_code)]
     NewFinalizationRegistry {
         dst: Reg,
         cleanup: Reg,
     },
     /// `dst = new Promise(executor)` — alloc a pending promise, call `executor`
     /// with its (resolve, reject) functions; a throwing executor rejects it.
+    #[allow(dead_code)]
     NewPromise {
         dst: Reg,
         executor: Reg,
@@ -943,9 +989,19 @@ pub enum Instr {
         callee: Reg,
         args: Reg,
     },
+    /// Call the already-captured `callee` with the already-captured receiver,
+    /// spreading `args`. Used for namespace statics so their property Get
+    /// precedes spread-argument iteration.
+    CallWithThisSpread {
+        dst: Reg,
+        callee: Reg,
+        this_v: Reg,
+        args: Reg,
+    },
     /// `dst = obj[name](...args_array)` — method call spreading the elements of
     /// the array in `args` (`this` = obj). Handles builtin methods (e.g.
     /// `arr.push(...xs)`) and user methods alike.
+    #[allow(dead_code)] // sealed legacy op: its property Get occurred after spread iteration
     CallMethodSpread {
         dst: Reg,
         obj: Reg,
@@ -955,6 +1011,7 @@ pub enum Instr {
     /// `dst = obj[key](...args_array)` — computed-member method call spreading the
     /// elements of `args` (`this` = obj). The computed-key analogue of
     /// `CallMethodSpread` (binds `this`, unlike `CallSpread` on the GET result).
+    #[allow(dead_code)] // sealed legacy op: use captured GetIndex + CallWithThisSpread
     CallMethodComputedSpread {
         dst: Reg,
         obj: Reg,
@@ -963,6 +1020,7 @@ pub enum Instr {
     },
     /// `dst = super.name(...args_array)` — super method call spreading the elements
     /// of `args` (`this` = the current receiver). The spread analogue of SuperMethod.
+    #[allow(dead_code)] // sealed legacy op: use SuperGetRef + CallWithThisSpread
     SuperMethodSpread {
         dst: Reg,
         home_class_id: u32,
@@ -970,6 +1028,7 @@ pub enum Instr {
         args: Reg,
     },
     /// `super[key](...args_array)`: computed form of SuperMethodSpread.
+    #[allow(dead_code)] // sealed legacy op: use SuperGetRefComputed + CallWithThisSpread
     SuperMethodComputedSpread {
         dst: Reg,
         home_class_id: u32,
@@ -988,22 +1047,35 @@ pub enum Instr {
     MathOp {
         dst: Reg,
         op: MathFn,
+        callee: Reg,
+        this_v: Reg,
         arg_base: Reg,
         argc: u16,
     },
     /// `dst = <Number|parseInt|parseFloat>(args…)` — a builtin global function.
+    /// `callee` is the exact value captured before argument evaluation. The
+    /// specialised path is guarded by identity with the main-realm intrinsic;
+    /// a miss ordinary-calls this value with the complete argument list.
     GlobalFn {
         dst: Reg,
         op: GlobalFn,
+        callee: Reg,
         arg_base: Reg,
         argc: u16,
     },
-    /// `dst = <static builtin>(args…)` — a constructor-namespace static method
-    /// over `argc` contiguous arg registers (Object.assign, Array.of,
-    /// String.fromCharCode, Number.isInteger/isNaN/isFinite/isSafeInteger).
+    /// `dst = <static builtin>(args…)` — a guarded constructor-namespace static
+    /// call over `argc` contiguous arg registers. `callee` and `this_v` are the
+    /// live method value and namespace receiver captured before argument
+    /// evaluation. The runtime takes the specialised path only when both still
+    /// identify the current realm's intrinsic; otherwise it performs an ordinary
+    /// call with these already-captured values. Keeping the reference in the
+    /// bytecode is required for `Object.assign(sideEffect())`-style calls where
+    /// an argument replaces the method after EvaluateCall has resolved it.
     StaticFn {
         dst: Reg,
         op: StaticFn,
+        callee: Reg,
+        this_v: Reg,
         arg_base: Reg,
         argc: u16,
     },
@@ -1013,20 +1085,18 @@ pub enum Instr {
         dst: Reg,
         src: Reg,
         mapfn: Reg,
+        callee: Reg,
+        this_v: Reg,
+        argc: u16,
     },
     /// `dst = Math.<op>(...arr)` — a variadic Math reduction (max/min/hypot)
     /// applied to the elements of the array in `args`.
     MathSpread {
         dst: Reg,
         op: MathFn,
+        callee: Reg,
+        this_v: Reg,
         args: Reg,
-    },
-    /// `dst = (val instanceof <ctor>)` for a built-in constructor (Array, Object,
-    /// Function, Error and its subclasses). User constructors are out of scope.
-    InstanceOf {
-        dst: Reg,
-        val: Reg,
-        ctor: InstanceCtor,
     },
     /// `dst = (val instanceof ctor)` where `ctor` is a runtime class value: true
     /// when `val` is an instance whose class is `ctor`.
@@ -1265,6 +1335,7 @@ pub enum Instr {
     },
     /// `dst = Symbol(desc?)` — a fresh unique Symbol primitive. `desc` (when present)
     /// is coerced to a string description (undefined → no description).
+    #[allow(dead_code)] // internal legacy op; syntactic Symbol uses generic Call
     MakeSymbol {
         dst: Reg,
         desc: Option<Reg>,
@@ -1282,6 +1353,7 @@ pub enum Instr {
     },
     /// `dst = BigInt(arg)` — convert a number/string/boolean/BigInt to a BigInt
     /// (non-integer number → RangeError; symbol/null/undefined → TypeError).
+    #[allow(dead_code)] // internal legacy op; syntactic BigInt uses generic Call
     BigIntFrom {
         dst: Reg,
         arg: Reg,
@@ -1302,6 +1374,8 @@ pub enum Instr {
     ObjectKeys {
         dst: Reg,
         obj: Reg,
+        callee: Reg,
+        this_v: Reg,
     },
     /// `dst = <for-in key list>` — own + INHERITED enumerable string keys, walking
     /// the [[Prototype]] chain with shadowing dedup (vs `ObjectKeys`, own-only).
@@ -1327,11 +1401,15 @@ pub enum Instr {
     ObjectValues {
         dst: Reg,
         obj: Reg,
+        callee: Reg,
+        this_v: Reg,
     },
     /// `dst = Object.entries(obj)` — array of `[key, value]` pair arrays.
     ObjectEntries {
         dst: Reg,
         obj: Reg,
+        callee: Reg,
+        this_v: Reg,
     },
     /// `dst = <length of array/string in obj>` (0 for anything else). Used by
     /// the `for-of` desugaring's bound check.
@@ -1602,6 +1680,19 @@ pub enum Instr {
         arg_base: Reg,
         argc: u16,
     },
+    /// Captured-reference call for the four RegExp-heavy method spellings.
+    /// `callee` and `this_v` were resolved before the argument list exactly as
+    /// for `CallWithThis`. The VM may enter the direct intrinsic lane only when
+    /// `callee` is the exact setup-time main-realm function for `op`; every
+    /// miss ordinary-calls that captured pair with the complete argument list.
+    RegExpMethod {
+        dst: Reg,
+        op: RegExpMethod,
+        callee: Reg,
+        this_v: Reg,
+        arg_base: Reg,
+        argc: u16,
+    },
 
     /// `dst = eval(arg)` — a DIRECT eval call (the callee is the unshadowed global
     /// `eval` identifier) emitted only from STRICT-mode code, so the evaluated
@@ -1618,10 +1709,21 @@ pub enum Instr {
         dst: Reg,
     },
 
+    /// A call whose syntactic callee is the IdentifierReference `eval`.
+    /// `callee` and `this_v` are the exact reference captured before argument
+    /// evaluation; the runtime applies direct-eval semantics iff `callee` is
+    /// this realm's %eval%.  Otherwise it performs an ordinary call with the
+    /// complete argument list and captured receiver (`undefined`, except for a
+    /// `with` object environment's WithBaseObject).
+    ///
+    /// Normally the arguments occupy `[arg_base, arg_base + argc)`.  With
+    /// `args_array`, `arg_base` instead names the materialized spread-argument
+    /// array and `argc` is zero; this preserves a dynamically-sized complete
+    /// argument list without re-reading the callee after spread iteration.
+    ///
     /// `tail`: the call sits in a proper-tail-call RETURN position — when the
-    /// runtime identity check finds `eval` REBOUND (an ordinary call of that
-    /// value, not a direct eval), the frame is reused like `TailCall`
-    /// (tco-non-eval-global: `eval = f; return eval(n-1)` must be a PTC).
+    /// captured callee is not %eval% (an ordinary call), the frame is reused
+    /// like `TailCall`.
     /// `derived_ctor`: the call site is inside a DERIVED-class constructor, so
     /// `super(...)` in the eval'd code is legal (PerformEval inherits the
     /// caller's this-binding status along with its lexical environment).
@@ -1631,7 +1733,11 @@ pub enum Instr {
     /// the class name, an enclosing function's `C` does not.
     DirectEval {
         dst: Reg,
-        arg: Reg,
+        callee: Reg,
+        this_v: Reg,
+        arg_base: Reg,
+        argc: u16,
+        args_array: bool,
         new_target_ok: bool,
         this_reg: Reg,
         home_class: u32,
@@ -1644,17 +1750,6 @@ pub enum Instr {
         var_env_is_global: bool,
         site: u16,
         tail: bool,
-    },
-
-    /// `dst = (src IS the realm's %eval% intrinsic)`. Lets a call site whose
-    /// callee reference is NAMED `eval` but does not resolve to the unshadowed
-    /// global (a local/param/upvalue binding, or a `with`-object property)
-    /// still take the direct-eval path when the live value is %eval%
-    /// (13.3.6.1 tests the reference's name and the callee VALUE, not where
-    /// the binding lives).
-    IsEvalFn {
-        dst: Reg,
-        src: Reg,
     },
 
     /// ResolveBinding for a strict `name = …` on a global the program does not
@@ -1685,6 +1780,8 @@ pub enum Instr {
 
     /// `dst = obj.<string_constants[name]>(args…)` — method call with `this`
     /// bound to `obj`. Arguments occupy `[arg_base, arg_base+argc)`.
+    #[allow(dead_code)]
+    // sealed legacy op: its property Get occurred after argument evaluation
     CallMethod {
         dst: Reg,
         obj: Reg,
@@ -1694,6 +1791,7 @@ pub enum Instr {
     },
     /// `dst = obj[key](args…)` — computed method call: resolve the method by the
     /// runtime `key`, then call it with `this` bound to `obj`.
+    #[allow(dead_code)] // sealed legacy op: use captured GetIndex + CallWithThis
     CallMethodComputed {
         dst: Reg,
         obj: Reg,
@@ -1838,18 +1936,23 @@ pub enum Instr {
     },
     /// `new Date(...)` → a Date. 0 args = now; 1 number = epoch ms; 1 string =
     /// parsed; ≥2 = (year, month0, day, h, m, s, ms) interpreted as UTC.
+    #[allow(dead_code)] // internal legacy op; syntactic `new Date` uses generic New
     DateNew {
         dst: Reg,
         arg_base: Reg,
         argc: u16,
     },
     /// `Date.UTC(year, month0, …)` → epoch ms (a number, not a Date).
+    #[allow(dead_code)]
+    // retained for internal bytecode compatibility; calls are reference-captured
     DateUTC {
         dst: Reg,
         arg_base: Reg,
         argc: u16,
     },
     /// `Date.parse(str)` → epoch ms (NaN if unparseable).
+    #[allow(dead_code)]
+    // retained for internal bytecode compatibility; calls are reference-captured
     DateParse {
         dst: Reg,
         src: Reg,
@@ -2326,7 +2429,8 @@ impl MathFn {
 }
 
 /// A builtin global function, resolved at compile time from a bare call.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum GlobalFn {
     Number,
     String,
@@ -2337,7 +2441,42 @@ pub enum GlobalFn {
     IsFinite,
 }
 
+/// Hot method spellings whose captured calls have a guarded RegExp-specialized
+/// implementation. The spelling is only a compile-time hint: runtime identity
+/// decides whether the direct implementation or exact ordinary-call fallback
+/// runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RegExpMethod {
+    Test,
+    Exec,
+    MatchAll,
+    Replace,
+}
+
+impl RegExpMethod {
+    pub const COUNT: usize = 4;
+
+    #[inline]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "test" => Self::Test,
+            "exec" => Self::Exec,
+            "matchAll" => Self::MatchAll,
+            "replace" => Self::Replace,
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
 impl GlobalFn {
+    pub const COUNT: usize = 7;
+
     pub fn from_name(name: &str) -> Option<GlobalFn> {
         Some(match name {
             "Number" => GlobalFn::Number,
@@ -2349,6 +2488,11 @@ impl GlobalFn {
             "isFinite" => GlobalFn::IsFinite,
             _ => return None,
         })
+    }
+
+    #[inline]
+    pub const fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -2436,44 +2580,6 @@ pub enum BitwiseOp {
     Shl,
     Shr,
     Ushr,
-}
-
-/// A built-in constructor recognised on the right of `instanceof`. The engine
-/// has no user-level prototype chain, so `x instanceof C` is decided
-/// structurally: by the heap kind of `x`, and (for errors) its `name` field.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InstanceCtor {
-    Array,
-    Object,
-    Function,
-    /// The `Error` base — matches any error subtype.
-    Error,
-    TypeError,
-    RangeError,
-    SyntaxError,
-    ReferenceError,
-    EvalError,
-    UriError,
-    AggregateError,
-}
-
-impl InstanceCtor {
-    pub fn from_name(name: &str) -> Option<InstanceCtor> {
-        Some(match name {
-            "Array" => InstanceCtor::Array,
-            "Object" => InstanceCtor::Object,
-            "Function" => InstanceCtor::Function,
-            "Error" => InstanceCtor::Error,
-            "TypeError" => InstanceCtor::TypeError,
-            "RangeError" => InstanceCtor::RangeError,
-            "SyntaxError" => InstanceCtor::SyntaxError,
-            "ReferenceError" => InstanceCtor::ReferenceError,
-            "EvalError" => InstanceCtor::EvalError,
-            "URIError" => InstanceCtor::UriError,
-            "AggregateError" => InstanceCtor::AggregateError,
-            _ => return None,
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug)]

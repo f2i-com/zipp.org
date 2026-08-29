@@ -397,7 +397,13 @@ impl<'a> FnCompiler<'a> {
         self.note_block_lexicals(stmts);
         for st in stmts {
             let pre = |fc: &mut Self, name: &str| {
-                if fc.captured.contains(name)
+                // The immutable global value names must also exist as TDZ
+                // bindings from block entry when shadowed by a local lexical.
+                // Otherwise a read before `let undefined`/`NaN`/`Infinity`
+                // incorrectly takes the compiler's constant fallback.  These
+                // declarations are rare, so giving just them the cell-backed
+                // TDZ path has no cost for ordinary blocks.
+                if (fc.captured.contains(name) || matches!(name, "undefined" | "NaN" | "Infinity"))
                     && !fc.scopes.last().unwrap().iter().any(|(n, _)| n == name)
                 {
                     let r = fc.alloc_reg();

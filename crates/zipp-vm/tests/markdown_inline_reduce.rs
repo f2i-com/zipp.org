@@ -274,14 +274,33 @@ fn child_realm_helper_uses_its_own_string_intrinsics() {
     if std::env::var_os("ZIPP_MARKDOWN_INLINE_CHILD").is_some() {
         return;
     }
+    let definitions = PRELUDE
+        .split("for (var warm")
+        .next()
+        .expect("PRELUDE warmup marker");
+    if std::env::var_os("ZIPP_MARKDOWN_ACCEPT_CHILD").is_some() {
+        // Prove the semantic recogniser still installs and the live main-realm
+        // helper/intrinsic guards accept the exact fast-path shape. This is a
+        // separate process because the reducer's engagement log is once-only.
+        let body = r#"
+        var helperResult = "";
+        for (var h = 0; h < 300; h++) helperResult = renderInline("`a&`");
+        console.log("helper=" + helperResult);
+        "#;
+        let src = format!("{definitions}\n{body}");
+        let out = zipp_vm::run(&src).expect("source compiles");
+        assert!(
+            out.error.is_none(),
+            "unexpected runtime error: {:?}",
+            out.error
+        );
+        assert_eq!(out.output, ["helper=<code>a&amp;</code>"]);
+        return;
+    }
     if std::env::var_os("ZIPP_MARKDOWN_REALM_CHILD").is_some() {
         // Define the exact functions without PRELUDE's main-realm warmup: the
         // child process's JIT log can then prove that a plan installs while a
         // child-realm exact helper is live, but the reducer never accepts it.
-        let definitions = PRELUDE
-            .split("for (var warm")
-            .next()
-            .expect("PRELUDE warmup marker");
         let body = r#"
         var helperRealm = $262.createRealm().global;
         var realmEscape = helperRealm.eval("(" + escapeHtml.toString() + ")");
@@ -314,6 +333,34 @@ fn child_realm_helper_uses_its_own_string_intrinsics() {
     }
 
     let exe = std::env::current_exe().expect("test binary path");
+    let main = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "child_realm_helper_uses_its_own_string_intrinsics",
+            "--nocapture",
+        ])
+        .env("ZIPP_MARKDOWN_ACCEPT_CHILD", "1")
+        .env("ZIPP_JITLOG", "1")
+        .env("ZIPP_JIT_THRESHOLD", "1")
+        .env_remove("ZIPP_MARKDOWN_REALM_CHILD")
+        .env_remove("ZIPP_NO_MARKDOWN_INLINE_REDUCE")
+        .env_remove("ZIPP_NOJIT")
+        .output()
+        .expect("main-realm guard child");
+    let main_stderr = String::from_utf8_lossy(&main.stderr);
+    assert!(
+        main.status.success(),
+        "main-realm helper child failed:\n{main_stderr}"
+    );
+    assert!(
+        main_stderr.contains("markdown-inline plan installed"),
+        "main-realm helper plan never installed:\n{main_stderr}"
+    );
+    assert!(
+        main_stderr.contains("markdown-inline reducer accepted"),
+        "main-realm exact helper never reached the reducer:\n{main_stderr}"
+    );
+
     let child = std::process::Command::new(&exe)
         .args([
             "--exact",
@@ -323,6 +370,9 @@ fn child_realm_helper_uses_its_own_string_intrinsics() {
         .env("ZIPP_MARKDOWN_REALM_CHILD", "1")
         .env("ZIPP_JITLOG", "1")
         .env("ZIPP_JIT_THRESHOLD", "1")
+        .env_remove("ZIPP_MARKDOWN_ACCEPT_CHILD")
+        .env_remove("ZIPP_NO_MARKDOWN_INLINE_REDUCE")
+        .env_remove("ZIPP_NOJIT")
         .output()
         .expect("realm guard child");
     let stderr = String::from_utf8_lossy(&child.stderr);

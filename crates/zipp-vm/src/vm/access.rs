@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
-use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
     PromiseState, PropAttr, ReactionPair, Reactions,
@@ -825,8 +825,11 @@ impl<'p> Vm<'p> {
             match self.heap.get(cidx) {
                 HeapObj::Object(m) => {
                     if let Some(i) = m.pos(key) {
-                        governing =
-                            Some((m.attr_at(i).accessor, m.attr_at(i).writable, m.attr_at(i).setter));
+                        governing = Some((
+                            m.attr_at(i).accessor,
+                            m.attr_at(i).writable,
+                            m.attr_at(i).setter,
+                        ));
                         break;
                     }
                     if m.class.is_some() {
@@ -853,8 +856,13 @@ impl<'p> Vm<'p> {
                 }
                 _ => {
                     governing = self.arr_props.get(&cidx).and_then(|m| {
-                        m.pos(key)
-                            .map(|i| (m.attr_at(i).accessor, m.attr_at(i).writable, m.attr_at(i).setter))
+                        m.pos(key).map(|i| {
+                            (
+                                m.attr_at(i).accessor,
+                                m.attr_at(i).writable,
+                                m.attr_at(i).setter,
+                            )
+                        })
                     });
                     break;
                 }

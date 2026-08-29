@@ -332,6 +332,20 @@ pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
             argc,
             ..
         } => callee == r || in_args(arg_base, argc),
+        Instr::CallWithThis {
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        }
+        | Instr::RegExpMethod {
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        } => callee == r || this_v == r || in_args(arg_base, argc),
         Instr::TailCall {
             callee,
             arg_base,
@@ -343,9 +357,20 @@ pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
             argc,
             ..
         } => obj == r || in_args(arg_base, argc),
-        Instr::MathOp { arg_base, argc, .. } | Instr::StaticFn { arg_base, argc, .. } => {
-            in_args(arg_base, argc)
-        }
+        Instr::MathOp {
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        } => callee == r || this_v == r || in_args(arg_base, argc),
+        Instr::StaticFn {
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        } => callee == r || this_v == r || in_args(arg_base, argc),
         _ => true, // unrecognised op → assume it reads `r`
     }
 }
@@ -397,6 +422,8 @@ pub(crate) fn accum_touches(i: &Instr, r: Reg) -> bool {
         | Instr::GetIndex { dst, .. }
         | Instr::GetIndexConcat { dst, .. }
         | Instr::Call { dst, .. }
+        | Instr::CallWithThis { dst, .. }
+        | Instr::RegExpMethod { dst, .. }
         | Instr::CallMethod { dst, .. }
         | Instr::MathOp { dst, .. }
         | Instr::StaticFn { dst, .. }
@@ -469,6 +496,8 @@ pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
         | Instr::GetIndex { dst, .. }
         | Instr::GetIndexConcat { dst, .. }
         | Instr::Call { dst, .. }
+        | Instr::CallWithThis { dst, .. }
+        | Instr::RegExpMethod { dst, .. }
         | Instr::CallMethod { dst, .. }
         | Instr::MathOp { dst, .. }
         | Instr::StaticFn { dst, .. }

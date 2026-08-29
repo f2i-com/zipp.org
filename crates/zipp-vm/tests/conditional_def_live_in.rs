@@ -377,6 +377,7 @@ fn conddef_all_modes_answer_identically() {
 
 // ── mechanism pins ──────────────────────────────────────────────────────────
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn jitlog_of(src: &str) -> String {
     let exe = std::env::current_exe().expect("test exe path");
     let out = Command::new(&exe)

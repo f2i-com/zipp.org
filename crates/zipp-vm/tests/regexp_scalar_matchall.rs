@@ -58,6 +58,46 @@ console.log(RegExp.input + "|" + RegExp.lastMatch + "|" + RegExp.lastParen + "|"
     )
 }
 
+fn captured_matchall_accessor_src(n: usize) -> String {
+    format!(
+        r#"var N={n},lines=new Array(N);
+for(var j=0;j<N;j++)lines[j]="a=1 b=2";
+var reKv=/([a-z]+)=(\d+)/g,kvCount=0,kvSum=0,km,i=0;
+function scan(){{for(i=0;i<N;i++){{for(km of lines[i].matchAll(reKv)){{
+  kvCount++;kvSum=(kvSum+(+km[2]))|0;
+}}}}}}
+scan();
+i=0;kvCount=0;kvSum=0;var gets=0,calls=0;
+var desc=Object.getOwnPropertyDescriptor(String.prototype,"matchAll");
+var custom=function(){{calls++;return [["q=7","q","7"]];}};
+Object.defineProperty(String.prototype,"matchAll",{{configurable:true,get:function(){{
+  gets++;Object.defineProperty(String.prototype,"matchAll",desc);return custom;
+}}}});
+scan();
+console.log(kvCount+"|"+kvSum+"|"+gets+"|"+calls+"|"+km[0]);"#,
+    )
+}
+
+fn matchall_intrinsic_getter_then_delete_src(n: usize) -> String {
+    format!(
+        r#"var N={n},lines=new Array(N);
+for(var j=0;j<N;j++)lines[j]="a=1 b=2";
+var reKv=/([a-z]+)=(\d+)/g,kvCount=0,kvSum=0,km,i=0;
+function scan(){{for(i=0;i<N;i++){{for(km of lines[i].matchAll(reKv)){{
+  kvCount++;kvSum=(kvSum+(+km[2]))|0;
+}}}}}}
+scan();
+i=0;kvCount=0;kvSum=0;var gets=0,caught="none";
+var desc=Object.getOwnPropertyDescriptor(String.prototype,"matchAll");
+Object.defineProperty(String.prototype,"matchAll",{{configurable:true,get:function(){{
+  gets++;delete String.prototype.matchAll;return desc.value;
+}}}});
+try{{scan();}}catch(e){{caught=e.constructor.name;}}
+Object.defineProperty(String.prototype,"matchAll",desc);
+console.log(caught+"|"+i+"|"+kvCount+"|"+kvSum+"|"+gets+"|"+km[0]);"#,
+    )
+}
+
 #[test]
 fn pristine_final_result_last_index_and_annex_b_statics_match_node() {
     assert_matches_node(&core_src(HOT));
@@ -178,6 +218,20 @@ i=0;kvCount=0;kvSum=0;scan();
 String.prototype.matchAll=old;
 console.log(kvCount+"|"+kvSum+"|"+calls+"|"+km[0]);"#;
     assert_matches_node(src);
+}
+
+#[test]
+fn captured_matchall_accessor_value_is_not_replaced_by_its_restored_slot() {
+    // The getter restores the intrinsic slot before returning a custom method.
+    // The current call must use that captured custom Value exactly once.
+    assert_matches_node(&captured_matchall_accessor_src(HOT));
+}
+
+#[test]
+fn outer_reducer_rechecks_live_matchall_slot_after_intrinsic_accessor_deletes_it() {
+    // Returning the intrinsic permits this iteration's call, but deleting the
+    // slot makes the next outer Get throw. The reducer must not skip that Get.
+    assert_matches_node(&matchall_intrinsic_getter_then_delete_src(HOT));
 }
 
 #[test]
@@ -450,7 +504,12 @@ fn scalar_mode_child() {
     let Some(mode) = std::env::var_os("ZIPP_RX_SCALAR_MODE_CHILD") else {
         return;
     };
-    assert_matches_node(&core_src(HOT));
+    let src = if mode == "accessor_gcstress" {
+        matchall_intrinsic_getter_then_delete_src(HOT)
+    } else {
+        core_src(HOT)
+    };
+    assert_matches_node(&src);
     let scalar = zipp_vm::regexp_scalar_matchall_stats();
     if mode == "nojit" {
         assert_eq!(scalar, (0, 0, 0, 0, 0, 0));
@@ -475,6 +534,10 @@ fn zz_scalar_default_threshold1_nojit_and_gcstress_modes() {
         ("nojit", &[("ZIPP_NOJIT", "1")]),
         (
             "gcstress",
+            &[("ZIPP_GC_STRESS", "1"), ("ZIPP_JIT_THRESHOLD", "1")],
+        ),
+        (
+            "accessor_gcstress",
             &[("ZIPP_GC_STRESS", "1"), ("ZIPP_JIT_THRESHOLD", "1")],
         ),
     ];

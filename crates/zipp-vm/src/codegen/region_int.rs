@@ -165,9 +165,10 @@ pub(crate) fn emit_bool_home_zero(ops: &mut dynasmrt::x64::Assembler, plan: &Reg
 
 /// W20 M2 -- the pin slot of an INT-tier-admissible `arr.push(int)` at `ip`.
 ///
-/// Admissible means: the mechanism's latch is on, the op is a one-argument
-/// `push` `CallMethod`, and the OSR pin planner pinned its receiver as a dense
-/// Array observed all-Int (`ARR_INT_PIN_KIND`). The pin does three jobs at
+/// Admissible means: the mechanism's latch is on, the op is either a legacy
+/// one-argument `push` `CallMethod` or both endpoints of one exact captured
+/// `GetProp; CallWithThis` pair, and the OSR pin planner pinned its receiver as
+/// a dense Array observed all-Int (`ARR_INT_PIN_KIND`). The pin does three jobs at
 /// once -- it keeps the receiver register out of the numeric home set
 /// (`ta_recv_regs`), it supplies the identity guard the emitted arm checks
 /// before it touches anything, and its snapshot slot is where the helper writes
@@ -179,9 +180,63 @@ pub(crate) fn emit_bool_home_zero(ops: &mut dynasmrt::x64::Assembler, plan: &Reg
 /// loosening the pin kind, and the arm boxes from an i64 home, so the all-Int
 /// observation is also what makes the array's own contents match what it will
 /// keep pushing.
+fn captured_arr_push(proto: &FuncProto, ip: usize, ta_plan: &TaPinPlan) -> Option<CapturedPinCall> {
+    let site = match proto.code.get(ip)? {
+        Instr::GetProp { .. } => ta_plan.captured_get(ip)?,
+        Instr::CallWithThis { .. } => ta_plan.captured_call(ip)?,
+        _ => return None,
+    };
+    if site.get_ip >= site.call_ip
+        || site.argc != 1
+        || site.callee_bits == 0
+        || proto
+            .string_constants
+            .get(site.name as usize)
+            .map(String::as_str)
+            != Some("push")
+    {
+        return None;
+    }
+    let j = *ta_plan.access.get(&site.get_ip)? as usize;
+    if ta_plan.access.get(&site.call_ip).copied() != Some(j as u8)
+        || ta_plan.pins.get(j)?.kind != ARR_INT_PIN_KIND
+        // Array method bit zero is the entry-time proof that the captured
+        // callable remains the pristine %Array.prototype%.push value.
+        || ta_plan.pins[j].method_mask & 1 == 0
+    {
+        return None;
+    }
+    match (proto.code.get(site.get_ip)?, proto.code.get(site.call_ip)?) {
+        (
+            Instr::GetProp { dst, obj, name },
+            Instr::CallWithThis {
+                dst: call_dst,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+            },
+        ) if *dst == site.callee
+            && *obj == site.obj
+            && *name == site.name
+            && *call_dst == site.dst
+            && *callee == site.callee
+            && *this_v == site.obj
+            && *arg_base == site.arg_base
+            && *argc == site.argc =>
+        {
+            Some(site)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn arr_push_pin(proto: &FuncProto, ip: usize, ta_plan: &TaPinPlan) -> Option<usize> {
     if !int_push_enabled() {
         return None;
+    }
+    if let Some(site) = captured_arr_push(proto, ip, ta_plan) {
+        return ta_plan.access.get(&site.call_ip).map(|&j| j as usize);
     }
     let j = *ta_plan.access.get(&ip)? as usize;
     if ta_plan.pins.get(j)?.kind != ARR_INT_PIN_KIND {
@@ -245,8 +300,8 @@ fn int_push3_enabled() -> bool {
 
 /// Find fail-closed three-push batches in an ordinary, unmetered INT region.
 ///
-/// The exact nine-op shape is three repetitions of
-/// `LoadGlobal receiver; LoadInt|Move argument; CallMethod push`. Every call
+/// The exact twelve-op shape is three repetitions of `LoadGlobal receiver;
+/// GetProp saved-callee; LoadInt|Move argument; CallWithThis`. Every call
 /// result must be bytecode-dead across the whole function, because the batched
 /// helper intentionally does not materialise the three otherwise discarded
 /// length results. No interior op may be a jump target, all receiver pins must
@@ -264,16 +319,10 @@ fn arr_push3_steps(
     enabled: bool,
 ) -> FxHashMap<usize, ArrPush3Step> {
     let mut out = FxHashMap::default();
-    if !enabled || e.saturating_sub(s) < 8 {
+    if !enabled || e.saturating_sub(s) < 11 {
         return out;
     }
 
-    let result_is_unread = |r: u16| {
-        !proto
-            .code
-            .iter()
-            .any(|ins| instr_uses(ins).into_iter().any(|u| u == r))
-    };
     // `TaPinSrc::Global` currently carries this same proof from jit_plans, but
     // batching reorders later receiver loads ahead of earlier appends. Keep the
     // source-stability licence local so a future pin-planner relaxation cannot
@@ -289,20 +338,15 @@ fn arr_push3_steps(
             )
         })
     };
-    let receiver_is_private = |r: u16, def_ip: usize, use_ip: usize| {
-        proto.code.iter().enumerate().all(|(ip, ins)| {
-            (writes_reg(ins) != Some(r) || ip == def_ip)
-                && (!instr_uses(ins).into_iter().any(|u| u == r) || ip == use_ip)
-        })
-    };
     let mut base = s;
-    while base + 8 <= e {
+    while base + 11 <= e {
         let mut pins = [0usize; 3];
         let mut calls = [0usize; 3];
         let mut args = [0u16; 3];
+        let mut globals = [0u32; 3];
         let mut ok = true;
         for leg in 0..3usize {
-            let b = base + 3 * leg;
+            let b = base + 4 * leg;
             let (recv, global) = match proto.code[b] {
                 Instr::LoadGlobal { dst, idx } => (dst, idx),
                 _ => {
@@ -310,47 +354,64 @@ fn arr_push3_steps(
                     break;
                 }
             };
-            let arg = match proto.code[b + 1] {
+            let (saved_callee, get_obj) = match proto.code[b + 1] {
+                Instr::GetProp { dst, obj, .. } => (dst, obj),
+                _ => {
+                    ok = false;
+                    break;
+                }
+            };
+            let arg = match proto.code[b + 2] {
                 Instr::LoadInt { dst, .. } | Instr::Move { dst, .. } => dst,
                 _ => {
                     ok = false;
                     break;
                 }
             };
-            let (dst, obj, arg_base) = match proto.code[b + 2] {
-                Instr::CallMethod {
+            let (dst, callee, obj, arg_base) = match proto.code[b + 3] {
+                Instr::CallWithThis {
                     dst,
-                    obj,
+                    callee,
+                    this_v,
                     arg_base,
                     argc: 1,
-                    ..
-                } => (dst, obj, arg_base),
+                } => (dst, callee, this_v, arg_base),
                 _ => {
                     ok = false;
                     break;
                 }
             };
-            let Some(j) = arr_push_pin(proto, b + 2, ta_plan) else {
+            let Some(site) = captured_arr_push(proto, b + 3, ta_plan) else {
+                ok = false;
+                break;
+            };
+            let Some(j) = arr_push_pin(proto, b + 3, ta_plan) else {
                 ok = false;
                 break;
             };
             if obj != recv
+                || get_obj != recv
+                || callee != saved_callee
+                || site.get_ip != b + 1
+                || site.call_ip != b + 3
+                || site.obj != recv
+                || site.callee != saved_callee
                 || arg_base != arg
                 || ta_plan.pins[j].src != TaPinSrc::Global(global)
                 || !global_is_stable(global)
-                // Later receiver LoadGlobals write frame slots speculatively.
-                // Prove those slots are compiler-private call temporaries, so
-                // rollback need only restore the two numeric physical homes.
-                || !receiver_is_private(recv, b, b + 2)
-                || !result_is_unread(dst)
-                || plan.split_recvs.contains(&dst)
-                || plan.write_through.contains(&dst)
-                // A future setup is speculative until the helper commits.
-                // Split/write-through argument registers make their boxed
-                // frame slot authoritative immediately, which the XMM-only
-                // rollback cannot undo before replaying the first setup.
-                || plan.split_recvs.contains(&arg)
-                || plan.write_through.contains(&arg)
+                // Prove these exact definitions dead/contained rather than
+                // rejecting a compiler register merely because a later,
+                // dominating overwrite recycles it for a boxed temporary.
+                || reg_value_is_observable_after_def(&proto.code, dst, b + 3, &[])
+                || reg_value_is_observable_after_def(&proto.code, arg, b + 2, &[b + 3])
+                // A future setup is speculative until the helper commits. On
+                // decline, replay begins at `base`; no split/write-through
+                // frame value may be read before its exact argument def
+                // reconstructs it. Handler/finally paths already fail closed
+                // in the CFG proof above.
+                || proto.code[base..b + 2]
+                    .iter()
+                    .any(|ins| instr_uses(ins).contains(&arg))
                 || plan.slot_consts.contains_key(&arg)
                 || !matches!(plan.reg_home.get(&arg), Some(Home::Xmm(_)))
             {
@@ -358,17 +419,21 @@ fn arr_push3_steps(
                 break;
             }
             pins[leg] = j;
-            calls[leg] = b + 2;
+            calls[leg] = b + 3;
             args[leg] = arg;
+            globals[leg] = global;
         }
         if ok
             && pins[0] != pins[1]
             && pins[0] != pins[2]
             && pins[1] != pins[2]
-            && !(base..=base + 8).any(|ip| cold.contains(&ip))
+            && globals[0] != globals[1]
+            && globals[0] != globals[2]
+            && globals[1] != globals[2]
+            && !(base..=base + 11).any(|ip| cold.contains(&ip))
             // The first receiver load may itself be a branch target; it is the
             // semantic start of the batch. No control flow may enter later.
-            && !(base + 1..=base + 8).any(|ip| plan.jump_targets.contains(&ip))
+            && !(base + 1..=base + 11).any(|ip| plan.jump_targets.contains(&ip))
         {
             for stage in 0..3usize {
                 out.insert(
@@ -381,7 +446,7 @@ fn arr_push3_steps(
                     },
                 );
             }
-            base += 9;
+            base += 12;
         } else {
             base += 1;
         }
@@ -413,11 +478,7 @@ pub(crate) fn region_is_int(proto: &FuncProto, start: u32, end: u32, ta_plan: &T
 /// def of them through to the frame slot (canonical UNDEFINED bits for the
 /// LoadUndefined; a boxed home store for a Move), keeping interpreter-resume
 /// state exact at every bail ip.
-pub(crate) fn undef_dead_regs(
-    proto: &FuncProto,
-    s: usize,
-    e: usize,
-) -> rustc_hash::FxHashSet<u16> {
+pub(crate) fn undef_dead_regs(proto: &FuncProto, s: usize, e: usize) -> rustc_hash::FxHashSet<u16> {
     let mut dsts: rustc_hash::FxHashSet<u16> = rustc_hash::FxHashSet::default();
     for ins in &proto.code[s..=e] {
         if let Instr::LoadUndefined { dst } = *ins {
@@ -450,6 +511,9 @@ pub(crate) fn int_unadmitted_ips(
     }
     let mut unadmitted: Vec<usize> = Vec::new();
     let (s, e) = (start as usize, end as usize);
+    let captured_math = crate::codegen::captured_math_sites(proto, s, e);
+    let math_get = |ip: usize| captured_math.iter().any(|site| site.get_ip == ip);
+    let math_call = |ip: usize| captured_math.iter().any(|site| site.call_ip == ip);
     // B192: `LoadUndefined` into a reg that is NEVER READ in-region (module
     // top-level statement-COMPLETION bookkeeping — `LoadUndefined dst` at a
     // loop head, `Move dst, value` per statement, no in-region reader). Such
@@ -493,17 +557,29 @@ pub(crate) fn int_unadmitted_ips(
     // which cannot inhabit an i64 home). Only under `admit_dv` (the GPR-routed
     // retry); the strict pass keeps declining these to the DOUBLE tier.
     let pinned_dv_int = |ip: usize| -> bool {
-        admit_dv
-            && ta_plan
+        if !admit_dv
+            || !ta_plan
                 .access
                 .get(&ip)
-                .map_or(false, |&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND)
-            && matches!(proto.code[ip], Instr::CallMethod { name, argc, .. }
-                if (argc == 1 || argc == 2)
-                    && proto
-                        .string_constants
-                        .get(name as usize)
-                        .is_some_and(|k| dv_get_kind(k).is_some_and(|kid| kid <= 6)))
+                .is_some_and(|&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND)
+        {
+            return false;
+        }
+        let sig = match proto.code[ip] {
+            Instr::CallMethod { name, argc, .. } => Some((name, argc)),
+            Instr::CallWithThis { .. } => {
+                ta_plan.captured_call(ip).map(|site| (site.name, site.argc))
+            }
+            Instr::GetProp { .. } => ta_plan.captured_get(ip).map(|site| (site.name, site.argc)),
+            _ => None,
+        };
+        sig.is_some_and(|(name, argc)| {
+            (argc == 1 || argc == 2)
+                && proto
+                    .string_constants
+                    .get(name as usize)
+                    .is_some_and(|k| dv_get_kind(k).is_some_and(|kid| kid <= 6))
+        })
     };
     // A dense Array observed all-Int (kind 252): `arr[i]` loads the element and
     // unboxes it into an i64 home under a per-access tag guard. READS only —
@@ -563,6 +639,9 @@ pub(crate) fn int_unadmitted_ips(
             // (CallMethod). A non-length GetProp / non-charCodeAt or unpinned call
             // still hits the catch-all reject below.
             Instr::GetProp { .. } if pinned_str(s + off) => {}
+            Instr::GetProp { .. } if pinned_dv_int(s + off) => {}
+            Instr::GetProp { .. } if arr_push_pin(proto, s + off, ta_plan).is_some() => {}
+            Instr::GetProp { .. } if math_get(s + off) => {}
             // Dense Array `.length` — element representation is irrelevant;
             // read `items.len()` straight from the guarded pin snapshot.
             // The name is re-checked (the pin planner registers a GetProp only for
@@ -571,12 +650,21 @@ pub(crate) fn int_unadmitted_ips(
                 if pinned_len(s + off)
                     && proto.string_constants.get(name as usize).is_some_and(|k| k == "length") => {}
             Instr::CallMethod { .. } if pinned_str(s + off) => {}
+            Instr::CallWithThis { .. } if pinned_str(s + off) => {}
             // W9: pinned-DV get* (int-lane kinds) under the GPR-routed retry.
             Instr::CallMethod { .. } if pinned_dv_int(s + off) => {}
+            Instr::CallWithThis { .. } if pinned_dv_int(s + off) => {}
             // W20 M2: `arr.push(int)` on a dense all-Int Array pin. The ONE
             // admitted op that issues a call; see `int_push_enabled` for what
             // re-establishes the tier's register contract around it.
             Instr::CallMethod { .. } if arr_push_pin(proto, s + off, ta_plan).is_some() => {}
+            Instr::CallWithThis { .. }
+                if arr_push_pin(proto, s + off, ta_plan).is_some() => {}
+            Instr::MathOp {
+                op: MathFn::Imul,
+                argc: 2,
+                ..
+            } if math_call(s + off) => {}
             // W20 M4: `!b` on a Bool home is `xor home, 1` -- a bool home holds
             // 0 or 1 by construction (every def is a `movzx home, al` off a
             // `set<cc>`, and the prologue zeroes any home it does not entry
@@ -588,9 +676,6 @@ pub(crate) fn int_unadmitted_ips(
             Instr::Not { .. } if int_push_enabled() => {}
             // B192: dead-in-region completion writes (see `undef_dead` above).
             Instr::LoadUndefined { dst } if undef_dead.contains(&dst) => {}
-            // `Math.imul(a, b)` — a 2-arg int32 multiply (ToInt32 of the low 32 of
-            // the product); the int path emits a native `imul eax, ecx`.
-            Instr::MathOp { op: MathFn::Imul, argc: 2, .. } => {}
             Instr::LoadConst { idx, .. } => {
                 // Only Int-tagged constants; a double const can't be an i64 home.
                 match proto.constants.get(idx as usize) {
@@ -625,6 +710,7 @@ pub(crate) fn compile_region_int(
     globals_base_helper: usize,
     ta_plan: &TaPinPlan,
     ta_snapshot: usize,
+    math_imul_guard: Option<MathIntrinsicGuard>,
     entry: &IntEntry<'_>,
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
@@ -635,6 +721,7 @@ pub(crate) fn compile_region_int(
         globals_base_helper,
         ta_plan,
         ta_snapshot,
+        math_imul_guard,
         false,
         entry,
         meter,
@@ -679,12 +766,18 @@ pub(crate) fn compile_region_int_maybe_cold(
     globals_base_helper: usize,
     ta_plan: &TaPinPlan,
     ta_snapshot: usize,
+    math_imul_guard: Option<MathIntrinsicGuard>,
     cold_exit: bool,
     // Deopt resume map + hoisted entry guards when `proto` is a SPLICE-FLATTENED
     // body (`IntEntry::default()` for an ordinary region — byte-identical).
     entry: &IntEntry<'_>,
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
+    let (s, e) = (start as usize, end as usize);
+    let captured_math = crate::codegen::captured_math_sites(proto, s, e);
+    if !captured_math.is_empty() && math_imul_guard.is_none() {
+        return None;
+    }
     let unadmitted = int_unadmitted_ips(proto, start, end, ta_plan, false)?;
     let cold: FxHashSet<usize> = if unadmitted.is_empty() {
         FxHashSet::default()
@@ -718,6 +811,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     globals_base_helper,
                     ta_plan,
                     ta_snapshot,
+                    math_imul_guard,
                     &p,
                     entry,
                     meter,
@@ -747,6 +841,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                                 globals_base_helper,
                                 ta_plan,
                                 ta_snapshot,
+                                math_imul_guard,
                                 &shared,
                                 entry,
                                 meter,
@@ -883,6 +978,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                         globals_base_helper,
                         ta_plan,
                         ta_snapshot,
+                        math_imul_guard,
                         &shared,
                         entry,
                         meter,
@@ -917,6 +1013,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                             globals_base_helper,
                             ta_plan,
                             ta_snapshot,
+                            math_imul_guard,
                             &p2,
                             entry,
                             meter,
@@ -959,6 +1056,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                                         globals_base_helper,
                                         ta_plan,
                                         ta_snapshot,
+                                        math_imul_guard,
                                         &shared,
                                         entry,
                                         meter,
@@ -1015,6 +1113,7 @@ pub(crate) fn compile_region_int_maybe_cold(
             globals_base_helper,
             ta_plan,
             ta_snapshot,
+            math_imul_guard,
             &plan,
             entry,
             meter,
@@ -1061,6 +1160,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                         globals_base_helper,
                         ta_plan,
                         ta_snapshot,
+                        math_imul_guard,
                         &shared,
                         entry,
                         meter,
@@ -1224,6 +1324,44 @@ pub(crate) fn compile_region_int_maybe_cold(
         let xi = 6 + k as u8;
         dynasm!(ops ; movdqu [rsp + xmm_off + (k as i32) * 16], Rx(xi));
     }
+    // The compiler now leaves the member reference split across
+    // `LoadGlobal; GetProp; <args>; MathOp`.  Before replacing that GetProp,
+    // validate the live global AND the live own `imul` slot once at entry.
+    // `captured_math_site` proves the global is never stored and no edge enters
+    // the captured span; the admitted call-free body cannot mutate Math, so
+    // this guard remains authoritative for every loop iteration.
+    if !captured_math.is_empty() {
+        let guard = math_imul_guard.expect("captured Math requires an intrinsic guard");
+        let mut guarded_globals: Vec<u32> = captured_math.iter().map(|site| site.global).collect();
+        guarded_globals.sort_unstable();
+        guarded_globals.dedup();
+        // With a pin the frame starts with Win64's 32-byte shadow space and
+        // its 200+32*n size also leaves rsp 16-aligned.  The historical
+        // no-pin frame is only the 160-byte xmm save area: rsp is still 8 mod
+        // 16 after allocating it because this path used to make no calls.
+        // Captured Math added the first such call, so carve the same 40-byte
+        // shadow/alignment pad the splice-entry helper uses.  Restore it
+        // before testing the result so a miss reaches `entry_bail` with the
+        // established frame layout.
+        let pad = if n_ta > 0 { 0 } else { 40 };
+        for global in guarded_globals {
+            if pad != 0 {
+                dynasm!(ops ; sub rsp, pad);
+            }
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov edx, global as i32
+                ; mov r8, QWORD guard.receiver_bits as i64
+                ; mov r9, QWORD guard.callee_bits as i64
+                ; mov rax, QWORD crate::vm::jit_math_imul_prefix_is_intrinsic as usize as i64
+                ; call rax
+            );
+            if pad != 0 {
+                dynasm!(ops ; add rsp, pad);
+            }
+            dynasm!(ops ; test rax, rax ; jz => entry_bail);
+        }
+    }
     emit_int_splice_entry_guards(&mut ops, entry, n_ta > 0, entry_bail);
     // ── pinned-TypedArray snapshots ── BEFORE loading any numeric home (jit_ta_snapshot
     // clobbers volatile xmm0..5, which double as homes; xmm6..15 are already saved and
@@ -1237,7 +1375,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         }
         dynasm!(ops
             ; mov rcx, rdi                      // vm
-            ; mov r8d, pin.kind as i32          // expected element kind
+            ; mov r8d, pin.snapshot_tag() as i32 // kind + intrinsic method mask
             ; lea r9, [rsp + ta_base + 32 * j as i32] // out: {obj_bits,base,len}
             ; mov rax, QWORD ta_snapshot as i64
             ; call rax
@@ -1405,7 +1543,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         // emitted above so any jump still resolves. NOTE: jumps/stores/returns
         // aren't reg-defs, so `writes_reg` returns None for them — never skipped.
         if let Some(d) = writes_reg(&proto.code[ip]) {
-            if plan.dead.contains(&d) {
+            if plan.dead.contains(&d) && captured_arr_push(proto, ip, ta_plan).is_none() {
                 continue;
             }
         }
@@ -1937,13 +2075,156 @@ pub(crate) fn compile_region_int_maybe_cold(
                 copy_clobber(&mut lc, d);
                 lc = None;
             }
+            // ── captured pinned member lookup ── The compiler preserves JS
+            // evaluation order as `GetProp; <args>; CallWithThis`.  The pin
+            // snapshot proves both the receiver identity and the pristine
+            // intrinsic method slot, so materialise the exact callable which
+            // the interpreter's GetProp would have produced.  The pairing
+            // pass rejects any jump into, or overwrite inside, the captured
+            // prefix; a miss therefore safely resumes at this GetProp.
+            Instr::GetProp { .. }
+                if ta_plan.captured_get(ip).is_some_and(|site| {
+                    ta_plan.access.get(&ip).is_some_and(|&j| {
+                        ta_plan.pins[j as usize].kind == STR_PIN_KIND
+                            && proto
+                                .string_constants
+                                .get(site.name as usize)
+                                .is_some_and(|name| name == "charCodeAt")
+                    })
+                }) =>
+            {
+                let site = ta_plan.captured_get(ip).expect("captured GetProp guard");
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]
+                        ; jne => deopt
+                    );
+                }
+                dynasm!(ops
+                    ; mov rax, QWORD site.callee_bits as i64
+                    ; mov [rbx + dreg(site.callee)], rax
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], rip_at
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                flag_cmp = None;
+                lc = None;
+            }
+            // Captured Array.push lookup.  Unlike a generic CallWithThis this
+            // is licensed only by `captured_arr_push`: the exact paired
+            // bytecodes, all-Int Array pin, pristine prototype method bit and
+            // saved callable bits all agree.  Materialising here (before the
+            // argument op) preserves the compiler's capture-first order.
+            Instr::GetProp { .. } if captured_arr_push(proto, ip, ta_plan).is_some() => {
+                let site = captured_arr_push(proto, ip, ta_plan)
+                    .expect("captured Array.push GetProp guard");
+                let j = arr_push_pin(proto, ip, ta_plan).expect("captured Array.push pin");
+                let off = ta_base + 32 * j as i32;
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                match ta_plan.pins[j].src {
+                    TaPinSrc::Global(g) => {
+                        dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]);
+                    }
+                    TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                }
+                dynasm!(ops
+                    ; cmp rax, [rsp + off]
+                    ; jne => deopt
+                    ; mov rax, QWORD site.callee_bits as i64
+                    ; mov [rbx + dreg(site.callee)], rax
+                    ; jmp => done
+                    ; => deopt
+                );
+                // A batched prefix may already have staged an earlier leg.
+                // Replay the exact first receiver setup; when later numeric
+                // argument homes were speculatively overwritten, restore the
+                // state saved at the first call before flush_exit boxes it.
+                if let Some(step) = push3.get(&site.call_ip) {
+                    if step.stage > 0 {
+                        for (k, &arg) in step.args[1..].iter().enumerate() {
+                            let ax = xh(&plan, arg);
+                            dynasm!(ops ; movq Rx(ax), [rsp + push3_rollback_off + 8 * k as i32]);
+                        }
+                    }
+                    let replay = rip(step.first_ip);
+                    dynasm!(ops ; mov DWORD [rsi], replay);
+                } else {
+                    dynasm!(ops ; mov DWORD [rsi], rip_at);
+                }
+                dynasm!(ops
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                flag_cmp = None;
+                lc = None;
+            }
+            // Captured-call twin of the legacy fused CallMethod arm above.
+            // The boxed callee/receiver were established by the guarded
+            // prefix, while the hot operation remains a call-free byte load.
+            Instr::CallWithThis { .. }
+                if ta_plan.captured_call(ip).is_some_and(|site| {
+                    ta_plan.access.get(&ip).is_some_and(|&j| {
+                        ta_plan.pins[j as usize].kind == STR_PIN_KIND
+                            && proto
+                                .string_constants
+                                .get(site.name as usize)
+                                .is_some_and(|name| name == "charCodeAt")
+                    })
+                }) =>
+            {
+                let site = ta_plan
+                    .captured_call(ip)
+                    .expect("captured CallWithThis guard");
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let d = xh(&plan, site.dst);
+                let kx = xh(&plan, site.arg_base);
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]
+                        ; jne => deopt
+                    );
+                }
+                dynasm!(ops
+                    ; movq rcx, Rx(kx)
+                    ; cmp rcx, [rsp + off + 16]
+                    ; jae => deopt
+                    ; mov rdx, [rsp + off + 8]
+                    ; movzx eax, BYTE [rdx + rcx]
+                    ; movq Rx(d), rax
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], rip_at
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                copy_clobber(&mut lc, d);
+                lc = None;
+            }
             // ── exact three-array push batch ── the receiver/argument setup
             // instructions remain emitted in source order. The first two
             // calls stage their already-unboxed argument; the third makes one
             // leaf call which preflights all three pins before mutating any,
             // then appends in the original order and refreshes every snapshot.
             // All three result registers are proven unread by `arr_push3_steps`.
-            Instr::CallMethod { arg_base, .. } if push3.contains_key(&ip) => {
+            Instr::CallWithThis { arg_base, .. } if push3.contains_key(&ip) => {
                 let step = push3[&ip];
                 let vx = xh(&plan, arg_base);
                 dynasm!(ops ; movq [rsp + push3_vals_off + 8 * step.stage as i32], Rx(vx));
@@ -2022,26 +2303,31 @@ pub(crate) fn compile_region_int_maybe_cold(
             // longer the pinned one — resumes the interpreter AT this ip, which
             // is sound because every early return in the helper happens before
             // it mutates anything.
-            Instr::CallMethod { dst, arg_base, .. }
+            Instr::CallMethod { dst, arg_base, .. } | Instr::CallWithThis { dst, arg_base, .. }
                 if arr_push_pin(proto, ip, ta_plan).is_some() =>
             {
                 let j = arr_push_pin(proto, ip, ta_plan).unwrap();
                 let off = ta_base + 32 * j as i32;
+                let result_unread = !proto
+                    .code
+                    .iter()
+                    .any(|ins| instr_uses(ins).into_iter().any(|r| r == dst));
                 // Both the pushed value and the new-length dst must live in
                 // xmm homes. `plan_region` types both Num and keeps the dst out
                 // of `dead` (the append is a side effect, so the dead-code pass
                 // must not skip the op), but a slot-materialized constant owns
                 // no home at all -- decline rather than assume.
                 if plan.slot_consts.contains_key(&arg_base)
-                    || plan.slot_consts.contains_key(&dst)
                     || !matches!(plan.reg_home.get(&arg_base), Some(Home::Xmm(_)))
-                    || !matches!(plan.reg_home.get(&dst), Some(Home::Xmm(_)))
+                    || (!result_unread
+                        && (plan.slot_consts.contains_key(&dst)
+                            || !matches!(plan.reg_home.get(&dst), Some(Home::Xmm(_)))))
                 {
                     decline_emit("int-emit: arr.push operand/dst has no numeric home");
                     return None;
                 }
                 let vx = xh(&plan, arg_base);
-                let d = xh(&plan, dst);
+                let d = (!result_unread).then(|| xh(&plan, dst));
                 let deopt = ops.new_dynamic_label();
                 let done = ops.new_dynamic_label();
                 match ta_plan.pins[j].src {
@@ -2080,18 +2366,44 @@ pub(crate) fn compile_region_int_maybe_cold(
                 for (k, &xi) in save_xmms.iter().enumerate() {
                     dynasm!(ops ; movq Rx(xi), [rsp + psave_off + 32 + 8 * k as i32]);
                 }
+                let replay = ta_plan
+                    .captured_call(ip)
+                    .filter(|_| captured_arr_push(proto, ip, ta_plan).is_some())
+                    .map_or(rip_at, |site| rip(site.get_ip));
                 dynasm!(ops
                     ; cmp rax, rcx
                     ; je => deopt
-                    ; movsxd rax, eax                    // Int payload → i64 home
-                    ; movq Rx(d), rax
+                );
+                if let Some(d) = d {
+                    dynasm!(ops
+                        ; movsxd rax, eax                // Int payload → i64 home
+                        ; movq Rx(d), rax
+                    );
+                    copy_clobber(&mut lc, d);
+                }
+                dynasm!(ops
                     ; jmp => done
                     ; => deopt
-                    ; mov DWORD [rsi], rip_at         // resume AT this ip
+                    ; mov DWORD [rsi], replay         // captured form replays GetProp
                     ; jmp => flush_exit
                     ; => done
                 );
-                copy_clobber(&mut lc, d);
+                lc = None;
+            }
+            // Guarded captured `Math.imul` lookup.  The entry check above
+            // proved the live global and its live own data slot; the captured
+            // span has no incoming edge or reference overwrite, so this is
+            // exactly the Value the interpreter GetProp would have stored.
+            Instr::GetProp { .. } if captured_math.iter().any(|site| site.get_ip == ip) => {
+                let site = captured_math
+                    .iter()
+                    .find(|site| site.get_ip == ip)
+                    .expect("captured Math GetProp guard");
+                let guard = math_imul_guard.expect("captured Math intrinsic guard");
+                dynasm!(ops
+                    ; mov rax, QWORD guard.callee_bits as i64
+                    ; mov [rbx + dreg(site.callee)], rax
+                );
                 lc = None;
             }
             // ── pinned length ── `str.length` → the snapshot `units`, `arr.length`
@@ -2187,7 +2499,10 @@ pub(crate) fn compile_region_int_maybe_cold(
         // the guard resumes at ip+1 expecting the result flushed), and the
         // receiver LoadGlobal half stored the object itself — `wt_def_at` holds
         // that second exclusion for all three tiers.
-        if !wt_pre {
+        if !wt_pre
+            && ta_plan.captured_get(ip).is_none()
+            && !captured_math.iter().any(|site| site.get_ip == ip)
+        {
             if let Some(d) = wt_def_at(proto, &plan, ip) {
                 // A non-`>>>` Bitwise result and Math.imul are PROVABLY i32
                 // (`>>>` yields a u32 that can exceed i32) — their write-through

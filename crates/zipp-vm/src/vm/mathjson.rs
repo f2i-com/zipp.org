@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
-use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
     PromiseState, PropAttr, ReactionPair, Reactions,
@@ -2094,7 +2094,7 @@ impl<'p> Vm<'p> {
         json_skip_ws(b, i);
         if b.get(*i) == Some(&b']') {
             *i += 1;
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(items))));
+            return Ok(self.alloc_array_current_realm(items));
         }
         loop {
             json_skip_ws(b, i);
@@ -2114,7 +2114,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        Ok(Value::heap(self.heap.alloc(HeapObj::Array(items))))
+        Ok(self.alloc_array_current_realm(items))
     }
 
     fn json_parse_object(
@@ -2182,7 +2182,7 @@ impl<'p> Vm<'p> {
         for (k, v) in pairs {
             map.set_owned(k, v);
         }
-        Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map)))))
+        Ok(self.alloc_object_current_realm(map))
     }
 
     /// `[[Get]](holder, key)` for the reviver walk: a canonical array index goes
@@ -2353,10 +2353,7 @@ impl<'p> Vm<'p> {
     /// carries a `"source"` data property holding the value's raw JSON text.
     /// An array/object node yields an empty context.
     fn make_json_context(&mut self, src: Option<&JsonSrc>) -> Value {
-        let ctx = Value::heap(
-            self.heap
-                .alloc(HeapObj::Object(Box::new(crate::heap::ObjMap::new()))),
-        );
+        let ctx = self.alloc_object_current_realm(crate::heap::ObjMap::new());
         if let Some(JsonSrc::Prim(s, _)) = src {
             let sv = self.alloc_str(s.clone());
             if let HeapObj::Object(m) = self.heap.get_mut(ctx.heap_index()) {
@@ -2446,7 +2443,7 @@ impl<'p> Vm<'p> {
             }
         }
         *i += 1; // ']'
-        let av = Value::heap(self.heap.alloc(HeapObj::Array(items)));
+        let av = self.alloc_array_current_realm(items);
         Ok((av, JsonSrc::Arr(srcs, av)))
     }
 
@@ -2527,7 +2524,7 @@ impl<'p> Vm<'p> {
         for (k, v) in pairs {
             map.set_owned(k, v);
         }
-        let ov = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))));
+        let ov = self.alloc_object_current_realm(map);
         Ok((ov, JsonSrc::Obj(srcs, ov)))
     }
 }

@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
-use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
     PromiseState, PropAttr, ReactionPair, Reactions,
@@ -19,7 +19,7 @@ impl<'p> Vm<'p> {
         }
         let idx = obj.heap_index();
         // A built-in constructor global (Map/Set/Date/…) keeps its .prototype as an
-        // own property; return it so `x instanceof Map` (instanceof_via_proto) works.
+        // own property; return it so OrdinaryHasInstance (`x instanceof Map`) works.
         if let HeapObj::Object(m) = self.heap.get(idx) {
             if m.is_ctor {
                 return m.get("prototype");
@@ -422,6 +422,16 @@ impl<'p> Vm<'p> {
         self.heap.pin_mirror_dict(arr_proto);
         self.str_proto = build(self, &str_methods, None);
         let str_proto = self.str_proto;
+        if let HeapObj::Object(p) = self.heap.get(str_proto) {
+            for (name, op) in [
+                ("matchAll", crate::bytecode::RegExpMethod::MatchAll),
+                ("replace", crate::bytecode::RegExpMethod::Replace),
+            ] {
+                if let Some(v) = p.get(name).filter(|v| v.is_heap()) {
+                    self.regexp_method_intrinsics[op.index()] = v.heap_index();
+                }
+            }
+        }
         // `String.prototype.trimLeft`/`trimRight` ARE `trimStart`/`trimEnd` — the
         // SAME function objects (Annex B legacy aliases), so trimLeft===trimStart
         // and trimLeft.name is "trimStart". `build` installed distinct natives;
@@ -1351,6 +1361,16 @@ impl<'p> Vm<'p> {
             );
             self.proto_of.insert(regexp_proto, Value::heap(obj_proto));
             self.regexp_proto = regexp_proto;
+            if let HeapObj::Object(p) = self.heap.get(regexp_proto) {
+                for (name, op) in [
+                    ("test", crate::bytecode::RegExpMethod::Test),
+                    ("exec", crate::bytecode::RegExpMethod::Exec),
+                ] {
+                    if let Some(v) = p.get(name).filter(|v| v.is_heap()) {
+                        self.regexp_method_intrinsics[op.index()] = v.heap_index();
+                    }
+                }
+            }
             // The flag/source/flags accessors live on the prototype as getters
             // (spec: a RegExp instance has no own properties for these).
             let accessors: [(&str, u16); 10] = [
@@ -2604,6 +2624,15 @@ impl<'p> Vm<'p> {
         // parse_int_fn/parse_float_fn were allocated up front (shared with Number.*).
         let is_nan_fn = self.heap.alloc(HeapObj::Native(GLOBAL_IS_NAN));
         let is_finite_fn = self.heap.alloc(HeapObj::Native(GLOBAL_IS_FINITE));
+        self.global_fn_intrinsics = [
+            number_ctor,
+            string_ctor,
+            boolean_ctor,
+            parse_int_fn,
+            parse_float_fn,
+            is_nan_fn,
+            is_finite_fn,
+        ];
         let eval_fn = self.heap.alloc(HeapObj::Native(GLOBAL_EVAL));
         self.eval_fn_idx = eval_fn;
         let encode_uri_fn = self.heap.alloc(HeapObj::Native(GLOBAL_ENCODE_URI));
@@ -2619,6 +2648,20 @@ impl<'p> Vm<'p> {
         // Host `print` as a first-class value (shells + the test262 harness
         // expect a global; the bare call form compiles to the Print instr).
         let print_fn = self.heap.alloc(HeapObj::Native(native::GLOBAL_PRINT));
+        // `console` is usually compiled straight to `Print`, but it still has
+        // to exist as a real namespace whenever lexical/with resolution or a
+        // first-class method reference makes that shortcut inapplicable.
+        let console_obj = build(
+            self,
+            &[
+                ("log", CONSOLE_LOG),
+                ("info", CONSOLE_INFO),
+                ("warn", CONSOLE_WARN),
+                ("error", CONSOLE_ERROR),
+                ("debug", CONSOLE_DEBUG),
+            ],
+            None,
+        );
         // The Annex-B call-assignment-target ReferenceError thrower (lib.rs
         // parse-retry rewrite). Resolvable as a global under its reserved name
         // only; hidden from globalThis own-keys reflection (props.rs).
@@ -2748,6 +2791,7 @@ impl<'p> Vm<'p> {
             ("escape", escape_fn),
             ("unescape", unescape_fn),
             ("print", print_fn),
+            ("console", console_obj),
             ("eval", eval_fn),
             ("globalThis", global_this),
             (native::ANNEXB_REF_ERROR_NAME, annexb_ref_error_fn),
@@ -2849,6 +2893,11 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // Snapshot exact main-realm RegExp protocol identities only after all
+        // prototype Symbol methods, accessors, and the constructor species
+        // getter have been installed. Realm copies reuse Native ids, so every
+        // optimization that elides a dynamic call must compare these Values.
+        self.capture_regexp_protocol_intrinsics();
         // B191: snapshot the primitive prototypes' method slots LAST, after
         // every install above — the name-dispatched fast paths prove against
         // exactly this state before serving an intrinsic.

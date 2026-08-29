@@ -433,6 +433,8 @@ fn hoistable_pins(
         return out;
     }
     let code = &proto.code;
+    let captured_math = captured_math_sites(proto, s, e);
+    let captured_math_get = |ip: usize| captured_math.iter().any(|site| site.get_ip == ip);
     let pin_kind_at = |ip: usize| -> Option<u8> {
         ta_plan
             .access
@@ -496,7 +498,12 @@ fn hoistable_pins(
             Instr::SetIndex { .. } => pin_kind_at(ip).is_some_and(|k| k < 9),
             // A pinned `.length` read (string units / dense-Array len).
             Instr::GetProp { .. } => {
-                matches!(pin_kind_at(ip), Some(STR_PIN_KIND) | Some(ARR_INT_PIN_KIND))
+                captured_math_get(ip)
+                    || arr_push_pin(proto, ip, ta_plan).is_some()
+                    || matches!(
+                        pin_kind_at(ip),
+                        Some(STR_PIN_KIND) | Some(DV_PIN_KIND) | Some(ARR_INT_PIN_KIND)
+                    )
             }
             // A pinned `charCodeAt` (direct byte load) or DV `get*` (inline
             // guarded byte load) — no user code, no allocation, cannot
@@ -512,6 +519,11 @@ fn hoistable_pins(
             Instr::CallMethod { .. } => {
                 matches!(pin_kind_at(ip), Some(STR_PIN_KIND) | Some(DV_PIN_KIND))
                     || arr_push_pin(proto, ip, ta_plan).is_some()
+            }
+            Instr::CallWithThis { .. } => {
+                arr_push_pin(proto, ip, ta_plan).is_some()
+                    || (ta_plan.captured_call(ip).is_some()
+                        && matches!(pin_kind_at(ip), Some(STR_PIN_KIND) | Some(DV_PIN_KIND)))
             }
             _ => false,
         };
@@ -868,6 +880,53 @@ fn plan_region_cold_inner(
 ) -> PlanOutcome {
     let code = &proto.code;
     let (s, e) = (start as usize, end as usize);
+    let captured_math = captured_math_sites(proto, s, e);
+    let math_get = |ip: usize| captured_math.iter().any(|site| site.get_ip == ip);
+    let captured_pin_get = |ip: usize| ta_plan.captured_get(ip);
+    let captured_pin_call = |ip: usize| ta_plan.captured_call(ip);
+    let discarded_arr_push_dst = |ip: usize| -> Option<u16> {
+        if !admit_bitwise || arr_push_pin(proto, ip, ta_plan).is_none() {
+            return None;
+        }
+        let dst = match code[ip] {
+            Instr::CallMethod { dst, .. } | Instr::CallWithThis { dst, .. } => dst,
+            _ => return None,
+        };
+        (!code
+            .iter()
+            .any(|ins| instr_uses(ins).into_iter().any(|r| r == dst)))
+        .then_some(dst)
+    };
+    // Captured member bytecodes carry boxed reference components in their
+    // generic use lists.  Those components are guarded/materialised in frame
+    // slots, never numeric homes; only the argument window participates in
+    // register-tier typing and liveness.  Keep `instr_uses` exhaustive for all
+    // other analyses and filter this exact paired shape locally.
+    let numeric_uses = |ip: usize, instr: &Instr| -> Vec<u16> {
+        let pin_get = captured_pin_get(ip);
+        let pin_call = captured_pin_call(ip);
+        let math_site = captured_math
+            .iter()
+            .find(|site| site.get_ip == ip || site.call_ip == ip);
+        instr_uses(instr)
+            .into_iter()
+            .filter(|&r| {
+                !pin_get.is_some_and(|site| r == site.obj)
+                    && !pin_call.is_some_and(|site| r == site.obj || r == site.callee)
+                    && !math_site.is_some_and(|site| {
+                        (ip == site.get_ip && r == site.receiver)
+                            || (ip == site.call_ip && (r == site.receiver || r == site.callee))
+                    })
+            })
+            .collect()
+    };
+    let numeric_def = |ip: usize, instr: &Instr| -> Option<u16> {
+        if captured_pin_get(ip).is_some() || math_get(ip) || discarded_arr_push_dst(ip).is_some() {
+            None
+        } else {
+            writes_reg(instr)
+        }
+    };
     // ── unboxed-region epic: pinned TypedArray element access ──
     // A pinned GetIndex/SetIndex whose element kind matches the REGISTER PATH can run
     // unboxed: the double/regalloc path (admit_bitwise=false) hosts a kind-8 Float64
@@ -918,7 +977,7 @@ fn plan_region_cold_inner(
                 continue;
             }
             if let Instr::GetProp { obj, .. } = *instr {
-                if ta_plan.access.contains_key(&ip) {
+                if ta_plan.access.contains_key(&ip) || math_get(ip) {
                     continue; // pinned `.length` -- not ours
                 }
                 cand_recv.insert(obj);
@@ -972,7 +1031,7 @@ fn plan_region_cold_inner(
                     Instr::GetProp { obj, .. } if !ta_plan.access.contains_key(&ip) => Some(obj),
                     _ => None,
                 };
-                for u in instr_uses(instr) {
+                for u in numeric_uses(s + off, instr) {
                     if Some(u) != recv_here && cand_recv.contains(&u) {
                         used_elsewhere.insert(u);
                     }
@@ -1135,13 +1194,24 @@ fn plan_region_cold_inner(
                 .access
                 .get(&ip)
                 .map_or(false, |&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND)
-            && matches!(code[ip], Instr::CallMethod { name, argc, .. }
-                if (argc == 1 || argc == 2)
-                    && proto
-                        .string_constants
-                        .get(name as usize)
-                        .is_some_and(|k| dv_get_kind(k)
-                            .is_some_and(|kid| !admit_bitwise || kid <= 6)))
+            && {
+                let sig = match code[ip] {
+                    Instr::CallMethod { name, argc, .. } => Some((name, argc)),
+                    Instr::CallWithThis { .. } => {
+                        captured_pin_call(ip).map(|site| (site.name, site.argc))
+                    }
+                    Instr::GetProp { .. } => {
+                        captured_pin_get(ip).map(|site| (site.name, site.argc))
+                    }
+                    _ => None,
+                };
+                sig.is_some_and(|(name, argc)| {
+                    (argc == 1 || argc == 2)
+                        && proto.string_constants.get(name as usize).is_some_and(|k| {
+                            dv_get_kind(k).is_some_and(|kid| !admit_bitwise || kid <= 6)
+                        })
+                })
+            }
     };
     // W20 M2: an INT-tier-admissible `arr.push(int)` -- a `CallMethod` on a
     // receiver pinned as a dense all-Int Array. Admitted on the INT path only
@@ -1149,6 +1219,24 @@ fn plan_region_cold_inner(
     // other tier's plan is unchanged.
     let pinned_arr_push =
         |ip: usize| -> bool { admit_bitwise && arr_push_pin(proto, ip, ta_plan).is_some() };
+    // Capture-first lowering deliberately recycles call temporaries across the
+    // exact push prefix (a prior numeric arg/result can become the next boxed
+    // receiver).  Those receiver registers require the already-proven
+    // split/write-through representation even when the broad experimental INT
+    // split switch is off.  Keep the exception local to receivers of the exact
+    // arr_push_pin proof; every other recycled receiver still obeys
+    // `admit_split`.
+    // The same compiler recycling occurs for the already-admitted captured
+    // string/DataView prefixes in this region.  This is still the exact
+    // TaPinPlan pairing (not general CallWithThis), and lets the shared
+    // split proof decide safety instead of rejecting solely because the broad
+    // INT split experiment is disabled.
+    let captured_pinned_recv: FxHashSet<u16> = ta_plan
+        .captured_calls
+        .values()
+        .filter(|site| (s..=e).contains(&site.get_ip) && (s..=e).contains(&site.call_ip))
+        .map(|site| site.obj)
+        .collect();
     let mut ta_recv_regs: FxHashSet<u16> = FxHashSet::default();
     // B94 recycled receivers (see `plan::RegionPlan::split_recvs`). A receiver
     // whose pinned accesses are all DV `get*` CallMethods is exempt from the
@@ -1170,7 +1258,7 @@ fn plan_region_cold_inner(
     let mut non_dv_splits = 0usize;
     let mut write_through: FxHashSet<u16> = FxHashSet::default();
     let mut split_recv_lg: FxHashSet<usize> = FxHashSet::default();
-    let mut recv_glob: Option<u32> = None;
+    let mut recv_loads: FxHashSet<usize> = FxHashSet::default();
     let mut split_all_dv;
     {
         // Candidate receiver regs: the `obj` of every pinned index op, and the
@@ -1190,7 +1278,12 @@ fn plan_region_cold_inner(
                 || pinned_dv(s + off)
                 || pinned_arr_push(s + off)
             {
-                if let Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. } = *instr {
+                let obj = match *instr {
+                    Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. } => Some(obj),
+                    Instr::CallWithThis { this_v, .. } => Some(this_v),
+                    _ => None,
+                };
+                if let Some(obj) = obj {
                     recv.insert(obj);
                 }
             }
@@ -1246,6 +1339,13 @@ fn plan_region_cold_inner(
                     {
                         Some(obj)
                     }
+                    Instr::CallWithThis { this_v, .. }
+                        if pinned_str(s + off)
+                            || pinned_dv(s + off)
+                            || pinned_arr_push(s + off) =>
+                    {
+                        Some(this_v)
+                    }
                     // ToPropKey's receiver use is only the nullish check, which
                     // the pin subsumes: a compiled region proves the receiver
                     // was a live TypedArray at plan time, nothing in a numeric
@@ -1258,13 +1358,14 @@ fn plan_region_cold_inner(
                     Instr::ToPropKey { obj, .. } => Some(obj),
                     _ => None,
                 };
-                for u in instr_uses(instr) {
+                for u in numeric_uses(s + off, instr) {
                     if Some(u) != idx_obj && recv.contains(&u) {
                         used_elsewhere.insert(u);
                     }
                 }
             }
             for &r in &recv {
+                let captured_prefix_split = captured_pinned_recv.contains(&r);
                 // Cleanly excludable when EITHER: (a) defined by exactly one
                 // LoadGlobal and used only as a pinned obj (the global-receiver
                 // case); OR (b) a live-in PARAM receiver — ZERO in-region defs and
@@ -1278,77 +1379,123 @@ fn plan_region_cold_inner(
                 let clean_param = def_n.get(&r).is_none() && !used_elsewhere.contains(&r);
                 if clean_global || clean_param {
                     ta_recv_regs.insert(r);
-                } else if admit_split && def_lg.contains(&r) && {
-                    // Every pinned access with THIS receiver must read its
-                    // identity from a global slot, and all from the SAME one.
-                    // A `TaPinSrc::Reg` pin reads `[rbx + dreg(r)]`, which the
-                    // numeric half of a recycled register also owns; that case
-                    // is not separable and declines below.
-                    let mut g0: Option<u32> = None;
-                    let mut ok = true;
-                    let mut all_dv = true;
-                    for (off, i) in code[s..=e].iter().enumerate() {
-                        if cold.contains(&(s + off)) {
-                            continue;
-                        }
-                        // A pinned-DV CallMethod's receiver splits on the same
-                        // terms as a pinned element access: the emitted code
-                        // reads identity from the pin's GLOBAL, never the reg.
-                        let pin_obj = match *i {
-                            Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. }
-                                if pinned_elem(s + off) =>
-                            {
-                                Some((obj, false))
-                            }
-                            Instr::CallMethod { obj, .. } if pinned_dv(s + off) => {
-                                Some((obj, true))
-                            }
-                            // W14: a pinned flat-ASCII STRING receiver
-                            // (`src.charCodeAt(i)` / `src.length`) and a dense
-                            // all-Int Array `.length` receiver split on exactly
-                            // the same terms — both emitters read identity from
-                            // the pin's GLOBAL, never the register (see the
-                            // charCodeAt and pinned-length arms). `recv_use_at`
-                            // 40 lines below has always listed them; this match
-                            // did not, so a recycled string receiver could never
-                            // reach the split and the whole region declined.
-                            Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
-                                if crate::codegen::multi_split_enabled()
-                                    && (pinned_str(s + off)
-                                        || pinned_len(s + off)
-                                        || pinned_arr_push(s + off)) =>
-                            {
-                                Some((obj, false))
-                            }
-                            _ => None,
-                        };
-                        if let Some((obj, is_dv)) = pin_obj {
-                            if obj != r {
+                } else if (admit_split || captured_prefix_split)
+                    && def_lg.contains(&r)
+                    && {
+                        // Every pinned access with THIS receiver must read its
+                        // identity from a global slot. The compiler may reuse one
+                        // temporary for several distinct receiver globals; each
+                        // access therefore re-proves its own nearest dominating
+                        // LoadGlobal rather than conflating the sources.
+                        // A `TaPinSrc::Reg` pin reads `[rbx + dreg(r)]`, which the
+                        // numeric half of a recycled register also owns; that case
+                        // is not separable and declines below.
+                        recv_loads.clear();
+                        let mut ok = true;
+                        let mut all_dv = true;
+                        for (off, i) in code[s..=e].iter().enumerate() {
+                            if cold.contains(&(s + off)) {
                                 continue;
                             }
-                            all_dv &= is_dv;
-                            match ta_plan
-                                .access
-                                .get(&(s + off))
-                                .map(|&j| ta_plan.pins[j as usize].src)
-                            {
-                                Some(TaPinSrc::Global(g)) if g0.is_none() || g0 == Some(g) => {
-                                    g0 = Some(g)
+                            // A pinned-DV CallMethod's receiver splits on the same
+                            // terms as a pinned element access: the emitted code
+                            // reads identity from the pin's GLOBAL, never the reg.
+                            let pin_obj = match *i {
+                                Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. }
+                                    if pinned_elem(s + off) =>
+                                {
+                                    Some((obj, false))
                                 }
-                                _ => ok = false,
+                                Instr::CallMethod { obj, .. } if pinned_dv(s + off) => {
+                                    Some((obj, true))
+                                }
+                                Instr::GetProp { obj, .. }
+                                | Instr::CallWithThis { this_v: obj, .. }
+                                    if pinned_dv(s + off) =>
+                                {
+                                    Some((obj, true))
+                                }
+                                // W14: a pinned flat-ASCII STRING receiver
+                                // (`src.charCodeAt(i)` / `src.length`) and a dense
+                                // all-Int Array `.length` receiver split on exactly
+                                // the same terms — both emitters read identity from
+                                // the pin's GLOBAL, never the register (see the
+                                // charCodeAt and pinned-length arms). `recv_use_at`
+                                // 40 lines below has always listed them; this match
+                                // did not, so a recycled string receiver could never
+                                // reach the split and the whole region declined.
+                                Instr::CallMethod { obj, .. } | Instr::GetProp { obj, .. }
+                                    if crate::codegen::multi_split_enabled()
+                                        && (pinned_str(s + off)
+                                            || pinned_len(s + off)
+                                            || pinned_arr_push(s + off)) =>
+                                {
+                                    Some((obj, false))
+                                }
+                                Instr::CallWithThis { this_v, .. }
+                                    if crate::codegen::multi_split_enabled()
+                                        && (pinned_str(s + off) || pinned_arr_push(s + off)) =>
+                                {
+                                    Some((this_v, false))
+                                }
+                                _ => None,
+                            };
+                            if let Some((obj, is_dv)) = pin_obj {
+                                if obj != r {
+                                    continue;
+                                }
+                                all_dv &= is_dv;
+                                match ta_plan
+                                    .access
+                                    .get(&(s + off))
+                                    .map(|&j| ta_plan.pins[j as usize].src)
+                                {
+                                    Some(TaPinSrc::Global(g)) => {
+                                        let access_ip = s + off;
+                                        let load_ip = (s..access_ip)
+                                            .rev()
+                                            .find(|&ip| writes_reg(&code[ip]) == Some(r));
+                                        let Some(load_ip) = load_ip.filter(|&ip| {
+                                        matches!(code[ip], Instr::LoadGlobal { dst, idx } if dst == r && idx == g)
+                                    }) else {
+                                        ok = false;
+                                        continue;
+                                    };
+                                        let entered = code.iter().any(|ins| {
+                                            let target = match *ins {
+                                                Instr::Jump { target }
+                                                | Instr::JumpIfFalse { target, .. }
+                                                | Instr::JumpIfTrue { target, .. }
+                                                | Instr::JumpIfNotLt { target, .. }
+                                                | Instr::JumpIfNotLe { target, .. } => Some(target),
+                                                _ => None,
+                                            };
+                                            target.is_some_and(|target| {
+                                                (load_ip + 1..=access_ip)
+                                                    .contains(&(target as usize))
+                                            })
+                                        });
+                                        if entered {
+                                            ok = false;
+                                        } else {
+                                            recv_loads.insert(load_ip);
+                                        }
+                                    }
+                                    _ => ok = false,
+                                }
                             }
                         }
+                        split_all_dv = all_dv;
+                        // The budget applies to ELEMENT/STRING-pinned receivers
+                        // only (B94's exercised case); DV-pinned receivers split
+                        // independently — the DV swizzle loop recycles two of them,
+                        // and a one-split rule declined it.
+                        ok && !recv_loads.is_empty()
+                            && (all_dv
+                                || captured_prefix_split
+                                || non_dv_splits < non_dv_split_budget)
                     }
-                    if let Some(g) = g0.filter(|_| ok) {
-                        recv_glob = Some(g);
-                    }
-                    split_all_dv = all_dv;
-                    // The budget applies to ELEMENT/STRING-pinned receivers
-                    // only (B94's exercised case); DV-pinned receivers split
-                    // independently — the DV swizzle loop recycles two of them,
-                    // and a one-split rule declined it.
-                    ok && g0.is_some() && (all_dv || non_dv_splits < non_dv_split_budget)
-                } {
+                {
                     // ── B94 live-range splitting ── the bytecode compiler RECYCLED
                     // this register: pinned receiver over one range, arithmetic temp
                     // over another (in `p_ta2` r17 is the array at ip37, the running
@@ -1359,10 +1506,7 @@ fn plan_region_cold_inner(
                     // and `flush_exit` skips it. What must still be PROVED is that no
                     // use reads the home before a numeric def fills it — the home is
                     // deliberately not entry-loaded, so it starts as garbage.
-                    let g = recv_glob.unwrap();
-                    let recv_lg_ips: FxHashSet<usize> = (s..=e)
-                        .filter(|&ip| matches!(code[ip], Instr::LoadGlobal { dst, idx } if dst == r && idx == g))
-                        .collect();
+                    let recv_lg_ips = recv_loads.clone();
                     let recv_use_at = |ip: usize| -> Option<u16> {
                         match code[ip] {
                             Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. }
@@ -1377,6 +1521,11 @@ fn plan_region_cold_inner(
                                     || pinned_arr_push(ip) =>
                             {
                                 Some(obj)
+                            }
+                            Instr::CallWithThis { this_v, .. }
+                                if pinned_str(ip) || pinned_dv(ip) || pinned_arr_push(ip) =>
+                            {
+                                Some(this_v)
                             }
                             Instr::ToPropKey { obj, .. } => Some(obj),
                             _ => None,
@@ -1395,7 +1544,7 @@ fn plan_region_cold_inner(
                     {
                         split_recvs.insert(r);
                         split_recv_lg.extend(recv_lg_ips);
-                        if !split_all_dv {
+                        if !split_all_dv && !captured_prefix_split {
                             non_dv_splits += 1;
                         }
                     } else {
@@ -1408,9 +1557,99 @@ fn plan_region_cold_inner(
                     // receivers; past that, or when a pin's identity comes from a
                     // register rather than a global slot, this is the fallback.
                     // DV-pinned splits are exempt from the budget.)
-                    decline!("pinned receiver reg not cleanly excludable");
+                    decline!(format_args!(
+                        "pinned receiver r{r} not cleanly excludable (defs={:?}, load-global={}, used-elsewhere={})",
+                        def_n.get(&r),
+                        def_lg.contains(&r),
+                        used_elsewhere.contains(&r)
+                    ));
                 }
             }
+        }
+    }
+    // Captured Math receiver/callee registers carry boxed identity values, not
+    // numbers.  Their LoadGlobal/GetProp bytecodes are emitted as guarded frame
+    // writes and MathOp consumes only the numeric argument window.  Reuse the
+    // established receiver-exclusion set so neither value is assigned a home.
+    for site in &captured_math {
+        let receiver_reused = code[s..=e]
+            .iter()
+            .enumerate()
+            .any(|(off, ins)| s + off != site.load_ip && writes_reg(ins) == Some(site.receiver));
+        if receiver_reused {
+            split_recvs.insert(site.receiver);
+            split_recv_lg.insert(site.load_ip);
+        } else {
+            ta_recv_regs.insert(site.receiver);
+        }
+        let callee_reused = code[s..=e]
+            .iter()
+            .enumerate()
+            .any(|(off, ins)| s + off != site.get_ip && writes_reg(ins) == Some(site.callee));
+        if callee_reused {
+            let boxed_defs: FxHashSet<usize> = [site.get_ip].into_iter().collect();
+            let boxed_use = |ip: usize| (ip == site.call_ip).then_some(site.callee);
+            if crate::codegen::plan::split_home_provably_safe(
+                code,
+                s,
+                e,
+                site.callee,
+                cold,
+                &boxed_defs,
+                &boxed_use,
+            ) {
+                // The frame slot carries the captured callable between GetProp
+                // and MathOp; numeric defs outside that window are
+                // write-through.  This keeps exact-ip deopts from replacing the
+                // saved callable with an unrelated numeric home during flush.
+                split_recvs.insert(site.callee);
+                split_recv_lg.insert(site.get_ip);
+            } else {
+                decline!("captured Math callee: home not provably live at a use");
+            }
+        } else {
+            ta_recv_regs.insert(site.callee);
+        }
+    }
+    let captured_pin_sites: Vec<_> = ta_plan
+        .captured_calls
+        .values()
+        .copied()
+        .filter(|site| (s..=e).contains(&site.call_ip) && (s..=e).contains(&site.get_ip))
+        .collect();
+    let captured_pin_get_ips: FxHashSet<usize> =
+        captured_pin_sites.iter().map(|site| site.get_ip).collect();
+    // The saved method Value is boxed control state.  A dedicated GetProp arm
+    // writes its exact guarded bits to the frame; only a later numeric reuse of
+    // the compiler temp receives a home.
+    for site in &captured_pin_sites {
+        let callee_reused = code[s..=e]
+            .iter()
+            .enumerate()
+            .any(|(off, ins)| s + off != site.get_ip && writes_reg(ins) == Some(site.callee));
+        if callee_reused {
+            let boxed_defs: FxHashSet<usize> = [site.get_ip].into_iter().collect();
+            let boxed_use = |ip: usize| (ip == site.call_ip).then_some(site.callee);
+            if crate::codegen::plan::split_home_provably_safe(
+                code,
+                s,
+                e,
+                site.callee,
+                cold,
+                &boxed_defs,
+                &boxed_use,
+            ) {
+                // Preserve the spec-order captured callable across every
+                // intermediate/call-site deopt. Numeric halves are
+                // write-through; flush therefore leaves this boxed frame value
+                // intact until CallWithThis consumes it.
+                split_recvs.insert(site.callee);
+                split_recv_lg.insert(site.get_ip);
+            } else {
+                decline!("captured member callee: home not provably live at a use");
+            }
+        } else {
+            ta_recv_regs.insert(site.callee);
         }
     }
     // Registers that are actually USED as an operand somewhere in the region.
@@ -1427,7 +1666,7 @@ fn plan_region_cold_inner(
         if cold.contains(&(s + off)) {
             continue;
         }
-        for u in instr_uses(instr) {
+        for u in numeric_uses(s + off, instr) {
             used.insert(u);
         }
     }
@@ -1467,7 +1706,7 @@ fn plan_region_cold_inner(
             if cold.contains(&(s + off)) {
                 continue;
             }
-            if let Some(d) = writes_reg(instr) {
+            if let Some(d) = numeric_def(s + off, instr) {
                 *def_n.entry(d).or_insert(0) += 1;
             }
         }
@@ -1533,13 +1772,19 @@ fn plan_region_cold_inner(
             if cold.contains(&ip) || ip == s || !pinned_dv(ip) {
                 continue;
             }
-            if let Instr::CallMethod {
-                arg_base,
-                argc: 2,
-                name,
-                ..
-            } = *instr
-            {
+            let sig = match *instr {
+                Instr::CallMethod {
+                    arg_base,
+                    argc: 2,
+                    name,
+                    ..
+                } => Some((arg_base, name)),
+                Instr::CallWithThis { .. } => captured_pin_call(ip)
+                    .filter(|site| site.argc == 2)
+                    .map(|site| (site.arg_base, site.name)),
+                _ => None,
+            };
+            if let Some((arg_base, name)) = sig {
                 let size = proto
                     .string_constants
                     .get(name as usize)
@@ -1688,6 +1933,9 @@ fn plan_region_cold_inner(
                     Instr::CallMethod {
                         arg_base, argc: 2, ..
                     } if pinned_dv(ip) => Some(arg_base + 1),
+                    Instr::CallWithThis { .. } if pinned_dv(ip) => captured_pin_call(ip)
+                        .filter(|site| site.argc == 2)
+                        .map(|site| site.arg_base + 1),
                     _ => None,
                 }
             };
@@ -1790,6 +2038,11 @@ fn plan_region_cold_inner(
             {
                 decline!("CallMethod (receiver not a pinned string/DataView)")
             }
+            Instr::CallWithThis { .. }
+                if !pinned_str(s + off) && !pinned_dv(s + off) && !pinned_arr_push(s + off) =>
+            {
+                decline!("CallWithThis (not a captured pinned string/DataView/Array.push)")
+            }
             // A Bitwise op declines UNLESS the caller (the INT path) admits it: its
             // i64 homes hold sign-extended integers, so the low 32 bits ARE ToInt32
             // and the op runs inline with no reload/rebox. The regalloc/double path
@@ -1831,6 +2084,16 @@ fn plan_region_cold_inner(
             | Instr::Ge { dst, .. }
             | Instr::Eq { dst, .. }
             | Instr::Ne { dst, .. } => (Some(dst), VTy::Bool),
+            // Statement-form push results are globally unread.  The call is
+            // still emitted for its append side effect, but assigning its
+            // recycled compiler temporary a numeric home can conflict with a
+            // later Bool/control use and needlessly blocks the capture-first
+            // tokenizer region.  A read anywhere keeps the ordinary Num dst.
+            Instr::CallMethod { .. } | Instr::CallWithThis { .. }
+                if discarded_arr_push_dst(s + off).is_some() =>
+            {
+                (None, VTy::Num)
+            }
             // Pinned-STRING charCodeAt → a small int (0..65535); pinned-STRING
             // length → the snapshot units; both land in a Num i64 home. A
             // pinned-DV `get*` result is a Num too: every whitelisted kind is
@@ -1840,6 +2103,14 @@ fn plan_region_cold_inner(
             {
                 (Some(dst), VTy::Num)
             }
+            Instr::CallWithThis { dst, .. }
+                if pinned_str(s + off) || pinned_dv(s + off) || pinned_arr_push(s + off) =>
+            {
+                (Some(dst), VTy::Num)
+            }
+            // Captured method lookup produces a boxed callable in the frame,
+            // not a numeric result. Its paired call below owns the Num dst.
+            Instr::GetProp { .. } if captured_pin_get(s + off).is_some() => (None, VTy::Num),
             Instr::GetProp { dst, .. } if pinned_str(s + off) => (Some(dst), VTy::Num),
             // W20: an admitted `GetProp` lands its probe result in a Num home
             // under a tag guard (`emit_box_to_home`) that DEOPTs on anything
@@ -1877,7 +2148,7 @@ fn plan_region_cold_inner(
         };
         // Record operand first-occurrences (uses) BEFORE the def, so a reg used
         // and defined by the same op counts the use first (live-in).
-        for u in instr_uses(instr) {
+        for u in numeric_uses(s + off, instr) {
             first_seen.entry(u).or_insert(false); // first occurrence is a use ⇒ live-in
             if !ty.contains_key(&u) {
                 // Type not yet known; tentatively untyped — refined when defined.
@@ -1888,8 +2159,9 @@ fn plan_region_cold_inner(
         // the RECEIVER half — typing that as Num would home an object.
         // A DV-flag-fused Eq's def is ELIDED (the call computes the flag inline),
         // so its Bool must not type the register — the remaining defs are Num.
-        let is_split_recv_load =
-            split_recv_lg.contains(&(s + off)) || dv_flag_elide.contains(&(s + off));
+        let is_split_recv_load = split_recv_lg.contains(&(s + off))
+            || captured_pin_get_ips.contains(&(s + off))
+            || dv_flag_elide.contains(&(s + off));
         // B192: a completion reg (`undef_dead`) may ONLY be defined by the two
         // ops the INT emitters write through (`LoadUndefined` reaches the
         // no-def catch-all; `Move` is filtered below). Any other def-op means
@@ -2018,7 +2290,7 @@ fn plan_region_cold_inner(
         if cold.contains(&(s + off)) {
             continue;
         }
-        for u in instr_uses(instr) {
+        for u in numeric_uses(s + off, instr) {
             if !ta_recv_regs.contains(&u)
                 && !box_regs.contains(&u)
                 && !ty.contains_key(&u)
@@ -2066,7 +2338,7 @@ fn plan_region_cold_inner(
                     numeric.push(b);
                 }
             }
-            for u in instr_uses(instr) {
+            for u in numeric_uses(s + off, instr) {
                 if ro_live_in.contains(&u) && !numeric.contains(&u) {
                     decline!("read-only live-in used where a number isn't required");
                     //
@@ -2109,13 +2381,19 @@ fn plan_region_cold_inner(
         // the single-byte kinds ignore the argument entirely (as the
         // interpreter does).
         if pinned_dv(s + off) {
-            if let Instr::CallMethod {
-                arg_base,
-                argc,
-                name,
-                ..
-            } = *instr
-            {
+            let sig = match *instr {
+                Instr::CallMethod {
+                    arg_base,
+                    argc,
+                    name,
+                    ..
+                } => Some((arg_base, argc, name)),
+                Instr::CallWithThis { .. } => {
+                    captured_pin_call(s + off).map(|site| (site.arg_base, site.argc, site.name))
+                }
+                _ => None,
+            };
+            if let Some((arg_base, argc, name)) = sig {
                 if ty.get(&arg_base) != Some(&VTy::Num) {
                     decline!("pinned DV pos operand is not numeric");
                 }
@@ -2181,6 +2459,12 @@ fn plan_region_cold_inner(
                     decline!("arr.push operand is not a numeric home");
                 }
             }
+            Instr::CallWithThis { .. } if pinned_arr_push(s + off) => {
+                let site = captured_pin_call(s + off).expect("captured Array.push metadata");
+                if ty.get(&site.arg_base) != Some(&VTy::Num) {
+                    decline!("arr.push operand is not a numeric home");
+                }
+            }
             // W20 M4: `xor home, 1` is `!b` only for a REAL boolean. Anything
             // else (`!0`, `!""`, `!obj`) is JS truthiness, which this tier does
             // not model -- decline rather than widen the arm.
@@ -2208,7 +2492,7 @@ fn plan_region_cold_inner(
                 const_def_ip.insert(dst, s + off);
             }
             _ => {
-                if let Some(d) = writes_reg(instr) {
+                if let Some(d) = numeric_def(s + off, instr) {
                     *def_count.entry(d).or_insert(0) += 1;
                 }
             }
@@ -2228,8 +2512,17 @@ fn plan_region_cold_inner(
         if cold.contains(&(s + off)) {
             continue;
         }
-        if let Instr::CallMethod { dst, .. } = *instr {
-            if pinned_dv(s + off) || pinned_arr_push(s + off) {
+        let effectful_dst = match *instr {
+            Instr::CallMethod { dst, .. } => Some(dst),
+            Instr::CallWithThis { dst, .. } if pinned_dv(s + off) || pinned_arr_push(s + off) => {
+                Some(dst)
+            }
+            _ => None,
+        };
+        if let Some(dst) = effectful_dst {
+            if pinned_dv(s + off)
+                || (pinned_arr_push(s + off) && discarded_arr_push_dst(s + off).is_none())
+            {
                 used.insert(dst);
             }
         }
@@ -2261,6 +2554,11 @@ fn plan_region_cold_inner(
                 str_imul_touch.push((ip, arg_base, false)); // index (use)
                 str_imul_touch.push((ip, dst, true)); // charCodeAt result (def)
             }
+            Instr::CallWithThis { .. } if pinned_str(ip) => {
+                let site = captured_pin_call(ip).expect("captured string call metadata");
+                str_imul_touch.push((ip, site.arg_base, false));
+                str_imul_touch.push((ip, site.dst, true));
+            }
             Instr::MathOp {
                 dst,
                 arg_base,
@@ -2290,6 +2588,17 @@ fn plan_region_cold_inner(
                 if admit_bitwise && pinned_dv(ip) {
                     str_imul_touch.push((ip, arg_base, false)); // pos (use)
                     str_imul_touch.push((ip, dst, true)); // result (def)
+                }
+            }
+            Instr::CallWithThis { .. } if pinned_dv(ip) => {
+                let site = captured_pin_call(ip).expect("captured DataView call metadata");
+                if let Some(&(a, b)) = dv_flag_fuse.get(&ip) {
+                    str_imul_touch.push((ip, a, false));
+                    str_imul_touch.push((ip, b, false));
+                }
+                if admit_bitwise {
+                    str_imul_touch.push((ip, site.arg_base, false));
+                    str_imul_touch.push((ip, site.dst, true));
                 }
             }
             _ => {}
@@ -2363,6 +2672,24 @@ fn plan_region_cold_inner(
     // which the ungated glob-range remat also fills — is what the pool-pressure
     // retry can release. See the `allow_hoist` parameter doc.
     let mut gated_hoists = false;
+    // A read-outside constant needs a stronger form of the ordinary loop
+    // hoist proof: no forward edge before its def may bypass the def by
+    // LEAVING the region. Otherwise the exit flush would publish the hoisted
+    // value on a path where the interpreter retained the old frame value.
+    // Constants with no outside reader do not need this extra condition.
+    let runs_before_forward_exit = |d: usize| {
+        code.iter().take(d).skip(s).all(|instr| {
+            let target = match *instr {
+                Instr::Jump { target }
+                | Instr::JumpIfFalse { target, .. }
+                | Instr::JumpIfTrue { target, .. }
+                | Instr::JumpIfNotLt { target, .. }
+                | Instr::JumpIfNotLe { target, .. } => target as usize,
+                _ => return true,
+            };
+            target <= d
+        })
+    };
     for (&r, &ip) in &const_def_ip {
         // `first_seen == true` only says the first OCCURRENCE is a def — it says
         // nothing about whether that def runs. Hoisting a constant whose def sits
@@ -2378,6 +2705,7 @@ fn plan_region_cold_inner(
             && first_seen.get(&r) == Some(&true)
             && used.contains(&r)
             && runs_every_iteration(code, s, e, ip)
+            && (!read_outside.contains(&r) || runs_before_forward_exit(ip))
         {
             hoist_ips.push(ip);
             hoisted.insert(r);
@@ -2498,6 +2826,7 @@ fn plan_region_cold_inner(
                     | Instr::Return { .. }
                     | Instr::MathOp { .. }
                     | Instr::CallMethod { .. }
+                    | Instr::CallWithThis { .. }
                     | Instr::LoadInt { .. }
                     | Instr::LoadConst { .. }
                     | Instr::LoadBool { .. }
@@ -2548,10 +2877,16 @@ fn plan_region_cold_inner(
                             arg_base,
                             argc,
                         } => r == callee || (r >= arg_base && (r - arg_base) < argc),
+                        Instr::StaticFn {
+                            callee,
+                            this_v,
+                            arg_base,
+                            argc,
+                            ..
+                        } => r == callee || r == this_v || (r >= arg_base && (r - arg_base) < argc),
                         Instr::NewArray { arg_base, argc, .. }
                         | Instr::ArrayCtor { arg_base, argc, .. }
                         | Instr::GlobalFn { arg_base, argc, .. }
-                        | Instr::StaticFn { arg_base, argc, .. }
                         | Instr::Print { arg_base, argc, .. } => {
                             r >= arg_base && (r - arg_base) < argc
                         }
@@ -2648,7 +2983,7 @@ fn plan_region_cold_inner(
                 *before |= uip < ip;
             };
             for (off, instr) in code[s..=e].iter().enumerate() {
-                if instr_uses(instr).contains(&r) {
+                if numeric_uses(s + off, instr).contains(&r) {
                     note_use(s + off, &mut last_use, &mut use_before_def);
                 }
             }
@@ -2698,9 +3033,22 @@ fn plan_region_cold_inner(
     if allow_hoist && !hoist_pins.is_empty() {
         for (off, instr) in code[s..=e].iter().enumerate() {
             let ip = s + off;
-            let Instr::GetProp { dst, .. } = *instr else {
+            let Instr::GetProp { dst, name, .. } = *instr else {
                 continue;
             };
+            // A captured `str.charCodeAt` also owns a STRING pin and begins
+            // with GetProp. Only the exact `.length` data read may be replaced
+            // by a numeric prologue fill; skipping a captured method lookup
+            // would leave its callee register non-callable on deopt replay.
+            if ta_plan.captured_get(ip).is_some()
+                || proto
+                    .string_constants
+                    .get(name as usize)
+                    .map(String::as_str)
+                    != Some("length")
+            {
+                continue;
+            }
             let Some(&j) = ta_plan.access.get(&ip) else {
                 continue;
             };
@@ -2914,10 +3262,10 @@ fn plan_region_cold_inner(
             first_ip.entry(r).or_insert(ip);
             last_ip.insert(r, ip);
         };
-        for u in instr_uses(instr) {
+        for u in numeric_uses(ip, instr) {
             touch(u);
         }
-        if let Some(d) = writes_reg(instr) {
+        if let Some(d) = numeric_def(ip, instr) {
             touch(d);
         }
     }
@@ -2945,7 +3293,15 @@ fn plan_region_cold_inner(
     // the INT tier and one on DOUBLE). `region_liveness` computes the real live
     // range; WIDEN with it rather than replace, so an under-modelled use can never
     // make a range narrower than it already was.
-    let liveness = region_liveness(code, s, e, cold, &str_imul_touch);
+    let liveness = region_liveness(
+        code,
+        s,
+        e,
+        cold,
+        &str_imul_touch,
+        &numeric_uses,
+        &numeric_def,
+    );
     for (&r, &(la, lb)) in &liveness.spans {
         if let Some(f) = first_ip.get_mut(&r) {
             *f = (*f).min(la);
@@ -3278,30 +3634,38 @@ fn plan_region_cold_inner(
                         .then(|| writes_reg(&code[ip - 1]))
                         .flatten()
                 });
-            for u in instr_uses(instr) {
+            for u in numeric_uses(ip, instr) {
                 if dv_flag_fuse.contains_key(&ip) && elided_dst == Some(u) {
                     continue;
                 }
                 touch.entry(u).or_default().push((ip, false));
             }
-            if let Some(d) = writes_reg(instr) {
-                if dv_flag_elide.contains(&ip) {
-                    continue;
+            // A B94 receiver LoadGlobal writes the boxed receiver to the frame,
+            // not the unrelated numeric half held in this register's home. It
+            // therefore cannot open or extend a numeric segment. Every real
+            // numeric def is write-through, so lending the home across these
+            // receiver-only windows preserves the split-receiver exit contract.
+            if !split_recv_lg.contains(&ip) {
+                if let Some(d) = numeric_def(ip, instr) {
+                    if dv_flag_elide.contains(&ip) {
+                        continue;
+                    }
+                    touch.entry(d).or_default().push((ip, true));
                 }
-                touch.entry(d).or_default().push((ip, true));
             }
         }
         for &(ip, r, is_def) in &str_imul_touch {
             touch.entry(r).or_default().push((ip, is_def));
         }
         for &r in &reg_order {
-            // Split receivers keep their proven single-interval contract
-            // (force-resident, memory-authoritative); slot-materialized
-            // consts carry no home at all; permanent values keep [s, e] via
-            // `range` below.
+            // Split receivers are eligible here: their numeric defs are
+            // write-through and receiver LoadGlobals were deliberately omitted
+            // above, so each numeric segment retains the existing
+            // memory-authoritative contract while its home can be lent during a
+            // receiver-only hole. Slot-materialized consts carry no home at all;
+            // permanent values keep [s, e] via `range` below.
             if ty[&r] != VTy::Num
                 || !shareable(r)
-                || split_recvs.contains(&r)
                 || slot_consts.contains_key(&r)
                 // W28: a type-split register's numeric home must span its whole
                 // mention window. Its BOOL range sits inside that window and
@@ -3357,7 +3721,10 @@ fn plan_region_cold_inner(
             if let Some(c) = cur.take() {
                 segs.push(c);
             }
-            if segs.len() < 2
+            // A split receiver may have only one numeric def-range: keeping
+            // that single precise segment is still material because the raw
+            // first/last range also includes its receiver-only LoadGlobal.
+            if (segs.len() < 2 && !split_recvs.contains(&r))
                 || segs
                     .iter()
                     .any(|&(a, b)| jump_targets.iter().any(|&t| t > a && t <= b))
@@ -4001,13 +4368,18 @@ pub(crate) struct RegionLiveness {
 /// are for the spans.
 ///
 /// `extra_touch` entries are `(ip, reg, is_def)`, matching `str_imul_touch`.
-pub(crate) fn region_liveness(
+pub(crate) fn region_liveness<F>(
     code: &[Instr],
     s: usize,
     e: usize,
     cold: &FxHashSet<usize>,
     extra_touch: &[(usize, u16, bool)],
-) -> RegionLiveness {
+    uses_at: &F,
+    defs_at: &impl Fn(usize, &Instr) -> Option<u16>,
+) -> RegionLiveness
+where
+    F: Fn(usize, &Instr) -> Vec<u16>,
+{
     let n = e - s + 1;
     let mut uses: Vec<Vec<u16>> = vec![Vec::new(); n];
     let mut defs: Vec<Vec<u16>> = vec![Vec::new(); n];
@@ -4020,8 +4392,8 @@ pub(crate) fn region_liveness(
             continue;
         }
         let k = ip - s;
-        uses[k].extend(instr_uses(&code[ip]));
-        if let Some(d) = writes_reg(&code[ip]) {
+        uses[k].extend(uses_at(ip, &code[ip]));
+        if let Some(d) = defs_at(ip, &code[ip]) {
             defs[k].push(d);
         }
         region_succs(code, s, e, ip, &mut scratch);
@@ -4172,11 +4544,15 @@ pub(crate) fn runs_every_iteration(code: &[Instr], s: usize, e: usize, d: usize)
 ///     because the exit contract below IS write-through's.
 ///  2. `r` is an ordinary homed value: not a pinned-TA receiver, not a B94
 ///     split receiver, not a `box_regs` member, not the source register of any
-///     pin (`excluded`), and never mentioned by a `Move`, a `Not` or a
-///     `ToPropKey`. Those three are exactly the ops whose handling reads a
-///     TYPE or a HOME KIND rather than the opcode: the GPR `Move` arm
-///     dispatches on `home(plan, dst)`, so a split register (numeric home plus
-///     a separate bool gpr) would take the numeric arm for a bool copy.
+///     pin (`excluded`), never mentioned by a `Not` or `ToPropKey`, and never
+///     used as a `Move` source. A `Move` may define ONLY `r`'s numeric half
+///     when its numeric source has a dominating in-region def and no branch
+///     can enter between that def and the copy. Those are exactly the ops
+///     whose handling reads a TYPE or a HOME KIND rather than the opcode: the
+///     GPR `Move` arm dispatches on `home(plan, dst)`, so an unproved /
+///     Bool-half copy into a split register (numeric home plus a separate bool
+///     gpr) would take the wrong arm. The source remains unsplittable, so the
+///     numeric arm cannot read its Bool view.
 ///  3. Every DEF of `r` is one of the ops in the whitelist below, whose type
 ///     is the same one `plan_region`'s `(def, dty)` match assigns. A def the
 ///     two views could disagree about refuses the candidate.
@@ -4260,12 +4636,49 @@ pub(crate) fn plan_type_splits(
             | Instr::Bitwise { .. }
             | Instr::GetIndex { .. }
             | Instr::CallMethod { .. }
+            | Instr::CallWithThis { .. }
             | Instr::MathOp {
                 op: MathFn::Imul,
                 argc: 2,
                 ..
             } => Some(VTy::Num),
             _ => None,
+        }
+    };
+    // The sole safe Move exception to (2). The most recent textual source def
+    // is a genuine reaching def only when no control-flow edge can enter after
+    // it and before (or at) the Move. Native entry is at `s`, while
+    // `jump_targets` is the complete set of in-region branch destinations, so
+    // this closed interval check proves that every path reaching the copy ran
+    // the numeric def first. Elided defs, receiver-object defs, live-ins,
+    // Bool/unpredictable defs, and sources with their own split story all fail
+    // closed. The source is tainted below even on success.
+    let proven_numeric_move = |ip: usize| -> Option<(u16, u16)> {
+        let Instr::Move { dst, src } = code[ip] else {
+            return None;
+        };
+        if src == dst || excluded.contains(&src) {
+            return None;
+        }
+        let def_ip = (s..ip)
+            .rev()
+            .find(|&prev| writes_reg(&code[prev]) == Some(src))?;
+        if dv_flag_elide.contains(&def_ip)
+            || split_recv_lg.contains(&def_ip)
+            || def_ty_of(&code[def_ip]) != Some(VTy::Num)
+            || jump_targets
+                .iter()
+                .any(|&target| target > def_ip && target <= ip)
+        {
+            return None;
+        }
+        Some((dst, src))
+    };
+    let def_ty_at = |ip: usize| -> Option<VTy> {
+        if proven_numeric_move(ip).is_some() {
+            Some(VTy::Num)
+        } else {
+            def_ty_of(&code[ip])
         }
     };
     // Cheap candidate prefilter. Most regions contain no recycled register
@@ -4280,13 +4693,16 @@ pub(crate) fn plan_type_splits(
     const DEF_UNPREDICTABLE: u8 = 4;
     let mut def_kinds: FxHashMap<u16, u8> = FxHashMap::default();
 
-    // (2) Refuse outright any register a Move/Not/ToPropKey mentions.
+    // (2) Refuse outright any register a Not/ToPropKey mentions. Move sources
+    // remain refused; only a destination with the proof above is exempt.
     let mut tainted: FxHashSet<u16> = FxHashSet::default();
     for ip in s..=e {
         match code[ip] {
             Instr::Move { dst, src } => {
-                tainted.insert(dst);
                 tainted.insert(src);
+                if proven_numeric_move(ip).is_none() {
+                    tainted.insert(dst);
+                }
             }
             Instr::Not { dst, .. } => {
                 tainted.insert(dst);
@@ -4302,7 +4718,7 @@ pub(crate) fn plan_type_splits(
         }
         if let Some(d) = writes_reg(&code[ip]) {
             if !dv_flag_elide.contains(&ip) && !split_recv_lg.contains(&ip) {
-                let kind = match def_ty_of(&code[ip]) {
+                let kind = match def_ty_at(ip) {
                     Some(VTy::Bool) => DEF_BOOL,
                     Some(VTy::Num) => DEF_NUM,
                     None => DEF_UNPREDICTABLE,
@@ -4387,7 +4803,7 @@ pub(crate) fn plan_type_splits(
         let mut unpredictable = false;
         for &(ip, has_def, _) in &ips {
             if has_def {
-                match def_ty_of(&code[ip]) {
+                match def_ty_at(ip) {
                     Some(t) => tys.push(Some(t)),
                     None => {
                         unpredictable = true;
@@ -4481,7 +4897,11 @@ mod type_split_tests {
     use super::*;
 
     fn splits(code: &[Instr]) -> FxHashMap<u16, TySplit> {
-        let jump_targets: FxHashSet<usize> = [0].into_iter().collect();
+        splits_with_targets(code, &[0])
+    }
+
+    fn splits_with_targets(code: &[Instr], targets: &[usize]) -> FxHashMap<u16, TySplit> {
+        let jump_targets: FxHashSet<usize> = targets.iter().copied().collect();
         let excluded = FxHashSet::default();
         let split_recv_lg = FxHashSet::default();
         let dv_flag_elide = FxHashSet::default();
@@ -4532,6 +4952,45 @@ mod type_split_tests {
             Instr::StrConcat { dst: 3, a: 0, b: 1 },
         ];
         assert!(splits(&unpredictable).is_empty());
+    }
+
+    #[test]
+    fn type_split_move_requires_a_dominating_numeric_source_def() {
+        if !type_split_enabled() {
+            return;
+        }
+
+        let eligible = [
+            Instr::Lt { dst: 3, a: 0, b: 1 },
+            Instr::JumpIfFalse { cond: 3, target: 4 },
+            Instr::Add { dst: 4, a: 0, b: 1 },
+            Instr::Move { dst: 3, src: 4 },
+        ];
+        let got = splits_with_targets(&eligible, &[0, 4]);
+        let sp = got
+            .get(&3)
+            .expect("a dominated numeric Move may open the numeric half");
+        assert_eq!((sp.bool_lo, sp.bool_hi), (0, 1));
+        assert_eq!((sp.num_lo, sp.num_hi), (3, 3));
+
+        // A branch may not enter after the source definition: then the Move
+        // can observe a value not established by the proposed reaching def.
+        assert!(splits_with_targets(&eligible, &[0, 3, 4]).is_empty());
+
+        let bool_source = [
+            Instr::Lt { dst: 3, a: 0, b: 1 },
+            Instr::JumpIfFalse { cond: 3, target: 4 },
+            Instr::Eq { dst: 4, a: 0, b: 1 },
+            Instr::Move { dst: 3, src: 4 },
+        ];
+        assert!(splits_with_targets(&bool_source, &[0, 4]).is_empty());
+
+        let live_in_source = [
+            Instr::Lt { dst: 3, a: 0, b: 1 },
+            Instr::JumpIfFalse { cond: 3, target: 3 },
+            Instr::Move { dst: 3, src: 4 },
+        ];
+        assert!(splits_with_targets(&live_in_source, &[0, 3]).is_empty());
     }
 }
 
@@ -4671,10 +5130,20 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::Not { a, .. }
         | Instr::ToStr { a, .. }
         | Instr::TypeOf { a, .. }
-        | Instr::TypeOfIs { a, .. }
-        | Instr::IsArray { a, .. }
-        | Instr::JsonParse { a, .. } => vec![a],
-        Instr::JsonStringify { val, space, .. } => vec![val, space],
+        | Instr::TypeOfIs { a, .. } => vec![a],
+        Instr::JsonParse {
+            a, callee, this_v, ..
+        } => vec![a, callee, this_v],
+        Instr::IsArray {
+            a, callee, this_v, ..
+        } => vec![a, callee, this_v],
+        Instr::JsonStringify {
+            val,
+            space,
+            callee,
+            this_v,
+            ..
+        } => vec![val, space, callee, this_v],
 
         // ── control flow ──
         Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => vec![cond],
@@ -4689,11 +5158,17 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::DeleteProp { obj, .. }
         | Instr::WithHas { obj, .. }
         | Instr::WithGet { obj, .. }
-        | Instr::ObjectKeys { obj, .. }
         | Instr::ForInKeys { obj, .. }
-        | Instr::ObjectValues { obj, .. }
-        | Instr::ObjectEntries { obj, .. }
         | Instr::LenOf { obj, .. } => vec![obj],
+        Instr::ObjectKeys {
+            obj, callee, this_v, ..
+        }
+        | Instr::ObjectValues {
+            obj, callee, this_v, ..
+        }
+        | Instr::ObjectEntries {
+            obj, callee, this_v, ..
+        } => vec![obj, callee, this_v],
         Instr::SetProp { obj, val, .. }
         | Instr::SetPrivate { obj, val, .. }
         | Instr::InitDataProp { obj, val, .. }
@@ -4727,7 +5202,6 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::ToObject { src, .. }
         | Instr::CheckCoercible { src }
         | Instr::ThisCheck { src }
-        | Instr::IsEvalFn { src, .. }
         | Instr::ArrayRest { src, .. }
         | Instr::ObjectRest { src, .. }
         | Instr::GetIterator { src, .. }
@@ -4742,11 +5216,28 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         // the callee or receiver. Reporting no uses let the home-unification
         // passes treat those registers as dead and alias over them — see the
         // matching note in `writes_reg`.
-        Instr::MathOp { arg_base, argc, .. }
-        | Instr::GlobalFn { arg_base, argc, .. }
-        | Instr::StaticFn { arg_base, argc, .. }
-        | Instr::ArrayCtor { arg_base, argc, .. }
-        | Instr::NewArray { arg_base, argc, .. }
+        Instr::StaticFn {
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        } => win(&[callee, this_v], arg_base, argc),
+        Instr::MathOp {
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        } => win(&[callee, this_v], arg_base, argc),
+        Instr::GlobalFn { callee, arg_base, argc, .. } => win(&[callee], arg_base, argc),
+        Instr::ArrayCtor { callee, arg_base, argc, .. } => {
+            match callee {
+                Some(callee) => win(&[callee], arg_base, argc),
+                None => win(&[], arg_base, argc),
+            }
+        }
+        Instr::NewArray { arg_base, argc, .. }
         | Instr::DateNew { arg_base, argc, .. }
         | Instr::DateUTC { arg_base, argc, .. }
         | Instr::Print { arg_base, argc, .. } => win(&[], arg_base, argc),
@@ -4754,6 +5245,7 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::TailCall { callee, arg_base, argc }
         | Instr::New { callee, arg_base, argc, .. } => win(&[callee], arg_base, argc),
         Instr::CallWithThis { callee, this_v, arg_base, argc, .. }
+        | Instr::RegExpMethod { callee, this_v, arg_base, argc, .. }
         | Instr::TailCallWithThis { callee, this_v, arg_base, argc } => {
             win(&[callee, this_v], arg_base, argc)
         }
@@ -4764,16 +5256,47 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::CallSpread { callee, args, .. } | Instr::NewSpread { callee, args, .. } => {
             vec![callee, args]
         }
+        Instr::CallWithThisSpread {
+            callee,
+            this_v,
+            args,
+            ..
+        } => vec![callee, this_v, args],
         Instr::CallMethodSpread { obj, args, .. } => vec![obj, args],
         Instr::CallMethodComputedSpread { obj, key, args, .. } => vec![obj, key, args],
-        Instr::MathSpread { args, .. } => vec![args],
-        Instr::ArrayFrom { src, mapfn, .. } => vec![src, mapfn],
-        Instr::InstanceOf { val, .. } => vec![val],
+        Instr::MathSpread {
+            callee,
+            this_v,
+            args,
+            ..
+        } => vec![callee, this_v, args],
+        Instr::ArrayFrom {
+            src,
+            mapfn,
+            callee,
+            this_v,
+            ..
+        } => vec![src, mapfn, callee, this_v],
         Instr::InstanceOfDyn { val, ctor, .. } => vec![val, ctor],
-        // `eval(arg)` with the caller's `this`. The eval'd code reaches the
-        // caller's NAMED bindings through the EvalScope / the Dyn global+upval
-        // ops, never through raw registers, so those two are the whole read set.
-        Instr::DirectEval { arg, this_reg, .. } => vec![arg, this_reg],
+        // The syntactic `eval` reference (callee + WithBaseObject), caller
+        // lexical `this`, and its COMPLETE argument source. A spread site uses
+        // one materialized Array register; an ordinary site uses a contiguous
+        // argument window.
+        Instr::DirectEval {
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            args_array,
+            this_reg,
+            ..
+        } => {
+            if args_array {
+                vec![callee, this_v, arg_base, this_reg]
+            } else {
+                win(&[callee, this_v, this_reg], arg_base, argc)
+            }
+        }
 
         // ── `super` ── every form also consumes the activation's `this`
         // (register 0), which no operand field names.
@@ -4787,6 +5310,8 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         Instr::SuperGetComputed { key, .. } | Instr::SuperGetObjComputed { key, .. } => {
             vec![key, THIS]
         }
+        Instr::SuperGetRef { receiver, .. } => vec![receiver],
+        Instr::SuperGetRefComputed { key, receiver, .. } => vec![key, receiver],
         Instr::SuperSet { base, val, .. } => vec![base, val, THIS],
         Instr::SuperSetComputed { base, key, val, .. } => vec![base, key, val, THIS],
         Instr::SuperSetObj { val, .. } => vec![val, THIS],
@@ -6324,8 +6849,8 @@ pub(crate) fn plan_field_promotion(
             _ => false,
         });
         match m.pos(fname) {
-            Some(slot) if !m.attr_at(slot).accessor && (!need_writable || m.attr_at(slot).writable) => {
-            }
+            Some(slot)
+                if !m.attr_at(slot).accessor && (!need_writable || m.attr_at(slot).writable) => {}
             _ => return None,
         }
     }

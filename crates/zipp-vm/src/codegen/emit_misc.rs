@@ -247,6 +247,56 @@ pub(crate) fn store_xmm(ops: &mut dynasmrt::x64::Assembler, dst: u16) {
     );
 }
 
+/// Validate the exact callable reference consumed by a JIT `MathOp`.
+///
+/// The `Math.imul` specialization replaces only the allocation-free Rust
+/// identity helper. Its source `LoadGlobal` and `GetProp` have already executed
+/// at this point on every activation, as have all arguments. Exact receiver and
+/// callee compares therefore preserve lookup/accessor/Proxy effects and
+/// replacement during argument evaluation. The heap generation compare closes
+/// the remaining GC slot-reuse ABA hole. Any mismatch bails at the MathOp, whose
+/// interpreter arm calls the already-captured callee with the captured receiver.
+pub(crate) fn emit_math_identity_guard(
+    ops: &mut dynasmrt::x64::Assembler,
+    op: MathFn,
+    callee: u16,
+    this_v: u16,
+    bail: dynasmrt::DynamicLabel,
+    imul_guard: Option<MathIntrinsicGuard>,
+) {
+    if matches!(op, MathFn::Imul) {
+        if let Some(guard) = imul_guard {
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(this_v)]
+                ; mov r10, QWORD guard.receiver_bits as i64
+                ; cmp rax, r10
+                ; jne => bail
+                ; mov rax, [rbx + dreg(callee)]
+                ; mov r10, QWORD guard.callee_bits as i64
+                ; cmp rax, r10
+                ; jne => bail
+                // Exact heap bits make eax the validated live slot index.
+                ; mov ecx, eax
+                ; cmp DWORD [r13 + rcx * 4], guard.callee_ver as i32
+                ; jne => bail
+            );
+            return;
+        }
+    }
+
+    let identity = crate::vm::jit_math_is_intrinsic as usize;
+    dynasm!(ops
+        ; mov rcx, rdi
+        ; mov edx, op as i32
+        ; mov r8, [rbx + dreg(callee)]
+        ; mov r9, [rbx + dreg(this_v)]
+        ; mov rax, QWORD identity as i64
+        ; call rax
+        ; test rax, rax
+        ; jz => bail
+    );
+}
+
 /// `regs[dst] = Math.<op>(args…)` for the mem paths. Operands are loaded as
 /// numbers (Int/double); a non-numeric operand BAILS to the interpreter, which
 /// runs the full ToNumber coercion (a user `valueOf`). So the helpers here never
@@ -273,11 +323,15 @@ pub(crate) fn emit_math_op(
     epilogue: dynasmrt::DynamicLabel,
     dst: u16,
     op: MathFn,
+    callee: u16,
+    this_v: u16,
     arg_base: u16,
     argc: u16,
     math_unary: usize,
     math_two: usize,
+    math_imul_guard: Option<MathIntrinsicGuard>,
 ) {
+    emit_math_identity_guard(ops, op, callee, this_v, bail, math_imul_guard);
     if argc == 1 {
         load_num_xmm(ops, arg_base, 0, bail);
         dynasm!(ops

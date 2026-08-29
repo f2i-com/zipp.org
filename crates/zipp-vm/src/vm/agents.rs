@@ -137,7 +137,8 @@ impl<'p> Vm<'p> {
     /// signals it is running (INTERPRETING.md). The worker compiles and runs
     /// `src` on its own thread with its own Vm/realm; only `agent_shared` (and
     /// any broadcast SAB bytes) are shared.
-    pub(crate) fn agent_start(&mut self, src: String) {
+    pub(crate) fn agent_start(&mut self, src: String) -> Result<(), Thrown> {
+        self.require_external_code_enabled()?;
         let shared = self.agent_shared();
         let (tx, rx) = mpsc::channel();
         let started = Arc::new((Mutex::new(false), Condvar::new()));
@@ -150,6 +151,7 @@ impl<'p> Vm<'p> {
         while !*running {
             running = cv.wait(running).unwrap();
         }
+        Ok(())
     }
 
     /// `$262.agent.broadcast(sab[, id])`: send the SAB's shared bytes to every

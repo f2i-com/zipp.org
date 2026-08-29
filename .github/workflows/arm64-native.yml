@@ -1,9 +1,10 @@
 name: ARM64 native JIT
 
-# Manual-trigger only (was: push to main on engine paths) — Actions quota.
+# Manual-trigger only because ARM64 runners are comparatively expensive.
 #   gh workflow run arm64-native.yml
 on:
   workflow_dispatch:
+
 jobs:
   native-arm64:
     name: ${{ matrix.os }}
@@ -19,6 +20,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Select stable Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Prove the runner is ARM64

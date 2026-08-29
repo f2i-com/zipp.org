@@ -14,6 +14,13 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
 
+  # The native sandbox is also a deliberately separate Cargo workspace/lock.
+  - package-ecosystem: cargo
+    directory: "/crates/zipp-sandbox"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
   - package-ecosystem: npm
     directory: "/landing"
     schedule:

@@ -72,6 +72,7 @@ enum ArrayCopyLenKind {
 #[derive(Clone, Copy)]
 struct ArrayCopyLenPlan {
     kind: ArrayCopyLenKind,
+    captured_call: bool,
     source_global: u32,
     sum_global: u32,
     i_global: u32,
@@ -630,40 +631,92 @@ fn recognize_in_probe_reduce(
 /// For concat the sole argument must be an array literal whose elements are
 /// integer literals evaluated inside the loop.  Including the complete loop
 /// skeleton is what makes it safe to skip every later argument evaluation and
-/// result allocation after the first CallMethod reaches the interpreter.
+/// result allocation after the first call reaches the interpreter.  Both the
+/// legacy fused `CallMethod` and the spec-order `GetProp; <literal args>;
+/// CallWithThis` lowering are recognized; the latter is additionally guarded
+/// against the exact callable Value captured by `GetProp`.
+fn captured_array_copy_name(proto: &crate::bytecode::FuncProto, call_ip: usize) -> Option<u32> {
+    let c = &proto.code;
+    let (callee, this_v, arg_base, argc) = match *c.get(call_ip)? {
+        Instr::CallWithThis {
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        } => (callee, this_v, arg_base, argc),
+        _ => return None,
+    };
+    // EvaluateCall captures the member before its arguments. Accept only the
+    // two compiler-exact, literal-only windows this reducer already proves:
+    // two integer arguments for slice, or one freshly allocated small
+    // integer-literal array for concat.
+    let get_ip = match argc {
+        2 => call_ip.checked_sub(3)?,
+        1 => {
+            let new_ip = call_ip.checked_sub(1)?;
+            let elem_count = match *c.get(new_ip)? {
+                Instr::NewArray { dst, argc, .. } if dst == arg_base => argc as usize,
+                _ => return None,
+            };
+            if elem_count > 8 {
+                return None;
+            }
+            new_ip.checked_sub(elem_count + 1)?
+        }
+        _ => return None,
+    };
+    match *c.get(get_ip)? {
+        Instr::GetProp { dst, obj, name } if dst == callee && obj == this_v => Some(name),
+        _ => None,
+    }
+}
+
 fn recognize_array_copy_len(
     proto: &crate::bytecode::FuncProto,
     call_ip: usize,
 ) -> Option<ArrayCopyLenPlan> {
     use crate::bytecode::BitwiseOp;
     let c = &proto.code;
-    let (call_dst, call_obj, name, call_arg_base, call_argc) = match *c.get(call_ip)? {
-        Instr::CallMethod {
-            dst,
-            obj,
-            name,
-            arg_base,
-            argc,
-        } => (dst, obj, name, arg_base, argc),
-        _ => return None,
-    };
+    let (call_dst, call_obj, name, call_arg_base, call_argc, captured_call) =
+        match *c.get(call_ip)? {
+            Instr::CallMethod {
+                dst,
+                obj,
+                name,
+                arg_base,
+                argc,
+            } => (dst, obj, name, arg_base, argc, false),
+            Instr::CallWithThis {
+                dst,
+                this_v,
+                arg_base,
+                argc,
+                ..
+            } => {
+                let name = captured_array_copy_name(proto, call_ip)?;
+                (dst, this_v, name, arg_base, argc, true)
+            }
+            _ => return None,
+        };
     let method = proto.string_constants.get(name as usize)?.as_str();
 
     let (start, kind, after_call) = match method {
         "slice" if call_argc == 2 => {
-            let start = call_ip.checked_sub(7)?;
-            let start_reg = match *c.get(start + 5)? {
+            let start = call_ip.checked_sub(7 + usize::from(captured_call))?;
+            let arg_pos = start + 5 + usize::from(captured_call);
+            let start_reg = match *c.get(arg_pos)? {
                 Instr::LoadInt { dst, .. } if dst == call_arg_base => dst,
                 _ => return None,
             };
-            let end_reg = match *c.get(start + 6)? {
+            let end_reg = match *c.get(arg_pos + 1)? {
                 Instr::LoadInt { dst, .. } if dst == call_arg_base + 1 => dst,
                 _ => return None,
             };
             (
                 start,
                 ArrayCopyLenKind::Slice { start_reg, end_reg },
-                start + 8,
+                call_ip + 1,
             )
         }
         "concat" if call_argc == 1 => {
@@ -682,9 +735,10 @@ fn recognize_array_copy_len(
             if elem_count > 8 {
                 return None;
             }
-            let start = new_ip.checked_sub(5 + elem_count)?;
+            let prefix = 5 + usize::from(captured_call);
+            let start = new_ip.checked_sub(prefix + elem_count)?;
             for n in 0..elem_count {
-                if !matches!(*c.get(start + 5 + n)?, Instr::LoadInt { dst, .. }
+                if !matches!(*c.get(start + prefix + n)?, Instr::LoadInt { dst, .. }
                     if dst == elem_base + n as u16)
                 {
                     return None;
@@ -711,6 +765,15 @@ fn recognize_array_copy_len(
         Instr::LoadGlobal { dst, idx } if dst == call_obj => (dst, idx),
         _ => return None,
     };
+    if captured_call
+        && !matches!(*c.get(start + 5)?, Instr::GetProp { dst, obj, name: n }
+            if dst == match *c.get(call_ip)? {
+                Instr::CallWithThis { callee, .. } => callee,
+                _ => return None,
+            } && obj == source && n == name)
+    {
+        return None;
+    }
     let len = match *c.get(after_call)? {
         Instr::GetProp { dst, obj, name }
             if obj == call_dst
@@ -771,6 +834,7 @@ fn recognize_array_copy_len(
     let _ = source;
     Some(ArrayCopyLenPlan {
         kind,
+        captured_call,
         source_global,
         sum_global,
         i_global,
@@ -923,8 +987,10 @@ fn recognize_object_keys_len(
     ip: usize,
 ) -> Option<ObjectKeysLenPlan> {
     use crate::bytecode::BitwiseOp;
-    let start = ip.checked_sub(5)?;
-    let end = start.checked_add(14)?;
+    // The guarded call snapshots `Object` and `Object.keys` before evaluating
+    // its source argument, adding two instructions ahead of ObjectKeys.
+    let start = ip.checked_sub(7)?;
+    let end = start.checked_add(16)?;
     if end >= proto.code.len() || !matches!(proto.code[ip], Instr::ObjectKeys { .. }) {
         return None;
     }
@@ -938,7 +1004,7 @@ fn recognize_object_keys_len(
         _ => return None,
     };
     if !matches!(c[start + 2], Instr::JumpIfNotLt { a, b, target }
-        if a == i_head && b == limit && target as usize == start + 15)
+        if a == i_head && b == limit && target as usize == start + 17)
     {
         return None;
     }
@@ -946,15 +1012,36 @@ fn recognize_object_keys_len(
         Instr::LoadGlobal { dst, idx } => (dst, idx),
         _ => return None,
     };
-    let (source, source_global) = match c[start + 4] {
+    let this_v = match c[start + 4] {
+        Instr::LoadGlobal { dst, .. } => dst,
+        _ => return None,
+    };
+    let callee = match c[start + 5] {
+        Instr::GetProp { dst, obj, name }
+            if obj == this_v
+                && proto
+                    .string_constants
+                    .get(name as usize)
+                    .is_some_and(|s| s == "keys") =>
+        {
+            dst
+        }
+        _ => return None,
+    };
+    let (source, source_global) = match c[start + 6] {
         Instr::LoadGlobal { dst, idx } => (dst, idx),
         _ => return None,
     };
-    let keys = match c[start + 5] {
-        Instr::ObjectKeys { dst, obj } if obj == source => dst,
+    let keys = match c[start + 7] {
+        Instr::ObjectKeys {
+            dst,
+            obj,
+            callee: c,
+            this_v: t,
+        } if obj == source && c == callee && t == this_v => dst,
         _ => return None,
     };
-    let len = match c[start + 6] {
+    let len = match c[start + 8] {
         Instr::GetProp { dst, obj, name }
             if obj == keys
                 && proto
@@ -966,15 +1053,15 @@ fn recognize_object_keys_len(
         }
         _ => return None,
     };
-    let added = match c[start + 7] {
+    let added = match c[start + 9] {
         Instr::Add { dst, a, b } if a == sum && b == len => dst,
         _ => return None,
     };
-    let zero = match c[start + 8] {
+    let zero = match c[start + 10] {
         Instr::LoadInt { dst, val: 0 } => dst,
         _ => return None,
     };
-    let reduced = match c[start + 9] {
+    let reduced = match c[start + 11] {
         Instr::Bitwise {
             dst,
             a,
@@ -983,22 +1070,22 @@ fn recognize_object_keys_len(
         } if a == added && b == zero => dst,
         _ => return None,
     };
-    if !matches!(c[start + 10], Instr::StoreGlobal { idx, src }
+    if !matches!(c[start + 12], Instr::StoreGlobal { idx, src }
         | Instr::StoreGlobalStrict { idx, src }
         | Instr::StoreGlobalResolved { idx, src }
             if idx == sum_global && src == reduced)
     {
         return None;
     }
-    let i_tail = match c[start + 11] {
+    let i_tail = match c[start + 13] {
         Instr::LoadGlobal { dst, idx } if idx == i_global => dst,
         _ => return None,
     };
-    if !matches!(c[start + 12], Instr::AddInt { dst, a, imm: 1, upd: true }
+    if !matches!(c[start + 14], Instr::AddInt { dst, a, imm: 1, upd: true }
         if dst == i_tail && a == i_tail)
-        || !matches!(c[start + 13], Instr::StoreGlobalResolved { idx, src }
+        || !matches!(c[start + 15], Instr::StoreGlobalResolved { idx, src }
             if idx == i_global && src == i_tail)
-        || !matches!(c[start + 14], Instr::Jump { target } if target as usize == start)
+        || !matches!(c[start + 16], Instr::Jump { target } if target as usize == start)
     {
         return None;
     }
@@ -1008,11 +1095,24 @@ fn recognize_object_keys_len(
         sum_global,
         i_global,
         limit_global,
-        exit: start + 15,
+        exit: start + 17,
     })
 }
 
 impl<'p> Vm<'p> {
+    /// Cheap static gate used by `CallWithThis` dispatch before entering the
+    /// full reducer proof. It inspects only compiler bytecode, so ordinary
+    /// captured method calls do not gain a heap lookup or callable-type test.
+    pub(crate) fn captured_array_copy_method(&self, func_id: u32, ip: usize) -> Option<&'p str> {
+        let proto = self.func(func_id as usize);
+        let name = captured_array_copy_name(proto, ip)?;
+        proto
+            .string_constants
+            .get(name as usize)
+            .map(String::as_str)
+            .filter(|name| matches!(*name, "slice" | "concat"))
+    }
+
     #[inline]
     fn enum_loop_observation_free(&self) -> bool {
         #[cfg(feature = "instrument")]
@@ -1068,7 +1168,7 @@ impl<'p> Vm<'p> {
     /// side-effect-free main-realm intrinsics: the method and constructor data
     /// slots on %Array.prototype%, the default @@species getter on %Array%, and
     /// (for concat) absence of @@isConcatSpreadable on both prototype anchors.
-    fn array_copy_chain_pristine(&self, receiver: Value, method: &str) -> Option<usize> {
+    fn array_copy_chain_pristine(&self, receiver: Value, method: &str) -> Option<(usize, Value)> {
         let len = self.array_copy_plain_len(receiver)?;
         if self.arr_proto == 0
             || self.obj_proto == 0
@@ -1082,17 +1182,22 @@ impl<'p> Vm<'p> {
             HeapObj::Object(map) if map.class.is_none() => map,
             _ => return None,
         };
-        let method_ok = ap.pos(method).is_some_and(|slot| {
-            !ap.attr_at(slot).accessor
-                && ap.val_at(slot).is_heap()
-                && matches!(self.heap.get(ap.val_at(slot).heap_index()), HeapObj::Native(id)
+        let method_target = ap.pos(method).and_then(|slot| {
+            let target = ap.val_at(slot);
+            (!ap.attr_at(slot).accessor
+                && target.is_heap()
+                && matches!(self.heap.get(target.heap_index()), HeapObj::Native(id)
                     if native::proto_method(*id)
-                        .is_some_and(|(name, kind, _)| name == method && kind == 0))
+                        .is_some_and(|(name, kind, _)| name == method && kind == 0)))
+            .then_some(target)
         });
         let constructor_ok = ap.pos("constructor").is_some_and(|slot| {
             !ap.attr_at(slot).accessor && ap.val_at(slot) == Value::heap(self.array_ctor)
         });
-        if !method_ok || !constructor_ok {
+        let Some(method_target) = method_target else {
+            return None;
+        };
+        if !constructor_ok {
             return None;
         }
         let op = match self.heap.get(self.obj_proto) {
@@ -1116,7 +1221,7 @@ impl<'p> Vm<'p> {
                 && matches!(self.heap.get(ctor.val_at(slot).heap_index()),
                     HeapObj::Native(id) if *id == native::SPECIES_GET)
         });
-        species_ok.then_some(len)
+        species_ok.then_some((len, method_target))
     }
 
     pub(crate) fn try_sparse_forin_fold_reduce(
@@ -1259,6 +1364,7 @@ impl<'p> Vm<'p> {
         base: usize,
         receiver: Value,
         method: &str,
+        captured_callee: Option<Value>,
     ) -> Option<usize> {
         if !array_copy_len_reduce_enabled()
             || !self.enum_loop_observation_free()
@@ -1268,6 +1374,9 @@ impl<'p> Vm<'p> {
         }
         let proto = self.program.functions.get(func_id as usize)?;
         let plan = recognize_array_copy_len(proto, ip)?;
+        if plan.captured_call != captured_callee.is_some() {
+            return None;
+        }
         let globals = [
             plan.source_global,
             plan.sum_global,
@@ -1295,7 +1404,10 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let source_len = self.array_copy_chain_pristine(receiver, method)?;
+        let (source_len, intrinsic_callee) = self.array_copy_chain_pristine(receiver, method)?;
+        if captured_callee.is_some_and(|callee| callee != intrinsic_callee) {
+            return None;
+        }
         let result_len = match plan.kind {
             ArrayCopyLenKind::Slice { start_reg, end_reg } if method == "slice" => {
                 let start = self.get(base, start_reg);
@@ -1624,7 +1736,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let proto = self.program.functions.get(func_id as usize)?;
-        let i_global = match proto.code.get(ip.checked_sub(5)?)? {
+        let i_global = match proto.code.get(ip.checked_sub(7)?)? {
             Instr::LoadGlobal { idx, .. } => *idx,
             _ => return None,
         };

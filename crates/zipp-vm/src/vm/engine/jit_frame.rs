@@ -336,6 +336,13 @@ impl<'p> Vm<'p> {
     /// pointers). Called before entering the top-level run.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn reserve_jit_regs(&mut self) {
+        // Entry points may compose (`run()` followed by `run_module_entry()`).
+        // Once native code has been enabled the recorded capacity is the
+        // lifetime pin: never reserve again and move the allocation out from
+        // under a pointer held by an in-flight native frame.
+        if self.reg_capacity != 0 {
+            return;
+        }
         // The register file must NEVER reallocate while a native JIT frame holds
         // a raw pointer into it (the caller's window pointer lives in a callee-
         // saved register across the self-call helper). A realloc there dangles
@@ -374,6 +381,27 @@ impl<'p> Vm<'p> {
     /// filesystem (the running script's directory). Without it, `import()` rejects.
     pub fn set_module_base_dir(&mut self, dir: Option<std::path::PathBuf>) {
         self.module_base_dir = dir;
+    }
+
+    /// Permit only the already-compiled main program to execute. No recorder is
+    /// attached and JIT policy is untouched; this is the release-PGO training
+    /// boundary, not a sandbox or a metered execution mode.
+    pub(crate) fn disable_external_code(&mut self) {
+        self.external_code_disabled = true;
+        // Dynamic import and ShadowRealm.importValue must not even resolve a
+        // filesystem path. import_module has its own defensive gate as well.
+        self.module_base_dir = None;
+    }
+
+    #[inline]
+    pub(crate) fn require_external_code_enabled(&self) -> Result<(), Thrown> {
+        if self.external_code_disabled {
+            Err(Thrown(
+                "EvalError: external code is disabled by the host".into(),
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Set the canonical filesystem boundary and confined loader budgets.

@@ -24,11 +24,11 @@ impl<'p> Vm<'p> {
     /// SOUNDNESS:
     /// * Reached ONLY from `jit_region_call_impl` (a JIT region helper), so the
     ///   interpreter / `ZIPP_NOJIT` path is byte-identical (never calls this).
-    /// * `ic_call_method` ALREADY resolved `fid` with the full guard set incl.
-    ///   the G3b own-shadow guard (its `ClassMethod` arm requires `own.is_none()`)
-    ///   and the class-version guard — so an instance own-write `inst.m = fn`
-    ///   misses the IC and never reaches here, and a stale class misses too. We
-    ///   only need to evaluate the resolved body faithfully.
+    /// * The caller supplies the exact callable it resolved. Legacy method ops
+    ///   reach this only after `ic_call_method`'s full receiver/own-shadow/class
+    ///   guards; `CallWithThis` reaches it only after resolving the callable
+    ///   Value captured by `GetProp`/`SuperGet`. In both cases `fid` is the live
+    ///   target that will run, and `recv` is the already-captured receiver.
     /// * NO partial side effect before a `None`: a two-pass shape — pass 1
     ///   (`method_body_inlinable`) validates the ENTIRE straight-line body is
     ///   executable WITHOUT running anything; pass 2 executes. So an unsupported
@@ -38,11 +38,12 @@ impl<'p> Vm<'p> {
     ///   ops use (`add_values`, `numeric_binop`) so results are byte-identical;
     ///   it is admitted only on operands that are ALREADY numbers (else pass 1
     ///   declines), so no observable `valueOf`/`ToPrimitive` ever runs off-frame.
-    /// * A nested `super.m()` is resolved via the SAME `ic_super_method` cache
-    ///   the interpreter uses (live home-class value + version-guarded chain),
-    ///   then evaluated off-frame recursively (depth-bounded) only when its target
-    ///   is trivial and effect-free. Otherwise the entire method declines before
-    ///   entering that target, so a later frame-call fallback cannot replay it.
+    /// * A nested legacy `super.m()` is resolved via `ic_super_method`. The
+    ///   spec-correct lowering (`SuperGet; CallWithThis`) instead invokes the
+    ///   exact Value produced by that `SuperGet`; it never re-resolves by name.
+    ///   Both paths recurse only for a trivial, effect-free target. Otherwise
+    ///   the whole method declines before entering it, so fallback cannot replay
+    ///   a committed effect.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn try_method_inline(
         &mut self,
@@ -206,6 +207,22 @@ impl<'p> Vm<'p> {
                 // `ic_super_get` (live, version-guarded). Pure (a read), so admitting
                 // it anywhere in the straight-line prefix is effect-free.
                 I::SuperGet { .. } => {}
+                // Current `super.m()` lowering captures the property Value before
+                // evaluating/calling it. Recover the zero-arg hot-class case only
+                // for the exact adjacent pair emitted by the compiler. The pass-2
+                // arm consumes the Value in `callee`; it never looks `name` up a
+                // second time. Anything with args/intervening work remains on the
+                // ordinary frame path.
+                I::CallWithThis {
+                    callee,
+                    this_v: 0,
+                    argc: 0,
+                    ..
+                } if ix > 0
+                    && matches!(
+                        code[ix - 1],
+                        I::SuperGet { dst, .. } if dst == callee
+                    ) => {}
                 // `GetSuperBase` capture for a SuperMethod/SuperSet — a pure read
                 // (the same lookup the interpreter's SuperBase op performs).
                 I::SuperBase { .. } => {}
@@ -421,6 +438,32 @@ impl<'p> Vm<'p> {
                     let v = self.mi_super_get(fid, body_ip, home_class_id, name, recv)?;
                     regs[dst as usize] = v;
                 }
+                I::CallWithThis {
+                    dst,
+                    callee,
+                    this_v: 0,
+                    argc: 0,
+                    ..
+                } if body_ip > 0
+                    && matches!(
+                        code[body_ip - 1],
+                        I::SuperGet { dst, .. } if dst == callee
+                    ) =>
+                {
+                    let bits = self.mi_captured_call(regs[callee as usize], recv, depth)?;
+                    if bits == crate::codegen::CALL_THREW || bits == crate::codegen::SELF_CALL_DEOPT
+                    {
+                        // The captured target is admitted only before it runs and
+                        // only when its complete recursive body is effect-free.
+                        // A deopt therefore commits nothing and may safely decline
+                        // the whole outer method; a throw must propagate.
+                        if bits == crate::codegen::SELF_CALL_DEOPT {
+                            return None;
+                        }
+                        return Some(crate::codegen::CALL_THREW);
+                    }
+                    regs[dst as usize] = Value::from_bits(bits);
+                }
                 I::SuperBase { dst, home_class_id } => {
                     // The same live GetSuperBase the interpreter's op performs
                     // (a pure read — a decline commits nothing).
@@ -596,6 +639,50 @@ impl<'p> Vm<'p> {
         // call (nothing committed) rather than staging args into the pinned
         // register file (which could realloc near capacity). Rare in practice.
         if s_argc != 0 {
+            return Some(SELF_CALL_DEOPT);
+        }
+        self.run_method_inline(fid, recv, 0, 0, 0, blen, depth + 1)
+    }
+
+    /// Invoke the exact callable Value captured by the adjacent
+    /// `SuperGet; CallWithThis` pair admitted by `method_body_inlinable_scan`.
+    /// This is deliberately narrower than a general off-frame call: zero args,
+    /// strict non-arrow user functions, bounded recursion, and a fully validated
+    /// effect-free body. In particular, it never converts the captured Value
+    /// back into a property name, so replacing a method after `SuperGet` cannot
+    /// redirect this call.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn mi_captured_call(
+        &mut self,
+        callee: Value,
+        recv: Value,
+        depth: u32,
+    ) -> Option<u64> {
+        use crate::codegen::SELF_CALL_DEOPT;
+        if depth >= Self::METHOD_INLINE_MAX_SUPER {
+            return Some(SELF_CALL_DEOPT);
+        }
+        let (fid, _closure) = match self.ic_plain_fn(callee) {
+            Some(target) => target,
+            None => return Some(SELF_CALL_DEOPT),
+        };
+        let target = self.func(fid as usize);
+        // Arrow `this` and sloppy OrdinaryCallBindThis both need setup_call's
+        // binding rules. Class methods (the hot path) and strict functions use
+        // the captured receiver exactly as supplied.
+        if target.lexical_this || !target.is_strict {
+            return Some(SELF_CALL_DEOPT);
+        }
+        let blen = match self.method_body_inlinable(fid) {
+            Some(len) => len,
+            None => return Some(SELF_CALL_DEOPT),
+        };
+        // A later guard in the outer method may still decline. Do not run a
+        // target whose only admitted committing op could then be replayed.
+        if self.func(fid as usize).code[..blen]
+            .iter()
+            .any(|instr| matches!(instr, Instr::SuperSet { .. }))
+        {
             return Some(SELF_CALL_DEOPT);
         }
         self.run_method_inline(fid, recv, 0, 0, 0, blen, depth + 1)
@@ -818,6 +905,38 @@ mod replay_safety_tests {
             .position(|candidate| candidate == name)
             .unwrap_or_else(|| panic!("missing global {name}"));
         vm.globals[slot]
+    }
+
+    /// The reference-order lowering splits a `super.m()` into an exact
+    /// `SuperGet; CallWithThis` pair. Keep the class-benchmark evaluator able
+    /// to consume that pair without returning to a frame or re-resolving `m`.
+    #[test]
+    fn captured_super_callee_stays_inlineable() {
+        let mut vm = vm(r#"
+                class Parent { value() { return this.n + 1; } }
+                class Child extends Parent {
+                    value() { return super.value() * 3 + 1; }
+                }
+                var subject = new Child();
+                subject.n = 4;
+            "#);
+        let subject = global(&vm, "subject");
+        let fid = vm
+            .program
+            .functions
+            .iter()
+            .position(|proto| proto.source.contains("super.value() * 3"))
+            .expect("Child.value function") as u32;
+
+        assert!(
+            vm.method_body_inlinable_scan(fid).is_some(),
+            "the captured super-call pair must pass the shape scan"
+        );
+        assert_eq!(
+            vm.try_method_inline(fid, subject, 0, 0, 0),
+            Some(Value::int(16).bits()),
+            "the exact captured Parent.value target must run off-frame"
+        );
     }
 
     /// A nested off-frame super call must not commit its own SuperSet and then

@@ -220,6 +220,39 @@ fn ghoist_parity_deopt_midloop_reentry() {
     );
 }
 
+/// Capture-first member lowering gives `charCodeAt` its own pinned `GetProp`.
+/// That lookup is not a `.length` read and must never become a numeric
+/// prologue fill: an OOB call deopts at `CallWithThis`, where the interpreter
+/// still needs the captured callable in its frame slot.
+#[test]
+fn ghoist_parity_captured_charcode_oob_replay() {
+    assert_matches_node(
+        r#"
+        var str = "the quick brown fox jumps over the lazy dog 0123456789 ABCDEF";
+        function main() {
+          var acc = 1;
+          for (var r = 0; r < 1; r++) acc = (Math.imul(acc, 31) + (kernel(9) | 0)) | 0;
+          return acc | 0;
+        }
+        function kernel(n) {
+          var h = 1, i = 0, t0 = 1;
+          for (i = 0; i < n; i++) {
+            t0 = str.charCodeAt(h);
+            h = (h + (t0 | 0)) | 0;
+          }
+          var kind = typeof t0 === "number" ? 2
+            : typeof t0 === "boolean" ? 3
+            : typeof t0 === "string" ? 5
+            : typeof t0 === "undefined" ? 7
+            : typeof t0 === "object" ? 11 : 13;
+          return (h ^ ((t0 | 0) * 3) ^ (kind * 64)) | 0;
+        }
+        try { console.log("D " + (main() >>> 0).toString(16)); }
+        catch (e) { console.log("D E:" + (e && e.constructor ? e.constructor.name : "?")); }
+        "#,
+    );
+}
+
 /// The typedarray-math DV swizzle shape on the DOUBLE tier (split receivers +
 /// fused endian Eq + hoisted identity), plus an OOB pos mid-loop: the bounds
 /// guard STAYS per-access, deopts, and the interpreter raises node's

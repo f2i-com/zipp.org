@@ -702,6 +702,30 @@ impl<'p> Vm<'p> {
                     Some((_, m)) => (m.val_at(slot), m.shape()),
                     None => return GetAct::None,
                 };
+                // Member calls are lowered in spec order as an adjacent
+                // `GetProp; CallWithThis` pair.  The transactional Tier-C
+                // own-method planner runs at the caller's next entry, when
+                // the receiver register need not be populated yet, so retain
+                // the exact receiver observed by this side-effect-free GET
+                // fill just as the legacy fused CallMethod cache did.  Limit
+                // this history to syntactic captured-call sites whose value
+                // is a plain user function: ordinary property reads should
+                // not pay the per-site receiver storage cost.
+                let captured_plain_method = matches!(
+                    (
+                        self.func(func_id as usize).code.get(ip),
+                        self.func(func_id as usize).code.get(ip + 1),
+                    ),
+                    (
+                        Some(Instr::GetProp { dst, obj, .. }),
+                        Some(Instr::CallWithThis {
+                            callee, this_v, ..
+                        }),
+                    ) if dst == callee && obj == this_v
+                ) && self.ic_plain_fn(v).is_some();
+                if captured_plain_method {
+                    self.mi_record_recv(func_id, ip, recv);
+                }
                 self.ic_install(
                     func_id,
                     ip,
@@ -726,6 +750,11 @@ impl<'p> Vm<'p> {
             }
             Walked::ClassMethod { class, callee } => {
                 if let Some((fid, closure)) = self.ic_plain_fn(callee) {
+                    // A spec-order member call fills this GET site rather than
+                    // the following CallWithThis site. Preserve the receiver
+                    // history here so its captured-call inline plan can build
+                    // the same polymorphic arms as the legacy fused call.
+                    self.mi_record_recv(func_id, ip, recv);
                     self.ic_install(
                         func_id,
                         ip,
@@ -1584,18 +1613,30 @@ impl<'p> Vm<'p> {
         different_fid.then_some(first)
     }
 
-    /// Read-only: the resolved class-method `fid` for a `CallMethod` site whose
-    /// receiver belongs to `class`, taken from a FILLED `ClassMethod` IC way. For
-    /// the Q7 method-inline planner (`build_method_inline_plan`). `None` if no
-    /// such way exists yet (unfilled site, or the class resolves a different
-    /// entry kind / a different class). Performs no fill / side effect.
+    /// Read-only: the resolved class-method `fid` and exact callable Value for a
+    /// method-read/call site whose receiver belongs to `class`, taken from a
+    /// FILLED `ClassMethod` IC way. The exact Value is required by captured-call
+    /// inline plans: equal function ids are not equal JS function identities.
+    /// `None` if no such way exists yet (unfilled site, or a different entry
+    /// kind/class). Performs no fill / side effect.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn ic_class_method_fid(&self, func_id: u32, ip: usize, class: u32) -> Option<u32> {
+    pub(crate) fn ic_class_method_target(
+        &self,
+        func_id: u32,
+        ip: usize,
+        class: u32,
+    ) -> Option<(u32, Value)> {
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
-            if let IcEntry::ClassMethod { class: c, fid, .. } = *e {
+            if let IcEntry::ClassMethod {
+                class: c,
+                fid,
+                callee,
+                ..
+            } = *e
+            {
                 if c == class {
-                    return Some(fid);
+                    return Some((fid, callee));
                 }
             }
         }
@@ -1967,7 +2008,8 @@ impl<'p> Vm<'p> {
                                 self.heap.get(hops.0[hops.1 as usize - 1].0)
                             {
                                 let s = slot as usize;
-                                if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor {
+                                if s < hm.keys.len() && hm.keys[s] == key && !hm.attr_at(s).accessor
+                                {
                                     return GetAct::Value(hm.val_at(s));
                                 }
                             }

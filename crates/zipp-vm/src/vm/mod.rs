@@ -20,7 +20,7 @@
 //! later make faster.
 
 #![allow(unused_imports)]
-use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
     PromiseState, PropAttr, ReactionPair, Reactions,
@@ -113,6 +113,81 @@ struct TiercActivationState {
     /// rooted for the whole activation, the collector never moves live boxes,
     /// and a closure's upvalue list is fixed at creation.
     upvals_raw: u64,
+}
+
+/// Suspended frame-free Tier-C activations kept as explicit VM roots. A
+/// frame-backed outer activation consumes no slot, so retain two levels of
+/// headroom under the native-call cap for fail-before-native fallback.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const TIER_C_ACTIVATION_ROOT_STACK_MAX: usize = JIT_REGION_CALL_MAX as usize - 2;
+
+/// B243: the root stack of suspended frame-free activations, as a FIXED
+/// inline array with a depth counter instead of a `Vec`.
+///
+/// The emitted cross-call lane pushes here directly — three qword stores
+/// into `slots[depth]` then `inc depth` — and pops with one `sub`. A `Vec`
+/// could not be pushed from emitted code soundly: its push may reallocate,
+/// and its ptr/len/cap layout is unspecified. A fixed array inside the VM has
+/// a compile-time bound (the cap check the helper already performs) and an
+/// address that is `rdi`-relative like every other `JIT_*_OFFSET`. The GC
+/// scans `slots[..depth]` (`as_slice`); everything past `depth` is stale and
+/// never read. Layout is asserted in `host_api.rs`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+struct ActivationRootStack {
+    depth: u32,
+    _pad: u32,
+    slots: [TiercActivationState; TIER_C_ACTIVATION_ROOT_STACK_MAX],
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl ActivationRootStack {
+    const EMPTY: Self = Self {
+        depth: 0,
+        _pad: 0,
+        slots: [TiercActivationState::EMPTY; TIER_C_ACTIVATION_ROOT_STACK_MAX],
+    };
+
+    /// `false` when full: the caller declines before native entry, exactly
+    /// as the `len() >= MAX` check it replaces.
+    #[inline]
+    fn push(&mut self, s: TiercActivationState) -> bool {
+        let d = self.depth as usize;
+        if d >= TIER_C_ACTIVATION_ROOT_STACK_MAX {
+            return false;
+        }
+        self.slots[d] = s;
+        self.depth += 1;
+        true
+    }
+
+    #[inline]
+    fn pop(&mut self) -> Option<TiercActivationState> {
+        if self.depth == 0 {
+            return None;
+        }
+        self.depth -= 1;
+        Some(self.slots[self.depth as usize])
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.depth as usize
+    }
+
+    #[inline]
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.depth == 0
+    }
+
+    /// The live prefix. A `depth` past the array is impossible by the push
+    /// guard; the slice bounds check is the release backstop if it ever were.
+    #[inline]
+    fn as_slice(&self) -> &[TiercActivationState] {
+        &self.slots[..self.depth as usize]
+    }
 }
 
 /// By-value restoration record for one Tier-C native entry. A suspended
@@ -386,6 +461,11 @@ pub(crate) enum Microtask {
         thenable: Value,
         then: Value,
         promise: u32,
+        /// Resolving functions are created when the job starts. They are
+        /// installed here one allocation at a time so the in-flight task stays
+        /// their traced owner across stress collection and arbitrary `then`.
+        resolve: Value,
+        reject: Value,
     },
     /// B218: the deferred finish for a `Promise.all` whose resolve-element
     /// jobs all ran EAGERLY at subscription (queue empty, every element
@@ -393,7 +473,9 @@ pub(crate) enum Microtask {
     /// where the FIRST element job would have been queued, which puts the
     /// result promise's reactions exactly where the spec's last element job
     /// would have put them — see `eager_combinator_enabled`.
-    CombinatorFinish { combinator: u32 },
+    CombinatorFinish {
+        combinator: u32,
+    },
 }
 
 /// Native (built-in) function ids — the discriminant carried by `HeapObj::Native`.
@@ -726,6 +808,309 @@ impl std::ops::Deref for JitGuardedMap {
     }
 }
 
+/// Explicit-layout owner for the VM's contiguous register file.
+///
+/// `storage.len()` is the initialized high-water extent and never decreases.
+/// `logical_len` is the live prefix visible to the interpreter, GC and safe
+/// indexing. Keeping those lengths separate lets native calls cheaply revive a
+/// previously initialized window without writing `Vec`'s private fields. The
+/// first two fields are an emitted-code ABI; their offsets are compile-checked
+/// in `host_api`.
+///
+/// Invariants after every safe operation (and after `set_len`):
+///
+/// * `logical_len <= storage.len() <= storage.capacity()`;
+/// * `ptr_mirror == storage.as_ptr().expose_provenance()`;
+/// * every element in `storage` is an initialized `Value`, while only
+///   `storage[..logical_len]` is live or traced.
+#[repr(C)]
+pub(crate) struct RegisterFile {
+    /// Exposed allocation address for emitted machine code. This is an integer
+    /// deliberately: retaining a raw pointer returned by `Vec::as_mut_ptr`
+    /// across ordinary safe element references is outside that method's narrow
+    /// aliasing guarantee. Rust callers always derive a fresh pointer from the
+    /// owning `Vec` through `as_ptr` / `as_mut_ptr` below.
+    ptr_mirror: usize,
+    logical_len: usize,
+    storage: Vec<Value>,
+}
+
+impl RegisterFile {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self::from_vec(Vec::new())
+    }
+
+    #[inline]
+    pub(crate) fn from_vec(mut storage: Vec<Value>) -> Self {
+        let logical_len = storage.len();
+        let ptr_mirror = storage.as_mut_ptr().expose_provenance();
+        Self {
+            ptr_mirror,
+            logical_len,
+            storage,
+        }
+    }
+
+    #[inline(always)]
+    fn refresh_ptr(&mut self) {
+        self.ptr_mirror = self.storage.as_mut_ptr().expose_provenance();
+    }
+
+    #[inline(always)]
+    pub(crate) fn len(&self) -> usize {
+        self.logical_len
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // Vec-compatible surface; used by feature-specific paths.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.logical_len == 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.storage.capacity()
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // Native/JIT pointer API; absent callers in safe builds.
+    pub(crate) fn as_ptr(&self) -> *const Value {
+        self.storage.as_ptr()
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // Native/JIT pointer API; absent callers in safe builds.
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut Value {
+        self.storage.as_mut_ptr()
+    }
+
+    #[inline(always)]
+    pub(crate) fn get(&self, index: usize) -> Option<&Value> {
+        self.storage[..self.logical_len].get(index)
+    }
+
+    #[inline(always)]
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) unsafe fn get_unchecked(&self, index: usize) -> &Value {
+        // SAFETY: forwarded from the caller; the slice limits the contract to
+        // the live prefix rather than the initialized inactive tail.
+        unsafe { self.storage[..self.logical_len].get_unchecked(index) }
+    }
+
+    #[inline(always)]
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) unsafe fn get_unchecked_mut(&mut self, index: usize) -> &mut Value {
+        // SAFETY: forwarded from the caller; callers prove index < logical_len.
+        unsafe { self.storage[..self.logical_len].get_unchecked_mut(index) }
+    }
+
+    /// Set the live length, preserving all backing elements as initialized.
+    ///
+    /// # Safety
+    /// Callers must additionally establish that every newly exposed slot holds
+    /// a semantically valid `Value`. The hard bound check keeps this operation
+    /// memory-safe in release builds as well as debug builds.
+    #[inline(always)]
+    #[cfg(not(feature = "safe-sandbox"))]
+    pub(crate) unsafe fn set_len(&mut self, new_len: usize) {
+        assert!(
+            new_len <= self.storage.len(),
+            "register logical length exceeds initialized high-water"
+        );
+        self.logical_len = new_len;
+    }
+
+    /// Vec-compatible resize of the live prefix. Revived inactive slots are
+    /// overwritten with `fill`; shrinking never reduces the initialized extent.
+    pub(crate) fn resize(&mut self, new_len: usize, fill: Value) {
+        let old_logical = self.logical_len;
+        if new_len > old_logical {
+            let old_high_water = self.storage.len();
+            if new_len > old_high_water {
+                self.storage.resize(new_len, fill);
+            }
+            let revived_end = new_len.min(old_high_water);
+            if old_logical < revived_end {
+                self.storage[old_logical..revived_end].fill(fill);
+            }
+        }
+        self.logical_len = new_len;
+        self.refresh_ptr();
+    }
+
+    #[inline]
+    pub(crate) fn truncate(&mut self, new_len: usize) {
+        self.logical_len = self.logical_len.min(new_len);
+    }
+
+    #[inline]
+    #[allow(dead_code)] // Vec-compatible surface; used by feature-specific paths.
+    pub(crate) fn clear(&mut self) {
+        self.logical_len = 0;
+    }
+
+    /// Reserve relative to the live length, matching `Vec::reserve` even when
+    /// the initialized inactive tail is longer than the live prefix.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        let wanted = self
+            .logical_len
+            .checked_add(additional)
+            .expect("capacity overflow");
+        if wanted > self.storage.capacity() {
+            self.storage.reserve(wanted - self.storage.len());
+        }
+        self.refresh_ptr();
+    }
+
+    /// Append to the live prefix, reusing and overwriting initialized inactive
+    /// storage before extending the high-water extent.
+    pub(crate) fn extend_from_slice(&mut self, values: &[Value]) {
+        let old_logical = self.logical_len;
+        let new_len = old_logical
+            .checked_add(values.len())
+            .expect("capacity overflow");
+        self.reserve(values.len());
+
+        let revived = (self.storage.len() - old_logical).min(values.len());
+        if revived != 0 {
+            self.storage[old_logical..old_logical + revived].copy_from_slice(&values[..revived]);
+        }
+        if revived < values.len() {
+            self.storage.extend_from_slice(&values[revived..]);
+        }
+        self.logical_len = new_len;
+        self.refresh_ptr();
+    }
+
+    /// Detach a copy of the logical tail while retaining initialized backing
+    /// storage in this file for later window reuse.
+    pub(crate) fn split_off(&mut self, at: usize) -> Vec<Value> {
+        assert!(at <= self.logical_len, "split index out of bounds");
+        let tail = self.storage[at..self.logical_len].to_vec();
+        self.logical_len = at;
+        tail
+    }
+
+    #[inline(always)]
+    #[allow(dead_code)] // JIT high-water proof and focused invariant tests.
+    pub(crate) fn initialized_len(&self) -> usize {
+        self.storage.len()
+    }
+}
+
+impl Default for RegisterFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<Vec<Value>> for RegisterFile {
+    fn from(storage: Vec<Value>) -> Self {
+        Self::from_vec(storage)
+    }
+}
+
+impl std::ops::Deref for RegisterFile {
+    type Target = [Value];
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        &self.storage[..self.logical_len]
+    }
+}
+
+impl std::ops::DerefMut for RegisterFile {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.storage[..self.logical_len]
+    }
+}
+
+impl<'a> IntoIterator for &'a RegisterFile {
+    type Item = &'a Value;
+    type IntoIter = std::slice::Iter<'a, Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.storage[..self.logical_len].iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut RegisterFile {
+    type Item = &'a mut Value;
+    type IntoIter = std::slice::IterMut<'a, Value>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.storage[..self.logical_len].iter_mut()
+    }
+}
+
+#[cfg(test)]
+mod register_file_tests {
+    use super::*;
+
+    #[test]
+    fn pointer_mirror_refreshes_after_reserve_and_growth() {
+        let mut regs = RegisterFile::from_vec(vec![Value::int(1)]);
+        regs.reserve(4_096);
+        assert_eq!(regs.ptr_mirror, regs.storage.as_ptr().expose_provenance());
+        regs.resize(4_097, Value::UNDEFINED);
+        assert_eq!(regs.ptr_mirror, regs.storage.as_ptr().expose_provenance());
+        assert_eq!(regs.len(), 4_097);
+        assert_eq!(regs.initialized_len(), 4_097);
+    }
+
+    #[test]
+    fn truncate_then_resize_overwrites_every_revived_slot() {
+        let mut regs = RegisterFile::from_vec(vec![Value::int(1), Value::int(2), Value::int(3)]);
+        regs.truncate(1);
+        assert_eq!(regs.initialized_len(), 3);
+        regs.resize(3, Value::int(9));
+        assert_eq!(&*regs, &[Value::int(1), Value::int(9), Value::int(9)]);
+        assert_eq!(regs.initialized_len(), 3);
+    }
+
+    #[test]
+    fn split_off_detaches_logical_tail_without_shrinking_backing() {
+        let mut regs = RegisterFile::from_vec(vec![
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
+            Value::int(4),
+        ]);
+        let tail = regs.split_off(2);
+        assert_eq!(tail, vec![Value::int(3), Value::int(4)]);
+        assert_eq!(&*regs, &[Value::int(1), Value::int(2)]);
+        assert_eq!(regs.initialized_len(), 4);
+
+        regs.extend_from_slice(&[Value::int(7), Value::int(8)]);
+        assert_eq!(
+            &*regs,
+            &[Value::int(1), Value::int(2), Value::int(7), Value::int(8)]
+        );
+        assert_eq!(regs.initialized_len(), 4);
+    }
+
+    #[test]
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn unsafe_logical_set_len_is_bounded_by_initialized_high_water() {
+        let mut regs = RegisterFile::from_vec(vec![Value::int(1), Value::int(2)]);
+        regs.truncate(1);
+        // SAFETY: slot 1 remains initialized in the retained backing extent.
+        unsafe { regs.set_len(2) };
+        assert_eq!(&*regs, &[Value::int(1), Value::int(2)]);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // This intentionally violates the API precondition; the hard check
+            // must reject it before logical state changes.
+            unsafe { regs.set_len(3) };
+        }));
+        assert!(result.is_err());
+        assert_eq!(regs.len(), 2);
+        assert_eq!(regs.initialized_len(), 2);
+    }
+}
+
 pub struct Vm<'p> {
     program: &'p Program,
     /// Functions compiled at runtime by `eval` / `new Function`. Each is a leaked
@@ -821,7 +1206,7 @@ pub struct Vm<'p> {
     globals: Vec<Value>,
     /// One contiguous register file shared by all live frames; each frame owns
     /// the window `[base, base + reg_count)`.
-    regs: Vec<Value>,
+    regs: RegisterFile,
     frames: Vec<Frame>,
     /// Step budget / abort flag / execution trace, when an embedder has asked
     /// for them. `None` — the only state a default build can be in — means the
@@ -877,6 +1262,12 @@ pub struct Vm<'p> {
     /// `pending_eval_frame`). Suppresses the "anonymous" wrapper's self-name
     /// binding (constructor-binding.js).
     pending_fn_ctor_eval: bool,
+    /// Host policy for a VM that may execute its already-compiled main program
+    /// but must not compile or load any additional source. This is independent
+    /// of instrumentation and leaves every JIT tier enabled. All runtime source
+    /// entry points check it before parsing or reading: eval/Function-family/
+    /// ShadowRealm.evaluate, `$262.evalScript`, agents, and module loading.
+    external_code_disabled: bool,
     /// Set by a `Yield` op to hand a generator's yielded value (+ the yield's
     /// bytecode ip, for the resume point) back to `generator_method`, which
     /// `.take()`s it to distinguish a suspension from a normal return.
@@ -925,6 +1316,12 @@ pub struct Vm<'p> {
     /// the interpreter's ordinary safepoints work inside resumed bodies.
     /// Saved/restored around nested drains.
     current_microtask: Option<Microtask>,
+    /// Heap Values held only in Rust by an in-flight Promise abstract operation:
+    /// fresh targets, capability functions, and transient constructor results.
+    /// Executors/callbacks/`then` getters may re-enter and collect, so keep a
+    /// small nesting stack in the VM root set instead of disabling GC across
+    /// arbitrary JavaScript.
+    promise_resolution_roots: Vec<u32>,
     /// The `.raw` array of a tagged-template strings object, keyed by the cooked
     /// array's heap index. Arrays don't carry named properties here, so a
     /// template object's `raw` lives in this side table (read by `get_prop`).
@@ -979,6 +1376,15 @@ pub struct Vm<'p> {
     /// and integers — never traced, never pruned.
     matchall_caps_scratch: Vec<Option<std::ops::Range<usize>>>,
     matchall_flat_scratch: Vec<u32>,
+    /// Native bytes owned by completed RegExp matches that an outer operation
+    /// retains while guest code can re-enter the VM (notably functional
+    /// replacement callbacks). `heap_bytes()` cannot see those Rust-local
+    /// `Vec`s, so every nested bounded search subtracts this process-wide-for-
+    /// the-VM reservation from both its fixed regex allowance and finite heap
+    /// headroom. An `Arc` lets the scoped guard release without borrowing the
+    /// VM across the callback.
+    #[cfg(feature = "safe-sandbox")]
+    regex_transient_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Single pending result for the exact MEM-only non-global exec region.
     /// No native/user-code re-entry is permitted while populated; every
     /// region exit first materializes it into its skipped global binding.
@@ -1338,6 +1744,17 @@ pub struct Vm<'p> {
     /// ArraySpeciesCreate to take the fast dense path when the resolved species is
     /// just `%Array%` itself.
     array_ctor: u32,
+    /// Exact main-realm identities for the guarded `GlobalFn` bytecode, indexed
+    /// by `GlobalFn::index()`. A fixed table keeps the hot guard hash-free.
+    global_fn_intrinsics: [u32; crate::bytecode::GlobalFn::COUNT],
+    /// Exact main-realm identities for captured `RegExpMethod` calls. Unlike a
+    /// live prototype-slot proof these remain valid when an argument mutates
+    /// the property after EvaluateCall has already captured its old value.
+    regexp_method_intrinsics: [u32; crate::bytecode::RegExpMethod::COUNT],
+    /// Exact main-realm identities consumed by RegExp protocol-collapse proofs
+    /// (`exec`, Symbol methods, flags accessors, and `@@species`). Native ids are
+    /// shared by realm copies, so they are not an identity proof.
+    regexp_protocol_intrinsics: [u32; proxy_regexp::REGEXP_PROTOCOL_INTRINSIC_COUNT],
     /// `String.prototype` — primitive string values delegate here for method
     /// access (`"x".charAt`, `"x".slice`, …, as values), 0 until `setup_globals`.
     str_proto: u32,
@@ -1971,7 +2388,7 @@ pub struct Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     jit_tierc_activation: TiercActivationState,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    jit_tierc_activation_stack: Vec<TiercActivationState>,
+    jit_tierc_activation_stack: ActivationRootStack,
     /// One-shot flag a region call helper sets when its bail is NOT a
     /// region-quality signal (depth-cap deopt, or a throw the call legitimately
     /// produced): `try_run_osr` consumes it and skips the deopt-eviction count
@@ -2138,14 +2555,15 @@ pub(crate) use gc::gc_nursery_stats;
 pub(crate) use gc::gc_stats;
 pub(crate) use gc::gc_young_budget_stats;
 pub(crate) use helpers_misc::call_inline_stats;
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) use helpers_misc::jit_shape_set_barrier;
 pub(crate) use helpers_misc::computed_call_stats;
 pub(crate) use helpers_misc::concat_set_stats;
-pub(crate) use helpers_misc::cross_fill_stats;
 pub(crate) use helpers_misc::cross_decline_stats;
+pub(crate) use helpers_misc::cross_fill_stats;
+pub(crate) use helpers_misc::hasprop_pin_absent_stats;
 pub(crate) use helpers_misc::ic_stats;
 pub(crate) use helpers_misc::iter_region_stats;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_shape_set_barrier;
 pub(crate) use proxy_regexp::regexp_call_direct_enabled;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use proxy_regexp::rx_scalar_exec_enabled;

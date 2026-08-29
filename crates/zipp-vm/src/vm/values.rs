@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
-use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
     PromiseState, PropAttr, ReactionPair, Reactions,
@@ -16,6 +16,88 @@ pub(crate) struct RegExpPre {
 }
 
 impl<'p> Vm<'p> {
+    /// Exact identity gate shared by user-visible bare-builtin bytecodes. The
+    /// expected handles are setup-time main-realm permanent roots, so equality
+    /// also rejects same-native-id functions allocated in another realm.
+    #[inline]
+    pub(crate) fn bare_builtin_is_intrinsic(&self, expected: u32, callee: Value) -> bool {
+        expected != 0 && callee.is_heap() && callee.heap_index() == expected
+    }
+
+    #[inline]
+    pub(crate) fn global_fn_is_intrinsic(
+        &self,
+        op: crate::bytecode::GlobalFn,
+        callee: Value,
+    ) -> bool {
+        self.bare_builtin_is_intrinsic(self.global_fn_intrinsics[op.index()], callee)
+    }
+
+    #[inline]
+    pub(crate) fn captured_regexp_method_is_intrinsic(
+        &self,
+        op: crate::bytecode::RegExpMethod,
+        callee: Value,
+    ) -> bool {
+        self.bare_builtin_is_intrinsic(self.regexp_method_intrinsics[op.index()], callee)
+    }
+
+    /// Allocation-free exact Get for a hot captured RegExp/String method. This
+    /// is used by generated GetProp code before argument evaluation: only a
+    /// main-realm intrinsic data property can be returned directly. Every own
+    /// shadow, accessor, foreign prototype, or replacement declines before an
+    /// observable effect and is replayed by the interpreter.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn captured_regexp_method_get_intrinsic(
+        &self,
+        op: crate::bytecode::RegExpMethod,
+        recv: Value,
+    ) -> Option<Value> {
+        let expected = *self.regexp_method_intrinsics.get(op.index())?;
+        if expected == 0 || !recv.is_heap() {
+            return None;
+        }
+        let name = match op {
+            crate::bytecode::RegExpMethod::Test => "test",
+            crate::bytecode::RegExpMethod::Exec => "exec",
+            crate::bytecode::RegExpMethod::MatchAll => "matchAll",
+            crate::bytecode::RegExpMethod::Replace => "replace",
+        };
+        let idx = recv.heap_index();
+        let proto = match op {
+            crate::bytecode::RegExpMethod::Test | crate::bytecode::RegExpMethod::Exec => {
+                if !matches!(self.heap.get(idx), HeapObj::RegExp { .. })
+                    || self
+                        .arr_props
+                        .get(&idx)
+                        .is_some_and(|props| props.pos(name).is_some())
+                {
+                    return None;
+                }
+                match self.proto_of.get(&idx) {
+                    None => self.regexp_proto,
+                    Some(value) if value.is_heap() => value.heap_index(),
+                    _ => return None,
+                }
+            }
+            crate::bytecode::RegExpMethod::MatchAll | crate::bytecode::RegExpMethod::Replace => {
+                if !self.heap.is_str_like(idx)
+                    || self.active_realm_proto(self.str_proto) != self.str_proto
+                {
+                    return None;
+                }
+                self.str_proto
+            }
+        };
+        let live = match self.heap.get(proto) {
+            HeapObj::Object(map) => map
+                .pos(name)
+                .and_then(|slot| (!map.attr_at(slot).accessor).then(|| map.val_at(slot))),
+            _ => None,
+        }?;
+        (live.is_heap() && live.heap_index() == expected).then_some(live)
+    }
+
     /// `key in obj` — does `obj` have the property `key`? Own object keys, a
     /// class instance's inherited methods/getters, array indices / `length`,
     /// Map/Set `size`, and class static members. `in` on a primitive throws
@@ -1169,18 +1251,15 @@ impl<'p> Vm<'p> {
         // Excluded, as before: a `setPrototypeOf`'d receiver and every arguments
         // object (both recorded in `proto_of`), a Proxy or a non-Array receiver
         // (not a `HeapObj::Array`, so the 64-level walk below still runs), and a
-        // negative key (`k < 0` keeps its pre-wave `false`, untouched).
+        // negative key (an ordinary named property such as "-1", which must
+        // retain the full chain walk below).
         if !self.array_proto_has_index && key.is_int() && obj.is_heap() {
             let idx = obj.heap_index();
             if !self.proto_of.contains_key(&idx) {
                 if let HeapObj::Array(items) = self.heap.get(idx) {
                     let k = key.as_int();
                     let overlaid = self.array_elements_overlaid(idx);
-                    if k < 0 {
-                        if !overlaid {
-                            return Some(false);
-                        }
-                    } else {
+                    if k >= 0 {
                         let ku = k as usize;
                         let dense_hit = items.get(ku).is_some_and(|v| !v.is_hole());
                         if !overlaid {
@@ -1279,94 +1358,6 @@ impl<'p> Vm<'p> {
         Some(self.has_property(obj, key))
     }
 
-    /// `val instanceof <built-in ctor>`. With no user prototype chain the result
-    /// is structural: by heap kind for Array/Object/Function, and by the `name`
-    /// field for the Error family (any error subtype satisfies `instanceof
-    /// Error`). Primitives are never an instance of anything.
-    pub(crate) fn eval_instanceof(&mut self, val: Value, ctor: InstanceCtor) -> bool {
-        use InstanceCtor as C;
-        if !val.is_heap() {
-            return false;
-        }
-        let idx = val.heap_index();
-        match ctor {
-            C::Array => {
-                if !matches!(self.heap.get(idx), HeapObj::Array(_)) {
-                    false
-                } else if self.arr_proto == 0 || !self.proto_of.contains_key(&idx) {
-                    // No re-linked [[Prototype]] → the structural answer is the
-                    // chain answer, and this is every array on the hot path.
-                    true
-                } else {
-                    // A re-linked array (`class X extends Array` instance, an
-                    // ArrayCreate performed by ANOTHER realm's built-in) is only
-                    // `instanceof Array` when THIS realm's %Array.prototype% is
-                    // still in its chain: `other.Array.prototype.toSorted.call(a)`
-                    // must answer false here and true for `other.Array`.
-                    self.is_prototype_of(Value::heap(self.arr_proto), val)
-                }
-            }
-            // Spec instanceof: is %Function.prototype% in `val`'s prototype chain?
-            // Catches plain functions/closures AND bound functions, natives, and
-            // the builtin constructor objects (Array/Object/Map/…) — all of which
-            // chain to %Function.prototype% — not just literal Func/Closure values.
-            C::Function => {
-                self.fn_proto != 0 && self.is_prototype_of(Value::heap(self.fn_proto), val)
-            }
-            // OrdinaryHasInstance: %Object.prototype% must be IN the value's
-            // prototype chain — a null-proto object / module namespace is NOT
-            // an instanceof Object.
-            C::Object => {
-                self.obj_proto != 0 && self.is_prototype_of(Value::heap(self.obj_proto), val)
-            }
-            // An error ctor: a canonical-named error instance (internal throw /
-            // `new TypeError`) OR — for `class X extends TypeError` / `Object.
-            // create(TypeError.prototype)` — the matching error prototype is in
-            // `val`'s prototype chain.
-            C::Error => self.error_name(idx).is_some() || self.error_proto_in_chain(val, "Error"),
-            C::TypeError => {
-                self.error_name(idx).as_deref() == Some("TypeError")
-                    || self.error_proto_in_chain(val, "TypeError")
-            }
-            C::RangeError => {
-                self.error_name(idx).as_deref() == Some("RangeError")
-                    || self.error_proto_in_chain(val, "RangeError")
-            }
-            C::SyntaxError => {
-                self.error_name(idx).as_deref() == Some("SyntaxError")
-                    || self.error_proto_in_chain(val, "SyntaxError")
-            }
-            C::ReferenceError => {
-                self.error_name(idx).as_deref() == Some("ReferenceError")
-                    || self.error_proto_in_chain(val, "ReferenceError")
-            }
-            C::EvalError => {
-                self.error_name(idx).as_deref() == Some("EvalError")
-                    || self.error_proto_in_chain(val, "EvalError")
-            }
-            C::UriError => {
-                self.error_name(idx).as_deref() == Some("URIError")
-                    || self.error_proto_in_chain(val, "URIError")
-            }
-            C::AggregateError => {
-                self.error_name(idx).as_deref() == Some("AggregateError")
-                    || self.error_proto_in_chain(val, "AggregateError")
-            }
-        }
-    }
-
-    /// Whether the error prototype named `name` (e.g. "TypeError") is in `val`'s
-    /// prototype chain — the proto-based half of `instanceof <ErrorCtor>`, which
-    /// catches subclasses and `Object.create(XError.prototype)`.
-    fn error_proto_in_chain(&mut self, val: Value, name: &str) -> bool {
-        match native::ERROR_NAMES.iter().position(|&n| n == name) {
-            Some(k) if self.error_protos[k] != 0 => {
-                self.is_prototype_of(Value::heap(self.error_protos[k]), val)
-            }
-            _ => false,
-        }
-    }
-
     /// Build an Error object from an internal throw message. A message like
     /// `"TypeError: cannot read …"` splits into `name="TypeError"` and
     /// `message="cannot read …"`; anything else becomes a generic `Error` whose
@@ -1388,8 +1379,8 @@ impl<'p> Vm<'p> {
     }
 
     /// Allocate a proto-linked error instance of the given kind (0=Error … 7=
-    /// AggregateError). `name` is set own (so the structural `instanceof`/`error_name`
-    /// path keeps working); `message` is set own only when supplied and not
+    /// AggregateError). `name` is set own for Error.prototype.toString;
+    /// `message` is set own only when supplied and not
     /// `undefined` (else inherited as "" from the prototype). The prototype link
     /// gives `.constructor`, `.toString`, and value-`instanceof` resolution.
     /// Map a Thrown message ("SyntaxError: …") to a REAL error object of the

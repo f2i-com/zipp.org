@@ -15,8 +15,10 @@ use crate::scm::SingleCharMatcher;
 use crate::types::{GroupData, LoopData};
 use crate::util::DebugCheckIndex;
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
+use alloc::{string::String, sync::Arc, vec::Vec};
 use core::ops::Range;
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 struct State<Position: PositionType> {
@@ -354,7 +356,7 @@ fn successful_match<Input: InputIndexer>(
     input: Input,
     start: Input::Position,
     state: &State<Input::Position>,
-    group_names: Box<[Box<str>]>,
+    group_names: Option<Arc<[Box<str>]>>,
 ) -> Match {
     let group_to_offset = |mr: &GroupData<Input::Position>| -> Option<Range<usize>> {
         mr.as_range().map(|r| Range {

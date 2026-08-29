@@ -10,7 +10,7 @@ use crate::exec;
 use crate::indexing::AsciiInput;
 use crate::insn::{CompiledRegex, StartPredicate};
 use regex::bytes::{CaptureLocations, Regex as BytesRegex, RegexBuilder};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 const MAX_LINEAR_PATTERN_BYTES: usize = 16 * 1024;
 const MAX_LINEAR_PROGRAM_BYTES: usize = 2 * 1024 * 1024;
@@ -40,7 +40,7 @@ struct LinearMatches<'r, 't> {
     input: &'t [u8],
     locations: Option<CaptureLocations>,
     next_start: Option<usize>,
-    group_names: &'r [Box<str>],
+    group_names: &'r Option<Arc<[Box<str>]>>,
 }
 
 #[derive(Debug, Clone)]

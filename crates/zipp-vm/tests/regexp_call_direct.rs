@@ -1,4 +1,4 @@
-//! Guard and semantic pins for the direct RegExp `CallMethod` lane.
+//! Guard and semantic pins for the captured RegExp `RegExpMethod` lane.
 //!
 //! The lane is a pure prefix: only a real RegExp whose named method still
 //! resolves to the exact intrinsic can enter it. Intrinsic `test` additionally
@@ -17,6 +17,26 @@ fn run_ok(src: &str) -> Vec<String> {
 }
 
 const HOT: usize = 6000;
+
+const FOREIGN_EXEC_REALM_SRC: &str = r#"
+    var foreign = $262.createRealm().global;
+    function hot(re, input) { return re.test(input); }
+    var warm = /a/;
+    for (var i = 0; i < 6000; i++) hot(warm, "a");
+
+    var saved = RegExp.prototype.exec;
+    RegExp.prototype.exec = foreign.RegExp.prototype.exec;
+    var poisoned = /a/g;
+    poisoned.lastIndex = foreign.Symbol("lastIndex");
+    var foreignError = false, mainError = false;
+    try { hot(poisoned, "a"); }
+    catch (error) {
+      foreignError = error.constructor === foreign.TypeError;
+      mainError = error.constructor === TypeError;
+    }
+    RegExp.prototype.exec = saved;
+    console.log(foreignError + "|" + mainError);
+"#;
 
 #[test]
 fn pristine_exec_and_test_preserve_results_last_index_and_arguments() {
@@ -40,6 +60,84 @@ fn pristine_exec_and_test_preserve_results_last_index_and_arguments() {
     );
     assert_eq!(out[0], "ab|a|b|1|zab|3|3|1");
     assert_eq!(out[1], "true|3|false|0|true");
+}
+
+#[test]
+fn captured_test_callee_survives_argument_mutation_and_keeps_all_effects() {
+    let out = run_ok(
+        r#"
+        var lateCalls = 0, customCalls = 0, extras = 0;
+        function late() { lateCalls++; return "late"; }
+        function custom(x) { customCalls++; return this.source + ":" + x; }
+        function tick() { extras++; return extras; }
+        function capturedIntrinsic(re) {
+          delete re.test;
+          return re.test((re.test = late, "a"), tick(), tick());
+        }
+        function capturedCustomTest(re) {
+          re.test = custom;
+          return re.test((delete re.test, "z"), tick(), tick());
+        }
+        function capturedIntrinsicExec(re) {
+          delete re.exec;
+          return re.exec((re.exec = late, "a"), tick(), tick());
+        }
+        function capturedCustomExec(re) {
+          re.exec = custom;
+          return re.exec((delete re.exec, "z"), tick(), tick());
+        }
+        var re = /a/, intrinsic, fallback, intrinsicExec, fallbackExec;
+        for (var i = 0; i < 200; i++) intrinsic = capturedIntrinsic(re);
+        for (var j = 0; j < 200; j++) fallback = capturedCustomTest(re);
+        for (var k = 0; k < 200; k++) intrinsicExec = capturedIntrinsicExec(re);
+        for (var n = 0; n < 200; n++) fallbackExec = capturedCustomExec(re);
+        console.log(intrinsic + "|" + fallback + "|" + intrinsicExec[0] + "|" +
+                    fallbackExec + "|" + lateCalls + "|" + customCalls + "|" + extras);
+        "#,
+    );
+    assert_eq!(out, ["true|a:z|a|a:z|0|400|1600"]);
+}
+
+#[test]
+fn foreign_exec_realm_child() {
+    if std::env::var_os("ZIPP_RX_FOREIGN_EXEC_CHILD").is_some() {
+        assert_eq!(run_ok(FOREIGN_EXEC_REALM_SRC), ["true|false"]);
+    }
+}
+
+#[test]
+fn nested_foreign_exec_identity_is_honored_in_all_hot_modes() {
+    if std::env::var_os("ZIPP_RX_FOREIGN_EXEC_CHILD").is_some() {
+        return;
+    }
+    let exe = std::env::current_exe().expect("test exe path");
+    let modes: &[(&str, &[(&str, &str)])] = &[
+        ("nojit", &[("ZIPP_NOJIT", "1")]),
+        ("jit", &[("ZIPP_JIT_THRESHOLD", "1")]),
+        (
+            "gc",
+            &[("ZIPP_JIT_THRESHOLD", "1"), ("ZIPP_GC_STRESS", "1")],
+        ),
+    ];
+    for (mode, envs) in modes {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["foreign_exec_realm_child", "--exact", "--nocapture"])
+            .env("ZIPP_RX_FOREIGN_EXEC_CHILD", "1")
+            .env_remove("ZIPP_NOJIT")
+            .env_remove("ZIPP_JIT_THRESHOLD")
+            .env_remove("ZIPP_GC_STRESS");
+        for &(key, value) in *envs {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("spawn foreign-exec child");
+        assert!(
+            out.status.success()
+                && !String::from_utf8_lossy(&out.stdout).contains("running 0 tests"),
+            "{mode} child failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -227,16 +325,20 @@ fn direct_call_counts_child() {
                     (ie, je)
                 );
                 assert!(it > 0 && ie > 0, "interpreter warmup did not use both arms");
-                assert!(
-                    jt > 0,
-                    "generated test helper never served: {:?}",
-                    (it, ie, jt, je, declines)
-                );
-                assert!(
-                    je > 0,
-                    "generated exec helper never served: {:?}",
-                    (it, ie, jt, je, declines)
-                );
+                if cfg!(feature = "jit") {
+                    assert!(
+                        jt > 0,
+                        "generated test helper never served: {:?}",
+                        (it, ie, jt, je, declines)
+                    );
+                    assert!(
+                        je > 0,
+                        "generated exec helper never served: {:?}",
+                        (it, ie, jt, je, declines)
+                    );
+                } else {
+                    assert_eq!((jt, je), (0, 0));
+                }
             }
         }
         "fallback" => {
@@ -250,11 +352,18 @@ fn direct_call_counts_child() {
                 "#
             ));
             assert_eq!(out[0], format!("true|late|{HOT}"));
-            let (_, _, jt, _, declines) = zipp_vm::regexp_call_direct_stats();
-            assert!(
-                jt > 0,
-                "warm pristine calls never used the generated helper"
-            );
+            let (it, _, jt, _, declines) = zipp_vm::regexp_call_direct_stats();
+            if cfg!(feature = "jit") {
+                assert!(
+                    jt > 0,
+                    "warm pristine calls never used the generated helper"
+                );
+            } else {
+                assert!(
+                    it > 0,
+                    "warm pristine calls never used the interpreter helper"
+                );
+            }
             assert!(
                 declines >= HOT as u64,
                 "late override did not exercise guard fallback: declines={declines}"
@@ -276,8 +385,15 @@ fn direct_call_counts_child() {
                 "#
             ));
             assert_eq!(out[0], format!("{HOT}|1"));
-            let (_, _, _, je, _) = zipp_vm::regexp_call_direct_stats();
-            assert!(je > 0, "throwing call site never used the generated helper");
+            let (_, ie, _, je, _) = zipp_vm::regexp_call_direct_stats();
+            if cfg!(feature = "jit") {
+                assert!(je > 0, "throwing call site never used the generated helper");
+            } else {
+                assert!(
+                    ie > 0,
+                    "throwing call site never used the interpreter helper"
+                );
+            }
         }
         other => panic!("unknown child mode {other}"),
     }

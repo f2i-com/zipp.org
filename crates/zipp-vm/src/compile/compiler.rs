@@ -1009,9 +1009,9 @@ impl Compiler {
         // reference) can capture them. Only DIRECT top-level lexicals are
         // function-body-scoped (block-nested ones are block-local), so this scans
         // the body's own statements, not recursively. The textual declaration
-        // REUSES the cell (var_decl / class_decl). Pre-creating an (undefined) cell
-        // does not weaken TDZ — zipp does not runtime-enforce a function-body
-        // lexical's TDZ today, and only CAPTURED names are touched.
+        // REUSES the cell (var_decl / class_decl). Besides captured/eval-visible
+        // names, the three immutable global value spellings take this path so a
+        // same-named local lexical shadows them from body entry and observes TDZ.
         if !is_script {
             let mut lex = std::collections::HashSet::new();
             for s in body {
@@ -1046,7 +1046,9 @@ impl Compiler {
                 // what killed every sm/expressions/destructuring-array-default-*
                 // (their harness evals `class D extends C` from a nested function
                 // declaration, with `C` a lexical of the enclosing IIFE).
-                if (fc.captured.contains(name) || fc.box_all_locals)
+                if (fc.captured.contains(name)
+                    || fc.box_all_locals
+                    || matches!(name.as_str(), "undefined" | "NaN" | "Infinity"))
                     && !fc.scopes[0].iter().any(|(n, _)| n == name)
                 {
                     // Box a TDZ cell: a read before the textual declaration runs

@@ -5,6 +5,83 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Whether the value written to `reg` at `def_ip` can be observed before every
+/// control-flow path overwrites it.
+///
+/// This is deliberately a whole-function CFG walk rather than a textual scan:
+/// compiler temporaries are routinely recycled after a dominating overwrite.
+/// Reads happen before the overwrite check so read-modify-write instructions
+/// remain observable. Exception-handler control flow carries hidden state that
+/// this small proof does not model, so functions containing it fail closed.
+pub(crate) fn reg_value_is_observable_after_def(
+    code: &[Instr],
+    reg: u16,
+    def_ip: usize,
+    allowed_use_ips: &[usize],
+) -> bool {
+    if def_ip >= code.len()
+        || code.iter().any(|ins| {
+            matches!(
+                ins,
+                Instr::PushHandler { .. }
+                    | Instr::PopHandler
+                    | Instr::PushFinally { .. }
+                    | Instr::PopFinally
+                    | Instr::EndFinally { .. }
+                    | Instr::JumpFinally { .. }
+            )
+        })
+    {
+        return true;
+    }
+
+    let mut work = vec![def_ip + 1];
+    let mut seen = vec![false; code.len()];
+    while let Some(ip) = work.pop() {
+        if ip >= code.len() || seen[ip] {
+            continue;
+        }
+        seen[ip] = true;
+        let ins = &code[ip];
+        if instr_uses(ins).contains(&reg) && !allowed_use_ips.contains(&ip) {
+            return true;
+        }
+        if writes_reg(ins) == Some(reg) {
+            continue;
+        }
+
+        let mut add = |next: usize| {
+            if next >= code.len() {
+                return false;
+            }
+            work.push(next);
+            true
+        };
+        match *ins {
+            Instr::Jump { target } => {
+                if !add(target as usize) {
+                    return true;
+                }
+            }
+            Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => {
+                if !add(target as usize) {
+                    return true;
+                }
+                if ip + 1 < code.len() {
+                    work.push(ip + 1);
+                }
+            }
+            Instr::Return { .. } | Instr::ReturnUndefined | Instr::Throw { .. } => {}
+            _ if ip + 1 < code.len() => work.push(ip + 1),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Can this function be JIT-compiled in the current (leaf-int) subset? Rejects
 /// any op outside the integer subset and any call/heap/closure/throw op.
 ///
@@ -18,12 +95,20 @@ pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u32>) -> bool {
     if proto.code.is_empty() {
         return false;
     }
-    // A rest parameter's array is materialized by the interpreter's call setup,
-    // not by emitted code; the native entry would skip it. Stay interpreted.
-    if proto.rest_reg.is_some() {
+    // Rest and `arguments` are materialized by the interpreter's call setup,
+    // not by the native self-call window. Stay interpreted when either can be
+    // observed by the body.
+    if proto.rest_reg.is_some() || proto.arguments_reg.is_some() {
         return false;
     }
     let code = &proto.code;
+    // A bare call to a sloppy function substitutes the callee realm's global
+    // object for `this`; the Tier-A self-call window deliberately seeds reg 0
+    // with undefined. That shortcut is exact only when the body never reads
+    // reg 0 (strict functions already receive undefined for a bare call).
+    if !proto.is_strict && code.iter().any(|instr| tier_a_reads_reg(instr, 0)) {
+        return false;
+    }
     for (ip, instr) in code.iter().enumerate() {
         match instr {
             Instr::LoadInt { .. }
@@ -50,8 +135,11 @@ pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u32>) -> bool {
             // preceding callee load of a self `Call` (checked at the Call).
             Instr::LoadGlobal { idx, .. } if Some(*idx) == self_slot => {}
             // A self-call: callee must be loaded from self_slot by the prior op.
-            Instr::Call { callee, .. } => {
-                if !is_self_call(code, ip, *callee, self_slot) {
+            Instr::Call { callee, argc, .. } => {
+                // The native window copies only actual arguments. Missing
+                // formal slots in a reused high-water window would otherwise
+                // retain values written by an earlier activation.
+                if *argc < proto.param_count || !is_self_call(code, ip, *callee, self_slot) {
                     return false;
                 }
             }
@@ -59,6 +147,39 @@ pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u32>) -> bool {
         }
     }
     true
+}
+
+/// Does an instruction accepted by Tier A read `reg`? This is intentionally
+/// local to the small whole-function subset: it is the admission proof that a
+/// sloppy function cannot observe Tier A's undefined reg-0 shortcut.
+fn tier_a_reads_reg(instr: &Instr, reg: u16) -> bool {
+    match *instr {
+        Instr::Move { src, .. } | Instr::Return { src } => src == reg,
+        Instr::AddInt { a, .. } => a == reg,
+        Instr::Add { a, b, .. }
+        | Instr::Sub { a, b, .. }
+        | Instr::Mul { a, b, .. }
+        | Instr::Mod { a, b, .. }
+        | Instr::Lt { a, b, .. }
+        | Instr::Le { a, b, .. }
+        | Instr::Gt { a, b, .. }
+        | Instr::Ge { a, b, .. }
+        | Instr::Eq { a, b, .. }
+        | Instr::Ne { a, b, .. }
+        | Instr::JumpIfNotLt { a, b, .. }
+        | Instr::JumpIfNotLe { a, b, .. } => a == reg || b == reg,
+        Instr::JumpIfFalse { cond, .. } | Instr::JumpIfTrue { cond, .. } => cond == reg,
+        Instr::Call {
+            callee,
+            arg_base,
+            argc,
+            ..
+        } => {
+            let r = reg as u32;
+            callee == reg || (r >= arg_base as u32 && r < arg_base as u32 + argc as u32)
+        }
+        _ => false,
+    }
 }
 
 /// Is the `Call` at `ip` (with callee register `callee`) a self-call — i.e. was
@@ -169,6 +290,8 @@ pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
         | Instr::StrConcatChain { dst, .. }
         | Instr::Bitwise { dst, .. }
         | Instr::Call { dst, .. }
+        | Instr::CallWithThis { dst, .. }
+        | Instr::RegExpMethod { dst, .. }
         // MathOp and CallMethod DEFINE their dst. They used to fall through the
         // `_` arm below and report "writes nothing", so a register defined by
         // `Math.imul(..)` or a pinned-string `charCodeAt(..)` looked
@@ -202,6 +325,128 @@ pub(crate) fn writes_reg(i: &Instr) -> Option<u16> {
         Instr::FinalizeObject { dst, .. } => Some(dst),
         _ => None,
     }
+}
+
+/// The destination carried by every bytecode control-flow edge.
+///
+/// Keep structural recognisers on this common, fail-closed list: handler and
+/// finally edges can enter a captured/replayed prefix just as an ordinary
+/// branch can, even though most numeric regions decline those opcodes later.
+pub(crate) fn bytecode_control_target(i: &Instr) -> Option<u32> {
+    match *i {
+        Instr::Jump { target }
+        | Instr::JumpIfFalse { target, .. }
+        | Instr::JumpIfTrue { target, .. }
+        | Instr::JumpIfNotLt { target, .. }
+        | Instr::JumpIfNotLe { target, .. }
+        | Instr::PushFinally { target, .. }
+        | Instr::JumpFinally { target, .. } => Some(target),
+        Instr::PushHandler { catch_target, .. } => Some(catch_target),
+        _ => None,
+    }
+}
+
+/// Exact compiler shape for a reference-captured `Math.imul` call.  The
+/// receiver global and property Get remain distinct bytecodes so argument
+/// evaluation observes the specified order; register tiers use this proof to
+/// treat those two boxed values as guarded control inputs rather than numeric
+/// homes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CapturedMathSite {
+    pub load_ip: usize,
+    pub get_ip: usize,
+    pub call_ip: usize,
+    pub receiver: u16,
+    pub callee: u16,
+    pub global: u32,
+}
+
+pub(crate) fn captured_math_site(
+    proto: &FuncProto,
+    start: usize,
+    end: usize,
+    call_ip: usize,
+) -> Option<CapturedMathSite> {
+    if !(start..=end).contains(&call_ip) {
+        return None;
+    }
+    let (callee, receiver) = match proto.code.get(call_ip)? {
+        Instr::MathOp {
+            op: crate::bytecode::MathFn::Imul,
+            callee,
+            this_v,
+            argc: 2,
+            ..
+        } => (*callee, *this_v),
+        _ => return None,
+    };
+    let get_ip = (start..call_ip)
+        .rev()
+        .find(|&ip| writes_reg(&proto.code[ip]) == Some(callee))?;
+    let name = match proto.code.get(get_ip)? {
+        Instr::GetProp { dst, obj, name } if *dst == callee && *obj == receiver => *name,
+        _ => return None,
+    };
+    if proto
+        .string_constants
+        .get(name as usize)
+        .map(String::as_str)
+        != Some("imul")
+    {
+        return None;
+    }
+    let load_ip = (start..get_ip)
+        .rev()
+        .find(|&ip| writes_reg(&proto.code[ip]) == Some(receiver))?;
+    let global = match proto.code.get(load_ip)? {
+        Instr::LoadGlobal { dst, idx } if *dst == receiver => *idx,
+        _ => return None,
+    };
+    // Both reference components must remain the captured values until MathOp.
+    if proto.code[get_ip + 1..call_ip]
+        .iter()
+        .any(|ins| writes_reg(ins).is_some_and(|r| r == callee || r == receiver))
+    {
+        return None;
+    }
+    // Folding the member lookup uses one exact intrinsic guard at native
+    // entry.  Keep that proof invariant for the whole region: no bytecode may
+    // replace the source global, and no control-flow edge may enter after its
+    // LoadGlobal (which would otherwise consume stale receiver/callee slots).
+    if proto.code[start..=end].iter().any(|ins| {
+        matches!(*ins,
+            Instr::StoreGlobal { idx, .. }
+            | Instr::StoreGlobalStrict { idx, .. }
+            | Instr::StoreGlobalResolved { idx, .. } if idx == global)
+    }) {
+        return None;
+    }
+    for ins in &proto.code {
+        let Some(target) = bytecode_control_target(ins).map(|target| target as usize) else {
+            continue;
+        };
+        if target > load_ip && target <= call_ip {
+            return None;
+        }
+    }
+    Some(CapturedMathSite {
+        load_ip,
+        get_ip,
+        call_ip,
+        receiver,
+        callee,
+        global,
+    })
+}
+
+pub(crate) fn captured_math_sites(
+    proto: &FuncProto,
+    start: usize,
+    end: usize,
+) -> Vec<CapturedMathSite> {
+    (start..=end)
+        .filter_map(|ip| captured_math_site(proto, start, end, ip))
+        .collect()
 }
 
 /// If this single-parameter function opens with a base case of the shape
@@ -773,4 +1018,36 @@ pub(crate) fn jump_if_not_cmp(
         _ => {}
     }
     emit_bail(ops, ip, bail);
+}
+
+#[cfg(test)]
+mod control_target_tests {
+    use super::*;
+
+    #[test]
+    fn includes_exceptional_handler_and_finally_edges() {
+        assert_eq!(
+            bytecode_control_target(&Instr::PushHandler {
+                catch_target: 11,
+                catch_reg: 2,
+            }),
+            Some(11)
+        );
+        assert_eq!(
+            bytecode_control_target(&Instr::PushFinally {
+                target: 12,
+                kind_reg: 3,
+                val_reg: 4,
+            }),
+            Some(12)
+        );
+        assert_eq!(
+            bytecode_control_target(&Instr::JumpFinally {
+                target: 13,
+                floor: 1,
+            }),
+            Some(13)
+        );
+        assert_eq!(bytecode_control_target(&Instr::PopFinally), None);
+    }
 }

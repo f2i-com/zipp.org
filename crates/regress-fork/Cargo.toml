@@ -31,6 +31,11 @@ repository = "https://github.com/ridiculousfish/regress"
 
 [features]
 backend-pikevm = []
+# Bound classical-backtracker work and transient backtrack storage.  This is
+# intentionally not a default feature: the dedicated untrusted-code profile
+# enables it, while ordinary/JIT users retain the upstream execution contract
+# and pay no meter branch.
+bounded-backtracking = []
 default = [
     "backend-pikevm",
     "std",
@@ -70,6 +75,11 @@ required-features = ["linear-ascii"]
 [[test]]
 name = "linear_feature_gate"
 path = "tests/linear_feature_gate.rs"
+
+[[test]]
+name = "limited_backtracking"
+path = "tests/limited_backtracking.rs"
+required-features = ["bounded-backtracking"]
 
 [[test]]
 name = "rxjit_differential"

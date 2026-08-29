@@ -22,9 +22,12 @@ use crate::util::to_char_sat;
 use alloc::{
     boxed::Box,
     string::{String, ToString},
+    sync::Arc,
     vec::Vec,
 };
 use core::{fmt, str::FromStr};
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 pub use parse::Error;
 
@@ -132,8 +135,100 @@ impl fmt::Display for Flags {
 /// string.
 pub type Range = core::ops::Range<usize>;
 
+/// Callback used by allocation-free drained ASCII scans.
+pub type ScanSink<'a> = dyn FnMut(Range, &[Option<Range>]) + 'a;
+
+/// Hard ceilings for one regex search/iterator.
+///
+/// `max_steps` counts classical bytecode instructions, backtrack operations,
+/// and the element work hidden inside optimized one-character loops,
+/// backreferences, and capture materialisation. `max_backtrack_bytes` caps
+/// all simultaneously-live classical-executor scratch: loop/capture state,
+/// explicit backtrack stacks, lookaround copies, and scan buffers.
+/// `max_memory_bytes` caps that scratch plus capture buffers retained by
+/// emitted matches across a global iterator.
+/// These limits are enforced only when the `bounded-backtracking` feature is
+/// enabled; the ordinary engine remains byte-for-byte unmetered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchLimits {
+    pub max_steps: u64,
+    pub max_backtrack_bytes: usize,
+    pub max_memory_bytes: usize,
+}
+
+impl MatchLimits {
+    /// The conservative ceilings used by the untrusted-code profile.
+    ///
+    /// Sixteen million work units permits a full 1 MiB `/./g` scan with ample
+    /// headroom while stopping exponential failure promptly. Internal scratch
+    /// is capped at 256 KiB and cumulative emitted-capture storage at 16 MiB;
+    /// both are independent of compiled-program storage, which callers account
+    /// separately.
+    pub const SANDBOX: Self = Self {
+        max_steps: 16 * 1024 * 1024,
+        max_backtrack_bytes: 256 * 1024,
+        max_memory_bytes: 16 * 1024 * 1024,
+    };
+
+    pub const UNLIMITED: Self = Self {
+        max_steps: u64::MAX,
+        max_backtrack_bytes: usize::MAX,
+        max_memory_bytes: usize::MAX,
+    };
+}
+
+/// The first hard regex-execution ceiling crossed by a search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchLimitError {
+    Steps,
+    BacktrackMemory,
+}
+
+/// Meter result for a regex iterator or drained scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchUsage {
+    pub steps: u64,
+    pub exhaustion: Option<MatchLimitError>,
+}
+
+impl MatchUsage {
+    pub const UNMETERED: Self = Self {
+        steps: 0,
+        exhaustion: None,
+    };
+}
+
+/// Result of a bounded drained scan. Exhaustion is structurally separate from
+/// normal subject completion, so a caller cannot mistake a stopped search for
+/// an ordinary `exhausted = true` answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LimitedScanResult {
+    pub completion: Result<bool, MatchLimitError>,
+    pub steps: u64,
+}
+
+impl LimitedScanResult {
+    #[inline]
+    pub fn match_usage(self) -> MatchUsage {
+        MatchUsage {
+            steps: self.steps,
+            exhaustion: self.completion.err(),
+        }
+    }
+}
+
 /// An iterator type which yields `Match`es found in a string.
 pub type Matches<'r, 't> = exec::Matches<backends::DefaultExecutor<'r, 't>>;
+
+/// Explicitly-metered classical iterator. Available only in builds that opt
+/// into hard backtracking ceilings.
+#[cfg(feature = "bounded-backtracking")]
+pub type LimitedMatches<'r, 't> =
+    exec::Matches<classicalbacktrack::BacktrackExecutor<'r, indexing::Utf8Input<'t>>>;
+
+#[cfg(feature = "bounded-backtracking")]
+pub type LimitedAsciiMatches<'r, 't> =
+    exec::Matches<classicalbacktrack::BacktrackExecutor<'r, indexing::AsciiInput<'t>>>;
 
 /// An iterator type which yields `Match`es found in a string, supporting ASCII
 /// only.
@@ -188,16 +283,12 @@ pub struct Match {
     //   - Empty, if there were no named capture groups.
     //   - A list of names with length `captures.len()`, corresponding to the
     //     capture group names in order. Groups without names have an empty string.
-    pub(crate) group_names: Box<[Box<str>]>,
+    pub(crate) group_names: Option<Arc<[Box<str>]>>,
 }
 
 #[cfg(feature = "linear-ascii")]
-pub(crate) fn clone_group_names(group_names: &[Box<str>]) -> Box<[Box<str>]> {
-    if group_names.iter().all(|name| name.is_empty()) {
-        Box::default()
-    } else {
-        group_names.to_vec().into_boxed_slice()
-    }
+pub(crate) fn clone_group_names(group_names: &Option<Arc<[Box<str>]>>) -> Option<Arc<[Box<str>]>> {
+    group_names.clone()
 }
 
 impl Match {
@@ -222,7 +313,11 @@ impl Match {
         if name.is_empty() {
             return None;
         }
-        let pos = self.group_names.iter().position(|s| s.as_ref() == name)?;
+        let pos = self
+            .group_names
+            .as_deref()?
+            .iter()
+            .position(|s| s.as_ref() == name)?;
         self.captures[pos].clone()
     }
 
@@ -286,7 +381,7 @@ impl Match {
         Match {
             range,
             captures,
-            group_names: Box::default(),
+            group_names: None,
         }
     }
 }
@@ -375,25 +470,24 @@ impl<'m> Iterator for NamedGroups<'m> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         // Increment next_group_idx until we find a non-empty name that we haven't seen yet.
-        debug_assert!(self.next_group_idx <= self.mat.group_names.len());
-        let end = self.mat.group_names.len();
+        let group_names = self.mat.group_names.as_deref().unwrap_or_default();
+        debug_assert!(self.next_group_idx <= group_names.len());
+        let end = group_names.len();
 
         loop {
             let mut idx = self.next_group_idx;
             // Skip empty names
-            while idx < end && self.mat.group_names[idx].is_empty() {
+            while idx < end && group_names[idx].is_empty() {
                 idx += 1;
             }
             if idx == end {
                 return None;
             }
 
-            let name = self.mat.group_names[idx].as_ref();
+            let name = group_names[idx].as_ref();
 
             // Check if we've already returned this name (by looking backwards)
-            let already_seen = self.mat.group_names[..idx]
-                .iter()
-                .any(|n| n.as_ref() == name);
+            let already_seen = group_names[..idx].iter().any(|n| n.as_ref() == name);
 
             if already_seen {
                 // Skip this duplicate and continue to next
@@ -404,8 +498,8 @@ impl<'m> Iterator for NamedGroups<'m> {
             // This is the first occurrence of this name. Find the best range value.
             // Prefer a Some value over None when there are duplicate names.
             let mut best_range = self.mat.captures[idx].clone();
-            for check_idx in (idx + 1)..end {
-                if self.mat.group_names[check_idx].as_ref() == name {
+            for (check_idx, check_name) in group_names.iter().enumerate().take(end).skip(idx + 1) {
+                if check_name.as_ref() == name {
                     // Found a duplicate name. Prefer a Some value over None.
                     if best_range.is_none() && self.mat.captures[check_idx].is_some() {
                         best_range = self.mat.captures[check_idx].clone();
@@ -420,7 +514,8 @@ impl<'m> Iterator for NamedGroups<'m> {
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let size = self.mat.group_names[self.next_group_idx..]
+        let group_names = self.mat.group_names.as_deref().unwrap_or_default();
+        let size = group_names[self.next_group_idx..]
             .iter()
             .filter(|s| !s.is_empty())
             .count();
@@ -635,6 +730,24 @@ impl Regex {
         backends::find(self, text, start)
     }
 
+    /// Classical search with caller-selected hard work and backtrack-storage
+    /// ceilings. Inspect [`exec::Matches::match_usage`] after iteration; a
+    /// limit is distinct from an ordinary no-match result.
+    #[cfg(feature = "bounded-backtracking")]
+    pub fn find_from_with_limits<'r, 't>(
+        &'r self,
+        text: &'t str,
+        start: usize,
+        limits: MatchLimits,
+    ) -> LimitedMatches<'r, 't> {
+        exec::Matches::new(
+            classicalbacktrack::BacktrackExecutor::<indexing::Utf8Input<'t>>::with_limits(
+                &self.cr, text, limits,
+            ),
+            start,
+        )
+    }
+
     /// Searches `text` to find the first match.
     /// The input text is expected to be ascii-only: only ASCII case-folding is
     /// supported.
@@ -671,6 +784,24 @@ impl Regex {
         }
     }
 
+    /// ASCII-element variant of [`Self::find_from_with_limits`]. This always
+    /// selects the complete classical executor, never the optional linear
+    /// tier, so work accounting has one stable unit.
+    #[cfg(feature = "bounded-backtracking")]
+    pub fn find_from_ascii_with_limits<'r, 't>(
+        &'r self,
+        text: &'t str,
+        start: usize,
+        limits: MatchLimits,
+    ) -> LimitedAsciiMatches<'r, 't> {
+        exec::Matches::new(
+            classicalbacktrack::BacktrackExecutor::<indexing::AsciiInput<'t>>::with_limits(
+                &self.cr, text, limits,
+            ),
+            start,
+        )
+    }
+
     /// Search an ASCII-only subject with an explicit executor plan.
     ///
     /// This bypasses `ZIPP_REGEX_TIER` and is intended for differential
@@ -702,15 +833,34 @@ impl Regex {
     /// and no `Match` is allocated. Returns true when the subject is
     /// exhausted (no match exists past the last emitted one), false when the
     /// scan stopped at `cap` hits. The input text is expected to be
-    /// ascii-only, as for `find_from_ascii`.
+    /// ascii-only, as for `find_from_ascii`. This legacy boolean form remains
+    /// unmetered so resource exhaustion cannot masquerade as completion; a
+    /// bounded caller must use `scan_ascii_with_limits`, whose result
+    /// distinguishes all three outcomes.
     pub fn scan_ascii(
         &self,
         text: &str,
         start: usize,
         cap: usize,
-        sink: &mut dyn FnMut(core::ops::Range<usize>, &[Option<core::ops::Range<usize>>]),
+        sink: &mut ScanSink<'_>,
     ) -> bool {
         crate::classicalbacktrack::scan_ascii_drain(&self.cr, text, start, cap, sink)
+    }
+
+    /// Drained ASCII scan with the same hard ceilings and meter report as the
+    /// limited iterators.
+    #[cfg(feature = "bounded-backtracking")]
+    pub fn scan_ascii_with_limits(
+        &self,
+        text: &str,
+        start: usize,
+        cap: usize,
+        limits: MatchLimits,
+        sink: &mut ScanSink<'_>,
+    ) -> LimitedScanResult {
+        crate::classicalbacktrack::scan_ascii_drain_with_limits(
+            &self.cr, text, start, cap, limits, sink,
+        )
     }
 
     /// PATCH (see VENDORED.md): whether the pattern has named capture groups.
@@ -718,7 +868,7 @@ impl Regex {
     /// bare ranges, so such patterns stay off the drained path.)
     #[inline]
     pub fn has_named_groups(&self) -> bool {
-        !self.cr.group_names.is_empty()
+        self.cr.group_names.is_some()
     }
 
     /// Number of numbered capture groups in the compiled program. This is a
@@ -757,6 +907,21 @@ impl Regex {
         )
     }
 
+    #[cfg(all(feature = "utf16", feature = "bounded-backtracking"))]
+    pub fn find_from_utf16_with_limits<'r, 't>(
+        &'r self,
+        text: &'t [u16],
+        start: usize,
+        limits: MatchLimits,
+    ) -> exec::Matches<super::classicalbacktrack::BacktrackExecutor<'r, indexing::Utf16Input<'t>>>
+    {
+        let input = Utf16Input::new(text, self.cr.flags.unicode_mode());
+        exec::Matches::new(
+            super::classicalbacktrack::BacktrackExecutor::new_with_limits(input, &self.cr, limits),
+            start,
+        )
+    }
+
     /// Returns an iterator for matches found in 'text' starting at index `start`.
     #[cfg(feature = "utf16")]
     pub fn find_from_ucs2<'r, 't>(
@@ -771,6 +936,21 @@ impl Regex {
                 input,
                 MatchAttempter::new(&self.cr, input.left_end()),
             ),
+            start,
+        )
+    }
+
+    #[cfg(all(feature = "utf16", feature = "bounded-backtracking"))]
+    pub fn find_from_ucs2_with_limits<'r, 't>(
+        &'r self,
+        text: &'t [u16],
+        start: usize,
+        limits: MatchLimits,
+    ) -> exec::Matches<super::classicalbacktrack::BacktrackExecutor<'r, indexing::Ucs2Input<'t>>>
+    {
+        let input = Ucs2Input::new(text, self.cr.flags.unicode_mode());
+        exec::Matches::new(
+            super::classicalbacktrack::BacktrackExecutor::new_with_limits(input, &self.cr, limits),
             start,
         )
     }

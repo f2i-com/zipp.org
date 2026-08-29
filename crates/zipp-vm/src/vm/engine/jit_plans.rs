@@ -34,23 +34,10 @@ fn computed_drop_obj_is_observable(
     call_ip: usize,
     region_start: usize,
     region_end: usize,
+    allowed_use_ips: &[usize],
 ) -> bool {
-    let used_between = code[def_ip + 1..call_ip]
-        .iter()
-        .any(|ins| crate::codegen::instr_uses(ins).contains(&obj));
-    // Conservative by design: even a later def could make a narrower proof
-    // possible, but rejecting every post-call in-region use ensures the
-    // object-valued definition is never erased while the native success path
-    // can still observe its slot.
-    let used_after = code[call_ip + 1..=region_end]
-        .iter()
-        .any(|ins| crate::codegen::instr_uses(ins).contains(&obj));
-    let used_outside = code
-        .iter()
-        .enumerate()
-        .filter(|(at, _)| *at < region_start || *at > region_end)
-        .any(|(_, ins)| crate::codegen::instr_uses(ins).contains(&obj));
-    used_between || used_after || used_outside
+    let _ = (call_ip, region_start, region_end);
+    crate::codegen::reg_value_is_observable_after_def(code, obj, def_ip, allowed_use_ips)
 }
 
 #[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
@@ -73,7 +60,7 @@ mod computed_drop_liveness_tests {
             Instr::Move { dst: 6, src: 9 },
             Instr::Jump { target: 1 },
         ];
-        assert!(computed_drop_obj_is_observable(&code, 9, 1, 3, 1, 5));
+        assert!(computed_drop_obj_is_observable(&code, 9, 1, 3, 1, 5, &[3]));
 
         let mut no_post_use = code;
         no_post_use[4] = Instr::Move { dst: 6, src: 4 };
@@ -83,7 +70,8 @@ mod computed_drop_liveness_tests {
             1,
             3,
             1,
-            5
+            5,
+            &[3]
         ));
     }
 }
@@ -273,6 +261,89 @@ fn span_code_unit_pred_plan(
     })
 }
 
+/// Recover the same closed predicate after spec-order call lowering changed
+///
+/// `source.charCodeAt(starts[i])`
+///
+/// from one `CallMethod` into `GetProp; <argument evaluation>; CallWithThis`.
+/// This is deliberately not general `CallWithThis` leaf admission. The saved
+/// callable must be the nearest definition of the call's callee register, the
+/// receiver and callable must survive the gap, and no branch may enter it.
+/// Once that proof succeeds, a plan-local legacy-shaped body lets the existing
+/// leaf admission checks and specialized emitter remain the sole authorities.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn captured_span_code_unit_pred_plan(
+    callee: &crate::bytecode::FuncProto,
+    argc: u16,
+) -> Option<(crate::codegen::SpanCodeUnitPredPlan, Vec<Instr>)> {
+    let term = callee
+        .code
+        .iter()
+        .position(|ins| matches!(ins, Instr::Return { .. } | Instr::ReturnUndefined))?;
+    let body = callee.code.get(..=term)?;
+    if body.len() != 20 || argc != 2 || callee.param_count != 2 {
+        return None;
+    }
+
+    let (saved_callee, receiver, name) = match body[14] {
+        Instr::GetProp { dst, obj, name } => (dst, obj, name),
+        _ => return None,
+    };
+    let (unit, call_callee, call_receiver, arg_base, call_argc) = match body[17] {
+        Instr::CallWithThis {
+            dst,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+        } => (dst, callee, this_v, arg_base, argc),
+        _ => return None,
+    };
+    if call_callee != saved_callee
+        || call_receiver != receiver
+        || call_argc != 1
+        || saved_callee == receiver
+        || !matches!(body[12], Instr::JumpIfFalse { target: 19, .. })
+    {
+        return None;
+    }
+    let nearest_writer = (0..17)
+        .rev()
+        .find(|&at| crate::codegen::writes_reg(&body[at]) == Some(call_callee));
+    if nearest_writer != Some(14)
+        || body[15..17].iter().any(|ins| {
+            crate::codegen::writes_reg(ins)
+                .is_some_and(|reg| reg == call_callee || reg == call_receiver)
+        })
+        || callee.code.iter().any(|ins| {
+            slot_guard_jump_target(ins).is_some_and(|target| (15..=17).contains(&(target as usize)))
+        })
+    {
+        return None;
+    }
+
+    // Normalize only the planner's private copy. The real bytecode (and every
+    // fallback) retains capture-first evaluation order. The specialized helper
+    // runs before generic body emission whenever this plan is present.
+    let mut normalized = Vec::with_capacity(19);
+    normalized.extend_from_slice(&body[..14]);
+    normalized.extend_from_slice(&body[15..17]);
+    normalized.push(Instr::CallMethod {
+        dst: unit,
+        obj: call_receiver,
+        name,
+        arg_base,
+        argc: call_argc,
+    });
+    normalized.extend_from_slice(&body[18..=19]);
+    let Instr::JumpIfFalse { target, .. } = &mut normalized[12] else {
+        return None;
+    };
+    *target = 18;
+    let plan = span_code_unit_pred_plan(callee, &normalized, argc)?;
+    Some((plan, normalized))
+}
+
 impl<'p> Vm<'p> {
     /// Build the TypedArray pin plan for the OSR region `[start, end]` from
     /// LIVE VM state (called right before `compile_region`, frame `base` on
@@ -299,42 +370,7 @@ impl<'p> Vm<'p> {
         // Conservative "does this instruction write register r" cover. An op
         // missing here only weakens the hint (see above) — never soundness.
         fn writes(i: &Instr, r: u16) -> bool {
-            let dst = match *i {
-                Instr::LoadInt { dst, .. }
-                | Instr::LoadConst { dst, .. }
-                | Instr::Move { dst, .. }
-                | Instr::LoadGlobal { dst, .. }
-                | Instr::LoadGlobalOrUndefined { dst, .. }
-                | Instr::AddInt { dst, .. }
-                | Instr::Add { dst, .. }
-                | Instr::Sub { dst, .. }
-                | Instr::Mul { dst, .. }
-                | Instr::Div { dst, .. }
-                | Instr::Mod { dst, .. }
-                | Instr::Neg { dst, .. }
-                | Instr::Not { dst, .. }
-                | Instr::Bitwise { dst, .. }
-                | Instr::Lt { dst, .. }
-                | Instr::Le { dst, .. }
-                | Instr::Gt { dst, .. }
-                | Instr::Ge { dst, .. }
-                | Instr::Eq { dst, .. }
-                | Instr::Ne { dst, .. }
-                | Instr::GetProp { dst, .. }
-                | Instr::GetIndex { dst, .. }
-                | Instr::HasProp { dst, .. }
-                | Instr::StrConcat { dst, .. }
-                | Instr::StrAppendInPlace { dst, .. }
-                | Instr::StrAppendIndex { dst, .. }
-                | Instr::AddRightPair { dst, .. }
-                | Instr::Pad2Concat { dst, .. }
-                | Instr::Pad2Conditional { dst, .. }
-                | Instr::StrConcatChain { dst, .. }
-                | Instr::Call { dst, .. }
-                | Instr::CallMethod { dst, .. } => dst,
-                _ => return false,
-            };
-            dst == r
+            crate::codegen::writes_reg(i) == Some(r)
         }
         let mut plan = TaPinPlan::default();
         let proto = self.func(func_id as usize);
@@ -366,7 +402,12 @@ impl<'p> Vm<'p> {
             Len,
         }
         for aip in s..=e {
-            let (obj, recv) = match proto.code[aip] {
+            // `captured` is the spec-order lowering of `obj.m(args)`: the
+            // property value is obtained before evaluating any argument and
+            // later invoked with the saved receiver.  Pair only the exact
+            // dominating GetProp and reject any branch into the open prefix.
+            let mut captured = None;
+            let (obj, recv, lookup_ip) = match proto.code[aip] {
                 // `arr[i]` (GetIndex), `arr[i]=v` (SetIndex), and `i in arr`
                 // (HasProp, brand=false) all pin their receiver the same way; the
                 // LIVE heap object decides TA-kind vs ARR_PIN_KIND. SetIndex pins
@@ -374,10 +415,10 @@ impl<'p> Vm<'p> {
                 // is left to the generic helper (it can grow/realloc), but its
                 // receiver is still observed here and resolves to ARR_PIN_KIND
                 // only when the inline GetIndex/HasProp can use it.
-                Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } => (obj, Recv::Ta),
+                Instr::GetIndex { obj, .. } | Instr::SetIndex { obj, .. } => (obj, Recv::Ta, aip),
                 Instr::HasProp {
                     obj, brand: false, ..
-                } => (obj, Recv::Ta),
+                } => (obj, Recv::Ta, aip),
                 // A whitelisted DataView `get*` receiver pins the same way
                 // (snapshot: data+byteOffset / byteLength).
                 Instr::CallMethod {
@@ -388,7 +429,7 @@ impl<'p> Vm<'p> {
                         .get(name as usize)
                         .is_some_and(|k| crate::codegen::dv_get_kind(k).is_some()) =>
                 {
-                    (obj, Recv::Dv)
+                    (obj, Recv::Dv, aip)
                 }
                 // A `str.charCodeAt(i)` receiver pins as a flat-ASCII string
                 // (snapshot: bytes ptr + units), so the access inlines to a
@@ -401,7 +442,7 @@ impl<'p> Vm<'p> {
                         .get(name as usize)
                         .is_some_and(|k| k == "charCodeAt") =>
                 {
-                    (obj, Recv::Str)
+                    (obj, Recv::Str, aip)
                 }
                 // W20 M2: an `arr.push(x)` receiver pins as a dense Array on
                 // exactly the same terms as `arr[i]` — the live receiver picks
@@ -422,7 +463,70 @@ impl<'p> Vm<'p> {
                         .get(name as usize)
                         .is_some_and(|k| k == "push") =>
                 {
-                    (obj, Recv::Ta)
+                    (obj, Recv::Ta, aip)
+                }
+                Instr::CallWithThis {
+                    dst,
+                    callee,
+                    this_v,
+                    arg_base,
+                    argc,
+                } => {
+                    let Some(get_ip) = (s..aip)
+                        .rev()
+                        .find(|&ip| crate::codegen::writes_reg(&proto.code[ip]) == Some(callee))
+                    else {
+                        continue;
+                    };
+                    let name = match proto.code[get_ip] {
+                        Instr::GetProp {
+                            dst: get_dst,
+                            obj: get_obj,
+                            name,
+                        } if get_dst == callee && get_obj == this_v => name,
+                        _ => continue,
+                    };
+                    if proto.code[get_ip + 1..aip].iter().any(|ins| {
+                        crate::codegen::writes_reg(ins).is_some_and(|r| r == callee || r == this_v)
+                    }) || proto.code.iter().any(|ins| {
+                        slot_guard_jump_target(ins)
+                            .is_some_and(|target| (get_ip + 1..=aip).contains(&(target as usize)))
+                    }) {
+                        continue;
+                    }
+                    let recv = match proto
+                        .string_constants
+                        .get(name as usize)
+                        .map(String::as_str)
+                    {
+                        Some(key)
+                            if (argc == 1 || argc == 2)
+                                && crate::codegen::dv_get_kind(key).is_some() =>
+                        {
+                            Recv::Dv
+                        }
+                        Some("charCodeAt") if argc == 1 => Recv::Str,
+                        // Capture-first lowering of the one Array mutator the
+                        // INT tier implements.  This remains a pin-planner
+                        // exception, not general CallWithThis admission: the
+                        // exact GetProp/callee/receiver pair above is required,
+                        // and the intrinsic slot is proved below and again by
+                        // the entry snapshot before native execution.
+                        Some("push") if crate::codegen::int_push_enabled() && argc == 1 => Recv::Ta,
+                        _ => continue,
+                    };
+                    captured = Some(crate::codegen::CapturedPinCall {
+                        get_ip,
+                        call_ip: aip,
+                        obj: this_v,
+                        callee,
+                        dst,
+                        name,
+                        arg_base,
+                        argc,
+                        callee_bits: 0,
+                    });
+                    (this_v, recv, get_ip)
                 }
                 // `.length` on the SAME receiver coalesces onto that receiver's pin
                 // — the snapshot's third word IS the length for both pin families
@@ -438,11 +542,13 @@ impl<'p> Vm<'p> {
                         .get(name as usize)
                         .is_some_and(|k| k == "length") =>
                 {
-                    (obj, Recv::Len)
+                    (obj, Recv::Len, aip)
                 }
                 _ => continue,
             };
-            let writer = (s..aip).rev().find(|&wip| writes(&proto.code[wip], obj));
+            let writer = (s..lookup_ip)
+                .rev()
+                .find(|&wip| writes(&proto.code[wip], obj));
             let src = match writer.map(|wip| &proto.code[wip]) {
                 Some(&Instr::LoadGlobal { idx, .. }) if !stored_globals.contains(&idx) => {
                     TaPinSrc::Global(idx)
@@ -459,7 +565,9 @@ impl<'p> Vm<'p> {
                     // value the accesses see).
                     if proto.code[s..=e].iter().any(|i| writes(i, obj)) {
                         if std::env::var_os("ZIPP_JITLOG").is_some() {
-                            eprintln!("[pin] fn{func_id}@{aip} decline: live-in reg written in-region");
+                            eprintln!(
+                                "[pin] fn{func_id}@{aip} decline: live-in reg written in-region"
+                            );
                         }
                         continue;
                     }
@@ -516,6 +624,11 @@ impl<'p> Vm<'p> {
                 // never a soundness gate).
                 (HeapObj::Array(items), Recv::Ta | Recv::Len)
                     if !self.array_elements_overlaid(live.heap_index())
+                        // A virtual sparse length is authoritative over
+                        // `items.len()`. Array pins use the snapshot length for
+                        // both `.length` and element bounds, so do not publish a
+                        // half-valid pin for this receiver.
+                        && !self.array_js_len.contains_key(&live.heap_index())
                         && !self.arguments_objs.contains_key(&live.heap_index()) =>
                 {
                     // All-Int (sampled) ⇒ offer the array to the INTEGER tier, which
@@ -563,20 +676,141 @@ impl<'p> Vm<'p> {
                 }
                 _ => continue,
             };
+            let key = captured
+                .and_then(|site| proto.string_constants.get(site.name as usize))
+                .map(String::as_str);
+            let method_mask = match (&recv, key) {
+                (Recv::Dv, Some(name)) => {
+                    let Some(bit) = crate::vm::native::DV_PROTO_METHODS
+                        .iter()
+                        .position(|&candidate| candidate == name)
+                    else {
+                        continue;
+                    };
+                    1u32 << bit
+                }
+                (Recv::Str, Some("charCodeAt")) => 1,
+                // For an Array pin bit zero licenses only the pristine
+                // %Array.prototype%.push slot.  Pin kind disambiguates this
+                // from string bit zero above.
+                (Recv::Ta, Some("push")) => 1,
+                // Legacy CallMethod sites still bypass the ordinary member
+                // lookup; derive their method name directly from the op.
+                (Recv::Dv, None) => {
+                    let Instr::CallMethod { name, .. } = proto.code[aip] else {
+                        continue;
+                    };
+                    let Some(bit) = proto.string_constants.get(name as usize).and_then(|name| {
+                        crate::vm::native::DV_PROTO_METHODS
+                            .iter()
+                            .position(|&candidate| candidate == name)
+                    }) else {
+                        continue;
+                    };
+                    1u32 << bit
+                }
+                (Recv::Str, None) => 1,
+                (Recv::Ta, None)
+                    if matches!(
+                        proto.code[aip],
+                        Instr::CallMethod { name, argc: 1, .. }
+                            if proto
+                                .string_constants
+                                .get(name as usize)
+                                .is_some_and(|name| name == "push")
+                    ) =>
+                {
+                    1
+                }
+                _ => 0,
+            };
+            if let Some(mut site) = captured {
+                let callee = match &recv {
+                    Recv::Dv => self.dataview_method_is_intrinsic(
+                        live.heap_index(),
+                        key.expect("captured DataView name"),
+                    ),
+                    Recv::Str => {
+                        let name = key.expect("captured string name");
+                        let expected = self.str_proto_baseline.get(name).copied();
+                        if self.str_proto == 0
+                            || self.active_realm_proto(self.str_proto) != self.str_proto
+                        {
+                            None
+                        } else {
+                            match (self.heap.get(self.str_proto), expected) {
+                                (HeapObj::Object(map), Some(bits)) => {
+                                    map.pos(name).and_then(|slot| {
+                                        (!map.attr_at(slot).accessor
+                                            && map.val_at(slot).bits() == bits)
+                                            .then_some(map.val_at(slot))
+                                    })
+                                }
+                                _ => None,
+                            }
+                        }
+                    }
+                    Recv::Ta if key == Some("push") => {
+                        // The captured GetProp must materialise the exact value
+                        // that ordinary lookup would have observed.  Named own
+                        // properties and a custom receiver prototype are
+                        // declined here (and independently by the runtime pin
+                        // gates); the prototype data slot must still equal its
+                        // boot-time intrinsic bits.
+                        let idx = live.heap_index();
+                        let expected = self.arr_proto_baseline.get("push").copied();
+                        if self.arr_proto == 0
+                            || self.active_realm_proto(self.arr_proto) != self.arr_proto
+                            || self.arr_props.contains_key(&idx)
+                            || self.proto_of.contains_key(&idx)
+                        {
+                            None
+                        } else {
+                            match (self.heap.get(self.arr_proto), expected) {
+                                (HeapObj::Object(map), Some(bits)) => {
+                                    map.pos("push").and_then(|slot| {
+                                        (!map.attr_at(slot).accessor
+                                            && map.val_at(slot).bits() == bits)
+                                            .then_some(map.val_at(slot))
+                                    })
+                                }
+                                _ => None,
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let Some(callee) = callee else {
+                    continue;
+                };
+                site.callee_bits = callee.bits();
+                captured = Some(site);
+            }
             let slot = match plan
                 .pins
                 .iter()
                 .position(|p| p.src == src && p.kind == kind)
             {
-                Some(j) => j,
+                Some(j) => {
+                    plan.pins[j].method_mask |= method_mask;
+                    j
+                }
                 None => {
                     if plan.pins.len() >= 8 {
                         continue; // slot budget — extra accesses use the helper
                     }
-                    plan.pins.push(TaPin { src, kind });
+                    plan.pins.push(TaPin {
+                        src,
+                        kind,
+                        method_mask,
+                    });
                     plan.pins.len() - 1
                 }
             };
+            if let Some(site) = captured {
+                plan.access.insert(site.get_ip, slot as u8);
+                plan.captured_calls.insert(site.call_ip, site);
+            }
             plan.access.insert(aip, slot as u8);
         }
         if b192_log {
@@ -626,8 +860,13 @@ impl<'p> Vm<'p> {
         // observes or overwrites callee register 0 (`this`). That single rule
         // makes ordinary-method and lexical-arrow binding differences irrelevant
         // without pretending the receiver itself is `undefined`.
-        fn pure_int_body(body: &[Instr]) -> bool {
-            body.iter().all(|ins| match *ins {
+        fn pure_int_body(callee: &crate::bytecode::FuncProto, body: &[Instr]) -> bool {
+            let captured_math = if body.is_empty() {
+                Vec::new()
+            } else {
+                crate::codegen::captured_math_sites(callee, 0, body.len() - 1)
+            };
+            body.iter().enumerate().all(|(ip, ins)| match *ins {
                 Instr::LoadInt { dst, .. } | Instr::LoadConst { dst, .. } => dst != 0,
                 Instr::Move { dst, src } => dst != 0 && src != 0,
                 Instr::Add { dst, a, b }
@@ -642,12 +881,26 @@ impl<'p> Vm<'p> {
                 | Instr::Gt { dst, a, b }
                 | Instr::Ge { dst, a, b } => dst != 0 && a != 0 && b != 0,
                 Instr::AddInt { dst, a, .. } | Instr::Neg { dst, a } => dst != 0 && a != 0,
+                Instr::LoadGlobal { dst, .. } => {
+                    dst != 0 && captured_math.iter().any(|site| site.load_ip == ip)
+                }
+                Instr::GetProp { dst, obj, .. } => {
+                    dst != 0 && obj != 0 && captured_math.iter().any(|site| site.get_ip == ip)
+                }
                 Instr::MathOp {
                     dst,
                     op: crate::bytecode::MathFn::Imul,
+                    callee,
+                    this_v,
                     arg_base,
                     argc: 2,
-                } => dst != 0 && arg_base != 0,
+                } => {
+                    dst != 0
+                        && callee != 0
+                        && this_v != 0
+                        && arg_base != 0
+                        && captured_math.iter().any(|site| site.call_ip == ip)
+                }
                 Instr::Return { src } => src != 0,
                 _ => false,
             })
@@ -670,23 +923,19 @@ impl<'p> Vm<'p> {
             .collect();
 
         for ip in s..=e {
-            let Instr::CallMethodComputed {
-                obj,
-                arg_base,
-                argc,
-                ..
-            } = caller.code[ip]
-            else {
+            let Some(site) = crate::codegen::computed_call_site(caller, s, ip) else {
                 continue;
             };
+            let (obj, arg_base, argc) = (site.obj, site.arg_base, site.argc);
+            let lookup_ip = site.get_ip.unwrap_or(ip);
 
             // Resolve the receiver copied into `obj` back to a source whose
             // Value is invariant for the whole native region. Every in-region
             // link must dominate the next one; a jump into its open gap would
             // permit an old frame-slot value and therefore declines.
             let mut reg = obj;
-            let mut cursor = ip;
-            let mut fallback_ip = ip;
+            let mut cursor = lookup_ip;
+            let mut fallback_ip = lookup_ip;
             let mut drop_obj_def = None;
             let mut seen = rustc_hash::FxHashSet::default();
             let recv_src = 'source: loop {
@@ -707,7 +956,7 @@ impl<'p> Vm<'p> {
                     }
                     break 'source Some(TaPinSrc::Reg(reg));
                 };
-                if reg == obj && cursor == ip {
+                if reg == obj && cursor == lookup_ip {
                     drop_obj_def = Some(def_ip);
                 }
                 if caller.code.iter().any(|ins| {
@@ -740,10 +989,35 @@ impl<'p> Vm<'p> {
                 // The success path omits this object-valued def (integer homes
                 // cannot represent it). It must be a truly transient call temp:
                 // no intervening or out-of-region read may observe the slot.
-                if computed_drop_obj_is_observable(&caller.code, obj, def_ip, ip, s, e) {
+                let mut allowed_uses = vec![ip];
+                if let Some(get_ip) = site.get_ip {
+                    allowed_uses.push(get_ip);
+                }
+                if computed_drop_obj_is_observable(
+                    &caller.code,
+                    obj,
+                    def_ip,
+                    ip,
+                    s,
+                    e,
+                    &allowed_uses,
+                ) {
                     if log {
                         eprintln!(
                             "[int-computed] fn{func_id}@{ip} DECLINE receiver temp is observable"
+                        );
+                    }
+                    continue;
+                }
+            }
+            if let (Some(get_ip), Some(callee)) = (site.get_ip, site.callee) {
+                // The captured GetIndex result is omitted beside its call. It
+                // may feed that exact CallWithThis and nothing else; otherwise
+                // the boxed function value remains observable.
+                if computed_drop_obj_is_observable(&caller.code, callee, get_ip, ip, s, e, &[ip]) {
+                    if log {
+                        eprintln!(
+                            "[int-computed] fn{func_id}@{ip} DECLINE captured callee temp is observable"
                         );
                     }
                     continue;
@@ -806,7 +1080,7 @@ impl<'p> Vm<'p> {
                 };
                 if default_arg_mask != 0
                     || !matches!(body.last(), Some(Instr::Return { .. }))
-                    || !pure_int_body(&body)
+                    || !pure_int_body(callee, &body)
                     || body.iter().any(|ins| match *ins {
                         Instr::LoadConst { idx, .. } => !callee
                             .constants
@@ -845,6 +1119,48 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
+                let body_has_direct_global = body.iter().any(|ins| {
+                    matches!(
+                        ins,
+                        Instr::LoadGlobal { .. }
+                            | Instr::LoadGlobalOrUndefined { .. }
+                            | Instr::StoreGlobal { .. }
+                            | Instr::StoreGlobalStrict { .. }
+                            | Instr::StoreGlobalResolved { .. }
+                    )
+                });
+                let direct_global_route_epoch = if body_has_direct_global {
+                    let route_is_exact = self.global_route_epoch == 0
+                        && self.current_realm_id().is_none()
+                        && self.jit_func_eligible(fid)
+                        && !self
+                            .closure_eval_scope
+                            .contains_key(&callee_value.heap_index())
+                        && body.iter().all(|ins| match *ins {
+                            Instr::LoadGlobal { idx, .. }
+                            | Instr::LoadGlobalOrUndefined { idx, .. } => {
+                                self.global_slot_directly_routable(idx)
+                            }
+                            Instr::StoreGlobal { idx, .. }
+                            | Instr::StoreGlobalStrict { idx, .. } => {
+                                self.global_store_slot_directly_routable(idx)
+                            }
+                            Instr::StoreGlobalResolved { .. } => false,
+                            _ => true,
+                        });
+                    if !route_is_exact {
+                        if log {
+                            eprintln!(
+                                "[int-computed] fn{func_id}@{ip} arm {index} DECLINE direct-global route is not exact"
+                            );
+                        }
+                        failed = true;
+                        break;
+                    }
+                    Some(0)
+                } else {
+                    None
+                };
                 let empty_upvals = FxHashMap::default();
                 let empty_nested = FxHashMap::default();
                 let typed_lane = match crate::codegen::build_typed_lane_guarded(
@@ -857,7 +1173,8 @@ impl<'p> Vm<'p> {
                     &empty_upvals,
                     &consts,
                     &empty_nested,
-                    None,
+                    direct_global_route_epoch,
+                    self.jit_math_imul_guard(),
                 ) {
                     Ok(lane) => lane,
                     Err(reason) => {
@@ -882,6 +1199,7 @@ impl<'p> Vm<'p> {
                     default_arg_mask: 0,
                     body,
                     consts,
+                    string_constants: callee.string_constants.clone(),
                     upvals: FxHashMap::default(),
                     cell_get: crate::vm::helpers_misc::jit_cell_get as usize,
                     cell_set: crate::vm::helpers_misc::jit_cell_set as usize,
@@ -891,7 +1209,7 @@ impl<'p> Vm<'p> {
                     uninit_mask,
                     alias_params,
                     slot_guard: None,
-                    direct_global_route_epoch: None,
+                    direct_global_route_epoch,
                     typed_lane: Some(typed_lane),
                     span_code_unit_pred: None,
                 });
@@ -964,7 +1282,9 @@ impl<'p> Vm<'p> {
         while ip + 6 <= n {
             let window = &caller.code[ip..ip + 6];
             let (math_slot, dst_math, dst_random, name, dst_k, k, dst_prod, dst_zero, dst_res) =
-                match (&window[0], &window[1], &window[2], &window[3], &window[4], &window[5]) {
+                match (
+                    &window[0], &window[1], &window[2], &window[3], &window[4], &window[5],
+                ) {
                     (
                         Instr::LoadGlobal { dst: dm, idx: ms },
                         Instr::CallMethod {
@@ -1034,9 +1354,7 @@ impl<'p> Vm<'p> {
             }
             let fid = match self.heap.get(rv.heap_index()) {
                 crate::heap::HeapObj::Func(id) => *id,
-                crate::heap::HeapObj::Closure { func, upvalues, .. }
-                    if upvalues.is_empty() =>
-                {
+                crate::heap::HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => {
                     *func
                 }
                 _ => {
@@ -1142,7 +1460,9 @@ impl<'p> Vm<'p> {
                     && ((*a == *dr && *b == *dl) || (*b == *dr && *a == *dl))
                     && ((*oa == *dp && *ob == *dz) || (*ob == *dp && *oa == *dz)) =>
                 {
-                    Some((*ua, *da, *ms, *dm, *dr, *name, *db, *dl, *ln, *dp, *dz, *dres))
+                    Some((
+                        *ua, *da, *ms, *dm, *dr, *name, *db, *dl, *ln, *dp, *dz, *dres,
+                    ))
                 }
                 _ => None,
             };
@@ -1156,7 +1476,11 @@ impl<'p> Vm<'p> {
                 ip += 1;
                 continue;
             }
-            if caller.string_constants.get(name as usize).map(|s| s.as_str()) != Some("random")
+            if caller
+                .string_constants
+                .get(name as usize)
+                .map(|s| s.as_str())
+                != Some("random")
                 || caller.string_constants.get(ln as usize).map(|s| s.as_str()) != Some("length")
                 || !self.global_slot_directly_routable(math_slot)
             {
@@ -1462,7 +1786,7 @@ impl<'p> Vm<'p> {
                         arrow_this: callee.lexical_this,
                         mask_gen: self.jit.cross_mask_gen(fid),
                         uninit_mask,
-                        
+
                     })
                 })
                 .flatten();
@@ -1490,9 +1814,15 @@ impl<'p> Vm<'p> {
         #[cfg(not(feature = "instrument"))]
         let c3m_unmetered = true;
         if let Some(base) = exemplar_base {
-            if c3m_unmetered && crate::codegen::cross3_enabled() && crate::codegen::cross3m_enabled() {
+            if c3m_unmetered
+                && crate::codegen::cross3_enabled()
+                && crate::codegen::cross3m_enabled()
+            {
                 for (ip, instr) in caller.code.iter().enumerate() {
-                    let Instr::CallMethod { obj, name, argc, .. } = *instr else {
+                    let Instr::CallMethod {
+                        obj, name, argc, ..
+                    } = *instr
+                    else {
                         continue;
                     };
                     if argc > 6 {
@@ -1504,8 +1834,7 @@ impl<'p> Vm<'p> {
                     if !recv.is_heap() || !self.ic_obj_ok(recv.heap_index()) {
                         continue;
                     }
-                    let crate::heap::HeapObj::Object(map) = self.heap.get(recv.heap_index())
-                    else {
+                    let crate::heap::HeapObj::Object(map) = self.heap.get(recv.heap_index()) else {
                         continue;
                     };
                     let sh = map.shape();
@@ -1990,52 +2319,76 @@ impl<'p> Vm<'p> {
             let mut nested_consts: rustc_hash::FxHashMap<u32, u64> =
                 rustc_hash::FxHashMap::default();
             let mut default_arg_mask = 0u64;
-            let body = match callee_leaf_ok_for_call(callee, argc) {
-                Some((b, mask)) => {
-                    default_arg_mask = mask;
-                    b
-                }
-                None => {
-                    // Same-proto inlining deliberately stops at a direct leaf:
-                    // a wrapper splice adds an independently identity-guarded
-                    // inner call and has no rotating-identity evidence yet.
-                    if same_proto {
-                        if log {
-                            eprintln!(
-                                "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
-                                 (same-proto target is not a direct leaf)"
-                            );
-                        }
-                        continue;
+            // The capture-first scanner predicate is recognized before the
+            // generic leaf gate rejects its CallWithThis. Run the normalized
+            // plan-local body through that SAME gate, preserving every normal
+            // function/register/parameter constraint without admitting any
+            // other CallWithThis shape.
+            let captured_span = if same_proto {
+                None
+            } else {
+                captured_span_code_unit_pred_plan(callee, argc).and_then(
+                    |(pred, normalized_code)| {
+                        let mut normalized_callee = callee.clone();
+                        normalized_callee.code = normalized_code;
+                        callee_leaf_ok_for_call(&normalized_callee, argc)
+                            .map(|(body, mask)| (pred, body, mask))
+                    },
+                )
+            };
+            let mut span_code_unit_pred = None;
+            let body = if let Some((pred, body, mask)) = captured_span {
+                default_arg_mask = mask;
+                span_code_unit_pred = Some(pred);
+                body
+            } else {
+                match callee_leaf_ok_for_call(callee, argc) {
+                    Some((b, mask)) => {
+                        default_arg_mask = mask;
+                        b
                     }
-                    let Some((outer, call_at)) = callee_leaf_ok_one_call(callee) else {
-                        if log {
-                            eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (not leaf-eligible)");
-                        }
-                        continue;
-                    };
-                    match self.splice_nested_leaf(fid, callee, &outer, call_at) {
-                        Some((flat, guard, inner_regs, inner_upvals, inner_consts)) => {
-                            nested.insert(call_at, guard);
-                            extra_regs = inner_regs;
-                            nested_upvals = inner_upvals;
-                            nested_consts = inner_consts;
-                            if log {
-                                eprintln!(
-                                    "[leaf] fn{func_id}@{ip} callee fn{fid} NESTED-INLINE \
-                                     (spliced at body ip {call_at}, +{inner_regs} regs)"
-                                );
-                            }
-                            flat
-                        }
-                        None => {
+                    None => {
+                        // Same-proto inlining deliberately stops at a direct leaf:
+                        // a wrapper splice adds an independently identity-guarded
+                        // inner call and has no rotating-identity evidence yet.
+                        if same_proto {
                             if log {
                                 eprintln!(
                                     "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
-                                     (wrapper's inner call not inlinable)"
+                                 (same-proto target is not a direct leaf)"
                                 );
                             }
                             continue;
+                        }
+                        let Some((outer, call_at)) = callee_leaf_ok_one_call(callee) else {
+                            if log {
+                                eprintln!("[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE (not leaf-eligible)");
+                            }
+                            continue;
+                        };
+                        match self.splice_nested_leaf(fid, callee, &outer, call_at) {
+                            Some((flat, guard, inner_regs, inner_upvals, inner_consts)) => {
+                                nested.insert(call_at, guard);
+                                extra_regs = inner_regs;
+                                nested_upvals = inner_upvals;
+                                nested_consts = inner_consts;
+                                if log {
+                                    eprintln!(
+                                        "[leaf] fn{func_id}@{ip} callee fn{fid} NESTED-INLINE \
+                                     (spliced at body ip {call_at}, +{inner_regs} regs)"
+                                    );
+                                }
+                                flat
+                            }
+                            None => {
+                                if log {
+                                    eprintln!(
+                                        "[leaf] fn{func_id}@{ip} callee fn{fid} DECLINE \
+                                     (wrapper's inner call not inlinable)"
+                                    );
+                                }
+                                continue;
+                            }
                         }
                     }
                 }
@@ -2285,6 +2638,7 @@ impl<'p> Vm<'p> {
                     &consts,
                     &nested,
                     direct_global_route_epoch,
+                    self.jit_math_imul_guard(),
                 ) {
                     Ok(lane) => {
                         if log {
@@ -2309,11 +2663,9 @@ impl<'p> Vm<'p> {
                      (default_mask={default_arg_mask:#x})"
                 );
             }
-            let mut span_code_unit_pred = if same_proto {
-                None
-            } else {
-                span_code_unit_pred_plan(callee, &body, argc)
-            };
+            if span_code_unit_pred.is_none() && !same_proto {
+                span_code_unit_pred = span_code_unit_pred_plan(callee, &body, argc);
+            }
             if let Some(pred) = span_code_unit_pred.as_mut() {
                 pred.pair = self.span_code_unit_pair_plan(
                     func_id,
@@ -2353,6 +2705,7 @@ impl<'p> Vm<'p> {
                     default_arg_mask,
                     body,
                     consts,
+                    string_constants: callee.string_constants.clone(),
                     nested,
                     upvals,
                     cell_get: crate::vm::helpers_misc::jit_cell_get as usize,
@@ -2502,31 +2855,119 @@ impl<'p> Vm<'p> {
         let reg_window = caller.reg_count;
         // The op at `ip` selects how the receiver's resolved member is inlined:
         // CallMethod -> class method; GetProp -> trivial class getter; SetProp ->
-        // trivial class setter (Stage 5). All share receiver enumeration + the
-        // guard tree; only the per-shape resolve/body/binding differ.
+        // trivial class setter (Stage 5); and the spec-order lowering
+        // GetProp{dst=callee} + CallWithThis{callee,this=obj} -> class method at
+        // the CALL ip. All share receiver enumeration + the guard tree; only the
+        // per-shape resolve/body/binding differ.
         #[derive(Clone, Copy)]
         enum MiKind {
             Method,
             Getter,
             Setter,
         }
+        // Spec-order member calls capture their callable before evaluating the
+        // argument list, so the defining GetProp and consuming CallWithThis are
+        // no longer necessarily adjacent. Pair only a straight-line dominated
+        // capture: the Get is the nearest callee writer, the saved receiver and
+        // callee survive the gap, and no control-flow edge can enter after the
+        // Get. The later emitter already guards the captured callee Value before
+        // running an inline body, preserving argument-side property replacement.
+        #[derive(Clone, Copy)]
+        struct CapturedMethodSite {
+            get_ip: usize,
+            call_ip: usize,
+            obj: u16,
+            callee: u16,
+            name: u32,
+            arg_base: u16,
+            argc: u16,
+        }
+        let mut captured_methods = Vec::new();
+        for call_ip in start as usize..=end as usize {
+            let (callee, this_v, arg_base, argc) = match caller.code[call_ip] {
+                Instr::CallWithThis {
+                    callee,
+                    this_v,
+                    arg_base,
+                    argc,
+                    ..
+                } => (callee, this_v, arg_base, argc),
+                _ => continue,
+            };
+            let Some(get_ip) = (start as usize..call_ip)
+                .rev()
+                .find(|&at| crate::codegen::writes_reg(&caller.code[at]) == Some(callee))
+            else {
+                continue;
+            };
+            let name = match caller.code[get_ip] {
+                Instr::GetProp { dst, obj, name }
+                    if dst == callee && obj == this_v && callee != this_v =>
+                {
+                    name
+                }
+                _ => continue,
+            };
+            if caller.code[get_ip + 1..call_ip].iter().any(|ins| {
+                crate::codegen::writes_reg(ins).is_some_and(|r| r == callee || r == this_v)
+            }) || caller.code.iter().any(|ins| {
+                slot_guard_jump_target(ins)
+                    .is_some_and(|target| (get_ip + 1..=call_ip).contains(&(target as usize)))
+            }) {
+                continue;
+            }
+            captured_methods.push(CapturedMethodSite {
+                get_ip,
+                call_ip,
+                obj: this_v,
+                callee,
+                name,
+                arg_base,
+                argc,
+            });
+        }
         for ip in start as usize..=end as usize {
             // W19 (MI-LANE): a method site's `(arg_base, argc)` travels with the
             // arm so a lane can read formals from the caller's argument slots —
             // the SAME pair `emit_inline_method_call` binds from, taken from the
             // same instruction, so the two cannot disagree.
-            let (obj, name, kind, arg_base, argc) = match caller.code[ip] {
-                Instr::CallMethod {
-                    obj,
-                    name,
-                    arg_base,
-                    argc,
-                    ..
-                } => (obj, name, MiKind::Method, arg_base, argc),
-                Instr::GetProp { obj, name, .. } => (obj, name, MiKind::Getter, 0, 0),
-                Instr::SetProp { obj, name, .. } => (obj, name, MiKind::Setter, 0, 0),
-                _ => continue,
-            };
+            let (obj, name, kind, arg_base, argc, lookup_ip, captured_callee) =
+                match caller.code[ip] {
+                    Instr::CallMethod {
+                        obj,
+                        name,
+                        arg_base,
+                        argc,
+                        ..
+                    } => (obj, name, MiKind::Method, arg_base, argc, ip, None),
+                    Instr::GetProp { obj, name, .. } => {
+                        // A later paired CallWithThis owns this method plan. Do
+                        // not also misclassify the captured data-method read as
+                        // a getter merely because arguments separate the pair.
+                        if captured_methods.iter().any(|site| site.get_ip == ip) {
+                            continue;
+                        }
+                        (obj, name, MiKind::Getter, 0, 0, ip, None)
+                    }
+                    Instr::SetProp { obj, name, .. } => (obj, name, MiKind::Setter, 0, 0, ip, None),
+                    Instr::CallWithThis { .. } => match captured_methods
+                        .iter()
+                        .find(|site| site.call_ip == ip)
+                        .copied()
+                    {
+                        Some(site) => (
+                            site.obj,
+                            site.name,
+                            MiKind::Method,
+                            site.arg_base,
+                            site.argc,
+                            site.get_ip,
+                            Some(site.callee),
+                        ),
+                        None => continue,
+                    },
+                    _ => continue,
+                };
             let key = &caller.string_constants[name as usize];
             // ── enumerate candidate receivers ── the live exemplar at the obj reg
             // (last iteration's value) PLUS, when `obj` was `arr[idx]`, the array's
@@ -2545,7 +2986,10 @@ impl<'p> Vm<'p> {
             // IC fills during warmup — robust for `var o = arr[i]; o.m()` (where
             // `o` is loaded indirectly, defeating the obj-reg/array trace below).
             // Each is identity+version-guarded, so extras/stale are safe.
-            if let Some(rset) = self.mi_recv.get(&(((func_id as u64) << 32) | ip as u64)) {
+            if let Some(rset) = self
+                .mi_recv
+                .get(&(((func_id as u64) << 32) | lookup_ip as u64))
+            {
                 for &b in rset {
                     push_cand(Value::from_bits(b), &mut cands, &mut cand_bits);
                 }
@@ -2558,7 +3002,7 @@ impl<'p> Vm<'p> {
             // Best-effort: the dense elements of the array a `arr[idx]` receiver
             // came from (supplements recording; the temp may be reused).
             if let Some(arr_reg) =
-                Self::mi_last_getindex_array(&caller.code, start as usize, ip, obj)
+                Self::mi_last_getindex_array(&caller.code, start as usize, lookup_ip, obj)
             {
                 if let Some(&av) = self.regs.get(base + arr_reg as usize) {
                     if av.is_heap() {
@@ -2579,7 +3023,7 @@ impl<'p> Vm<'p> {
                 let built = match kind {
                     MiKind::Method => self.build_method_shape(
                         func_id,
-                        ip,
+                        lookup_ip,
                         recv,
                         key,
                         reg_window,
@@ -2632,6 +3076,7 @@ impl<'p> Vm<'p> {
                 MethodInlinePlan {
                     reg_window,
                     win_top,
+                    captured_callee,
                     shapes,
                 },
             );
@@ -2897,8 +3342,11 @@ impl<'p> Vm<'p> {
             _ => None,
         };
         let mut proto_method = None;
-        let (fid, method_slot) = match (recv_class, own_slot) {
-            (Some(c), None) => (self.ic_class_method_fid(func_id, ip, c)?, None),
+        let (fid, method_slot, captured_callee_bits, class_method) = match (recv_class, own_slot) {
+            (Some(c), None) => {
+                let (fid, callee) = self.ic_class_method_target(func_id, ip, c)?;
+                (fid, None, callee.bits(), Some((c, self.heap.version_of(c))))
+            }
             // ── B78: the method is INHERITED ── a plain object with neither a
             // class nor an own slot for `key`. `Object.create(proto)` and
             // `Ctor.prototype.m = fn` both land here, and both used to fall
@@ -2948,7 +3396,7 @@ impl<'p> Vm<'p> {
                     holder_slot: slot,
                     fn_bits: fv.bits(),
                 });
-                (f, None)
+                (f, None, fv.bits(), None)
             }
             (_, Some(slot)) => {
                 // The own property must be a plain data slot (an accessor would
@@ -2981,7 +3429,7 @@ impl<'p> Vm<'p> {
                 if self.func(f as usize).lexical_this {
                     return None;
                 }
-                (f, Some((slot as u32, fv.bits())))
+                (f, Some((slot as u32, fv.bits())), fv.bits(), None)
             }
         };
         let callee = self.func(fid as usize);
@@ -2992,7 +3440,13 @@ impl<'p> Vm<'p> {
             false,
             allow_global_methods && method_slot.is_some(),
         )?;
-        let body: Vec<Instr> = callee.code[..body_len].to_vec();
+        // Restore the old internal representation only inside this guarded
+        // inline plan: an adjacent zero-arg `SuperGet; CallWithThis` has no
+        // intervening observable work, and its exact holder Value is guarded
+        // by the existing SuperInline record. Runtime bytecode stays split and
+        // therefore preserves Get-before-arguments for every non-inlined path.
+        let (body, captured_super_sites) =
+            Self::mi_normalize_captured_super_calls(&callee.code[..body_len]);
         let has_direct_global = body.iter().any(|i| {
             matches!(
                 i,
@@ -3061,7 +3515,8 @@ impl<'p> Vm<'p> {
                     return None; // v1: 0-arg super only
                 }
                 let skey = &callee.string_constants[sname as usize];
-                let sr = self.ic_super_method_baked(fid, bi, home_class_id, skey)?;
+                let lookup_bi = captured_super_sites.get(&bi).copied().unwrap_or(bi);
+                let sr = self.ic_super_method_baked(fid, lookup_bi, home_class_id, skey)?;
                 let scallee = self.func(sr.fid as usize);
                 // Super target must be inlinable AND have NO nested super (v1).
                 let sblen = Self::method_inline_body_ok(scallee, false, false, false)?;
@@ -3124,6 +3579,8 @@ impl<'p> Vm<'p> {
                 own_acc: None,
                 recv_bits: recv.bits(),
                 recv_ver,
+                captured_callee_bits: Some(captured_callee_bits),
+                class_method,
                 vals_ptr,
                 field_slots,
                 callee_reg_count: callee.reg_count,
@@ -3443,6 +3900,8 @@ impl<'p> Vm<'p> {
                 own_acc,
                 recv_bits: recv.bits(),
                 recv_ver,
+                captured_callee_bits: None,
+                class_method: None,
                 vals_ptr,
                 field_slots,
                 callee_reg_count: callee.reg_count,
@@ -3592,6 +4051,55 @@ impl<'p> Vm<'p> {
         true
     }
 
+    /// Convert the compiler's spec-order zero-arg super-call pair into the
+    /// sealed legacy shape consumed by the existing inline scheduler. This is
+    /// plan-local only: the original bytecode and every fallback keep the exact
+    /// captured callable. `sites[normalized_ip]` records the original SuperGet
+    /// ip whose IC owns the live holder/Value proof.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn mi_normalize_captured_super_calls(
+        body: &[Instr],
+    ) -> (Vec<Instr>, rustc_hash::FxHashMap<usize, usize>) {
+        let mut out = Vec::with_capacity(body.len());
+        let mut sites = rustc_hash::FxHashMap::default();
+        let mut ip = 0usize;
+        while ip < body.len() {
+            if let (
+                Instr::SuperGet {
+                    dst: callee,
+                    home_class_id,
+                    name,
+                },
+                Some(Instr::CallWithThis {
+                    dst,
+                    callee: call_callee,
+                    this_v: 0,
+                    arg_base,
+                    argc: 0,
+                }),
+            ) = (body[ip].clone(), body.get(ip + 1))
+            {
+                if callee == *call_callee {
+                    let normalized_ip = out.len();
+                    out.push(Instr::SuperMethod {
+                        dst: *dst,
+                        base: callee,
+                        home_class_id,
+                        name,
+                        arg_base: *arg_base,
+                        argc: 0,
+                    });
+                    sites.insert(normalized_ip, ip);
+                    ip += 2;
+                    continue;
+                }
+            }
+            out.push(body[ip].clone());
+            ip += 1;
+        }
+        (out, sites)
+    }
+
     /// Trivial-method body scan for the Q7 in-region emitter. Returns the body
     /// length (ops up to and incl. the first `Return`/`ReturnUndefined`), or
     /// `None` to decline. `allow_super` admits `SuperMethod` (the outer body); a
@@ -3639,6 +4147,22 @@ impl<'p> Vm<'p> {
                 // `super.m()` admitted only in the outer body (Stage 3); the
                 // resolved super target is re-scanned with allow_super=false.
                 I::SuperMethod { .. } if allow_super => {}
+                // Spec-order form of the same zero-arg call. The planner turns
+                // this exact adjacent pair into a synthetic SuperMethod in its
+                // private body copy, retaining the original SuperGet ip for IC
+                // resolution. No args/intervening op means the holder cannot be
+                // observably changed between capture and call.
+                I::CallWithThis {
+                    callee,
+                    this_v: 0,
+                    argc: 0,
+                    ..
+                } if allow_super
+                    && ix > 0
+                    && matches!(
+                        code[ix - 1],
+                        I::SuperGet { dst, .. } if dst == callee
+                    ) => {}
                 // `GetSuperBase` — the base capture the compiler plants ahead of
                 // every `super.m()` and `super.x = v`, because
                 // MakeSuperPropertyReference must read the home object's
@@ -3741,6 +4265,7 @@ impl<'p> Vm<'p> {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub(crate) fn bump_regs_hw(&mut self, needed: usize) {
+        debug_assert!(needed <= self.regs.initialized_len());
         if needed > self.regs_hw {
             self.regs_hw = needed;
         }
@@ -3897,11 +4422,15 @@ fn shift_leaf_regs(i: &Instr, off: u16, const_off: u32) -> Option<Instr> {
         Instr::MathOp {
             dst,
             op,
+            callee,
+            this_v,
             arg_base,
             argc,
         } => Instr::MathOp {
             dst: s(dst),
             op,
+            callee: s(callee),
+            this_v: s(this_v),
             arg_base: s(arg_base),
             argc,
         },
@@ -3958,6 +4487,7 @@ fn slot_guard_def(i: &Instr) -> Option<Option<u16>> {
         | Instr::Ge { dst, .. }
         | Instr::MathOp { dst, .. }
         | Instr::Call { dst, .. }
+        | Instr::RegExpMethod { dst, .. }
         | Instr::CallMethod { dst, .. }
         | Instr::UpvalGet { dst, .. }
         | Instr::CellGet { dst, .. } => Some(dst),
@@ -4004,8 +4534,7 @@ fn slot_guard_jump_target(i: &Instr) -> Option<u32> {
 fn recognize_seeded_xorshift(callee: &crate::bytecode::FuncProto) -> Option<(u32, [(u8, u8); 3])> {
     use crate::bytecode::{BitwiseOp as B, Instr};
     let len_ok = callee.code.len() == 24
-        || (callee.code.len() == 25
-            && matches!(callee.code[24], Instr::ReturnUndefined));
+        || (callee.code.len() == 25 && matches!(callee.code[24], Instr::ReturnUndefined));
     if !len_ok
         || callee.param_count != 0
         || callee.is_generator
@@ -4019,10 +4548,7 @@ fn recognize_seeded_xorshift(callee: &crate::bytecode::FuncProto) -> Option<(u32
     let mut shifts = [(0u8, 0u8); 3];
     for step in 0..3 {
         let at = step * 6;
-        let [Instr::LoadGlobal { dst: fd, idx }, Instr::LoadGlobal {
-            dst: sd,
-            idx: idx2,
-        }, Instr::LoadInt { dst: ad, val }, Instr::Bitwise {
+        let [Instr::LoadGlobal { dst: fd, idx }, Instr::LoadGlobal { dst: sd, idx: idx2 }, Instr::LoadInt { dst: ad, val }, Instr::Bitwise {
             dst: shd,
             a: sa,
             b: sb,

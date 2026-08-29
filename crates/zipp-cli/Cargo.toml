@@ -10,11 +10,11 @@ name = "zipp"
 path = "src/main.rs"
 
 [dependencies]
-# Enable mimalloc's hardened mode (guarded metadata, stronger randomization and
-# integrity checks). The native runner is defense in depth rather than the
-# primary hostile-code boundary, but allocator hardening raises the cost of
-# exploiting a memory-corruption defect in that process.
-mimalloc = { version = "0.1.52", default-features = false, features = ["secure"] }
+# The ordinary JIT CLI is the maximum-throughput profile for trusted scripts.
+# Untrusted code belongs in the separately resolved zipp-sandbox workspace,
+# which enables mimalloc/secure and excludes unsafe/JIT engine features. Keep an
+# opt-in hardened allocator here for deployments that accept its measured cost.
+mimalloc = { version = "0.1.52", default-features = false }
 # The CLI's explicit `sandbox` command uses the VM's instruction/heap meter.
 # Ordinary `zipp js` does not attach a recorder, preserving its semantics; the
 # feature contributes one predictable null check to interpreted dispatch.
@@ -22,4 +22,13 @@ zipp-vm = { path = "../zipp-vm", features = ["instrument"] }
 
 [features]
 default = []
+secure-allocator = ["mimalloc/secure"]
 regex-linear = ["zipp-vm/regex-linear"]
+
+[build-dependencies]
+sha2 = "0.10.9"
+
+[dev-dependencies]
+# `tests/build_source_identity.rs` includes the build-script helper directly so
+# the provenance framing and fail-closed behavior are exercised by `cargo test`.
+sha2 = "0.10.9"

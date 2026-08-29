@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
-use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
     PromiseState, PropAttr, ReactionPair, Reactions,
@@ -176,6 +176,49 @@ impl<'p> Vm<'p> {
             },
             _ => false,
         }
+    }
+
+    /// Resolve one DataView `get*` method only when the receiver still has the
+    /// exact main-realm intrinsic chain.  Native register lanes bypass ordinary
+    /// `[[Get]]`, so an own shadow, custom prototype, accessor, deleted slot,
+    /// replacement callable, or child-realm prototype must fail closed.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn dataview_method_is_intrinsic(&self, view_idx: u32, name: &str) -> Option<Value> {
+        let method = crate::vm::native::DV_PROTO_METHODS
+            .iter()
+            .position(|&candidate| candidate == name)?;
+        if !name.starts_with("get")
+            || !matches!(self.heap.get(view_idx), HeapObj::DataView { .. })
+            || self
+                .arr_props
+                .get(&view_idx)
+                .is_some_and(|map| map.pos(name).is_some())
+            || self.dataview_proto == 0
+            || self.active_realm_proto(self.dataview_proto) != self.dataview_proto
+            || !matches!(
+                self.proto_of.get(&view_idx),
+                Some(proto) if proto.is_heap() && proto.heap_index() == self.dataview_proto
+            )
+        {
+            return None;
+        }
+        let value = match self.heap.get(self.dataview_proto) {
+            HeapObj::Object(map) => {
+                let slot = map.pos(name)?;
+                if map.attr_at(slot).accessor {
+                    return None;
+                }
+                map.val_at(slot)
+            }
+            _ => return None,
+        };
+        (value.is_heap()
+            && matches!(
+                self.heap.get(value.heap_index()),
+                HeapObj::Native(id)
+                    if *id == crate::vm::native::DV_METHOD_BASE + method as u16
+            ))
+        .then_some(value)
     }
 
     /// `IsTypedArrayFixedLength(O)`: is this view's length settled for good?

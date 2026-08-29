@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Counterbalanced Node-vs-Zipp harness for the hostile benchmark corpus.
+"""Counterbalanced Node/Bun/Deno/Zipp harness for the hostile benchmark corpus.
 
 The retained ``bench/real`` series is intentionally frozen.  This harness is
 separate because the hostile corpus has different requirements: nested entry
@@ -60,6 +60,7 @@ from typing import Any, Callable, Iterable
 
 
 CORE_PATH = Path(__file__).with_name("bench.py")
+STAGE_HELPER_PATH = Path(__file__).with_name("pgo_training.py")
 CORE_SPEC = importlib.util.spec_from_file_location("zipp_bench_core", CORE_PATH)
 if CORE_SPEC is None or CORE_SPEC.loader is None:  # pragma: no cover - import invariant
     raise RuntimeError(f"cannot import benchmark helpers from {CORE_PATH}")
@@ -73,6 +74,8 @@ MANIFEST_SCHEMA_VERSION = 1
 ARTIFACT_SCHEMA_VERSION = 1
 DEFAULT_TIMEOUT_S = 300.0
 DEFAULT_REPS = 15
+CANONICAL_ENGINE_NAMES = ("node", "bun", "deno", "zipp")
+COMPARISON_ENGINE_NAMES = ("node", "bun", "deno")
 
 ROOT_KEYS = frozenset({"schema_version", "cases", "description"})
 CASE_KEYS = frozenset(
@@ -264,7 +267,9 @@ def load_manifest(path: Path | str = DEFAULT_MANIFEST) -> Manifest:
         ids.add(case_id)
 
         category = _filter_token(item["category"], f"{label}.category")
-        entry_rel, entry = _resolve_input(manifest_root, item["entry"], f"{label}.entry")
+        entry_rel, entry = _resolve_input(
+            manifest_root, item["entry"], f"{label}.entry"
+        )
         inferred_goal = "module" if entry.suffix == ".mjs" else "script"
         goal = item.get("goal", inferred_goal)
         if goal not in ("script", "module"):
@@ -280,7 +285,9 @@ def load_manifest(path: Path | str = DEFAULT_MANIFEST) -> Manifest:
         if family is not None:
             family = _filter_token(family, f"{label}.family")
         if (family is None) != (variant is None):
-            raise ManifestError(f"{label}.family and .variant must be provided together")
+            raise ManifestError(
+                f"{label}.family and .variant must be provided together"
+            )
         if family is not None and variant is not None:
             variants = family_variants.setdefault(family, set())
             if variant in variants:
@@ -411,12 +418,23 @@ def select_cases(
     return selected
 
 
-def engine_prefix(engine: str, executable: str, goal: str) -> list[str]:
-    if engine == "node":
-        return [executable]
+def engine_prefix(
+    engine: str, executable: str | list[str] | tuple[str, ...], goal: str
+) -> list[str]:
+    """Return the goal-aware command prefix without shell interpretation."""
+
+    command = [executable] if isinstance(executable, str) else list(executable)
+    if not command or any(not isinstance(part, str) or not part for part in command):
+        raise ValueError(f"{engine} command must contain nonempty strings")
+    if engine in ("node", "bun", "deno"):
+        return command
     if engine == "zipp":
-        return [executable, "mjs" if goal == "module" else "js"]
+        return [*command, "mjs" if goal == "module" else "js"]
     raise ValueError(f"unknown engine {engine!r}")
+
+
+def _command_parts(command: str | list[str] | tuple[str, ...]) -> list[str]:
+    return [command] if isinstance(command, str) else list(command)
 
 
 def _temporary_empty(suffix: str) -> Path:
@@ -458,24 +476,37 @@ Runner = Callable[..., dict[str, Any]]
 def run_measurements(
     cases: tuple[Case, ...],
     *,
-    node: str,
-    zipp: str,
+    node: str | list[str] | tuple[str, ...],
+    bun: str | list[str] | tuple[str, ...] = ("bun", "run"),
+    deno: str | list[str] | tuple[str, ...] = ("deno", "run"),
+    zipp: str | list[str] | tuple[str, ...],
+    engine_names: tuple[str, ...] = CANONICAL_ENGINE_NAMES,
     reps: int,
     seed: int,
     timeout_override: float | None = None,
+    process_env: dict[str, str] | None = None,
+    fresh_environment: bool = False,
     runner: Runner = core.run_once,
 ) -> dict[str, Any]:
-    """Run cold observations and return raw samples plus correctness state."""
+    """Run cold observations and return rep-paired samples and correctness state."""
 
-    engines = [("node", [node]), ("zipp", [zipp])]
-    engine_names = [name for name, _ in engines]
+    if not engine_names or len(set(engine_names)) != len(engine_names):
+        raise ValueError("engine_names must be nonempty and unique")
+    if "node" not in engine_names or "zipp" not in engine_names:
+        raise ValueError("hostile measurements require node and zipp")
+    commands = {"node": node, "bun": bun, "deno": deno, "zipp": zipp}
+    unknown = sorted(set(engine_names) - set(commands))
+    if unknown:
+        raise ValueError(f"unknown engine(s): {', '.join(unknown)}")
+    engines = [(name, _command_parts(commands[name])) for name in engine_names]
+    measured_engine_names = [name for name, _ in engines]
     samples = {
         metric: {
-            engine: {case.id: [] for case in cases} for engine in engine_names
+            engine: {case.id: [] for case in cases} for engine in measured_engine_names
         }
         for metric in ("startup", "cold", "adjusted")
     }
-    outputs: dict[str, dict[str, bytes]] = {name: {} for name in engine_names}
+    outputs: dict[str, dict[str, bytes]] = {name: {} for name in measured_engine_names}
     observations: list[dict[str, Any]] = []
     schedules: list[dict[str, Any]] = []
     health_failures: list[str] = []
@@ -497,16 +528,30 @@ def run_measurements(
             for case_position, case in enumerate(case_order):
                 timeout = timeout_override or case.timeout_s
                 for engine_position, (engine, raw_cmd) in enumerate(ordered_engines):
-                    prefix = engine_prefix(engine, raw_cmd[0], case.goal)
+                    prefix = engine_prefix(engine, raw_cmd, case.goal)
+                    if fresh_environment:
+                        if process_env is not None:
+                            raise ValueError(
+                                "fresh_environment cannot be combined with process_env"
+                            )
+                        runner_environment = {"fresh_environment": True}
+                    else:
+                        runner_environment = (
+                            {"base_env": process_env}
+                            if process_env is not None
+                            else {}
+                        )
                     startup_result = runner(
                         prefix,
                         empty[case.goal],
                         timeout=timeout,
+                        **runner_environment,
                     )
                     full_result = runner(
                         prefix,
                         case.entry,
                         timeout=timeout,
+                        **runner_environment,
                     )
                     startup_s = float(startup_result["elapsed_s"])
                     cold_s = float(full_result["elapsed_s"])
@@ -514,7 +559,9 @@ def run_measurements(
                     startup_failure = _result_failure(
                         startup_result, engine, case, rep, "startup"
                     )
-                    full_failure = _result_failure(full_result, engine, case, rep, "run")
+                    full_failure = _result_failure(
+                        full_result, engine, case, rep, "run"
+                    )
                     healthy = startup_failure is None and full_failure is None
                     if startup_failure:
                         health_failures.append(startup_failure)
@@ -524,6 +571,7 @@ def run_measurements(
                     stdout = full_result.get("stdout", b"")
                     observation: dict[str, Any] = {
                         "rep": rep,
+                        "pair_id": f"{case.id}:{rep}",
                         "case": case.id,
                         "case_position": case_position,
                         "engine": engine,
@@ -551,7 +599,9 @@ def run_measurements(
                             startup_result["stderr"]
                         )
                     if full_result.get("stderr"):
-                        observation["stderr"] = core.decode_stderr(full_result["stderr"])
+                        observation["stderr"] = core.decode_stderr(
+                            full_result["stderr"]
+                        )
                     observations.append(observation)
 
                     if healthy:
@@ -581,9 +631,18 @@ def run_measurements(
 
     for case in cases:
         node_output = outputs["node"].get(case.id)
-        zipp_output = outputs["zipp"].get(case.id)
-        if node_output is not None and zipp_output is not None and node_output != zipp_output:
-            correctness_failures.append(f"zipp output differs from node on {case.id}")
+        for engine in measured_engine_names:
+            if engine == "node":
+                continue
+            engine_output = outputs[engine].get(case.id)
+            if (
+                node_output is not None
+                and engine_output is not None
+                and node_output != engine_output
+            ):
+                correctness_failures.append(
+                    f"{engine} output differs from node on {case.id}"
+                )
 
     health_failures = list(dict.fromkeys(health_failures))
     correctness_failures = list(dict.fromkeys(correctness_failures))
@@ -594,6 +653,7 @@ def run_measurements(
         "schedules": schedules,
         "health_failures": health_failures,
         "correctness_failures": correctness_failures,
+        "engine_names": measured_engine_names,
         "all_correct": not health_failures and not correctness_failures,
     }
 
@@ -606,7 +666,12 @@ def _ratio_detail(
     bootstrap_samples: int,
 ) -> dict[str, Any]:
     if len(numerators) != len(denominators) or not numerators:
-        return {"paired_ratio": None, "ci95": None, "nonpositive_pairs": 0}
+        return {
+            "paired_ratio": None,
+            "ci95": None,
+            "ci95_method": core.DESCRIPTIVE_BOOTSTRAP_METHOD,
+            "nonpositive_pairs": 0,
+        }
     nonpositive = sum(
         numerator <= 0 or denominator <= 0
         for numerator, denominator in zip(numerators, denominators)
@@ -615,6 +680,7 @@ def _ratio_detail(
         return {
             "paired_ratio": None,
             "ci95": None,
+            "ci95_method": core.DESCRIPTIVE_BOOTSTRAP_METHOD,
             "nonpositive_pairs": nonpositive,
         }
     ratios = core.paired_ratios(numerators, denominators)
@@ -626,7 +692,28 @@ def _ratio_detail(
     return {
         "paired_ratio": statistics.median(ratios),
         "ci95": [low, high],
+        "ci95_method": core.DESCRIPTIVE_BOOTSTRAP_METHOD,
         "nonpositive_pairs": 0,
+    }
+
+
+def _bonferroni_sign_test(
+    numerators: list[float],
+    denominators: list[float],
+    *,
+    hypothesis_count: int,
+) -> dict[str, Any] | None:
+    """Return an exact one-sided paired sign test and Bonferroni threshold."""
+
+    if hypothesis_count < 1:
+        return None
+    test = core.exact_one_sided_sign_test(numerators, denominators)
+    if test is None:
+        return None
+    return {
+        **test,
+        "hypothesis_count": hypothesis_count,
+        "bonferroni_alpha": 0.05 / hypothesis_count,
     }
 
 
@@ -634,14 +721,20 @@ def degradation_summaries(
     cases: tuple[Case, ...],
     samples: dict[str, dict[str, dict[str, list[float]]]],
     *,
+    engine_names: list[str] | None = None,
     seed: int,
     bootstrap_samples: int,
 ) -> list[dict[str, Any]]:
     """Compare every measured stressor with its family's measured baseline.
 
-    ``relative_parity_ratio`` is ``(zipp/node stressor) / (zipp/node baseline)``.
-    Above one means the stressor hurts Zipp more than it hurts Node.
+    Relative parity is ``(zipp/competitor stressor) / (zipp/competitor baseline)``.
+    Above one means the stressor hurts Zipp more than that competitor.  The
+    legacy ``relative_parity_ratio`` field remains the Node comparison.
     """
+
+    if engine_names is None:
+        engine_names = list(samples["cold"])
+    competitors = [name for name in engine_names if name != "zipp"]
 
     by_family: dict[str, list[Case]] = {}
     for case in cases:
@@ -673,32 +766,49 @@ def degradation_summaries(
                         ),
                         bootstrap_samples=bootstrap_samples,
                     )
-                    for engine in ("node", "zipp")
+                    for engine in engine_names
                 }
-                node_base = samples[metric]["node"][baseline.id]
                 zipp_base = samples[metric]["zipp"][baseline.id]
-                node_stress = samples[metric]["node"][stressor.id]
                 zipp_stress = samples[metric]["zipp"][stressor.id]
-                relative: list[float] = []
-                if len({len(node_base), len(zipp_base), len(node_stress), len(zipp_stress)}) == 1:
-                    for nb, zb, ns, zs in zip(
-                        node_base, zipp_base, node_stress, zipp_stress
-                    ):
-                        if min(nb, zb, ns, zs) <= 0:
-                            relative = []
-                            break
-                        relative.append((zs / ns) / (zb / nb))
-                relative_detail = _ratio_detail(
-                    relative,
-                    [1.0] * len(relative),
-                    seed=core.derived_seed(
-                        seed, "relative-degradation", family, stressor.id, metric
-                    ),
-                    bootstrap_samples=bootstrap_samples,
-                )
+                relative_by_competitor: dict[str, Any] = {}
+                for competitor in competitors:
+                    competitor_base = samples[metric][competitor][baseline.id]
+                    competitor_stress = samples[metric][competitor][stressor.id]
+                    relative: list[float] = []
+                    lengths = {
+                        len(competitor_base),
+                        len(zipp_base),
+                        len(competitor_stress),
+                        len(zipp_stress),
+                    }
+                    if len(lengths) == 1:
+                        for cb, zb, cs, zs in zip(
+                            competitor_base,
+                            zipp_base,
+                            competitor_stress,
+                            zipp_stress,
+                        ):
+                            if min(cb, zb, cs, zs) <= 0:
+                                relative = []
+                                break
+                            relative.append((zs / cs) / (zb / cb))
+                    relative_by_competitor[competitor] = _ratio_detail(
+                        relative,
+                        [1.0] * len(relative),
+                        seed=core.derived_seed(
+                            seed,
+                            "relative-degradation",
+                            family,
+                            stressor.id,
+                            metric,
+                            competitor,
+                        ),
+                        bootstrap_samples=bootstrap_samples,
+                    )
                 metrics[metric] = {
                     "engine_stressor_over_baseline": engine_ratios,
-                    "relative_parity_ratio": relative_detail,
+                    "relative_parity_ratio": relative_by_competitor.get("node"),
+                    "relative_parity_ratio_by_competitor": relative_by_competitor,
                 }
             result.append(
                 {
@@ -717,6 +827,8 @@ def category_balanced_geomean(
     cases: tuple[Case, ...],
     samples: dict[str, dict[str, list[float]]],
     *,
+    baseline: str = "node",
+    compare_name: str = "zipp",
     seed: int,
     bootstrap_samples: int,
 ) -> dict[str, Any] | None:
@@ -737,8 +849,10 @@ def category_balanced_geomean(
     ratios: dict[str, list[float]] = {}
     reps: int | None = None
     for case in cases:
-        paired = list(zip(samples["zipp"][case.id], samples["node"][case.id]))
-        if not paired or any(numerator <= 0 or denominator <= 0 for numerator, denominator in paired):
+        paired = list(zip(samples[compare_name][case.id], samples[baseline][case.id]))
+        if not paired or any(
+            numerator <= 0 or denominator <= 0 for numerator, denominator in paired
+        ):
             return None
         row = [numerator / denominator for numerator, denominator in paired]
         if reps is None:
@@ -755,7 +869,9 @@ def category_balanced_geomean(
             row_points = []
             for case_id in rows:
                 values = ratios[case_id]
-                selected = values if indexes is None else [values[index] for index in indexes]
+                selected = (
+                    values if indexes is None else [values[index] for index in indexes]
+                )
                 row_points.append(statistics.median(selected))
             category_points.append(core.geometric_mean(row_points))
         return core.geometric_mean(category_points)
@@ -774,6 +890,92 @@ def category_balanced_geomean(
         "categories": {category: rows for category, rows in by_category.items()},
         "geomean_paired_ratio": point,
         "ci95": ci,
+        "ci95_method": core.DESCRIPTIVE_BOOTSTRAP_METHOD,
+    }
+
+
+def _faster_than_all_gate(
+    comparisons: dict[str, dict[str, Any]], *, all_correct: bool = True
+) -> dict[str, Any]:
+    """Return an explicit strict gate for Zipp beating Node, Bun, and Deno.
+
+    Ratios are Zipp/competitor. Each comparison must have a point ratio below
+    one and reject the exact paired sign-test null at its row-family
+    Bonferroni threshold. Bootstrap intervals are reported descriptively only.
+    A subset can be inspected but cannot satisfy this canonical gate.
+    """
+
+    complete = tuple(comparisons) == COMPARISON_ENGINE_NAMES
+    point = (
+        complete
+        and all_correct
+        and all(
+            detail.get("paired_ratio") is not None and detail["paired_ratio"] < 1.0
+            for detail in comparisons.values()
+        )
+    )
+    descriptive_interval_below_one = (
+        complete
+        and all_correct
+        and all(
+            isinstance(detail.get("paired_ratio_ci95"), list)
+            and len(detail["paired_ratio_ci95"]) == 2
+            and detail["paired_ratio_ci95"][1] < 1.0
+            for detail in comparisons.values()
+        )
+    )
+    exact_familywise = (
+        complete
+        and all_correct
+        and point
+        and all(
+            isinstance(detail.get("exact_sign_test"), dict)
+            and detail["exact_sign_test"].get("rejects") is True
+            for detail in comparisons.values()
+        )
+    )
+    return {
+        "required_competitors": list(COMPARISON_ENGINE_NAMES),
+        "criterion": (
+            "every paired ratio is below 1.0 and every exact one-sided sign-test "
+            "p-value meets its row×competitor Bonferroni threshold"
+        ),
+        "complete": complete,
+        "all_correct": all_correct,
+        "point_estimate": point,
+        "descriptive_bootstrap_ci95_conjunction": descriptive_interval_below_one,
+        "exact_sign_test_familywise95": exact_familywise,
+        # Compatibility aliases; method fields above make their meaning explicit.
+        "individual_ci95": descriptive_interval_below_one,
+        "familywise95": exact_familywise,
+        "ci95": exact_familywise,
+    }
+
+
+def _descriptive_faster_than_all_gate(
+    comparisons: dict[str, dict[str, Any]], *, all_correct: bool = True
+) -> dict[str, Any]:
+    """Summarize suite-geomean estimates without turning bootstrap into proof."""
+
+    complete = tuple(comparisons) == COMPARISON_ENGINE_NAMES
+    point = complete and all_correct and all(
+        detail.get("paired_ratio") is not None and detail["paired_ratio"] < 1.0
+        for detail in comparisons.values()
+    )
+    descriptive = complete and all_correct and all(
+        isinstance(detail.get("paired_ratio_ci95"), list)
+        and len(detail["paired_ratio_ci95"]) == 2
+        and detail["paired_ratio_ci95"][1] < 1.0
+        for detail in comparisons.values()
+    )
+    return {
+        "required_competitors": list(COMPARISON_ENGINE_NAMES),
+        "criterion": "descriptive suite-geomean comparison; not a hypothesis test",
+        "complete": complete,
+        "all_correct": all_correct,
+        "point_estimate": point,
+        "descriptive_bootstrap_ci95_conjunction": descriptive,
+        "bootstrap_intervals": core.DESCRIPTIVE_BOOTSTRAP_METHOD,
     }
 
 
@@ -787,56 +989,176 @@ def summarize(
     if measurement["health_failures"]:
         return None
     samples = measurement["samples"]
+    engine_names = list(measurement.get("engine_names") or samples["cold"])
+    if "node" not in engine_names or "zipp" not in engine_names:
+        return None
+    for metric in ("startup", "cold", "adjusted"):
+        for case in cases:
+            counts = {len(samples[metric][engine][case.id]) for engine in engine_names}
+            if counts == {0} or len(counts) != 1:
+                return None
+    competitors = [name for name in engine_names if name != "zipp"]
+    all_correct = measurement.get("all_correct") is True
+    row_hypothesis_count = max(1, len(cases) * len(competitors))
     ids = [case.id for case in cases]
     categories = sorted({case.category for case in cases})
     case_summaries: dict[str, Any] = {}
     for case in cases:
+        metrics: dict[str, Any] = {}
+        for metric in ("startup", "cold", "adjusted"):
+            comparisons = {
+                competitor: core.metric_summary(
+                    samples[metric],
+                    engine_names,
+                    case.id,
+                    competitor,
+                    "zipp",
+                    seed=core.derived_seed(seed, "case", case.id, metric, competitor),
+                    bootstrap_samples=bootstrap_samples,
+                )
+                for competitor in competitors
+            }
+            for competitor, detail in comparisons.items():
+                sign_test = _bonferroni_sign_test(
+                    samples[metric]["zipp"][case.id],
+                    samples[metric][competitor][case.id],
+                    hypothesis_count=row_hypothesis_count,
+                )
+                if sign_test is not None:
+                    sign_test["rejects"] = (
+                        detail.get("paired_ratio") is not None
+                        and detail["paired_ratio"] < 1.0
+                        and sign_test["one_sided_pvalue"]
+                        <= sign_test["bonferroni_alpha"]
+                    )
+                detail["exact_sign_test"] = sign_test
+                detail["paired_ratio_ci95_method"] = (
+                    core.DESCRIPTIVE_BOOTSTRAP_METHOD
+                )
+            # Preserve the schema-v1 Node comparison fields in place while
+            # recording the complete comparison table alongside them.
+            node_detail = comparisons["node"]
+            metrics[metric] = {
+                **node_detail,
+                "zipp_vs": comparisons,
+                "zipp_faster_than_all": _faster_than_all_gate(
+                    comparisons, all_correct=all_correct
+                ),
+            }
         case_summaries[case.id] = {
             "category": case.category,
             "family": case.family,
             "variant": case.variant,
-            "metrics": {
-                metric: core.metric_summary(
-                    samples[metric],
-                    ["node", "zipp"],
-                    case.id,
-                    "node",
-                    "zipp",
-                    seed=core.derived_seed(seed, "case", case.id, metric),
-                    bootstrap_samples=bootstrap_samples,
-                )
-                for metric in ("startup", "cold", "adjusted")
-            },
+            "metrics": metrics,
         }
 
     suite_summaries: dict[str, Any] = {}
     for metric in ("startup", "cold", "adjusted"):
-        suite_summaries[metric] = {
-            "overall": core.subset_geomean(
+        overall_by_competitor = {
+            competitor: core.subset_geomean(
                 samples[metric],
                 ids,
-                "node",
+                competitor,
                 "zipp",
-                seed=core.derived_seed(seed, "overall", metric),
+                seed=core.derived_seed(seed, "overall", metric, competitor),
                 bootstrap_samples=bootstrap_samples,
-            ),
-            "category_balanced": category_balanced_geomean(
+            )
+            for competitor in competitors
+        }
+        balanced_by_competitor = {
+            competitor: category_balanced_geomean(
                 cases,
                 samples[metric],
-                seed=core.derived_seed(seed, "category-balanced", metric),
+                baseline=competitor,
+                compare_name="zipp",
+                seed=core.derived_seed(seed, "category-balanced", metric, competitor),
                 bootstrap_samples=bootstrap_samples,
-            ),
-            "categories": {
+            )
+            for competitor in competitors
+        }
+        categories_by_competitor = {
+            competitor: {
                 category: core.subset_geomean(
                     samples[metric],
                     [case.id for case in cases if case.category == category],
-                    "node",
+                    competitor,
                     "zipp",
-                    seed=core.derived_seed(seed, "category", category, metric),
+                    seed=core.derived_seed(
+                        seed, "category", category, metric, competitor
+                    ),
                     bootstrap_samples=bootstrap_samples,
                 )
                 for category in categories
-            },
+            }
+            for competitor in competitors
+        }
+        suite_gate_inputs = {
+            competitor: {
+                "paired_ratio": (
+                    detail.get("geomean_paired_ratio") if detail else None
+                ),
+                "paired_ratio_ci95": detail.get("ci95") if detail else None,
+            }
+            for competitor, detail in overall_by_competitor.items()
+        }
+        row_gates = {
+            case.id: case_summaries[case.id]["metrics"][metric]["zipp_faster_than_all"]
+            for case in cases
+        }
+        all_rows_gate = {
+            "required_competitors": list(COMPARISON_ENGINE_NAMES),
+            "criterion": (
+                "all row×competitor paired ratios are below 1.0 and all exact "
+                "one-sided paired sign tests meet alpha=0.05/m"
+            ),
+            "hypothesis_count": row_hypothesis_count,
+            "all_correct": all_correct,
+            "complete": bool(row_gates)
+            and all(gate["complete"] for gate in row_gates.values()),
+            "point_estimate": bool(row_gates)
+            and all(gate["point_estimate"] for gate in row_gates.values()),
+            "descriptive_bootstrap_ci95_conjunction": bool(row_gates)
+            and all(gate["individual_ci95"] for gate in row_gates.values()),
+            "exact_sign_test_familywise95": bool(row_gates)
+            and all(gate["familywise95"] for gate in row_gates.values()),
+            "failing_point_rows": [
+                case_id
+                for case_id, gate in row_gates.items()
+                if not gate["point_estimate"]
+            ],
+            "failing_descriptive_bootstrap_ci95_rows": [
+                case_id
+                for case_id, gate in row_gates.items()
+                if not gate["individual_ci95"]
+            ],
+            "failing_exact_sign_test_rows": [
+                case_id
+                for case_id, gate in row_gates.items()
+                if not gate["familywise95"]
+            ],
+        }
+        # Compatibility aliases point to the exact family-wise decision.
+        all_rows_gate["individual_ci95"] = all_rows_gate[
+            "descriptive_bootstrap_ci95_conjunction"
+        ]
+        all_rows_gate["familywise95"] = all_rows_gate[
+            "exact_sign_test_familywise95"
+        ]
+        all_rows_gate["ci95"] = all_rows_gate["exact_sign_test_familywise95"]
+        all_rows_gate["failing_ci95_rows"] = all_rows_gate[
+            "failing_exact_sign_test_rows"
+        ]
+        suite_summaries[metric] = {
+            "overall": overall_by_competitor["node"],
+            "overall_by_competitor": overall_by_competitor,
+            "category_balanced": balanced_by_competitor["node"],
+            "category_balanced_by_competitor": balanced_by_competitor,
+            "categories": categories_by_competitor["node"],
+            "categories_by_competitor": categories_by_competitor,
+            "zipp_faster_than_all": _descriptive_faster_than_all_gate(
+                suite_gate_inputs, all_correct=all_correct
+            ),
+            "all_rows_faster_than_all": all_rows_gate,
         }
 
     return {
@@ -845,9 +1167,25 @@ def summarize(
         "degradations": degradation_summaries(
             cases,
             samples,
+            engine_names=engine_names,
             seed=seed,
             bootstrap_samples=bootstrap_samples,
         ),
+        "engine_names": engine_names,
+        "ratio_direction": "zipp/competitor (<1 favors zipp)",
+        "familywise_method": {
+            "family_alpha": 0.05,
+            "test": "exact paired sign test",
+            "null": "strict paired win probability <= 0.5; ties are non-wins",
+            "sidedness": "one-sided",
+            "correction": "Bonferroni",
+            "scope": "each metric separately across all measured row×competitor comparisons",
+            "bootstrap_intervals": core.DESCRIPTIVE_BOOTSTRAP_METHOD,
+        },
+        "pairing": {
+            "unit": "case+repetition",
+            "order": "ascending repetition index within each case and engine",
+        },
     }
 
 
@@ -859,6 +1197,17 @@ def _format_ratio(detail: dict[str, Any] | None) -> str:
     return f"{detail['paired_ratio']:.3f}x{span}"
 
 
+def _format_sign_test(detail: dict[str, Any] | None) -> str:
+    test = detail.get("exact_sign_test") if detail else None
+    if not isinstance(test, dict):
+        return "n/a"
+    return (
+        f"{test['strict_wins']}/{test['trials']} wins, "
+        f"p={test['one_sided_pvalue']:.6g}, "
+        f"threshold={test['bonferroni_alpha']:.6g}"
+    )
+
+
 def print_report(
     cases: tuple[Case, ...],
     summary: dict[str, Any] | None,
@@ -867,39 +1216,77 @@ def print_report(
     if summary is None:
         print("statistics unavailable because one or more processes failed")
     else:
+        engine_names = summary["engine_names"]
+        competitors = [name for name in engine_names if name != "zipp"]
         for metric in ("cold", "adjusted"):
-            print(f"\nmetric={metric}; paired medians; zipp/node")
-            print(f"{'case':<30}{'node':>11}{'zipp':>11}  ratio [95% CI]")
+            print(
+                f"\nmetric={metric}; paired by case+rep; ratios are "
+                "zipp/competitor; bootstrap intervals are descriptive"
+            )
+            print(f"{'case':<30}" + "".join(f"{engine:>12}" for engine in engine_names))
             for case in cases:
                 detail = summary["case_summaries"][case.id]["metrics"][metric]
                 medians = detail["median_ms"]
                 print(
-                    f"{case.id:<30}{medians['node']:>9.1f}ms"
-                    f"{medians['zipp']:>9.1f}ms  {_format_ratio(detail)}"
+                    f"{case.id:<30}"
+                    + "".join(f"{medians[engine]:>9.1f}ms" for engine in engine_names)
                 )
-            overall = summary["suite_summaries"][metric]["overall"]
-            if overall:
-                ci = overall.get("ci95")
-                span = f" [{ci[0]:.3f},{ci[1]:.3f}]" if ci else ""
                 print(
-                    f"geomean[overall] {overall['geomean_paired_ratio']:.4f}x{span}"
-                )
-            balanced = summary["suite_summaries"][metric]["category_balanced"]
-            if balanced:
-                ci = balanced.get("ci95")
-                span = f" [{ci[0]:.3f},{ci[1]:.3f}]" if ci else ""
-                print(
-                    "geomean[category-balanced] "
-                    f"{balanced['geomean_paired_ratio']:.4f}x{span}"
-                )
-            for category, detail in summary["suite_summaries"][metric][
-                "categories"
-            ].items():
-                if detail:
-                    print(
-                        f"geomean[{category}] "
-                        f"{detail['geomean_paired_ratio']:.4f}x"
+                    f"{'':<30}"
+                    + "  ".join(
+                        f"zipp/{competitor}="
+                        f"{_format_ratio(detail['zipp_vs'][competitor])} "
+                        "exact-sign="
+                        f"{_format_sign_test(detail['zipp_vs'][competitor])}"
+                        for competitor in competitors
                     )
+                )
+            suite = summary["suite_summaries"][metric]
+            for competitor in competitors:
+                overall = suite["overall_by_competitor"][competitor]
+                if overall:
+                    ci = overall.get("ci95")
+                    span = f" [{ci[0]:.3f},{ci[1]:.3f}]" if ci else ""
+                    print(
+                        f"geomean[overall] zipp/{competitor}="
+                        f"{overall['geomean_paired_ratio']:.4f}x{span} "
+                        "(descriptive bootstrap)"
+                    )
+                balanced = suite["category_balanced_by_competitor"][competitor]
+                if balanced:
+                    ci = balanced.get("ci95")
+                    span = f" [{ci[0]:.3f},{ci[1]:.3f}]" if ci else ""
+                    print(
+                        f"geomean[category-balanced] zipp/{competitor}="
+                        f"{balanced['geomean_paired_ratio']:.4f}x{span}"
+                    )
+                for category, category_detail in suite["categories_by_competitor"][
+                    competitor
+                ].items():
+                    if category_detail:
+                        print(
+                            f"geomean[{category}] zipp/{competitor}="
+                            f"{category_detail['geomean_paired_ratio']:.4f}x"
+                        )
+            geomean_gate = suite["zipp_faster_than_all"]
+            print(
+                "ZIPP_GEOMEAN_FASTER_THAN_NODE_BUN_DENO_"
+                f"POINT={'1' if geomean_gate['point_estimate'] else '0'}  "
+                "ZIPP_GEOMEAN_FASTER_THAN_NODE_BUN_DENO_"
+                "DESCRIPTIVE_BOOTSTRAP_CI95_CONJUNCTION="
+                f"{'1' if geomean_gate['descriptive_bootstrap_ci95_conjunction'] else '0'}"
+            )
+            rows_gate = suite["all_rows_faster_than_all"]
+            print(
+                "ZIPP_FASTER_THAN_NODE_BUN_DENO_ALL_ROWS_"
+                f"POINT={'1' if rows_gate['point_estimate'] else '0'}  "
+                "ZIPP_FASTER_THAN_NODE_BUN_DENO_ALL_ROWS_"
+                "DESCRIPTIVE_BOOTSTRAP_CI95_CONJUNCTION="
+                f"{'1' if rows_gate['descriptive_bootstrap_ci95_conjunction'] else '0'}  "
+                "ZIPP_FASTER_THAN_NODE_BUN_DENO_ALL_ROWS_"
+                "EXACT_SIGN_BONFERRONI95="
+                f"{'1' if rows_gate['exact_sign_test_familywise95'] else '0'}"
+            )
 
         available = [row for row in summary["degradations"] if row["available"]]
         if available:
@@ -911,12 +1298,20 @@ def print_report(
                 for row in available:
                     detail = row["metrics"][metric]
                     engine = detail["engine_stressor_over_baseline"]
-                    relative = detail["relative_parity_ratio"]
                     print(
                         f"{row['family']}: {row['stressor']} / {row['baseline']}  "
-                        f"node={_format_ratio(engine['node'])}  "
-                        f"zipp={_format_ratio(engine['zipp'])}  "
-                        f"relative={_format_ratio(relative)}"
+                        + "  ".join(
+                            f"{name}={_format_ratio(engine[name])}"
+                            for name in engine_names
+                        )
+                    )
+                    print(
+                        "  relative="
+                        + "  ".join(
+                            f"zipp/{competitor}="
+                            f"{_format_ratio(detail['relative_parity_ratio_by_competitor'][competitor])}"
+                            for competitor in competitors
+                        )
                     )
 
     for failure in measurement["health_failures"] + measurement["correctness_failures"]:
@@ -927,10 +1322,14 @@ def print_report(
     )
 
 
-def case_to_json(case: Case) -> dict[str, Any]:
+def case_to_json(case: Case, *, display_root: Path | None = None) -> dict[str, Any]:
     data = asdict(case)
-    data["entry"] = str(case.entry)
-    data["inputs"] = [str(path) for path in case.inputs]
+    if display_root is None:
+        data["entry"] = str(case.entry)
+        data["inputs"] = [str(path) for path in case.inputs]
+    else:
+        data["entry"] = str(display_root / Path(case.entry_rel))
+        data["inputs"] = [str(display_root / Path(rel)) for rel in case.input_rels]
     data["input_rels"] = list(case.input_rels)
     data["features"] = list(case.features)
     return data
@@ -948,12 +1347,23 @@ def input_digests(cases: tuple[Case, ...]) -> dict[str, str | None]:
     return dict(sorted(digests.items()))
 
 
-def harness_digests() -> dict[str, str | None]:
-    paths = (Path(__file__).resolve(), CORE_PATH.resolve())
+def live_input_digests(
+    root: Path, cases: tuple[Case, ...]
+) -> dict[str, str | None]:
+    rels = sorted({rel for case in cases for rel in case.input_rels})
     return {
-        path.relative_to(ROOT).as_posix(): core.file_digest(path)
-        for path in paths
+        rel: core.file_digest(root.joinpath(*PurePosixPath(rel).parts))
+        for rel in rels
     }
+
+
+def harness_digests() -> dict[str, str | None]:
+    paths = (
+        Path(__file__).resolve(),
+        CORE_PATH.resolve(),
+        STAGE_HELPER_PATH.resolve(),
+    )
+    return {path.relative_to(ROOT).as_posix(): core.file_digest(path) for path in paths}
 
 
 def digest_drift(
@@ -992,6 +1402,11 @@ def artifact_publishable(
     *,
     all_correct: bool,
     publication_reasons: list[str],
+    benchmark_environment_policy: dict[str, Any],
+    publication_sources_head_before: bool,
+    publication_sources_head_after: bool,
+    repository_head_before: bool,
+    repository_head_after: bool,
 ) -> bool:
     return (
         all_correct
@@ -999,6 +1414,12 @@ def artifact_publishable(
         and not engine_drift
         and not source_drift
         and not publication_reasons
+        and publication_sources_head_before is True
+        and publication_sources_head_after is True
+        and repository_head_before is True
+        and repository_head_after is True
+        and benchmark_environment_policy
+        == core.canonical_benchmark_environment_descriptor()
     )
 
 
@@ -1006,6 +1427,7 @@ def publication_policy_reasons(
     manifest_path: Path,
     *,
     filtered: bool,
+    engine_names: tuple[str, ...] | list[str] = CANONICAL_ENGINE_NAMES,
     reps: int,
     bootstrap_samples: int,
     source_reason: str | None,
@@ -1018,10 +1440,13 @@ def publication_policy_reasons(
         reasons.append("alternate manifest (canonical hostile manifest required)")
     if filtered:
         reasons.append("filtered corpus (all default cases required)")
-    if reps < DEFAULT_REPS:
+    if tuple(engine_names) != CANONICAL_ENGINE_NAMES:
         reasons.append(
-            f"only {reps} repetitions (at least {DEFAULT_REPS} required)"
+            "publication requires exact engine order node,bun,deno,zipp "
+            "with Node as the correctness and ratio baseline"
         )
+    if reps < DEFAULT_REPS:
+        reasons.append(f"only {reps} repetitions (at least {DEFAULT_REPS} required)")
     if bootstrap_samples < core.BOOTSTRAP_SAMPLES:
         reasons.append(
             f"only {bootstrap_samples} bootstrap samples "
@@ -1047,29 +1472,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--features",
         help="comma-separated features; selected cases must contain all of them",
     )
-    parser.add_argument("--list", action="store_true", help="list selected cases and exit")
+    parser.add_argument(
+        "--list", action="store_true", help="list selected cases and exit"
+    )
     parser.add_argument("--reps", type=int, default=DEFAULT_REPS)
     parser.add_argument(
         "--seed",
         type=lambda value: int(value, 0),
         default=core.DEFAULT_SEED,
     )
-    parser.add_argument(
-        "--bootstrap-samples", type=int, default=core.BOOTSTRAP_SAMPLES
-    )
+    parser.add_argument("--bootstrap-samples", type=int, default=core.BOOTSTRAP_SAMPLES)
     parser.add_argument(
         "--timeout",
         type=float,
         help="override every case timeout (seconds)",
     )
     parser.add_argument("--node", default="node")
+    parser.add_argument("--bun", default="bun")
+    parser.add_argument("--deno", default="deno")
+    parser.add_argument(
+        "--engines",
+        default=",".join(CANONICAL_ENGINE_NAMES),
+        help=(
+            "comma-separated engine subset (default exact canonical order "
+            "node,bun,deno,zipp; subsets are diagnostic-only)"
+        ),
+    )
     parser.add_argument(
         "--zipp",
         default=str(
-            ROOT
-            / "target"
-            / "release"
-            / ("zipp.exe" if os.name == "nt" else "zipp")
+            ROOT / "target" / "release" / ("zipp.exe" if os.name == "nt" else "zipp")
         ),
     )
     parser.add_argument("--json", help="write a raw hostile-benchmark artifact")
@@ -1097,6 +1529,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_engine_commands(
+    engine_names: tuple[str, ...],
+    *,
+    node: str,
+    bun: str,
+    deno: str,
+    zipp: str,
+    timeout: float,
+    process_env: dict[str, str] | None = None,
+    fresh_environment: bool = False,
+) -> dict[str, list[str]]:
+    """Resolve mutable external launchers to their native engine binaries."""
+
+    raw = {
+        "node": [node],
+        "bun": [bun, "run"],
+        "deno": [deno, "run"],
+        "zipp": [zipp],
+    }
+    commands: dict[str, list[str]] = {}
+    for name in engine_names:
+        command = raw[name]
+        launcher = core.resolved_executable(command)
+        if launcher is None:
+            raise ValueError(f"{name}: engine launcher was not found: {command[0]}")
+        if name == "zipp":
+            commands[name] = [str(launcher)]
+            continue
+        commands[name] = core.canonical_engine_command(
+            name,
+            [str(launcher), *command[1:]],
+            timeout,
+            process_env=process_env,
+            fresh_environment=fresh_environment,
+        )
+    return commands
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.reps < 1:
@@ -1120,36 +1590,22 @@ def main(argv: list[str] | None = None) -> int:
     except (ManifestError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
 
-    publication_paths = {
-        manifest.path,
-        Path(__file__).resolve(),
-        CORE_PATH.resolve(),
-        *(
-            manifest.root / Path(rel)
-            for case in cases
-            for rel in case.input_rels
-        ),
-    }
-    publication_sources_head_before, publication_source_reason = (
-        core.git_paths_match_head(publication_paths)
-    )
-    environment = core.relevant_environment()
-    publication_reasons = publication_policy_reasons(
-        manifest.path,
-        filtered=any(
-            selector is not None
-            for selector in (args.cases, args.categories, args.families, args.features)
-        ),
-        reps=args.reps,
-        bootstrap_samples=args.bootstrap_samples,
-        source_reason=publication_source_reason,
-        environment=environment,
-    )
+    try:
+        engine_names = parse_csv(args.engines, "--engines")
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    unknown_engines = sorted(set(engine_names) - set(CANONICAL_ENGINE_NAMES))
+    if unknown_engines:
+        raise SystemExit(f"unknown engine(s): {', '.join(unknown_engines)}")
+    if "node" not in engine_names or "zipp" not in engine_names:
+        raise SystemExit("--engines must include node and zipp")
 
     if args.list:
         for case in cases:
             family = (
-                f" family={case.family}/{case.variant}" if case.family is not None else ""
+                f" family={case.family}/{case.variant}"
+                if case.family is not None
+                else ""
             )
             features = f" features={','.join(case.features)}" if case.features else ""
             print(
@@ -1157,6 +1613,94 @@ def main(argv: list[str] | None = None) -> int:
                 f"{family}{features}"
             )
         return 0
+
+    workspace_commit = core.git_revision()
+    benchmark_environment_policy = core.canonical_benchmark_environment_descriptor()
+    stage_files = {
+        "tools/bench.py": CORE_PATH.resolve(),
+        "tools/bench_hostile.py": Path(__file__).resolve(),
+        "tools/pgo_training.py": STAGE_HELPER_PATH.resolve(),
+        "bench/hostile/manifest.json": manifest.path,
+    }
+    for case in manifest.cases:
+        for rel, path in zip(case.input_rels, case.inputs):
+            key = f"bench/hostile/{rel}"
+            previous = stage_files.get(key)
+            if previous is not None and previous != path:
+                raise SystemExit(f"hostile input {rel!r} resolved inconsistently")
+            stage_files[key] = path
+    try:
+        input_stage = core.ImmutableInputStage(
+            stage_files, prefix="zipp-hostile-inputs-"
+        )
+        staged_manifest = load_manifest(
+            input_stage.path("bench/hostile/manifest.json")
+        )
+        cases = select_cases(
+            staged_manifest,
+            case_ids=parse_csv(args.cases, "--cases"),
+            categories=parse_csv(args.categories, "--categories"),
+            families=parse_csv(args.families, "--families"),
+            features=parse_csv(args.features, "--features"),
+        )
+    except (ManifestError, OSError, ValueError) as exc:
+        raise SystemExit(f"cannot stage immutable hostile inputs: {exc}") from exc
+
+    manifest_hash_before = core.file_digest(
+        input_stage.path("bench/hostile/manifest.json")
+    )
+    input_hashes_before = input_digests(cases)
+    harness_hashes_before = {
+        "tools/bench.py": core.file_digest(input_stage.path("tools/bench.py")),
+        "tools/bench_hostile.py": core.file_digest(
+            input_stage.path("tools/bench_hostile.py")
+        ),
+        "tools/pgo_training.py": core.file_digest(
+            input_stage.path("tools/pgo_training.py")
+        ),
+    }
+    publication_paths = {
+        manifest.path,
+        Path(__file__).resolve(),
+        CORE_PATH.resolve(),
+        STAGE_HELPER_PATH.resolve(),
+        *(manifest.root / Path(rel) for case in cases for rel in case.input_rels),
+    }
+    publication_sources_head_before, publication_source_reason = (
+        core.git_paths_match_head(publication_paths)
+    )
+    repository_head_before, repository_head_reason = core.git_repository_matches_head()
+    environment = core.relevant_environment()
+    publication_reasons = publication_policy_reasons(
+        manifest.path,
+        filtered=any(
+            selector is not None
+            for selector in (args.cases, args.categories, args.families, args.features)
+        ),
+        engine_names=engine_names,
+        reps=args.reps,
+        bootstrap_samples=args.bootstrap_samples,
+        source_reason=publication_source_reason,
+        environment=environment,
+    )
+    if (
+        repository_head_reason is not None
+        and repository_head_reason not in publication_reasons
+    ):
+        publication_reasons.append(repository_head_reason)
+
+    try:
+        engine_commands = resolve_engine_commands(
+            engine_names,
+            node=args.node,
+            bun=args.bun,
+            deno=args.deno,
+            zipp=args.zipp,
+            timeout=args.timeout or DEFAULT_TIMEOUT_S,
+            fresh_environment=True,
+        )
+    except (KeyError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
     if publication_reasons:
         print("publication policy (this run is diagnostic-only):", file=sys.stderr)
@@ -1170,16 +1714,17 @@ def main(argv: list[str] | None = None) -> int:
             "(pass --overwrite-json to replace it)"
         )
 
-    workspace_commit = core.git_revision()
-    manifest_hash_before = core.file_digest(manifest.path)
-    input_hashes_before = input_digests(cases)
-    harness_hashes_before = harness_digests()
     engines_before = [
-        core.engine_metadata("node", [args.node], args.timeout or DEFAULT_TIMEOUT_S),
-        core.engine_metadata("zipp", [args.zipp], args.timeout or DEFAULT_TIMEOUT_S),
+        core.engine_metadata(
+            name,
+            engine_commands[name],
+            args.timeout or DEFAULT_TIMEOUT_S,
+            fresh_environment=True,
+        )
+        for name in engine_names
     ]
     provenance_reasons, uncovered_provenance_reasons = core.provenance_assessment(
-        engines_before,
+        [metadata for metadata in engines_before if metadata["name"] == "zipp"],
         workspace_commit,
         is_ab=False,
         allow_dirty=args.allow_dirty_engine,
@@ -1201,22 +1746,56 @@ def main(argv: list[str] | None = None) -> int:
         print("  recorded; this artifact is publishable:false", file=sys.stderr)
     measurement = run_measurements(
         cases,
-        node=args.node,
-        zipp=args.zipp,
+        node=engine_commands["node"],
+        bun=engine_commands.get("bun", [args.bun, "run"]),
+        deno=engine_commands.get("deno", [args.deno, "run"]),
+        zipp=engine_commands["zipp"],
+        engine_names=engine_names,
         reps=args.reps,
         seed=args.seed,
         timeout_override=args.timeout,
+        fresh_environment=True,
     )
+    completeness_failures = core.sample_completeness_failures(
+        measurement["samples"]["cold"],
+        measurement["samples"]["startup"],
+        measurement["samples"]["adjusted"],
+        list(engine_names),
+        [case.id for case in cases],
+        args.reps,
+    )
+    measurement["health_failures"].extend(completeness_failures)
+    if completeness_failures:
+        measurement["all_correct"] = False
     engines_after = [
-        core.engine_metadata("node", [args.node], args.timeout or DEFAULT_TIMEOUT_S),
-        core.engine_metadata("zipp", [args.zipp], args.timeout or DEFAULT_TIMEOUT_S),
+        core.engine_metadata(
+            name,
+            engine_commands[name],
+            args.timeout or DEFAULT_TIMEOUT_S,
+            fresh_environment=True,
+        )
+        for name in engine_names
     ]
     drift = core.engine_drift(engines_before, engines_after)
     for reason in drift:
         measurement["health_failures"].append(f"engine changed during run: {reason}")
     manifest_hash_after = core.file_digest(manifest.path)
-    input_hashes_after = input_digests(cases)
+    input_hashes_after = live_input_digests(manifest.root, cases)
     harness_hashes_after = harness_digests()
+    staged_manifest_hash_after = core.file_digest(
+        input_stage.path("bench/hostile/manifest.json")
+    )
+    staged_input_hashes_after = input_digests(cases)
+    staged_harness_hashes_after = {
+        "tools/bench.py": core.file_digest(input_stage.path("tools/bench.py")),
+        "tools/bench_hostile.py": core.file_digest(
+            input_stage.path("tools/bench_hostile.py")
+        ),
+        "tools/pgo_training.py": core.file_digest(
+            input_stage.path("tools/pgo_training.py")
+        ),
+    }
+    workspace_commit_after = core.git_revision()
     source_drift = digest_drift(
         manifest_hash_before,
         manifest_hash_after,
@@ -1225,11 +1804,29 @@ def main(argv: list[str] | None = None) -> int:
         harnesses_before=harness_hashes_before,
         harnesses_after=harness_hashes_after,
     )
+    source_drift.extend(
+        digest_drift(
+            manifest_hash_before,
+            staged_manifest_hash_after,
+            input_hashes_before,
+            staged_input_hashes_after,
+            harnesses_before=harness_hashes_before,
+            harnesses_after=staged_harness_hashes_after,
+        )
+    )
+    if workspace_commit_after != workspace_commit:
+        source_drift.append(
+            "workspace HEAD changed during run "
+            f"({workspace_commit} -> {workspace_commit_after})"
+        )
     measurement["health_failures"].extend(source_drift)
     if drift or source_drift:
         measurement["all_correct"] = False
     publication_sources_head_after, publication_source_reason_after = (
         core.git_paths_match_head(publication_paths)
+    )
+    repository_head_after, repository_head_reason_after = (
+        core.git_repository_matches_head()
     )
     if (
         publication_source_reason_after is not None
@@ -1239,6 +1836,16 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "publication policy changed during the run: "
             f"{publication_source_reason_after}",
+            file=sys.stderr,
+        )
+    if (
+        repository_head_reason_after is not None
+        and repository_head_reason_after not in publication_reasons
+    ):
+        publication_reasons.append(repository_head_reason_after)
+        print(
+            "publication policy changed during the run: "
+            f"{repository_head_reason_after}",
             file=sys.stderr,
         )
 
@@ -1255,17 +1862,26 @@ def main(argv: list[str] | None = None) -> int:
             "schema_version": ARTIFACT_SCHEMA_VERSION,
             "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
             "workspace_commit": workspace_commit,
+            "workspace_commit_before": workspace_commit,
+            "workspace_commit_after": workspace_commit_after,
             "publishable": artifact_publishable(
                 provenance_reasons,
                 drift,
                 source_drift,
                 all_correct=measurement["all_correct"],
                 publication_reasons=publication_reasons,
+                benchmark_environment_policy=benchmark_environment_policy,
+                publication_sources_head_before=publication_sources_head_before,
+                publication_sources_head_after=publication_sources_head_after,
+                repository_head_before=repository_head_before,
+                repository_head_after=repository_head_after,
             ),
             "provenance_reasons": provenance_reasons,
             "publication_reasons": publication_reasons,
             "publication_sources_head_before": publication_sources_head_before,
             "publication_sources_head_after": publication_sources_head_after,
+            "repository_head_before": repository_head_before,
+            "repository_head_after": repository_head_after,
             "manifest": str(manifest.path),
             "manifest_sha256_before": manifest_hash_before,
             "manifest_sha256_after": manifest_hash_after,
@@ -1274,13 +1890,19 @@ def main(argv: list[str] | None = None) -> int:
             "input_sha256_before": input_hashes_before,
             "input_sha256_after": input_hashes_after,
             "source_drift": source_drift,
-            "cases": [case_to_json(case) for case in cases],
+            "cases": [
+                case_to_json(case, display_root=manifest.root) for case in cases
+            ],
+            "benchmark_input_staging_policy": core.BENCHMARK_INPUT_STAGING_POLICY,
             "selection": {
                 "cases": parse_csv(args.cases, "--cases"),
                 "categories": parse_csv(args.categories, "--categories"),
                 "families": parse_csv(args.families, "--families"),
                 "features": parse_csv(args.features, "--features"),
             },
+            "engine_names": list(engine_names),
+            "correctness_baseline": "node",
+            "ratio_direction": "zipp/competitor (<1 favors zipp)",
             "reps": args.reps,
             "seed": args.seed,
             "bootstrap_samples": args.bootstrap_samples,
@@ -1295,6 +1917,7 @@ def main(argv: list[str] | None = None) -> int:
                 "power_mode": core.power_mode(),
             },
             "environment": environment,
+            "benchmark_environment_policy": benchmark_environment_policy,
             "schedules": measurement["schedules"],
             "observations": measurement["observations"],
             "all_correct": measurement["all_correct"],
@@ -1304,7 +1927,8 @@ def main(argv: list[str] | None = None) -> int:
         }
         core.write_json_result(json_path, artifact, overwrite=args.overwrite_json)
 
-    return 0 if measurement["all_correct"] and summary is not None else 1
+    status = 0 if measurement["all_correct"] and summary is not None else 1
+    return status
 
 
 if __name__ == "__main__":

@@ -340,6 +340,11 @@ fn splits(log: &str) -> usize {
         .count()
 }
 
+fn has_pinned_receiver_decline(log: &str) -> bool {
+    log.lines()
+        .any(|line| line.contains("pinned receiver r") && line.contains("not cleanly excludable"))
+}
+
 /// The mechanism itself: two receivers split in one region, the kernel on the
 /// integer tier. With the switch off the SAME program must decline the plan
 /// entirely (`plan_region=None`) and land on MEM — which is what makes this an
@@ -392,7 +397,7 @@ fn msplit_mechanism_string_receiver_gate() {
     let name = "msplit_parity_string_and_element_receivers";
     let off = jitlog_of(name, &[("ZIPP_NO_MULTI_SPLIT", "1")]);
     assert!(
-        off.contains("pinned receiver reg not cleanly excludable"),
+        has_pinned_receiver_decline(&off),
         "expected the pre-W14 decline with the switch off:\n{off}"
     );
     assert!(
@@ -418,7 +423,7 @@ fn msplit_mechanism_string_receiver_gate() {
 fn msplit_mechanism_budget_declines_past_four() {
     let log = jitlog_of("msplit_parity_five_receivers_exceed_the_budget", &[]);
     assert!(
-        log.contains("pinned receiver reg not cleanly excludable"),
+        has_pinned_receiver_decline(&log),
         "five receivers should hit the whole-region decline:\n{log}"
     );
     assert!(

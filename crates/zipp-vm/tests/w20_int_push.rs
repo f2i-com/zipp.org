@@ -216,6 +216,37 @@ console.log("livehomes-{k} " + s);
     )
 }
 
+/// Compact mechanism probe for a successful pinned append followed by a
+/// same-region deopt. Squaring the large tagged Int exceeds the exact-integer
+/// home range only after the append commits. Numeric and bool homes remain live
+/// across both operations and are observed in the return value.
+fn compact_post_push_deopt_case(n: usize) -> String {
+    format!(
+        r#"var out = [];
+function kernel(n) {{
+  var i = 0, h = 0, p = 0, q = 0, b = false;
+  while (i < n) {{
+    h = 2147483000;
+    p = (i + 3) | 0;
+    q = (h ^ i) | 0;
+    b = (i & 1) === 0;
+    out.push((h + i) & 255);
+    h = h * h;
+    if (b) h = (h + p + q) | 0;
+    else h = (h - p + q) | 0;
+    i = i + 1;
+  }}
+  return "" + h + ":" + p + ":" + q + ":" + b;
+}}
+var s = "";
+out = []; s += "|" + kernel({n}) + ":" + out.length;
+out = []; s += "|" + kernel({n}) + ":" + out.length;
+out = []; s += "|" + kernel({n}) + ":" + out.length;
+console.log("compact-deopt " + s);
+"#
+    )
+}
+
 /// The append read straight back through its OWN pin on the same iteration.
 /// `out.length` and `out[...]` both come from the 32-byte snapshot slot that
 /// `jit_array_push_pinned` rewrites, so this is the case a stale `base`/`len`
@@ -328,8 +359,8 @@ console.log("aliased-{n} " + s);
 }
 
 /// The tokenizer shape itself, shrunk: a `charCodeAt` scan with many bool
-/// condition sites that emits three parallel token arrays. This is the kernel
-/// [`intpush_mechanism_reaches_the_int_tier`] asserts the tier on.
+/// condition sites that emits three parallel token arrays. Its large region is
+/// semantic/fail-closed coverage; compact fixtures below isolate tier mechanics.
 fn tokenizer_case(n: usize) -> String {
     format!(
         r#"var src = "";
@@ -504,6 +535,7 @@ fn intpush_parity_live_homes_across_append_and_deopt() {
     for k in 1..=4 {
         assert_matches_node(&live_homes_across_push_case(k, 180));
     }
+    assert_matches_node(&compact_post_push_deopt_case(180));
 }
 
 /// Every `Vec` capacity doubling from empty to 4096, with the appended element
@@ -795,6 +827,7 @@ fn intpush_all_modes_answer_identically() {
         push_bools_case(8, 400),
         live_homes_across_push_case(1, 180),
         live_homes_across_push_case(4, 180),
+        compact_post_push_deopt_case(180),
         realloc_boundary_case(1000),
         realloc_boundary_case(4097),
         shared_push_getindex_mem_case(800),
@@ -891,22 +924,22 @@ fn jitlog_of(src: &str, env: &[(&str, &str)]) -> String {
 }
 
 /// B94's rule, applied to this wave: a green differential proves nothing until
-/// the log shows the mechanism RAN. The tokenizer kernel must reach an `INT
-/// region` compile with the package on, and must NOT with either rung off —
-/// the useful tier transition requires both rungs.
+/// a compact push/bool fixture shows the mechanism RAN. The larger tokenizer
+/// remains a semantic and fail-closed oracle for register-type conflicts.
 #[test]
 fn intpush_mechanism_reaches_the_int_tier() {
-    let src = tokenizer_case(400);
+    let src = push_bools_case(8, 400);
     let on = jitlog_of(&src, &[]);
     assert!(
         on.contains("[jit] INT region fn") && on.contains("compiled"),
         "package ON did not reach the INT tier; log was:\n{on}"
     );
-    // Rung 1 off: the `CallMethod` decline is back and nothing else changes.
+    // Rung 1 off: capture-first lowering leaves the ordinary `CallWithThis`
+    // decline in place and nothing else changes.
     let no_push = jitlog_of(&src, &[("ZIPP_NO_INT_PUSH", "1")]);
     assert!(
-        no_push.contains("CallMethod (receiver not a pinned string/DataView)"),
-        "ZIPP_NO_INT_PUSH=1 did not restore the CallMethod decline; log was:\n{no_push}"
+        no_push.contains("CallWithThis (not a captured pinned string/DataView/Array.push)"),
+        "ZIPP_NO_INT_PUSH=1 did not restore the CallWithThis decline; log was:\n{no_push}"
     );
     // Rung 2 off: the region gets past `push` and declines one rung later, at
     // the bool pool — the decline string that appears on NO bench row today.
@@ -918,7 +951,7 @@ fn intpush_mechanism_reaches_the_int_tier() {
 
     // Keep the call-clobber/deopt oracle non-vacuous too: it must be the INT
     // emitter, not the interpreter or memory tier, that executes the push.
-    let live_homes = jitlog_of(&live_homes_across_push_case(4, 180), &[]);
+    let live_homes = jitlog_of(&compact_post_push_deopt_case(180), &[]);
     assert!(
         live_homes.contains("[jit] INT region fn")
             && live_homes.contains("compiled")
@@ -929,7 +962,7 @@ fn intpush_mechanism_reaches_the_int_tier() {
 
 #[test]
 fn intpush3_mechanism_engages_declines_atomically_and_switches_off() {
-    let src = tokenizer_case(400);
+    let src = push3_home_pressure_case(400);
     let on = jitlog_of(&src, &[("ZIPP_JIT_THRESHOLD", "1")]);
     assert!(
         on.contains("array-push3 groups="),
@@ -990,8 +1023,8 @@ fn intpush3_mechanism_engages_declines_atomically_and_switches_off() {
 /// automatically to the fallback emitters. Three facts make this gate
 /// non-vacuous:
 ///
-/// 1. With both rungs on, the tokenizer still compiles INT (the filter is never
-///    on that path).
+/// 1. With both rungs on, a compact push/bool fixture compiles INT (the filter
+///    is never on that path).
 /// 2. With bool reuse off, INT declines and the MEM fallback reports that it
 ///    dropped at least one push-only snapshot and retained none of that class.
 /// 3. A receiver used by BOTH `push` and `GetIndex` remains pinned/shared; the
@@ -1000,14 +1033,14 @@ fn intpush3_mechanism_engages_declines_atomically_and_switches_off() {
 /// The off switch must reproduce the unfiltered fallback on the same binary.
 #[test]
 fn push_pin_filter_is_tier_specific_and_non_vacuous() {
-    let tokenizer = tokenizer_case(400);
-    let on = jitlog_of(&tokenizer, &[]);
+    let push_bools = push_bools_case(8, 400);
+    let on = jitlog_of(&push_bools, &[]);
     assert!(
         on.contains("[jit] INT region fn") && on.contains("compiled"),
-        "both-rung tokenizer stopped compiling INT; log was:\n{on}"
+        "both-rung compact fixture stopped compiling INT; log was:\n{on}"
     );
 
-    let fallback = jitlog_of(&tokenizer, &[("ZIPP_NO_BOOL_REUSE", "1")]);
+    let fallback = jitlog_of(&push_bools, &[("ZIPP_NO_BOOL_REUSE", "1")]);
     let dropped = fallback.lines().any(|line| {
         line.contains("fallback push-pin filter")
             && line.contains("remaining_push_only=0")
@@ -1017,11 +1050,11 @@ fn push_pin_filter_is_tier_specific_and_non_vacuous() {
         fallback.contains("bool live-in, or bool gpr pool exhausted")
             && fallback.contains("[jit] MEM region fn")
             && dropped,
-        "bool-declined tokenizer did not compact push-only fallback pins; log was:\n{fallback}"
+        "bool-declined compact fixture did not filter push-only fallback pins; log was:\n{fallback}"
     );
 
     let unfiltered = jitlog_of(
-        &tokenizer,
+        &push_bools,
         &[
             ("ZIPP_NO_BOOL_REUSE", "1"),
             ("ZIPP_NO_PUSH_PIN_FILTER", "1"),

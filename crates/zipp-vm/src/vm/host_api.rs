@@ -113,12 +113,71 @@ const _: () = {
     assert!(core::mem::offset_of!(A, upvals_raw) == 16);
     assert!(core::mem::size_of::<A>() == 24);
 };
-/// B189b mirror for the emitted call lane: a Closure occupant's captured
-/// `this` bits (the upvalue base travels helper-side through
-/// `jit_cross3_enter`, so it has no emitted offset).
+/// B189b mirrors for the emitted call lane: a Closure occupant's captured
+/// `this` bits and (B243, emitted again) its upvalue base, which the inline
+/// activation install reads per call exactly as `jit_cross3_enter` did
+/// through `upvals_mirror_of`.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_THIS_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
     + core::mem::offset_of!(crate::heap::Heap, this_mirror_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_UPVALS_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, upvals_mirror_raw);
+
+/// B244: VM-relative offset of the saturating dense-Array snapshot epoch.
+/// Emitted code reads this scalar after a native cross call; equality with its
+/// stack-cached copy licenses reuse of Array raw bases only when the value is
+/// not `u64::MAX` (the permanently-dirty saturation state).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ARRAY_SNAPSHOT_EPOCH_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, array_snapshot_epoch);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    assert!(core::mem::size_of::<u64>() == 8);
+    assert!(JIT_ARRAY_SNAPSHOT_EPOCH_OFFSET % core::mem::align_of::<u64>() == 0);
+};
+
+/// B243: explicit register-file fields and its high-water mark, for the inline
+/// window open/close. Native code reads the mirrored exposed allocation address
+/// and writes only the logical length; it never depends on `Vec`'s private
+/// layout or retains a Rust raw pointer across safe element references.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_REGS_PTR_OFFSET: usize = core::mem::offset_of!(Vm<'static>, regs)
+    + core::mem::offset_of!(crate::vm::RegisterFile, ptr_mirror);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_REGS_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, regs)
+    + core::mem::offset_of!(crate::vm::RegisterFile, logical_len);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_REGS_HW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, regs_hw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    use crate::vm::RegisterFile as R;
+    assert!(core::mem::offset_of!(R, ptr_mirror) == 0);
+    assert!(core::mem::offset_of!(R, logical_len) == core::mem::size_of::<usize>());
+    assert!(core::mem::offset_of!(R, storage) == 2 * core::mem::size_of::<usize>());
+    assert!(JIT_REGS_PTR_OFFSET % core::mem::align_of::<usize>() == 0);
+    assert!(JIT_REGS_LEN_OFFSET % core::mem::align_of::<usize>() == 0);
+};
+
+/// B243: the activation root stack, scanned by the GC as `slots[..depth]`
+/// and pushed/popped by the emitted lane as `rdi + SLOTS + depth*24` /
+/// `inc`/`sub` on `depth`. Layout contract, compile-checked below.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ROOT_DEPTH_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, jit_tierc_activation_stack)
+        + core::mem::offset_of!(crate::vm::ActivationRootStack, depth);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_ROOT_SLOTS_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, jit_tierc_activation_stack)
+        + core::mem::offset_of!(crate::vm::ActivationRootStack, slots);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    use crate::vm::ActivationRootStack as R;
+    assert!(core::mem::offset_of!(R, depth) == 0);
+    assert!(core::mem::offset_of!(R, slots) == 8);
+    assert!(core::mem::size_of::<R>() == 8 + 24 * crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX);
+    assert!(crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX == 62);
+};
 /// B189b native GC-due guard: the emitted lane calls only when NO collection
 /// is pending (`maybe_gc` would be a no-op); a pending request routes to the
 /// helper, whose safe point runs it.
@@ -149,8 +208,9 @@ const _: () = {
 /// helper's full preflight can decide.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[allow(dead_code)] // consumed by the B189b emitted same-proto call lane
-pub(crate) const JIT_OBJ_REALM_NONEMPTY_OFFSET: usize = core::mem::offset_of!(Vm<'static>, obj_realm)
-    + core::mem::offset_of!(crate::vm::JitGuardedMap, nonempty_raw);
+pub(crate) const JIT_OBJ_REALM_NONEMPTY_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, obj_realm)
+        + core::mem::offset_of!(crate::vm::JitGuardedMap, nonempty_raw);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[allow(dead_code)] // consumed by the B189b emitted same-proto call lane
 pub(crate) const JIT_EVAL_SCOPE_NONEMPTY_OFFSET: usize =
@@ -284,6 +344,33 @@ impl HostValueBudget {
             "RangeError: host value exceeds the conversion string limit ({} bytes)",
             self.max_string_bytes
         )
+    }
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod layout_tests {
+    use super::*;
+    use crate::value::Value;
+
+    #[test]
+    fn register_file_emitted_offsets_address_explicit_fields() {
+        let mut regs = crate::vm::RegisterFile::from_vec(vec![Value::UNDEFINED; 3]);
+        regs.truncate(1);
+        let base = &mut regs as *mut crate::vm::RegisterFile as *mut u8;
+        let ptr_off = core::mem::offset_of!(crate::vm::RegisterFile, ptr_mirror);
+        let len_off = core::mem::offset_of!(crate::vm::RegisterFile, logical_len);
+        // SAFETY: repr(C) field offsets above identify aligned fields of `regs`.
+        assert_eq!(
+            unsafe { *(base.add(ptr_off) as *const usize) },
+            regs.as_ptr().expose_provenance()
+        );
+        assert_eq!(unsafe { *(base.add(len_off) as *const usize) }, regs.len());
+
+        // This is the exact B243 operation: revive only within the initialized
+        // high-water backing and observe it through the safe logical view.
+        unsafe { core::ptr::write(base.add(len_off) as *mut usize, 3) };
+        assert_eq!(regs.len(), 3);
+        assert_eq!(regs.initialized_len(), 3);
     }
 }
 

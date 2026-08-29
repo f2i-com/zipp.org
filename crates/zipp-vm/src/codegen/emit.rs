@@ -982,7 +982,7 @@ pub(crate) fn emit_refetch_ta(
         }
         dynasm!(ops
             ; mov rcx, rdi                      // vm
-            ; mov r8d, pin.kind as i32          // expected element kind
+            ; mov r8d, pin.snapshot_tag() as i32 // kind + intrinsic method mask
             ; lea r9, [rsp + ta_slot_off(j)]    // out: snapshot slot
             ; mov rax, QWORD snapshot_helper as i64
             ; call rax

@@ -808,26 +808,38 @@ impl<'p> Vm<'p> {
                     )));
                 }
                 let prom = self.alloc_promise();
-                let pair = self.new_resolver_pair();
-                let res = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
-                    promise: prom,
-                    is_reject: false,
-                    pair,
-                }));
-                let rej = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
-                    promise: prom,
-                    is_reject: true,
-                    pair,
-                }));
-                if self.call_value(a0, Value::UNDEFINED, &[res, rej]).is_err() {
-                    let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
-                    // Step 10.a Call([[Reject]]): no-op once the pair fired
-                    // (resolve-then-throw keeps the resolution).
-                    if self.resolver_pair_fire(pair) {
-                        self.reject(prom, reason);
+                let roots = [Value::heap(prom), over.unwrap_or(Value::UNDEFINED)];
+                // A realm facade delegates here through the main implementation
+                // with its native realm installed. CreateResolvingFunctions is
+                // fresh and belongs to that Promise constructor's realm; an
+                // unrelated foreign newTarget alone does not change it.
+                let resolver_realm = self.native_callee_realm.unwrap_or(0);
+                return self.with_promise_operation_roots(&roots, |vm| {
+                    let pair = vm.new_resolver_pair();
+                    let res = vm.heap.alloc(HeapObj::BoundResolver {
+                        promise: prom,
+                        is_reject: false,
+                        pair,
+                    });
+                    vm.adopt_fresh_result_to_realm(res, vm.fn_proto, resolver_realm);
+                    let res = Value::heap(res);
+                    let rej = vm.heap.alloc(HeapObj::BoundResolver {
+                        promise: prom,
+                        is_reject: true,
+                        pair,
+                    });
+                    vm.adopt_fresh_result_to_realm(rej, vm.fn_proto, resolver_realm);
+                    let rej = Value::heap(rej);
+                    if vm.call_value(a0, Value::UNDEFINED, &[res, rej]).is_err() {
+                        let reason = vm.pending_throw.take().unwrap_or(Value::UNDEFINED);
+                        // Step 10.a Call([[Reject]]): no-op once the pair fired
+                        // (resolve-then-throw keeps the resolution).
+                        if vm.resolver_pair_fire(pair) {
+                            vm.reject(prom, reason);
+                        }
                     }
-                }
-                return Ok(self.set_ctor_proto(Value::heap(prom), over));
+                    Ok(vm.set_ctor_proto(Value::heap(prom), over))
+                });
             }
         }
         // A user function with no [[Construct]] (generator, async, arrow, or a
@@ -1129,6 +1141,9 @@ impl<'p> Vm<'p> {
         args: &[Value],
     ) -> Result<bool, Thrown> {
         let oidx = obj.heap_index();
+        // Preserve the actual super constructor's realm before normalizing a
+        // createRealm facade to the main implementation for brand matching.
+        let builtin_realm = self.get_function_realm(cval);
         // A `$262.createRealm()` FACADE constructor mirrors a main-realm built-in,
         // so `class B extends g.ArrayBuffer` must brand exactly like `class B
         // extends ArrayBuffer`. Every test below compares against a MAIN ctor /
@@ -1460,16 +1475,20 @@ impl<'p> Vm<'p> {
                 self.proto_of.insert(oidx, sub_proto);
             }
             let pair = self.new_resolver_pair();
-            let res = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+            let res = self.heap.alloc(HeapObj::BoundResolver {
                 promise: oidx,
                 is_reject: false,
                 pair,
-            }));
-            let rej = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
+            });
+            self.adopt_fresh_result_to_realm(res, self.fn_proto, builtin_realm);
+            let res = Value::heap(res);
+            let rej = self.heap.alloc(HeapObj::BoundResolver {
                 promise: oidx,
                 is_reject: true,
                 pair,
-            }));
+            });
+            self.adopt_fresh_result_to_realm(rej, self.fn_proto, builtin_realm);
+            let rej = Value::heap(rej);
             if self.call_value(a0, Value::UNDEFINED, &[res, rej]).is_err() {
                 let reason = self.pending_throw.take().unwrap_or(Value::UNDEFINED);
                 // Step 10.a Call([[Reject]]): no-op once the pair fired.

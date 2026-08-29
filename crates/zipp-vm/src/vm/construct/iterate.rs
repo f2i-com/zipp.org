@@ -15,6 +15,9 @@ impl<'p> Vm<'p> {
         // returns a String wrapper), null/undefined throw.
         self.require_object_coercible(arg0)?;
         let target = self.to_object(arg0)?;
+        if let Some(r) = self.native_callee_realm {
+            self.realm_box_proto(target, r);
+        }
         let tidx = target.heap_index();
         let mut added_any = false;
         for &src in &args[1..] {
@@ -1104,7 +1107,7 @@ impl<'p> Vm<'p> {
             };
             map.set(&pk, v);
         }
-        Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map)))))
+        Ok(self.alloc_object_current_realm(map))
     }
 
     /// AddEntriesFromIterable using a collection's OBSERVABLE adder (Map/WeakMap

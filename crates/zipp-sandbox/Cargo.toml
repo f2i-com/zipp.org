@@ -1,0 +1,37 @@
+[package]
+name = "zipp-sandbox"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Hardened native runner for untrusted JavaScript using zipp-vm"
+publish = false
+
+# This package must stay in a separate feature-resolution domain from the
+# native JIT CLI. Cargo unifies dependency features within one workspace. It is
+# built from this repository because its audited supervisor source is shared by
+# path with zipp-cli rather than copied into a publishable crate archive.
+[workspace]
+resolver = "2"
+
+[profile.dev]
+overflow-checks = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+overflow-checks = true
+panic = "abort"
+
+[[bin]]
+name = "zipp-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+# Secure mode protects allocator metadata and enables stronger randomization
+# and integrity checks in mimalloc.
+mimalloc = { version = "0.1.52", default-features = false, features = ["secure"] }
+# Do not permit Cargo's default `jit` feature into this artifact. safe-sandbox
+# enables metering and compile-time unsafe-code prohibitions in both the VM and
+# the regex engine.
+zipp-vm = { path = "../zipp-vm", default-features = false, features = ["safe-sandbox"] }

@@ -456,9 +456,12 @@ impl ScriptState {
     /// an atomic load per instruction is a real cost for a flag that is almost
     /// never set.
     ///
-    /// Note what this does NOT bound: a single native builtin. A pathological
-    /// `JSON.parse` or a catastrophic regex is ONE instruction, so wall-clock
-    /// safety still needs the abort flag driven by a timer on another thread.
+    /// Note what this does NOT generally bound: a single native builtin. A
+    /// pathological `JSON.parse` is ONE instruction, so wall-clock safety still
+    /// needs the abort flag driven by a timer on another thread. The
+    /// `safe-sandbox` profile additionally meters classical regex work and caps
+    /// its transient backtrack stack; ordinary `instrument` builds retain the
+    /// unmetered regex engine for compatibility and speed.
     #[cfg(feature = "instrument")]
     pub fn set_limits(
         &mut self,

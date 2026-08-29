@@ -402,8 +402,17 @@ pub(crate) extern "win64" fn jit_new_array(
 /// primitive string.  A panic after that safe point may follow committed GC or
 /// allocation state, so the FFI boundary is fail-stop rather than replaying.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_int_string(vm: *mut core::ffi::c_void, value_bits: u64) -> u64 {
+pub(crate) extern "win64" fn jit_int_string(
+    vm: *mut core::ffi::c_void,
+    value_bits: u64,
+    callee_bits: u64,
+) -> u64 {
     if vm.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let callee = Value::from_bits(callee_bits);
+    if !vm.global_fn_is_intrinsic(crate::bytecode::GlobalFn::String, callee) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let value = Value::from_bits(value_bits);
@@ -419,7 +428,6 @@ pub(crate) extern "win64" fn jit_int_string(vm: *mut core::ffi::c_void, value_bi
     }
 
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let vm = unsafe { &mut *(vm as *mut Vm) };
         // The argument is immediate and every other live Value remains in the
         // native frame's vm.regs window, so collection is safe before copying
         // the stack-local decimal bytes into the new heap string.
@@ -578,7 +586,10 @@ mod tests {
                 }
             }
         }
-        assert!(objects >= 200, "expected the retained literals on the heap, saw {objects}");
+        assert!(
+            objects >= 200,
+            "expected the retained literals on the heap, saw {objects}"
+        );
         assert_eq!(
             deviating, 0,
             "all-default 4-key literals must stay elided ({deviating}/{objects} deviate)"
@@ -971,7 +982,8 @@ mod tests {
             Value::int(11),
             Value::TRUE,
             Value::int(99),
-        ];
+        ]
+        .into();
         let vm_ptr = &mut vm as *mut Vm as *mut core::ffi::c_void;
         let regs = vm.regs.as_ptr() as *const u64;
         let packed = (4u64 << 32) | (1u64 << 16) | 2;
@@ -994,10 +1006,13 @@ mod tests {
     #[test]
     fn int_string_is_exact_interned_bounded_and_pure_on_decline() {
         let mut vm = vm("function probe() { return 0; }");
+        let string_callee =
+            Value::heap(vm.global_fn_intrinsics[crate::bytecode::GlobalFn::String.index()]).bits();
         let vm_ptr = &mut vm as *mut Vm as *mut core::ffi::c_void;
 
         for (n, expected) in [(0, "0"), (9, "9"), (10, "10"), (63, "63"), (99, "99")] {
-            let value = Value::from_bits(jit_int_string(vm_ptr, Value::int(n).bits()));
+            let value =
+                Value::from_bits(jit_int_string(vm_ptr, Value::int(n).bits(), string_callee));
             assert_eq!(vm.display(value), expected);
             let expected_slot = if n < 10 {
                 (b'0' as i32 + n) as u32
@@ -1014,14 +1029,20 @@ mod tests {
             (i32::MIN, "-2147483648"),
             (i32::MAX, "2147483647"),
         ] {
-            let value = Value::from_bits(jit_int_string(vm_ptr, Value::int(n).bits()));
+            let value =
+                Value::from_bits(jit_int_string(vm_ptr, Value::int(n).bits(), string_callee));
             assert_eq!(vm.display(value), expected);
         }
 
         let before = vm.heap.len();
         assert_eq!(
-            jit_int_string(vm_ptr, Value::TRUE.bits()),
+            jit_int_string(vm_ptr, Value::TRUE.bits(), string_callee),
             crate::codegen::SELF_CALL_DEOPT
+        );
+        assert_eq!(
+            jit_int_string(vm_ptr, Value::int(1).bits(), Value::UNDEFINED.bits()),
+            crate::codegen::SELF_CALL_DEOPT,
+            "a replaced/non-callable String callee must decline"
         );
         assert_eq!(
             vm.heap.len(),

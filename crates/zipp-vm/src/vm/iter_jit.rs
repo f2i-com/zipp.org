@@ -153,12 +153,25 @@ pub(crate) extern "win64" fn jit_iter_close_finally(
 /// ordinary objects and arrays (no traps, no user code). Proxies, primitives,
 /// and nullish receivers decline purely.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) extern "win64" fn jit_object_keys(vm: *mut core::ffi::c_void, obj_bits: u64) -> u64 {
+pub(crate) extern "win64" fn jit_object_keys(
+    vm: *mut core::ffi::c_void,
+    obj_bits: u64,
+    callee_bits: u64,
+    this_bits: u64,
+) -> u64 {
     if vm.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
+        if !vm.static_builtin_is_intrinsic(
+            "Object",
+            crate::vm::native::OBJ_KEYS,
+            Value::from_bits(callee_bits),
+            Value::from_bits(this_bits),
+        ) {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
         let o = Value::from_bits(obj_bits);
         if !o.is_heap() || o.heap_index() as usize >= vm.heap.len() {
             return crate::codegen::SELF_CALL_DEOPT;

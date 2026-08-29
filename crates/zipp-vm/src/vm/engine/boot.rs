@@ -163,7 +163,7 @@ impl<'p> Vm<'p> {
             globals,
             global_gens,
             bytecode_stored_slots,
-            regs: Vec::new(),
+            regs: RegisterFile::new(),
             frames: Vec::new(),
             #[cfg(feature = "instrument")]
             instr_rec: None,
@@ -177,6 +177,7 @@ impl<'p> Vm<'p> {
             pending_new_target: Value::UNDEFINED,
             pending_eval_frame: false,
             pending_fn_ctor_eval: false,
+            external_code_disabled: false,
             pending_yield: None,
             pending_yield_handlers: Vec::new(),
             pending_yield_eval_scope: u32::MAX,
@@ -185,6 +186,7 @@ impl<'p> Vm<'p> {
             cap_capture: None,
             microtasks: std::collections::VecDeque::new(),
             current_microtask: None,
+            promise_resolution_roots: Vec::new(),
             coll_proof_cache: [(u32::MAX, 0, 0, 0); crate::vm::COLL_PROOF_SLOTS],
             template_raws: std::collections::HashMap::new(),
             template_cache: std::collections::HashMap::new(),
@@ -195,8 +197,16 @@ impl<'p> Vm<'p> {
             matchall_batches: rustc_hash::FxHashMap::default(),
             matchall_caps_scratch: Vec::new(),
             matchall_flat_scratch: Vec::new(),
+            #[cfg(feature = "safe-sandbox")]
+            regex_transient_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             regexp_scalar_exec_pending: None,
+            // Keep the safe profile's fixed Annex-B record resident from VM
+            // creation, eliminating the first successful RegExp's otherwise
+            // infallible Vec growth. Initial legacy statics are empty strings.
+            #[cfg(feature = "safe-sandbox")]
+            regexp_last: vec![Value::heap(crate::heap::INTERN_EMPTY); 14],
+            #[cfg(not(feature = "safe-sandbox"))]
             regexp_last: Vec::new(),
             typeof_strs: [Value::UNDEFINED; 8],
             regexp_last_lazy: None,
@@ -283,6 +293,10 @@ impl<'p> Vm<'p> {
             arr_proto: 0,
             arr_proto_len: 0,
             array_ctor: 0,
+            global_fn_intrinsics: [0; crate::bytecode::GlobalFn::COUNT],
+            regexp_method_intrinsics: [0; crate::bytecode::RegExpMethod::COUNT],
+            regexp_protocol_intrinsics: [0;
+                crate::vm::proxy_regexp::REGEXP_PROTOCOL_INTRINSIC_COUNT],
             str_proto: 0,
             map_proto: 0,
             coll_intrinsic_memo: [[None; crate::vm::COLL_MEMO_NAMES]; 2],
@@ -436,7 +450,7 @@ impl<'p> Vm<'p> {
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             jit_tierc_activation: TiercActivationState::EMPTY,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-            jit_tierc_activation_stack: Vec::new(),
+            jit_tierc_activation_stack: ActivationRootStack::EMPTY,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             osr_deopt_exempt: false,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -493,6 +507,11 @@ impl<'p> Vm<'p> {
             )
             .saturating_add(
                 self.globals
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(
+                self.regexp_last
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Value>()),
             )

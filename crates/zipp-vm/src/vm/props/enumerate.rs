@@ -63,11 +63,11 @@ impl<'p> Vm<'p> {
                     }
                     EnumWhat::Entries => {
                         let v = self.get_member(obj, &ks, obj)?;
-                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))));
+                        out.push(self.alloc_array_current_realm(vec![k, v]));
                     }
                 }
             }
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+            return Ok(self.alloc_array_current_realm(out));
         }
         // A TypedArray enumerates its integer indices `0..length` (all enumerable),
         // then any enumerable named own prop. Handled before the generic match
@@ -95,11 +95,11 @@ impl<'p> Vm<'p> {
                     EnumWhat::Values => v,
                     EnumWhat::Entries => {
                         let ks = self.alloc_str(k);
-                        Value::heap(self.heap.alloc(HeapObj::Array(vec![ks, v])))
+                        self.alloc_array_current_realm(vec![ks, v])
                     }
                 })
                 .collect();
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+            return Ok(self.alloc_array_current_realm(out));
         }
         // An Array enumerates its dense indices `0..length` (skipping any special
         // index defineProperty made non-enumerable), then its enumerable named own
@@ -207,12 +207,12 @@ impl<'p> Vm<'p> {
                     EnumWhat::Values => out.push(v),
                     EnumWhat::Entries => {
                         let kv = self.alloc_str(k);
-                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, v]))));
+                        out.push(self.alloc_array_current_realm(vec![kv, v]));
                     }
                     EnumWhat::Keys => {}
                 }
             }
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+            return Ok(self.alloc_array_current_realm(out));
         }
         // A String exotic (boxed `new String(s)` or a string primitive): its own
         // ENUMERABLE keys are the character indices `0..length` (the exotic chars;
@@ -231,7 +231,7 @@ impl<'p> Vm<'p> {
                     }
                     EnumWhat::Entries => {
                         let ch = self.get_index(sval, Value::num(i as f64))?;
-                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, ch]))));
+                        out.push(self.alloc_array_current_realm(vec![kv, ch]));
                     }
                 }
             }
@@ -252,12 +252,10 @@ impl<'p> Vm<'p> {
                 match what {
                     EnumWhat::Keys => out.push(kv),
                     EnumWhat::Values => out.push(v),
-                    EnumWhat::Entries => {
-                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, v]))))
-                    }
+                    EnumWhat::Entries => out.push(self.alloc_array_current_realm(vec![kv, v])),
                 }
             }
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+            return Ok(self.alloc_array_current_realm(out));
         }
         // A plain Object: EnumerableOwnPropertyNames — snapshot the ordered own string
         // keys ([[OwnPropertyKeys]]) ONCE, then per key re-read the LIVE descriptor (so
@@ -315,11 +313,11 @@ impl<'p> Vm<'p> {
                         EnumWhat::Entries => {
                             let v = self.get_member(obj, &k, obj)?;
                             let kv = self.alloc_str(k);
-                            out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, v]))));
+                            out.push(self.alloc_array_current_realm(vec![kv, v]));
                         }
                     }
                 }
-                return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+                return Ok(self.alloc_array_current_realm(out));
             }
         }
         // A callable (function / closure / bound / native): enumerate its own keys in
@@ -370,11 +368,11 @@ impl<'p> Vm<'p> {
                     EnumWhat::Entries => {
                         let v = self.get_member(obj, &k, obj)?;
                         let kv = self.alloc_str(k);
-                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, v]))));
+                        out.push(self.alloc_array_current_realm(vec![kv, v]));
                     }
                 }
             }
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+            return Ok(self.alloc_array_current_realm(out));
         }
         // Every REMAINING exotic (Map, Set, Date, Promise, ArrayBuffer, DataView, a
         // generator, a boxed Number/Boolean/Symbol wrapper, …) has no exotic own
@@ -409,11 +407,11 @@ impl<'p> Vm<'p> {
                     EnumWhat::Entries => {
                         let v = self.get_member(obj, &k, obj)?;
                         let kv = self.alloc_str(k);
-                        out.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![kv, v]))));
+                        out.push(self.alloc_array_current_realm(vec![kv, v]));
                     }
                 }
             }
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))));
+            return Ok(self.alloc_array_current_realm(out));
         }
         let pairs: Vec<(String, Value)> = if obj.is_heap() {
             match self.heap.get(obj.heap_index()) {
@@ -473,11 +471,11 @@ impl<'p> Vm<'p> {
                 EnumWhat::Values => v,
                 EnumWhat::Entries => {
                     let ks = self.alloc_str(k);
-                    Value::heap(self.heap.alloc(HeapObj::Array(vec![ks, v])))
+                    self.alloc_array_current_realm(vec![ks, v])
                 }
             })
             .collect();
-        Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+        Ok(self.alloc_array_current_realm(out))
     }
 
     /// EnumerateObjectProperties (for-in): the own + INHERITED enumerable string
@@ -723,7 +721,7 @@ impl<'p> Vm<'p> {
         m.set("writable", Value::bool(w));
         m.set("enumerable", Value::bool(e));
         m.set("configurable", Value::bool(c));
-        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
+        self.alloc_object_current_realm(m)
     }
 
     /// Build an accessor descriptor object `{get, set, enumerable, configurable}`.
@@ -739,6 +737,6 @@ impl<'p> Vm<'p> {
         m.set("set", set);
         m.set("enumerable", Value::bool(e));
         m.set("configurable", Value::bool(c));
-        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
+        self.alloc_object_current_realm(m)
     }
 }

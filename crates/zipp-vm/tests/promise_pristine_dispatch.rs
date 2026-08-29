@@ -120,16 +120,8 @@ fn replacing_the_prototype_method_with_a_non_native_is_observed() {
 fn an_accessor_on_the_prototype_is_not_taken_as_intrinsic() {
     // `!m.attr_at(i).accessor` in the probe: a getter must RUN, and its RESULT is
     // what gets called.
-    //
-    // The count PINS A KNOWN PRE-EXISTING DIVERGENCE, deliberately, rather than
-    // hiding it behind `gets > 0`: node reads the accessor ONCE and zipp reads
-    // it TWICE. When the probe declines, the arm re-proves intrinsic-ness with
-    // `get_prop` (running the getter), returns `Ok(None)`, and the caller's
-    // `get_prop` + `call_value` runs it again. Confirmed pre-existing by
-    // `ZIPP_NO_PROMISE_PRISTINE=1`, which prints `gets=2` on the old path too;
-    // recorded in §6 of PERF_ROADMAP.md. If someone closes that, this assertion
-    // should FAIL and be updated to node's `1` — which is the point of pinning
-    // the wrong number instead of an inequality.
+    // Capturing the reference before evaluating arguments also ensures the
+    // accessor runs exactly once, matching ECMAScript and Node.
     let out = run_ok(
         r#"
         "use strict";
@@ -144,7 +136,7 @@ fn an_accessor_on_the_prototype_is_not_taken_as_intrinsic() {
         console.log(r + "/gets=" + gets);
         "#,
     );
-    assert_eq!(out[0], "VIA-GETTER/gets=2", "node gives gets=1 — see §6");
+    assert_eq!(out[0], "VIA-GETTER/gets=1");
 }
 
 #[test]

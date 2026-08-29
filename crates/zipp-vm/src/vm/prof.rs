@@ -133,8 +133,8 @@ pub(crate) fn enabled() -> bool {
 /// most of it recovered by keeping the hot side to one load + compare.
 #[cold]
 fn init() -> bool {
-    let v = (std::env::var_os("ZIPP_PROF").is_some()
-        || std::env::var_os("ZIPP_PROF_PC").is_some()) as u8;
+    let v = (std::env::var_os("ZIPP_PROF").is_some() || std::env::var_os("ZIPP_PROF_PC").is_some())
+        as u8;
     ON.store(v, Ordering::Relaxed);
     if v == 1 {
         // B237: the FIRST thread to enter a phase is the engine thread, which
@@ -206,7 +206,6 @@ pub fn dump() -> (Vec<(&'static str, u64, f64)>, u64) {
     v.sort_by(|a, b| b.1.cmp(&a.1));
     (v, total)
 }
-
 
 /// B237: instruction-pointer sampling.
 ///

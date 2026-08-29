@@ -285,9 +285,11 @@ fn run(args: &[String]) -> Result<(), String> {
             // wrapper makes both legal in real `.js` files; test262 wants the
             // grammar as specified, so its runner passes this.
             let mut path = None;
+            let mut pgo_training = false;
             for a in it.by_ref() {
                 match a.as_str() {
                     "--script-goal" => zipp_vm::set_pure_script_goal(true),
+                    "--pgo-training" => pgo_training = true,
                     other => {
                         path = Some(other.to_string());
                         break;
@@ -312,7 +314,11 @@ fn run(args: &[String]) -> Result<(), String> {
                 }
             });
             match harness {
+                None if pgo_training => emit(zipp_vm::run_for_pgo_training(&src, base_dir)?),
                 None => emit(zipp_vm::run_with_base(&src, base_dir)?),
+                Some(_) if pgo_training => {
+                    Err("--pgo-training does not accept a harness prelude".into())
+                }
                 Some(h) => {
                     let hsrc = std::fs::read_to_string(h)
                         .map_err(|e| format!("cannot read harness '{h}': {e}"))?;
@@ -495,7 +501,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!(
                 "  zipp ast <file-or-dir>          parse and print the AST (--sweep for a corpus)"
             );
-            println!("  zipp --version [--json]         build identity (commit, dirty digest, rustc, target)");
+            println!("  zipp --version [--json]         build identity (source, compiler flags, PGO hashes)");
             println!("\nenvironment:");
             println!("  ZIPP_NOJIT=1                    interpreter only (no native codegen)");
             println!("  ZIPP_GC_STRESS=1                collect on every allocation");
@@ -525,11 +531,11 @@ fn run(args: &[String]) -> Result<(), String> {
 /// This binary's build identity, as human text or as one JSON object.
 ///
 /// `source` is the field that matters for a benchmark: `<commit>` when the tree
-/// was clean, `<commit>+dirty.<digest>` when it was not, where the digest covers
-/// `git diff HEAD`. Two builds of different uncommitted edits therefore differ,
-/// which a bare commit hash cannot express — and recording the parent commit for
-/// a dirty build is precisely how a benchmark artifact came to name the wrong
-/// source.
+/// was clean, `<commit>+dirty.<digest>` when it was not, where the SHA-256 digest
+/// covers path-sorted binary diffs plus framed untracked paths and file/symlink
+/// bytes. Two builds of different uncommitted edits therefore differ, which a
+/// bare commit hash cannot express — and recording the parent commit for a dirty
+/// build is precisely how a benchmark artifact came to name the wrong source.
 ///
 /// `#[cold]`/`#[inline(never)]` are not decoration. The release profile is fat
 /// LTO with one codegen unit, so adding `format!` machinery anywhere reachable
@@ -552,6 +558,23 @@ fn build_identity(json: bool) -> String {
     let jit = zipp_vm::jit_enabled();
     let features = env!("ZIPP_BUILD_FEATURES");
     let rustflags = env!("ZIPP_BUILD_RUSTFLAGS");
+    let rustflags_source = env!("ZIPP_BUILD_RUSTFLAGS_SOURCE");
+    let pgo_profile_sha256 = env!("ZIPP_BUILD_PGO_PROFILE_SHA256");
+    let pgo_training_recipe_sha256 = env!("ZIPP_BUILD_PGO_TRAINING_RECIPE_SHA256");
+    let pgo_build_recipe_sha256 = env!("ZIPP_BUILD_PGO_BUILD_RECIPE_SHA256");
+    let pgo_build_contract = env!("ZIPP_BUILD_PGO_BUILD_CONTRACT");
+    let pgo_build_environment_policy = env!("ZIPP_BUILD_PGO_BUILD_ENV_POLICY");
+    let pgo_build_environment_sha256 = env!("ZIPP_BUILD_PGO_BUILD_ENV_SHA256");
+    let pgo_source_snapshot_sha256 = env!("ZIPP_BUILD_PGO_SOURCE_SNAPSHOT_SHA256");
+    let pgo_cargo_identity = env!("ZIPP_BUILD_PGO_CARGO_IDENTITY");
+    let pgo_cargo_sha256 = env!("ZIPP_BUILD_PGO_CARGO_SHA256");
+    let pgo_rustc_sha256 = env!("ZIPP_BUILD_PGO_RUSTC_SHA256");
+    let pgo_linker_identity = env!("ZIPP_BUILD_PGO_LINKER_IDENTITY");
+    let pgo_linker_sha256 = env!("ZIPP_BUILD_PGO_LINKER_SHA256");
+    let pgo_msvc_cl_identity = env!("ZIPP_BUILD_PGO_MSVC_CL_IDENTITY");
+    let pgo_msvc_cl_sha256 = env!("ZIPP_BUILD_PGO_MSVC_CL_SHA256");
+    let pgo_msvc_lib_identity = env!("ZIPP_BUILD_PGO_MSVC_LIB_IDENTITY");
+    let pgo_msvc_lib_sha256 = env!("ZIPP_BUILD_PGO_MSVC_LIB_SHA256");
     if json {
         // Hand-rolled: the CLI has no JSON dependency and every value here is
         // either a digest, an identifier or a compiler version string.
@@ -561,7 +584,20 @@ fn build_identity(json: bool) -> String {
                 "{{\"name\":\"zipp\",\"version\":\"{}\",\"source\":\"{}\",\"commit\":\"{}\",",
                 "\"dirty\":{},\"diff_digest\":\"{}\",\"rustc\":\"{}\",\"target\":\"{}\",",
                 "\"profile\":\"{}\",\"opt_level\":\"{}\",\"features\":\"{}\",",
-                "\"rustflags\":\"{}\",\"jit\":{}}}\n"
+                "\"rustflags\":\"{}\",\"rustflags_source\":\"{}\",",
+                "\"pgo_profile_sha256\":\"{}\",",
+                "\"pgo_training_recipe_sha256\":\"{}\",",
+                "\"pgo_build_recipe_sha256\":\"{}\",",
+                "\"pgo_build_contract\":\"{}\",",
+                "\"pgo_build_environment_policy\":\"{}\",",
+                "\"pgo_build_environment_sha256\":\"{}\",",
+                "\"pgo_source_snapshot_sha256\":\"{}\",",
+                "\"pgo_cargo_identity\":\"{}\",\"pgo_cargo_sha256\":\"{}\",",
+                "\"pgo_rustc_sha256\":\"{}\",",
+                "\"pgo_linker_identity\":\"{}\",\"pgo_linker_sha256\":\"{}\",",
+                "\"pgo_msvc_cl_identity\":\"{}\",\"pgo_msvc_cl_sha256\":\"{}\",",
+                "\"pgo_msvc_lib_identity\":\"{}\",\"pgo_msvc_lib_sha256\":\"{}\",",
+                "\"jit\":{}}}\n"
             ),
             env!("CARGO_PKG_VERSION"),
             esc(&source),
@@ -574,6 +610,23 @@ fn build_identity(json: bool) -> String {
             esc(env!("ZIPP_BUILD_OPT_LEVEL")),
             esc(features),
             esc(rustflags),
+            esc(rustflags_source),
+            esc(pgo_profile_sha256),
+            esc(pgo_training_recipe_sha256),
+            esc(pgo_build_recipe_sha256),
+            esc(pgo_build_contract),
+            esc(pgo_build_environment_policy),
+            esc(pgo_build_environment_sha256),
+            esc(pgo_source_snapshot_sha256),
+            esc(pgo_cargo_identity),
+            esc(pgo_cargo_sha256),
+            esc(pgo_rustc_sha256),
+            esc(pgo_linker_identity),
+            esc(pgo_linker_sha256),
+            esc(pgo_msvc_cl_identity),
+            esc(pgo_msvc_cl_sha256),
+            esc(pgo_msvc_lib_identity),
+            esc(pgo_msvc_lib_sha256),
             jit,
         );
     }
@@ -608,9 +661,127 @@ fn build_identity(json: bool) -> String {
             "disabled (interpreter only)"
         }
     );
-    if !rustflags.is_empty() {
-        s += &format!("rustflags: {rustflags}\n");
-    }
+    s += &format!(
+        "rustflags: {} ({rustflags_source})\n",
+        if rustflags.is_empty() {
+            "(none)"
+        } else {
+            rustflags
+        }
+    );
+    s += &format!(
+        "pgo profile sha256: {}\n",
+        if pgo_profile_sha256.is_empty() {
+            "(none)"
+        } else {
+            pgo_profile_sha256
+        }
+    );
+    s += &format!(
+        "pgo training recipe sha256: {}\n",
+        if pgo_training_recipe_sha256.is_empty() {
+            "(none)"
+        } else {
+            pgo_training_recipe_sha256
+        }
+    );
+    s += &format!(
+        "pgo build recipe sha256: {}\n",
+        if pgo_build_recipe_sha256.is_empty() {
+            "(none)"
+        } else {
+            pgo_build_recipe_sha256
+        }
+    );
+    s += &format!(
+        "pgo build contract: {}\n",
+        if pgo_build_contract.is_empty() {
+            "(none)"
+        } else {
+            pgo_build_contract
+        }
+    );
+    s += &format!(
+        "pgo build environment: {} / {}\n",
+        if pgo_build_environment_policy.is_empty() {
+            "(none)"
+        } else {
+            pgo_build_environment_policy
+        },
+        if pgo_build_environment_sha256.is_empty() {
+            "(none)"
+        } else {
+            pgo_build_environment_sha256
+        }
+    );
+    s += &format!(
+        "pgo source snapshot sha256: {}\n",
+        if pgo_source_snapshot_sha256.is_empty() {
+            "(none)"
+        } else {
+            pgo_source_snapshot_sha256
+        }
+    );
+    s += &format!(
+        "pgo cargo: {} / {}\n",
+        if pgo_cargo_identity.is_empty() {
+            "(none)"
+        } else {
+            pgo_cargo_identity
+        },
+        if pgo_cargo_sha256.is_empty() {
+            "(none)"
+        } else {
+            pgo_cargo_sha256
+        }
+    );
+    s += &format!(
+        "pgo rustc sha256: {}\n",
+        if pgo_rustc_sha256.is_empty() {
+            "(none)"
+        } else {
+            pgo_rustc_sha256
+        }
+    );
+    s += &format!(
+        "pgo linker: {} / {}\n",
+        if pgo_linker_identity.is_empty() {
+            "(none)"
+        } else {
+            pgo_linker_identity
+        },
+        if pgo_linker_sha256.is_empty() {
+            "(none)"
+        } else {
+            pgo_linker_sha256
+        }
+    );
+    s += &format!(
+        "pgo MSVC cl: {} / {}\n",
+        if pgo_msvc_cl_identity.is_empty() {
+            "(none)"
+        } else {
+            pgo_msvc_cl_identity
+        },
+        if pgo_msvc_cl_sha256.is_empty() {
+            "(none)"
+        } else {
+            pgo_msvc_cl_sha256
+        }
+    );
+    s += &format!(
+        "pgo MSVC lib: {} / {}\n",
+        if pgo_msvc_lib_identity.is_empty() {
+            "(none)"
+        } else {
+            pgo_msvc_lib_identity
+        },
+        if pgo_msvc_lib_sha256.is_empty() {
+            "(none)"
+        } else {
+            pgo_msvc_lib_sha256
+        }
+    );
     s
 }
 
@@ -630,5 +801,54 @@ fn collect_js(p: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         } else if path.extension().is_some_and(|x| x == "js" || x == "mjs") {
             out.push(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod build_identity_tests {
+    use super::build_identity;
+
+    #[test]
+    fn json_identity_exposes_effective_flags_and_pgo_provenance() {
+        let identity = build_identity(true);
+        for field in [
+            "\"rustflags\":",
+            "\"rustflags_source\":",
+            "\"pgo_profile_sha256\":",
+            "\"pgo_training_recipe_sha256\":",
+            "\"pgo_build_recipe_sha256\":",
+            "\"pgo_build_contract\":",
+            "\"pgo_build_environment_policy\":",
+            "\"pgo_build_environment_sha256\":",
+            "\"pgo_source_snapshot_sha256\":",
+            "\"pgo_cargo_identity\":",
+            "\"pgo_cargo_sha256\":",
+            "\"pgo_rustc_sha256\":",
+            "\"pgo_linker_identity\":",
+            "\"pgo_linker_sha256\":",
+            "\"pgo_msvc_cl_identity\":",
+            "\"pgo_msvc_cl_sha256\":",
+            "\"pgo_msvc_lib_identity\":",
+            "\"pgo_msvc_lib_sha256\":",
+        ] {
+            assert!(identity.contains(field), "missing {field}: {identity}");
+        }
+        assert!(identity.ends_with("}\n"));
+        assert!(!identity.contains('\x1f'));
+    }
+
+    #[test]
+    fn human_identity_exposes_pgo_provenance() {
+        let identity = build_identity(false);
+        assert!(identity.contains("rustflags:"));
+        assert!(identity.contains("pgo profile sha256:"));
+        assert!(identity.contains("pgo training recipe sha256:"));
+        assert!(identity.contains("pgo build recipe sha256:"));
+        assert!(identity.contains("pgo build contract:"));
+        assert!(identity.contains("pgo build environment:"));
+        assert!(identity.contains("pgo linker:"));
+        assert!(identity.contains("pgo source snapshot sha256:"));
+        assert!(identity.contains("pgo MSVC cl:"));
+        assert!(identity.contains("pgo MSVC lib:"));
     }
 }

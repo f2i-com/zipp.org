@@ -269,6 +269,7 @@ impl<'p> Vm<'p> {
         raw_path: &std::path::Path,
         mtype: Option<&str>,
     ) -> Result<Value, Thrown> {
+        self.require_external_code_enabled()?;
         self.with_confined_module_depth(|vm| vm.import_module_inner(raw_path, mtype))
     }
 
@@ -1205,6 +1206,7 @@ impl<'p> Vm<'p> {
         raw_path: &std::path::Path,
         mtype: Option<&str>,
     ) -> Result<Value, Thrown> {
+        self.require_external_code_enabled()?;
         let confined = self.module_root.is_some();
         let path = self.resolve_module_path(raw_path).map_err(|err| {
             if confined {

@@ -8,8 +8,10 @@ use crate::startpredicate;
 use crate::types::{BracketContents, CaptureGroupID, LoopID};
 use crate::unicode;
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::convert::TryInto;
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 /// \return an anchor instruction for a given IR anchor.
 fn make_anchor(anchor_type: ir::AnchorType, multiline: bool) -> Insn {
@@ -405,7 +407,7 @@ pub fn emit(n: &ir::Regex) -> CompiledRegex {
             brackets: Vec::new(),
             loops: 0,
             groups: 0,
-            group_names: Box::new([]),
+            group_names: None,
             flags: n.flags,
             start_pred: startpredicate::predicate_for_re(n),
             suffix_start: None,
@@ -423,14 +425,17 @@ pub fn emit(n: &ir::Regex) -> CompiledRegex {
     }
     // Populate group names, unless all are empty.
     debug_assert!(
-        result.group_names.is_empty(),
+        result.group_names.is_none(),
         "Group names should not be set"
     );
     if emitter.group_names.iter().any(|s| !s.is_empty()) {
-        result.group_names = emitter.group_names.into_boxed_slice();
+        result.group_names = Some(Arc::from(emitter.group_names.into_boxed_slice()));
     }
     debug_assert!(
-        result.group_names.is_empty() || result.group_names.len() == result.groups as usize
+        result
+            .group_names
+            .as_deref()
+            .is_none_or(|names| names.len() == result.groups as usize)
     );
     result
 }

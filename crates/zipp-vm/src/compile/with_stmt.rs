@@ -335,14 +335,10 @@ impl<'a> FnCompiler<'a> {
     /// `var x` as non-configurable, and an eval-introduced var as deletable —
     /// this compilation's own cx lists can't tell) and actually REMOVES a
     /// configurable binding (an implicit `x = 1` global, an eval var, a caller
-    /// activation's EvalScope entry). `NaN`/`Infinity`/`undefined` are the only
-    /// non-configurable builtin global properties; they're not tracked as
-    /// compiler globals, so check them by name.
+    /// activation's EvalScope entry). Runtime resolution is intentional even for
+    /// `NaN`/`Infinity`/`undefined`: an EvalScope binding of the same name wins;
+    /// only its fall-through immutable global property is non-configurable.
     pub(crate) fn emit_static_delete(&mut self, n: &str, dst: Reg) {
-        if matches!(n, "NaN" | "Infinity" | "undefined") {
-            self.emit(Instr::LoadBool { dst, val: false });
-            return;
-        }
         match self.resolve_existing(n) {
             Some(Binding::Local(_))
             | Some(Binding::LocalCell(_))

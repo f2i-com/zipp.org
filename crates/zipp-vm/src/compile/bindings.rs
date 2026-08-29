@@ -321,7 +321,7 @@ impl<'a> FnCompiler<'a> {
 
     /// A tagged template is tail-callable when its tag is a plain callee
     /// (identifier / call — no member tag, whose call binds `this` to the
-    /// object; `String.raw` keeps its fast path).
+    /// object and therefore uses the receiver-preserving lowering).
     // NOTE: signature. `Expr::TaggedTemplate { tag, quasi }` inlines the node, so
     // this takes the TAG expression.
     //
@@ -419,6 +419,38 @@ impl<'a> FnCompiler<'a> {
                 self.emit_tail_return(&exprs[n - 1])
             }
             Expr::Call(c) if self.tail_callable(c) => {
+                // A named `eval` call is a direct-eval candidate regardless of
+                // whether the reference resolves through a global, local,
+                // upvalue or `with` object environment. Snapshot the exact
+                // callee/reference receiver before arguments; DirectEval only
+                // reuses this frame when that captured value is NOT %eval%.
+                if let Expr::Ident(id) = &c.callee {
+                    if &**id == "eval" {
+                        let save = self.next_reg;
+                        let with_objs = self.with_obj_regs(id);
+                        let (callee, this_v) = if with_objs.is_empty() {
+                            let callee = self.alloc_reg();
+                            let live = self.expr_into(&c.callee, callee)?;
+                            if live != callee {
+                                self.emit(Instr::Move {
+                                    dst: callee,
+                                    src: live,
+                                });
+                            }
+                            let this_v = self.alloc_reg();
+                            self.emit(Instr::LoadUndefined { dst: this_v });
+                            (callee, this_v)
+                        } else {
+                            self.emit_with_callee_chain(id, &with_objs)
+                        };
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                        let dst = self.alloc_reg();
+                        self.emit_direct_eval(callee, this_v, arg_base, argc, false, dst, true);
+                        self.emit(Instr::Return { src: dst });
+                        self.next_reg = save;
+                        return Ok(());
+                    }
+                }
                 // A with-shadowable identifier callee: the with-chain resolves
                 // the callee + `this` (= the with-object), then the frame is
                 // reused via TailCallWithThis (tco-non-eval-with).
@@ -442,31 +474,6 @@ impl<'a> FnCompiler<'a> {
                             arg_base,
                             argc,
                         });
-                        self.emit(Instr::Return { src: dst });
-                        self.next_reg = save;
-                        return Ok(());
-                    }
-                }
-                // A compile-time DIRECT eval in tail position: the DirectEval
-                // op itself frame-reuses only when `eval` is REBOUND at
-                // runtime (an ordinary call); the genuine-eval path is not a
-                // tail call per spec.
-                if let Expr::Ident(id) = &c.callee {
-                    if &**id == "eval"
-                        && matches!(self.resolve("eval"), Binding::Global(_))
-                        && self.with_objs_for("eval").is_empty()
-                    {
-                        let save = self.next_reg;
-                        let dst = self.alloc_reg();
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        let arg = if argc == 0 {
-                            let r = self.temp();
-                            self.emit(Instr::LoadUndefined { dst: r });
-                            r
-                        } else {
-                            arg_base
-                        };
-                        self.emit_direct_eval(arg, dst, true);
                         self.emit(Instr::Return { src: dst });
                         self.next_reg = save;
                         return Ok(());

@@ -223,20 +223,9 @@ fn super_method_inline_throwing_target_propagates_once() {
 
 #[test]
 fn super_ordering_argument_list_swap_is_tier_consistent() {
-    // Why `SuperBase` exists: GetSuperBase runs at MakeSuperPropertyReference
-    // time, BEFORE ArgumentListEvaluation. This pins that an argument which
-    // re-targets the chain produces the SAME answer in the inlined tier as in the
-    // interpreter — the point of the op being dropped rather than mis-emitted.
-    //
-    // KNOWN DEVIATION (pre-existing; `ZIPP_NOJIT=1` and the pre-inline build
-    // agree, so inlining is not involved): this prints "ordered LATER2 LATER3"
-    // where V8 prints "ordered A2 LATER3". Per 13.3.6.1 the reference's
-    // GetValue — the `super.m` lookup itself, not just the base — happens before
-    // the arguments run, so the swapped prototype should not be visible to the
-    // call it was swapped by. zipp captures only the BASE up front and resolves
-    // the method after the argument list, so it sees the swap. Closing it means
-    // resolving the method at `SuperBase` time and carrying the callee, not the
-    // base — a separate correctness change.
+    // EvaluateCall completes GetValue(super.m) before ArgumentListEvaluation.
+    // Therefore the call which re-targets B.prototype's prototype still invokes
+    // the already-captured A method; only the following call sees `later`.
     let out = run_ok(&hot(r#"
         class A { m(x) { return "A" + x; } }
         class B extends A {
@@ -252,7 +241,7 @@ fn super_ordering_argument_list_swap_is_tier_consistent() {
         console.log("ordered", seen, o.hit(function () { return 3; }));
         "#));
     assert_eq!(out[0], "warm A1");
-    assert_eq!(out[1], "ordered LATER2 LATER3");
+    assert_eq!(out[1], "ordered A2 LATER3");
 }
 
 #[test]

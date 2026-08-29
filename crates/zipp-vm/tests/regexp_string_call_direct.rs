@@ -1,5 +1,5 @@
 //! Guard, protocol-ordering, and mechanism pins for the primitive-string
-//! `matchAll(RegExp)` / `replace(RegExp, string)` direct CallMethod lane.
+//! `matchAll(RegExp)` / `replace(RegExp, string)` captured RegExpMethod lane.
 //!
 //! A direct attempt is a pure prefix: receiver/argument kinds, active realm,
 //! the live String prototype method, and every RegExp dependency are proven
@@ -9,6 +9,81 @@
 use std::process::Command;
 
 const HOT: usize = 5000;
+
+const FOREIGN_PROTOCOL_REALM_SRC: &str = r#"
+    "use strict";
+    var foreign = $262.createRealm().global;
+    function hotMatch(s, re) { return s.matchAll(re); }
+    function hotReplace(s, re, replacement) { return s.replace(re, replacement); }
+    for (var i = 0; i < 6000; i++) {
+      Array.from(hotMatch("aba", /a/g));
+      hotReplace("aba", /a/g, "x");
+    }
+
+    var foreignIterProto = Object.getPrototypeOf(
+      foreign.RegExp.prototype[Symbol.matchAll].call(/a/g, "a")
+    );
+    function withProtoSlot(key, body) {
+      var main = Object.getOwnPropertyDescriptor(RegExp.prototype, key);
+      var child = Object.getOwnPropertyDescriptor(foreign.RegExp.prototype, key);
+      Object.defineProperty(RegExp.prototype, key, child);
+      try { return body(); }
+      finally { Object.defineProperty(RegExp.prototype, key, main); }
+    }
+
+    var foreignIterator = withProtoSlot(Symbol.matchAll, function () {
+      return hotMatch("a", /a/g);
+    });
+    var matchAllRealm = Object.getPrototypeOf(foreignIterator) === foreignIterProto;
+
+    var matchValue = withProtoSlot(Symbol.match, function () {
+      return Array.from(hotMatch("a", /a/g)).length;
+    });
+    var flagsValue = withProtoSlot("flags", function () {
+      return Array.from(hotMatch("a", /a/g)).length;
+    });
+
+    var componentNames = [
+      "hasIndices", "global", "ignoreCase", "multiline",
+      "dotAll", "unicode", "unicodeSets", "sticky"
+    ];
+    var componentValues = true;
+    for (var c = 0; c < componentNames.length; c++) {
+      var count = withProtoSlot(componentNames[c], function () {
+        return Array.from(hotMatch("a", /a/g)).length;
+      });
+      componentValues = componentValues && count === 1;
+    }
+
+    var foreignMatchArray = withProtoSlot("exec", function () {
+      return hotMatch("a", /a/g).next().value;
+    });
+    var execRealm = Object.getPrototypeOf(foreignMatchArray) === foreign.Array.prototype;
+
+    var mainSpecies = Object.getOwnPropertyDescriptor(RegExp, Symbol.species);
+    var childSpecies = Object.getOwnPropertyDescriptor(foreign.RegExp, Symbol.species);
+    Object.defineProperty(RegExp, Symbol.species, childSpecies);
+    var speciesValue;
+    try { speciesValue = Array.from(hotMatch("a", /a/g)).length; }
+    finally { Object.defineProperty(RegExp, Symbol.species, mainSpecies); }
+
+    var replaceForeignError = false, replaceMainError = false, replaceErrorName = "none";
+    withProtoSlot(Symbol.replace, function () {
+      var re = /a/;
+      Object.defineProperty(re, "flags", { value: foreign.Symbol("flags") });
+      try { hotReplace("a", re, "x"); }
+      catch (error) {
+        replaceForeignError = error.constructor === foreign.TypeError;
+        replaceMainError = error.constructor === TypeError;
+        replaceErrorName = error.constructor && error.constructor.name;
+      }
+    });
+
+    console.log([
+      matchAllRealm, matchValue, flagsValue, componentValues, execRealm,
+      speciesValue, replaceForeignError, replaceMainError, replaceErrorName
+    ].join("|"));
+"#;
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
@@ -99,6 +174,125 @@ fn global_replace_normalises_negative_zero_last_index() {
         console.log(out + "|" + Object.is(re.lastIndex, -0) + "|" + re.lastIndex);
         "#,
     );
+}
+
+#[test]
+fn captured_string_callees_survive_argument_mutation_and_keep_all_effects() {
+    let out = run_ok(
+        r#""use strict";
+        var intrinsicReplace = String.prototype.replace;
+        var intrinsicMatchAll = String.prototype.matchAll;
+        var lateCalls = 0, customCalls = 0, extras = 0;
+        function tick() { extras++; return extras; }
+        function late() { lateCalls++; return "late"; }
+        function customReplace(search, replacement) {
+          customCalls++;
+          return "R:" + this + ":" + replacement + ":" + arguments.length;
+        }
+        function customMatchAll(search) {
+          customCalls++;
+          return ["M:" + this + ":" + search.source + ":" + arguments.length];
+        }
+        function capturedIntrinsicReplace(s, re) {
+          String.prototype.replace = intrinsicReplace;
+          return s.replace((String.prototype.replace = late, re), "x", tick(), tick());
+        }
+        function capturedCustomReplace(s, re) {
+          String.prototype.replace = customReplace;
+          return s.replace((String.prototype.replace = intrinsicReplace, re), "x", tick(), tick());
+        }
+        function capturedIntrinsicMatchAll(s, re) {
+          String.prototype.matchAll = intrinsicMatchAll;
+          return Array.from(s.matchAll(
+            (String.prototype.matchAll = late, re), tick(), tick()
+          )).length;
+        }
+        function capturedCustomMatchAll(s, re) {
+          String.prototype.matchAll = customMatchAll;
+          return s.matchAll(
+            (String.prototype.matchAll = intrinsicMatchAll, re), tick(), tick()
+          )[0];
+        }
+
+        var ir, cr, im, cm;
+        for (var i = 0; i < 200; i++) ir = capturedIntrinsicReplace("aba", /a/g);
+        for (var j = 0; j < 200; j++) cr = capturedCustomReplace("aba", /a/g);
+        for (var k = 0; k < 200; k++) im = capturedIntrinsicMatchAll("aba", /a/g);
+        for (var n = 0; n < 200; n++) cm = capturedCustomMatchAll("aba", /a/g);
+        String.prototype.replace = intrinsicReplace;
+        String.prototype.matchAll = intrinsicMatchAll;
+        console.log(ir + "|" + cr + "|" + im + "|" + cm + "|" +
+                    lateCalls + "|" + customCalls + "|" + extras);
+        "#,
+    );
+    assert_eq!(out, ["xbx|R:aba:x:4|2|M:aba:a:3|0|400|1600"]);
+}
+
+#[test]
+fn foreign_protocol_realm_child() {
+    let Some(mode) = std::env::var_os("ZIPP_RX_FOREIGN_PROTOCOL_CHILD") else {
+        return;
+    };
+    assert_eq!(
+        run_ok(FOREIGN_PROTOCOL_REALM_SRC),
+        ["true|1|1|true|true|1|true|false|TypeError"]
+    );
+    let stats = zipp_vm::regexp_string_call_direct_stats();
+    // Twelve mutations decline at RegExpMethod itself. `exec` and `@@species`
+    // are re-proved inside the still-exact main @@matchAll native, so their
+    // slow-protocol fallback is covered by the foreign result realm / semantic
+    // checks above rather than the outer decline counter.
+    assert!(
+        stats.4 >= 12,
+        "same-id foreign protocol slots bypassed exact guards in {mode:?}: {stats:?}"
+    );
+    if mode == "nojit" || !cfg!(feature = "jit") {
+        assert!(
+            stats.0 > 0 && stats.1 > 0,
+            "interpreter direct arms were vacuous: {stats:?}"
+        );
+    } else {
+        assert!(
+            stats.2 > 0 && stats.3 > 0,
+            "generated direct arms were vacuous: {stats:?}"
+        );
+    }
+}
+
+#[test]
+fn nested_foreign_protocol_identities_are_honored_in_all_hot_modes() {
+    if std::env::var_os("ZIPP_RX_FOREIGN_PROTOCOL_CHILD").is_some() {
+        return;
+    }
+    let exe = std::env::current_exe().expect("test exe path");
+    let modes: &[(&str, &[(&str, &str)])] = &[
+        ("nojit", &[("ZIPP_NOJIT", "1")]),
+        ("jit", &[("ZIPP_JIT_THRESHOLD", "1")]),
+        (
+            "gc",
+            &[("ZIPP_JIT_THRESHOLD", "1"), ("ZIPP_GC_STRESS", "1")],
+        ),
+    ];
+    for (mode, envs) in modes {
+        let mut cmd = Command::new(&exe);
+        cmd.args(["foreign_protocol_realm_child", "--exact", "--nocapture"])
+            .env("ZIPP_RX_FOREIGN_PROTOCOL_CHILD", *mode)
+            .env("ZIPP_RXSTATS", "1")
+            .env_remove("ZIPP_NOJIT")
+            .env_remove("ZIPP_JIT_THRESHOLD")
+            .env_remove("ZIPP_GC_STRESS");
+        for &(key, value) in *envs {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("spawn foreign-protocol child");
+        assert!(
+            out.status.success()
+                && !String::from_utf8_lossy(&out.stdout).contains("running 0 tests"),
+            "{mode} child failed:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 /// This is both an adversarial direct-guard test and a regression pin for the
@@ -353,7 +547,11 @@ fn string_regexp_counts_child() {
             } else {
                 let (im, ir, jm, jr, _) = stats;
                 assert!(im > 0 && ir > 0, "interpreter arms were vacuous: {stats:?}");
-                assert!(jm > 0 && jr > 0, "generated arms were vacuous: {stats:?}");
+                if cfg!(feature = "jit") {
+                    assert!(jm > 0 && jr > 0, "generated arms were vacuous: {stats:?}");
+                } else {
+                    assert_eq!((jm, jr), (0, 0));
+                }
                 assert!(
                     im + jm >= HOT as u64 && ir + jr >= HOT as u64,
                     "lost calls: {stats:?}"
@@ -384,10 +582,17 @@ fn string_regexp_counts_child() {
             ));
             assert_eq!(out[0], format!("{HOT}|1"));
             let stats = zipp_vm::regexp_string_call_direct_stats();
-            assert!(
-                stats.2 > 0,
-                "throwing site never entered generated helper: {stats:?}"
-            );
+            if cfg!(feature = "jit") {
+                assert!(
+                    stats.2 > 0,
+                    "throwing site never entered generated helper: {stats:?}"
+                );
+            } else {
+                assert!(
+                    stats.0 > 0,
+                    "throwing site never entered interpreter helper: {stats:?}"
+                );
+            }
         }
         other => panic!("unknown child mode {other}"),
     }

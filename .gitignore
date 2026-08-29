@@ -1,5 +1,6 @@
 /target
 crates/zipp-wasm/target/
+crates/zipp-sandbox/target/
 **/*.rs.bk
 # Cargo.lock is committed — zipp-lang ships a binary (the `zipp` CLI), so a
 # locked dependency set keeps builds reproducible.

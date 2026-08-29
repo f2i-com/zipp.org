@@ -111,34 +111,16 @@ pub(crate) fn class_key_name(key: &PropKey) -> R<String> {
         // A private member `#x`: keyed by "#x" (a reserved property name; the
         // engine does not enforce true hard privacy, but `this.#x` works).
         PropKey::Private(id) => Ok(private_key(id)),
-        // COMPUTED keys. oxc's `PropertyKey` inherited the whole `Expression`
-        // enum, so `["a"]`, `[1]`, `[1n]` and `[Symbol.iterator]` arrived at the
-        // very same arms as their non-computed spellings — this function never
-        // saw the `computed` flag and so never distinguished them. Computed is a
-        // VARIANT now, so the same four literal shapes are re-matched through it
-        // to keep every answer identical.
+        // COMPUTED keys. Only side-effect-free literals may be folded here.
+        // In particular, `[Symbol.iterator]` is a property access, not a literal:
+        // resolving `Symbol` and getting `iterator` are observable when either is
+        // shadowed/rebound or the property is an accessor. It must therefore take
+        // the runtime-computed class-element path.
         PropKey::Computed(e) => match e {
             Expr::Str(s) => Ok(string_literal_key(s)),
             Expr::Num(n) => Ok(fmt_key_num(*n)),
             // A BigInt key's property name is its base-10 value string.
             Expr::BigInt(b) => Ok(b.to_string()),
-            // A computed well-known-symbol key, e.g. `[Symbol.iterator]() {}`, maps to
-            // the reserved string key (so a class can define the iteration method).
-            Expr::Member(m) => {
-                if let (Expr::Ident(o), MemberProp::Ident(p)) = (&m.object, &m.prop) {
-                    if &**o == "Symbol" {
-                        // Well-known symbols use the `@@<name>` key convention (matching
-                        // the VM's `key_of`), so `[Symbol.toPrimitive]() {}` etc. work.
-                        if let Some(k) = well_known_symbol_key(p) {
-                            return Ok(k.into());
-                        }
-                    }
-                }
-                Err(
-                    "computed or private class member names are not in the zipp-vm subset yet"
-                        .into(),
-                )
-            }
             _ => Err(
                 "computed or private class member names are not in the zipp-vm subset yet".into(),
             ),
@@ -159,22 +141,6 @@ pub(crate) fn private_key(name: &str) -> String {
     } else {
         format!("#{name}")
     }
-}
-
-/// Recognise the built-in Error constructor names the subset supports. Returns
-/// the canonical `name` to store on the error object.
-pub(crate) fn error_ctor(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "Error" => "Error",
-        "TypeError" => "TypeError",
-        "RangeError" => "RangeError",
-        "SyntaxError" => "SyntaxError",
-        "ReferenceError" => "ReferenceError",
-        "EvalError" => "EvalError",
-        "URIError" => "URIError",
-        "AggregateError" => "AggregateError",
-        _ => return None,
-    })
 }
 
 /// Collect the names introduced by top-level `var` declarations, recursing
@@ -648,21 +614,6 @@ pub(crate) fn fn_name_for_key(key: &str) -> String {
     match key.strip_prefix("@@") {
         Some(rest) if well_known_symbol_key(rest) == Some(key) => format!("[Symbol.{rest}]"),
         _ => key.to_string(),
-    }
-}
-
-/// The canonical index of an error constructor name (parallel to the VM's
-/// `ERROR_NAMES` / `error_protos`). Unknown → 0 (`Error`).
-pub(crate) fn error_kind_index(name: &str) -> u8 {
-    match name {
-        "TypeError" => 1,
-        "RangeError" => 2,
-        "SyntaxError" => 3,
-        "ReferenceError" => 4,
-        "EvalError" => 5,
-        "URIError" => 6,
-        "AggregateError" => 7,
-        _ => 0, // "Error" and anything unexpected
     }
 }
 

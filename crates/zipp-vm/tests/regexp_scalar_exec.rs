@@ -121,6 +121,25 @@ console.log(m+"|"+octSum+"|"+i);"#,
     )
 }
 
+fn captured_exec_accessor_src(n: usize) -> String {
+    format!(
+        r#"var N={n},lines=new Array(N);
+for(var j=0;j<N;j++)lines[j]="1.2.3.4";
+var reIp=/(\d+).(\d+).(\d+).(\d+)/,octSum=0,ipMatches=0,m,i=0;
+function scan(){{for(i=0;i<N;i++){{m=reIp.exec(lines[i]);if(m){{
+  ipMatches++;octSum=(octSum+(+m[1])+(+m[2])+(+m[3])+(+m[4]))|0;
+}}}}}}
+scan();
+i=0;octSum=0;ipMatches=0;var gets=0,calls=0;
+var custom=function(){{calls++;return ["custom","10","20","30","40"];}};
+Object.defineProperty(reIp,"exec",{{configurable:true,get:function(){{
+  gets++;delete reIp.exec;return custom;
+}}}});
+scan();
+console.log(ipMatches+"|"+octSum+"|"+gets+"|"+calls+"|"+m[0]);"#,
+    )
+}
+
 #[test]
 fn pristine_final_result_lastindex_statics_and_mutation_match_node() {
     assert_matches_node(&core_src(HOT));
@@ -206,6 +225,14 @@ fn result_global_alias_declines_and_matches_node() {
 }
 
 #[test]
+fn captured_exec_accessor_value_survives_self_deletion_before_scalar_guard() {
+    // The observable Get returns `custom`, then exposes the pristine prototype
+    // method before argument evaluation completes. Scalarization must validate
+    // the captured Value, not re-read the now-intrinsic `reIp.exec` property.
+    assert_matches_node(&captured_exec_accessor_src(HOT));
+}
+
+#[test]
 fn scalar_counts_child() {
     let Some(mode) = std::env::var_os("ZIPP_RX_EXEC_COUNTS_CHILD") else {
         return;
@@ -217,6 +244,7 @@ fn scalar_counts_child() {
         "hole" => hole_src(HOT),
         "slow" => slow_add_src().to_owned(),
         "alias" => alias_src(HOT),
+        "capture_delete" => captured_exec_accessor_src(HOT),
         other => panic!("unknown counts child {other}"),
     };
     assert_matches_node(&src);
@@ -244,6 +272,10 @@ fn scalar_counts_child() {
             success > 0 && materialized > 0 && slow > 0,
             "slow closure vacuous {stats:?}"
         ),
+        // The accessor Get itself may deopt before the scalar helper. The
+        // source assertion proves the captured custom value was called, while
+        // later pristine iterations keep the scalar mechanism non-vacuous.
+        "capture_delete" => assert!(success > 0, "later scalar path was vacuous {stats:?}"),
         "off" | "alias" => assert_eq!(stats, (0, 0, 0, 0, 0, 0, 0, 0)),
         _ => unreachable!(),
     }
@@ -260,6 +292,7 @@ fn zz_mechanism_and_dependency_switches() {
         ("miss", None),
         ("hole", None),
         ("slow", None),
+        ("capture_delete", None),
         ("alias", None),
         ("off", Some(("ZIPP_NO_RX_SCALAR_EXEC", "1"))),
         ("off", Some(("ZIPP_NO_RX_CALL_DIRECT", "1"))),
@@ -298,7 +331,12 @@ fn scalar_mode_child() {
     let Some(mode) = std::env::var_os("ZIPP_RX_EXEC_MODE_CHILD") else {
         return;
     };
-    assert_matches_node(&core_src(HOT));
+    let src = if mode == "capture_gcstress" {
+        captured_exec_accessor_src(HOT)
+    } else {
+        core_src(HOT)
+    };
+    assert_matches_node(&src);
     let stats = zipp_vm::regexp_scalar_exec_stats();
     if mode == "nojit" {
         assert_eq!(stats, (0, 0, 0, 0, 0, 0, 0, 0));
@@ -309,6 +347,12 @@ fn scalar_mode_child() {
         );
         assert_eq!(stats.0, stats.3 + stats.4);
         assert_eq!(stats.2, 4 * stats.0);
+        if mode == "capture_gcstress" {
+            assert!(
+                stats.0 > 0,
+                "post-accessor GC-stress scalar path was vacuous: {stats:?}"
+            );
+        }
     }
 }
 
@@ -324,6 +368,10 @@ fn zz_default_threshold1_nojit_and_gcstress_modes() {
         ("nojit", &[("ZIPP_NOJIT", "1")]),
         (
             "gcstress",
+            &[("ZIPP_GC_STRESS", "1"), ("ZIPP_JIT_THRESHOLD", "1")],
+        ),
+        (
+            "capture_gcstress",
             &[("ZIPP_GC_STRESS", "1"), ("ZIPP_JIT_THRESHOLD", "1")],
         ),
     ];

@@ -3053,7 +3053,11 @@ fn emit_stmt(o: &mut String, ind: usize, p: &Ctx, st: &Stmt) {
             // of its own dependence cycle and no hoistable region forms.
             let store = format!("{p}gstr = \"prop_\" + {l}rb;");
             let read = format!("{l}h = ({l}h + {p}gstr.length) | 0;");
-            line(o, ind, &format!("for (var {l}rb = 0; {l}rb < 64; {l}rb++) {{"));
+            line(
+                o,
+                ind,
+                &format!("for (var {l}rb = 0; {l}rb < 64; {l}rb++) {{"),
+            );
             match style {
                 0 => {
                     line(o, ind + 1, &store);
@@ -5739,6 +5743,12 @@ fn tier_coverage_report() {
 /// its body with `| 0`, and `fn_int::can_compile` admits no `Bitwise` op, so
 /// every generated recursion landed on Tier C instead. Both halves of that are
 /// pinned here — the engine's new line, and the generator shape that reaches it.
+///
+/// The first call also crosses the default threshold while recursive native
+/// frames are parked. Growing the interpreter-visible window for the deopt must
+/// preserve those frames: zero-filling from the stale logical length corrupts
+/// their live arguments (an infinite recursion / RangeError, and a hang under
+/// GC stress).
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn tier_a_is_reached() {
@@ -5749,25 +5759,42 @@ fn tier_a_is_reached() {
 function rec(x) { if (x < 2) return x; return rec(x - 1) + rec(x - 2); }
 var h = 1;
 for (var i = 0; i < 400; i++) h = (h + rec((i & 7) + 2)) | 0;
-console.log(h);
+console.log("D " + h);
 "#;
     let dir = std::env::temp_dir().join("zipp-jit-fuzz");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(format!("tiera-{}.js", std::process::id()));
     std::fs::write(&path, SRC).expect("write case");
-    let out = spawn_job(
-        &format!("file:{}", path.display()),
-        mode("base"),
-        Duration::from_secs(60),
-        true,
-    );
+    let mut base_log = String::new();
+    for name in ["base", "nojit", "gcstress"] {
+        let out = spawn_job(
+            &format!("file:{}", path.display()),
+            mode(name),
+            Duration::from_secs(15),
+            name == "base",
+        );
+        assert!(
+            out.ok,
+            "Tier A active-recursion case crashed or hung in {name}; stderr:\n{}",
+            out.stderr
+        );
+        assert_eq!(
+            out.lines,
+            ["D 4351"],
+            "Tier A active-recursion case answered incorrectly in {name}; stderr:\n{}",
+            out.stderr
+        );
+        if name == "base" {
+            base_log = out.stderr;
+        }
+    }
     let _ = std::fs::remove_file(&path);
     assert!(
-        out.stderr
+        base_log
             .lines()
             .any(|l| l.contains("[jit] Tier A") && l.contains("compiled")),
         "no Tier A compile logged for a fib-shaped self-recursion; JITLOG said:\n{}",
-        out.stderr
+        base_log
     );
     // …and the generator really does emit that spelling, so this is not a test
     // of a string that only lives in this file.

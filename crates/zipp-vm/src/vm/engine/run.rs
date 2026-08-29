@@ -25,6 +25,103 @@ fn callvalue_flat_enabled() -> bool {
     }
 }
 
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod tier_a_module_pin_tests {
+    use super::*;
+
+    const CHILD_ENV: &str = "ZIPP_TIER_A_MODULE_PIN_CHILD";
+    const MARKER: &str = "[tier-a-module-pin] direct=2176 entry=2176";
+    const MODULE_SRC: &str = r#"
+function rec(n) {
+  if (n < 2) return n;
+  return rec(n - 1) + rec(n - 2);
+}
+let sum = 0;
+for (let i = 0; i < 64; i++) sum = (sum + rec(9)) | 0;
+console.log("module-rec:" + sum);
+"#;
+
+    fn direct_module() -> usize {
+        let ast = crate::front::parse_module(MODULE_SRC).expect("direct module parses");
+        let program =
+            crate::compile::compile_main_module(&ast, MODULE_SRC).expect("direct module compiles");
+        let mut vm = Vm::new(&program);
+        vm.run_module().expect("direct module runs");
+        assert_eq!(vm.output, ["module-rec:2176"]);
+        vm.reg_capacity
+    }
+
+    fn fresh_module_entry() -> usize {
+        let dir =
+            std::env::temp_dir().join(format!("zipp-tier-a-module-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create module-pin temp dir");
+        let path = dir.join("entry.mjs");
+        std::fs::write(&path, MODULE_SRC).expect("write module-pin entry");
+
+        let host_ast = crate::front::parse_script("").expect("empty host parses");
+        let host =
+            crate::compile::compile_main_program(&host_ast, "").expect("empty host compiles");
+        let mut vm = Vm::new(&host);
+        vm.set_module_base_dir(Some(dir.clone()));
+        let result = vm.run_module_entry(&path);
+        let output = vm.output.clone();
+        let capacity = vm.reg_capacity;
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+        result.expect("fresh module entry runs");
+        assert_eq!(output, ["module-rec:2176"]);
+        capacity
+    }
+
+    #[test]
+    fn module_pin_child() {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            return;
+        }
+        let direct_capacity = direct_module();
+        let entry_capacity = fresh_module_entry();
+        assert!(
+            direct_capacity != 0,
+            "direct module left registers unpinned"
+        );
+        assert!(
+            entry_capacity != 0,
+            "fresh module entry left registers unpinned"
+        );
+        eprintln!("{MARKER}");
+    }
+
+    #[test]
+    fn module_entries_pin_before_tier_a_new_ground() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "vm::engine::run::tier_a_module_pin_tests::module_pin_child",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env("ZIPP_JIT_THRESHOLD", "1")
+            .env("ZIPP_JITLOG", "1")
+            .env_remove("ZIPP_NOJIT")
+            .env_remove("ZIPP_NO_MODULE_JIT")
+            .output()
+            .expect("spawn module-pin child");
+        assert!(
+            output.status.success(),
+            "module-pin child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(MARKER), "missing child marker:\n{stderr}");
+        assert!(
+            stderr.matches("[jit] Tier A").count() >= 2,
+            "both module entries must reach Tier A new-ground recursion:\n{stderr}"
+        );
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Run the top-level function (id 0) to completion.
     pub fn run(&mut self) -> Result<Value, Thrown> {
@@ -76,6 +173,7 @@ impl<'p> Vm<'p> {
             ));
         }
         self.regs.resize(top_regs, Value::UNDEFINED);
+        self.bump_regs_hw(top_regs);
         // A Script's top-level `this` is the global object (a Module's would be
         // undefined). Reg 0 is `this`; seed it with globalThis so sloppy code like
         // `this.x = 1` at the top level targets the global object.
@@ -133,6 +231,13 @@ impl<'p> Vm<'p> {
             self.hoist_functions();
             self.set_gc_floor();
         }
+        // A caller may invoke this public entry directly on a fresh VM instead
+        // of first running a host script. Pin the register allocation before a
+        // loader-installed function can retain a native window pointer. The
+        // helper is idempotent for the ordinary `run(); run_module_entry()`
+        // composition.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.reserve_jit_regs();
         let r = self.import_module(path, None);
         // An ENTRY whose top-level await suspended finishes through the
         // microtask drain below; if its body promise then REJECTED, that
@@ -235,6 +340,11 @@ impl<'p> Vm<'p> {
         self.setup_globals();
         self.hoist_functions();
         self.set_gc_floor();
+        // Unlike `run_with_prelude`, this direct async module entry has no
+        // top-level script frame on which to perform the native register pin.
+        // Establish it before the async body can call a Tier-A function.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        self.reserve_jit_regs();
         // Module top-level `this` is undefined. alloc_async builds + drives the
         // activation to its first await; drain_microtasks runs it to completion.
         let p = self.alloc_async(0, NO_CLOSURE, Value::UNDEFINED, &[]);
@@ -637,7 +747,22 @@ impl<'p> Vm<'p> {
                         self.active_realm = Some(g);
                     }
                 }
-                let r = self.call_value(Value::heap(main), this, args);
+                // Array's call and construct behaviours are identical, but the
+                // delegated construction must keep the CHILD facade as
+                // newTarget.  Calling the main constructor as a function used
+                // to build a main-prototype array and merely realm-tag it below:
+                // `var A = other.Array; A(1, 2)` consequently had the wrong
+                // `%Array.prototype%`.  The facade newTarget selects the child
+                // prototype while preserving Array(3)'s length-vs-item rules.
+                let r = if main == self.array_ctor && self.array_ctor != 0 {
+                    let prev_ncr = self.native_callee_realm;
+                    self.native_callee_realm = Some(cr);
+                    let built = self.construct_with_newtarget(Value::heap(main), args, callee);
+                    self.native_callee_realm = prev_ncr;
+                    built
+                } else {
+                    self.call_value(Value::heap(main), this, args)
+                };
                 self.active_realm = prev_realm;
                 // An error raised by the realm's OWN built-in is created with that
                 // realm's error constructors (the spec's "the current Realm Record"
@@ -687,6 +812,48 @@ impl<'p> Vm<'p> {
     /// instead of resolving twice.
     #[inline]
     pub(crate) fn call_value_plain(
+        &mut self,
+        callee: Value,
+        this: Value,
+        args: &[Value],
+        func_id: u32,
+        closure: u32,
+    ) -> Result<Value, Thrown> {
+        // A native that calls user code remains on the Rust stack while the JS
+        // callback runs.  Its `native_callee_realm` is therefore ambient state,
+        // not the callback's execution realm: a main-realm callback entered by
+        // `other.Array.from` must not allocate `Object.keys` / `JSON.parse`
+        // results with the OTHER native's intrinsics.  Conversely, a callback
+        // born in the other realm must install that realm even when a main
+        // native (or main code) invokes it.  `active_realm` has precedence over
+        // the frame-derived realm, so merely pushing the callback frame is not
+        // enough when a main callback is entered during `other.evalScript`.
+        //
+        // Keep the ordinary no-realm call path as a single predictable branch.
+        // The body helper gives this path one exit here, so every early return
+        // (generator/async construction included) and every throw restores both
+        // pieces of caller context.
+        // `native_callee_realm` and the createRealm form of `active_realm` are
+        // installed only from a realm whose global was first registered in
+        // `realm_global_objs`.  Thus an empty map proves there is no callback
+        // realm boundary to suspend, without two extra Option probes per call.
+        // JitGuardedMap has no DerefMut and updates this write-through byte on
+        // every mutation; createRealm globals are rooted and never removed.
+        if self.realm_global_objs.nonempty_raw == 0 {
+            return self.call_value_plain_body(callee, this, args, func_id, closure);
+        }
+        let caller_native_realm = self.native_callee_realm.take();
+        let caller_active_realm = self.active_realm;
+        let callee_realm = self.get_function_realm(callee);
+        self.active_realm = self.realm_global_obj(callee_realm);
+        let result = self.call_value_plain_body(callee, this, args, func_id, closure);
+        self.active_realm = caller_active_realm;
+        self.native_callee_realm = caller_native_realm;
+        result
+    }
+
+    #[inline(always)]
+    fn call_value_plain_body(
         &mut self,
         callee: Value,
         this: Value,
@@ -1234,6 +1401,7 @@ impl<'p> Vm<'p> {
         // assembled source before standalone parameter parsing/allocation, so
         // the marker also suppresses exactly this matching second charge.
         let fn_ctor = std::mem::take(&mut self.pending_fn_ctor_eval);
+        self.require_external_code_enabled()?;
         // This is the common gate for every runtime compiler entry: direct and
         // indirect eval, Function constructors, ShadowRealm.evaluate, and the
         // embedder's global-context eval helper all arrive here. Charge before

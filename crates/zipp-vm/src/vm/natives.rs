@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
-use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
     PromiseState, PropAttr, ReactionPair, Reactions,
@@ -228,8 +228,11 @@ impl<'p> Vm<'p> {
             match self.heap.get(cur.heap_index()) {
                 HeapObj::Object(m) => {
                     if let Some(i) = m.pos(&key) {
-                        governing =
-                            Some((m.attr_at(i).accessor, m.attr_at(i).writable, m.attr_at(i).setter));
+                        governing = Some((
+                            m.attr_at(i).accessor,
+                            m.attr_at(i).writable,
+                            m.attr_at(i).setter,
+                        ));
                         break;
                     }
                     if m.class.is_some() {
@@ -348,8 +351,13 @@ impl<'p> Vm<'p> {
                         _ => self.arr_props.get(&h),
                     };
                     match side.and_then(|m| {
-                        m.pos(&key)
-                            .map(|i| (m.attr_at(i).accessor, m.attr_at(i).writable, m.attr_at(i).setter))
+                        m.pos(&key).map(|i| {
+                            (
+                                m.attr_at(i).accessor,
+                                m.attr_at(i).writable,
+                                m.attr_at(i).setter,
+                            )
+                        })
                     }) {
                         Some((true, _, setter)) => setter != Value::UNDEFINED,
                         Some((_, w, _)) => w,
@@ -1043,10 +1051,57 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        // HIDDEN built-in iterator prototypes. Array/Map/Set/String iterator
+        // objects expose these through Object.getPrototypeOf even though no
+        // constructor global names them. A realm-copied `values`/`entries`
+        // native must therefore create an iterator whose `next` method and
+        // @@toStringTag live in that native's own realm, not the caller's.
+        // RegExp String Iterators use the same mechanism for `matchAll`.
+        {
+            let realm_iter_proto = self.realms[r as usize]
+                .get(&self.iterator_proto_root)
+                .copied();
+            for main_proto in [
+                self.array_iter_proto,
+                self.map_iter_proto,
+                self.set_iter_proto,
+                self.string_iter_proto,
+                self.regexp_string_iter_proto,
+            ] {
+                if main_proto == 0 {
+                    continue;
+                }
+                let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_proto) {
+                    HeapObj::Object(mm) => mm
+                        .keys
+                        .iter()
+                        .zip(mm.vals_slice().iter())
+                        .zip(mm.attrs_iter())
+                        .map(|((k, v), a)| (k.clone(), *v, a))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let proto_idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                for (k, v, mut a) in props {
+                    let copy = self.realm_copy_value(v, r);
+                    if a.accessor {
+                        a.setter = self.realm_copy_value(a.setter, r);
+                    }
+                    if let HeapObj::Object(pm) = self.heap.get_mut(proto_idx) {
+                        pm.define(&k, copy, a);
+                    }
+                }
+                if let Some(root) = realm_iter_proto {
+                    self.proto_of.insert(proto_idx, Value::heap(root));
+                }
+                self.obj_realm.insert(proto_idx, r);
+                self.realms[r as usize].insert(main_proto, proto_idx);
+            }
+        }
         // Namespace objects: fresh per realm, with the main namespace's props
         // copied (fresh same-id Natives / shared data) so `other.Reflect.construct`
         // etc. are functional.
-        for ns in ["Math", "JSON", "Reflect", "Atomics", "Intl"] {
+        for ns in ["Math", "JSON", "Reflect", "Atomics", "Intl", "console"] {
             let mut m = ObjMap::new();
             if let Some(&main_ns) = self.builtin_globals.get(ns) {
                 let props: Vec<(String, Value, PropAttr)> = match self.heap.get(main_ns) {
@@ -1255,6 +1310,49 @@ impl<'p> Vm<'p> {
             }
         }
         Value::heap(idx)
+    }
+
+    /// OrdinaryObjectCreate for a built-in's result. As with ArrayCreate above,
+    /// the implicit `%Object.prototype%` comes from the built-in's own realm.
+    /// Main-realm calls pay only the same single Option check.
+    pub(crate) fn alloc_object_current_realm(&mut self, map: ObjMap) -> Value {
+        let idx = self.heap.alloc(HeapObj::Object(Box::new(map)));
+        if let Some(r) = self.native_callee_realm {
+            let home = self.native_home(self.obj_proto);
+            if home != self.obj_proto {
+                self.proto_of.insert(idx, Value::heap(home));
+                self.obj_realm.insert(idx, r);
+            }
+        }
+        Value::heap(idx)
+    }
+
+    /// Attach an exotic result object to the built-in native's own realm.
+    /// Unlike ordinary objects/arrays, exotics have a kind-specific implicit
+    /// prototype, so a foreign result needs both an explicit prototype link
+    /// and the realm tag used by GetFunctionRealm/constructor fallbacks.
+    pub(crate) fn adopt_native_result_realm(&mut self, idx: u32, main_proto: u32) {
+        if let Some(r) = self.native_callee_realm {
+            self.adopt_fresh_result_to_realm(idx, main_proto, r);
+        }
+    }
+
+    /// Explicit-realm form for a newly allocated result whose realm comes from
+    /// another spec input rather than the currently executing native (notably
+    /// NewPromiseCapability's constructor C). Callers must pass a fresh object:
+    /// this intentionally cannot be used to retag user-provided inputs.
+    pub(crate) fn adopt_fresh_result_to_realm(&mut self, idx: u32, main_proto: u32, realm: u32) {
+        if realm == 0 {
+            return;
+        }
+        if let Some(&home) = self
+            .realms
+            .get(realm as usize)
+            .and_then(|m| m.get(&main_proto))
+        {
+            self.proto_of.insert(idx, Value::heap(home));
+            self.obj_realm.insert(idx, realm);
+        }
     }
 
     /// The CURRENT realm's image of a main intrinsic prototype: primitive member
@@ -1573,16 +1671,18 @@ impl<'p> Vm<'p> {
     /// iteration (push/pop/`length` writes/element writes) are observed, and
     /// exhaustion LATCHES via `usize::MAX` so a later grow is not iterated.
     pub(crate) fn array_iter_step(&mut self, it_idx: u32) -> Option<Result<(Value, bool), Thrown>> {
-        let (live, index, proto) = match self.heap.get(it_idx) {
-            HeapObj::Iterator {
-                live, index, proto, ..
-            } => (*live, *index, *proto),
+        let (live, index) = match self.heap.get(it_idx) {
+            HeapObj::Iterator { live, index, .. } => (*live, *index),
             _ => return None,
         };
         let (coll, kind) = live?;
-        if proto != self.array_iter_proto
-            || matches!(self.heap.get(coll), HeapObj::TypedArray { .. })
-        {
+        // The Array Iterator brand is its live array-like backing slot, not the
+        // realm identity of its prototype: a foreign intrinsic `next` may be
+        // transplanted onto a main-realm Array Iterator (and vice versa).
+        if matches!(
+            self.heap.get(coll),
+            HeapObj::TypedArray { .. } | HeapObj::Map { .. } | HeapObj::Set(_)
+        ) {
             return None;
         }
         Some(self.array_iter_step_inner(it_idx, coll, kind, index))
@@ -1621,10 +1721,7 @@ impl<'p> Vm<'p> {
                     1 => self.get_index(Value::heap(coll), Value::num(index as f64))?,
                     _ => {
                         let e = self.get_index(Value::heap(coll), Value::num(index as f64))?;
-                        Value::heap(
-                            self.heap
-                                .alloc(HeapObj::Array(vec![Value::num(index as f64), e])),
-                        )
+                        self.alloc_array_current_realm(vec![Value::num(index as f64), e])
                     }
                 };
                 index += 1;
@@ -1696,7 +1793,7 @@ impl<'p> Vm<'p> {
                         let yielded = match kind {
                             0 => k,
                             1 => v,
-                            _ => Value::heap(self.heap.alloc(HeapObj::Array(vec![k, v]))),
+                            _ => self.alloc_array_current_realm(vec![k, v]),
                         };
                         result = (yielded, false);
                         break;
@@ -2674,13 +2771,19 @@ impl<'p> Vm<'p> {
                         }
                         self.proto_of
                             .insert(matcher_idx, Value::heap(self.regexp_proto));
-                        let proto = self.regexp_string_iter_proto;
+                        let main_proto = self.regexp_string_iter_proto;
+                        let proto = self.native_home(main_proto);
                         let it = self.heap.alloc(HeapObj::Iterator {
                             items: Vec::new(),
                             index: 0,
                             proto,
                             live: None,
                         });
+                        if proto != main_proto {
+                            if let Some(r) = self.native_callee_realm {
+                                self.obj_realm.insert(it, r);
+                            }
+                        }
                         let fbits = (global as u8) | ((full_unicode as u8) << 1) | extra_bits;
                         // O(1): stored units on a Str, stored len on a Cons —
                         // no flatten needed for the length alone.
@@ -2749,13 +2852,19 @@ impl<'p> Vm<'p> {
                 // Build a LAZY %RegExpStringIterator%: an empty Iterator object whose
                 // `next()` runs one RegExpExec (honouring a user `exec`) at a time —
                 // exec/lastIndex side effects are observable per step, not up front.
-                let proto = self.regexp_string_iter_proto;
+                let main_proto = self.regexp_string_iter_proto;
+                let proto = self.native_home(main_proto);
                 let it = self.heap.alloc(HeapObj::Iterator {
                     items: Vec::new(),
                     index: 0,
                     proto,
                     live: None,
                 });
+                if proto != main_proto {
+                    if let Some(r) = self.native_callee_realm {
+                        self.obj_realm.insert(it, r);
+                    }
+                }
                 let fbits = (global as u8) | ((full_unicode as u8) << 1);
                 // O(1) whatever the subject's shape (Str or Cons); the field
                 // is only load-bearing on the `ITFB_FUSED` path, which this
@@ -3026,7 +3135,7 @@ impl<'p> Vm<'p> {
                         && self.array_ctor != 0
                         && this.heap_index() == self.array_ctor);
                 if use_default {
-                    Value::heap(self.heap.alloc(HeapObj::Array(items)))
+                    self.alloc_array_current_realm(items)
                 } else {
                     let _gc = self.gc_lock_guard();
                     let target = self.construct(this, &[Value::num(n as f64)])?;
@@ -3293,8 +3402,9 @@ impl<'p> Vm<'p> {
             AGENT_START => {
                 // Spawn a concurrent worker agent (its own thread + Vm/realm)
                 // and BLOCK until it signals it is running (INTERPRETING.md).
+                self.require_external_code_enabled()?;
                 let src = self.to_js_string(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-                self.agent_start(src);
+                self.agent_start(src)?;
                 Value::UNDEFINED
             }
             AGENT_BROADCAST => {
@@ -3340,6 +3450,22 @@ impl<'p> Vm<'p> {
                 self.instrument_output_line(&line)
                     .map_err(|msg| Thrown(msg.into()))?;
                 self.output.push(line);
+                Value::UNDEFINED
+            }
+            CONSOLE_LOG | CONSOLE_INFO | CONSOLE_DEBUG => {
+                let line = self.inspect_line(args.len(), |i| args[i]);
+                #[cfg(feature = "instrument")]
+                self.instrument_output_line(&line)
+                    .map_err(|msg| Thrown(msg.into()))?;
+                self.output.push(line);
+                Value::UNDEFINED
+            }
+            CONSOLE_WARN | CONSOLE_ERROR => {
+                let line = self.inspect_line(args.len(), |i| args[i]);
+                #[cfg(feature = "instrument")]
+                self.instrument_output_line(&line)
+                    .map_err(|msg| Thrown(msg.into()))?;
+                self.errput.push(line);
                 Value::UNDEFINED
             }
             AGENT_SLEEP => {
@@ -3579,7 +3705,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                Value::heap(self.heap.alloc(HeapObj::Array(syms)))
+                self.alloc_array_current_realm(syms)
             }
             OBJ_FROM_ENTRIES => {
                 let src = args.first().copied().unwrap_or(Value::UNDEFINED);
@@ -3612,7 +3738,7 @@ impl<'p> Vm<'p> {
                     }
                     map.set(&ks, desc);
                 }
-                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))))
+                self.alloc_object_current_realm(map)
             }
             // Integrity traits. Non-object arguments pass through unchanged
             // (freeze/seal/preventExtensions) or report as already-locked
@@ -3871,7 +3997,7 @@ impl<'p> Vm<'p> {
                                 }
                             }
                             None => {
-                                let arr = Value::heap(self.heap.alloc(HeapObj::Array(vec![item])));
+                                let arr = self.alloc_array_current_realm(vec![item]);
                                 map.set(&ks, arr);
                             }
                         }
@@ -3908,11 +4034,13 @@ impl<'p> Vm<'p> {
                             None => {
                                 finder.record_push(&self.heap, &keys, key);
                                 keys.push(key);
-                                vals.push(Value::heap(self.heap.alloc(HeapObj::Array(vec![item]))));
+                                vals.push(self.alloc_array_current_realm(vec![item]));
                             }
                         }
                     }
-                    Value::heap(self.heap.alloc(HeapObj::Map { keys, vals }))
+                    let result = self.heap.alloc(HeapObj::Map { keys, vals });
+                    self.adopt_native_result_realm(result, self.map_proto);
+                    Value::heap(result)
                 }
             }
             // Promise.withResolvers() -> { promise, resolve, reject }.
@@ -3947,7 +4075,7 @@ impl<'p> Vm<'p> {
                 map.set("promise", promise);
                 map.set("resolve", resolve);
                 map.set("reject", reject);
-                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))))
+                self.alloc_object_current_realm(map)
             }
             PROMISE_TRY => {
                 if !self.is_constructor(this) {
@@ -3962,34 +4090,40 @@ impl<'p> Vm<'p> {
                 };
                 if this == self.promise_ctor_value() {
                     let p = self.alloc_promise();
-                    match self.call_value(a0, Value::UNDEFINED, &rest) {
-                        Ok(v) => self.resolve(p, v),
-                        Err(Thrown(msg)) => {
-                            // Preserve the actual thrown VALUE, not a reconstructed
-                            // error from its message string.
-                            let e = match self.pending_throw.take() {
-                                Some(v) => v,
-                                None => self.alloc_error_from_message(&msg),
-                            };
-                            self.reject(p, e);
+                    self.with_promise_resolution_root(p, |vm| {
+                        match vm.call_value(a0, Value::UNDEFINED, &rest) {
+                            Ok(v) => vm.resolve(p, v),
+                            Err(Thrown(msg)) => {
+                                // Preserve the actual thrown VALUE, not a reconstructed
+                                // error from its message string.
+                                let e = match vm.pending_throw.take() {
+                                    Some(v) => v,
+                                    None => vm.alloc_error_from_message(&msg),
+                                };
+                                vm.reject(p, e);
+                            }
                         }
-                    }
+                    });
                     Value::heap(p)
                 } else {
                     // NewPromiseCapability(C): settle through C's captured resolve/reject.
                     let (promise, resolve, reject) = self.new_promise_capability(this)?;
-                    match self.call_value(a0, Value::UNDEFINED, &rest) {
-                        Ok(v) => {
-                            self.call_value(resolve, Value::UNDEFINED, &[v])?;
+                    let roots = [promise, resolve, reject];
+                    self.with_promise_operation_roots(&roots, |vm| -> Result<(), Thrown> {
+                        match vm.call_value(a0, Value::UNDEFINED, &rest) {
+                            Ok(v) => {
+                                vm.call_value(resolve, Value::UNDEFINED, &[v])?;
+                            }
+                            Err(Thrown(msg)) => {
+                                let e = match vm.pending_throw.take() {
+                                    Some(v) => v,
+                                    None => vm.alloc_error_from_message(&msg),
+                                };
+                                vm.call_value(reject, Value::UNDEFINED, &[e])?;
+                            }
                         }
-                        Err(Thrown(msg)) => {
-                            let e = match self.pending_throw.take() {
-                                Some(v) => v,
-                                None => self.alloc_error_from_message(&msg),
-                            };
-                            self.call_value(reject, Value::UNDEFINED, &[e])?;
-                        }
-                    }
+                        Ok(())
+                    })?;
                     promise
                 }
             }
@@ -4257,7 +4391,7 @@ impl<'p> Vm<'p> {
                     let (parsed, srctree) = self.json_parse_with_src(&s)?;
                     let mut m = crate::heap::ObjMap::new();
                     m.set("", parsed);
-                    let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
+                    let wrapper = self.alloc_object_current_realm(m);
                     self.internalize_json(wrapper, "", reviver, Some(&srctree))?
                 } else {
                     self.json_parse(&s)?
@@ -4284,7 +4418,7 @@ impl<'p> Vm<'p> {
                 }
                 let mut m = crate::heap::ObjMap::new();
                 m.set("", a0);
-                let wrapper = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
+                let wrapper = self.alloc_object_current_realm(m);
                 let mut visited = Vec::new();
                 match self.json_value(
                     wrapper,
@@ -4485,7 +4619,7 @@ impl<'p> Vm<'p> {
                     let mut m = ObjMap::new();
                     m.set("value", value);
                     m.set("done", Value::bool(ret_done));
-                    return Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m)))));
+                    return Ok(self.alloc_object_current_realm(m));
                 }
                 // A live TypedArray iterator (keys/values/entries) re-reads the view's
                 // current length each step, so a resizable buffer's grow yields new
@@ -4513,10 +4647,10 @@ impl<'p> Vm<'p> {
                                     1 => self.ta_element_get(coll, index),
                                     _ => {
                                         let e = self.ta_element_get(coll, index);
-                                        Value::heap(self.heap.alloc(HeapObj::Array(vec![
+                                        self.alloc_array_current_realm(vec![
                                             Value::num(index as f64),
                                             e,
-                                        ])))
+                                        ])
                                     }
                                 };
                                 index += 1;
@@ -4531,7 +4665,7 @@ impl<'p> Vm<'p> {
                         let mut m = ObjMap::new();
                         m.set("value", result.0);
                         m.set("done", Value::bool(result.1));
-                        return Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m)))));
+                        return Ok(self.alloc_object_current_realm(m));
                     }
                 }
                 // A live ARRAY-LIKE iterator. The step is shared with the
@@ -4542,7 +4676,7 @@ impl<'p> Vm<'p> {
                     let mut m = ObjMap::new();
                     m.set("value", v);
                     m.set("done", Value::bool(done));
-                    return Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m)))));
+                    return Ok(self.alloc_object_current_realm(m));
                 }
                 // Live Map/Set, or a snapshot iterator. Shared with the
                 // `IterNext` opcode, which takes the pair and never builds the
@@ -4556,7 +4690,7 @@ impl<'p> Vm<'p> {
                 let mut m = ObjMap::new();
                 m.set("value", val);
                 m.set("done", Value::bool(done));
-                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
+                self.alloc_object_current_realm(m)
             }
             ITER_SELF => this, // `iter[Symbol.iterator]()` returns the iterator itself
             ITER_DISPOSE => {
@@ -4713,6 +4847,7 @@ impl<'p> Vm<'p> {
             }
             DOLLAR262_GC => Value::UNDEFINED,
             DOLLAR262_EVAL_SCRIPT => {
+                self.require_external_code_enabled()?;
                 let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
                 let code = self.to_js_string(a0)?;
                 self.eval_script(&code)?
@@ -4873,6 +5008,14 @@ impl<'p> Vm<'p> {
                             .into(),
                     ));
                 }
+                #[cfg(feature = "safe-sandbox")]
+                if self.regexp_last.is_empty() {
+                    // Safe VMs create and audit the fixed 14-value record in
+                    // `Vm::new`; fail closed if that internal invariant is ever
+                    // broken instead of taking an infallible allocation path.
+                    return Err(Thrown(self.instrument_regex_memory_exhausted().into()));
+                }
+                #[cfg(not(feature = "safe-sandbox"))]
                 if self.regexp_last.is_empty() {
                     self.regexp_last = vec![Value::UNDEFINED; 14];
                 }
@@ -5425,7 +5568,7 @@ impl<'p> Vm<'p> {
                                 && matches!(self.heap.get(a.heap_index()), HeapObj::Promise { .. });
                             if is_native_promise && self.get_prop(a, "constructor")? != this {
                                 let p = self.alloc_promise();
-                                self.resolve(p, a);
+                                self.resolve_fresh_promise(p, a);
                                 Value::heap(p)
                             } else {
                                 Value::heap(self.to_promise(a))
@@ -5438,7 +5581,9 @@ impl<'p> Vm<'p> {
                                 a
                             } else {
                                 let (promise, resolve, _) = self.new_promise_capability(this)?;
-                                self.call_value(resolve, Value::UNDEFINED, &[a])?;
+                                self.with_promise_operation_roots(&[promise, resolve], |vm| {
+                                    vm.call_value(resolve, Value::UNDEFINED, &[a])
+                                })?;
                                 promise
                             }
                         }
@@ -5452,7 +5597,9 @@ impl<'p> Vm<'p> {
                             Value::heap(p)
                         } else {
                             let (promise, _, reject) = self.new_promise_capability(this)?;
-                            self.call_value(reject, Value::UNDEFINED, &[a])?;
+                            self.with_promise_operation_roots(&[promise, reject], |vm| {
+                                vm.call_value(reject, Value::UNDEFINED, &[a])
+                            })?;
                             promise
                         }
                     }
@@ -5678,15 +5825,18 @@ impl<'p> Vm<'p> {
                 // Proxy.revocable(target, handler) → { proxy, revoke }.
                 let p = self.make_proxy(a0, a1)?;
                 let revoke_fn = self.heap.alloc(HeapObj::Native(PROXY_REVOKE));
-                let revoke = Value::heap(self.heap.alloc(HeapObj::Bound {
+                self.adopt_native_result_realm(revoke_fn, self.fn_proto);
+                let revoke = self.heap.alloc(HeapObj::Bound {
                     target: Value::heap(revoke_fn),
                     this: p,
                     args: Vec::new(),
-                }));
+                });
+                self.adopt_native_result_realm(revoke, self.fn_proto);
+                let revoke = Value::heap(revoke);
                 let mut m = ObjMap::new();
                 m.set("proxy", p);
                 m.set("revoke", revoke);
-                Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
+                self.alloc_object_current_realm(m)
             }
             PROXY_REVOKE => {
                 if this.is_heap() {
@@ -6092,7 +6242,7 @@ impl<'p> Vm<'p> {
             INTL_GET_CANONICAL_LOCALES => {
                 let list = self.canonicalize_locale_list(a0)?;
                 let items: Vec<Value> = list.into_iter().map(|s| self.alloc_str(s)).collect();
-                Value::heap(self.heap.alloc(HeapObj::Array(items)))
+                self.alloc_array_current_realm(items)
             }
             INTL_SUPPORTED_VALUES_OF => {
                 let key = self.to_js_string(a0)?;
@@ -6134,7 +6284,7 @@ impl<'p> Vm<'p> {
                     vals.iter().map(|s| s.to_string()).chain(zones).collect();
                 sorted.sort_unstable();
                 let items: Vec<Value> = sorted.into_iter().map(|s| self.alloc_str(s)).collect();
-                Value::heap(self.heap.alloc(HeapObj::Array(items)))
+                self.alloc_array_current_realm(items)
             }
             INTL_SUPPORTED_LOCALES_OF => {
                 let list = self.canonicalize_locale_list(a0)?;

@@ -157,6 +157,14 @@ env_off_switch! {
     fn tierc_method_global_inline_enabled() = "ZIPP_NO_TIERC_METHOD_GLOBAL_INLINE"
 }
 
+env_off_switch! {
+    /// Scalar-replace a fresh one-step object/array literal when every use is
+    /// an exact projection in one return-ending Tier-C basic block. Metered and
+    /// GC-stress VMs decline separately; `ZIPP_NO_TIERC_BLOCK_SROA=1` restores
+    /// the ordinary allocation/property helpers for a same-binary A/B.
+    fn tierc_block_sroa_enabled() = "ZIPP_NO_TIERC_BLOCK_SROA"
+}
+
 /// Admit unary numeric negation into Tier C. The emitted path flips the f64
 /// sign bit (preserving JavaScript's `-(+0) === -0`) and side-effectlessly
 /// declines non-numeric operands to the exact interpreter instruction.
@@ -994,8 +1002,10 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
                     reject!("[tierC-reject] MathOp arity {argc} op {op:?}");
                 }
             }
-            // General plain call `f(args…)` — `this = undefined`.
-            Instr::Call { .. } => {}
+            // General plain call or an exact captured-callee call. The latter
+            // carries its receiver explicitly and never re-resolves a member
+            // name in native code.
+            Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
             // Proper-tail-call PREFIX: the compiler always emits `TailCall`
             // immediately before an ordinary `Call`+`Return` of the same site
             // (compile/bindings.rs, compile/exprs.rs), and the interpreter's
@@ -1251,8 +1261,13 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::Neg { dst, a }
             | Instr::Not { dst, a }
             | Instr::TypeOf { dst, a }
-            | Instr::TypeOfIs { dst, a, .. }
-            | Instr::IsArray { dst, a } => (u1(a), Some(dst)),
+            | Instr::TypeOfIs { dst, a, .. } => (u1(a), Some(dst)),
+            Instr::IsArray {
+                dst,
+                a,
+                callee,
+                this_v,
+            } => (u3(a, callee, this_v), Some(dst)),
             Instr::LenOf { dst, obj } | Instr::ForInKeys { dst, obj } => (u1(obj), Some(dst)),
             Instr::ForInLive { dst, obj, key } => (u2(obj, key), Some(dst)),
             Instr::GetIndex { dst, obj, key } => (u2(obj, key), Some(dst)),
@@ -1295,12 +1310,25 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             } => (Uses::range(arg_base, argc).plus(obj).plus(key), Some(dst)),
             Instr::ArrayCtor {
                 dst,
+                callee,
                 arg_base,
                 argc,
-            } => (Uses::range(arg_base, argc), Some(dst)),
+                ..
+            } => {
+                let uses = match callee {
+                    Some(reg) => Uses::range(arg_base, argc).plus(reg),
+                    None => Uses::range(arg_base, argc),
+                };
+                (uses, Some(dst))
+            }
             Instr::GetIterator { dst, src } => (u1(src), Some(dst)),
             Instr::IterPrime { dst, iter } => (u1(iter), Some(dst)),
-            Instr::ObjectKeys { dst, obj } => (u1(obj), Some(dst)),
+            Instr::ObjectKeys {
+                dst,
+                obj,
+                callee,
+                this_v,
+            } => (u3(obj, callee, this_v), Some(dst)),
             Instr::HasProp {
                 dst,
                 key,
@@ -1319,22 +1347,46 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             Instr::LooseEq { dst, a, b } => (u2(a, b), Some(dst)),
             Instr::MathOp {
                 dst,
+                callee,
+                this_v,
                 arg_base,
                 argc,
                 ..
-            } => (Uses::range(arg_base, argc), Some(dst)),
+            } => (
+                Uses::range(arg_base, argc).plus(callee).plus(this_v),
+                Some(dst),
+            ),
             Instr::GlobalFn {
                 dst,
+                callee,
                 arg_base,
                 argc,
                 ..
-            } => (Uses::range(arg_base, argc), Some(dst)),
+            } => (Uses::range(arg_base, argc).plus(callee), Some(dst)),
             Instr::Call {
                 dst,
                 callee,
                 arg_base,
                 argc,
             } => (Uses::range(arg_base, argc).plus(callee), Some(dst)),
+            Instr::CallWithThis {
+                dst,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+            }
+            | Instr::RegExpMethod {
+                dst,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+                ..
+            } => (
+                Uses::range(arg_base, argc).plus(callee).plus(this_v),
+                Some(dst),
+            ),
             // Frame-reuse prefix: the interpreter reads callee + args (USES
             // must be exact per the contract above); it defines nothing.
             Instr::TailCall {
@@ -1426,6 +1478,515 @@ mod smallvec {
             }
             true
         }
+    }
+}
+
+/// Compile-time-only Tier-C scalar replacement. Instruction indices stay
+/// unchanged: an allocation becomes a benign tagged zero and each proved
+/// projection becomes a register move. Unlike region-local SROA this lane has
+/// no deopt materializer, so its live range admits only non-bailing transfers.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[derive(Default)]
+struct TiercBlockSroaPlan {
+    alloc_dst: Vec<Option<u16>>,
+    read_src: Vec<Option<u16>>,
+    finalized_sites: usize,
+    array_sites: usize,
+    reads: usize,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl TiercBlockSroaPlan {
+    fn ensure_slots(&mut self, n: usize) {
+        if self.alloc_dst.is_empty() {
+            self.alloc_dst.resize(n, None);
+            self.read_src.resize(n, None);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.finalized_sites == 0 && self.array_sites == 0
+    }
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+enum TiercBlockAggregate<'a> {
+    Array {
+        arg_base: u16,
+        argc: u16,
+    },
+    Finalized {
+        plan: &'a crate::bytecode::StaticKeyPlan,
+        val_base: u16,
+    },
+}
+
+/// `reg` must still contain the bits copied by the erased allocation. A write
+/// at the projection itself is conservatively rejected too; accepting the
+/// self-move case is not worth widening this proof.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn tierc_block_sroa_source_unchanged(
+    code: &[Instr],
+    after: usize,
+    through: usize,
+    reg: u16,
+) -> bool {
+    code.get(after..=through).is_some_and(|slice| {
+        slice
+            .iter()
+            .all(|instr| cross_ud(instr).is_some_and(|(_, dst)| dst != Some(reg)))
+    })
+}
+
+/// Require the array index to be an immediate loaded after the allocation in
+/// this same straight-line block. This deliberately does not propagate Moves
+/// or constants across predecessors.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn tierc_block_sroa_reaching_int(code: &[Instr], after: usize, at: usize, reg: u16) -> Option<i32> {
+    for instr in code.get(after..at)?.iter().rev() {
+        let (_, dst) = cross_ud(instr)?;
+        if dst == Some(reg) {
+            return match *instr {
+                Instr::LoadInt { val, .. } => Some(val),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+/// Prove one allocation and return its exact projection map. The 64-op cap is
+/// both a profitability gate and an attacker-work bound; the public planner
+/// also considers at most 16 aggregate sites per function.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn plan_tierc_block_sroa_site(
+    proto: &FuncProto,
+    targeted: &[bool],
+    yield_heads: &[u32],
+    alloc_ip: usize,
+    dst: u16,
+    aggregate: TiercBlockAggregate<'_>,
+) -> Option<Vec<(usize, u16)>> {
+    const MAX_BLOCK_OPS: usize = 64;
+
+    let code = &proto.code;
+    if dst >= proto.reg_count {
+        return None;
+    }
+    let (source_base, source_end) = match &aggregate {
+        TiercBlockAggregate::Array { arg_base, argc, .. } => {
+            (*arg_base, arg_base.checked_add(*argc)?)
+        }
+        TiercBlockAggregate::Finalized { val_base, plan } => (
+            *val_base,
+            val_base.checked_add(u16::try_from(plan.len()).ok()?)?,
+        ),
+    };
+    // The real instruction snapshots every source before defining dst. Our
+    // filler writes dst first, so an overlapping source window is not safe.
+    if (source_base..source_end).contains(&dst) {
+        return None;
+    }
+    let scan_end = alloc_ip
+        .checked_add(MAX_BLOCK_OPS)?
+        .min(code.len().saturating_sub(1));
+    let mut block_end = None;
+    for ip in alloc_ip + 1..=scan_end {
+        match code[ip] {
+            Instr::Return { .. } | Instr::ReturnUndefined => {
+                block_end = Some(ip);
+                break;
+            }
+            Instr::Jump { .. }
+            | Instr::JumpIfFalse { .. }
+            | Instr::JumpIfTrue { .. }
+            | Instr::JumpIfNotLt { .. }
+            | Instr::JumpIfNotLe { .. } => return None,
+            _ => {}
+        }
+    }
+    let block_end = block_end?;
+    // No side entry may skip the allocation or any alias construction. A
+    // region-yield exit in the live range would likewise require materializing
+    // the erased aggregate, which this deliberately tiny lane never does.
+    if targeted.get(alloc_ip + 1..=block_end)?.iter().any(|&v| v)
+        || yield_heads
+            .iter()
+            .any(|&head| (alloc_ip + 1..=block_end).contains(&(head as usize)))
+    {
+        return None;
+    }
+
+    let mut aliases = FxHashSet::default();
+    aliases.insert(dst);
+    let mut reads = Vec::new();
+    for ip in alloc_ip + 1..=block_end {
+        let instr = &code[ip];
+        // Closure creation also reads the child proto's ParentLocal capture
+        // registers, which no per-instruction use table can see. Compiler
+        // bytecode boxes those sources explicitly, but a hand-built malformed
+        // proto must not reach a deopt after this allocation was erased.
+        if !aliases.is_empty()
+            && matches!(instr, Instr::MakeClosure { .. } | Instr::MakeArrow { .. })
+        {
+            return None;
+        }
+        // Use the closed Tier-C table before inspecting operands. Besides
+        // declining unknown ops, `Uses::for_each` rejects malformed range
+        // operands whose `base + count` would overflow `u16`.
+        let (uses, defined) = cross_ud(instr)?;
+        if uses.count() > MAX_BLOCK_OPS {
+            return None;
+        }
+        let mut invalid_use = false;
+        let mut alias_uses = Vec::new();
+        if !uses.for_each(|reg| {
+            if reg >= proto.reg_count {
+                invalid_use = true;
+            } else if aliases.contains(&reg) {
+                alias_uses.push(reg);
+            }
+        }) || invalid_use
+        {
+            return None;
+        }
+        let source_was_alias = matches!(*instr, Instr::Move { src, .. } if aliases.contains(&src));
+
+        if !alias_uses.is_empty() {
+            let projected = match (&aggregate, instr) {
+                (
+                    TiercBlockAggregate::Finalized { plan, val_base },
+                    Instr::GetProp { obj, name, .. },
+                ) if aliases.contains(obj) && alias_uses.iter().all(|&reg| reg == *obj) => {
+                    let key = proto.string_constants.get(*name as usize)?;
+                    let field = plan.keys().iter().position(|candidate| candidate == key)?;
+                    val_base.checked_add(u16::try_from(field).ok()?)?
+                }
+                (
+                    TiercBlockAggregate::Array { arg_base, argc },
+                    Instr::GetIndex { obj, key, .. },
+                ) if aliases.contains(obj)
+                    && !aliases.contains(key)
+                    && alias_uses.iter().all(|&reg| reg == *obj) =>
+                {
+                    let index = tierc_block_sroa_reaching_int(code, alloc_ip + 1, ip, *key)?;
+                    if index < 0 || index >= *argc as i32 {
+                        return None;
+                    }
+                    arg_base.checked_add(index as u16)?
+                }
+                (_, Instr::Move { src, .. }) if aliases.contains(src) => {
+                    // Alias-only transfer; there is no projection at this ip.
+                    u16::MAX
+                }
+                _ => return None,
+            };
+            if projected != u16::MAX {
+                if projected >= proto.reg_count
+                    || aliases.contains(&projected)
+                    || !tierc_block_sroa_source_unchanged(code, alloc_ip + 1, ip, projected)
+                {
+                    return None;
+                }
+                reads.push((ip, projected));
+            }
+        }
+
+        // cross_ud is the closed Tier-C one-def table. Unknown/multi-def ops
+        // decline rather than risking a stale alias after a hidden write.
+        if let Some(defined) = defined {
+            if defined >= proto.reg_count {
+                return None;
+            }
+            aliases.remove(&defined);
+        }
+        if source_was_alias {
+            let Instr::Move { dst, .. } = *instr else {
+                unreachable!()
+            };
+            aliases.insert(dst);
+        }
+    }
+    if reads.is_empty() {
+        return None;
+    }
+
+    // Between allocation and the final aggregate observation there may be no
+    // helper, effect, guard, or control transfer. Thus generated code cannot
+    // bail while an interpreter continuation would need the real allocation.
+    let last_read = reads.last()?.0;
+    for (offset, instr) in code.get(alloc_ip + 1..=last_read)?.iter().enumerate() {
+        let ip = alloc_ip + 1 + offset;
+        let pure = matches!(
+            instr,
+            Instr::LoadInt { .. }
+                | Instr::LoadConst { .. }
+                | Instr::LoadUndefined { .. }
+                | Instr::LoadNull { .. }
+                | Instr::LoadBool { .. }
+                | Instr::Move { .. }
+        ) || (reads.iter().any(|&(read_ip, _)| read_ip == ip)
+            && matches!(instr, Instr::GetProp { .. } | Instr::GetIndex { .. }));
+        if !pure {
+            return None;
+        }
+    }
+    Some(reads)
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn plan_tierc_block_sroa(
+    proto: &FuncProto,
+    targeted: &[bool],
+    yield_heads: &[u32],
+) -> TiercBlockSroaPlan {
+    const MAX_SITES: usize = 16;
+
+    let mut out = TiercBlockSroaPlan::default();
+    if std::env::var_os("ZIPP_GC_STRESS").is_some()
+        || !proto.eval_sites.is_empty()
+        || proto.code.iter().any(|instr| {
+            matches!(
+                instr,
+                Instr::PushFinally { .. }
+                    | Instr::PopFinally
+                    | Instr::EndFinally { .. }
+                    | Instr::IterCloseFinally { .. }
+            )
+        })
+    {
+        return out;
+    }
+
+    let mut considered = 0usize;
+    for (alloc_ip, instr) in proto.code.iter().enumerate() {
+        let (dst, aggregate, finalized) = match *instr {
+            Instr::NewArray {
+                dst,
+                arg_base,
+                argc,
+            } if argc != 0
+                && arg_base
+                    .checked_add(argc)
+                    .is_some_and(|end| end <= proto.reg_count) =>
+            {
+                (dst, TiercBlockAggregate::Array { arg_base, argc }, false)
+            }
+            Instr::FinalizeObject {
+                dst,
+                plan,
+                val_base,
+                count,
+            } if count != 0
+                && val_base
+                    .checked_add(count)
+                    .is_some_and(|end| end <= proto.reg_count) =>
+            {
+                let Some(plan) = proto.static_key_plans.get(plan as usize) else {
+                    continue;
+                };
+                if !plan.runtime_valid()
+                    || plan.len() != count as usize
+                    || plan.len() > crate::bytecode::FINALIZE_STAGE_SLOTS
+                    || plan.has_element_key()
+                {
+                    continue;
+                }
+                (dst, TiercBlockAggregate::Finalized { plan, val_base }, true)
+            }
+            _ => continue,
+        };
+        considered += 1;
+        if considered > MAX_SITES {
+            break;
+        }
+        let Some(reads) =
+            plan_tierc_block_sroa_site(proto, targeted, yield_heads, alloc_ip, dst, aggregate)
+        else {
+            continue;
+        };
+        if out.alloc_dst.get(alloc_ip).copied().flatten().is_some()
+            || reads
+                .iter()
+                .any(|&(ip, _)| out.read_src.get(ip).copied().flatten().is_some())
+        {
+            continue;
+        }
+        out.ensure_slots(proto.code.len());
+        out.alloc_dst[alloc_ip] = Some(dst);
+        for (ip, src) in reads {
+            out.read_src[ip] = Some(src);
+            out.reads += 1;
+        }
+        if finalized {
+            out.finalized_sites += 1;
+        } else {
+            out.array_sites += 1;
+        }
+    }
+    out
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod tierc_block_sroa_tests {
+    use super::*;
+
+    const ARRAY_SOURCE: &str = r#"
+        function project(value) {
+          const array = [value, 3];
+          const alias = array;
+          return (alias[0] + alias[1]) | 0;
+        }
+        project(7);
+    "#;
+
+    fn project_proto() -> FuncProto {
+        let ast = crate::front::parse_script(ARRAY_SOURCE).expect("parse source");
+        crate::compile::compile_program(&ast, ARRAY_SOURCE)
+            .expect("compile source")
+            .functions
+            .into_iter()
+            .find(|proto| proto.name == "project")
+            .expect("project proto")
+    }
+
+    fn targets(proto: &FuncProto) -> Vec<bool> {
+        let mut targets = vec![false; proto.code.len()];
+        for instr in &proto.code {
+            let target = match *instr {
+                Instr::Jump { target }
+                | Instr::JumpIfFalse { target, .. }
+                | Instr::JumpIfTrue { target, .. }
+                | Instr::JumpIfNotLt { target, .. }
+                | Instr::JumpIfNotLe { target, .. } => Some(target as usize),
+                _ => None,
+            };
+            if let Some(target) = target.filter(|&target| target < targets.len()) {
+                targets[target] = true;
+            }
+        }
+        targets
+    }
+
+    fn array_site(proto: &FuncProto) -> (usize, u16, u16) {
+        proto
+            .code
+            .iter()
+            .enumerate()
+            .find_map(|(ip, instr)| match *instr {
+                Instr::NewArray { dst, arg_base, .. } => Some((ip, dst, arg_base)),
+                _ => None,
+            })
+            .expect("array site")
+    }
+
+    #[test]
+    fn exact_array_plan_declines_side_entry() {
+        let proto = project_proto();
+        let mut targeted = targets(&proto);
+        let read_ip = proto
+            .code
+            .iter()
+            .position(|instr| matches!(instr, Instr::GetIndex { .. }))
+            .expect("array read");
+        let baseline = plan_tierc_block_sroa(&proto, &targeted, &[]);
+        assert_eq!((baseline.array_sites, baseline.reads), (1, 2));
+
+        // Model an edge from outside the block directly into its first read.
+        // The production target map is purely structural, so setting this bit
+        // exercises the same side-entry rejection without hand-authoring a
+        // malformed jump target in otherwise compiler-generated bytecode.
+        targeted[read_ip] = true;
+        assert!(plan_tierc_block_sroa(&proto, &targeted, &[]).is_empty());
+    }
+
+    #[test]
+    fn exact_array_plan_declines_escape_effect_and_source_overwrite() {
+        let proto = project_proto();
+        let (alloc_ip, dst, arg_base) = array_site(&proto);
+
+        let mut escaped = proto.clone();
+        escaped
+            .code
+            .insert(alloc_ip + 1, Instr::StoreGlobal { idx: 0, src: dst });
+        assert!(plan_tierc_block_sroa(&escaped, &targets(&escaped), &[]).is_empty());
+
+        let mut effected = proto.clone();
+        effected.code.insert(
+            alloc_ip + 1,
+            Instr::StoreGlobal {
+                idx: 0,
+                src: arg_base,
+            },
+        );
+        assert!(plan_tierc_block_sroa(&effected, &targets(&effected), &[]).is_empty());
+
+        let mut overwritten = proto;
+        overwritten.code.insert(
+            alloc_ip + 1,
+            Instr::LoadInt {
+                dst: arg_base,
+                val: 99,
+            },
+        );
+        assert!(plan_tierc_block_sroa(&overwritten, &targets(&overwritten), &[]).is_empty());
+    }
+
+    #[test]
+    fn exact_array_plan_declines_overflowing_use_window() {
+        let mut proto = project_proto();
+        let (alloc_ip, dst, _) = array_site(&proto);
+        proto.code.insert(
+            alloc_ip + 1,
+            Instr::NewArray {
+                dst,
+                arg_base: u16::MAX,
+                argc: 2,
+            },
+        );
+
+        assert!(plan_tierc_block_sroa(&proto, &targets(&proto), &[]).is_empty());
+    }
+
+    #[test]
+    fn exact_array_plan_declines_oversize_use_window() {
+        let mut proto = project_proto();
+        proto.reg_count = 128;
+        let return_ip = proto
+            .code
+            .iter()
+            .position(|instr| matches!(instr, Instr::Return { .. }))
+            .expect("return site");
+        proto.code.insert(
+            return_ip,
+            Instr::NewArray {
+                dst: 100,
+                arg_base: 32,
+                argc: 65,
+            },
+        );
+
+        assert!(plan_tierc_block_sroa(&proto, &targets(&proto), &[]).is_empty());
+    }
+
+    #[test]
+    fn exact_array_plan_declines_hidden_closure_capture() {
+        let mut proto = project_proto();
+        let (_, dst, _) = array_site(&proto);
+        let return_ip = proto
+            .code
+            .iter()
+            .position(|instr| matches!(instr, Instr::Return { .. }))
+            .expect("return site");
+        proto.code.insert(
+            return_ip,
+            Instr::MakeClosure {
+                dst,
+                func_id: u32::MAX,
+            },
+        );
+
+        assert!(plan_tierc_block_sroa(&proto, &targets(&proto), &[]).is_empty());
     }
 }
 
@@ -1869,6 +2430,17 @@ pub(crate) fn compile_proto_mem(
             targeted[target] = true;
         }
     }
+    let block_sroa = if meter.is_none() && tierc_block_sroa_enabled() {
+        plan_tierc_block_sroa(proto, &targeted, yield_heads)
+    } else {
+        TiercBlockSroaPlan::default()
+    };
+    if !block_sroa.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!(
+            "[jit] fn{func_id} Tier-C block-SROA finalized={} arrays={} reads={}",
+            block_sroa.finalized_sites, block_sroa.array_sites, block_sroa.reads
+        );
+    }
     let mut upval_forward = vec![None; n];
     if tierc_upval_forward_enabled() {
         for ip in 1..n {
@@ -2030,8 +2602,29 @@ pub(crate) fn compile_proto_mem(
     let leaf_needs_version_pins = leaf_plan
         .values()
         .any(|p| (p.same_proto_fid.is_none() && p.slot_guard.is_none()) || !p.nested.is_empty());
+    let has_direct_math_guard = heap.math_imul_guard.is_some()
+        && (proto.code.iter().any(|i| {
+            matches!(
+                i,
+                Instr::MathOp {
+                    op: MathFn::Imul,
+                    ..
+                }
+            )
+        }) || leaf_plan.values().any(|p| {
+            p.body.iter().any(|i| {
+                matches!(
+                    i,
+                    Instr::MathOp {
+                        op: MathFn::Imul,
+                        ..
+                    }
+                )
+            })
+        }));
     let refetch_pinned = has_prop
         || do_method
+        || has_direct_math_guard
         || if precise_entry_pins {
             leaf_needs_version_pins
         } else {
@@ -2298,6 +2891,32 @@ pub(crate) fn compile_proto_mem(
                 continue;
             }
         }
+        if let Some(dst) = block_sroa.alloc_dst.get(ip).copied().flatten() {
+            // Kill any stale heap root in the allocation register while
+            // preserving the original instruction index and branch labels.
+            dynasm!(ops
+                ; mov rax, QWORD INT_TAG as i64
+                ; mov [rbx + dreg(dst)], rax
+            );
+            continue;
+        }
+        if let Some(src) = block_sroa.read_src.get(ip).copied().flatten() {
+            let (dst, prop_site) = match proto.code[ip] {
+                Instr::GetProp { dst, .. } => (dst, true),
+                Instr::GetIndex { dst, .. } => (dst, false),
+                _ => return None,
+            };
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(src)]
+                ; mov [rbx + dreg(dst)], rax
+            );
+            // Jit::compile reserved this original GetProp site even though the
+            // projection no longer probes it. Keep every later site aligned.
+            if prop_site {
+                ic_site += 1;
+            }
+            continue;
+        }
         // Each op gets its OWN dedicated bail label (records THIS ip); a guard
         // miss resumes the interpreter exactly here, side-effect-free.
         let bail = ops.new_dynamic_label();
@@ -2514,19 +3133,33 @@ pub(crate) fn compile_proto_mem(
             }
             Instr::ArrayCtor {
                 dst,
+                callee,
                 arg_base,
                 argc,
+                ..
             } => {
                 // Dense `new Array(…)` subset; RangeError/sparse lengths and
                 // malformed windows decline before any allocation.
                 let helper = crate::vm::jit_array_ctor as usize;
-                let packed = ((proto.reg_count.max(1) as u64) << 32)
+                let mut packed = ((proto.reg_count.max(1) as u64) << 32)
                     | ((arg_base as u64) << 16)
                     | argc as u64;
+                // Bit 63 says r9 is an observable captured callee. Never use a
+                // JS Value as the sentinel: `Array = undefined` is a valid miss.
+                if callee.is_some() {
+                    packed |= 1u64 << 63;
+                }
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, rbx
                     ; mov r8, QWORD packed as i64
+                );
+                if let Some(callee) = callee {
+                    dynasm!(ops ; mov r9, [rbx + dreg(callee)]);
+                } else {
+                    dynasm!(ops ; mov r9, QWORD Value::UNDEFINED.bits() as i64);
+                }
+                dynasm!(ops
                     ; mov rax, QWORD helper as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
@@ -2682,13 +3315,20 @@ pub(crate) fn compile_proto_mem(
                 );
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
-            Instr::ObjectKeys { dst, obj } => {
+            Instr::ObjectKeys {
+                dst,
+                obj,
+                callee,
+                this_v,
+            } => {
                 // Ordinary-object/array own-key snapshot (allocates; no user
                 // code). Proxies and primitives decline purely.
                 let helper = crate::vm::jit_object_keys as usize;
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(obj)]
+                    ; mov r8, [rbx + dreg(callee)]
+                    ; mov r9, [rbx + dreg(this_v)]
                     ; mov rax, QWORD helper as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
@@ -2838,8 +3478,7 @@ pub(crate) fn compile_proto_mem(
                 };
                 if let Some((plan_ptr, shape)) = baked {
                     let helper = crate::vm::jit_finalize_object_baked as usize;
-                    let packed =
-                        ((shape as u64) << 32) | ((val_base as u64) << 16) | count as u64;
+                    let packed = ((shape as u64) << 32) | ((val_base as u64) << 16) | count as u64;
                     dynasm!(ops
                         ; mov rcx, rdi
                         ; mov rdx, rbx
@@ -2856,9 +3495,8 @@ pub(crate) fn compile_proto_mem(
                 } else {
                     let helper = crate::vm::jit_finalize_object as usize;
                     let packed_plan = ((func_id as u64) << 32) | plan as u64;
-                    let packed_window = ((proto.reg_count as u64) << 32)
-                        | ((val_base as u64) << 16)
-                        | count as u64;
+                    let packed_window =
+                        ((proto.reg_count as u64) << 32) | ((val_base as u64) << 16) | count as u64;
                     dynasm!(ops
                         ; mov rcx, rdi
                         ; mov rdx, rbx
@@ -3357,6 +3995,8 @@ pub(crate) fn compile_proto_mem(
             Instr::MathOp {
                 dst,
                 op,
+                callee,
+                this_v,
                 arg_base,
                 argc,
             } => emit_math_op(
@@ -3366,14 +4006,18 @@ pub(crate) fn compile_proto_mem(
                 epilogue,
                 dst,
                 op,
+                callee,
+                this_v,
                 arg_base,
                 argc,
                 heap.math_unary,
                 heap.math_two,
+                heap.math_imul_guard,
             ),
             Instr::GlobalFn {
                 dst,
                 op: crate::bytecode::GlobalFn::String,
+                callee,
                 arg_base,
                 argc,
             } => {
@@ -3386,6 +4030,7 @@ pub(crate) fn compile_proto_mem(
                 dynasm!(ops
                     ; mov rcx, rdi
                     ; mov rdx, [rbx + dreg(arg_base)]
+                    ; mov r8, [rbx + dreg(callee)]
                     ; mov rax, QWORD helper as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
@@ -3611,13 +4256,20 @@ pub(crate) fn compile_proto_mem(
                     ; mov [rbx + dreg(dst)], rax          // Bool Value bits
                 );
             }
-            Instr::IsArray { dst, a } => {
+            Instr::IsArray {
+                dst,
+                a,
+                callee,
+                this_v,
+            } => {
                 // `Array.isArray(v)` → Bool bits; deopt sentinel for the rare
                 // throwing case (revoked Proxy → interpreter re-executes + throws,
                 // safe to redo — the check is side-effect-free). Pure, no refetch.
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov rdx, [rbx + dreg(a)]            // value bits
+                    ; mov r8, [rbx + dreg(callee)]        // captured callee bits
+                    ; mov r9, [rbx + dreg(this_v)]        // captured receiver bits
                     ; mov rax, QWORD heap.is_array as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
@@ -3929,6 +4581,7 @@ pub(crate) fn compile_proto_mem(
                             packed_args,
                             refetch,
                             None,
+                            None,
                         );
                     } else {
                         emit_tierc_general_method(
@@ -4221,6 +4874,7 @@ pub(crate) fn compile_proto_mem(
                         dst,
                         heap.math_unary,
                         heap.math_two,
+                        heap.math_imul_guard,
                         // v2 body-op helpers (order matches the signature).
                         heap.get_index,
                         heap.char_code_at,
@@ -4251,6 +4905,115 @@ pub(crate) fn compile_proto_mem(
                 if cross {
                     dynasm!(ops ; => cross_done);
                 }
+            }
+            Instr::RegExpMethod {
+                dst,
+                op,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+            } => {
+                use crate::bytecode::RegExpMethod as R;
+
+                let direct_on = match op {
+                    R::Test | R::Exec => crate::vm::regexp_call_direct_enabled(),
+                    R::MatchAll if argc >= 1 => crate::vm::string_regexp_call_direct_enabled(),
+                    R::Replace if argc >= 2 => crate::vm::string_regexp_call_direct_enabled(),
+                    _ => false,
+                };
+                let done = ops.new_dynamic_label();
+                if direct_on {
+                    let slow = ops.new_dynamic_label();
+                    let direct_bail = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(this_v)]
+                    );
+                    match op {
+                        R::Test | R::Exec => {
+                            if argc == 0 {
+                                dynasm!(ops ; mov r8, QWORD Value::UNDEFINED.bits() as i64);
+                            } else {
+                                dynasm!(ops ; mov r8, [rbx + dreg(arg_base)]);
+                            }
+                            dynasm!(ops
+                                ; mov r9d, (op == R::Test) as i32
+                                ; mov rax, QWORD heap.regexp_call_direct as i64
+                            );
+                        }
+                        R::MatchAll | R::Replace => dynasm!(ops
+                            ; lea r8, [rbx + dreg(arg_base)]
+                            ; mov r9d, (op == R::Replace) as i32
+                            ; mov rax, QWORD heap.string_regexp_call_direct as i64
+                        ),
+                    }
+                    dynasm!(ops
+                        ; mov r10, [rbx + dreg(callee)]
+                        ; mov [rsp + 32], r10               // captured callee (5th arg)
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => slow
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => direct_bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if let Some((vb, icb)) = refetch {
+                        emit_refetch_pinned(&mut ops, vb, Some(icb));
+                    }
+                    emit_region_bail(&mut ops, ip, direct_bail, epilogue);
+                    dynasm!(ops
+                        ; jmp => done
+                        ; => slow
+                    );
+                }
+
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed_args =
+                    ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_call_with_this_ic as usize,
+                    packed_fip,
+                    packed_args,
+                    argc,
+                    dst,
+                    refetch,
+                    None,
+                );
+                dynasm!(ops ; => done);
+            }
+            Instr::CallWithThis {
+                dst,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+            } => {
+                // Exact captured-reference call. The helper reads both Value
+                // operands from the rooted VM register window on every
+                // execution; no name/shape-based target lookup is permitted.
+                let packed_fip = ((func_id as u64) << 32) | ip as u64;
+                let packed_args =
+                    ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_call_with_this_ic as usize,
+                    packed_fip,
+                    packed_args,
+                    argc,
+                    dst,
+                    refetch,
+                    None,
+                );
             }
             Instr::StrAppendInPlace { dst, a, b } => {
                 // In-place `dst = a + b` (the linearity-proved accumulator

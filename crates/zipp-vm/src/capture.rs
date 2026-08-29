@@ -521,9 +521,10 @@ pub(crate) fn references_name(e: &Expr, name: &str) -> bool {
 fn expr_refs(e: &Expr, out: &mut HashSet<String>) {
     match e {
         Expr::Ident(n) => {
-            if &**n != "undefined" {
-                out.insert(n.to_string());
-            }
+            // `undefined` is an ordinary IdentifierReference.  Its immutable
+            // global value is only the final fallback: a parameter/local in an
+            // enclosing function must be captured just like any other name.
+            out.insert(n.to_string());
         }
         Expr::Binary { left, right, .. } => {
             expr_refs(left, out);
@@ -659,8 +660,7 @@ fn expr_refs(e: &Expr, out: &mut HashSet<String>) {
 /// only ever reached the assignment side.
 fn target_refs(t: &Target, out: &mut HashSet<String>) {
     match t {
-        // Not filtered against "undefined", unlike a read: `undefined = 1` names
-        // a binding here. Pre-port behaviour, preserved.
+        // An assignment target names a binding just like an identifier read.
         Target::Ident { name, .. } => {
             out.insert(name.to_string());
         }

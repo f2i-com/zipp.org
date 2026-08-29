@@ -356,6 +356,12 @@ pub fn tierc_activation_root_stats() -> u64 {
     vm::tierc_activation_root_stats()
 }
 
+/// Pinned dense-Array `HasProp` hole/OOB-positive answers emitted without the
+/// generic helper. Non-zero only when `ZIPP_ICSTATS=1` was set before compile.
+pub fn hasprop_pin_absent_stats() -> u64 {
+    vm::hasprop_pin_absent_stats()
+}
+
 /// `ZIPP_BUILTINSTATS=1` histogram: `(receiver kind, method name, calls)`,
 /// most-called first. Empty unless the variable was set. See
 /// `vm::builtins::bstats` for why this exists rather than a reading of
@@ -505,6 +511,27 @@ fn compile_only(src: &str, module: bool) -> Result<bytecode::Program, String> {
 /// to resolve a dynamic `import(specifier)` against the filesystem. `None` (the
 /// `run` default) means no host module loader, so `import()` rejects.
 pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<Outcome, String> {
+    run_with_policy(src, base_dir, false)
+}
+
+/// Run one release-PGO training program while denying every secondary source
+/// compiler/loader. The main source is parsed and compiled normally, all JITs
+/// remain enabled, but eval/Function-family/ShadowRealm, `$262` source hooks,
+/// agents, and filesystem modules fail before parsing or reading their input.
+/// This is a provenance boundary for trusted in-tree training, not a sandbox.
+#[doc(hidden)]
+pub fn run_for_pgo_training(
+    src: &str,
+    base_dir: Option<std::path::PathBuf>,
+) -> Result<Outcome, String> {
+    run_with_policy(src, base_dir, true)
+}
+
+fn run_with_policy(
+    src: &str,
+    base_dir: Option<std::path::PathBuf>,
+    disable_external_code: bool,
+) -> Result<Outcome, String> {
     // Annex B call assignment targets (`f() = 1` in sloppy code) need no
     // source-rewrite-and-reparse any more: the parser produces `Target::Call`
     // directly and the compiler emits the runtime ReferenceError.
@@ -525,6 +552,9 @@ pub fn run_with_base(src: &str, base_dir: Option<std::path::PathBuf>) -> Result<
     }
     let mut vm = vm::Vm::new(&program);
     vm.set_module_base_dir(base_dir);
+    if disable_external_code {
+        vm.disable_external_code();
+    }
     match vm.run() {
         Ok(_) => Ok(Outcome {
             output: vm.output,

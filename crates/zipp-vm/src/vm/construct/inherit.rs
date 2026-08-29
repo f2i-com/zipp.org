@@ -21,39 +21,6 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// `v instanceof F` for a constructor FUNCTION `F`: true iff `F.prototype` is
-    /// somewhere in `v`'s prototype chain.
-    pub(crate) fn instanceof_via_proto(&mut self, v: Value, ctor: Value) -> Result<bool, Thrown> {
-        // A bound function's instanceof uses the [[BoundTargetFunction]]'s
-        // prototype (OrdinaryHasInstance step 2) — unwrap the bind chain.
-        let mut ctor = ctor;
-        for _ in 0..1000 {
-            match ctor.is_heap().then(|| self.heap.get(ctor.heap_index())) {
-                Some(HeapObj::Bound { target, .. }) => ctor = *target,
-                _ => break,
-            }
-        }
-        let target = match self.prototype_of(ctor) {
-            Some(p) => p,
-            None => return Ok(false),
-        };
-        // The chain walk uses the CHECKED [[GetPrototypeOf]] (identical to the
-        // infallible one for non-proxies): a Proxy link's trap invariants —
-        // revoked handler, non-object result, non-extensible-target mismatch —
-        // throw per OrdinaryHasInstance step 7.b instead of degrading to null.
-        let mut cur = self.get_prototype_of_checked(v)?;
-        for _ in 0..10_000 {
-            if !cur.is_heap() {
-                return Ok(false);
-            }
-            if cur == target {
-                return Ok(true);
-            }
-            cur = self.get_prototype_of_checked(cur)?;
-        }
-        Ok(false)
-    }
-
     /// OrdinaryHasInstance(C, O) — the algorithm behind both the default
     /// `Function.prototype[Symbol.hasInstance]` method and the `instanceof`
     /// operator's non-overridden path. A bound function resolves to its target; a
@@ -123,28 +90,6 @@ impl<'p> Vm<'p> {
             cur = self.get_prototype_of_checked(cur)?;
         }
         Ok(false)
-    }
-
-    /// True iff `v` is an object whose class chain includes the class at heap
-    /// index `class_idx` (`v instanceof C`, walking `extends` links).
-    pub(crate) fn instance_of_class(&self, v: Value, class_idx: u32) -> bool {
-        if !v.is_heap() {
-            return false;
-        }
-        let mut cur = match self.heap.get(v.heap_index()) {
-            HeapObj::Object(m) => m.class,
-            _ => None,
-        };
-        while let Some(cidx) = cur {
-            if cidx == class_idx {
-                return true;
-            }
-            cur = match self.heap.get(cidx) {
-                HeapObj::Class(c) => c.parent,
-                _ => None,
-            };
-        }
-        false
     }
 
     /// The class VALUE the constructor frame on top of the stack belongs to.

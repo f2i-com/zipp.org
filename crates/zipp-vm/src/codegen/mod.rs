@@ -427,6 +427,24 @@ pub(crate) fn cross3_enabled() -> bool {
     }
 }
 
+/// B243 latch: `ZIPP_NO_CROSS3_INLINE=1` makes the emitted cross-call lane
+/// open/close its window and root the prior activation through the three
+/// helpers again (`jit_cross3_enter`, `jit_cross3_unroot`,
+/// `jit_window_close`), byte for byte the pre-B243 lane. Emit-time.
+pub(crate) fn cross3_inline_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_CROSS3_INLINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 pub(crate) fn same_proto_cross2_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static ON: AtomicU8 = AtomicU8::new(2);
@@ -501,6 +519,10 @@ const ARR_HOLE_BITS: u64 = 0x7FFC_0000_0000_0002;
 /// value.rs `Value::TRUE`.
 const BOOL_TRUE_BITS: u64 = 0x7FFA_0000_0000_0001;
 
+/// `Value::FALSE` bits, used by the pinned dense-Array `HasProp` absent lane.
+/// Kept beside `BOOL_TRUE_BITS` so the two raw stores cannot drift apart.
+const BOOL_FALSE_BITS: u64 = 0x7FFA_0000_0000_0000;
+
 /// Where a pinned TypedArray's live Value is RE-READ from at region entry and
 /// after every user-code helper: a global slot (`g` never stored in the region)
 /// or a frame register (never written in the region). The static choice is only
@@ -519,6 +541,19 @@ pub enum TaPinSrc {
 pub struct TaPin {
     pub src: TaPinSrc,
     pub kind: u8,
+    /// Intrinsic method slots whose direct, call-free access this snapshot
+    /// licenses.  Bits index `DV_PROTO_METHODS`; string bit zero denotes
+    /// `charCodeAt`.  Element/length-only pins leave the mask empty.
+    pub method_mask: u32,
+}
+
+impl TaPin {
+    /// Pack the pin kind and its method proof into the existing `u32` snapshot
+    /// argument.  Keeping this in one ABI word avoids growing every region
+    /// prologue with a fifth Win64 call argument.
+    pub(crate) fn snapshot_tag(self) -> u32 {
+        (self.method_mask << 8) | self.kind as u32
+    }
 }
 
 /// `TaPin::kind` marker for a pinned DataView receiver (not a TA element kind).
@@ -692,6 +727,38 @@ pub fn is_arr_pin(kind: u8) -> bool {
 pub struct TaPinPlan {
     pub pins: Vec<TaPin>,
     pub access: FxHashMap<usize, u8>,
+    /// Spec-order member calls are lowered as `GetProp; <args>;
+    /// CallWithThis`.  Register tiers need the pairing both to keep the boxed
+    /// receiver/callee out of numeric homes and to materialise the exact
+    /// captured callable before emitting the old call-free intrinsic lane.
+    /// Keyed by the `CallWithThis` ip; `access` contains both member ips.
+    pub captured_calls: FxHashMap<usize, CapturedPinCall>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CapturedPinCall {
+    pub get_ip: usize,
+    pub call_ip: usize,
+    pub obj: u16,
+    pub callee: u16,
+    pub dst: u16,
+    pub name: u32,
+    pub arg_base: u16,
+    pub argc: u16,
+    pub callee_bits: u64,
+}
+
+impl TaPinPlan {
+    pub(crate) fn captured_call(&self, ip: usize) -> Option<CapturedPinCall> {
+        self.captured_calls.get(&ip).copied()
+    }
+
+    pub(crate) fn captured_get(&self, ip: usize) -> Option<CapturedPinCall> {
+        self.captured_calls
+            .values()
+            .find(|site| site.get_ip == ip)
+            .copied()
+    }
 }
 
 /// One exact, side-effect-free leaf predicate that can be evaluated as a
@@ -907,6 +974,9 @@ pub struct LeafInlinePlan {
     /// Resolved numeric-constant bits the body's `LoadConst` ops reference,
     /// keyed by the constant index (the callee's own constant pool index).
     pub consts: FxHashMap<u32, u64>,
+    /// Callee-local property names used when a raw INT splice copies a guarded
+    /// captured member prefix into the caller's synthetic FuncProto.
+    pub string_constants: Vec<String>,
     /// Baked CELL for each upvalue index the body READS, as Value bits.
     ///
     /// An inlined body has no frame of its own, so the interpreter's
@@ -1125,6 +1195,18 @@ pub struct MethodInlineShape {
     /// Guard: the receiver heap slot's live version (ABA + own-shadow +
     /// vals-realloc discriminator).
     pub recv_ver: u32,
+    /// Exact callable bits resolved while this method arm was planned. A
+    /// captured-reference plan compares the already-evaluated callee register
+    /// against this value before entering the body; this is independent of the
+    /// receiver/member guards below and is what preserves Get-before-arguments
+    /// replacement semantics.
+    pub captured_callee_bits: Option<u64>,
+    /// Class heap identity/version behind a class-method arm. A fused captured
+    /// GetProp prefix has not run the ordinary IC probe yet, so it rechecks the
+    /// same live class version that `IcEntry::ClassMethod` validates before it
+    /// may materialize `captured_callee_bits`. Own/prototype methods use their
+    /// explicit slot/hop guards instead.
+    pub class_method: Option<(u32, u32)>,
     /// Baked base pointer of this receiver's ObjMap `vals` (valid behind the
     /// version guard); shared by the outer body AND its inlined super bodies.
     pub vals_ptr: u64,
@@ -1192,6 +1274,10 @@ pub struct MethodInlinePlan {
     /// Highest scratch reg index used across all arms (outer window + super
     /// sub-windows) — the headroom (`jit_regs_fits`) bound.
     pub win_top: u16,
+    /// Callee register for a `GetProp; CallWithThis` plan. `None` is the legacy
+    /// fused `CallMethod`/accessor form. Every arm in a captured plan carries a
+    /// matching `captured_callee_bits` value and guards it before executing.
+    pub captured_callee: Option<u16>,
     /// The receiver arms (1 = monomorphic; ≤ JIT_IC_WAYS). A guard tree.
     pub shapes: Vec<MethodInlineShape>,
 }
@@ -1199,6 +1285,25 @@ pub struct MethodInlinePlan {
 /// Win64 addresses of the heap helpers (vm.rs), passed from the interpreter into
 /// `Jit::compile_region`. The inline-cache base site index is assigned inside
 /// `compile_region` (not here), then bundled into `HeapHelpers` for codegen.
+#[derive(Clone, Copy)]
+pub struct MathIntrinsicGuard {
+    /// Exact main-realm `Math` receiver captured when this code is compiled.
+    pub receiver_bits: u64,
+    /// Heap generation of the receiver.  Structural changes (including a
+    /// values-vector relocation) invalidate the baked slot address below.
+    pub receiver_ver: u32,
+    /// Direct address and slot of the main-realm `Math.imul` data property.
+    /// Generated code first validates `receiver_ver`, then re-reads this slot;
+    /// the value comparison is required because an in-place overwrite does not
+    /// bump the object's generation.
+    pub receiver_vals: u64,
+    pub receiver_slot: u32,
+    /// Exact main-realm intrinsic `Math.imul` callable.
+    pub callee_bits: u64,
+    /// Heap-slot generation paired with `callee_bits`, defeating slot-reuse ABA.
+    pub callee_ver: u32,
+}
+
 #[derive(Clone, Copy)]
 pub struct HeapHelperAddrs {
     pub get_prop_miss: usize,
@@ -1290,6 +1395,10 @@ pub struct HeapHelperAddrs {
     /// Helper for a TWO-ARG `Math.<op>` (Pow/Atan2/Imul/Min/Max/Hypot) over
     /// already-numeric args (pure, same constraints). Returns f64 bits.
     pub math_two: usize,
+    /// Call-free exact-identity guard for the main-realm `Math.imul`, when it
+    /// was pristine at compile time. The emitted check still consumes the
+    /// per-call captured receiver/callee and their live heap-slot generation.
+    pub math_imul_guard: Option<MathIntrinsicGuard>,
     /// Helper for `CellGet` / `UpvalGet` reading a captured-local cell: a pure
     /// heap LOAD of the cell's inner Value (no alloc, no user code). Returns the
     /// inner Value bits, or `SELF_CALL_DEOPT` for a still-uninitialized (TDZ)
@@ -1455,6 +1564,7 @@ impl HeapHelperAddrs {
             dv_get: self.dv_get,
             math_unary: self.math_unary,
             math_two: self.math_two,
+            math_imul_guard: self.math_imul_guard,
             cell_get: self.cell_get,
             cell_set: self.cell_set,
             upval_set: self.upval_set,
@@ -1720,6 +1830,25 @@ pub(crate) fn hasprop_jumpfuse_enabled() -> bool {
         2 => false,
         _ => {
             let on = std::env::var_os("ZIPP_NO_HASPROP_JUMPFUSE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Pinned dense-Array `HasProp` absent answer. `jit_ta_snapshot` publishes a
+/// bit only while the receiver uses the default chain and the sticky indexed-
+/// prototype protector is still valid; the MEM emitter may then answer a hole
+/// or positive out-of-bounds Int key as `false` without crossing the helper.
+/// `ZIPP_NO_HASPROP_PIN_ABSENT=1` restores the old hole/OOB helper route.
+pub(crate) fn hasprop_pin_absent_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_HASPROP_PIN_ABSENT").is_none();
             STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -2091,11 +2220,13 @@ fn exact_function_source(source: &str, expected: &str) -> bool {
 /// Runtime validation for the live helper binding used by
 /// [`MarkdownInlinePlan`]. This is intentionally just as exact as the caller
 /// recogniser: a lookalike helper can contain coercions or observable calls.
+/// Register allocation is deliberately not part of the licence: the exact
+/// source and semantic function metadata pin the behaviour, while register
+/// counts are a compiler-layout detail that changes under equivalent lowering.
 pub(crate) fn markdown_escape_html_proto(proto: &FuncProto) -> bool {
     proto.name == "escapeHtml"
         && proto.param_count == 1
         && proto.length == 1
-        && proto.reg_count == 60
         && proto.is_strict
         && proto.simple_params
         && proto.rest_reg.is_none()
@@ -2113,13 +2244,13 @@ pub(crate) fn markdown_escape_html_proto(proto: &FuncProto) -> bool {
 /// Recognise only the exact benchmark-independent inline Markdown scanner.
 /// Source identity pins comments, control flow and every emitted literal; the
 /// two equal `LoadGlobal`s recover the helper binding without baking a global
-/// slot number. `ZIPP_NO_MARKDOWN_INLINE_REDUCE=1` omits the plan entirely.
+/// slot number. As with the helper proof, register count is intentionally not a
+/// semantic gate. `ZIPP_NO_MARKDOWN_INLINE_REDUCE=1` omits the plan entirely.
 fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePlan> {
     if std::env::var_os("ZIPP_NO_MARKDOWN_INLINE_REDUCE").is_some()
         || proto.name != "renderInline"
         || proto.param_count != 1
         || proto.length != 1
-        || proto.reg_count != 122
         || !proto.is_strict
         || !proto.simple_params
         || proto.rest_reg.is_some()
@@ -2376,7 +2507,7 @@ fn json_walk_plan(proto: &FuncProto, const_strs: &FxHashMap<u32, u64>) -> Option
     );
     op!(36, Instr::StoreGlobalResolved { idx, src: 24 } if *idx == bools);
     op!(37, Instr::ReturnUndefined);
-    op!(38, Instr::IsArray { dst: 25, a: 1 });
+    op!(38, Instr::IsArray { dst: 25, a: 1, .. });
     op!(
         39,
         Instr::JumpIfFalse {
@@ -3451,7 +3582,10 @@ impl Jit {
         // callee heated by this very loop lands its entry within a couple
         // of back-edges; a callee that never compiles costs the region at
         // most 8 deferred iterations before it compiles helper-side.
-        let c = self.cross_defer_spent.entry((func_id, entry_ip)).or_insert(0);
+        let c = self
+            .cross_defer_spent
+            .entry((func_id, entry_ip))
+            .or_insert(0);
         if *c >= 8 {
             return false;
         }
@@ -3537,9 +3671,7 @@ impl Jit {
     /// never seen — consistent with what the first `set_cross_entry` keeps
     /// when the mask does not change).
     pub fn cross_mask_gen(&self, fid: u32) -> u32 {
-        self.cross_table
-            .get(fid as usize)
-            .map_or(0, |r| r.mask_gen)
+        self.cross_table.get(fid as usize).map_or(0, |r| r.mask_gen)
     }
 
     fn clear_cross_entry(&mut self, func_id: u32) {
@@ -3654,7 +3786,11 @@ impl Jit {
         // B207 (review): the B206 contract "metered bodies never carry
         // yield heads" is enforced HERE, not trusted to callers — a
         // charge-then-bail at a head would double-charge every call.
-        let yield_heads: &[u32] = if self.meter.is_some() { &[] } else { yield_heads };
+        let yield_heads: &[u32] = if self.meter.is_some() {
+            &[]
+        } else {
+            yield_heads
+        };
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         if fnjit_mem_enabled() && mem_can_compile(proto, const_strs) {
             // One inline-cache site per GetProp/SetProp in the whole function
@@ -4112,8 +4248,9 @@ impl Jit {
                         // that contains it; this is where a region body's range
                         // becomes known.
                         let (a, n) = code.code_span();
-                        crate::vm::prof::pc::register(
-                            a, n, || format!("fn{func_id} region [{start},{end}]"));
+                        crate::vm::prof::pc::register(a, n, || {
+                            format!("fn{func_id} region [{start},{end}]")
+                        });
                     }
                     self.regions.insert(
                         key,
@@ -4180,8 +4317,9 @@ impl Jit {
                             // that contains it; this is where a region body's range
                             // becomes known.
                             let (a, n) = code.code_span();
-                            crate::vm::prof::pc::register(
-                                a, n, || format!("fn{func_id} region [{start},{end}]"));
+                            crate::vm::prof::pc::register(a, n, || {
+                                format!("fn{func_id} region [{start},{end}]")
+                            });
                         }
                         self.regions.insert(
                             key,
@@ -4237,6 +4375,7 @@ impl Jit {
                 globals_base_helper,
                 ita,
                 heap_helpers.ta_snapshot,
+                heap_helpers.math_imul_guard,
                 &entry,
                 meter,
             ) {
@@ -4248,8 +4387,9 @@ impl Jit {
                     // that contains it; this is where a region body's range
                     // becomes known.
                     let (a, n) = code.code_span();
-                    crate::vm::prof::pc::register(
-                        a, n, || format!("fn{func_id} region [{start},{end}]"));
+                    crate::vm::prof::pc::register(a, n, || {
+                        format!("fn{func_id} region [{start},{end}]")
+                    });
                 }
                 self.regions.insert(
                     key,
@@ -4319,8 +4459,9 @@ impl Jit {
                     // that contains it; this is where a region body's range
                     // becomes known.
                     let (a, n) = code.code_span();
-                    crate::vm::prof::pc::register(
-                        a, n, || format!("fn{func_id} region [{start},{end}]"));
+                    crate::vm::prof::pc::register(a, n, || {
+                        format!("fn{func_id} region [{start},{end}]")
+                    });
                 }
                 self.regions.insert(
                     key,

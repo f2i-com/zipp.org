@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
-use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
     PromiseState, PropAttr, ReactionPair, Reactions,
@@ -187,14 +187,8 @@ impl<'p> Vm<'p> {
         }
         let proto_ok = match self.heap.get(self.regexp_proto) {
             HeapObj::Object(m) => {
-                let data_native = |k: &str, id: u16| {
-                    m.pos(k).is_some_and(|i| {
-                        !m.attr_at(i).accessor
-                            && m.val_at(i).is_heap()
-                            && matches!(self.heap.get(m.val_at(i).heap_index()),
-                                        HeapObj::Native(n) if *n == id)
-                    })
-                };
+                let data_native =
+                    |k: &str, id: u16| self.regexp_proto_slot_is_intrinsic(m, k, false, id);
                 data_native("@@match", native::REGEXP_SYM_MATCH)
                     && data_native("@@matchAll", native::REGEXP_SYM_MATCHALL)
             }
@@ -212,7 +206,7 @@ impl<'p> Vm<'p> {
         Some(self.call_native(native::REGEXP_SYM_MATCHALL, arg0, &[recv]))
     }
 
-    /// Guarded direct bytecode `CallMethod` for the two hot primitive-string /
+    /// Guarded captured `RegExpMethod` for the two hot primitive-string /
     /// RegExp combinations: `s.matchAll(re)` and `s.replace(re, string)`.
     ///
     /// `Ok(None)` is a PURE decline.  Every type, realm, live method-slot and
@@ -222,6 +216,7 @@ impl<'p> Vm<'p> {
     /// selects matchAll; `true` selects replace.  `from_jit` is diagnostic only.
     pub(crate) fn string_regexp_call_direct(
         &mut self,
+        callee: Value,
         recv: Value,
         arg0: Value,
         replacement: Value,
@@ -240,10 +235,15 @@ impl<'p> Vm<'p> {
             return Ok(None);
         };
 
-        // This proves both that primitive lookup is in the main realm and that
-        // the live own String.prototype slot is the exact metadata-derived
-        // native DATA property.  It re-reads attr/Value/Native id every call.
-        if !self.string_regexp_method_is_intrinsic(name) {
+        // EvaluateCall already performed the observable method Get. Validate
+        // its captured result against the permanent main-realm identity; never
+        // re-read the live prototype slot after argument effects.
+        let op = if is_replace {
+            crate::bytecode::RegExpMethod::Replace
+        } else {
+            crate::bytecode::RegExpMethod::MatchAll
+        };
+        if !self.captured_regexp_method_is_intrinsic(op, callee) {
             super::proxy_regexp::rxstats::count_string_call_direct_decline();
             return Ok(None);
         }

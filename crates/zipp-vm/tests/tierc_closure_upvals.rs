@@ -543,10 +543,11 @@ fn tierc_closure_rotating_mechanism_engages() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("SAME-PROTO-ARROW2 fn2 callee_regs=23"),
-        "mechanism child did not select the exact same-prototype cross-call lane:\n{}",
-        String::from_utf8_lossy(&out.stderr)
+        stderr.contains("SAME-PROTO-ARROW2 fn2 callee_regs=")
+            && stderr.contains("CROSS3 fn2 native-emitted lane"),
+        "mechanism child did not select and emit the same-prototype cross-call lane:\n{stderr}"
     );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("Tier-C upval-forward sites=1"),

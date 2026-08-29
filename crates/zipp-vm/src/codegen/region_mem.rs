@@ -5,6 +5,107 @@
 #![allow(unused_imports)]
 use super::*;
 
+env_off_switch!(
+    /// B244: skip redundant dense-Array snapshot helper calls after a native
+    /// cross-call when the heap's coarse Array mutation epoch is unchanged.
+    /// Off restores the unconditional post-call snapshot derivation.
+    fn cross_array_snapshot_epoch_enabled() = "ZIPP_NO_CROSS_ARRAY_SNAPSHOT_EPOCH"
+);
+
+/// Emit one half of a pin-plan refresh without renumbering its stack slots.
+/// The split lets cross-call completions always refresh TypedArrays/DataViews/
+/// strings while guarding only dense Arrays with the B244 mutation epoch.
+fn emit_refetch_ta_partition(
+    ops: &mut dynasmrt::x64::Assembler,
+    snapshot_helper: usize,
+    plan: &TaPinPlan,
+    arrays: bool,
+) {
+    for (j, pin) in plan.pins.iter().enumerate() {
+        if is_arr_pin(pin.kind) != arrays {
+            continue;
+        }
+        match pin.src {
+            TaPinSrc::Global(g) => dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]),
+            TaPinSrc::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
+        }
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov r8d, pin.snapshot_tag() as i32
+            ; lea r9, [rsp + ta_slot_off(j)]
+            ; mov rax, QWORD snapshot_helper as i64
+            ; call rax
+        );
+    }
+}
+
+#[inline]
+fn cross_array_epoch_cache_off(c3_off: i32, plan: &TaPinPlan) -> Option<i32> {
+    (cross_array_snapshot_epoch_enabled() && plan.pins.iter().any(|p| is_arr_pin(p.kind)))
+        // B243 occupies the former tail with the live entry pointer. B244
+        // reloads that pointer immediately before `call`, freeing this qword
+        // as the one region-lifetime epoch cache without growing the frame.
+        .then_some(c3_off + 56)
+}
+
+/// Post-user-code pin repair for a native cross-call. Non-Array pins always
+/// rederive because detach/resize/reassignment has no relation to the Array
+/// epoch. Array raw bases/lengths are reused only on a non-saturated equality
+/// AND exact equality between every pin's live source Value and its cached
+/// `obj_bits`. The identity half is required for `globalA = preexistingB`,
+/// which changes no Heap payload and therefore cannot advance the epoch.
+/// Any mismatch refreshes every Array pin and advances the stack cache.
+fn emit_cross_refetch_ta(
+    ops: &mut dynasmrt::x64::Assembler,
+    snapshot_helper: usize,
+    plan: &TaPinPlan,
+    epoch_cache_off: Option<i32>,
+) {
+    let Some(cache) = epoch_cache_off else {
+        emit_refetch_ta(ops, snapshot_helper, plan);
+        return;
+    };
+    use crate::vm::host_api::JIT_ARRAY_SNAPSHOT_EPOCH_OFFSET;
+    emit_refetch_ta_partition(ops, snapshot_helper, plan, false);
+    let refresh_arrays = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rdi + JIT_ARRAY_SNAPSHOT_EPOCH_OFFSET as i32]
+        ; cmp rax, [rsp + cache]
+        ; jne => refresh_arrays
+        // Saturation is permanently dirty: equality at MAX never licenses a
+        // raw-pointer reuse, avoiding a theoretical wrap/ABA state.
+        ; cmp rax, -1
+        ; je => refresh_arrays
+    );
+    // Heap cleanliness says each cached occupant stayed put; source equality
+    // separately says the binding still names that occupant. Check all Array
+    // pins before licensing any raw read (one mismatch refreshes the group).
+    for (j, pin) in plan.pins.iter().enumerate() {
+        if !is_arr_pin(pin.kind) {
+            continue;
+        }
+        match pin.src {
+            TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+            TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+        }
+        dynasm!(ops
+            ; cmp rax, [rsp + ta_slot_off(j)]
+            ; jne => refresh_arrays
+        );
+    }
+    dynasm!(ops
+        ; jmp => done
+        ; => refresh_arrays
+    );
+    emit_refetch_ta_partition(ops, snapshot_helper, plan, true);
+    dynasm!(ops
+        ; mov rax, [rdi + JIT_ARRAY_SNAPSHOT_EPOCH_OFFSET as i32]
+        ; mov [rsp + cache], rax
+        ; => done
+    );
+}
+
 /// Same-binary A/B switch for the guarded `hasOwnProperty.call` intrinsic.
 /// Read while compiling a region, never on the generated hot path.
 #[inline]
@@ -198,6 +299,16 @@ pub(crate) fn compile_region_mem(
     // tight-headroom run falls back to the per-call helper for every site).
     let do_leaf = !leaf_plan.is_empty();
     let do_method = !method_plan.is_empty();
+    let has_direct_math_guard = heap.math_imul_guard.is_some()
+        && proto.code[s..=e].iter().any(|i| {
+            matches!(
+                i,
+                Instr::MathOp {
+                    op: MathFn::Imul,
+                    ..
+                }
+            )
+        });
     // The Q4 leaf-inline identity guard re-checks the callee slot's live version
     // (read from r13, the pinned heap version-array base) to defeat GC slot-reuse
     // ABA. r13 is pinned at the prologue, but any intervening ALLOCATING / user-
@@ -205,7 +316,8 @@ pub(crate) fn compile_region_mem(
     // Vec and leave r13 STALE. So whenever the region inlines a call, the version
     // base must be re-derived after such helpers too — exactly where a GetProp/
     // SetProp region re-derives it. Fold `do_leaf` into the refetch gate.
-    let refetch_pinned = has_prop || do_leaf || do_method || has_forin_version_inline;
+    let refetch_pinned =
+        has_prop || do_leaf || do_method || has_forin_version_inline || has_direct_math_guard;
     let max_scratch_top: u64 = leaf_plan
         .values()
         .map(|p| p.reg_window as u64 + p.callee_reg_count as u64)
@@ -216,9 +328,10 @@ pub(crate) fn compile_region_mem(
     // 8B 5th-arg slot. 32*n keeps the frame's 16-alignment. The leaf-inline
     // headroom flag adds one more 16B slot at the top of the frame.
     let n_ta = ta_plan.pins.len();
-    // B189b: 48 bytes of emitted-call scratch (prior activation 24B, window
-    // base|flag 8B, result 8B, bail slot 8B) between the TA pins and the leaf
-    // flag; 48 keeps the frame's 16-alignment. `c3_off` is its base.
+    // B189b/B243: 64 bytes of emitted-call scratch (prior activation 24B,
+    // window base|flag 8B, result 8B, bail slot 8B, callee bits 8B, and an 8B
+    // entry-or-B244-Array-epoch tail) between the TA pins and leaf flag.
+    // `c3_off` is its base.
     let do_cross3 = cross_plan
         .values()
         .any(|site| site.cross3.is_some() || site.cross3m.is_some());
@@ -232,6 +345,13 @@ pub(crate) fn compile_region_mem(
     let leaf_flag_off = frame - 8;
     // Re-derive the pins after any helper that can run user code.
     let ta_refetch = (n_ta > 0).then_some((heap.ta_snapshot, ta_plan));
+    // B244 reuses the last qword of the 64-byte CROSS3 scratch as one coarse
+    // Array-epoch cache for every dense-Array pin in the region. It exists only
+    // when CROSS3 allocated that scratch; all other helper paths retain their
+    // unconditional snapshot refresh.
+    let array_epoch_cache = do_cross3
+        .then(|| cross_array_epoch_cache_off(c3_off, ta_plan))
+        .flatten();
     // Registers fed by a DOUBLE constant (`x * 1.5`, `i * 2654435761`): their
     // arithmetic skips the Int+Int fast path (it would fail every iteration).
     // Pure perf heuristic — a multiply-defined reg merely keeps the check.
@@ -353,6 +473,13 @@ pub(crate) fn compile_region_mem(
     // Pin each TypedArray's `{obj_bits, base, len}` snapshot (entry derivation).
     if let Some((snap, plan)) = ta_refetch {
         emit_refetch_ta(&mut ops, snap, plan);
+    }
+    if let Some(cache) = array_epoch_cache {
+        use crate::vm::host_api::JIT_ARRAY_SNAPSHOT_EPOCH_OFFSET;
+        dynasm!(ops
+            ; mov rax, [rdi + JIT_ARRAY_SNAPSHOT_EPOCH_OFFSET as i32]
+            ; mov [rsp + cache], rax
+        );
     }
     // ── Q4 leaf-inline headroom check (once per entry) ── `jit_regs_fits(vm,
     // rbx, max_scratch_top)` → 1 if the carved scratch windows lie inside the
@@ -871,6 +998,8 @@ pub(crate) fn compile_region_mem(
             Instr::MathOp {
                 dst,
                 op,
+                callee,
+                this_v,
                 arg_base,
                 argc,
             } => emit_math_op(
@@ -880,10 +1009,13 @@ pub(crate) fn compile_region_mem(
                 epilogue,
                 dst,
                 op,
+                callee,
+                this_v,
                 arg_base,
                 argc,
                 heap.math_unary,
                 heap.math_two,
+                heap.math_imul_guard,
             ),
             Instr::CellGet { dst, cell } => {
                 // Per-op captured-cell read (jit_cell_get). NEVER hoisted: a
@@ -1254,11 +1386,12 @@ pub(crate) fn compile_region_mem(
                 // this receiver (ARR_PIN_KIND): identity-guard, then an INTEGER
                 // key in `[0, len)` whose element is NOT a HOLE answers `true`
                 // call-free (an in-range present element is unconditionally an
-                // own property — the prototype chain is irrelevant). Every other
-                // case (guard miss / declined-snapshot all-zero slot / non-Int
-                // key / OOB / a HOLE) routes to the generic `jit_has_property`
-                // helper, which walks the real prototype chain (an OOB/hole index
-                // can still be inherited) — so the inline never INVENTS a `false`.
+                // own property — the prototype chain is irrelevant). A snapshot
+                // carrying `TA_SNAP_INDEX_ABSENT` also proves that a HOLE or a
+                // positive OOB Int is `false`: the receiver still uses the
+                // intrinsic chain and the sticky indexed-prototype protector was
+                // clear at this entry/refetch. Every unproved case routes to the
+                // generic helper, so the inline never invents an absent answer.
                 // This is the 80%-present hot path of the hole-iter `if (i in
                 // packed)` loop; the read-only inline neither allocates nor moves
                 // the Vec, so no refetch.
@@ -1271,6 +1404,17 @@ pub(crate) fn compile_region_mem(
                 let hp_done = ops.new_dynamic_label();
                 if let Some((slot, _)) = pinned {
                     let off = ta_slot_off(slot);
+                    let absent_fast = hasprop_pin_absent_enabled();
+                    let hp_oob = ops.new_dynamic_label();
+                    let hp_absent = ops.new_dynamic_label();
+                    let absent_counter = (absent_fast
+                        && crate::vm::haspropabsentstats::stats_enabled())
+                    .then(crate::vm::haspropabsentstats::counter_addr);
+                    let fused = if hasprop_jumpfuse_enabled() {
+                        cmp_branch_pair(ip, dst)
+                    } else {
+                        None
+                    };
                     dynasm!(ops
                         ; mov rax, [rbx + dreg(obj)]      // receiver bits
                         ; cmp rax, [rsp + off]            // identity vs snapshot
@@ -1284,12 +1428,24 @@ pub(crate) fn compile_region_mem(
                         ; jne => hp_slow                  // non-Int key → helper
                         ; movsxd rcx, ecx                 // Int payload (may be < 0)
                         ; cmp rcx, [rsp + off + 16]       // unsigned: i < len?
-                        ; jae => hp_slow                  // OOB/negative → helper (proto walk)
+                    );
+                    if absent_fast {
+                        dynasm!(ops ; jae => hp_oob);
+                    } else {
+                        dynasm!(ops ; jae => hp_slow);
+                    }
+                    dynasm!(ops
                         ; mov rdx, [rsp + off + 8]        // pinned items base
                         ; mov rax, [rdx + rcx * 8]        // items[i] (Value bits)
                         ; mov r10, QWORD ARR_HOLE_BITS as i64
                         ; cmp rax, r10
-                        ; je => hp_slow                   // HOLE (absent own) → helper (proto walk)
+                    );
+                    if absent_fast {
+                        dynasm!(ops ; je => hp_absent);
+                    } else {
+                        dynasm!(ops ; je => hp_slow);
+                    }
+                    dynasm!(ops
                         ; mov r10, QWORD BOOL_TRUE_BITS as i64
                         ; mov [rbx + dreg(dst)], r10      // in-range present → true
                     );
@@ -1313,11 +1469,6 @@ pub(crate) fn compile_region_mem(
                     // and still falls into it, including its SELF_CALL_DEOPT bail.
                     // `cmp_branch_pair` itself declines under step metering, so
                     // the elided block cannot go uncharged.
-                    let fused = if hasprop_jumpfuse_enabled() {
-                        cmp_branch_pair(ip, dst)
-                    } else {
-                        None
-                    };
                     match fused {
                         Some((true, tgt)) => {
                             // JumpIfFalse on a `true` condition: not taken.
@@ -1338,6 +1489,51 @@ pub(crate) fn compile_region_mem(
                             dynasm!(ops ; jmp => t);
                         }
                         None => dynasm!(ops ; jmp => hp_done),
+                    }
+                    if absent_fast {
+                        dynasm!(ops
+                            // Unsigned OOB includes negative Ints. Negative keys
+                            // are ordinary named properties ("-1"), not protected
+                            // array indices, and must retain the full chain walk.
+                            ; => hp_oob
+                            ; test rcx, rcx
+                            ; js => hp_slow
+                            ; => hp_absent
+                            ; test QWORD [rsp + off + 24],
+                                crate::vm::TA_SNAP_INDEX_ABSENT as i32
+                            ; jz => hp_slow
+                            ; mov r10, QWORD BOOL_FALSE_BITS as i64
+                            ; mov [rbx + dreg(dst)], r10
+                        );
+                        if let Some(addr) = absent_counter {
+                            dynasm!(ops
+                                ; mov rax, QWORD addr as i64
+                                ; lock inc QWORD [rax]
+                            );
+                        }
+                        match fused {
+                            Some((true, tgt)) => {
+                                // JumpIfFalse on a proven false condition: taken.
+                                let t = region_target(
+                                    tgt,
+                                    start,
+                                    end,
+                                    &in_region,
+                                    &mut exit_stubs,
+                                    &mut ops,
+                                );
+                                dynasm!(ops ; jmp => t);
+                            }
+                            Some((false, _)) => {
+                                // JumpIfTrue on false: fall through past the pair.
+                                let ft = lbl((ip + 2) as u32, &in_region);
+                                dynasm!(ops ; jmp => ft);
+                            }
+                            None => dynasm!(ops ; jmp => hp_done),
+                        }
+                        if std::env::var_os("ZIPP_JITLOG").is_some() {
+                            eprintln!("[jit] MEM pinned HasProp absent lane emitted at ip {ip}");
+                        }
                     }
                     dynasm!(ops ; => hp_slow);
                 }
@@ -1486,6 +1682,53 @@ pub(crate) fn compile_region_mem(
                     .copied()
                     .unwrap_or_default();
                 let acc = site_emit.acc.then(|| ops.new_dynamic_label());
+                // Adjacent zero-arg captured method call: for a receiver/data
+                // arm whose complete body is already planned, the same pure
+                // structural guards can materialize this GetProp's exact Value
+                // and execute the call now. Success skips the paired
+                // CallWithThis; any miss falls through to this original GetProp
+                // and then its exact-call path. Accessors/proxies/exotics never
+                // produce a method arm, so their observable Get still runs.
+                if let Some((mp, call_dst, call_arg_base)) =
+                    proto.code.get(ip + 1).and_then(|next| match *next {
+                        Instr::CallWithThis {
+                            dst: call_dst,
+                            callee,
+                            this_v,
+                            arg_base,
+                            argc: 0,
+                        } if callee == dst && this_v == obj => method_plan
+                            .get(&(ip + 1))
+                            .map(|mp| (mp, call_dst, arg_base)),
+                        _ => None,
+                    })
+                {
+                    debug_assert_eq!(mp.captured_callee, Some(dst));
+                    debug_assert!(ip + 2 <= e);
+                    let prefix_fallback = ops.new_dynamic_label();
+                    let call_ip = ip + 1;
+                    let packed_fip = ((heap.func_id as u64) << 32) | call_ip as u64;
+                    let packed_args =
+                        ((obj as u64) << 32) | ((dst as u64) << 16) | call_arg_base as u64;
+                    emit_inline_method_call(
+                        &mut ops,
+                        ip,
+                        epilogue,
+                        leaf_flag_off,
+                        mp,
+                        obj,
+                        call_arg_base,
+                        0,
+                        call_dst,
+                        crate::vm::jit_call_with_this_ic as usize,
+                        packed_fip,
+                        packed_args,
+                        refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                        ta_refetch,
+                        Some((prefix_fallback, lbl((ip + 2) as u32, &in_region))),
+                    );
+                    dynasm!(ops ; => prefix_fallback);
+                }
                 // Stage 5: inline a trivial class GETTER for this `o.v` site as a
                 // per-receiver guard tree (a pure prefix). A hit writes `dst` and
                 // jumps to `cont`; all-miss falls through to the IC probe below
@@ -1846,9 +2089,10 @@ pub(crate) fn compile_region_mem(
                         // array variable was reassigned, or the snapshot DECLINED
                         // for an arr_props/arguments array → all-zero slot →
                         // rax never equals 0 for a real heap Value) → generic
-                        // helper. The base is re-derived after every Vec-growth
-                        // op (push / generic SetIndex / user-code helper), so a
-                        // realloc cannot leave it stale across iterations.
+                        // helper. Direct Vec-growth ops rederive the base; after
+                        // native cross calls B244 may retain it only under both
+                        // the Array-mutation epoch and live-source identity
+                        // guards, so a realloc cannot survive as a stale read.
                         let hole = ops.new_dynamic_label();
                         dynasm!(ops
                             ; mov rax, [rbx + dreg(obj)]      // receiver bits
@@ -2122,43 +2366,6 @@ pub(crate) fn compile_region_mem(
                 argc,
             } => {
                 let key = proto.string_constants[name as usize].as_str();
-                if let Some(plan) = scalar_exec.filter(|p| p.call_ip == ip) {
-                    debug_assert_eq!(key, "exec");
-                    debug_assert_eq!(argc, 1);
-                    debug_assert_eq!(obj, plan.re_reg);
-                    debug_assert_eq!(arg_base, plan.input_reg);
-                    debug_assert_eq!(dst, plan.call_result_reg);
-                    let packed_dsts = plan
-                        .tonum_dsts
-                        .iter()
-                        .enumerate()
-                        .fold(0u64, |bits, (g, &reg)| bits | ((reg as u64) << (16 * g)));
-                    dynasm!(ops
-                        ; mov rcx, rdi
-                        ; mov rdx, rbx
-                        ; mov r8, [rbx + dreg(obj)]
-                        ; mov r9, [rbx + dreg(arg_base)]
-                        ; mov rax, QWORD packed_dsts as i64
-                        ; mov [rsp + 32], rax               // fifth Win64 arg
-                        ; mov rax, QWORD heap.regexp_scalar_exec as i64
-                        ; call rax
-                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                        ; cmp rax, r10
-                        ; je => bail                        // pure prefix; replay CallMethod
-                        ; mov [rbx + dreg(dst)], rax        // TRUE success / NULL miss
-                    );
-                    // The helper runs the loop safe point and may alter every
-                    // heap/pin side vector. Re-derive all snapshots before the
-                    // next iteration's direct Array load.
-                    if refetch_pinned {
-                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
-                    }
-                    if let Some((snap, pin_plan)) = ta_refetch {
-                        emit_refetch_ta(&mut ops, snap, pin_plan);
-                    }
-                    emit_region_bail(&mut ops, ip, bail, epilogue);
-                    continue;
-                }
                 // Exact `Object.prototype.hasOwnProperty.call(array, numericKey)`
                 // intrinsic. The helper proves both the `hasOwnProperty`
                 // callable and its inherited `%Function.prototype%.call` slot,
@@ -2202,6 +2409,7 @@ pub(crate) fn compile_region_mem(
                             packed_args,
                             refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                             ta_refetch,
+                            None,
                         );
                     } else {
                         emit_region_call_ic(
@@ -2219,182 +2427,6 @@ pub(crate) fn compile_region_mem(
                         );
                     }
                     dynasm!(ops ; => hasown_done);
-                    continue;
-                }
-                // Pristine primitive-string `matchAll(RegExp)` /
-                // `replace(RegExp, string)`: the helper proves receiver kind,
-                // active main realm, the live metadata-derived String method
-                // slot, and every RegExp protocol dependency before doing any
-                // observable operation. A miss is therefore a pure prefix and
-                // falls through to the unchanged generic call site below.
-                if ((key == "matchAll" && argc == 1) || (key == "replace" && argc == 2))
-                    && crate::vm::string_regexp_call_direct_enabled()
-                {
-                    let srx_slow = ops.new_dynamic_label();
-                    let srx_done = ops.new_dynamic_label();
-                    let srx_bail = ops.new_dynamic_label();
-                    // In the scalar outer plan, a direct-helper miss must
-                    // resume the original CallMethod at 381. Falling through
-                    // to the generic helper could execute observable work and
-                    // then enter scalar protocol guards at 382, violating the
-                    // pure-prefix proof.
-                    let srx_decline = if scalar_matchall.is_some_and(|p| p.call_ip == ip) {
-                        srx_bail
-                    } else {
-                        srx_slow
-                    };
-                    dynasm!(ops
-                        ; mov rcx, rdi                          // vm
-                        ; mov rdx, [rbx + dreg(obj)]            // receiver bits
-                        ; lea r8, [rbx + dreg(arg_base)]        // &args[0..argc]
-                        ; mov r9d, (key == "replace") as i32   // 0 matchAll, 1 replace
-                        ; mov rax, QWORD heap.string_regexp_call_direct as i64
-                        ; call rax
-                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                        ; cmp rax, r10
-                        ; je => srx_decline                     // pure guard miss
-                        ; mov r10, QWORD CALL_THREW as i64
-                        ; cmp rax, r10
-                        ; je => srx_bail                        // committed throw
-                        ; mov [rbx + dreg(dst)], rax
-                    );
-                    // Matcher/iterator/result construction and replacement
-                    // assembly allocate. Re-derive every potentially moved or
-                    // patched pinned/TypedArray snapshot, matching the generic
-                    // method helper's post-call contract.
-                    if refetch_pinned {
-                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
-                    }
-                    if let Some((snap, plan)) = ta_refetch {
-                        emit_refetch_ta(&mut ops, snap, plan);
-                    }
-                    emit_region_bail(&mut ops, ip, srx_bail, epilogue);
-                    dynasm!(ops
-                        ; jmp => srx_done
-                        ; => srx_slow
-                    );
-
-                    let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
-                    let packed_args =
-                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
-                    if let Some(mp) = method_plan.get(&ip) {
-                        emit_inline_method_call(
-                            &mut ops,
-                            ip,
-                            epilogue,
-                            leaf_flag_off,
-                            mp,
-                            obj,
-                            arg_base,
-                            argc,
-                            dst,
-                            heap.call_method_ic,
-                            packed_fip,
-                            packed_args,
-                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
-                            ta_refetch,
-                        );
-                    } else {
-                        emit_region_call_ic(
-                            &mut ops,
-                            ip,
-                            bail,
-                            epilogue,
-                            heap.call_method_ic,
-                            packed_fip,
-                            packed_args,
-                            argc,
-                            dst,
-                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
-                            ta_refetch,
-                        );
-                    }
-                    dynasm!(ops ; => srx_done);
-                    continue;
-                }
-                // Pristine RegExp `test` / `exec`: collapse the generic
-                // CallMethod helper, IC probe, builtin dispatch and native
-                // wrapper into one guarded helper call. The helper reuses the
-                // interpreter's exact per-call intrinsic proofs. A miss has
-                // done no observable work and falls through to the unchanged
-                // generic call emission below; a throw is committed and exits.
-                if matches!(key, "test" | "exec") && crate::vm::regexp_call_direct_enabled() {
-                    let rx_slow = ops.new_dynamic_label();
-                    let rx_done = ops.new_dynamic_label();
-                    let rx_bail = ops.new_dynamic_label();
-                    dynasm!(ops
-                        ; mov rcx, rdi                          // vm
-                        ; mov rdx, [rbx + dreg(obj)]            // receiver bits
-                    );
-                    if argc == 0 {
-                        dynasm!(ops ; mov r8, QWORD Value::UNDEFINED.bits() as i64);
-                    } else {
-                        dynasm!(ops ; mov r8, [rbx + dreg(arg_base)]); // input bits
-                    }
-                    dynasm!(ops
-                        ; mov r9d, (key == "test") as i32       // 0 exec, 1 test
-                        ; mov rax, QWORD heap.regexp_call_direct as i64
-                        ; call rax
-                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                        ; cmp rax, r10
-                        ; je => rx_slow                         // pure guard miss
-                        ; mov r10, QWORD CALL_THREW as i64
-                        ; cmp rax, r10
-                        ; je => rx_bail                         // committed throw
-                        ; mov [rbx + dreg(dst)], rax
-                    );
-                    // Input coercion and `lastIndex.valueOf` can run arbitrary
-                    // user code; exec/result construction allocates. Re-derive
-                    // every potentially moved/patched region snapshot exactly
-                    // as the generic method helper does.
-                    if refetch_pinned {
-                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
-                    }
-                    if let Some((snap, plan)) = ta_refetch {
-                        emit_refetch_ta(&mut ops, snap, plan);
-                    }
-                    emit_region_bail(&mut ops, ip, rx_bail, epilogue);
-                    dynasm!(ops
-                        ; jmp => rx_done
-                        ; => rx_slow
-                    );
-
-                    let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
-                    let packed_args =
-                        ((name as u64) << 32) | ((obj as u64) << 16) | arg_base as u64;
-                    if let Some(mp) = method_plan.get(&ip) {
-                        emit_inline_method_call(
-                            &mut ops,
-                            ip,
-                            epilogue,
-                            leaf_flag_off,
-                            mp,
-                            obj,
-                            arg_base,
-                            argc,
-                            dst,
-                            heap.call_method_ic,
-                            packed_fip,
-                            packed_args,
-                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
-                            ta_refetch,
-                        );
-                    } else {
-                        emit_region_call_ic(
-                            &mut ops,
-                            ip,
-                            bail,
-                            epilogue,
-                            heap.call_method_ic,
-                            packed_fip,
-                            packed_args,
-                            argc,
-                            dst,
-                            refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
-                            ta_refetch,
-                        );
-                    }
-                    dynasm!(ops ; => rx_done);
                     continue;
                 }
                 // ── `s.indexOf(t)` intrinsic ──
@@ -2841,6 +2873,7 @@ pub(crate) fn compile_region_mem(
                             packed_args,
                             refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                             ta_refetch,
+                            None,
                         );
                     } else {
                         emit_region_call_ic(
@@ -2941,7 +2974,7 @@ pub(crate) fn compile_region_mem(
                         emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                     }
                     if let Some((snap, plan)) = ta_refetch {
-                        emit_refetch_ta(&mut ops, snap, plan);
+                        emit_cross_refetch_ta(&mut ops, snap, plan, array_epoch_cache);
                     }
                     dynasm!(ops
                         ; jmp => cross_done
@@ -2973,6 +3006,7 @@ pub(crate) fn compile_region_mem(
                         dst,
                         heap.math_unary,
                         heap.math_two,
+                        heap.math_imul_guard,
                         // v2 body-op helpers (order matches the signature).
                         heap.get_index,
                         heap.char_code_at,
@@ -3002,6 +3036,182 @@ pub(crate) fn compile_region_mem(
                 }
                 if cross {
                     dynasm!(ops ; => cross_done);
+                }
+            }
+            Instr::RegExpMethod {
+                dst,
+                op,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+            } => {
+                use crate::bytecode::RegExpMethod as R;
+
+                if let Some(plan) = scalar_exec.filter(|p| p.call_ip == ip) {
+                    debug_assert_eq!(op, R::Exec);
+                    debug_assert_eq!(argc, 1);
+                    debug_assert_eq!(callee, plan.callee_reg);
+                    debug_assert_eq!(this_v, plan.re_reg);
+                    debug_assert_eq!(arg_base, plan.input_reg);
+                    debug_assert_eq!(dst, plan.call_result_reg);
+                    let packed_inputs =
+                        ((callee as u64) << 32) | ((this_v as u64) << 16) | arg_base as u64;
+                    let packed_dsts = plan
+                        .tonum_dsts
+                        .iter()
+                        .enumerate()
+                        .fold(0u64, |bits, (g, &reg)| bits | ((reg as u64) << (16 * g)));
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, rbx
+                        ; mov r8, QWORD packed_inputs as i64
+                        ; mov r9, QWORD packed_dsts as i64
+                        ; mov rax, QWORD heap.regexp_scalar_exec as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail                        // pure prefix; replay RegExpMethod
+                        ; mov [rbx + dreg(dst)], rax        // TRUE success / NULL miss
+                    );
+                    // The helper runs the loop safe point and may alter every
+                    // heap/pin side vector. Re-derive all snapshots before the
+                    // next iteration's direct Array load.
+                    if refetch_pinned {
+                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                    }
+                    if let Some((snap, pin_plan)) = ta_refetch {
+                        emit_refetch_ta(&mut ops, snap, pin_plan);
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                    continue;
+                }
+
+                let direct_on = match op {
+                    R::Test | R::Exec => crate::vm::regexp_call_direct_enabled(),
+                    R::MatchAll if argc >= 1 => crate::vm::string_regexp_call_direct_enabled(),
+                    R::Replace if argc >= 2 => crate::vm::string_regexp_call_direct_enabled(),
+                    _ => false,
+                };
+                let done = ops.new_dynamic_label();
+                if direct_on {
+                    let slow = ops.new_dynamic_label();
+                    let direct_bail = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(this_v)]
+                    );
+                    match op {
+                        R::Test | R::Exec => {
+                            if argc == 0 {
+                                dynasm!(ops ; mov r8, QWORD Value::UNDEFINED.bits() as i64);
+                            } else {
+                                dynasm!(ops ; mov r8, [rbx + dreg(arg_base)]);
+                            }
+                            dynasm!(ops
+                                ; mov r9d, (op == R::Test) as i32
+                                ; mov rax, QWORD heap.regexp_call_direct as i64
+                            );
+                        }
+                        R::MatchAll | R::Replace => dynasm!(ops
+                            ; lea r8, [rbx + dreg(arg_base)]
+                            ; mov r9d, (op == R::Replace) as i32
+                            ; mov rax, QWORD heap.string_regexp_call_direct as i64
+                        ),
+                    }
+                    dynasm!(ops
+                        ; mov r10, [rbx + dreg(callee)]
+                        ; mov [rsp + 32], r10               // captured callee (5th arg)
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => slow                        // pure exact-guard miss
+                        ; mov r10, QWORD CALL_THREW as i64
+                        ; cmp rax, r10
+                        ; je => direct_bail                 // committed throw
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    if refetch_pinned {
+                        emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
+                    }
+                    if let Some((snap, plan)) = ta_refetch {
+                        emit_refetch_ta(&mut ops, snap, plan);
+                    }
+                    emit_region_bail(&mut ops, ip, direct_bail, epilogue);
+                    dynasm!(ops
+                        ; jmp => done
+                        ; => slow
+                    );
+                }
+
+                // Direct decline and disabled modes ordinary-call the exact
+                // captured pair, never a spelling-based member lookup.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let packed_args =
+                    ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
+                emit_region_call_ic(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    crate::vm::jit_call_with_this_ic as usize,
+                    packed_fip,
+                    packed_args,
+                    argc,
+                    dst,
+                    refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                    ta_refetch,
+                );
+                dynasm!(ops ; => done);
+            }
+            Instr::CallWithThis {
+                dst,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+            } => {
+                // The callee and receiver were captured by the preceding
+                // reference evaluation. A method plan may inline its exact
+                // target, but guards `callee` in addition to the receiver and
+                // member structure. Every miss falls through to the exact
+                // CallWithThis helper; it must never re-resolve by name.
+                let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
+                let packed_args =
+                    ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
+                if let Some(mp) = method_plan.get(&ip) {
+                    debug_assert_eq!(mp.captured_callee, Some(callee));
+                    emit_inline_method_call(
+                        &mut ops,
+                        ip,
+                        epilogue,
+                        leaf_flag_off,
+                        mp,
+                        this_v,
+                        arg_base,
+                        argc,
+                        dst,
+                        crate::vm::jit_call_with_this_ic as usize,
+                        packed_fip,
+                        packed_args,
+                        refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                        ta_refetch,
+                        None,
+                    );
+                } else {
+                    emit_region_call_ic(
+                        &mut ops,
+                        ip,
+                        bail,
+                        epilogue,
+                        crate::vm::jit_call_with_this_ic as usize,
+                        packed_fip,
+                        packed_args,
+                        argc,
+                        dst,
+                        refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
+                        ta_refetch,
+                    );
                 }
             }
             Instr::StrConcat { dst, a, b } => {
@@ -3278,14 +3488,19 @@ pub(crate) fn compile_region_mem(
             Instr::StaticFn {
                 dst,
                 op,
+                callee,
+                this_v,
                 arg_base,
                 argc: _,
             } => {
                 // Bounded set (admission gated argc == 1). PromiseResolve
                 // ALLOCATES ⇒ the StrConcat discipline: re-derive r13 (and the
-                // TA snapshots) after the call; no user code ⇒ r14 safe. A
-                // heap argument returns the deopt sentinel and the interpreter
-                // runs the full identity/thenable protocol at this ip.
+                // TA snapshots) after the call; no user code ⇒ r14 safe. The
+                // helper first validates the pre-argument callee+receiver
+                // snapshots. An identity miss or a heap Promise.resolve argument
+                // returns the deopt sentinel; the interpreter re-enters at this
+                // op using those already-captured values (it never repeats the
+                // property Get or argument side effects).
                 use crate::bytecode::StaticFn as S;
                 let code: u32 = match op {
                     S::PromiseResolve => 0,
@@ -3298,7 +3513,10 @@ pub(crate) fn compile_region_mem(
                 dynasm!(ops
                     ; mov rcx, rdi                        // vm
                     ; mov edx, code as i32                // op code (helper's own map)
-                    ; mov r8, [rbx + dreg(arg_base)]      // a0 bits
+                    ; mov r8, [rbx + dreg(callee)]        // captured callee bits
+                    ; mov r9, [rbx + dreg(this_v)]        // captured receiver bits
+                    ; mov rax, [rbx + dreg(arg_base)]     // a0 bits (fifth Win64 arg)
+                    ; mov [rsp + 32], rax
                     ; mov rax, QWORD heap.static_fn as i64
                     ; call rax
                     ; mov r10, QWORD SELF_CALL_DEOPT as i64
@@ -3402,11 +3620,13 @@ pub(crate) fn compile_region_mem(
                 next,
             } => {
                 if let Some(plan) = scalar_matchall.filter(|p| p.iter_next_ip == ip) {
-                    // Eight admission-proved u16 operands in the fourth/fifth
-                    // Win64 arguments. Besides avoiding another stack slot
-                    // (TA pins start immediately above the existing one), the
-                    // second pack gives the helper enough context to collapse
-                    // the remaining OUTER dense-string-array scan in one call.
+                    // Three admission-proved register indices plus eight u16
+                    // operands in the fourth/fifth Win64 arguments. Reading
+                    // the iterator, primed next method, and exact captured
+                    // matchAll callee from the frame after the helper's GC safe
+                    // point keeps every input traced without another stack slot.
+                    let iter_next_callee =
+                        ((iter as u64) << 32) | ((next as u64) << 16) | plan.callee_reg as u64;
                     let result_capture_count_sum = ((plan.result_global as u64) << 48)
                         | ((plan.capture as u64) << 32)
                         | ((plan.count_global as u64) << 16)
@@ -3417,8 +3637,8 @@ pub(crate) fn compile_region_mem(
                         | plan.re_global as u64;
                     dynasm!(ops
                         ; mov rcx, rdi
-                        ; mov rdx, [rbx + dreg(iter)]
-                        ; mov r8, [rbx + dreg(next)]
+                        ; mov rdx, rbx
+                        ; mov r8, QWORD iter_next_callee as i64
                         ; mov r9, QWORD result_capture_count_sum as i64
                         ; mov rax, QWORD i_n_lines_re as i64
                         ; mov [rsp + 32], rax
@@ -3892,15 +4112,18 @@ pub(crate) struct Cross3Invoke {
 /// in `r10d` and its Value bits in `rax`; the caller's guard prefix has
 /// already proven the fid. The 64-byte stack scratch at `c3` holds: prior
 /// activation (24B) @ +0, window base|flags @ +24, result @ +32, bail slot
-/// @ +40, callee bits @ +48.
+/// @ +40, callee bits @ +48, and either the checked native entry (incumbent)
+/// or B244's region-lifetime dense-Array snapshot epoch @ +56.
 ///
-/// `jit_cross3_enter` opens the window AND installs the callee's activation
-/// (duplicating a frame-free-active prior on the GC root stack -- bit 1 of
-/// its return says so, and `jit_cross3_unroot` pops the duplicate after the
-/// inline restore). On the mid-body-bail path the `cross3_finish` helper
+/// The B243 fast path opens/closes an already-initialised window and installs
+/// the callee activation inline. It falls back before mutation when the window
+/// is not contiguous, reaches new high-water ground, or the root stack is full.
+/// The old
+/// `jit_cross3_enter`/`jit_cross3_unroot`/`jit_window_close` helpers remain the
+/// exact kill-switch and fallback path. On a mid-body bail, `cross3_finish`
 /// COMPLETES the call (B184: effects have happened; interpreter resume over
-/// the same window, never a replay); `CALL_THREW` unwinds via the region
-/// bail label exactly like the helper route.
+/// the same window, never a replay); `CALL_THREW` unwinds via the region bail
+/// label exactly like the helper route.
 #[allow(clippy::too_many_arguments)]
 fn emit_cross3_invoke(
     ops: &mut dynasmrt::x64::Assembler,
@@ -3916,10 +4139,25 @@ fn emit_cross3_invoke(
         JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_TABLE_RAW_OFFSET,
         JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_GC_REQUESTED_OFFSET, JIT_GC_STRESS_OFFSET,
         JIT_GLOBAL_ROUTE_EPOCH_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
-        JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_THIS_MIRROR_RAW_OFFSET,
+        JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_REGS_HW_OFFSET, JIT_REGS_LEN_OFFSET,
+        JIT_REGS_PTR_OFFSET, JIT_ROOT_DEPTH_OFFSET, JIT_ROOT_SLOTS_OFFSET,
+        JIT_THIS_MIRROR_RAW_OFFSET, JIT_UPVALS_MIRROR_RAW_OFFSET,
     };
+    let inline_regs = crate::codegen::cross3_inline_enabled();
+    let fill_counter = inline_regs
+        .then(|| crate::vm::crossstats::stats_enabled())
+        .filter(|enabled| *enabled)
+        .map(|_| crate::vm::crossstats::fill_fast_counter_addr());
+    let root_counter = inline_regs
+        .then(|| crate::vm::activationrootstats::stats_enabled())
+        .filter(|enabled| *enabled)
+        .map(|_| crate::vm::activationrootstats::nested_counter_addr());
+    let array_epoch_cache =
+        ta_refetch.and_then(|(_, plan)| cross_array_epoch_cache_off(iv.c3, plan));
     let zeroed = ops.new_dynamic_label();
     let noroot = ops.new_dynamic_label();
+    let inline_noroot = ops.new_dynamic_label();
+    let inline_entered = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
     let act = JIT_ACTIVATION_OFFSET as i32;
     let depth = JIT_CALL_DEPTH_OFFSET as i32;
@@ -3944,7 +4182,15 @@ fn emit_cross3_invoke(
         ; mov r11, [r11 + (iv.fid as i32) * 16]
         ; test r11, r11
         ; jz => fb
-        ; mov [rsp + iv.c3 + 56], r11
+    );
+    if array_epoch_cache.is_none() {
+        dynasm!(ops
+            // The incumbent B243 spelling keeps the checked entry in the
+            // scratch tail. B244 uses that word for its epoch cache instead.
+            ; mov [rsp + iv.c3 + 56], r11
+        );
+    }
+    dynasm!(ops
         ; mov r11, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
         ; cmp DWORD [r11 + (iv.fid as i32) * 16 + 8], iv.mask_gen as i32
         ; jne => fb
@@ -3954,24 +4200,102 @@ fn emit_cross3_invoke(
         ; jne => fb
         ; cmp BYTE [rdi + JIT_GC_STRESS_OFFSET as i32], 0
         ; jne => fb
-        // -- save the prior activation (three qwords), then enter: window +
-        // callee activation install in one helper (root-stack aware) --
+        // Save the prior activation (three qwords). The inline and helper
+        // entry paths share the same restore record.
         ; mov r11, [rdi + act]
         ; mov [rsp + c3], r11
         ; mov r11, [rdi + act + 8]
         ; mov [rsp + c3 + 8], r11
         ; mov r11, [rdi + act + 16]
         ; mov [rsp + c3 + 16], r11
-        ; mov rcx, rdi
-        ; lea rdx, [rbx + dreg(iv.caller_regs)]
-        ; mov r8d, iv.callee_regs as i32
-        ; mov r9d, r10d
-        ; mov rax, QWORD heap.cross3_enter as i64
-        ; call rax
-        ; test rax, rax
-        ; jz => fb
-        ; mov [rsp + c3 + 24], rax
-        // Re-derive the callee idx from the stashed bits (r10 died).
+    );
+    if inline_regs {
+        let regs_ptr = JIT_REGS_PTR_OFFSET as i32;
+        let regs_len = JIT_REGS_LEN_OFFSET as i32;
+        dynasm!(ops
+            // Prove the caller occupies the top of the live register prefix. Nothing has
+            // been mutated yet, so every decline can replay through `fb`.
+            ; mov r11, [rdi + regs_ptr]
+            ; mov r8, [rdi + regs_len]
+            ; lea rdx, [r11 + r8 * 8]
+            ; lea rcx, [rbx + dreg(iv.caller_regs)]
+            ; cmp rdx, rcx
+            ; jne => fb
+            // Inline only the steady-state set_len arm. New high-water ground
+            // retains the helper's full resize/zero-fill implementation.
+            ; add r8, iv.callee_regs as i32
+            ; cmp r8, [rdi + JIT_REGS_HW_OFFSET as i32]
+            ; ja => fb
+            ; mov [rsp + c3 + 24], rdx
+            // A frame-free prior needs a visible duplicate while the callee
+            // runs. High-water and root capacity are checked before mutation.
+            ; cmp WORD [rdi + act], 0x0101
+            ; jne => inline_noroot
+            ; cmp DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32],
+                crate::vm::TIER_C_ACTIVATION_ROOT_STACK_MAX as i32
+            ; jae => fb
+            ; or BYTE [rsp + c3 + 24], 2
+            ; => inline_noroot
+            // Expose the already-initialised window.
+            ; mov [rdi + regs_len], r8
+            ; test BYTE [rsp + c3 + 24], 2
+            ; jz => inline_entered
+            // slots[depth] = prior. 24 bytes/slot = (depth * 3) * 8.
+            ; mov eax, DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32]
+            ; lea rcx, [rax + rax * 2]
+            ; lea rcx, [rdi + rcx * 8 + JIT_ROOT_SLOTS_OFFSET as i32]
+            ; mov r11, [rsp + c3]
+            ; mov [rcx], r11
+            ; mov r11, [rsp + c3 + 8]
+            ; mov [rcx + 8], r11
+            ; mov r11, [rsp + c3 + 16]
+            ; mov [rcx + 16], r11
+            ; inc DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32]
+        );
+        if let Some(addr) = root_counter {
+            dynasm!(ops
+                ; mov rax, QWORD addr as i64
+                ; lock inc QWORD [rax]
+            );
+        }
+        dynasm!(ops
+            ; => inline_entered
+            // active=1, frame_free=1, closure=r10d; callee=r10d; then the
+            // live closure's fixed upvalue-list base from its dense mirror.
+            ; mov r11, r10
+            ; shl r11, 32
+            ; or r11, 0x0101
+            ; mov [rdi + act], r11
+            ; mov r11d, r10d
+            ; mov [rdi + act + 8], r11
+            ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+            ; mov r11, [r11 + r10 * 8]
+            ; mov [rdi + act + 16], r11
+        );
+        if let Some(addr) = fill_counter {
+            dynasm!(ops
+                ; mov rax, QWORD addr as i64
+                ; lock inc QWORD [rax]
+            );
+        }
+    } else {
+        dynasm!(ops
+            // Pre-B243 helper entry: window open plus root-stack-aware
+            // activation install. Kept byte-for-byte as the kill switch.
+            ; mov rcx, rdi
+            ; lea rdx, [rbx + dreg(iv.caller_regs)]
+            ; mov r8d, iv.callee_regs as i32
+            ; mov r9d, r10d
+            ; mov rax, QWORD heap.cross3_enter as i64
+            ; call rax
+            ; test rax, rax
+            ; jz => fb
+            ; mov [rsp + c3 + 24], rax
+        );
+    }
+    dynasm!(ops
+        // Re-derive the callee idx from the stashed bits (the helper call, or
+        // optional stats counter maintenance, may have consumed rax).
         ; mov rax, [rsp + c3 + 48]
         ; mov r10d, eax
         // -- window fill: this, args, then the may-read-before-write mask --
@@ -4032,7 +4356,22 @@ fn emit_cross3_invoke(
         ; mov rcx, r9
         ; lea rdx, [rsp + c3 + 40]
         ; mov r8, rdi
-        ; mov rax, [rsp + iv.c3 + 56]
+    );
+    if array_epoch_cache.is_some() {
+        dynasm!(ops
+            // The VM is single-mutator and no routing mutation occurs between
+            // the entry/mask guard above and this reload. The optional legacy
+            // enter helper changes only window/activation state. Re-reading the
+            // live table frees the scratch tail for B244's epoch cache.
+            ; mov rax, [rdi + JIT_CROSS_TABLE_RAW_OFFSET as i32]
+            ; mov rax, [rax + (iv.fid as i32) * 16]
+        );
+    } else {
+        dynasm!(ops
+            ; mov rax, [rsp + iv.c3 + 56]
+        );
+    }
+    dynasm!(ops
         ; call rax
         ; mov [rsp + c3 + 32], rax
         // -- restore the caller activation inline; pop the root-stack
@@ -4045,20 +4384,47 @@ fn emit_cross3_invoke(
         ; mov [rdi + act + 16], r11
         ; test BYTE [rsp + c3 + 24], 2
         ; jz => noroot
-        ; mov rcx, rdi
-        ; mov rax, QWORD heap.cross3_unroot as i64
-        ; call rax
+    );
+    if inline_regs {
+        dynasm!(ops
+            ; dec DWORD [rdi + JIT_ROOT_DEPTH_OFFSET as i32]
+        );
+    } else {
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rax, QWORD heap.cross3_unroot as i64
+            ; call rax
+        );
+    }
+    dynasm!(ops
         ; => noroot
         ; mov r10d, [rsp + c3 + 40]
         ; cmp r10d, crate::codegen::NO_BAIL as i32
         ; jne => slow
         // -- clean native return --
         ; dec DWORD [rdi + depth]
-        ; mov rcx, rdi
         ; mov rdx, [rsp + c3 + 24]
         ; and rdx, -4
-        ; mov rax, QWORD heap.window_close as i64
-        ; call rax
+    );
+    if inline_regs {
+        let regs_ptr = JIT_REGS_PTR_OFFSET as i32;
+        let regs_len = JIT_REGS_LEN_OFFSET as i32;
+        dynasm!(ops
+            // Logical truncate: backing Values stay initialized and inactive,
+            // so restoring the explicit length is the whole operation.
+            ; mov r11, [rdi + regs_ptr]
+            ; sub rdx, r11
+            ; shr rdx, 3
+            ; mov [rdi + regs_len], rdx
+        );
+    } else {
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov rax, QWORD heap.window_close as i64
+            ; call rax
+        );
+    }
+    dynasm!(ops
         ; mov rax, [rsp + c3 + 32]
         ; mov [rbx + dreg(iv.dst)], rax
     );
@@ -4066,7 +4432,7 @@ fn emit_cross3_invoke(
         emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));
     }
     if let Some((snap, plan_ta)) = ta_refetch {
-        emit_refetch_ta(ops, snap, plan_ta);
+        emit_cross_refetch_ta(ops, snap, plan_ta, array_epoch_cache);
     }
     dynasm!(ops
         ; jmp => cross_done
@@ -4093,11 +4459,10 @@ fn emit_cross3_invoke(
         emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));
     }
     if let Some((snap, plan_ta)) = ta_refetch {
-        emit_refetch_ta(ops, snap, plan_ta);
+        emit_cross_refetch_ta(ops, snap, plan_ta, array_epoch_cache);
     }
     dynasm!(ops
         ; jmp => cross_done
         ; => fb
     );
 }
-

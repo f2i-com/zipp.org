@@ -147,6 +147,12 @@ pub(crate) const DYNAMIC_FUNCTIONS_MSG: &str =
     "RangeError: dynamic code exceeded its retained-function limit";
 pub(crate) const DYNAMIC_CLASSES_MSG: &str =
     "RangeError: dynamic code exceeded its retained-class limit";
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const REGEX_STEPS_MSG: &str =
+    "RangeError: regular expression exceeded its execution budget";
+#[cfg(feature = "safe-sandbox")]
+pub(crate) const REGEX_MEMORY_MSG: &str =
+    "RangeError: regular expression exceeded its backtrack memory budget";
 
 /// The first resource ceiling an instrumented VM actually attempted to cross.
 ///
@@ -167,6 +173,10 @@ pub(crate) enum ResourceExhaustion {
     DynamicCalls,
     DynamicFunctions,
     DynamicClasses,
+    #[cfg(feature = "safe-sandbox")]
+    RegexSteps,
+    #[cfg(feature = "safe-sandbox")]
+    RegexMemory,
 }
 
 impl ResourceExhaustion {
@@ -181,6 +191,10 @@ impl ResourceExhaustion {
             Self::DynamicCalls => DYNAMIC_CALLS_MSG,
             Self::DynamicFunctions => DYNAMIC_FUNCTIONS_MSG,
             Self::DynamicClasses => DYNAMIC_CLASSES_MSG,
+            #[cfg(feature = "safe-sandbox")]
+            Self::RegexSteps => REGEX_STEPS_MSG,
+            #[cfg(feature = "safe-sandbox")]
+            Self::RegexMemory => REGEX_MEMORY_MSG,
         }
     }
 }
@@ -488,7 +502,206 @@ fn blank(row: &mut TraceStep) {
 /// The result of a metering check: `Err` stops the script.
 pub(crate) type Tick = Result<(), &'static str>;
 
+/// A scoped charge for native RegExp result storage that survives across a
+/// guest callback. The counter is shared instead of borrowed so the callback
+/// may freely re-enter the same VM; dropping this guard releases the charge on
+/// success, error propagation, and panic unwinding alike.
+#[cfg(feature = "safe-sandbox")]
+pub(crate) struct RegexTransientReservation {
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    bytes: usize,
+}
+
+#[cfg(feature = "safe-sandbox")]
+impl Drop for RegexTransientReservation {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let previous = self.counter.fetch_sub(self.bytes, Ordering::Relaxed);
+        debug_assert!(
+            previous >= self.bytes,
+            "RegExp transient-memory reservation underflow"
+        );
+    }
+}
+
 impl super::Vm<'_> {
+    /// Derive one regex search's hard ceilings. The fixed ceilings stop
+    /// catastrophic backtracking even when the host left its VM budgets
+    /// unlimited; finite VM budgets tighten them so transient backtrack
+    /// storage cannot hide outside `heap_bytes()` and regex work cannot spend
+    /// more gas than remains.
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) fn instrument_regex_limits(&self) -> regress::MatchLimits {
+        use std::sync::atomic::Ordering;
+
+        let mut limits = regress::MatchLimits::SANDBOX;
+        // `heap_bytes()` deliberately measures VM-owned resident storage, not
+        // Rust locals in an outer regex operation. Subtract their scoped
+        // reservation independently from the fixed regex ceiling so nesting is
+        // bounded even when the embedder left its heap limit unlimited.
+        let transient = self.regex_transient_bytes.load(Ordering::Relaxed);
+        limits.max_memory_bytes = limits.max_memory_bytes.saturating_sub(transient);
+        limits.max_backtrack_bytes = limits.max_backtrack_bytes.min(limits.max_memory_bytes);
+        let Some(rec) = self.instr_rec.as_ref() else {
+            return limits;
+        };
+        if rec.remaining != i64::MAX {
+            limits.max_steps = limits.max_steps.min(rec.remaining.max(0) as u64);
+        }
+        if rec.heap_limit != usize::MAX {
+            let headroom = rec
+                .heap_limit
+                .saturating_sub(self.heap_bytes())
+                .saturating_sub(transient);
+            limits.max_memory_bytes = limits.max_memory_bytes.min(headroom);
+            limits.max_backtrack_bytes = limits.max_backtrack_bytes.min(limits.max_memory_bytes);
+        }
+        limits
+    }
+
+    /// Replacement retains every match before invoking a functional replacer.
+    /// Split the same transient/headroom ceiling between executor-owned state
+    /// (including capture buffers) and the outer `Vec<Match>`, so the two Rust
+    /// allocation families cannot each consume the full allowance.
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) fn instrument_regex_collection_limits(&self) -> (regress::MatchLimits, usize) {
+        let mut limits = self.instrument_regex_limits();
+        let output_bytes = limits.max_memory_bytes / 2;
+        limits.max_memory_bytes -= output_bytes;
+        limits.max_backtrack_bytes = limits.max_backtrack_bytes.min(limits.max_memory_bytes);
+        (limits, output_bytes)
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    fn instrument_charge_regex_transient(&mut self, bytes: usize) -> Tick {
+        use std::sync::atomic::Ordering;
+
+        if let Some(message) = self
+            .instr_rec
+            .as_ref()
+            .and_then(|rec| rec.terminal_message())
+        {
+            return Err(message);
+        }
+
+        let current = self.regex_transient_bytes.load(Ordering::Relaxed);
+        let fixed_available = regress::MatchLimits::SANDBOX
+            .max_memory_bytes
+            .saturating_sub(current);
+        let heap_limit = self
+            .instr_rec
+            .as_ref()
+            .map_or(usize::MAX, |rec| rec.heap_limit);
+        let heap_available = if heap_limit == usize::MAX {
+            usize::MAX
+        } else {
+            heap_limit
+                .saturating_sub(self.heap_bytes())
+                .saturating_sub(current)
+        };
+        if bytes > fixed_available.min(heap_available) {
+            return Err(self.instrument_regex_memory_exhausted());
+        }
+
+        // `bytes <= usize::MAX - current` follows from the fixed-allowance
+        // comparison above (the fixed allowance is at most 16 MiB).
+        self.regex_transient_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Reserve completed native match storage before any coercion or
+    /// functional replacer can call back into RegExp. The allocation already
+    /// obeyed the per-collection split limit; this second, scoped accounting is
+    /// what makes that allocation visible to nested searches.
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) fn instrument_reserve_regex_transient(
+        &mut self,
+        bytes: usize,
+    ) -> Result<RegexTransientReservation, &'static str> {
+        let counter = std::sync::Arc::clone(&self.regex_transient_bytes);
+        self.instrument_charge_regex_transient(bytes)?;
+        Ok(RegexTransientReservation { counter, bytes })
+    }
+
+    /// Extend a scoped reservation when a retained result Vec grows between
+    /// observable `exec` calls. Capacity growth is charged before the next
+    /// guest re-entry; the guard releases the aggregate allocation at exit.
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) fn instrument_grow_regex_transient(
+        &mut self,
+        reservation: &mut RegexTransientReservation,
+        bytes: usize,
+    ) -> Tick {
+        debug_assert!(std::sync::Arc::ptr_eq(
+            &reservation.counter,
+            &self.regex_transient_bytes
+        ));
+        self.instrument_charge_regex_transient(bytes)?;
+        reservation.bytes = reservation
+            .bytes
+            .checked_add(bytes)
+            .expect("RegExp transient reservation is capped below usize::MAX");
+        Ok(())
+    }
+
+    /// Return an unused part of a provisional allocation charge. Callers use
+    /// this after `try_reserve_exact`/string construction to reconcile the
+    /// conservative preflight with the allocator's actual retained capacity.
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) fn instrument_shrink_regex_transient(
+        &mut self,
+        reservation: &mut RegexTransientReservation,
+        bytes: usize,
+    ) {
+        use std::sync::atomic::Ordering;
+
+        debug_assert!(std::sync::Arc::ptr_eq(
+            &reservation.counter,
+            &self.regex_transient_bytes
+        ));
+        assert!(
+            bytes <= reservation.bytes,
+            "RegExp transient-memory reservation shrink underflow"
+        );
+        reservation.bytes -= bytes;
+        let previous = reservation.counter.fetch_sub(bytes, Ordering::Relaxed);
+        assert!(
+            previous >= bytes,
+            "RegExp transient-memory counter shrink underflow"
+        );
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) fn instrument_regex_memory_exhausted(&mut self) -> &'static str {
+        let cause = ResourceExhaustion::RegexMemory;
+        match self.instr_rec.as_mut() {
+            Some(rec) => rec.exhaust(cause),
+            None => cause.message(),
+        }
+    }
+
+    /// Reconcile completed regex work with the VM recorder before any match
+    /// result becomes observable. A regex-local ceiling is a sticky host
+    /// resource failure, not a catchable JS exception that can be ignored.
+    #[cfg(feature = "safe-sandbox")]
+    pub(crate) fn instrument_regex_usage(&mut self, usage: regress::MatchUsage) -> Tick {
+        self.charge_steps(usage.steps.min(i64::MAX as u64) as i64);
+        let cause = match usage.exhaustion {
+            None => return Ok(()),
+            Some(regress::MatchLimitError::Steps) => ResourceExhaustion::RegexSteps,
+            Some(regress::MatchLimitError::BacktrackMemory) => ResourceExhaustion::RegexMemory,
+        };
+        if cause == ResourceExhaustion::RegexMemory {
+            Err(self.instrument_regex_memory_exhausted())
+        } else {
+            match self.instr_rec.as_mut() {
+                Some(rec) => Err(rec.exhaust(cause)),
+                None => Err(cause.message()),
+            }
+        }
+    }
+
     /// Reject a known contiguous allocation before asking the global allocator
     /// for it. The periodic full-heap scan remains the backstop for aggregate
     /// growth, while this closes the single-allocation overshoot that otherwise
@@ -1184,7 +1397,9 @@ fn classify(instr: &Instr) -> (u8, Claim, Option<u16>, Option<u16>, u64, Option<
         }
 
         // ── calls and returns ──
-        Call { dst, callee, .. } | CallWithThis { dst, callee, .. } => {
+        Call { dst, callee, .. }
+        | CallWithThis { dst, callee, .. }
+        | RegExpMethod { dst, callee, .. } => {
             (op::CALL, Claim::Call, Some(callee), None, 0, Some(dst))
         }
         New { dst, callee, .. } => (op::CALL, Claim::Call, Some(callee), None, 0, Some(dst)),
@@ -1259,6 +1474,49 @@ mod tests {
         rec.remaining = 1_000_000;
         vm.set_instrumentation(rec);
         vm
+    }
+
+    #[cfg(feature = "safe-sandbox")]
+    #[test]
+    fn regex_transient_reservations_are_nested_and_scoped() {
+        fn return_early(vm: &mut crate::vm::Vm<'_>, bytes: usize) -> Tick {
+            let _reservation = vm.instrument_reserve_regex_transient(bytes)?;
+            Err("sentinel")
+        }
+
+        let mut vm = instrumented_vm("");
+        let full = regress::MatchLimits::SANDBOX.max_memory_bytes;
+        let first_bytes = 64 * 1024;
+        let second_bytes = 32 * 1024;
+        let first = vm
+            .instrument_reserve_regex_transient(first_bytes)
+            .expect("first reservation fits");
+        assert_eq!(
+            vm.instrument_regex_limits().max_memory_bytes,
+            full - first_bytes
+        );
+        {
+            let _second = vm
+                .instrument_reserve_regex_transient(second_bytes)
+                .expect("nested reservation fits");
+            assert_eq!(
+                vm.instrument_regex_limits().max_memory_bytes,
+                full - first_bytes - second_bytes
+            );
+        }
+        assert_eq!(
+            vm.instrument_regex_limits().max_memory_bytes,
+            full - first_bytes
+        );
+        drop(first);
+        assert_eq!(vm.instrument_regex_limits().max_memory_bytes, full);
+
+        assert_eq!(return_early(&mut vm, first_bytes), Err("sentinel"));
+        assert_eq!(
+            vm.instrument_regex_limits().max_memory_bytes,
+            full,
+            "an early return must drop and release the reservation"
+        );
     }
 
     /// The opcode numbers are a wire contract with the prover crate. Change one

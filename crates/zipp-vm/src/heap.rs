@@ -1055,26 +1055,40 @@ pub struct ObjMap {
 /// eventual free — the attributed bulk of the object build floor
 /// (B187-scout: 80ns/object of pure construction against node's ~4).
 ///
-/// CONTAINMENT INVARIANT (what makes the raw base sound): the `Slab` variant
+/// CONTAINMENT INVARIANT (what makes the raw addresses sound): the `Slab` variant
 /// is ONLY ever constructed by [`Heap::alloc_finalized`] and only ever lives
 /// inside a heap slot; every path that removes such an object from its slot
 /// (`free_slot`, `replace`) returns the cell to the slab first, the courier
 /// never ships it, and VM teardown frees the chunks wholesale. The base
 /// pointer aims into a `Box<[Value; VAL_SLAB_CHUNK]>` the heap owns for its
-/// whole life — chunk boxes never move or shrink. A structural growth
-/// (key add) SPILLS to the `Vec` form before pushing; the key-add version
-/// bump already invalidates every cached `vals` pointer, which is exactly
-/// the discipline the mirrors and identity ways rely on today.
+/// whole life — chunk boxes never move or shrink. The owner pointer aims at
+/// one class in the heap's boxed class array, which likewise never moves even
+/// if its `Heap`/`Vm` does. A structural mutation SPILLS to the `Vec` form,
+/// publishes that replacement, and only then returns the old cell through its
+/// exact owner. The caller's version bump already invalidates every cached
+/// `vals` pointer, which is exactly the discipline the mirrors and identity
+/// ways rely on today.
 enum ValStore {
     Vec(Vec<Value>),
-    /// `base` is a `*mut Value` stored as `usize` (the containment invariant
-    /// above is the Send/aliasing argument; the heap is single-threaded and
-    /// slab objects never cross threads). Compiled OUT of the hardened
-    /// `safe-sandbox` build, which forbids `unsafe` — that build always
-    /// takes the `Vec` form.
+    /// `base` and the owner address are exposed-provenance pointers stored as
+    /// integers. The owner's low five (alignment-guaranteed zero) address bits
+    /// carry `len` 1..=16, keeping this variant at two machine words and the
+    /// whole enum at the 24-byte `Vec` size. The containment invariant above
+    /// is the Send/aliasing argument: the heap is single-threaded and slab
+    /// objects never cross threads. Compiled OUT of the hardened
+    /// `safe-sandbox` build, which forbids `unsafe`; that build always takes
+    /// the `Vec` form.
     #[cfg(not(feature = "safe-sandbox"))]
-    Slab { base: usize, len: u16, class: u8 },
+    Slab {
+        base: usize,
+        owner_and_len: usize,
+    },
 }
+
+#[cfg(not(feature = "safe-sandbox"))]
+const VAL_SLAB_OWNER_LEN_BITS: usize = 5;
+#[cfg(not(feature = "safe-sandbox"))]
+const VAL_SLAB_OWNER_LEN_MASK: usize = (1 << VAL_SLAB_OWNER_LEN_BITS) - 1;
 
 impl ValStore {
     #[inline]
@@ -1082,7 +1096,7 @@ impl ValStore {
         match self {
             ValStore::Vec(v) => v.len(),
             #[cfg(not(feature = "safe-sandbox"))]
-            ValStore::Slab { len, .. } => *len as usize,
+            ValStore::Slab { owner_and_len, .. } => owner_and_len & VAL_SLAB_OWNER_LEN_MASK,
         }
     }
 
@@ -1094,8 +1108,14 @@ impl ValStore {
             // heap-owned, immovable chunk with at least `len` initialized
             // slots (alloc_finalized wrote them before publishing).
             #[cfg(not(feature = "safe-sandbox"))]
-            ValStore::Slab { base, len, .. } => unsafe {
-                std::slice::from_raw_parts(*base as *const Value, *len as usize)
+            ValStore::Slab {
+                base,
+                owner_and_len,
+            } => unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::with_exposed_provenance::<Value>(*base),
+                    owner_and_len & VAL_SLAB_OWNER_LEN_MASK,
+                )
             },
         }
     }
@@ -1106,8 +1126,14 @@ impl ValStore {
             ValStore::Vec(v) => v,
             // SAFETY: as `as_slice`, plus exclusive access via `&mut self`.
             #[cfg(not(feature = "safe-sandbox"))]
-            ValStore::Slab { base, len, .. } => unsafe {
-                std::slice::from_raw_parts_mut(*base as *mut Value, *len as usize)
+            ValStore::Slab {
+                base,
+                owner_and_len,
+            } => unsafe {
+                std::slice::from_raw_parts_mut(
+                    std::ptr::with_exposed_provenance_mut::<Value>(*base),
+                    *owner_and_len & VAL_SLAB_OWNER_LEN_MASK,
+                )
             },
         }
     }
@@ -1117,7 +1143,7 @@ impl ValStore {
         match self {
             ValStore::Vec(v) => v.as_ptr(),
             #[cfg(not(feature = "safe-sandbox"))]
-            ValStore::Slab { base, .. } => *base as *const Value,
+            ValStore::Slab { base, .. } => std::ptr::with_exposed_provenance::<Value>(*base),
         }
     }
 
@@ -1126,28 +1152,58 @@ impl ValStore {
         self.as_slice().get(i)
     }
 
-    /// Structural growth: a `Slab` store SPILLS to the `Vec` form first (the
-    /// caller's key-add version bump invalidates every cached pointer, per
-    /// the field doc). The vacated cell is returned by the HEAP-level caller
-    /// (`Heap`-routed mutations), not here — `ValStore` cannot reach the
-    /// slab's free lists; see `Heap::note_object_grew`.
+    /// Return `store`'s cell through the stable class owner encoded in it.
+    /// The caller must first replace every published reference to that cell.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn return_slab_cell(store: ValStore) {
+        let ValStore::Slab {
+            base,
+            owner_and_len,
+        } = store
+        else {
+            debug_assert!(false, "only a slab store has a cell to return");
+            return;
+        };
+        let owner_addr = owner_and_len & !VAL_SLAB_OWNER_LEN_MASK;
+        // SAFETY: `owner_addr` was exposed from the matching class in
+        // `Heap::alloc_finalized`. That class lives in a Box for the entire
+        // Heap lifetime, and containment guarantees this method runs only on
+        // the owning mutator while the Heap is alive. The store was replaced
+        // before this call, so no live safe reference can still reach `base`.
+        unsafe {
+            let owner = std::ptr::with_exposed_provenance_mut::<ValSlabClass>(owner_addr);
+            debug_assert!(!owner.is_null());
+            (*owner).free_cell(base);
+        }
+    }
+
+    /// Replace a slab store by an empty owned store and return its cell. Used
+    /// before a dead shell can enter the object pool or courier.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn strip_slab(&mut self) {
+        if matches!(self, ValStore::Slab { .. }) {
+            let old = std::mem::replace(self, ValStore::Vec(Vec::new()));
+            Self::return_slab_cell(old);
+        }
+    }
+
+    /// Structural growth: a `Slab` store SPILLS to the `Vec` form first. The
+    /// Vec (including the new value) is fully allocated and published before
+    /// the old cell goes home, so allocation failure cannot leave the object
+    /// pointing at a returned cell. The caller's key-add version bump
+    /// invalidates every cached pointer, per the field doc.
     fn push(&mut self, v: Value) {
         match self {
             ValStore::Vec(vec) => vec.push(v),
             #[cfg(not(feature = "safe-sandbox"))]
             ValStore::Slab { .. } => {
-                // SPILL: structural growth materializes the Vec form. The
-                // vacated cell is deliberately LEAKED WITHIN ITS HEAP'S OWN
-                // CHUNKS (reclaimed wholesale at teardown): the store has no
-                // route to its owning slab, and any out-of-band parking is
-                // unsound the moment two VMs share a thread — a drained cell
-                // could enter the WRONG heap's free list and dangle when the
-                // first heap drops. Spills are rare (a finalize-born literal
-                // gaining a key), so the retention is bounded and safe.
                 let mut vec = self.as_slice().to_vec();
                 vec.reserve(1);
                 vec.push(v);
-                *self = ValStore::Vec(vec);
+                let old = std::mem::replace(self, ValStore::Vec(vec));
+                Self::return_slab_cell(old);
             }
         }
     }
@@ -1157,10 +1213,10 @@ impl ValStore {
             ValStore::Vec(vec) => vec.remove(i),
             #[cfg(not(feature = "safe-sandbox"))]
             ValStore::Slab { .. } => {
-                // As `push`: spill and leak the cell (see there for why).
                 let mut vec = self.as_slice().to_vec();
                 let out = vec.remove(i);
-                *self = ValStore::Vec(vec);
+                let old = std::mem::replace(self, ValStore::Vec(vec));
+                Self::return_slab_cell(old);
                 out
             }
         }
@@ -1243,6 +1299,7 @@ fn val_slab_class_cap(class: u8) -> usize {
 /// Freeing and allocating are a Vec push/pop; chunks are only ever released
 /// wholesale when the heap itself drops.
 #[cfg(not(feature = "safe-sandbox"))]
+#[repr(align(32))]
 struct ValSlabClass {
     chunks: Vec<Box<[Value; VAL_SLAB_CHUNK]>>,
     /// Bases of returned cells, ready for reuse.
@@ -1250,6 +1307,11 @@ struct ValSlabClass {
     /// Next unused offset (in `Value`s) within the LAST chunk.
     cursor: usize,
 }
+
+// The tagged-owner representation above depends on all five low address bits
+// being zero. Keep this compile-time proof next to the type that supplies it.
+#[cfg(not(feature = "safe-sandbox"))]
+const _: () = assert!(std::mem::align_of::<ValSlabClass>() >= (1 << VAL_SLAB_OWNER_LEN_BITS));
 
 /// Values per chunk box (32 KiB of `Value`s): big enough that chunk
 /// allocation is rare, small enough that a mostly-dead slab is not a large
@@ -1277,18 +1339,32 @@ impl ValSlabClass {
             self.cursor = 0;
         }
         let chunk = self.chunks.last_mut().expect("chunk just ensured");
-        let base = unsafe { chunk.as_mut_ptr().add(self.cursor) } as usize;
+        let base = unsafe { chunk.as_mut_ptr().add(self.cursor) }.expose_provenance();
         self.cursor += cap;
         base
     }
 
     #[inline]
     fn free_cell(&mut self, base: usize) {
+        debug_assert!(
+            self.chunks.iter().any(|chunk| {
+                let start = chunk.as_ptr().expose_provenance();
+                let bytes = VAL_SLAB_CHUNK * std::mem::size_of::<Value>();
+                let offset = base.wrapping_sub(start);
+                offset < bytes && offset.is_multiple_of(std::mem::size_of::<Value>())
+            }),
+            "ValStore returned a cell to a foreign slab owner"
+        );
+        debug_assert!(
+            !self.free.contains(&base),
+            "ValStore returned the same slab cell twice"
+        );
         self.free.push(base);
     }
 
     fn resident_bytes(&self) -> usize {
         self.chunks.len() * VAL_SLAB_CHUNK * std::mem::size_of::<Value>()
+            + vec_capacity_bytes(&self.chunks)
             + vec_capacity_bytes(&self.free)
     }
 }
@@ -1770,7 +1846,10 @@ impl ObjMap {
             m.keys.reserve_exact(n);
             {
                 #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
-                let ValStore::Vec(v) = &mut m.vals else { unreachable!("ctor stores are Vec-born") };
+                let ValStore::Vec(v) = &mut m.vals
+                else {
+                    unreachable!("ctor stores are Vec-born")
+                };
                 v.reserve_exact(n);
             }
             m.attrs.reserve_exact(n);
@@ -1791,7 +1870,10 @@ impl ObjMap {
         if n > 0 {
             {
                 #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
-                let ValStore::Vec(v) = &mut m.vals else { unreachable!("ctor stores are Vec-born") };
+                let ValStore::Vec(v) = &mut m.vals
+                else {
+                    unreachable!("ctor stores are Vec-born")
+                };
                 v.reserve_exact(n);
             }
             m.attrs.reserve_exact(n);
@@ -1966,7 +2048,10 @@ impl ObjMap {
             m.keys.reserve_exact(n);
             {
                 #[allow(irrefutable_let_patterns)] // one-armed under safe-sandbox
-                let ValStore::Vec(v) = &mut m.vals else { unreachable!("ctor stores are Vec-born") };
+                let ValStore::Vec(v) = &mut m.vals
+                else {
+                    unreachable!("ctor stores are Vec-born")
+                };
                 v.reserve_exact(n);
             }
             m.attrs.reserve_exact(n);
@@ -2247,7 +2332,11 @@ impl ObjMap {
     /// the dynamic-append path hashes the key for its presence probe and then
     /// hands the same tag here for the table insert.
     pub(crate) fn push_data_tagged(&mut self, key: String, val: Value, tag: u32) {
-        debug_assert_eq!(tag, prop_tag(&key), "push_data_tagged: caller's tag is wrong");
+        debug_assert_eq!(
+            tag,
+            prop_tag(&key),
+            "push_data_tagged: caller's tag is wrong"
+        );
         self.planned_append_failed |= self.keys.is_planned();
         self.shape_pushed_owned(&key, &PropAttr::data());
         self.has_element_key |= key_names_element(&key);
@@ -3663,7 +3752,7 @@ mod gc_courier {
     /// owned data; adding one here is a `Send` proof obligation the spawn
     /// below makes the compiler check.
     #[allow(dead_code)] // the fields exist to OWN payloads across the send;
-    // the courier's entire job is dropping them unread.
+                        // the courier's entire job is dropping them unread.
     pub(super) enum Item {
         Obj(Box<super::ObjMap>),
         Str(super::JsStr),
@@ -4340,6 +4429,26 @@ pub struct Heap {
     /// `vals`-pointer: a matching version proves `vals` hasn't reallocated since
     /// the cache was filled. Allocated in lockstep with `objs` so indices align.
     versions: Vec<u32>,
+    /// B244: one coarse invalidation epoch for emitted dense-Array snapshots.
+    ///
+    /// A native region may hold an Array's raw `Vec<Value>` base and length in
+    /// a stack snapshot. After user code, equality with the region's cached
+    /// epoch proves no live Array payload was mutably borrowed, structurally
+    /// version-bumped, discarded, or recycled in the interim. Emitted code
+    /// separately compares every pin's live binding Value with cached
+    /// `obj_bits`; the two proofs together license the raw snapshot. The epoch
+    /// deliberately does NOT promise that
+    /// `jit_ta_snapshot` would make the same eligibility decision today:
+    /// named-only sidecars (freeze/seal/SetRaw) do not affect dense indexed
+    /// reads. Indexed overlays and virtual-length changes pass through an
+    /// Array mutable borrow and therefore dirty the epoch.
+    ///
+    /// Saturation is fail-closed: `u64::MAX` is permanently dirty and emitted
+    /// code never skips a refresh at that value. The field is absent from
+    /// interpreter-only/safe-sandbox builds, where there is no raw Array pin
+    /// to validate and no mutation-path tax to pay.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) array_snapshot_epoch: u64,
     /// SHAPE MIRROR, parallel to `objs`: the object's hidden class as of the
     /// last settling event, or [`crate::shape::DICT`] (0). The emitted
     /// shape-way probes (B178) guard on THIS word — `mirror == way.shape`
@@ -4435,7 +4544,7 @@ pub struct Heap {
     courier_bulk: bool,
     /// The literal value slab (B187 stage 2), one class per capacity bucket.
     #[cfg(not(feature = "safe-sandbox"))]
-    val_slab: [ValSlabClass; 3],
+    val_slab: Box<[ValSlabClass; 3]>,
     /// B187 stage 3: recycled `Box<ObjMap>` shells. The sweep pushes a dying
     /// object's box here (instead of shipping it to the courier) when its
     /// remaining contents are drop-cheap — Planned keys, all-default attrs,
@@ -4825,7 +4934,11 @@ impl Heap {
             courier_small_mass: 0,
             courier_bulk: false,
             #[cfg(not(feature = "safe-sandbox"))]
-            val_slab: [ValSlabClass::new(), ValSlabClass::new(), ValSlabClass::new()],
+            val_slab: Box::new([
+                ValSlabClass::new(),
+                ValSlabClass::new(),
+                ValSlabClass::new(),
+            ]),
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
@@ -4853,6 +4966,8 @@ impl Heap {
             this_mirror_raw: 0,
             upvals_mirror_raw: 0,
             versions,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            array_snapshot_epoch: 0,
             free: Vec::new(),
             live,
             gc_requested: false,
@@ -5011,21 +5126,25 @@ impl Heap {
         let store = match val_slab_class(vals.len()) {
             Some(class) if val_slab_enabled() => {
                 let cap = val_slab_class_cap(class);
-                let base = self.val_slab[class as usize].alloc_cell(cap);
+                let owner = &mut self.val_slab[class as usize];
+                let owner_addr = std::ptr::from_mut(&mut *owner).expose_provenance();
+                debug_assert_eq!(owner_addr & VAL_SLAB_OWNER_LEN_MASK, 0);
+                debug_assert!((1..=16).contains(&vals.len()));
+                let owner_and_len = owner_addr | vals.len();
+                let base = owner.alloc_cell(cap);
                 // SAFETY: the cell has `cap >= vals.len()` slots inside a
                 // live, immovable chunk this heap owns; no other reference
                 // aims at it (fresh from the free list or the cursor).
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         vals.as_ptr(),
-                        base as *mut Value,
+                        std::ptr::with_exposed_provenance_mut::<Value>(base),
                         vals.len(),
                     );
                 }
                 ValStore::Slab {
                     base,
-                    len: vals.len() as u16,
-                    class,
+                    owner_and_len,
                 }
             }
             _ => ValStore::Vec(vals.to_vec()),
@@ -5076,7 +5195,11 @@ impl Heap {
         if !settled_alloc_enabled() {
             return self.alloc(HeapObj::Object(boxed));
         }
-        debug_assert_eq!(boxed.shape(), shape, "settled mirror must carry the map's own shape");
+        debug_assert_eq!(
+            boxed.shape(),
+            shape,
+            "settled mirror must carry the map's own shape"
+        );
         let vals = boxed.vals.as_ptr() as u64;
         self.alloc_settled(
             HeapObj::Object(boxed),
@@ -5624,7 +5747,12 @@ impl Heap {
                     // B207 (review): the recycle pools are real retained
                     // memory the heap ceiling must see — 112-byte shells
                     // plus the array buffers' element capacity.
-                    self.val_slab.iter().map(|c| c.resident_bytes()).sum::<usize>()
+                    std::mem::size_of_val(self.val_slab.as_ref())
+                        + self
+                            .val_slab
+                            .iter()
+                            .map(|c| c.resident_bytes())
+                            .sum::<usize>()
                         + self.obj_pool.len() * std::mem::size_of::<ObjMap>()
                         + vec_capacity_bytes(&self.obj_pool)
                         + self
@@ -5633,13 +5761,9 @@ impl Heap {
                             .map(|v| v.capacity() * std::mem::size_of::<Value>())
                             .sum::<usize>()
                         + vec_capacity_bytes(&self.arr_pool)
-            + self.concat_memo.len() * std::mem::size_of::<ConcatMemoEntry>()
-            + self
-                .key_pool
-                .iter()
-                .map(|k| k.capacity())
-                .sum::<usize>()
-            + vec_capacity_bytes(&self.key_pool)
+                        + self.concat_memo.len() * std::mem::size_of::<ConcatMemoEntry>()
+                        + self.key_pool.iter().map(|k| k.capacity()).sum::<usize>()
+                        + vec_capacity_bytes(&self.key_pool)
                 }
                 #[cfg(feature = "safe-sandbox")]
                 {
@@ -5721,6 +5845,13 @@ impl Heap {
         // here exactly as before. The bookkeeping around it never leaves the
         // mutator.
         let dead = std::mem::replace(&mut self.objs[idx as usize], HeapObj::Date(f64::NAN));
+        // B244 ABA boundary: a snapshot carries only the heap-index bits. A
+        // collected Array must dirty the global epoch before this slot can be
+        // handed to a different occupant with the same bits.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if matches!(&dead, HeapObj::Array(_)) {
+            self.dirty_array_snapshots();
+        }
         // B198: clear only the cold mirrors the dying occupant OWNED — the
         // induction with `refresh_mirror`'s kind-conditional writes keeps
         // every other slot's cold fields at their defaults already, and the
@@ -5744,10 +5875,7 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         let dead = match dead {
             HeapObj::Object(mut m) => {
-                if let ValStore::Slab { base, class, .. } = m.vals {
-                    self.val_slab[class as usize].free_cell(base);
-                    m.vals = ValStore::Vec(Vec::new());
-                }
+                m.vals.strip_slab();
                 // B220: recycle this object's key buffers. Only OWNED keys
                 // qualify — a `Planned` map's keys belong to a shared plan
                 // Arc and are not ours to take. The Strings are moved out, so
@@ -6104,6 +6232,14 @@ impl Heap {
         self.young.clear();
     }
 
+    /// Invalidate every emitted dense-Array raw snapshot. Saturation is an
+    /// intentional one-way transition to the always-refresh state.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn dirty_array_snapshots(&mut self) {
+        self.array_snapshot_epoch = self.array_snapshot_epoch.saturating_add(1);
+    }
+
     /// Overwrite the whole object at `idx`, bumping its version.
     ///
     /// A subclass constructor's `super()` allocates a plain object and then
@@ -6137,6 +6273,12 @@ impl Heap {
         self.write_barrier(idx);
         #[cfg_attr(feature = "safe-sandbox", allow(unused_variables))]
         let old = std::mem::replace(&mut self.objs[idx as usize], obj);
+        // Replacing an Array discards the storage a compiled snapshot may
+        // still name. This also covers Array -> Array replacement/ABA.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if matches!(&old, HeapObj::Array(_)) {
+            self.dirty_array_snapshots();
+        }
         // B198: a replace can change occupant KIND, so the old occupant's
         // cold mirrors are cleared here under the same induction free_slot
         // maintains (refresh below writes the new occupant's own fields).
@@ -6154,10 +6296,7 @@ impl Heap {
         // first (the strip makes the shell's drop cell-blind).
         #[cfg(not(feature = "safe-sandbox"))]
         if let HeapObj::Object(mut m) = old {
-            if let ValStore::Slab { base, class, .. } = m.vals {
-                self.val_slab[class as usize].free_cell(base);
-                m.vals = ValStore::Vec(Vec::new());
-            }
+            m.vals.strip_slab();
         }
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
         self.refresh_mirror(idx);
@@ -6171,6 +6310,12 @@ impl Heap {
     /// practically unreachable. A `u64` would remove even the theoretical edge.
     #[inline]
     pub fn bump_version(&mut self, idx: u32) {
+        // Array version bumps include descriptor/structural changes that can
+        // invalidate a dense raw read even when the Vec itself did not grow.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if matches!(self.objs[idx as usize], HeapObj::Array(_)) {
+            self.dirty_array_snapshots();
+        }
         self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
         // Invalidate, don't refresh: callers bump on either side of the
         // mutation, and a refresh here would capture the wrong side at a
@@ -6204,6 +6349,14 @@ impl Heap {
 
     #[inline]
     pub fn get_mut(&mut self, idx: u32) -> &mut HeapObj {
+        // The mutable borrow is the central write chokepoint. Bump before
+        // lending it out: callers can grow/shrink/reorder/overwrite an Array
+        // without any further Heap call, and a conservative false positive is
+        // only one later refresh. Non-JIT builds compile this branch away.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if matches!(self.objs[idx as usize], HeapObj::Array(_)) {
+            self.dirty_array_snapshots();
+        }
         &mut self.objs[idx as usize]
     }
 
@@ -6657,8 +6810,9 @@ pub(crate) mod gcoracle {
     pub(crate) const COLL_INSERT: usize = 8;
     pub(crate) const CLOSURE_HOME: usize = 9;
     pub(crate) const CLOSURE_NEW_TARGET: usize = 10;
+    pub(crate) const CLASS_MEMBER: usize = 11;
 
-    const NAMES: [&str; 11] = [
+    const NAMES: [&str; 12] = [
         "set_prop",
         "set_index",
         "jit_set_prop",
@@ -6670,8 +6824,9 @@ pub(crate) mod gcoracle {
         "coll_insert",
         "closure_home",
         "closure_new_target",
+        "class_member",
     ];
-    static COUNTS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+    static COUNTS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
     #[inline]
     pub(crate) fn hit(site: usize) {
@@ -6692,13 +6847,258 @@ pub(crate) mod gcoracle {
 mod tests {
     use super::*;
 
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[test]
+    fn array_snapshot_epoch_covers_mutation_discard_reuse_and_saturates() {
+        let mut h = Heap::new();
+        let a = h.alloc(HeapObj::Array(vec![Value::int(1)]));
+        assert_eq!(
+            h.array_snapshot_epoch, 0,
+            "fresh Arrays need no invalidation"
+        );
+        assert!(matches!(h.get(a), HeapObj::Array(_)));
+        assert_eq!(h.array_snapshot_epoch, 0, "immutable reads stay clean");
+
+        let HeapObj::Array(items) = h.get_mut(a) else {
+            unreachable!()
+        };
+        items.push(Value::int(2));
+        assert_eq!(
+            h.array_snapshot_epoch, 1,
+            "mutable Array borrow dirties once"
+        );
+
+        h.bump_version(a);
+        assert_eq!(h.array_snapshot_epoch, 2, "Array structural bump dirties");
+        let s = h.alloc(HeapObj::Str(JsStr::new("x".into())));
+        let _ = h.get_mut(s);
+        h.bump_version(s);
+        assert_eq!(h.array_snapshot_epoch, 2, "non-Arrays do not false-dirty");
+
+        h.replace(a, HeapObj::Array(vec![Value::int(3)]));
+        assert_eq!(
+            h.array_snapshot_epoch, 3,
+            "Array-to-Array replacement dirties"
+        );
+        h.replace(a, HeapObj::Str(JsStr::new("gone".into())));
+        assert_eq!(h.array_snapshot_epoch, 4, "discarding an Array dirties");
+        h.replace(a, HeapObj::Array(vec![Value::int(4)]));
+        assert_eq!(
+            h.array_snapshot_epoch, 4,
+            "installing a fresh Array over a non-Array needs no extra bump"
+        );
+
+        h.free_slot(a);
+        assert_eq!(
+            h.array_snapshot_epoch, 5,
+            "collection closes the ABA window"
+        );
+        let before_reuse = h.array_snapshot_epoch;
+        let reused = h.alloc(HeapObj::Array(vec![Value::int(5)]));
+        assert_eq!(reused, a, "the test must exercise heap-index reuse");
+        assert_eq!(h.array_snapshot_epoch, before_reuse);
+
+        h.array_snapshot_epoch = u64::MAX - 1;
+        let _ = h.get_mut(reused);
+        assert_eq!(h.array_snapshot_epoch, u64::MAX);
+        let _ = h.get_mut(reused);
+        h.bump_version(reused);
+        h.free_slot(reused);
+        assert_eq!(
+            h.array_snapshot_epoch,
+            u64::MAX,
+            "MAX is a permanent fail-closed dirty state"
+        );
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn static_key_plan_keeps_hot_layout_sizes_exact() {
         assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);
         assert_eq!(std::mem::size_of::<PropKeys>(), 24);
+        assert_eq!(std::mem::size_of::<ValStore>(), 24);
         assert_eq!(std::mem::size_of::<ObjMap>(), 112);
         assert_eq!(std::mem::size_of::<HeapObj>(), 80);
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn slab_fixture() -> (StaticKeyPlan, [Value; 4], u32) {
+        let plan = StaticKeyPlan::new(vec!["a".into(), "b".into(), "c".into(), "d".into()]);
+        let vals = [Value::int(1), Value::int(2), Value::int(3), Value::int(4)];
+        let data = crate::shape::attr_bits(true, true, true, false);
+        let shape = plan.keys().iter().fold(crate::shape::EMPTY, |shape, key| {
+            crate::shape::add(shape, key, data)
+        });
+        (plan, vals, shape)
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn object_slab_identity(heap: &Heap, idx: u32) -> (usize, usize) {
+        let HeapObj::Object(map) = heap.get(idx) else {
+            panic!("fixture slot is not an object")
+        };
+        let ValStore::Slab {
+            base,
+            owner_and_len,
+        } = &map.vals
+        else {
+            panic!("finalized fixture did not use the slab")
+        };
+        (*base, *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK)
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[test]
+    fn slab_spills_return_once_to_the_exact_moved_heap_owner() {
+        let (plan, vals, shape) = slab_fixture();
+        let mut heaps = vec![Heap::new(), Heap::new()];
+        let left_idx = heaps[0].alloc_finalized(&plan, &vals, shape);
+        let right_idx = heaps[1].alloc_finalized(&plan, &vals, shape);
+        let (left_base, left_owner) = object_slab_identity(&heaps[0], left_idx);
+        let (right_base, right_owner) = object_slab_identity(&heaps[1], right_idx);
+        assert_ne!(left_base, right_base);
+        assert_ne!(
+            left_owner, right_owner,
+            "each Heap must own a distinct class"
+        );
+
+        // Move both Heaps after cells have captured their owner. The boxed
+        // classes must remain stable while the outer Heap addresses change.
+        heaps.swap(0, 1);
+        assert_eq!(
+            object_slab_identity(&heaps[1], left_idx),
+            (left_base, left_owner)
+        );
+        assert_eq!(
+            object_slab_identity(&heaps[0], right_idx),
+            (right_base, right_owner)
+        );
+        assert_eq!(
+            std::ptr::from_ref(&heaps[1].val_slab[0]).expose_provenance(),
+            left_owner
+        );
+        assert_eq!(
+            std::ptr::from_ref(&heaps[0].val_slab[0]).expose_provenance(),
+            right_owner
+        );
+
+        // PUSH spills left and returns only left's cell. A second structural
+        // transition is now Vec -> Vec and must not return it twice.
+        let HeapObj::Object(left) = heaps[1].get_mut(left_idx) else {
+            unreachable!()
+        };
+        assert!(left.set("extra", Value::int(5)));
+        assert!(left.remove("b"));
+        heaps[1].bump_version(left_idx);
+        assert_eq!(heaps[1].val_slab[0].free, vec![left_base]);
+        assert!(heaps[0].val_slab[0].free.is_empty());
+
+        // The owning heap can immediately reuse that exact cell while the
+        // spilled object remains live; REMOVE then returns it once again.
+        let left_reuse = heaps[1].alloc_finalized(&plan, &vals, shape);
+        assert_eq!(object_slab_identity(&heaps[1], left_reuse).0, left_base);
+        assert!(heaps[1].val_slab[0].free.is_empty());
+        let HeapObj::Object(left2) = heaps[1].get_mut(left_reuse) else {
+            unreachable!()
+        };
+        assert_eq!(left2.remove_at(2), "c");
+        left2.push_data("after-remove".into(), Value::int(6));
+        heaps[1].bump_version(left_reuse);
+        assert_eq!(heaps[1].val_slab[0].free, vec![left_base]);
+
+        // Dropping/replacing already-spilled maps cannot enqueue the cell a
+        // second time. The still-slab-backed right map returns only to right.
+        heaps[1].replace(left_idx, HeapObj::Date(0.0));
+        heaps[1].replace(left_reuse, HeapObj::Date(0.0));
+        assert_eq!(heaps[1].val_slab[0].free, vec![left_base]);
+        heaps[0].replace(right_idx, HeapObj::Date(0.0));
+        assert_eq!(heaps[0].val_slab[0].free, vec![right_base]);
+        assert_eq!(heaps[1].val_slab[0].free, vec![left_base]);
+
+        let right_reuse = heaps[0].alloc_finalized(&plan, &vals, shape);
+        assert_eq!(object_slab_identity(&heaps[0], right_reuse).0, right_base);
+        heaps[0].replace(right_reuse, HeapObj::Date(0.0));
+        assert_eq!(heaps[0].val_slab[0].free, vec![right_base]);
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[test]
+    fn slab_owner_tag_roundtrips_every_length_and_capacity_class() {
+        let mut heap = Heap::new();
+        let data = crate::shape::attr_bits(true, true, true, false);
+        for len in 1..=16 {
+            let plan = StaticKeyPlan::new((0..len).map(|i| format!("k{i}")).collect());
+            let vals: Vec<Value> = (0..len).map(|i| Value::int(i as i32)).collect();
+            let shape = plan.keys().iter().fold(crate::shape::EMPTY, |shape, key| {
+                crate::shape::add(shape, key, data)
+            });
+            let class = val_slab_class(len).expect("covered length") as usize;
+            let idx = heap.alloc_finalized(&plan, &vals, shape);
+            let (base, owner) = object_slab_identity(&heap, idx);
+            let HeapObj::Object(map) = heap.get(idx) else {
+                unreachable!()
+            };
+            let ValStore::Slab { owner_and_len, .. } = &map.vals else {
+                unreachable!()
+            };
+            assert_eq!(map.vals_len(), len);
+            assert_eq!(owner_and_len & VAL_SLAB_OWNER_LEN_MASK, len);
+            assert_eq!(
+                owner,
+                std::ptr::from_ref(&heap.val_slab[class]).expose_provenance()
+            );
+
+            let HeapObj::Object(map) = heap.get_mut(idx) else {
+                unreachable!()
+            };
+            map.push_data("spill".into(), Value::int(99));
+            heap.bump_version(idx);
+            assert_eq!(heap.val_slab[class].free, vec![base]);
+            heap.replace(idx, HeapObj::Date(0.0));
+            heap.free_slot(idx);
+            assert_eq!(heap.val_slab[class].free, vec![base]);
+        }
+        for (class, slab) in heap.val_slab.iter().enumerate() {
+            assert_eq!(slab.chunks.len(), 1);
+            assert_eq!(slab.cursor, val_slab_class_cap(class as u8));
+            assert_eq!(slab.free.len(), 1);
+        }
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[test]
+    fn structural_churn_reuses_one_chunk_and_resident_bytes_plateau() {
+        let (plan, vals, shape) = slab_fixture();
+        let mut heap = Heap::new();
+        let baseline = heap.audit_resident_bytes();
+
+        // Sixteen whole slab chunks' worth of would-be leaked cells. Replacing
+        // before free keeps the test's courier/object-pool side effects out of
+        // the resident-byte signal; both push and remove spill paths run.
+        for i in 0..(VAL_SLAB_CHUNK * 4) {
+            let idx = heap.alloc_finalized(&plan, &vals, shape);
+            let HeapObj::Object(map) = heap.get_mut(idx) else {
+                unreachable!()
+            };
+            if i & 1 == 0 {
+                map.push_data("extra".into(), Value::int(i as i32));
+            } else {
+                assert_eq!(map.remove_at(1), "b");
+            }
+            heap.bump_version(idx);
+            heap.replace(idx, HeapObj::Date(0.0));
+            heap.free_slot(idx);
+        }
+
+        let class = &heap.val_slab[0];
+        assert_eq!(class.chunks.len(), 1, "spilled cells must be reused");
+        assert_eq!(class.cursor, val_slab_class_cap(0));
+        assert_eq!(class.free.len(), 1);
+        let resident_growth = heap.audit_resident_bytes().saturating_sub(baseline);
+        assert!(
+            resident_growth < 4 * VAL_SLAB_CHUNK * std::mem::size_of::<Value>(),
+            "structural churn retained {resident_growth} bytes instead of plateauing"
+        );
     }
 
     #[test]
@@ -6965,7 +7365,11 @@ mod tests {
                 assert!(a.remove(&key));
                 b.remove_at(i);
                 assert_eq!(a.keys, b.keys, "n={n} victim={victim}: keys diverged");
-                assert_eq!(a.vals_slice(), b.vals_slice(), "n={n} victim={victim}: vals diverged");
+                assert_eq!(
+                    a.vals_slice(),
+                    b.vals_slice(),
+                    "n={n} victim={victim}: vals diverged"
+                );
                 assert_map_consistent(&a);
                 assert_map_consistent(&b);
                 for j in 0..n {
@@ -7701,7 +8105,10 @@ mod tests {
         let elided = m.resident_bytes();
         m.attr_mut(2).enumerable = false;
         assert!(m.may_deviate_attrs());
-        assert!(m.resident_bytes() > elided, "materialized column must be charged");
+        assert!(
+            m.resident_bytes() > elided,
+            "materialized column must be charged"
+        );
         assert!(!m.attr_at(2).enumerable && m.attr_at(3).enumerable);
     }
 
@@ -7747,7 +8154,10 @@ impl Drop for Heap {
             let [h, m] = self.concat_memo_stats;
             eprintln!("[concatmemo] hits={h} misses={m}");
             let [ks, km, kr] = self.key_pool_stats;
-            eprintln!("[keypool] served={ks} missed={km} recycled={kr} resident={}", self.key_pool.len());
+            eprintln!(
+                "[keypool] served={ks} missed={km} recycled={kr} resident={}",
+                self.key_pool.len()
+            );
         }
     }
 }
@@ -7871,27 +8281,33 @@ pub fn bench_floor_decompose(
         let b = Box::new(ObjMap::new());
         keep = keep.wrapping_add((&*b as *const ObjMap as usize) & 7);
     }
-    lines.push(format!("box-pair(empty): {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+    lines.push(format!(
+        "box-pair(empty): {:.1}ns/obj (k{})",
+        per(t.elapsed()),
+        keep & 1
+    ));
 
     // (b2) fresh box + slab store: today's engine construction minus the
     // heap-slot/mirror tail.
     let class = val_slab_class(vals.len()).expect("slab class");
     let cap = val_slab_class_cap(class);
     let mut slab = ValSlabClass::new();
+    let owner_addr = std::ptr::from_mut(&mut slab).expose_provenance();
+    debug_assert_eq!(owner_addr & VAL_SLAB_OWNER_LEN_MASK, 0);
+    let owner_and_len = owner_addr | vals.len();
     let t = Instant::now();
     let mut keep = 0usize;
     for i in 0..n {
         let base = slab.alloc_cell(cap);
         unsafe {
-            let p = base as *mut Value;
+            let p = std::ptr::with_exposed_provenance_mut::<Value>(base);
             for (j, &bits) in vals.iter().enumerate() {
                 *p.add(j) = Value::num((bits ^ (i as u64 ^ j as u64)) as f64);
             }
         }
         let store = ValStore::Slab {
             base,
-            len: vals.len() as u16,
-            class,
+            owner_and_len,
         };
         let m = Box::new(ObjMap::finalized_from_store(plan.clone(), store, shape));
         keep = keep.wrapping_add(m.len());
@@ -7899,7 +8315,11 @@ pub fn bench_floor_decompose(
             slab.free_cell(*base);
         }
     }
-    lines.push(format!("fresh-box+slab: {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+    lines.push(format!(
+        "fresh-box+slab: {:.1}ns/obj (k{})",
+        per(t.elapsed()),
+        keep & 1
+    ));
 
     // (d) pooled box + fresh Vec store: the box malloc/free pair removed.
     let mut b = Box::new(ObjMap::new());
@@ -7913,25 +8333,31 @@ pub fn bench_floor_decompose(
         *b = ObjMap::finalized_from_store(plan.clone(), ValStore::Vec(v), shape);
         keep = keep.wrapping_add(b.len());
     }
-    lines.push(format!("pooled-box+vec: {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+    lines.push(format!(
+        "pooled-box+vec: {:.1}ns/obj (k{})",
+        per(t.elapsed()),
+        keep & 1
+    ));
 
     // (e) pooled box + slab store: the compact-construction candidate floor.
     let mut slab = ValSlabClass::new();
+    let owner_addr = std::ptr::from_mut(&mut slab).expose_provenance();
+    debug_assert_eq!(owner_addr & VAL_SLAB_OWNER_LEN_MASK, 0);
+    let owner_and_len = owner_addr | vals.len();
     let mut b = Box::new(ObjMap::new());
     let t = Instant::now();
     let mut keep = 0usize;
     for i in 0..n {
         let base = slab.alloc_cell(cap);
         unsafe {
-            let p = base as *mut Value;
+            let p = std::ptr::with_exposed_provenance_mut::<Value>(base);
             for (j, &bits) in vals.iter().enumerate() {
                 *p.add(j) = Value::num((bits ^ (i as u64 ^ j as u64)) as f64);
             }
         }
         let store = ValStore::Slab {
             base,
-            len: vals.len() as u16,
-            class,
+            owner_and_len,
         };
         let prev = if let ValStore::Slab { base, .. } = &b.vals {
             Some(*base)
@@ -7944,7 +8370,11 @@ pub fn bench_floor_decompose(
         }
         keep = keep.wrapping_add(b.len());
     }
-    lines.push(format!("pooled-box+slab: {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+    lines.push(format!(
+        "pooled-box+slab: {:.1}ns/obj (k{})",
+        per(t.elapsed()),
+        keep & 1
+    ));
 
     // (f) the ENGINE path on a real heap: alloc_finalized + free_slot per
     // iteration (steady-state slot reuse, mirrors, young log, pool), minus
@@ -7961,7 +8391,11 @@ pub fn bench_floor_decompose(
         keep = keep.wrapping_add(idx as usize & 7);
         h.free_slot(idx);
     }
-    lines.push(format!("engine alloc+free: {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+    lines.push(format!(
+        "engine alloc+free: {:.1}ns/obj (k{})",
+        per(t.elapsed()),
+        keep & 1
+    ));
 
     // (g) the same engine round-trip with the recycle pool serving (the
     // refill flag forced, as inside a minor sweep) — the pooled steady state
@@ -7979,6 +8413,10 @@ pub fn bench_floor_decompose(
         keep = keep.wrapping_add(idx as usize & 7);
         h.free_slot(idx);
     }
-    lines.push(format!("engine pooled alloc+free: {:.1}ns/obj (k{})", per(t.elapsed()), keep & 1));
+    lines.push(format!(
+        "engine pooled alloc+free: {:.1}ns/obj (k{})",
+        per(t.elapsed()),
+        keep & 1
+    ));
     lines
 }

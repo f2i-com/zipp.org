@@ -22,6 +22,10 @@ const SOURCE: &str = r#"
     }
 
     function readX(value) {
+      // A named property below already throws on nullish input through GetProp.
+      // Keep an empty pattern too so this probe deliberately exercises the
+      // standalone RequireObjectCoercible bytecode and its Tier-C gate.
+      const {} = value;
       const { x } = value;
       const code = value.text.charCodeAt(0);
       let out = x + code - 65 + 1;

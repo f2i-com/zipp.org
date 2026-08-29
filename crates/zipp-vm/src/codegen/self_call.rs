@@ -63,6 +63,8 @@ pub(crate) fn emit_self_call(
     self_val_bits: u64,
 ) {
     let depth_off = crate::vm::JIT_RECURSE_DEPTH_OFFSET as i32;
+    let regs_ptr_off = crate::vm::host_api::JIT_REGS_PTR_OFFSET as i32;
+    let regs_hw_off = crate::vm::host_api::JIT_REGS_HW_OFFSET as i32;
     let max = crate::vm::JIT_SELF_RECURSE_MAX_PUB as i32;
     let slow = ops.new_dynamic_label();
     let store = ops.new_dynamic_label();
@@ -72,9 +74,10 @@ pub(crate) fn emit_self_call(
 
     // ── FAST PATH ── depth guard, then a direct native call to our own entry.
     // The callee window is CONTIGUOUS at rbx + reg_count*8 (the register file is
-    // pinned to a fixed capacity and never reallocates; get/set index it by raw
-    // pointer, so writing past the live `len` is sound — the memory is allocated
-    // and the callee defs every reg before reading). Depth bounds the native
+    // pinned to a fixed capacity and never reallocates. The explicit register
+    // store additionally requires the whole callee window to lie below its
+    // initialized high-water mark; new ground takes the Rust finisher, which
+    // grows the initialized storage before exposing it. Depth bounds the native
     // stack; the depth limit (256) × reg_count is far below the reserved
     // capacity (max_window × MAX_FRAMES), so the window can't overflow the buffer.
     dynasm!(ops
@@ -82,6 +85,12 @@ pub(crate) fn emit_self_call(
         ; cmp eax, max
         ; jae => slow                        // at the limit → Rust trampoline
         ; lea r11, [rbx + dreg(reg_count)]   // r11 = callee regs base
+        ; mov r10, [rdi + regs_ptr_off]
+        ; mov rax, [rdi + regs_hw_off]
+        ; lea r10, [r10 + rax * 8]           // initialized backing end
+        ; lea rax, [r11 + dreg(reg_count)]   // callee window end
+        ; cmp rax, r10
+        ; ja => slow                         // never write uninitialized backing
         ; mov rax, QWORD Value::UNDEFINED.bits() as i64
         ; mov [r11], rax                     // callee reg0 = this = undefined
     );

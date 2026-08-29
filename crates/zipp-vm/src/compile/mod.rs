@@ -30,7 +30,7 @@ use crate::parse::ast::{self, *};
 use crate::parse::token::StrVal;
 
 use crate::bytecode::{
-    BitwiseOp, ClassDef, FuncProto, InstanceCtor, Instr, Program, Reg, UpvalSource, KEY_WRITEBACK,
+    BitwiseOp, ClassDef, FuncProto, Instr, Program, Reg, UpvalSource, KEY_WRITEBACK,
 };
 use crate::capture;
 use crate::value::Value;

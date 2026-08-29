@@ -320,6 +320,14 @@ pub const DEC_ACCESS_GET: u16 = 941;
 pub const DEC_ACCESS_SET: u16 = 942;
 /// `context.access.has(target)` — same state as DEC_ACCESS_GET.
 pub const DEC_ACCESS_HAS: u16 = 943;
+/// Host console namespace methods. Unlike the compile-time `Print` shortcut,
+/// these are first-class callable values so dynamic/`with` resolution can fall
+/// back to the actual global object without changing observable semantics.
+pub const CONSOLE_LOG: u16 = 944;
+pub const CONSOLE_INFO: u16 = 945;
+pub const CONSOLE_WARN: u16 = 946;
+pub const CONSOLE_ERROR: u16 = 947;
+pub const CONSOLE_DEBUG: u16 = 948;
 // Object.prototype Annex-B accessor helpers + __proto__.
 pub const OBJPROTO_DEFINE_GETTER: u16 = 622;
 pub const OBJPROTO_DEFINE_SETTER: u16 = 623;
@@ -1638,6 +1646,11 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         GLOBAL_IS_FINITE => ("isFinite", 1),
         GLOBAL_EVAL => ("eval", 1),
         GLOBAL_PRINT => ("print", 1),
+        CONSOLE_LOG => ("log", 0),
+        CONSOLE_INFO => ("info", 0),
+        CONSOLE_WARN => ("warn", 0),
+        CONSOLE_ERROR => ("error", 0),
+        CONSOLE_DEBUG => ("debug", 0),
         SAB_GROW => ("grow", 1),
         SAB_SLICE => ("slice", 2),
         DISPOSABLE_USE => ("use", 1),

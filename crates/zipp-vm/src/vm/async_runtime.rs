@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
-use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
     PromiseState, PropAttr, ReactionPair, Reactions,
@@ -193,6 +193,25 @@ fn promise_all_direct_enabled() -> bool {
         1 => true,
         _ => {
             let v = std::env::var_os("ZIPP_NO_PROMISE_ALL_DIRECT").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_PROMISE_RESOLVE_DIRECT=1` restores the historical
+/// allocate-pending-then-settle sequence. The direct form is valid only for a
+/// fresh intrinsic promise wrapping a non-heap primitive: no thenable lookup,
+/// adoption, user code, reaction, or old-to-young edge can exist in that gap.
+#[inline]
+pub(super) fn promise_resolve_direct_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PROMISE_RESOLVE_DIRECT").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -752,18 +771,42 @@ impl<'p> Vm<'p> {
         let mut map = ObjMap::new();
         map.set("value", value);
         map.set("done", Value::bool(done));
-        Value::heap(self.heap.alloc(HeapObj::Object(Box::new(map))))
+        self.alloc_object_current_realm(map)
     }
 
     // ── promises / microtasks ──
 
     pub(crate) fn alloc_promise(&mut self) -> u32 {
-        self.heap.alloc(HeapObj::Promise {
+        let promise = self.heap.alloc(HeapObj::Promise {
             state: PromiseState::Pending,
             result: Value::UNDEFINED,
             reactions: Reactions::None,
             handled: false,
-        })
+        });
+        self.realm_born(promise, self.promise_proto);
+        promise
+    }
+
+    /// Try to allocate the result of intrinsic `Promise.resolve(primitive)`
+    /// directly in its final state. The release-mode heap check lives here—not
+    /// only at JIT/interpreter call sites—so a future caller cannot accidentally
+    /// bypass thenable lookup/adoption or omit a write barrier for a heap Value.
+    /// There is no observable pending interval for an accepted input: the
+    /// promise is fresh, the value cannot be a thenable, and no reaction can
+    /// exist until after this call returns.
+    #[inline]
+    pub(crate) fn try_alloc_fulfilled_primitive_promise(&mut self, value: Value) -> Option<u32> {
+        if value.is_heap() || !promise_resolve_direct_enabled() {
+            return None;
+        }
+        let promise = self.heap.alloc(HeapObj::Promise {
+            state: PromiseState::Fulfilled,
+            result: value,
+            reactions: Reactions::None,
+            handled: false,
+        });
+        self.realm_born(promise, self.promise_proto);
+        Some(promise)
     }
 
     /// Settle a pending promise (no-op if already settled — the one-shot guard
@@ -1090,7 +1133,9 @@ impl<'p> Vm<'p> {
         };
         let intrinsic_slot = |key: &str, target: u32| {
             m.pos(key).filter(|&i| {
-                !m.attr_at(i).accessor && m.val_at(i).is_heap() && m.val_at(i).heap_index() == target
+                !m.attr_at(i).accessor
+                    && m.val_at(i).is_heap()
+                    && m.val_at(i).heap_index() == target
             })
         };
         let then_slot = intrinsic_slot("then", self.promise_then_intrinsic)?;
@@ -1202,6 +1247,8 @@ impl<'p> Vm<'p> {
                         thenable: value,
                         then,
                         promise: p,
+                        resolve: Value::UNDEFINED,
+                        reject: Value::UNDEFINED,
                     });
                     return;
                 }
@@ -1212,6 +1259,53 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn reject(&mut self, p: u32, reason: Value) {
         self.settle(p, PromiseState::Rejected, reason);
+    }
+
+    /// Keep heap Values owned only by a Promise abstract operation's Rust locals
+    /// alive across re-entrant JavaScript. This is deliberately narrower than
+    /// `gc_lock_guard`: user code may run and the collector may reclaim everything
+    /// except these Values and the ordinary VM roots.
+    pub(crate) fn with_promise_operation_roots<R>(
+        &mut self,
+        roots: &[Value],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let base = self.promise_resolution_roots.len();
+        self.promise_resolution_roots.extend(
+            roots
+                .iter()
+                .filter(|value| value.is_heap())
+                .map(|value| value.heap_index()),
+        );
+        let result = f(self);
+        debug_assert!(self.promise_resolution_roots.len() >= base);
+        self.promise_resolution_roots.truncate(base);
+        result
+    }
+
+    /// Keep a promise target live while an abstract operation still owns it only
+    /// in a Rust local. The closure form also covers work which runs *before*
+    /// `resolve` (Promise executors / Promise.try callbacks).
+    pub(crate) fn with_promise_resolution_root<R>(
+        &mut self,
+        p: u32,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.with_promise_operation_roots(&[Value::heap(p)], f)
+    }
+
+    /// Resolve a freshly allocated (or temporarily unpublished) promise.
+    /// `resolve` may invoke an arbitrary `then` getter before it queues the
+    /// ThenableJob; keep the target live without suppressing collection.
+    pub(crate) fn resolve_fresh_promise(&mut self, p: u32, value: Value) {
+        if value.is_heap() && self.is_object_value(value) {
+            self.with_promise_resolution_root(p, |vm| vm.resolve(p, value));
+        } else {
+            // Heap-backed strings/symbols/bigints are still primitives: no
+            // `then` lookup or callback can occur, so avoid charging them for
+            // a root-stack push just because their representation is a slot.
+            self.resolve(p, value);
+        }
     }
 
     /// Register reactions on `p` (creating/reusing the dependent promise `into`),
@@ -1716,7 +1810,7 @@ impl<'p> Vm<'p> {
                     0 => {
                         self.async_gen_pop_front(idx);
                         let r = self.iter_result(Value::UNDEFINED, true);
-                        self.resolve(p, r);
+                        self.resolve_fresh_promise(p, r);
                     }
                     1 => {
                         self.async_gen_pop_front(idx);
@@ -1815,7 +1909,7 @@ impl<'p> Vm<'p> {
                         arg.heap_index()
                     } else {
                         let p = self.alloc_promise();
-                        self.resolve(p, arg);
+                        self.resolve_fresh_promise(p, arg);
                         p
                     }
                 }
@@ -1878,7 +1972,7 @@ impl<'p> Vm<'p> {
                     match input {
                         Resume::Value(v) | Resume::Return(v) => {
                             let r = self.iter_result(v, true);
-                            self.resolve(p, r);
+                            self.resolve_fresh_promise(p, r);
                         }
                         Resume::Throw(e) => self.reject(p, e),
                     }
@@ -2045,7 +2139,7 @@ impl<'p> Vm<'p> {
             };
             if let Some(req) = front {
                 let r = self.iter_result(y, false);
-                self.resolve(req.promise, r);
+                self.resolve_fresh_promise(req.promise, r);
             }
             // More requests already queued → service the next one now, honoring
             // its kind (a queued `.next(v)` delivers ITS argument to this yield;
@@ -2081,7 +2175,7 @@ impl<'p> Vm<'p> {
                 };
                 if let Some(req) = front {
                     let r = self.iter_result(ret, true);
-                    self.resolve(req.promise, r);
+                    self.resolve_fresh_promise(req.promise, r);
                 }
                 self.async_gen_service_queue(idx);
             }
@@ -2116,7 +2210,16 @@ impl<'p> Vm<'p> {
             if matches!(self.heap.get(v.heap_index()), HeapObj::Promise { .. }) {
                 return v.heap_index();
             }
+            let p = self.alloc_promise();
+            self.resolve_fresh_promise(p, v);
+            return p;
         }
+        if let Some(promise) = self.try_alloc_fulfilled_primitive_promise(v) {
+            return promise;
+        }
+        // The kill-switch comparator keeps the historical primitive path exact:
+        // a non-heap value cannot run a then getter or allocate while resolving,
+        // so the temporary root stack is neither needed nor charged to OFF.
         let p = self.alloc_promise();
         self.resolve(p, v);
         p
@@ -2663,8 +2766,13 @@ impl<'p> Vm<'p> {
                 && index <= i32::MAX as u32
                 && promise_all_direct_enabled()
             {
-                eager_used |=
-                    self.then_combinator_all_direct(next.heap_index(), comb, index, cap_reject, result);
+                eager_used |= self.then_combinator_all_direct(
+                    next.heap_index(),
+                    comb,
+                    index,
+                    cap_reject,
+                    result,
+                );
                 continue;
             }
             // onFulfilled / onRejected per PerformPromise{All,AllSettled,Race,Any}: a
@@ -3141,7 +3249,11 @@ impl<'p> Vm<'p> {
                     // deadlocks its importers).
                     self.resolve(result, Value::UNDEFINED);
                 } else {
-                    self.resolve(result, ret);
+                    if ret.is_heap() {
+                        self.resolve_fresh_promise(result, ret);
+                    } else {
+                        self.resolve(result, ret);
+                    }
                 }
             }
             Err(_) => {
@@ -3263,6 +3375,7 @@ impl<'p> Vm<'p> {
                 thenable,
                 then,
                 promise,
+                ..
             } => {
                 let pair = self.new_resolver_pair();
                 let res = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
@@ -3270,11 +3383,24 @@ impl<'p> Vm<'p> {
                     is_reject: false,
                     pair,
                 }));
+                // The running task is the traced owner of its freshly-created
+                // resolvers. Publish each one BEFORE the next allocation: under
+                // ZIPP_GC_STRESS an otherwise local-only resolver may be swept
+                // and its slot reused before `then` receives it.
+                if let Some(Microtask::ThenableJob { resolve, .. }) =
+                    self.current_microtask.as_mut()
+                {
+                    *resolve = res;
+                }
                 let rej = Value::heap(self.heap.alloc(HeapObj::BoundResolver {
                     promise,
                     is_reject: true,
                     pair,
                 }));
+                if let Some(Microtask::ThenableJob { reject, .. }) = self.current_microtask.as_mut()
+                {
+                    *reject = rej;
+                }
                 if let Err(Thrown(msg)) = self.call_value(then, thenable, &[res, rej]) {
                     let e = match self.pending_throw.take() {
                         Some(v) => v,

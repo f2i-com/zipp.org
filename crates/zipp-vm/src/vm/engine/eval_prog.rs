@@ -620,6 +620,15 @@ impl<'p> Vm<'p> {
             }
             None => Value::heap(self.heap.alloc(HeapObj::Func(base_func))),
         };
+        // This synthesized callable is the eval program's execution context,
+        // so it belongs to the realm in which PerformEval compiled it just as
+        // a source-level function created by MakeFunc/MakeClosure does.  The
+        // plain-call realm boundary derives `active_realm` from the callee; an
+        // untagged child-realm eval root therefore ran as main-realm code and
+        // made functions it created main-realm too.  In particular, their
+        // syntactic `eval(...)` calls treated the child's %eval% as foreign
+        // indirect eval and lost the live caller-cell environment.
+        self.realm_tag_new(script.heap_index());
         // A direct eval's code resolves the CALLER's private brand chain
         // (frame.callee = this script value).
         if let Some(ch) = caller_chain {
@@ -660,6 +669,7 @@ impl<'p> Vm<'p> {
     /// pipeline's name-mapped slots), matching script
     /// GlobalDeclarationInstantiation rather than eval semantics.
     pub(crate) fn eval_script(&mut self, code: &str) -> Result<Value, Thrown> {
+        self.require_external_code_enabled()?;
         // SCRIPT goal: module mode would make the whole program strict and
         // silently disable Annex B.3.3 hoisting, sloppy semantics, and HTML
         // comments.

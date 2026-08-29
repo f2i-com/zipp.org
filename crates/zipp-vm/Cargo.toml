@@ -43,4 +43,8 @@ instrument = []
 # This deliberately conflicts with `jit`: native code generation and every
 # performance-only unchecked path are excluded, while the regex engine selects
 # its index-based/safe implementations.
-safe-sandbox = ["instrument", "regress/prohibit-unsafe"]
+safe-sandbox = [
+    "instrument",
+    "regress/prohibit-unsafe",
+    "regress/bounded-backtracking",
+]

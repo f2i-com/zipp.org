@@ -172,6 +172,29 @@ console.log("pure mix h=" + h + " tail=" + tail + " k=" + k);
     ));
 }
 
+/// Dedicated mechanism fixture: its three compact numeric callees flatten
+/// into a region that still fits the physical XMM planner, then overflows the
+/// smaller GPR pool. With glob-range narrowing disabled, only B97's proven
+/// write-through sharing makes the GPR-only retry fit.
+#[test]
+fn gprwt_fixture_flattened_b97_probe() {
+    assert_matches_node(&prog(
+        r#"var xs = [];
+for (var i = 0; i < N; i++) xs.push(i % 13);
+var h = 0, tail = 0, k = 0;
+function step(a, x) { return (((a ^ x) + 17) | 0); }
+for (var r = 0; r < 5; r++) {
+  h = 2166136261;
+  for (var ti = 0; ti < xs.length; ti++) {
+    h = step(h, xs[ti]); h = step(h, ti); h = step(h, ti & 7);
+  }
+}
+for (k = 0; k + 2 < xs.length; k += 977) tail = (tail + xs[k]) | 0;
+console.log("b97 h=" + h + " tail=" + tail + " k=" + k);
+"#,
+    ));
+}
+
 /// The same flattenable shape followed by reads of recycled top-level temps.
 /// This is the exit-flush hazard B97's write-through sharing must preserve.
 #[test]
@@ -275,50 +298,33 @@ console.log("seen h=" + h + " seen=" + seen);
     ));
 }
 
-/// The mechanism. On the DEFAULT build the flattened mix loop's re-plan fits the
-/// GPR pool and the region engages there; under `ZIPP_NO_GPR_WT_SHARE=1` the
-/// SAME region declines on pool overflow and falls to the xmm integer emitter.
-/// If the decline stops appearing with the switch off, this stopped being an
-/// off-switch.
+/// B97's mechanism is isolated with glob-range narrowing disabled. The default
+/// benchmark-style fixtures above remain parity coverage only: their rewritten
+/// regions no longer claim to engage this allocator path.
 #[test]
-fn gprwt_mechanism_the_flattened_mix_loop_reaches_the_gpr_emitter() {
-    // The real parse-style/global-write siblings stay parity-only: their pinned
-    // string prefix widens this body past the current GPR plan. These pure
-    // result siblings isolate B97 from that independent admission boundary.
-    for name in [
-        "gprwt_parity_flattenable_pure_mix_loop",
-        "gprwt_parity_flattenable_recycled_temps_read_after_the_loop",
-    ] {
-        let on = jitlog_of(name, &[]);
-        assert!(
-            on.contains("INT splice ["),
-            "{name}: no region was flattened:\n{on}"
-        );
-        let on_span = first_gpr_retry_span(&on);
-        assert!(
-            on.contains(&format!("INT region [{on_span}] GPR homes engaged")),
-            "{name}: the flattened region never reached the GPR emitter:\n{on}"
-        );
+fn gprwt_mechanism_no_glob_range_rewritten_probe_reaches_gpr() {
+    const NAME: &str = "gprwt_fixture_flattened_b97_probe";
+    let on = jitlog_of(NAME, &[("ZIPP_NO_GLOB_RANGE", "1")]);
+    let on_span = rewritten_splice_retry_span(&on);
+    assert!(
+        on.contains(&format!(
+            "INT-GPR nest retry [{on_span}]: shared-home re-plan"
+        )) && on.contains(&format!("INT region [{on_span}] GPR homes engaged")),
+        "the no-glob-range rewritten region did not engage B97:\n{on}"
+    );
 
-        let off = jitlog_of(name, &[("ZIPP_NO_GPR_WT_SHARE", "1")]);
-        assert!(
-            off.contains("INT splice ["),
-            "{name}: the off-switch must not disturb the flatten:\n{off}"
-        );
-        let off_span = first_gpr_retry_span(&off);
-        assert!(
-            off.lines()
-                .filter(|l| l.contains(&format!("INT-GPR decline [{off_span}]")))
-                .count()
-                >= 2,
-            "{name}: with the switch off the re-plan must still overflow the \
-             GPR pool:\n{off}"
-        );
-        assert!(
-            !off.contains(&format!("INT region [{off_span}] GPR homes engaged")),
-            "{name}: the disabled write-through plan unexpectedly engaged:\n{off}"
-        );
-    }
+    let off = jitlog_of(
+        NAME,
+        &[("ZIPP_NO_GLOB_RANGE", "1"), ("ZIPP_NO_GPR_WT_SHARE", "1")],
+    );
+    let off_span = rewritten_splice_retry_span(&off);
+    assert_eq!(on_span, off_span, "ON/OFF selected different rewrites");
+    assert!(
+        gpr_declined_home_counts(&off, &off_span).len() >= 2
+            && !off.contains(&format!("INT region [{off_span}] GPR homes engaged"))
+            && off.contains(&format!("INT region [{off_span}] guard-hoist")),
+        "the B97 off-switch did not overflow and fall back to XMM:\n{off}"
+    );
 }
 
 /// The re-plan that engages is the SHARED-HOME one, and it engages because the
@@ -326,37 +332,31 @@ fn gprwt_mechanism_the_flattened_mix_loop_reaches_the_gpr_emitter() {
 /// body. Pin both halves: the first attempt overflows, the retry fits.
 #[test]
 fn gprwt_mechanism_the_shared_home_replan_is_what_fits() {
-    let on = jitlog_of("gprwt_parity_flattenable_pure_mix_loop", &[]);
+    const NAME: &str = "gprwt_fixture_flattened_b97_probe";
+    let on = jitlog_of(NAME, &[("ZIPP_NO_GLOB_RANGE", "1")]);
+    let span = rewritten_splice_retry_span(&on);
+    let initial = *gpr_declined_home_counts(&on, &span)
+        .first()
+        .expect("the distinct-home attempt must overflow");
+    let shared = gpr_engaged_home_count(&on, &span)
+        .expect("the shared-home retry must engage the rewritten region");
     assert!(
-        on.lines()
-            .any(|l| l.starts_with("[jit] INT-GPR decline") && l.contains("gprs")),
-        "the FIRST (distinct-homes) attempt is expected to overflow:\n{on}"
+        shared < initial,
+        "B97 did not reduce rewritten-region homes ({initial} -> {shared}):\n{on}"
     );
-    assert!(
-        on.contains("nest retry") && on.contains("shared-home re-plan"),
-        "the shared-home re-plan is what this mechanism rides on:\n{on}"
-    );
-    // The plan the retry produces must be strictly narrower than the one the
-    // off-switch produces — that difference IS the released permanent homes.
-    let homes = |log: &str| -> usize {
-        let span = first_gpr_retry_span(log);
-        log.lines()
-            .filter(|l| l.contains(&format!("region [{span}] glob-range plan:")))
-            .filter_map(|l| l.split("glob-range plan:").nth(1))
-            .filter_map(|t| t.split("homes=").nth(1))
-            .filter_map(|t| t.trim().parse::<usize>().ok())
-            .next()
-            .expect("the retry region's glob-range plan line with a home count")
-    };
+
     let off = jitlog_of(
-        "gprwt_parity_flattenable_pure_mix_loop",
-        &[("ZIPP_NO_GPR_WT_SHARE", "1")],
+        NAME,
+        &[("ZIPP_NO_GLOB_RANGE", "1"), ("ZIPP_NO_GPR_WT_SHARE", "1")],
     );
+    let off_span = rewritten_splice_retry_span(&off);
+    let off_declines = gpr_declined_home_counts(&off, &off_span);
     assert!(
-        homes(&on) < homes(&off),
-        "sharing did not narrow the plan ({} on vs {} off):\n{on}",
-        homes(&on),
-        homes(&off)
+        off_span == span
+            && off_declines.len() >= 2
+            && off_declines.iter().all(|&homes| homes >= initial)
+            && gpr_engaged_home_count(&off, &off_span).is_none(),
+        "disabled B97 unexpectedly narrowed or engaged the rewrite:\n{off}"
     );
 }
 
@@ -394,11 +394,48 @@ fn gprwt_all_modes_answer_identically() {
     }
 }
 
-fn first_gpr_retry_span(log: &str) -> &str {
+fn parse_span_after<'a>(line: &'a str, marker: &str) -> Option<(&'a str, usize, usize)> {
+    let span = line.split_once(marker)?.1.split_once(']')?.0;
+    let (start, end) = span.split_once(',')?;
+    Some((span, start.parse().ok()?, end.parse().ok()?))
+}
+
+fn rewritten_splice_retry_span(log: &str) -> String {
+    let (splice_at, splice_line) = log
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains("[jit] INT splice ["))
+        .expect("the fixture's source region must flatten");
+    let (_, _, source_end) = parse_span_after(splice_line, "INT splice [")
+        .expect("the source splice log must carry a span");
+    let ops = splice_line
+        .rsplit_once(", ")
+        .and_then(|(_, tail)| tail.strip_suffix(" ops"))
+        .and_then(|n| n.parse::<usize>().ok())
+        .expect("the source splice log must carry its rewritten op count");
     log.lines()
-        .find(|l| l.contains("INT-GPR nest retry"))
-        .and_then(|l| l.split(['[', ']']).nth(3))
-        .expect("an INT-GPR nest retry carrying its region span")
+        .skip(splice_at + 1)
+        .filter_map(|line| parse_span_after(line, "INT-GPR nest retry ["))
+        .find(|(_, start, end)| *start > source_end && end - start + 1 == ops)
+        .map(|(span, _, _)| span.to_string())
+        .expect("a GPR retry whose span is exactly the rewritten splice")
+}
+
+fn gpr_declined_home_counts(log: &str, span: &str) -> Vec<usize> {
+    let marker = format!("INT-GPR decline [{span}]: ");
+    log.lines()
+        .filter_map(|line| line.split_once(&marker).map(|(_, tail)| tail))
+        .filter_map(|tail| tail.split_once(" homes >").map(|(n, _)| n))
+        .filter_map(|n| n.parse().ok())
+        .collect()
+}
+
+fn gpr_engaged_home_count(log: &str, span: &str) -> Option<usize> {
+    let marker = format!("INT region [{span}] GPR homes engaged (");
+    log.lines()
+        .find_map(|line| line.split_once(&marker).map(|(_, tail)| tail))
+        .and_then(|tail| tail.split_once(" homes").map(|(n, _)| n))
+        .and_then(|n| n.parse().ok())
 }
 
 fn jitlog_of(test_name: &str, env: &[(&str, &str)]) -> String {

@@ -123,6 +123,108 @@ macro_rules! decline {
     }};
 }
 
+/// The two bytecode shapes that preserve a computed method reference until
+/// its arguments have been evaluated. New bytecode uses the capture-first
+/// `GetIndex`/`CallWithThis` pair; the sealed legacy opcode remains accepted so
+/// old/precompiled protos keep the same optimization contract.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ComputedCallSite {
+    pub(crate) get_ip: Option<usize>,
+    pub(crate) dst: u16,
+    pub(crate) obj: u16,
+    pub(crate) key: u16,
+    pub(crate) callee: Option<u16>,
+    pub(crate) arg_base: u16,
+    pub(crate) argc: u16,
+}
+
+/// Recognize only the exact capture-first computed-call pair. The captured
+/// callee, receiver, and key must survive argument evaluation unchanged, and
+/// no control-flow edge may enter after the property read. These facts let the
+/// computed splice omit both boxed operations while retaining the original
+/// pair as its miss/replay target.
+pub(crate) fn computed_call_site(
+    proto: &FuncProto,
+    region_start: usize,
+    call_ip: usize,
+) -> Option<ComputedCallSite> {
+    match *proto.code.get(call_ip)? {
+        Instr::CallMethodComputed {
+            dst,
+            obj,
+            key,
+            arg_base,
+            argc,
+        } => Some(ComputedCallSite {
+            get_ip: None,
+            dst,
+            obj,
+            key,
+            callee: None,
+            arg_base,
+            argc,
+        }),
+        Instr::CallWithThis {
+            dst,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+        } => {
+            let get_ip = (region_start..call_ip)
+                .rev()
+                .find(|&ip| writes_reg(&proto.code[ip]) == Some(callee))?;
+            let Instr::GetIndex {
+                dst: get_dst,
+                obj,
+                key,
+            } = proto.code[get_ip]
+            else {
+                return None;
+            };
+            if get_dst != callee
+                || obj != this_v
+                || callee == this_v
+                || callee == key
+                || dst == callee
+                || dst == this_v
+                || dst == key
+            {
+                return None;
+            }
+            let arg_end = arg_base.checked_add(argc)?;
+            if (arg_base..arg_end).contains(&callee)
+                || (arg_base..arg_end).contains(&this_v)
+                || (arg_base..arg_end).contains(&key)
+            {
+                return None;
+            }
+            if proto.code[get_ip + 1..call_ip]
+                .iter()
+                .any(|ins| writes_reg(ins).is_some_and(|r| r == callee || r == this_v || r == key))
+            {
+                return None;
+            }
+            if proto.code.iter().any(|ins| {
+                bytecode_control_target(ins)
+                    .is_some_and(|target| (get_ip + 1..=call_ip).contains(&(target as usize)))
+            }) {
+                return None;
+            }
+            Some(ComputedCallSite {
+                get_ip: Some(get_ip),
+                dst,
+                obj,
+                key,
+                callee: Some(callee),
+                arg_base,
+                argc,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Plan a flattened INT body for `[start, end]`, or `None` to compile the
 /// region exactly as before.
 ///
@@ -150,7 +252,7 @@ pub(crate) fn plan_int_splice(
         .filter(|&ip| matches!(proto.code[ip], Instr::Call { .. }))
         .collect();
     let computed: Vec<usize> = (s..=e)
-        .filter(|&ip| matches!(proto.code[ip], Instr::CallMethodComputed { .. }))
+        .filter(|&ip| computed_call_site(proto, s, ip).is_some())
         .collect();
     if !computed.is_empty() {
         // Keep the first lane deliberately bounded to one computed dispatch and
@@ -340,6 +442,7 @@ pub(crate) fn plan_int_splice(
     // straight out of this proto and must stay the interpreter's.
     let mut code = proto.code.clone();
     let mut constants = proto.constants.clone();
+    let mut string_constants = proto.string_constants.clone();
     let base = code.len();
     for ins in &mut code[s..=e] {
         *ins = Instr::ReturnUndefined;
@@ -360,7 +463,14 @@ pub(crate) fn plan_int_splice(
         vip_of.insert(o, flat.len());
         let r = span_resume.get(&o).copied().unwrap_or(o as u32);
         if let Some(site) = site_at.get(&o) {
-            emit_splice(site, &mut flat, &mut resume, &mut constants, r)?;
+            emit_splice(
+                site,
+                &mut flat,
+                &mut resume,
+                &mut constants,
+                &mut string_constants,
+                r,
+            )?;
             continue;
         }
         if sites.iter().any(|st| st.def_ip == o) {
@@ -400,15 +510,39 @@ pub(crate) fn plan_int_splice(
             access.insert(ip, j);
         }
     }
+    let mut captured_calls = FxHashMap::default();
+    for (&ip, site) in &ta_plan.captured_calls {
+        if !(s..=e).contains(&ip) {
+            captured_calls.insert(ip, *site);
+            continue;
+        }
+        let (Some(&get_off), Some(&call_off)) =
+            (vip_of.get(&site.get_ip), vip_of.get(&site.call_ip))
+        else {
+            continue;
+        };
+        let mut mapped = *site;
+        mapped.get_ip = base + get_off;
+        mapped.call_ip = base + call_off;
+        captured_calls.insert(mapped.call_ip, mapped);
+    }
     let new_ta = TaPinPlan {
         pins: ta_plan.pins.clone(),
         access,
+        captured_calls,
     };
     let mut sp = proto.clone();
     sp.reg_count = sp.reg_count.max(win_top as u16);
     sp.code = code;
     sp.constants = constants;
-    if !int_unadmitted_ips(&sp, new_start, new_end, &new_ta, false).is_some_and(|v| v.is_empty()) {
+    sp.string_constants = string_constants;
+    let admitted = int_unadmitted_ips(&sp, new_start, new_end, &new_ta, false);
+    if admitted.as_ref().is_none_or(|v| !v.is_empty()) {
+        if let Some(ips) = admitted {
+            for ip in ips {
+                log_decline(format_args!("flattened reject @{ip}: {:?}", sp.code[ip]));
+            }
+        }
         decline!("[{start},{end}] flattened body is not INT-admissible");
     }
     if std::env::var_os("ZIPP_JITLOG").is_some() {
@@ -461,16 +595,10 @@ fn plan_int_computed_splice(
     if cp.variants.is_empty() || cp.variants.len() > 4 {
         decline!("@{call_ip} computed arm count {}", cp.variants.len());
     }
-    let Instr::CallMethodComputed {
-        dst,
-        key,
-        arg_base,
-        argc,
-        ..
-    } = proto.code[call_ip]
-    else {
+    let Some(site) = computed_call_site(proto, start as usize, call_ip) else {
         return None;
     };
+    let (dst, key, arg_base, argc) = (site.dst, site.key, site.arg_base, site.argc);
     let (s, e) = (start as usize, end as usize);
     let fallback = cp.fallback_ip as usize;
     if !(s..=call_ip).contains(&fallback) {
@@ -487,6 +615,7 @@ fn plan_int_computed_splice(
     let win = key_cmp.checked_add(1)?;
     let mut win_top = win as u64;
     let mut wins = Vec::with_capacity(cp.variants.len());
+    let mut route_epoch = None;
     for lp in &cp.variants {
         if lp.upvals.len() != 0
             || !lp.nested.is_empty()
@@ -496,6 +625,24 @@ fn plan_int_computed_splice(
             || !matches!(lp.body.last(), Some(Instr::Return { .. }))
         {
             decline!("@{call_ip} computed arm lost its pure typed proof");
+        }
+        if lp.body.iter().any(|ins| {
+            matches!(
+                ins,
+                Instr::LoadGlobal { .. }
+                    | Instr::LoadGlobalOrUndefined { .. }
+                    | Instr::StoreGlobal { .. }
+                    | Instr::StoreGlobalStrict { .. }
+                    | Instr::StoreGlobalResolved { .. }
+            )
+        }) {
+            let Some(epoch) = lp.direct_global_route_epoch else {
+                decline!("@{call_ip} computed direct globals lack a route guard");
+            };
+            if route_epoch.is_some_and(|existing| existing != epoch) {
+                decline!("@{call_ip} computed route guards disagree");
+            }
+            route_epoch = Some(epoch);
         }
         let arm_win = (win as u64).max(lp.reg_window as u64);
         win_top = win_top.max(arm_win.checked_add(lp.callee_reg_count as u64)?);
@@ -507,6 +654,7 @@ fn plan_int_computed_splice(
 
     let mut code = proto.code.clone();
     let mut constants = proto.constants.clone();
+    let mut string_constants = proto.string_constants.clone();
     let base = code.len();
     for ins in &mut code[s..=e] {
         *ins = Instr::ReturnUndefined;
@@ -519,7 +667,7 @@ fn plan_int_computed_splice(
 
     for o in s..=e {
         vip_of.insert(o, flat.len());
-        if cp.drop_obj_def.is_some_and(|d| d as usize == o) {
+        if cp.drop_obj_def.is_some_and(|d| d as usize == o) || site.get_ip == Some(o) {
             continue;
         }
         if o != call_ip {
@@ -563,6 +711,7 @@ fn plan_int_computed_splice(
                 &mut flat,
                 &mut resume,
                 &mut constants,
+                &mut string_constants,
                 cp.fallback_ip,
             )?;
             // Success rejoins the original continuation. The ordinary target
@@ -613,15 +762,39 @@ fn plan_int_computed_splice(
             access.insert(ip, j);
         }
     }
+    let mut captured_calls = FxHashMap::default();
+    for (&ip, site) in &ta_plan.captured_calls {
+        if !(s..=e).contains(&ip) {
+            captured_calls.insert(ip, *site);
+            continue;
+        }
+        let (Some(&get_off), Some(&call_off)) =
+            (vip_of.get(&site.get_ip), vip_of.get(&site.call_ip))
+        else {
+            continue;
+        };
+        let mut mapped = *site;
+        mapped.get_ip = base + get_off;
+        mapped.call_ip = base + call_off;
+        captured_calls.insert(mapped.call_ip, mapped);
+    }
     let new_ta = TaPinPlan {
         pins: ta_plan.pins.clone(),
         access,
+        captured_calls,
     };
     let mut sp = proto.clone();
     sp.reg_count = sp.reg_count.max(win_top as u16);
     sp.code = code;
     sp.constants = constants;
-    if !int_unadmitted_ips(&sp, new_start, new_end, &new_ta, false).is_some_and(|v| v.is_empty()) {
+    sp.string_constants = string_constants;
+    let admitted = int_unadmitted_ips(&sp, new_start, new_end, &new_ta, false);
+    if admitted.as_ref().is_none_or(|v| !v.is_empty()) {
+        if let Some(ips) = admitted {
+            for ip in ips {
+                log_decline(format_args!("computed reject @{ip}: {:?}", sp.code[ip]));
+            }
+        }
         decline!("[{start},{end}] computed flattened body is not INT-admissible");
     }
 
@@ -652,7 +825,7 @@ fn plan_int_computed_splice(
         ta_plan: new_ta,
         resume,
         guards: Vec::new(),
-        route_epoch: None,
+        route_epoch,
         computed_guards: vec![computed_guard],
         regs_fits: (regs_fits_helper, win_top),
         scratch_base: Some(proto.reg_count),
@@ -666,6 +839,7 @@ fn emit_splice(
     flat: &mut Vec<Instr>,
     resume: &mut Vec<u32>,
     constants: &mut Vec<Value>,
+    string_constants: &mut Vec<String>,
     r: u32,
 ) -> Option<()> {
     let lp = site.plan;
@@ -711,7 +885,7 @@ fn emit_splice(
         }
     }
     for ins in body {
-        let Some(m) = map_body_instr(ins, &map, constants, lp) else {
+        let Some(m) = map_body_instr(ins, &map, constants, string_constants, lp) else {
             decline!("@{} body op {ins:?} is not flattenable", site.call_ip);
         };
         flat.push(m);
@@ -740,6 +914,7 @@ fn map_body_instr(
     i: &Instr,
     map: &impl Fn(u16) -> u16,
     constants: &mut Vec<Value>,
+    string_constants: &mut Vec<String>,
     lp: &LeafInlinePlan,
 ) -> Option<Instr> {
     let m = map;
@@ -763,6 +938,24 @@ fn map_body_instr(
             src: m(src),
         },
         Instr::LoadGlobal { dst, idx } => Instr::LoadGlobal { dst: m(dst), idx },
+        Instr::GetProp { dst, obj, name } => {
+            let key = lp.string_constants.get(name as usize)?;
+            let mapped_name = match string_constants
+                .iter()
+                .position(|candidate| candidate == key)
+            {
+                Some(index) => index as u32,
+                None => {
+                    string_constants.push(key.clone());
+                    (string_constants.len() - 1) as u32
+                }
+            };
+            Instr::GetProp {
+                dst: m(dst),
+                obj: m(obj),
+                name: mapped_name,
+            }
+        }
         Instr::StoreGlobal { idx, src } => Instr::StoreGlobal { idx, src: m(src) },
         Instr::StoreGlobalStrict { idx, src } => Instr::StoreGlobalStrict { idx, src: m(src) },
         Instr::StoreGlobalResolved { idx, src } => Instr::StoreGlobalResolved { idx, src: m(src) },
@@ -802,6 +995,21 @@ fn map_body_instr(
             b: m(b),
             op,
         },
+        Instr::MathOp {
+            dst,
+            op: crate::bytecode::MathFn::Imul,
+            callee,
+            this_v,
+            arg_base,
+            argc: 2,
+        } => Instr::MathOp {
+            dst: m(dst),
+            op: crate::bytecode::MathFn::Imul,
+            callee: m(callee),
+            this_v: m(this_v),
+            arg_base: m(arg_base),
+            argc: 2,
+        },
         Instr::Eq { dst, a, b } => Instr::Eq {
             dst: m(dst),
             a: m(a),
@@ -832,17 +1040,6 @@ fn map_body_instr(
             a: m(a),
             b: m(b),
         },
-        Instr::MathOp {
-            dst,
-            op: MathFn::Imul,
-            arg_base,
-            argc: 2,
-        } => Instr::MathOp {
-            dst: m(dst),
-            op: MathFn::Imul,
-            arg_base: m(arg_base),
-            argc: 2,
-        },
         _ => return None,
     })
 }
@@ -862,11 +1059,6 @@ fn int_op_can_exit(i: &Instr) -> bool {
             | Instr::StoreGlobalStrict { .. }
             | Instr::StoreGlobalResolved { .. }
             | Instr::Bitwise { .. }
-            | Instr::MathOp {
-                op: MathFn::Imul,
-                argc: 2,
-                ..
-            }
             | Instr::Eq { .. }
             | Instr::Ne { .. }
             | Instr::Lt { .. }
@@ -899,7 +1091,10 @@ fn int_op_can_exit(i: &Instr) -> bool {
 /// unconditional decline.
 fn span_pinned_charcodeat(proto: &FuncProto, ta_plan: &TaPinPlan, ip: usize) -> bool {
     splice_charcodeat_enabled()
-        && matches!(proto.code[ip], Instr::CallMethod { .. })
+        && matches!(
+            proto.code[ip],
+            Instr::CallMethod { .. } | Instr::GetProp { .. } | Instr::CallWithThis { .. }
+        )
         && ta_plan
             .access
             .get(&ip)
@@ -966,11 +1161,6 @@ fn span_is_replayable(
                 | Instr::Ne { .. }
                 | Instr::GetIndex { .. }
                 | Instr::GetProp { .. }
-                | Instr::MathOp {
-                    op: MathFn::Imul,
-                    argc: 2,
-                    ..
-                }
         ) && !span_pinned_charcodeat(proto, ta_plan, ip)
         {
             decline!("@{call_ip} non-replayable op @{ip} in callee-def span");
@@ -999,24 +1189,13 @@ fn span_is_replayable(
     // self-contained rather than borrowed.
     let _ = (s, e);
     for ins in &proto.code {
-        if let Some(t) = jump_target(ins) {
+        if let Some(t) = bytecode_control_target(ins) {
             if (def_ip + 1..=call_ip).contains(&(t as usize)) {
                 decline!("@{call_ip} a jump enters the callee-def span at @{t}");
             }
         }
     }
     Some(())
-}
-
-fn jump_target(i: &Instr) -> Option<u32> {
-    match *i {
-        Instr::Jump { target }
-        | Instr::JumpIfFalse { target, .. }
-        | Instr::JumpIfTrue { target, .. }
-        | Instr::JumpIfNotLt { target, .. }
-        | Instr::JumpIfNotLe { target, .. } => Some(target),
-        _ => None,
-    }
 }
 
 /// Registers read ANYWHERE outside `[s, e]` in the enclosing function — the
@@ -1083,7 +1262,7 @@ fn region_live_out(
             let ip = s + k;
             let mut out: FxHashSet<u16> = FxHashSet::default();
             let mut fallthrough = true;
-            if let Some(t) = jump_target(&proto.code[ip]) {
+            if let Some(t) = bytecode_control_target(&proto.code[ip]) {
                 if matches!(proto.code[ip], Instr::Jump { .. }) {
                     fallthrough = false;
                 }
@@ -1181,10 +1360,26 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         | Instr::ToNum { dst, a }
         | Instr::ToStr { dst, a }
         | Instr::TypeOf { dst, a }
-        | Instr::TypeOfIs { dst, a, .. }
-        | Instr::IsArray { dst, a } => r(vec![a], Some(dst)),
-        Instr::JsonParse { dst, a } => r(vec![a], Some(dst)),
-        Instr::JsonStringify { dst, val, space } => r(vec![val, space], Some(dst)),
+        | Instr::TypeOfIs { dst, a, .. } => r(vec![a], Some(dst)),
+        Instr::IsArray {
+            dst,
+            a,
+            callee,
+            this_v,
+        } => r(vec![a, callee, this_v], Some(dst)),
+        Instr::JsonParse {
+            dst,
+            a,
+            callee,
+            this_v,
+        } => r(vec![a, callee, this_v], Some(dst)),
+        Instr::JsonStringify {
+            dst,
+            val,
+            space,
+            callee,
+            this_v,
+        } => r(vec![val, space, callee, this_v], Some(dst)),
         Instr::HasProp { dst, key, obj, .. } => r(vec![key, obj], Some(dst)),
         Instr::InstanceOfDyn { dst, val, ctor } => r(vec![val, ctor], Some(dst)),
         Instr::ArrayRest { dst, src, .. } => r(vec![src], Some(dst)),
@@ -1192,6 +1387,12 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         Instr::RequireObject { val } => r(vec![val], None),
         Instr::IterClose { iter } | Instr::IterCloseQuiet { iter } => r(vec![iter], None),
         Instr::CallSpread { dst, callee, args } => r(vec![callee, args], Some(dst)),
+        Instr::CallWithThisSpread {
+            dst,
+            callee,
+            this_v,
+            args,
+        } => r(vec![callee, this_v, args], Some(dst)),
         Instr::CallMethodSpread { dst, obj, args, .. } => r(vec![obj, args], Some(dst)),
         Instr::TailCall {
             callee,
@@ -1204,9 +1405,15 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         }
         Instr::ArrayCtor {
             dst,
+            callee,
             arg_base,
             argc,
-        } => r((0..argc).map(|k| arg_base + k).collect(), Some(dst)),
+            ..
+        } => {
+            let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
+            v.extend(callee);
+            r(v, Some(dst))
+        }
         Instr::GetIndex { dst, obj, key } => r(vec![obj, key], Some(dst)),
         Instr::GetIndexConcat { dst, obj, key, .. } => r(vec![obj, key], Some(dst)),
         Instr::SetIndex { obj, key, val } => r(vec![obj, key, val], None),
@@ -1219,27 +1426,46 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         Instr::UpvalSet { src, .. } => r(vec![src], None),
         Instr::MathOp {
             dst,
+            callee,
+            this_v,
             arg_base,
             argc,
             ..
+        } => {
+            let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
+            v.push(callee);
+            v.push(this_v);
+            r(v, Some(dst))
         }
-        | Instr::GlobalFn {
+        Instr::GlobalFn {
             dst,
+            callee,
             arg_base,
             argc,
             ..
+        } => {
+            let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
+            v.push(callee);
+            r(v, Some(dst))
         }
-        | Instr::StaticFn {
-            dst,
-            arg_base,
-            argc,
-            ..
-        }
-        | Instr::NewArray {
+        Instr::NewArray {
             dst,
             arg_base,
             argc,
         } => r((0..argc).map(|k| arg_base + k).collect(), Some(dst)),
+        Instr::StaticFn {
+            dst,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        } => {
+            let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
+            v.push(callee);
+            v.push(this_v);
+            r(v, Some(dst))
+        }
         Instr::Call {
             dst,
             callee,
@@ -1248,6 +1474,31 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         } => {
             let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
             v.push(callee);
+            r(v, Some(dst))
+        }
+        Instr::CallWithThis {
+            dst,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+        } => {
+            let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
+            v.push(callee);
+            v.push(this_v);
+            r(v, Some(dst))
+        }
+        Instr::RegExpMethod {
+            dst,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            ..
+        } => {
+            let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
+            v.push(callee);
+            v.push(this_v);
             r(v, Some(dst))
         }
         Instr::New {

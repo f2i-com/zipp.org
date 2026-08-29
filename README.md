@@ -28,22 +28,27 @@ discard and recreate the Worker/WASM instance between tenants. See
 [`SECURITY.md`](SECURITY.md) for the complete threat model and deployment
 checklist.
 
-The native CLI offers additional defense-in-depth limits for classic scripts:
+For a hardened native interpreter, build the separately resolved
+[`zipp-sandbox`](crates/zipp-sandbox/README.md) executable. Its zipp-vm
+dependency has default features disabled and `safe-sandbox` enabled, so neither
+native JIT can be unified into the artifact and unsafe code is a compile-time
+error in both the VM and regex engine. Release builds also retain overflow
+checks and use mimalloc's secure mode.
 
 ```sh
-./target/release/zipp sandbox file.js
-# Equivalent discoverable spelling:
-./target/release/zipp js --sandbox file.js
+cargo build --locked --release --manifest-path crates/zipp-sandbox/Cargo.toml
+./crates/zipp-sandbox/target/release/zipp-sandbox file.js
 
 # Imports are denied by default. Opt in to one canonical filesystem tree:
-./target/release/zipp sandbox --allow-imports ./plugins ./plugins/main.js
+./crates/zipp-sandbox/target/release/zipp-sandbox \
+  --allow-imports ./plugins ./plugins/main.js
 ```
 
-The native runner executes the script in a supervised child with a cleared
-environment, closed stdin, a hard wall deadline, an instruction budget, a
-payload-aware VM heap high-water ceiling, and a combined stdout/stderr cap.
-Blocking `Atomics.wait`, the VM's native JIT, and the regex native JIT are
-disabled before untrusted source is parsed.
+The hardened native runner executes the script in a supervised child with a
+cleared environment, closed stdin, a hard wall deadline, an instruction budget,
+a payload-aware VM heap high-water ceiling, and a combined stdout/stderr cap.
+Blocking `Atomics.wait` is disabled before untrusted source is parsed; the VM
+and regex native JITs are absent at compile time.
 Runtime compilation is also bounded across `eval`, `Function`, and
 `ShadowRealm.evaluate`: 64 KiB per source, 1 MiB and 256 attempts over the
 child lifetime, with at most 4,096 retained function definitions and 1,024
@@ -64,24 +69,32 @@ link inside the root still names its target as an in-root path.
 Forwarded output preserves ordinary Unicode, newlines, and tabs; other terminal
 control characters and bidi direction overrides/isolates are replaced with `?`
 before reaching the caller's terminal.
-Run `zipp sandbox --help` for the complete option list and defaults.
+Run `zipp-sandbox --help` for the complete option list and defaults.
 
-The sandbox currently has no ES-module entry mode: `zipp sandbox --module` and
-`zipp mjs --sandbox` fail closed. Do not use the unbounded compatibility `mjs`
-command for hostile input; bundle it as a classic script or add external OS
-isolation first.
+The sandbox currently has no ES-module entry mode: `zipp-sandbox --module`
+fails closed. Do not use the unbounded compatibility `mjs` command for hostile
+input; bundle it as a classic script or add external OS isolation first.
 
 The native command is language, process, resource, and import containment—not
-a kernel/OS sandbox or a memory-safety boundary. Its child retains the invoking
-user's identity and the native executable still contains unsafe/JIT machinery
-for the ordinary `js` command, even though the child disables JIT execution.
+a kernel/OS sandbox. Its child retains the invoking user's identity.
 The heap figure is conservative but is not exact process RSS, and native
 builtins can do work between instruction polls. Do not use this command as the
 sole boundary for arbitrary hostile code: use the Worker/WASM design above, or
 add an external restricted account/container and platform filesystem, network,
-process, CPU, and memory controls. Making `sandbox` the default spelling would
-also be a deliberate CLI compatibility change: existing `js`/`mjs` callers
-need an import-policy migration before their unbounded path can be removed.
+process, CPU, and memory controls.
+
+For compatibility, the fast JIT-enabled CLI still accepts `zipp sandbox` and
+`zipp js --sandbox`. Those aliases use the same supervisor and limits but their
+executable contains the ordinary CLI's unsafe/JIT machinery; treat them only as
+defense in depth and use `zipp-sandbox` when the hardened native profile
+matters.
+
+The ordinary `zipp` binary deliberately defaults to mimalloc's high-throughput
+mode for trusted workloads. `cargo build --release --features secure-allocator`
+enables mimalloc's guarded metadata/randomization in that JIT binary when its
+measured cost is acceptable. This opt-in does not replace `zipp-sandbox`: only
+the separately resolved runner excludes both JITs and forbids unsafe engine
+code at compile time.
 
 ---
 
@@ -92,20 +105,24 @@ are still reported separately so the long-running series remains comparable.
 On 2026-08-25 the engine took a deliberate security-hardening turn (sandbox
 metering, allocation/iteration ceilings, a hardened allocator build — see
 [SECURITY.md](SECURITY.md)); some of that protection is paid for in hot-path
-time, and the numbers below are the honest post-hardening state, measured on
-the definitive clean PGO capture of `b2db432`.
+time, and the numbers below are the honest post-hardening state, measured in
+the retained legacy PGO capture
+[`real13_b2db432_pgo`](bench/real13_b2db432_pgo_2026-08-28.json) at `b2db432`.
+That capture predates the stricter per-process environment and PGO-provenance
+publication envelope documented below, so it is historical evidence rather
+than a current-policy artifact.
 
 | | |
 |---|---|
 | **Conformance** | **99.991% of test262** — 95,933 of 95,942 executions on this capture's binary: the six historical expected failures plus three module-code failures that arrived with the security hardening (they reproduce on the pristine hardening commit; ledger B181) — zero from the performance waves, and the waves' full sweeps have twice CAUGHT wrong-answer classes before landing (B181, and B189a's ctor-receiver find below) |
-| **Performance** | **all-13 geomean 0.68× Node**; fastest engine on 6 of 13 rows; the retained-ten headline **0.965×**, its best reading of the series. The 17-row hostile corpus reaches **0.920×** — a series best (0.936× before it) — on the first PROFILE-guided waves: an instruction-pointer profiler showed the four biggest hostile rows sharing one object-lifecycle profile, and two bounded fixes to it moved stable shapes 1.66× → **1.53×**, the React-shaped reconciler 1.86× → **1.78×**, megamorphic shapes 1.60× → **1.57×** and the bytecode interpreter 0.96× → **0.92×**; on the real corpus two JSON waves took json-large 1.27× → **1.19×** |
+| **Performance** | **all-13 geomean 0.68× Node**; fastest engine on 6 of 13 rows; the retained-ten headline **0.965×**, its best reading of the series. The 17-row hostile corpus reached **0.920×** — a series best (0.936× before it) — on the first PROFILE-guided waves: an instruction-pointer profiler showed the four biggest hostile rows sharing one object-lifecycle profile, and two bounded fixes to it moved stable shapes 1.66× → **1.53×**, the React-shaped reconciler 1.86× → **1.78×**, megamorphic shapes 1.60× → **1.57×** and the bytecode interpreter 0.96× → **0.92×**; on the real corpus two JSON waves took json-large 1.27× → **1.19×** |
 
 ### Speed vs Node, Bun and Deno
 
-Cold wall time including process launch, 21 paired runs per row with
+Cold wall time including process launch, 15 paired runs per row with
 deterministically shuffled engine and benchmark order. Bold time = fastest
-engine; bold ratio = zipp beats Node. Every output is byte-identical across all
-four engines.
+engine; bold ratio = zipp beats Node. Every stdout result is byte-identical
+across all four engines.
 Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · zipp at `b2db432` (PGO build).
 
 | benchmark | node | bun | deno | **zipp** | ratio to node |
@@ -200,9 +217,9 @@ properties, mixed local types, allocation/GC pressure, exceptions, sustained
 async work, modules, a React-shaped kernel, a warm router, and exact vendored
 npm source.
 
-Hostile results are never folded into the retained-ten headline. They are
-the generalisation gate — and the corpus now holds **under parity for the
-fifth capture running**: the current publishable capture
+Hostile results are never folded into the retained-ten headline. They are a
+separate stress corpus. In the retained series the corpus held **under parity
+for the fifth legacy capture running**. The retained capture
 ([`head_clean_b2db432_pgo`](bench/hostile/head_clean_b2db432_pgo_2026-08-28.json),
 zipp at `b2db432`, full corpus, 15 counterbalanced repetitions, exact on
 all 17 rows) measures **0.9200× cold ordinary geomean** — a series best
@@ -404,29 +421,74 @@ back in ([`DOC.md`](DOC.md#embedding)).
 
 ## Reproducing the numbers
 
+```powershell
+# Run from an x64 Visual Studio Developer PowerShell. Native Git Bash is
+# required; PATH's WSL bash is rejected.
+& 'C:\Program Files\Git\bin\bash.exe' tools/pgo.sh  # the measured binary
+```
+
 ```sh
-bash tools/pgo.sh                                    # the measured binary
-python tools/bench.py --engines node,bun,deno,zipp --reps 21
-python tools/bench_hostile.py --reps 15              # separate generalisation gate
+python tools/bench.py --zipp target/x86_64-pc-windows-msvc/release/zipp.exe --engines node,bun,deno,zipp --reps 21
+python tools/bench_hostile.py --zipp target/x86_64-pc-windows-msvc/release/zipp.exe --reps 15  # separate generalisation gate
 ```
 
 The harness counterbalances two-engine A/B order exactly for even repetition
 counts and within one run for odd counts, and deterministically shuffles engine
 and benchmark order for multi-engine captures. It pairs an empty
-launch with every full launch, reports paired medians with bootstrap intervals,
-and compares output as exact bytes. By default it refuses dirty or non-HEAD
-engines. Diagnostic overrides preserve every provenance reason and force
-`publishable:false`; source, harness, input, engine, process-health, and output
-drift also fail publication closed. For the hostile corpus, publication also
-requires the canonical unfiltered manifest, at least 15 repetitions, and at
-least 10,000 bootstrap samples; the manifest, both harnesses, and every declared
-input must be tracked and clean against `HEAD`. Captured environment values are
-restricted to an explicit allowlist of safe numeric/boolean controls;
-credentials, unknown keys, paths, and arbitrary runtime values are redacted. A
-hostile run with any inherited engine/runtime control is diagnostic-only. Source
-content is compared directly with its `HEAD` blob before and after measurement,
-so Git index hints cannot hide local corpus or harness edits. A clean artifact
-should still be audited before its numbers become a public claim.
+launch with every full launch, reports paired medians with descriptive
+percentile-bootstrap intervals, and compares stdout as exact bytes. Every
+measured process, launcher-resolution probe, and metadata probe gets its own
+fresh, isolated home/cache/temp tree, created outside timing and removed after
+that process; arbitrary or future ambient runtime variables are not inherited.
+By default the harness refuses dirty or non-HEAD engines. Diagnostic overrides
+preserve every provenance reason and force `publishable:false`; source, harness, input, engine,
+process-health, and output drift also fail publication closed. A publishable
+real-suite headline requires the complete Node/Bun/Deno/zipp table, Node as
+baseline, cold wall time, the modern report, and a canonical PGO binary. That
+measurement first copies every selected program (and every declared hostile
+dependency) into a private read-only tree before any engine probe, and every
+timed process executes only those staged bytes. The live checkout and the stage
+are rechecked afterward, so an editor cannot create a mixed-source artifact by
+temporarily replacing a file and restoring it. The canonical PGO binary binds
+its profile and structural-similarity-guarded training recipe plus the release
+profile, target, JIT/features, exact codegen flags, selected Cargo/rustc/rust-lld
+and MSVC `cl.exe`/`lib.exe` driver identities and byte hashes, allowlisted build
+environment, and Cargo definition files into a recomputed build-recipe hash.
+MSVC backend DLLs, SDK headers, and import libraries are represented by the
+validated environment paths, not a byte-complete SDK manifest. Both Cargo
+stages build the same private read-only clone of one clean `HEAD`; publication
+rechecks the original checkout. Recipe and source-snapshot verification reads
+the clean commit's Git blob bytes, so Windows checkout EOL materialization
+cannot change the byte domain. The PGO recipe trains only seven deterministic, LF-only
+mechanism workloads under `bench/pgo-training`; every tracked JavaScript/module
+benchmark outside that directory (including the legacy, long, scope, real, and
+hostile sets), plus every manifest-declared non-code hostile input, is excluded
+from training and bound by path and byte digest as publication data. Before
+training, a fail-closed validator also normalizes
+identifiers and literal values and rejects suspicious token-gram containment,
+shared token runs, padded fragments, distinctive shared integers and shift
+tuples, long cooked strings/regex bodies, and ambiguous source spellings. Training
+runs from an exclusive read-only stage with secondary runtime compilation and
+module loading disabled, byte-exact expected stdout/stderr, bounded time/output,
+and an explicitly hashed one-profile-per-input merge. Profiles and binaries are
+atomically published after path and digest checks. These policies, their helper
+bytes, and the output manifest are part of the recipe hash. This is an auditable
+anti-leakage boundary, not proof of statistical independence or a hostile-code
+sandbox.
+For the hostile corpus, publication also requires the canonical unfiltered
+manifest, at least 15 repetitions, and at least 10,000 bootstrap samples. The
+literal “faster than Node, Bun, and Deno on every row” result uses paired
+per-competitor ratios plus exact one-sided paired sign tests of whether the
+strict per-run win probability exceeds 0.5. Every point ratio must be below
+one, and every exact p-value must meet `0.05 / (rows × competitors)`, controlling
+family-wise type-I error at 5% by Bonferroni. Bootstrap intervals remain
+descriptive and never decide this gate. The entire repository, manifest,
+harnesses, and declared inputs must remain clean
+against the same `HEAD` before and after measurement. A clean artifact should
+still be independently audited before its numbers become a public claim.
+These controls address ordinary editor/build races and accidental clobbering;
+a malicious process already running as the benchmark account is outside this
+boundary and requires a separate build account or isolated host.
 
 Use at least 15 pairs for a change expected under 10%, and 21 for a marginal
 decision. A same-binary A/A check once reversed a row from −0.4% to +1.1% while

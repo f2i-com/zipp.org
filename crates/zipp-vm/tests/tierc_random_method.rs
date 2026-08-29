@@ -1,7 +1,7 @@
-//! Exactness coverage for Tier-C admission and native-to-native dispatch of a
-//! dynamically resolved zero-argument `random` method. The name is intentionally
-//! not treated as a pristine Math intrinsic: replacements, receiver `this`,
-//! arrows, accessors and throws remain live.
+//! Exactness coverage for Tier-C dispatch of a captured, dynamically resolved
+//! zero-argument `random` method. The name is intentionally not treated as a
+//! pristine Math intrinsic: replacements, receiver `this`, arrows, accessors
+//! and throws remain live.
 
 use std::process::Command;
 
@@ -177,30 +177,13 @@ fn execution_mode_child() {
 }
 
 #[test]
-fn jit_ablation_nojit_and_gc_modes_match() {
+fn jit_method_inline_nojit_and_gc_modes_match() {
     let exe = std::env::current_exe().expect("test binary path");
     for (mode, env) in [
         ("hot", &[("ZIPP_JIT_THRESHOLD", "1")][..]),
         (
-            "no_own_slot_direct",
-            &[
-                ("ZIPP_JIT_THRESHOLD", "1"),
-                ("ZIPP_NO_METHOD_OWN_SLOT_DIRECT", "1"),
-            ][..],
-        ),
-        (
-            "no_method_cross",
-            &[
-                ("ZIPP_JIT_THRESHOLD", "1"),
-                ("ZIPP_NO_METHOD_CROSSCALL", "1"),
-            ][..],
-        ),
-        (
-            "no_tierc_method",
-            &[
-                ("ZIPP_JIT_THRESHOLD", "1"),
-                ("ZIPP_NO_TIERC_RANDOM_METHOD", "1"),
-            ][..],
+            "no_method_inline",
+            &[("ZIPP_JIT_THRESHOLD", "1"), ("ZIPP_NO_METHOD_INLINE", "1")][..],
         ),
         ("nojit", &[("ZIPP_NOJIT", "1")][..]),
         (
@@ -212,9 +195,7 @@ fn jit_ablation_nojit_and_gc_modes_match() {
         cmd.args(["execution_mode_child", "--exact"])
             .env("ZIPP_RANDOM_METHOD_CHILD", "1")
             .env_remove("ZIPP_JIT_THRESHOLD")
-            .env_remove("ZIPP_NO_METHOD_OWN_SLOT_DIRECT")
-            .env_remove("ZIPP_NO_METHOD_CROSSCALL")
-            .env_remove("ZIPP_NO_TIERC_RANDOM_METHOD")
+            .env_remove("ZIPP_NO_METHOD_INLINE")
             .env_remove("ZIPP_NOJIT")
             .env_remove("ZIPP_GC_STRESS");
         for &(key, value) in env {
@@ -233,15 +214,16 @@ fn jit_ablation_nojit_and_gc_modes_match() {
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[test]
-fn own_slot_direct_prefix_is_emitted() {
+fn capture_first_member_calls_reach_tier_c() {
     let exe = std::env::current_exe().expect("test binary path");
     let out = Command::new(exe)
         .args(["execution_mode_child", "--exact", "--nocapture"])
         .env("ZIPP_RANDOM_METHOD_CHILD", "1")
         .env("ZIPP_JIT_THRESHOLD", "1")
         .env("ZIPP_JITLOG", "1")
+        .env("ZIPP_VM_DUMP", "1")
         .env_remove("ZIPP_NOJIT")
-        .env_remove("ZIPP_NO_METHOD_OWN_SLOT_DIRECT")
+        .env_remove("ZIPP_NO_METHOD_INLINE")
         .output()
         .expect("spawn engagement child");
     assert!(
@@ -252,7 +234,11 @@ fn own_slot_direct_prefix_is_emitted() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("Tier-C own-slot-direct method sites="),
-        "own-slot direct prefix was not emitted:\n{stderr}"
+        stderr.contains("CallWithThis {") && !stderr.contains("CallMethod {"),
+        "member calls were not lowered to capture-first CallWithThis bytecode:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("Tier C fn"),
+        "capture-first member-call bodies did not reach Tier C:\n{stderr}"
     );
 }

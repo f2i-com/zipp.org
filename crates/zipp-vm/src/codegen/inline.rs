@@ -133,6 +133,7 @@ pub(crate) fn emit_inline_leaf_call(
     dst: u16,
     math_unary: usize,
     math_two: usize,
+    math_imul_guard: Option<MathIntrinsicGuard>,
     // Helpers for the v2 body ops (DISTINCT names — do NOT confuse with `helper`
     // below, which is the fallback call_ic; a literal copy of a region template's
     // `QWORD helper` would emit `call call_ic` with the wrong ABI). Param order is
@@ -687,10 +688,13 @@ pub(crate) fn emit_inline_leaf_call(
             Instr::MathOp {
                 dst: d,
                 op,
+                callee,
+                this_v,
                 arg_base: ab,
                 argc: ac,
             } => {
                 let bail = ops.new_dynamic_label();
+                emit_math_identity_guard(ops, op, rg(callee), rg(this_v), bail, math_imul_guard);
                 if ac == 1 {
                     load_num_xmm(ops, rg(ab), 0, bail);
                     dynasm!(ops
@@ -1495,9 +1499,16 @@ pub(crate) fn emit_inline_method_call(
     packed_args: u64,
     refetch: Option<(usize, usize)>,
     ta_refetch: Option<(usize, &TaPinPlan)>,
+    // A fused captured GetProp prefix supplies `(fallback, success)` labels:
+    // miss continues with the original GetProp, while success skips its paired
+    // CallWithThis. `None` emits the ordinary helper fallback locally.
+    prefix_control: Option<(dynasmrt::DynamicLabel, dynasmrt::DynamicLabel)>,
 ) {
-    let fallback = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
+    let is_prefix = prefix_control.is_some();
+    let (fallback, done) = match prefix_control {
+        Some(labels) => labels,
+        None => (ops.new_dynamic_label(), ops.new_dynamic_label()),
+    };
     let w = plan.reg_window;
     // Load the receiver ONCE into rax. On a per-shape guard MISS we `jne` before
     // running any body, so rax still holds the receiver for the next arm; only a
@@ -1535,6 +1546,16 @@ pub(crate) fn emit_inline_method_call(
             ; cmp edx, DWORD shape.recv_ver as i32
             ; jne => miss
         );
+        // A fused captured-Get prefix has not executed the ordinary class IC
+        // probe. Match its live class-version guard before materializing the
+        // immutable class method Value baked from that IC.
+        if let Some((class, ver)) = shape.class_method {
+            dynasm!(ops
+                ; mov ecx, [r13 + (class as i32) * 4]
+                ; cmp ecx, DWORD ver as i32
+                ; jne => miss
+            );
+        }
         // ── plain-object receiver: the method is an own property, so its SLOT
         // VALUE must still be the callee we baked. An in-place overwrite does
         // not change the shape and so does not bump the version above.
@@ -1567,6 +1588,31 @@ pub(crate) fn emit_inline_method_call(
                 ; cmp rcx, r10
                 ; jne => miss
             );
+        }
+        // The split reference-order form carries the exact callable through
+        // arguments in a register. Receiver/member guards alone are
+        // insufficient: an argument may have replaced the property, while this
+        // call must still invoke the earlier Value. At the fused Get prefix the
+        // pure structural guards above prove that Value and materialize it;
+        // at the later Call site compare it explicitly. Any mismatch falls to
+        // the exact CallWithThis helper, never to a name-based method lookup.
+        if let Some(callee_reg) = plan.captured_callee {
+            let callee_bits = shape
+                .captured_callee_bits
+                .expect("captured method plan missing exact callee bits");
+            if is_prefix {
+                dynasm!(ops
+                    ; mov r10, QWORD callee_bits as i64
+                    ; mov [rbx + dreg(callee_reg)], r10
+                );
+            } else {
+                dynasm!(ops
+                    ; mov rcx, [rbx + dreg(callee_reg)]
+                    ; mov r10, QWORD callee_bits as i64
+                    ; cmp rcx, r10
+                    ; jne => miss
+                );
+            }
         }
         // ── W19 (MI-LANE) ── a scheduled register-resident emission replaces
         // the boxed body below. It needs NO scratch window at all: no `this`
@@ -1636,23 +1682,25 @@ pub(crate) fn emit_inline_method_call(
         }
         dynasm!(ops ; jmp => done);
     }
-    // ── fallback ── the UNCHANGED per-call helper (a pure prefix).
-    dynasm!(ops ; => fallback);
-    let helper_bail = ops.new_dynamic_label();
-    emit_region_call_ic(
-        ops,
-        call_ip,
-        helper_bail,
-        epilogue,
-        helper,
-        packed_fip,
-        packed_args,
-        argc,
-        dst,
-        refetch,
-        ta_refetch,
-    );
-    dynasm!(ops ; => done);
+    if !is_prefix {
+        // ── fallback ── the UNCHANGED per-call helper (a pure prefix).
+        dynasm!(ops ; => fallback);
+        let helper_bail = ops.new_dynamic_label();
+        emit_region_call_ic(
+            ops,
+            call_ip,
+            helper_bail,
+            epilogue,
+            helper,
+            packed_fip,
+            packed_args,
+            argc,
+            dst,
+            refetch,
+            ta_refetch,
+        );
+        dynasm!(ops ; => done);
+    }
 }
 
 /// Q7 Stage 5: inline a trivial class GETTER (`o.v`) or SETTER (`o.v = x`) for a
@@ -1906,6 +1954,14 @@ pub(crate) enum LaneStep {
         bits: u64,
         ver: u32,
     },
+    /// Captured `Math.imul` reference.  This replaces the source GetProp only
+    /// after validating the live global receiver, receiver layout generation,
+    /// exact own data slot value, and callable generation.  Every miss replays
+    /// the unchanged outer call before any transactional lane store commits.
+    MathImulGuard {
+        gidx: u32,
+        guard: MathIntrinsicGuard,
+    },
     /// `Rq(d) = imm64` (an int immediate too wide for an ALU imm32 field).
     GImm {
         d: u8,
@@ -1933,6 +1989,12 @@ pub(crate) enum LaneStep {
         b: LaneOp32,
         op: crate::bytecode::BitwiseOp,
     },
+    /// `Math.imul`: low signed 32 bits of the product.
+    Imul32 {
+        d: u8,
+        a: LaneOp32,
+        b: LaneOp32,
+    },
     /// `movsxd Rq(d), low32(s)` — the `|0` wrap of a wide exact integer.
     SignExt {
         d: u8,
@@ -1942,12 +2004,6 @@ pub(crate) enum LaneStep {
     ZeroExt {
         d: u8,
         s: u8,
-    },
-    /// `Math.imul`: 32-bit signed multiply of ToInt32'd operands.
-    Imul32 {
-        d: u8,
-        a: LaneOp32,
-        b: LaneOp32,
     },
     /// ToInt32 of an f64 home, IN-RANGE ONLY: out-of-i32 (the modular-wrap
     /// case, NaN, ±Inf) jumps to fallback and the whole call re-runs.
@@ -2062,6 +2118,7 @@ enum Av {
     Int { h: u8, lo: i64, hi: i64 },
     F64 { h: u8 },
     Callee { g: u32 },
+    MathCallee { g: u32 },
 }
 
 const I53: i64 = 1i64 << 53;
@@ -2071,10 +2128,11 @@ const IV32: (i64, i64) = (i32::MIN as i64, i32::MAX as i64);
 /// = an op outside the modelled set (treated as using everything — the walk
 /// declines on it anyway, this only keeps the scans conservative).
 #[allow(clippy::type_complexity)]
-fn lane_use_def(ins: &Instr) -> Option<(([u16; 3], u8), Option<u16>)> {
-    let u0 = |d| Some((([0u16; 3], 0u8), d));
-    let u1 = |a, d| Some((([a, 0, 0], 1u8), d));
-    let u2 = |a, b, d| Some((([a, b, 0], 2u8), d));
+fn lane_use_def(ins: &Instr) -> Option<(([u16; 4], u8), Option<u16>)> {
+    let u0 = |d| Some((([0u16; 4], 0u8), d));
+    let u1 = |a, d| Some((([a, 0, 0, 0], 1u8), d));
+    let u2 = |a, b, d| Some((([a, b, 0, 0], 2u8), d));
+    let u4 = |a, b, c, d, out| Some((([a, b, c, d], 4u8), out));
     match *ins {
         Instr::LoadInt { dst, .. }
         | Instr::LoadConst { dst, .. }
@@ -2090,16 +2148,12 @@ fn lane_use_def(ins: &Instr) -> Option<(([u16; 3], u8), Option<u16>)> {
         Instr::AddInt { dst, a, .. } => u1(a, Some(dst)),
         Instr::MathOp {
             dst,
+            callee,
+            this_v,
             arg_base,
-            argc,
+            argc: 2,
             ..
-        } => {
-            if argc == 2 {
-                u2(arg_base, arg_base + 1, Some(dst))
-            } else {
-                u1(arg_base, Some(dst))
-            }
-        }
+        } => u4(callee, this_v, arg_base, arg_base + 1, Some(dst)),
         Instr::UpvalSet { src, .. }
         | Instr::StoreGlobal { src, .. }
         | Instr::StoreGlobalStrict { src, .. }
@@ -2108,6 +2162,9 @@ fn lane_use_def(ins: &Instr) -> Option<(([u16; 3], u8), Option<u16>)> {
         // into the step as an absolute `vals` address behind the arm's
         // identity+version guard. `obj != 0` stays unmodelled (`None`).
         Instr::GetProp { dst, obj: 0, .. } => u0(Some(dst)),
+        // A captured Math reference reads its namespace receiver.  The body
+        // walker below admits only an exact GetProp/MathOp pairing.
+        Instr::GetProp { dst, obj, .. } => u1(obj, Some(dst)),
         // W19 (MI-LANE): the flattened super marker. Like the nested-splice
         // `Call` below it is a guard site, not a def: the super body's ops
         // follow and a rewritten `Move` writes the call's dst.
@@ -2238,6 +2295,9 @@ struct LaneBuilder<'a> {
     /// Ordinary leaf planning pre-validates direct global routing. Method lanes
     /// do not, so they retain the historical callee-guard-only treatment.
     allow_global_values: bool,
+    /// Exact main-realm Math.imul slot proof.  `None` makes every captured
+    /// Math reference fail closed to the boxed body.
+    math_imul_guard: Option<MathIntrinsicGuard>,
     /// Side storage for `LaneStep::SuperGuard` hop lists.
     hop_pool: Vec<(u32, u32)>,
 }
@@ -2332,7 +2392,7 @@ impl LaneBuilder<'_> {
                     self.binds.insert(v, sid);
                     Ok(sid)
                 }
-                Av::Callee { .. } => Err("callee-value-escapes"),
+                Av::Callee { .. } | Av::MathCallee { .. } => Err("callee-value-escapes"),
                 _ => Ok(sid),
             };
         }
@@ -2548,7 +2608,9 @@ impl LaneBuilder<'_> {
                     slf.steps.push(LaneStep::XImm { d: scratch, bits });
                     scratch
                 }
-                Av::Callee { .. } => unreachable!("resolve rejected a callee value"),
+                Av::Callee { .. } | Av::MathCallee { .. } => {
+                    unreachable!("resolve rejected a callee value")
+                }
             }
         };
         let xa = conv(self, sa, 0);
@@ -2589,7 +2651,9 @@ impl LaneBuilder<'_> {
                 self.steps.push(LaneStep::ToI32F64 { d: t, s: h });
                 LaneOp32::R(t)
             }
-            Av::Callee { .. } => unreachable!("resolve rejected a callee value"),
+            Av::Callee { .. } | Av::MathCallee { .. } => {
+                unreachable!("resolve rejected a callee value")
+            }
         })
     }
 
@@ -2896,7 +2960,6 @@ pub(crate) fn build_mi_lane(
                 | Instr::AddInt { .. }
                 | Instr::Neg { .. }
                 | Instr::Bitwise { .. }
-                | Instr::MathOp { .. }
                 | Instr::SuperMethod { .. }
                 | Instr::SuperGet { .. }
         )
@@ -2931,6 +2994,7 @@ pub(crate) fn build_mi_lane(
         Some(&ctx),
         global_route_guard,
         global_route_guard.is_some(),
+        None,
     )
 }
 
@@ -2962,6 +3026,7 @@ pub(crate) fn build_typed_lane(
         consts,
         nested,
         None,
+        None,
     )
 }
 
@@ -2983,6 +3048,7 @@ pub(crate) fn build_typed_lane_guarded(
     consts: &FxHashMap<u32, u64>,
     nested: &FxHashMap<usize, NestedGuard>,
     global_route_guard: Option<u32>,
+    math_imul_guard: Option<MathIntrinsicGuard>,
 ) -> Result<TypedLanePlan, &'static str> {
     build_lane_inner(
         body,
@@ -2997,6 +3063,7 @@ pub(crate) fn build_typed_lane_guarded(
         None,
         global_route_guard,
         false,
+        math_imul_guard,
     )
 }
 
@@ -3014,6 +3081,7 @@ fn build_lane_inner(
     mi: Option<&MiLaneCtx>,
     global_route_guard: Option<u32>,
     allow_global_stores: bool,
+    math_imul_guard: Option<MathIntrinsicGuard>,
 ) -> Result<TypedLanePlan, &'static str> {
     use crate::bytecode::BitwiseOp as B;
     if body.len() > LANE_MAX_BODY {
@@ -3071,6 +3139,7 @@ fn build_lane_inner(
         steps,
         n_guards,
         allow_global_values: global_route_guard.is_some() && typed_global_load_enabled(),
+        math_imul_guard,
         hop_pool: Vec::new(),
     };
     // ── entry: hoisted upval loads ── every upval index whose FIRST body op
@@ -3200,6 +3269,43 @@ fn build_lane_inner(
                     b.binds.insert(dst, sid);
                 }
             }
+            // Captured `Math.imul`: the compiler emits `LoadGlobal Math;
+            // GetProp imul` before evaluating either argument.  A typed lane
+            // replaces that lookup only when the exact Math data slot is still
+            // pristine.  The guard is emitted here (the source Get position),
+            // while the arithmetic remains at the later MathOp position.
+            Instr::GetProp { dst, obj, .. } => {
+                let paired = body[i + 1..]
+                    .iter()
+                    .take_while(|next| {
+                        crate::codegen::writes_reg(next) != Some(dst)
+                            && crate::codegen::writes_reg(next) != Some(obj)
+                    })
+                    .any(|next| {
+                        matches!(
+                            next,
+                            Instr::MathOp {
+                                op: MathFn::Imul,
+                                callee,
+                                this_v,
+                                argc: 2,
+                                ..
+                            } if *callee == dst && *this_v == obj
+                        )
+                    });
+                if !paired {
+                    return Err("getprop-outside-captured-math");
+                }
+                let gidx = match b.binds.get(&obj).map(|&sid| b.slots[sid]) {
+                    Some(Av::Callee { g }) => g,
+                    _ => return Err("math-receiver-not-a-global-load"),
+                };
+                let guard = b.math_imul_guard.ok_or("math-guard-missing")?;
+                b.steps.push(LaneStep::MathImulGuard { gidx, guard });
+                b.n_guards += 1;
+                let sid = b.push_slot(Av::MathCallee { g: gidx });
+                b.binds.insert(dst, sid);
+            }
             // ── W19 (MI-LANE): the flattened `super.m()` / `super.v` marker ──
             // emit the guard block; the super body's scheduled steps follow and
             // a rewritten `Move` binds the call's dst. No value is produced
@@ -3319,7 +3425,9 @@ fn build_lane_inner(
                                 b.bind_int(dst, d, (0, u32::MAX as i64));
                             }
                         }
-                        Av::Callee { .. } => unreachable!("resolve rejected a callee value"),
+                        Av::Callee { .. } | Av::MathCallee { .. } => {
+                            unreachable!("resolve rejected a callee value")
+                        }
                     }
                     continue;
                 }
@@ -3365,9 +3473,19 @@ fn build_lane_inner(
             Instr::MathOp {
                 dst,
                 op: MathFn::Imul,
+                callee,
+                this_v,
                 arg_base: ab,
                 argc: 2,
             } => {
+                let receiver_g = match b.binds.get(&this_v).map(|&sid| b.slots[sid]) {
+                    Some(Av::Callee { g }) => g,
+                    _ => return Err("math-receiver-not-captured"),
+                };
+                match b.binds.get(&callee).map(|&sid| b.slots[sid]) {
+                    Some(Av::MathCallee { g }) if g == receiver_g => {}
+                    _ => return Err("math-callee-not-captured"),
+                }
                 let sa = b.resolve(i, ab)?;
                 let sb = b.resolve(i, ab + 1)?;
                 let a32 = b.to32(i, sa, None)?;
@@ -3427,7 +3545,9 @@ fn build_lane_inner(
                         });
                     }
                     Av::F64 { h } => b.steps.push(LaneStep::RetF64 { s: h }),
-                    Av::Callee { .. } => return Err("callee-value-escapes"),
+                    Av::Callee { .. } | Av::MathCallee { .. } => {
+                        return Err("callee-value-escapes")
+                    }
                 }
                 returned = true;
             }
@@ -3462,7 +3582,7 @@ fn build_lane_inner(
                 });
             }
             Av::F64 { h } => b.steps.push(LaneStep::BoxF64ToSlot { s: h, slot }),
-            Av::Callee { .. } => return Err("callee-value-escapes"),
+            Av::Callee { .. } | Av::MathCallee { .. } => return Err("callee-value-escapes"),
         }
     }
     for (k, &(idx, _)) in pending.iter().enumerate() {
@@ -3490,7 +3610,7 @@ fn build_lane_inner(
                 narrow: lo >= IV32.0 && hi <= IV32.1,
             }),
             Av::F64 { h } => b.steps.push(LaneStep::GlobalCommitF64 { slot, s: h }),
-            Av::Callee { .. } => return Err("global-value-unresolved"),
+            Av::Callee { .. } | Av::MathCallee { .. } => return Err("global-value-unresolved"),
         }
     }
     let n_ops = b.steps.len() as u16;
@@ -3639,6 +3759,25 @@ fn emit_typed_lane(
                     ; jne => fallback
                 );
             }
+            LaneStep::MathImulGuard { gidx, guard } => {
+                dynasm!(ops
+                    ; mov rax, [r12 + (gidx as i32) * 8]
+                    ; mov rcx, QWORD guard.receiver_bits as i64
+                    ; cmp rax, rcx
+                    ; jne => fallback
+                    ; mov ecx, eax
+                    ; cmp DWORD [r13 + rcx * 4], guard.receiver_ver as i32
+                    ; jne => fallback
+                    ; mov rcx, QWORD guard.receiver_vals as i64
+                    ; mov rax, [rcx + (guard.receiver_slot as i32) * 8]
+                    ; mov rcx, QWORD guard.callee_bits as i64
+                    ; cmp rax, rcx
+                    ; jne => fallback
+                    ; mov ecx, eax
+                    ; cmp DWORD [r13 + rcx * 4], guard.callee_ver as i32
+                    ; jne => fallback
+                );
+            }
             LaneStep::GImm { d, v } => {
                 dynasm!(ops ; mov Rq(d), QWORD v);
             }
@@ -3770,12 +3909,6 @@ fn emit_typed_lane(
                     }
                 }
             },
-            LaneStep::SignExt { d, s } => {
-                dynasm!(ops ; movsxd Rq(d), Rd(s));
-            }
-            LaneStep::ZeroExt { d, s } => {
-                dynasm!(ops ; mov Rd(d), Rd(s));
-            }
             LaneStep::Imul32 { d, a, b } => {
                 match a {
                     LaneOp32::R(r) => dynasm!(ops ; mov eax, Rd(r)),
@@ -3786,6 +3919,12 @@ fn emit_typed_lane(
                     LaneOp32::I(v) => dynasm!(ops ; mov ecx, v ; imul eax, ecx),
                 }
                 dynasm!(ops ; movsxd Rq(d), eax);
+            }
+            LaneStep::SignExt { d, s } => {
+                dynasm!(ops ; movsxd Rq(d), Rd(s));
+            }
+            LaneStep::ZeroExt { d, s } => {
+                dynasm!(ops ; mov Rd(d), Rd(s));
             }
             LaneStep::ToI32F64 { d, s } => {
                 // cvttsd2si's indefinite (NaN/±Inf/|x| ≥ 2^63) fails the
@@ -4209,11 +4348,10 @@ mod lane_tests {
         );
     }
 
-    /// The mulberry/ri shape (upval PRNG state + imul/shift mixing + f64
-    /// div + int wrap) schedules: the exact body the row's 4.45M activations
-    /// run, reduced to its op skeleton.
+    /// A typed lane must decline guarded Math until its register model carries
+    /// the captured callee and receiver identity inputs.
     #[test]
-    fn mulberry_shape_schedules() {
+    fn guarded_math_declines_typed_lane() {
         let mut upvals = FxHashMap::default();
         upvals.insert(0u16, Value::heap(1234).bits());
         let mut consts = FxHashMap::default();
@@ -4251,6 +4389,8 @@ mod lane_tests {
             Instr::MathOp {
                 dst: 10,
                 op: MathFn::Imul,
+                callee: 1,
+                this_v: 2,
                 arg_base: 8,
                 argc: 2,
             },
@@ -4282,15 +4422,7 @@ mod lane_tests {
             Instr::Return { src: 17 },
         ];
         let r = build_typed_lane(&body, 1, 1, 10, 20, 18, &upvals, &consts, &no_nested());
-        let lane = r.expect("the mulberry/ri op skeleton must schedule");
-        // Entry upval call+bind, the param guard: at least three guards.
-        assert!(lane.n_guards >= 3, "guards={}", lane.n_guards);
-        assert!(lane.n_ops > 0);
-        // The upval write must commit: a box step + a cell_set call.
-        assert!(lane
-            .steps
-            .iter()
-            .any(|s| matches!(s, LaneStep::CellCommit { .. })));
+        assert_eq!(r.err(), Some("math-receiver-not-captured"));
     }
 
     /// Transactional global writes are never emitted in source order. Even a
@@ -4338,6 +4470,7 @@ mod lane_tests {
             Some(&mi),
             Some(0),
             true,
+            None,
         )
         .expect("closed global method body must schedule");
 
@@ -4411,6 +4544,7 @@ mod lane_tests {
             Some(&mi),
             None,
             true,
+            None,
         );
         assert_eq!(unguarded.err(), Some("global-route-unguarded"));
 
@@ -4434,6 +4568,7 @@ mod lane_tests {
             Some(&mi),
             Some(0),
             true,
+            None,
         );
         assert_eq!(unsupported.err(), Some("op-outside-lane-set"));
     }

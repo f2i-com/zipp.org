@@ -623,8 +623,10 @@ impl<'a> FnCompiler<'a> {
             let out = self.alloc_reg();
             self.emit(Instr::ArrayCtor {
                 dst: out,
+                callee: None,
                 arg_base: 0,
                 argc: 0,
+                is_construct: false,
             });
             let v = self.alloc_reg();
             let dflag = self.alloc_reg();

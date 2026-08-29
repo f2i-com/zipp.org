@@ -20,6 +20,22 @@ fn run_ok(source: &str) -> Vec<String> {
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const DETACHED_SUSPENDED_GC_SOURCE: &str = r#"
   "use strict";
+  function invoke(holder,n) {
+    let x=(n+3)|0; x=Math.imul(x,3); x=(x+11)|0;
+    x=(x^85)|0; x=(x-9)|0; x=Math.imul(x,5);
+    x=x>>>1; x=(x<<1)|0;
+    return (holder.random()+(x^x))|0;
+  }
+  // Keep one explicit native-to-native layer above `invoke`.  The enclosing
+  // loop is intentionally too effectful for a native region, so call-routing
+  // changes can otherwise leave `invoke` frame-backed and make the
+  // activation-root probe vacuous.  These stateless wrappers are globals so
+  // the inner call has a stable route; ZIPP_NO_TIERC_LEAF keeps it as a real
+  // cross entry rather than a bytecode splice.
+  function invokeCross(holder,n) {
+    const value=invoke(holder,n);
+    return (value+0)|0;
+  }
   (function () {
     let getterRound=0;
     const warmTarget={};
@@ -58,23 +74,17 @@ const DETACHED_SUSPENDED_GC_SOURCE: &str = r#"
       };
       return {random:detached};
     }
-    function invoke(holder,n) {
-      let x=(n+3)|0; x=Math.imul(x,3); x=(x+11)|0;
-      x=(x^85)|0; x=(x-9)|0; x=Math.imul(x,5);
-      x=x>>>1; x=(x<<1)|0;
-      return (holder.random()+(x^x))|0;
-    }
     let warm=getterWarm^getterWarm;
     for(let i=0;i<1200;i++) {
       const holder=makeHolder((i*3+1)|0,target);
-      warm=(warm+invoke(holder,(i&7)+1))|0;
+      warm=(warm+invokeCross(holder,(i&7)+1))|0;
       if(holder.random!==null) throw new Error("not detached during warmup");
     }
     Object.defineProperty(target,"x",{get:allocatingGetter});
     let sum=warm^warm;
     for(let i=0;i<1200;i++) {
       const holder=makeHolder((i*3+1)|0,target);
-      sum=(sum+invoke(holder,(i&7)+1))|0;
+      sum=(sum+invokeCross(holder,(i&7)+1))|0;
       if(holder.random!==null) throw new Error("not detached");
     }
     console.log("detached:"+sum);

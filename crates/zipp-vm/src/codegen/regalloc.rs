@@ -761,7 +761,7 @@ pub(crate) fn compile_region_regalloc(
         }
         dynasm!(ops
             ; mov rcx, rdi                      // vm
-            ; mov r8d, pin.kind as i32          // expected element kind
+            ; mov r8d, pin.snapshot_tag() as i32 // kind + intrinsic method mask
             ; lea r9, [rsp + ta_base + 32 * j as i32] // out: {obj_bits,base,len}
             ; mov rax, QWORD ta_snapshot as i64
             ; call rax
@@ -1331,6 +1331,49 @@ pub(crate) fn compile_region_regalloc(
                 );
                 lc = None;
             }
+            // Captured DataView member lookup.  The compiler evaluates the
+            // reference before arguments (`GetProp; ...; CallWithThis`); the
+            // pin snapshot revalidates the exact pristine prototype method and
+            // this arm materialises that callable in the boxed frame slot.
+            Instr::GetProp { .. }
+                if ta_plan.captured_get(ip).is_some_and(|_| {
+                    ta_plan
+                        .access
+                        .get(&ip)
+                        .is_some_and(|&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND)
+                }) =>
+            {
+                let site = ta_plan.captured_get(ip).expect("captured DataView GetProp");
+                debug_assert!(matches!(
+                    proto.code[ip],
+                    Instr::GetProp { obj, .. } if obj == site.obj
+                ));
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(g) => dynasm!(ops ; mov rax, [r12 + (g as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]
+                        ; jne => deopt
+                    );
+                }
+                dynasm!(ops
+                    ; mov rax, QWORD site.callee_bits as i64
+                    ; mov [rbx + dreg(site.callee)], rax
+                    ; jmp => done
+                    ; => deopt
+                    ; mov DWORD [rsi], ip as i32
+                    ; jmp => flush_exit
+                    ; => done
+                );
+                flag_cmp = None;
+                lc = None;
+            }
             // ── pinned-DataView get* read ── dv.getUint32(pos[, le]) → an inline
             // byte load, UNBOXED into the dst f64 home. `plan_region` admits a
             // CallMethod on this path ONLY as a pinned-DV get* (`pinned_dv`), with
@@ -1351,13 +1394,36 @@ pub(crate) fn compile_region_regalloc(
             // because raw bytes flushed from a home as Value bits could otherwise
             // alias a NaN-box tag. Scratch stays rax/rcx/rdx/xmm0: r8-r11 are
             // BOOL_GPRS homes (the endian flags live there).
-            Instr::CallMethod {
-                dst,
-                arg_base,
-                argc,
-                name,
-                ..
-            } => {
+            Instr::CallMethod { .. } | Instr::CallWithThis { .. } => {
+                let (dst, arg_base, argc, name) = match proto.code[ip] {
+                    Instr::CallMethod {
+                        dst,
+                        arg_base,
+                        argc,
+                        name,
+                        ..
+                    } => (dst, arg_base, argc, name),
+                    Instr::CallWithThis { .. } => {
+                        let site = match ta_plan.captured_call(ip) {
+                            Some(site)
+                                if ta_plan.access.get(&ip).is_some_and(|&j| {
+                                    ta_plan.pins[j as usize].kind == DV_PIN_KIND
+                                }) =>
+                            {
+                                site
+                            }
+                            _ => {
+                                decline_emit(format_args!(
+                                    "regalloc-emit-unhandled: {:?}",
+                                    proto.code[ip]
+                                ));
+                                return None;
+                            }
+                        };
+                        (site.dst, site.arg_base, site.argc, site.name)
+                    }
+                    _ => unreachable!(),
+                };
                 let kindid = match proto
                     .string_constants
                     .get(name as usize)
@@ -1647,13 +1713,15 @@ pub(crate) fn compile_region_regalloc(
         // write-through: plan_region's "DV endian-flag fusion" admission proves
         // every exit inside the fused window resumes inside it and re-runs the
         // killing def, so that store is load-bearing, not symmetrical noise.
-        if let Some(d) = wt_def_at(proto, &plan, ip) {
-            if plan.split_recvs.contains(&d) || plan.write_through.contains(&d) {
-                if let Some(&Home::Xmm(h)) = plan.reg_home.get(&d) {
-                    dynasm!(ops
-                        ; movq rax, Rx(h)
-                        ; mov [rbx + dreg(d)], rax
-                    );
+        if ta_plan.captured_get(ip).is_none() {
+            if let Some(d) = wt_def_at(proto, &plan, ip) {
+                if plan.split_recvs.contains(&d) || plan.write_through.contains(&d) {
+                    if let Some(&Home::Xmm(h)) = plan.reg_home.get(&d) {
+                        dynasm!(ops
+                            ; movq rax, Rx(h)
+                            ; mov [rbx + dreg(d)], rax
+                        );
+                    }
                 }
             }
         }

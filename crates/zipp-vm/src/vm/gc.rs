@@ -296,7 +296,7 @@ impl Vm<'_> {
         // JS-visible objects before allocating/collecting.
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         for state in std::iter::once(&self.jit_tierc_activation)
-            .chain(self.jit_tierc_activation_stack.iter())
+            .chain(self.jit_tierc_activation_stack.as_slice().iter())
         {
             if state.active {
                 root_idx!(state.closure);
@@ -404,10 +404,14 @@ impl Vm<'_> {
                     thenable,
                     then,
                     promise,
+                    resolve,
+                    reject,
                 } => {
                     root_val!(*thenable);
                     root_val!(*then);
                     root_idx!(*promise);
+                    root_val!(*resolve);
+                    root_val!(*reject);
                 }
                 // B218: the deferred settle job roots its combinator, which
                 // owns the element values recorded eagerly.
@@ -419,6 +423,9 @@ impl Vm<'_> {
         if let Some((resolve, reject)) = &self.cap_capture {
             root_val!(*resolve);
             root_val!(*reject);
+        }
+        for &promise in &self.promise_resolution_roots {
+            root_idx!(promise);
         }
         for f in &self.frames {
             root_idx!(f.closure);
@@ -485,6 +492,16 @@ impl Vm<'_> {
         // Builtin globals (Object/Array/Error/…): permanent roots so a builtin the
         // program never referenced — reachable only via this map for eval — survives.
         for &i in self.builtin_globals.values() {
+            root_idx!(i);
+        }
+        // Setup-time exact identities used by the captured RegExpMethod guard.
+        // They must remain permanent roots even after user code replaces every
+        // corresponding prototype slot, or a reused heap index could make the
+        // bits-only identity check accept an unrelated object (ABA).
+        for &i in &self.regexp_method_intrinsics {
+            root_idx!(i);
+        }
+        for &i in &self.regexp_protocol_intrinsics {
             root_idx!(i);
         }
         // Side tables: their VALUES are roots (an entry keyed by a live object
@@ -1481,6 +1498,30 @@ mod closure_side_table_gc_tests {
     }
 
     #[test]
+    fn register_gc_roots_stop_at_logical_len_not_initialized_high_water() {
+        let program = program_with_keep_global();
+        let mut vm = Vm::new(&program);
+        vm.run().expect("program runs");
+        vm.heap.set_nursery(false);
+
+        let live = vm.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+        let stale = vm.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+        vm.regs.resize(2, Value::UNDEFINED);
+        vm.regs[0] = Value::heap(live);
+        vm.regs[1] = Value::heap(stale);
+        vm.regs.truncate(1);
+        assert!(vm.regs.initialized_len() >= 2);
+
+        vm.gc();
+        assert!(!vm.heap.free_indices().contains(&live));
+        assert!(vm.heap.free_indices().contains(&stale));
+
+        vm.regs.clear();
+        vm.gc();
+        assert!(vm.heap.free_indices().contains(&live));
+    }
+
+    #[test]
     fn dead_method_home_cycle_is_collected() {
         for (label, table) in home_tables() {
             let program = program_with_keep_global();
@@ -1941,7 +1982,6 @@ pub use gcstats::dump as gc_stats;
 pub use gcstats::dump_budget as gc_young_budget_stats;
 pub use gcstats::dump_gen as gc_gen_stats;
 pub use gcstats::dump_nursery as gc_nursery_stats;
-
 
 /// `ZIPP_NO_OBJ_POOL_MAJOR=1` keeps MAJOR sweeps off the recycle pool
 /// (minor-only refill, the B194-landed behavior) — the single-binary A/B

@@ -150,7 +150,7 @@ impl<'p> Vm<'p> {
                 // now. Only slot 0 (`input`) is always already materialised; slot 1
                 // joined the deferred set in B71.
                 if slot >= 1 {
-                    self.regexp_last_materialise();
+                    self.regexp_last_materialise()?;
                 }
                 match self.regexp_last.get(slot).copied() {
                     Some(v) => Ok(v),

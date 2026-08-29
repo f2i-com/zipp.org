@@ -24,7 +24,6 @@ env_off_switch! {
 /// emitter cannot accidentally scalarize a merely similar loop.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RxScalarMatchallPlan {
-    pub(crate) call_ip: usize,
     pub(crate) get_iterator_ip: usize,
     pub(crate) iter_prime_ip: usize,
     pub(crate) iter_next_ip: usize,
@@ -35,6 +34,7 @@ pub(crate) struct RxScalarMatchallPlan {
     pub(crate) add_ip: usize,
     pub(crate) close_ip: usize,
     pub(crate) end_finally_ip: usize,
+    pub(crate) callee_reg: Reg,
     pub(crate) iter_reg: Reg,
     pub(crate) i_global: u32,
     pub(crate) n_global: u32,
@@ -63,6 +63,7 @@ pub(crate) struct RxScalarExecPlan {
     pub(crate) capture_tonum_ips: [usize; 4],
     pub(crate) add_ips: [usize; 4],
     pub(crate) input_pin_slot: usize,
+    pub(crate) callee_reg: Reg,
     pub(crate) re_reg: Reg,
     pub(crate) input_reg: Reg,
     pub(crate) call_result_reg: Reg,
@@ -94,7 +95,7 @@ pub(crate) fn rx_scalar_exec_plan(
     end: u32,
     ta_plan: &TaPinPlan,
 ) -> Option<RxScalarExecPlan> {
-    if !crate::vm::rx_scalar_exec_enabled() || end != start.checked_add(41)? {
+    if !crate::vm::rx_scalar_exec_enabled() || end != start.checked_add(42)? {
         return None;
     }
     let s = start as usize;
@@ -120,19 +121,32 @@ pub(crate) fn rx_scalar_exec_plan(
         Instr::LoadGlobal { dst, idx } => (dst, idx),
         _ => return None,
     };
-    let (lines, lines_global) = match code[s + 4] {
+    let callee_reg = match code[s + 4] {
+        Instr::GetProp { dst, obj, name }
+            if obj == re_reg
+                && proto
+                    .string_constants
+                    .get(name as usize)
+                    .map(String::as_str)
+                    == Some("exec") =>
+        {
+            dst
+        }
+        _ => return None,
+    };
+    let (lines, lines_global) = match code[s + 5] {
         Instr::LoadGlobal { dst, idx } => (dst, idx),
         _ => return None,
     };
-    let i1 = match code[s + 5] {
+    let i1 = match code[s + 6] {
         Instr::LoadGlobal { dst, idx } if idx == i_global => dst,
         _ => return None,
     };
-    let input_reg = match code[s + 6] {
+    let input_reg = match code[s + 7] {
         Instr::GetIndex { dst, obj, key } if obj == lines && key == i1 => dst,
         _ => return None,
     };
-    let input_pin_slot = ta_plan.access.get(&(s + 6)).copied()? as usize;
+    let input_pin_slot = ta_plan.access.get(&(s + 7)).copied()? as usize;
     if !ta_plan
         .pins
         .get(input_pin_slot)
@@ -140,27 +154,18 @@ pub(crate) fn rx_scalar_exec_plan(
     {
         return None;
     }
-    let call_result_reg = match code[s + 7] {
-        Instr::CallMethod {
+    let call_result_reg = match code[s + 8] {
+        Instr::RegExpMethod {
             dst,
-            obj,
-            name,
+            op: crate::bytecode::RegExpMethod::Exec,
+            callee,
+            this_v,
             arg_base,
             argc,
-        } if obj == re_reg
-            && arg_base == input_reg
-            && argc == 1
-            && proto
-                .string_constants
-                .get(name as usize)
-                .map(String::as_str)
-                == Some("exec") =>
-        {
-            dst
-        }
+        } if callee == callee_reg && this_v == re_reg && arg_base == input_reg && argc == 1 => dst,
         _ => return None,
     };
-    let result_global = match code[s + 8] {
+    let result_global = match code[s + 9] {
         Instr::StoreGlobal { idx, src }
         | Instr::StoreGlobalStrict { idx, src }
         | Instr::StoreGlobalResolved { idx, src }
@@ -170,22 +175,22 @@ pub(crate) fn rx_scalar_exec_plan(
         }
         _ => return None,
     };
-    let result_test_reg = match code[s + 9] {
+    let result_test_reg = match code[s + 10] {
         Instr::LoadGlobal { dst, idx } if idx == result_global => dst,
         _ => return None,
     };
-    if !matches!(code[s + 10], Instr::JumpIfFalse { cond, target }
-            if cond == result_test_reg && target == start + 38)
+    if !matches!(code[s + 11], Instr::JumpIfFalse { cond, target }
+            if cond == result_test_reg && target == start + 39)
     {
         return None;
     }
-    let (count, count_global) = match code[s + 11] {
+    let (count, count_global) = match code[s + 12] {
         Instr::LoadGlobal { dst, idx } => (dst, idx),
         _ => return None,
     };
-    if !matches!(code[s + 12], Instr::AddInt { dst, a, imm: 1, upd: true }
+    if !matches!(code[s + 13], Instr::AddInt { dst, a, imm: 1, upd: true }
             if dst == count && a == count)
-        || !matches!(code[s + 13],
+        || !matches!(code[s + 14],
             Instr::StoreGlobal { idx, src }
             | Instr::StoreGlobalStrict { idx, src }
             | Instr::StoreGlobalResolved { idx, src }
@@ -193,7 +198,7 @@ pub(crate) fn rx_scalar_exec_plan(
     {
         return None;
     }
-    let (sum, sum_global) = match code[s + 14] {
+    let (sum, sum_global) = match code[s + 15] {
         Instr::LoadGlobal { dst, idx } => (dst, idx),
         _ => return None,
     };
@@ -220,7 +225,7 @@ pub(crate) fn rx_scalar_exec_plan(
     let mut tonum_dsts = [0u16; 4];
     let mut accum = sum;
     for g in 0..4 {
-        let base = s + 15 + 5 * g;
+        let base = s + 16 + 5 * g;
         let result_obj = match code[base] {
             Instr::LoadGlobal { dst, idx } if idx == result_global => dst,
             _ => return None,
@@ -249,11 +254,11 @@ pub(crate) fn rx_scalar_exec_plan(
         tonum_dsts[g] = num;
         accum = next;
     }
-    let zero = match code[s + 35] {
+    let zero = match code[s + 36] {
         Instr::LoadInt { dst, val: 0 } => dst,
         _ => return None,
     };
-    let final_sum = match code[s + 36] {
+    let final_sum = match code[s + 37] {
         Instr::Bitwise {
             dst,
             a,
@@ -262,38 +267,39 @@ pub(crate) fn rx_scalar_exec_plan(
         } if a == accum && b == zero => dst,
         _ => return None,
     };
-    let i2 = match code[s + 38] {
+    let i2 = match code[s + 39] {
         Instr::LoadGlobal { dst, idx } if idx == i_global => dst,
         _ => return None,
     };
-    if !matches!(code[s + 37],
+    if !matches!(code[s + 38],
             Instr::StoreGlobal { idx, src }
             | Instr::StoreGlobalStrict { idx, src }
             | Instr::StoreGlobalResolved { idx, src }
                 if idx == sum_global && src == final_sum)
-        || !matches!(code[s + 39], Instr::AddInt { dst, a, imm: 1, upd: true }
+        || !matches!(code[s + 40], Instr::AddInt { dst, a, imm: 1, upd: true }
             if dst == i2 && a == i2)
-        || !matches!(code[s + 40],
+        || !matches!(code[s + 41],
             Instr::StoreGlobal { idx, src }
             | Instr::StoreGlobalStrict { idx, src }
             | Instr::StoreGlobalResolved { idx, src }
                 if idx == i_global && src == i2)
-        || !matches!(code[s + 41], Instr::Jump { target } if target == start)
+        || !matches!(code[s + 42], Instr::Jump { target } if target == start)
     {
         return None;
     }
 
     Some(RxScalarExecPlan {
-        input_get_ip: s + 6,
-        call_ip: s + 7,
-        result_store_ip: s + 8,
-        result_reload_ip: s + 9,
+        input_get_ip: s + 7,
+        call_ip: s + 8,
+        result_store_ip: s + 9,
+        result_reload_ip: s + 10,
         capture_load_ips,
         capture_key_ips,
         capture_get_ips,
         capture_tonum_ips,
         add_ips,
         input_pin_slot,
+        callee_reg,
         re_reg,
         input_reg,
         call_result_reg,
@@ -348,31 +354,32 @@ pub(crate) fn rx_scalar_matchall_plan(
         Instr::GetIndex { dst, obj, key } if obj == lines && key == i1 => dst,
         _ => return None,
     };
-    if !matches!(code[s + 6], Instr::CheckCoercible { src } if src == line) {
-        return None;
-    }
+    let callee_reg = match code[s + 6] {
+        Instr::GetProp { dst, obj, name }
+            if obj == line
+                && proto
+                    .string_constants
+                    .get(name as usize)
+                    .map(String::as_str)
+                    == Some("matchAll") =>
+        {
+            dst
+        }
+        _ => return None,
+    };
     let (re, re_global) = match code[s + 7] {
         Instr::LoadGlobal { dst, idx } => (dst, idx),
         _ => return None,
     };
     let iter = match code[s + 8] {
-        Instr::CallMethod {
+        Instr::RegExpMethod {
             dst,
-            obj,
-            name,
+            op: crate::bytecode::RegExpMethod::MatchAll,
+            callee,
+            this_v,
             arg_base,
             argc,
-        } if obj == line
-            && arg_base == re
-            && argc == 1
-            && proto
-                .string_constants
-                .get(name as usize)
-                .map(String::as_str)
-                == Some("matchAll") =>
-        {
-            dst
-        }
+        } if callee == callee_reg && this_v == line && arg_base == re && argc == 1 => dst,
         _ => return None,
     };
     if !matches!(code[s + 9], Instr::GetIterator { dst, src } if dst == iter && src == iter) {
@@ -513,7 +520,6 @@ pub(crate) fn rx_scalar_matchall_plan(
     }
 
     Some(RxScalarMatchallPlan {
-        call_ip: s + 8,
         get_iterator_ip: s + 9,
         iter_prime_ip: s + 10,
         iter_next_ip: s + 12,
@@ -524,6 +530,7 @@ pub(crate) fn rx_scalar_matchall_plan(
         add_ip: s + 24,
         close_ip: s + 30,
         end_finally_ip: s + 31,
+        callee_reg,
         iter_reg: iter,
         i_global,
         n_global,
@@ -670,8 +677,10 @@ pub(crate) fn region_can_compile(
                     reject!("[decline] CallMethodComputed (dense helper disabled) at region [{start},{end}]");
                 }
             }
-            // Plain calls `f(…)` — same protocol via `jit_call_ic`.
-            Instr::Call { .. } => {}
+            // Plain calls `f(…)`, plus calls carrying a previously captured
+            // receiver/reference — same completion/deopt protocol via their
+            // respective exact-call helpers.
+            Instr::Call { .. } | Instr::CallWithThis { .. } | Instr::RegExpMethod { .. } => {}
             // Logical `!` — MEM path (Bool flips natively; anything else goes
             // through the `jit_truthy` helper).
             Instr::Not { .. } => {}
@@ -1579,6 +1588,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) math_unary: usize,
     /// Pure two-arg `Math.<op>` helper (MathFn code, f64 bits, f64 bits → f64 bits).
     pub(crate) math_two: usize,
+    /// Exact main-realm `Math.imul` identity + heap-generation guard.
+    pub(crate) math_imul_guard: Option<MathIntrinsicGuard>,
     /// Pure `CellGet` helper (cell bits → inner Value bits / TDZ-deopt sentinel).
     pub(crate) cell_get: usize,
     /// `jit_str_index_of` intrinsic.
@@ -1690,13 +1701,11 @@ fn filter_push_only_pins(proto: &FuncProto, plan: &TaPinPlan) -> (TaPinPlan, Pus
     let mut nonpush_use = vec![false; plan.pins.len()];
     let mut stats = PushPinFilterStats::default();
 
-    let is_push = |ip: usize| {
-        matches!(
-            proto.code.get(ip),
-            Some(Instr::CallMethod { name, argc: 1, .. })
-                if proto.string_constants.get(*name as usize).is_some_and(|key| key == "push")
-        )
-    };
+    // `arr_push_pin` recognises both the legacy CallMethod and both endpoints
+    // of the exact capture-first GetProp/CallWithThis pair.  Treating the
+    // saved-callee GetProp as a real fallback consumer would retain every
+    // push-only pin after the compiler lowering changed shape.
+    let is_push = |ip: usize| arr_push_pin(proto, ip, plan).is_some();
     for (&ip, &slot) in &plan.access {
         let Some(used) = ((slot as usize) < plan.pins.len()).then_some(slot as usize) else {
             continue;
@@ -1848,6 +1857,7 @@ pub(crate) fn compile_region_numeric(
         gh,
         &TaPinPlan::default(),
         0,
+        None,
         &IntEntry::default(),
         meter,
     ) {

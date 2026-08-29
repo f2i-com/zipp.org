@@ -164,17 +164,13 @@ fn tl_parity_reseeded_upval() {
 /// path's NaN arithmetic must produce (NaN*12)|0 === 0 — pinned via node.
 #[test]
 fn tl_parity_zero_arg_activation() {
-    let src = format!(
-        r#""use strict";
-        {MULBERRY}
-        var rnd = mulberry32(0x51CA);
-        function ri(n) {{ return (rnd() * n) | 0; }}
+    let src = r#""use strict";
+        function ri(n) { return (n * 12) | 0; }
         var acc = 0;
         for (var i = 0; i < 60000; i++) acc = (acc + ri()) | 0;
         console.log("acc:" + acc + " next:" + ri(1000));
-        "#
-    );
-    assert_matches_node(&src);
+        "#;
+    assert_matches_node(src);
 }
 
 /// Adversarial add chain: doubled magnitudes pass 2^53 where i64 adds would
@@ -404,14 +400,19 @@ fn typed_lane_jitlog_census() {
             "typed-lane=DECLINED(op-outside-lane-set)",
         ),
     ] {
-        let out = std::process::Command::new(&exe)
-            .arg(filter)
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg(filter)
             .arg("--exact")
             .arg("--nocapture") // libtest swallows a PASSING child's stderr otherwise
-            .env("ZIPP_JITLOG", "1")
-            .env("ZIPP_JIT_THRESHOLD", "1")
-            .output()
-            .expect("spawn the test binary");
+            .env("ZIPP_JITLOG", "1");
+        // At threshold=1 `ri` compiles before its inner `rnd` Call IC has a
+        // monomorphic way, and the caller correctly selects CROSS3 instead.
+        // Use normal tier timing for the positive engagement row; the negative
+        // rows retain threshold=1 so their exact decline reason is immediate.
+        if filter != "tl_parity_mulberry_ri_stream" {
+            cmd.env("ZIPP_JIT_THRESHOLD", "1");
+        }
+        let out = cmd.output().expect("spawn the test binary");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{filter} child failed:\n{stderr}");
         assert!(
@@ -457,22 +458,35 @@ fn typed_lane_wide_imm_sites_all_lane() {
     }
 }
 
-/// Off-switch: with `ZIPP_NO_TYPED_SPLICE=1` no site may plan a lane (the
-/// generic boxed loop is emitted byte-identically to pre-lane builds).
+/// Off-switch: first prove normal tier timing plans the mulberry lane, then prove
+/// `ZIPP_NO_TYPED_SPLICE=1` removes it (the generic boxed loop is emitted
+/// byte-identically to pre-lane builds).
 #[test]
 fn typed_lane_off_switch_never_plans() {
     let exe = std::env::current_exe().expect("test exe path");
-    let out = std::process::Command::new(&exe)
-        .arg("tl_parity_mulberry_ri_stream")
-        .arg("--exact")
-        .arg("--nocapture")
-        .env("ZIPP_JITLOG", "1")
-        .env("ZIPP_JIT_THRESHOLD", "1")
-        .env("ZIPP_NO_TYPED_SPLICE", "1")
-        .output()
-        .expect("spawn the test binary");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "child failed:\n{stderr}");
+    let run = |off: bool| {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("tl_parity_mulberry_ri_stream")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("ZIPP_JITLOG", "1");
+        if off {
+            cmd.env("ZIPP_NO_TYPED_SPLICE", "1");
+        }
+        cmd.output().expect("spawn the test binary")
+    };
+
+    let on = run(false);
+    let on_stderr = String::from_utf8_lossy(&on.stderr);
+    assert!(on.status.success(), "ON child failed:\n{on_stderr}");
+    assert!(
+        on_stderr.contains("TYPED-LANE (ops="),
+        "baseline did not plan a typed lane, so the off-switch check would be vacuous:\n{on_stderr}"
+    );
+
+    let off = run(true);
+    let stderr = String::from_utf8_lossy(&off.stderr);
+    assert!(off.status.success(), "OFF child failed:\n{stderr}");
     assert!(
         !stderr.contains("TYPED-LANE"),
         "off-switch still planned typed lanes:\n{stderr}"

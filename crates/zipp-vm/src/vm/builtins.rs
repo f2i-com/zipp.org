@@ -1,6 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
-use crate::bytecode::{InstanceCtor, Instr, Program, UpvalSource};
+use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
     PromiseState, PropAttr, ReactionPair, Reactions,
@@ -318,10 +318,7 @@ impl<'p> Vm<'p> {
     /// so the bits are stable for the VM's lifetime and value-bits equality
     /// against this table is a tamper-proof "still the boot intrinsic" test.
     pub(crate) fn capture_proto_baselines(&mut self) {
-        for (proto, out) in [
-            (self.str_proto, 0usize),
-            (self.arr_proto, 1usize),
-        ] {
+        for (proto, out) in [(self.str_proto, 0usize), (self.arr_proto, 1usize)] {
             if proto == 0 {
                 continue;
             }
@@ -423,7 +420,12 @@ impl<'p> Vm<'p> {
         }
     }
 
-    pub(crate) fn collection_method_is_intrinsic(&mut self, idx: u32, name: &str, kind: u8) -> bool {
+    pub(crate) fn collection_method_is_intrinsic(
+        &mut self,
+        idx: u32,
+        name: &str,
+        kind: u8,
+    ) -> bool {
         // B215: the RECEIVER half of this proof, cached per (idx, method)
         // under the receiver's heap version. Every install that could change
         // the answer bumps `versions[idx]`: an own-shadow ADD (the named-prop
@@ -450,7 +452,11 @@ impl<'p> Vm<'p> {
                 let cslot = ((idx as usize).wrapping_mul(31) ^ nid) & (COLL_PROOF_SLOTS - 1);
                 let (ci, cv, cn, ck) = self.coll_proof_cache[cslot];
                 if ci == idx && cv == self.heap.version_of(idx) && cn == nid as u8 && ck == kind {
-                    let mproto = if kind == 4 { self.map_proto } else { self.set_proto };
+                    let mproto = if kind == 4 {
+                        self.map_proto
+                    } else {
+                        self.set_proto
+                    };
                     if let Some((ver, pslot, fn_bits)) =
                         self.coll_intrinsic_memo[(kind == 4) as usize][nid]
                     {

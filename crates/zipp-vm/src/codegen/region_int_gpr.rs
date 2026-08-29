@@ -1029,11 +1029,62 @@ impl GprDeoptShadow {
     }
 }
 
+/// Re-check one captured DataView `GetProp; CallWithThis` pair against both
+/// bytecode instructions and the pin/access proof. The shared capture planner
+/// has already proved no overwrite or branch entry inside the prefix; keeping
+/// this exact check local makes any future shape drift a shadow decline.
+fn gpr_deopt_shadow_captured_dv(
+    proto: &FuncProto,
+    ta_plan: &TaPinPlan,
+    ip: usize,
+) -> Option<CapturedPinCall> {
+    let site = match proto.code.get(ip)? {
+        Instr::GetProp { .. } => ta_plan.captured_get(ip)?,
+        Instr::CallWithThis { .. } => ta_plan.captured_call(ip)?,
+        _ => return None,
+    };
+    if site.get_ip >= site.call_ip || (site.argc != 1 && site.argc != 2) {
+        return None;
+    }
+    let &pin = ta_plan.access.get(&site.get_ip)?;
+    if ta_plan.access.get(&site.call_ip) != Some(&pin)
+        || ta_plan.pins.get(pin as usize)?.kind != DV_PIN_KIND
+        || !matches!(
+            proto.code.get(site.get_ip),
+            Some(Instr::GetProp { dst, obj, name })
+                if *dst == site.callee && *obj == site.obj && *name == site.name
+        )
+        || !matches!(
+            proto.code.get(site.call_ip),
+            Some(Instr::CallWithThis { dst, callee, this_v, arg_base, argc })
+                if *dst == site.dst
+                    && *callee == site.callee
+                    && *this_v == site.obj
+                    && *arg_base == site.arg_base
+                    && *argc == site.argc
+        )
+        || proto
+            .string_constants
+            .get(site.name as usize)
+            .and_then(|name| dv_get_kind(name))
+            .map_or(true, |kind| kind > 6)
+    {
+        return None;
+    }
+    Some(site)
+}
+
 /// Exact destination model for the closed V1 instruction whitelist below.
 /// Keep this local instead of inheriting the broader planner's `writes_reg`:
-/// in particular, pinned `CallMethod` and inline `Math.imul` have explicit
-/// emitter write-through hooks and must be counted/proved here as definitions.
-fn gpr_deopt_shadow_def(instr: &Instr) -> Option<u16> {
+/// in particular, pinned legacy/captured DataView calls and inline `Math.imul`
+/// have explicit emitter write-through hooks and must be counted/proved here
+/// as definitions. A captured GetProp is boxed control, never a numeric def.
+fn gpr_deopt_shadow_def(
+    proto: &FuncProto,
+    ta_plan: &TaPinPlan,
+    ip: usize,
+    instr: &Instr,
+) -> Option<u16> {
     match *instr {
         Instr::LoadInt { dst, .. }
         | Instr::LoadConst { dst, .. }
@@ -1059,6 +1110,12 @@ fn gpr_deopt_shadow_def(instr: &Instr) -> Option<u16> {
             ..
         }
         | Instr::CallMethod { dst, .. } => Some(dst),
+        Instr::CallWithThis { dst, .. }
+            if gpr_deopt_shadow_captured_dv(proto, ta_plan, ip)
+                .is_some_and(|site| site.dst == dst) =>
+        {
+            Some(dst)
+        }
         _ => None,
     }
 }
@@ -1095,8 +1152,9 @@ fn gpr_deopt_shadow_plan(
         return None;
     }
 
-    // Closed, call-free body. CallMethod is admitted only when this exact ip
-    // is a pinned integer DataView getter; Math.imul is emitted inline too.
+    // Closed, call-free body. A legacy CallMethod or captured
+    // GetProp/CallWithThis pair is admitted only when this exact ip belongs to
+    // a pinned integer DataView getter; Math.imul is emitted inline too.
     // Mul is admitted only when the existing range proof elides its guard, so
     // its result is inside the i53 domain. An unproved Mul stays excluded: i64
     // overflow is the one way a numeric def could collide with the EMPTY
@@ -1142,6 +1200,12 @@ fn gpr_deopt_shadow_plan(
                         .and_then(|k| dv_get_kind(k))
                         .map_or(true, |kind| kind > 6)
                 {
+                    return None;
+                }
+            }
+            Instr::GetProp { .. } | Instr::CallWithThis { .. } => {
+                let site = gpr_deopt_shadow_captured_dv(proto, ta_plan, ip)?;
+                if site.get_ip < s || site.call_ip > e {
                     return None;
                 }
             }
@@ -1220,17 +1284,35 @@ fn gpr_deopt_shadow_plan(
                 {
                     recv_resets = recv_resets.saturating_add(1);
                 }
+                Instr::GetProp { dst, .. }
+                    if gpr_deopt_shadow_captured_dv(proto, ta_plan, ip).is_some_and(|site| {
+                        site.callee == *dst
+                            && plan.split_recvs.contains(dst)
+                            && reg_ids.binary_search(dst).is_ok()
+                    }) =>
+                {
+                    // A reused captured callee has the same memory-authority
+                    // transition as a receiver LoadGlobal, but its boxed half
+                    // is the guarded callable written by the dedicated
+                    // GetProp arm. That arm already marks this exact numeric
+                    // shadow EMPTY, so count the reset rather than requiring a
+                    // numeric def here. Every other split_recv_lg shape still
+                    // declines below.
+                    recv_resets = recv_resets.saturating_add(1);
+                }
                 _ => return None,
             }
         }
-        if let Some(d) = gpr_deopt_shadow_def(instr) {
-            // CallMethod/Math.imul use explicit emitter hooks. If either ever
-            // defines a split/write-through logical slot that is not one of
-            // the proven numeric shadows, declining is safer than relying on
-            // a Bool-home or missing-home path that V1 does not model.
+        if let Some(d) = gpr_deopt_shadow_def(proto, ta_plan, ip, instr) {
+            // Legacy/captured DV calls and Math.imul use explicit emitter
+            // hooks. If one ever defines a split/write-through logical slot
+            // that is not one of the proven numeric shadows, declining is
+            // safer than relying on a Bool-home or missing-home path that V1
+            // does not model.
             if matches!(
                 instr,
                 Instr::CallMethod { .. }
+                    | Instr::CallWithThis { .. }
                     | Instr::MathOp {
                         op: MathFn::Imul,
                         argc: 2,
@@ -1332,6 +1414,7 @@ fn gpr_home_map(
     e: usize,
     metered: bool,
     allow_spill: bool,
+    spill_cap: usize,
     spill_base: i32,
 ) -> Result<(FxHashMap<u8, Loc>, FxHashMap<u16, i32>, bool, usize), bool> {
     // Out of scope: any plan feature whose write-through/flush interplay was
@@ -1495,7 +1578,7 @@ fn gpr_home_map(
             }
         }
         n_spill = used.len() - pool.len();
-        if forced.len() > pool.len() || n_spill > GPR_SPILL_CAP {
+        if forced.len() > pool.len() || n_spill > spill_cap {
             if std::env::var_os("ZIPP_JITLOG").is_some() {
                 // base_pool_len, not pool.len(): the spill path forcibly
                 // added r13/r14 above, and the ablation discipline diffs
@@ -2365,6 +2448,7 @@ pub(crate) fn compile_region_int_gpr(
     globals_base_helper: usize,
     ta_plan: &TaPinPlan,
     ta_snapshot: usize,
+    math_imul_guard: Option<MathIntrinsicGuard>,
     plan: &RegionPlan,
     // See `compile_region_int_maybe_cold`: the deopt resume map + hoisted entry
     // guards for a SPLICE-FLATTENED body (default = an ordinary region).
@@ -2373,6 +2457,17 @@ pub(crate) fn compile_region_int_gpr(
     allow_spill: bool,
 ) -> GprAttempt {
     let (s, e) = (start as usize, end as usize);
+    let captured_math = crate::codegen::captured_math_sites(proto, s, e);
+    // Captured Math is admitted only with the allocation-free direct identity
+    // guard; the helper fallback would clobber this allocator's mixed volatile
+    // and non-volatile home set.
+    if proto.code[s..=e]
+        .iter()
+        .any(|i| matches!(i, Instr::MathOp { .. }))
+        && math_imul_guard.is_none()
+    {
+        return GprAttempt::OutOfScope;
+    }
     // W20 M2: a region with an admitted `arr.push(int)` is out of scope for the
     // GPR sub-mode. The xmm INT emitter states its call-save set in three lines
     // (the bool gprs in use, plus any numeric home in xmm2..xmm5; xmm6..15 and
@@ -2400,9 +2495,21 @@ pub(crate) fn compile_region_int_gpr(
     // from symbolic home colours to the existing GPR allocator.  The global
     // spill kill switch still disables both uses, and the computed lane's own
     // switch prevents this branch from existing at all.
-    let computed_spill =
-        !entry.computed_guards.is_empty() && std::env::var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
-    let spill_enabled = allow_spill && (gpr_spill_slots_enabled() || computed_spill);
+    let spills_not_forced_off = std::env::var_os("ZIPP_NO_GPR_SPILL_SLOTS").is_none();
+    let computed_spill = !entry.computed_guards.is_empty() && spills_not_forced_off;
+    // Spec-order member calls add a captured callee prefix and can turn an
+    // otherwise seven-home DV loop into a graph-colouring shape that needs one
+    // extra symbolic home.  On the post-share retry, one existing canonical
+    // spill slot is cheaper than abandoning the integer lane (and far narrower
+    // than enabling the historically slower general multi-spill policy).
+    let captured_prefix_spill = spills_not_forced_off
+        && ta_plan
+            .captured_calls
+            .values()
+            .any(|site| s <= site.call_ip && site.call_ip <= e);
+    let general_spill = gpr_spill_slots_enabled() || computed_spill;
+    let spill_enabled = allow_spill && (general_spill || captured_prefix_spill);
+    let spill_cap = if general_spill { GPR_SPILL_CAP } else { 1 };
     let (map, hoist_c, inline_guards, n_spill) = match gpr_home_map(
         proto,
         plan,
@@ -2410,6 +2517,7 @@ pub(crate) fn compile_region_int_gpr(
         e,
         meter.is_some(),
         spill_enabled,
+        spill_cap,
         spill_base,
     ) {
         Ok(m) => m,
@@ -2578,6 +2686,27 @@ pub(crate) fn compile_region_int_gpr(
         ; sub rsp, frame
         ; mov [rsp + ip_slot], rsi            // rsi becomes a numeric home
     );
+    // Exact entry guard for a folded `Math.imul` captured-reference prefix.
+    // The recogniser proves the guarded global is stable for the region and no
+    // edge can enter after its LoadGlobal, so this stays outside the hot loop.
+    if !captured_math.is_empty() {
+        let guard = math_imul_guard.expect("captured Math requires an intrinsic guard");
+        let mut guarded_globals: Vec<u32> = captured_math.iter().map(|site| site.global).collect();
+        guarded_globals.sort_unstable();
+        guarded_globals.dedup();
+        for global in guarded_globals {
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov edx, global as i32
+                ; mov r8, QWORD guard.receiver_bits as i64
+                ; mov r9, QWORD guard.callee_bits as i64
+                ; mov rax, QWORD crate::vm::jit_math_imul_prefix_is_intrinsic as usize as i64
+                ; call rax
+                ; test rax, rax
+                ; jz => entry_bail
+            );
+        }
+    }
     // Same frame contract as the xmm tier (shadow at the bottom, rsp 16-aligned)
     // — always, here, since `ta_base` is 32 whether or not the region pins.
     emit_int_splice_entry_guards(&mut ops, entry, true, entry_bail);
@@ -2591,7 +2720,7 @@ pub(crate) fn compile_region_int_gpr(
         }
         dynasm!(ops
             ; mov rcx, rdi                      // vm
-            ; mov r8d, pin.kind as i32          // expected element kind
+            ; mov r8d, pin.snapshot_tag() as i32 // kind + intrinsic method mask
             ; lea r9, [rsp + ta_base + 32 * j as i32] // out: {obj_bits,base,len}
             ; mov rax, QWORD ta_snapshot as i64
             ; call rax
@@ -3565,13 +3694,87 @@ pub(crate) fn compile_region_int_gpr(
                 }
                 store_dst(&mut ops, dl);
             }
+            // Captured member references are lowered as
+            // `GetProp; <args>; CallWithThis`.  The pin snapshot has already
+            // revalidated the exact pristine intrinsic method, so write the
+            // captured callable into its boxed frame slot.  On a non-hoisted
+            // pin, receiver identity is still checked at this exact lookup ip.
+            Instr::GetProp { .. }
+                if ta_plan.captured_get(ip).is_some_and(|_| {
+                    ta_plan.access.get(&ip).is_some_and(|&j| {
+                        matches!(ta_plan.pins[j as usize].kind, STR_PIN_KIND | DV_PIN_KIND)
+                    })
+                }) =>
+            {
+                let site = ta_plan.captured_get(ip).expect("captured GetProp guard");
+                debug_assert!(matches!(
+                    proto.code[ip],
+                    Instr::GetProp { obj, .. } if obj == site.obj
+                ));
+                let j = ta_plan.access[&ip] as usize;
+                let off = ta_base + 32 * j as i32;
+                let deopt = ops.new_dynamic_label();
+                let done = ops.new_dynamic_label();
+                if !plan.hoist_pins.contains(&(j as u8)) {
+                    match ta_plan.pins[j].src {
+                        TaPinSrc::Global(gi) => dynasm!(ops ; mov rax, [r12 + (gi as i32) * 8]),
+                        TaPinSrc::Reg(r) => dynasm!(ops ; mov rax, [rbx + dreg(r)]),
+                    }
+                    dynasm!(ops
+                        ; cmp rax, [rsp + off]
+                        ; jne => deopt
+                    );
+                }
+                dynasm!(ops
+                    ; mov rax, QWORD site.callee_bits as i64
+                    ; mov [rbx + dreg(site.callee)], rax
+                );
+                if let Some(slot) = shadow.reg_slot(site.callee) {
+                    emit_gpr_deopt_shadow_empty(&mut ops, slot);
+                }
+                dynasm!(ops
+                    ; jmp => done
+                    ; => deopt
+                );
+                emit_store_ip(&mut ops, ip_slot, rip_at);
+                dynasm!(ops
+                    ; jmp => flush_exit
+                    ; => done
+                );
+            }
+            // Guarded captured `Math.imul` lookup. The entry guard proved the
+            // live global and own slot for the whole call-free region.
+            Instr::GetProp { .. } if captured_math.iter().any(|site| site.get_ip == ip) => {
+                let site = captured_math
+                    .iter()
+                    .find(|site| site.get_ip == ip)
+                    .expect("captured Math GetProp guard");
+                let guard = math_imul_guard.expect("captured Math intrinsic guard");
+                dynasm!(ops
+                    ; mov rax, QWORD guard.callee_bits as i64
+                    ; mov [rbx + dreg(site.callee)], rax
+                );
+                if let Some(slot) = shadow.reg_slot(site.callee) {
+                    emit_gpr_deopt_shadow_empty(&mut ops, slot);
+                }
+            }
             // ── pinned-string charCodeAt ── same guards/deopt as the xmm arm.
-            Instr::CallMethod { dst, arg_base, .. }
+            Instr::CallMethod { .. } | Instr::CallWithThis { .. }
                 if ta_plan
                     .access
                     .get(&ip)
                     .map_or(false, |&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND) =>
             {
+                let (dst, arg_base) = match proto.code[ip] {
+                    Instr::CallMethod { dst, arg_base, .. } => (dst, arg_base),
+                    Instr::CallWithThis { .. } => {
+                        let site = ta_plan
+                            .captured_call(ip)
+                            .expect("pinned captured string call");
+                        (site.dst, site.arg_base)
+                    }
+                    _ => unreachable!(),
+                };
                 let j = ta_plan.access[&ip] as usize;
                 let off = ta_base + 32 * j as i32;
                 let dl = g(dst);
@@ -3626,17 +3829,28 @@ pub(crate) fn compile_region_int_gpr(
             // OOB pos, TypeError for a detached buffer — a detached/shrunk/
             // non-DV receiver snapshots {0,0,0} and misses identity). Scratch:
             // rax/rcx/rdx only (r8-r11 may be Bool or numeric homes).
-            Instr::CallMethod {
-                dst,
-                arg_base,
-                argc,
-                name,
-                ..
-            } if ta_plan
-                .access
-                .get(&ip)
-                .map_or(false, |&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND) =>
+            Instr::CallMethod { .. } | Instr::CallWithThis { .. }
+                if ta_plan
+                    .access
+                    .get(&ip)
+                    .map_or(false, |&j| ta_plan.pins[j as usize].kind == DV_PIN_KIND) =>
             {
+                let (dst, arg_base, argc, name) = match proto.code[ip] {
+                    Instr::CallMethod {
+                        dst,
+                        arg_base,
+                        argc,
+                        name,
+                        ..
+                    } => (dst, arg_base, argc, name),
+                    Instr::CallWithThis { .. } => {
+                        let site = ta_plan
+                            .captured_call(ip)
+                            .expect("pinned captured DataView call");
+                        (site.dst, site.arg_base, site.argc, site.name)
+                    }
+                    _ => unreachable!(),
+                };
                 let kindid = match proto
                     .string_constants
                     .get(name as usize)
@@ -3897,7 +4111,10 @@ pub(crate) fn compile_region_int_gpr(
         // the guard resumes at ip+1 expecting the result flushed), and the
         // receiver LoadGlobal half stored the object itself — `wt_def_at` holds
         // that second exclusion for all three tiers.
-        if !wt_pre {
+        if !wt_pre
+            && ta_plan.captured_get(ip).is_none()
+            && !captured_math.iter().any(|site| site.get_ip == ip)
+        {
             if let Some(d) = wt_def_at(proto, plan, ip) {
                 // A non-`>>>` Bitwise result and Math.imul are PROVABLY i32
                 // (`>>>` yields a u32 that can exceed i32) — their write-through

@@ -29,6 +29,11 @@ impl<'p> Vm<'p> {
         args: &[Value],
         kind: u8,
     ) -> Result<Value, Thrown> {
+        // Host policy is checked before even argument coercion. Besides avoiding
+        // user-observable `toString` effects, this guarantees malformed
+        // parameter text never reaches the standalone parameter parser in the
+        // release-PGO execution mode.
+        self.require_external_code_enabled()?;
         self.preflight_native_iteration_work(args.len() as u64)?;
         let (params, body) = if args.is_empty() {
             (String::new(), String::new())
@@ -325,7 +330,7 @@ impl<'p> Vm<'p> {
                 let _gc = self.gc_lock_guard(); // settle value held across alloc
                 let p = self.alloc_promise();
                 match settle {
-                    Ok(v) => self.resolve(p, v),
+                    Ok(v) => self.resolve_fresh_promise(p, v),
                     Err(e) => self.reject(p, e),
                 }
                 Ok(Value::heap(p))
@@ -495,7 +500,7 @@ impl<'p> Vm<'p> {
                         // Await(result): wrap in a promise (thenables adopt),
                         // continue from its settlement.
                         let p = self.alloc_promise();
-                        self.resolve(p, r);
+                        self.resolve_fresh_promise(p, r);
                         let step_t = Value::heap(
                             self.heap.alloc(HeapObj::Native(native::DISPOSE_ASYNC_STEP)),
                         );

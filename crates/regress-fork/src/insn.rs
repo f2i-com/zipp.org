@@ -1,7 +1,9 @@
 //! Bytecode instructions for a compiled regex
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, sync::Arc, vec::Vec};
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 use crate::api;
 use crate::bytesearch::{AsciiBitmap, ByteArraySet, ByteBitmap};
@@ -235,7 +237,7 @@ pub struct CompiledRegex {
     //   - Empty, if there were no named capture groups.
     //   - A list of names with length `groups`, corresponding to the capture
     //     group names in order. Groups without names have an empty string.
-    pub group_names: Box<[Box<str>]>,
+    pub group_names: Option<Arc<[Box<str>]>>,
 
     // Flags controlling matching.
     pub flags: api::Flags,
@@ -269,11 +271,12 @@ impl CompiledRegex {
                     .capacity()
                     .saturating_mul(core::mem::size_of::<BracketContents>()),
             )
-            .saturating_add(
-                self.group_names
+            .saturating_add(self.group_names.as_deref().map_or(0, |names| {
+                names
                     .len()
-                    .saturating_mul(core::mem::size_of::<Box<str>>()),
-            );
+                    .saturating_mul(core::mem::size_of::<Box<str>>())
+                    .saturating_add(2 * core::mem::size_of::<usize>())
+            }));
 
         for insn in &self.insns {
             if let Insn::BackRefMulti { groups, .. } = insn {
@@ -284,8 +287,10 @@ impl CompiledRegex {
         for bracket in &self.brackets {
             bytes = bytes.saturating_add(bracket.cps.resident_bytes());
         }
-        for name in &self.group_names {
-            bytes = bytes.saturating_add(name.len());
+        if let Some(group_names) = self.group_names.as_deref() {
+            for name in group_names {
+                bytes = bytes.saturating_add(name.len());
+            }
         }
         if let StartPredicate::ByteSeq(finder) = &self.start_pred {
             bytes = bytes

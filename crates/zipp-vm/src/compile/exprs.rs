@@ -36,27 +36,17 @@ fn collect_static_key_plan_name(plan_names: &mut Vec<u32>, name: u32) {
 // gone from this file (`expr_into`, `typeof (f)`, `delete (x)`). That is a
 // deliberate behaviour change in one direction only: a parenthesized operand now
 // reaches the pattern matches that recognise a *shape* — `new (Array)(1)`,
-// `x instanceof (Array)`, `(Math).PI`, `` (String.raw)`…` `` — where before the
+// `x instanceof (Array)` and `(Math).PI` — where before the
 // wrapper node hid it and the generic path ran. Parenthesization is observable in
 // exactly two places (assignment-target simplicity, and NamedEvaluation via
 // `Target::Ident { covered }`), and neither is one of these, so the fold is
 // correct; it just was not reachable before.
 //
 // NOTE: helpers defined HERE and nowhere else in this file's group —
-// `arg_expr`, `static_key_text`, `lone_surrogate_markers`, `PropVal`, and the
+// `static_key_text`, `lone_surrogate_markers`, `PropVal`, and the
 // `FnCompiler` methods `str_const`, `member`, `private_member`, `prop_value`,
 // `object_accessor`, `object_data_prop`. If another section lands an identical
 // helper, keep one copy.
-
-/// The expression of a plain (non-spread) argument. Mirrors oxc's
-/// `Argument::as_expression`, which returned `None` for a `...spread`, so every
-/// `args.first().and_then(|a| a.as_expression())` reads the same as before.
-pub(crate) fn arg_expr(a: &ast::Arg) -> Option<&ast::Expr> {
-    match a {
-        ast::Arg::Expr(e) => Some(e),
-        ast::Arg::Spread(_) => None,
-    }
-}
 
 /// The TEXT of a non-computed property key, or `None` when the key has no static
 /// spelling (a computed key, or a private name). Property keys are Rust `String`s
@@ -441,36 +431,6 @@ impl<'a> FnCompiler<'a> {
                         "SyntaxError: '{n}' is a reserved word in strict mode"
                     ));
                 }
-                // Special global value identifiers that are not user bindings.
-                // Inside a `with`, an own property of a with-object SHADOWS the
-                // literal (e.g. `with({NaN:'x'}) NaN` === 'x'); the literal is the
-                // fallback when no with-object carries the name.
-                if matches!(n, "undefined" | "NaN" | "Infinity") {
-                    let lit = |s: &mut Self| match n {
-                        "undefined" => s.emit(Instr::LoadUndefined { dst }),
-                        "NaN" => {
-                            let idx = s.add_const(Value::num(f64::NAN));
-                            s.emit(Instr::LoadConst { dst, idx });
-                        }
-                        _ => {
-                            let idx = s.add_const(Value::num(f64::INFINITY));
-                            s.emit(Instr::LoadConst { dst, idx });
-                        }
-                    };
-                    let with_objs = self.with_obj_regs(n);
-                    if with_objs.is_empty() {
-                        lit(self);
-                        return Ok(dst);
-                    }
-                    let nidx = self.string_name(n);
-                    let end_jumps = self.emit_with_get_chain(nidx, &with_objs, dst);
-                    lit(self);
-                    let end = self.here();
-                    for je in end_jumps {
-                        self.patch_jump(je, end);
-                    }
-                    return Ok(dst);
-                }
                 // A parameter referenced before its own left-to-right
                 // initialization — `(x = x)` (self) or `(x = y, y)` (forward) — is
                 // in the Temporal Dead Zone: reading it throws a ReferenceError.
@@ -498,7 +458,32 @@ impl<'a> FnCompiler<'a> {
                 if !with_objs.is_empty() {
                     return Ok(self.load_with(n, &with_objs, dst));
                 }
-                match self.resolve(n) {
+                let binding = self.resolve(n);
+                // These three names are immutable VALUE properties only at the
+                // end of ResolveBinding.  Locals/params/upvalues/class names and
+                // every active `with` object have already won above.  A
+                // direct-eval zone must still perform its dynamic lookup before
+                // falling back to the global value, so only the proven-static
+                // Global case is folded here.
+                if matches!(n, "undefined" | "NaN" | "Infinity")
+                    && matches!(binding, Binding::Global(_))
+                    && !self.box_all_locals
+                    && !self.cx.dyn_global_zone
+                {
+                    match n {
+                        "undefined" => self.emit(Instr::LoadUndefined { dst }),
+                        "NaN" => {
+                            let idx = self.add_const(Value::num(f64::NAN));
+                            self.emit(Instr::LoadConst { dst, idx });
+                        }
+                        _ => {
+                            let idx = self.add_const(Value::num(f64::INFINITY));
+                            self.emit(Instr::LoadConst { dst, idx });
+                        }
+                    }
+                    return Ok(dst);
+                }
+                match binding {
                     Binding::Local(r) => Ok(r), // already in a register
                     Binding::LocalCell(cell) => {
                         self.emit(Instr::CellGet { dst, cell });
@@ -555,172 +540,26 @@ impl<'a> FnCompiler<'a> {
             E::Await(a) => self.await_expr(a, dst),
             E::Call(c) => self.call(c, dst),
             E::New { callee, args } => {
-                // `new Error(msg)` / `new TypeError(msg)` / `new RangeError(msg)`
-                // → a plain object {name, message}. Other constructors aren't in
-                // the subset yet. The by-name lowerings below fire only for the
-                // PRISTINE global builtin — a user binding of the same name
-                // (`function TypeError() {}`) takes the generic value path.
-                // A spread anywhere in the arguments disqualifies EVERY by-name
-                // lowering below: they all reach for `args.first()` or
-                // `eval_args_contiguous`, which either hard-errors ("spread
-                // arguments are not in the zipp-vm subset yet") or silently drops
-                // the spread — `new Map(...[[[1,2]]])` built an empty Map. The
-                // generic `NewSpread` path at the bottom constructs the same
-                // builtin correctly, so route spread calls there.
+                // Only Array keeps a dedicated user-visible constructor opcode.
+                // Every other named builtin uses the generic construct path: it
+                // already implements exact constructor identity, proxies,
+                // newTarget/prototype selection and the complete argument list.
                 let has_spread = args.iter().any(|a| matches!(a, ast::Arg::Spread(_)));
-                let id_opt = match &**callee {
-                    ast::Expr::Ident(id) if !has_spread && self.builtin_unshadowed(id) => Some(id),
-                    _ => None,
-                };
-                if let Some(id) = id_opt {
-                    let id: &str = id;
-                    if let Some(kind) = error_ctor(id) {
-                        return self.build_error(kind, args, dst);
-                    }
-                    // `new Array(…)` / `new Object()` builtins (no real global).
-                    if id == "Array" {
-                        let (arg_base, argc) = self.eval_args_contiguous(args)?;
-                        self.emit(Instr::ArrayCtor {
-                            dst,
-                            arg_base,
-                            argc,
-                        });
-                        return Ok(dst);
-                    }
-                    if id == "Object" {
-                        // `new Object()` → a fresh object; `new Object(x)` → ToObject(x).
-                        if let Some(arg) = args.first().and_then(arg_expr) {
-                            let src = self.expr(arg)?;
-                            self.emit(Instr::ToObject { dst, src });
-                        } else {
-                            self.emit(Instr::NewObject { dst, hint: 0 });
-                        }
-                        return Ok(dst);
-                    }
-                    // `new Promise(executor)`. A missing executor is a RUNTIME
-                    // TypeError (NewPromise validates callability), not a
-                    // compile error — `new Promise()` inside a never-taken
-                    // branch must still compile.
-                    if id == "Promise" {
-                        let executor = {
-                            let t = self.temp();
-                            match args.first().and_then(arg_expr) {
-                                Some(e) => {
-                                    let v = self.expr_into(e, t)?;
-                                    if v != t {
-                                        self.emit(Instr::Move { dst: t, src: v });
-                                    }
-                                }
-                                None => self.emit(Instr::LoadUndefined { dst: t }),
-                            }
-                            t
-                        };
-                        self.emit(Instr::NewPromise { dst, executor });
-                        self.next_reg -= 1; // reclaim executor temp
-                        return Ok(dst);
-                    }
-                    // `new RegExp(pattern?, flags?)` — pattern may be a string or a RegExp.
-                    if id == "RegExp" {
-                        return self.emit_regexp(args, dst, true);
-                    }
-                    // `new Map(iter?)` / `new Set(iter?)` / `new WeakMap(iter?)` /
-                    // `new WeakSet(iter?)`.
-                    if matches!(id, "Map" | "Set" | "WeakMap" | "WeakSet") {
-                        let src = match args.first().and_then(arg_expr) {
-                            Some(e) => {
-                                let t = self.temp();
-                                let v = self.expr_into(e, t)?;
-                                if v != t {
-                                    self.emit(Instr::Move { dst: t, src: v });
-                                }
-                                Some(t)
-                            }
-                            None => None,
-                        };
-                        self.emit(match id {
-                            "Set" => Instr::NewSet { dst, src },
-                            "Map" => Instr::NewMap { dst, src },
-                            "WeakSet" => Instr::NewWeakSet { dst, src },
-                            _ => Instr::NewWeakMap { dst, src },
-                        });
-                        if src.is_some() {
-                            self.next_reg -= 1; // reclaim the src temp
-                        }
-                        return Ok(dst);
-                    }
-                    // `new String/Number/Boolean(arg?)` — a boxed primitive wrapper.
-                    if matches!(id, "String" | "Number" | "Boolean") {
-                        let kind = match id {
-                            "String" => 0u8,
-                            "Number" => 1,
-                            _ => 2,
-                        };
-                        let arg = match args.first().and_then(arg_expr) {
-                            Some(e) => {
-                                let t = self.temp();
-                                let v = self.expr_into(e, t)?;
-                                if v != t {
-                                    self.emit(Instr::Move { dst: t, src: v });
-                                }
-                                Some(t)
-                            }
-                            None => None,
-                        };
-                        self.emit(Instr::NewBox { dst, kind, arg });
-                        if arg.is_some() {
-                            self.next_reg -= 1;
-                        }
-                        return Ok(dst);
-                    }
-                    // `new WeakRef(target)` — target required (the op validates it's
-                    // an object).
-                    if id == "WeakRef" {
-                        let target = self.temp();
-                        match args.first().and_then(arg_expr) {
-                            Some(e) => {
-                                let v = self.expr_into(e, target)?;
-                                if v != target {
-                                    self.emit(Instr::Move {
-                                        dst: target,
-                                        src: v,
-                                    });
-                                }
-                            }
-                            None => self.emit(Instr::LoadUndefined { dst: target }),
-                        }
-                        self.emit(Instr::NewWeakRef { dst, target });
-                        self.next_reg -= 1; // reclaim target temp
-                        return Ok(dst);
-                    }
-                    // `new FinalizationRegistry(cleanupCallback)`.
-                    if id == "FinalizationRegistry" {
-                        let cleanup = self.temp();
-                        match args.first().and_then(arg_expr) {
-                            Some(e) => {
-                                let v = self.expr_into(e, cleanup)?;
-                                if v != cleanup {
-                                    self.emit(Instr::Move {
-                                        dst: cleanup,
-                                        src: v,
-                                    });
-                                }
-                            }
-                            None => self.emit(Instr::LoadUndefined { dst: cleanup }),
-                        }
-                        self.emit(Instr::NewFinalizationRegistry { dst, cleanup });
-                        self.next_reg -= 1; // reclaim cleanup temp
-                        return Ok(dst);
-                    }
-                    // `new Date(...)`.
-                    if id == "Date" {
-                        let (arg_base, argc) = self.eval_args_contiguous(args)?;
-                        self.emit(Instr::DateNew {
-                            dst,
-                            arg_base,
-                            argc,
-                        });
-                        return Ok(dst);
-                    }
+                if !has_spread
+                    && matches!(&**callee, ast::Expr::Ident(id) if &**id == "Array" && self.builtin_unshadowed(id))
+                {
+                    let save = self.next_reg;
+                    let callee_reg = self.capture_plain_callee(callee)?;
+                    let (arg_base, argc) = self.eval_args_contiguous(args)?;
+                    self.emit(Instr::ArrayCtor {
+                        dst,
+                        callee: Some(callee_reg),
+                        arg_base,
+                        argc,
+                        is_construct: true,
+                    });
+                    self.next_reg = save.max(dst + 1);
+                    return Ok(dst);
                 }
                 // General `new C(args)`: evaluate the constructor value, then the
                 // args (contiguous), and let the VM build the instance. When the
@@ -729,15 +568,8 @@ impl<'a> FnCompiler<'a> {
                 // SNAPSHOTTED into a temp before the args run: an argument's
                 // side effect reassigning the callee variable must not change
                 // which value is constructed (EvaluateNew takes GetValue first).
-                let cv = self.expr(callee)?;
                 let save = self.next_reg;
-                let callee_reg = self.temp();
-                if cv != callee_reg {
-                    self.emit(Instr::Move {
-                        dst: callee_reg,
-                        src: cv,
-                    });
-                }
+                let callee_reg = self.capture_plain_callee(callee)?;
                 if has_spread {
                     let args_arr = self.build_spread_args(args)?;
                     self.emit(Instr::NewSpread {
@@ -745,7 +577,7 @@ impl<'a> FnCompiler<'a> {
                         callee: callee_reg,
                         args: args_arr,
                     });
-                    self.next_reg = save; // reclaim the callee temp (+ arg scratch)
+                    self.next_reg = save.max(dst + 1); // reclaim callee + arg scratch
                     return Ok(dst);
                 }
                 let (arg_base, argc) = self.eval_args_contiguous(args)?;
@@ -755,7 +587,7 @@ impl<'a> FnCompiler<'a> {
                     arg_base,
                     argc,
                 });
-                self.next_reg = save; // reclaim the callee temp + args
+                self.next_reg = save.max(dst + 1); // reclaim callee + args
                 Ok(dst)
             }
             E::Function(f) => {
@@ -873,29 +705,9 @@ impl<'a> FnCompiler<'a> {
     }
 
     pub(crate) fn static_member(&mut self, m: &ast::Member, prop: &str, dst: Reg) -> R<Reg> {
-        // Math constants (Math.PI, Math.E, …) — Math has no real global object.
-        if let ast::Expr::Ident(o) = &m.object {
-            if &**o == "Math" {
-                let c = match prop {
-                    "PI" => Some(std::f64::consts::PI),
-                    "E" => Some(std::f64::consts::E),
-                    "LN2" => Some(std::f64::consts::LN_2),
-                    "LN10" => Some(std::f64::consts::LN_10),
-                    "LOG2E" => Some(std::f64::consts::LOG2_E),
-                    "LOG10E" => Some(std::f64::consts::LOG10_E),
-                    "SQRT2" => Some(std::f64::consts::SQRT_2),
-                    "SQRT1_2" => Some(std::f64::consts::FRAC_1_SQRT_2),
-                    _ => None,
-                };
-                if let Some(v) = c {
-                    self.load_number(dst, v);
-                    return Ok(dst);
-                }
-            }
-            // `Symbol.iterator` etc. are now real Symbol VALUES — they resolve as
-            // ordinary property reads of the `Symbol` global (whose key_of maps to
-            // the engine's `@@iterator` convention, so iteration is unchanged).
-        }
+        // Namespace constants (notably Math.PI/E/…) are ordinary property reads.
+        // Folding them by identifier spelling ignored lexical shadowing, a
+        // rebound global, and live property replacement/accessors.
         // `super.name` — read an inherited property through the lexical home: a class
         // method via its home class, an object method via its runtime [[HomeObject]].
         if matches!(&m.object, ast::Expr::Super) {
@@ -1033,50 +845,12 @@ impl<'a> FnCompiler<'a> {
     /// (call chains etc. — those stay value-calls). `inner` is the chain's
     /// wrapped expression (`Expr::Chain`'s payload).
     pub(crate) fn chain_member_callee(&mut self, inner: &ast::Expr) -> R<Option<(Reg, Reg)>> {
-        enum Kind<'k> {
-            Static(&'k str),
-            Computed(&'k ast::Expr),
-        }
-        let (object, optional, kind) = match inner {
-            ast::Expr::Member(m) if !matches!(m.object, ast::Expr::Super) => match &m.prop {
-                ast::MemberProp::Ident(p) => (&m.object, m.optional, Kind::Static(p)),
-                ast::MemberProp::Computed(k) => (&m.object, m.optional, Kind::Computed(k)),
-                // A private member is neither of the two forms this handles.
-                ast::MemberProp::Private(_) => return Ok(None),
-            },
+        let member = match inner {
+            ast::Expr::Member(m) => m,
             _ => return Ok(None),
         };
         self.chain_bails.push(Vec::new());
-        let res: R<(Reg, Reg)> = (|| {
-            let o = self.expr(object)?;
-            let obj = self.alloc_reg();
-            if o != obj {
-                self.emit(Instr::Move { dst: obj, src: o });
-            }
-            if optional {
-                self.emit_optional_check(obj);
-            }
-            let callee = self.alloc_reg();
-            match &kind {
-                Kind::Static(p) => {
-                    let name = self.string_name(p);
-                    self.emit(Instr::GetProp {
-                        dst: callee,
-                        obj,
-                        name,
-                    });
-                }
-                Kind::Computed(k) => {
-                    let key = self.expr(k)?;
-                    self.emit(Instr::GetIndex {
-                        dst: callee,
-                        obj,
-                        key,
-                    });
-                }
-            }
-            Ok((callee, obj))
-        })();
+        let res = self.capture_member_callee(member);
         let bails = self.chain_bails.pop().unwrap();
         let (callee, obj) = res?;
         if !bails.is_empty() {
@@ -1129,7 +903,9 @@ impl<'a> FnCompiler<'a> {
 
     /// `` tag`q0${e0}q1…` `` — call `tag(strings, e0, e1, …)` where `strings` is
     /// the array of cooked literal parts carrying a `.raw` array of the un-escaped
-    /// parts. `String.raw` is handled inline (no real global exists).
+    /// parts. The tag is resolved exactly like a call reference before any
+    /// substitution is evaluated, including its receiver when it is a member
+    /// or a `with`-resolved identifier.
     pub(crate) fn tagged_template(
         &mut self,
         tag: &ast::Expr,
@@ -1157,44 +933,42 @@ impl<'a> FnCompiler<'a> {
         dst: Reg,
         tail: bool,
     ) -> R<Reg> {
-        // `String.raw` template — concatenate the RAW parts with the values.
-        if let ast::Expr::Member(m) = tag_expr {
-            if let (ast::Expr::Ident(o), ast::MemberProp::Ident(p)) = (&m.object, &m.prop) {
-                if &**o == "String" && &**p == "raw" {
-                    return self.string_raw(quasi, dst);
-                }
-            }
-        }
         let n = quasi.exprs.len();
         // Evaluate the tag (and its `this` for a member tag) first, into stable
         // registers that survive the argument block.
         enum Tag {
             Plain(Reg),
-            Method(Reg, u32),
+            Method { callee: Reg, this_v: Reg },
         }
-        // Only a STATIC member tag binds a receiver here; a computed or private
-        // member tag goes down the plain-value path, as it always has.
-        let static_tag = match tag_expr {
-            ast::Expr::Member(m) => match &m.prop {
-                ast::MemberProp::Ident(p) => Some((&m.object, p)),
-                _ => None,
-            },
-            _ => None,
-        };
-        let tag = match static_tag {
-            Some((object, prop)) => {
-                let obj = self.expr(object)?;
-                let obj_reg = self.alloc_reg();
-                if obj != obj_reg {
-                    self.emit(Instr::Move {
-                        dst: obj_reg,
-                        src: obj,
-                    });
-                }
-                let name = self.string_name(prop);
-                Tag::Method(obj_reg, name)
+        let tag = match tag_expr {
+            // Static, computed, private and super tags all retain the reference
+            // receiver, and complete the property Get before template-object
+            // construction or substitution evaluation.
+            ast::Expr::Member(m) => {
+                let (callee, this_v) = self.capture_member_callee(m)?;
+                Tag::Method { callee, this_v }
             }
-            None => {
+            // `with (o) { tag`x` }` uses WithBaseObject for `this`, exactly as
+            // the corresponding call expression does. The fallback path binds
+            // undefined when no object environment carries the name.
+            ast::Expr::Ident(id) => {
+                let with_objs = self.with_obj_regs(id);
+                if with_objs.is_empty() {
+                    let callee = self.expr(tag_expr)?;
+                    let callee_reg = self.alloc_reg();
+                    if callee != callee_reg {
+                        self.emit(Instr::Move {
+                            dst: callee_reg,
+                            src: callee,
+                        });
+                    }
+                    Tag::Plain(callee_reg)
+                } else {
+                    let (callee, this_v) = self.emit_with_callee_chain(id, &with_objs);
+                    Tag::Method { callee, this_v }
+                }
+            }
+            _ => {
                 let callee = self.expr(tag_expr)?;
                 let callee_reg = self.alloc_reg();
                 if callee != callee_reg {
@@ -1265,13 +1039,23 @@ impl<'a> FnCompiler<'a> {
                     argc,
                 })
             }
-            Tag::Method(obj, name) => self.emit(Instr::CallMethod {
-                dst,
-                obj,
-                name,
-                arg_base,
-                argc,
-            }),
+            Tag::Method { callee, this_v } => {
+                if tail {
+                    self.emit(Instr::TailCallWithThis {
+                        callee,
+                        this_v,
+                        arg_base,
+                        argc,
+                    });
+                }
+                self.emit(Instr::CallWithThis {
+                    dst,
+                    callee,
+                    this_v,
+                    arg_base,
+                    argc,
+                })
+            }
         }
         Ok(dst)
     }
@@ -1324,26 +1108,6 @@ impl<'a> FnCompiler<'a> {
         });
         self.next_reg = save;
         Ok(())
-    }
-
-    /// `String.raw` template: concatenate the RAW literal parts with the
-    /// stringified interpolation values (`String.raw\`a\\n${1}b\`` → `a\\n1b`).
-    pub(crate) fn string_raw(&mut self, quasi: &ast::TemplateLit, dst: Reg) -> R<Reg> {
-        let idx = self.add_string_const(&quasi.quasis[0].raw);
-        self.emit(Instr::LoadConst { dst, idx });
-        for (i, e) in quasi.exprs.iter().enumerate() {
-            let r = self.expr(e)?;
-            self.emit(Instr::Add { dst, a: dst, b: r });
-            if let Some(qe) = quasi.quasis.get(i + 1) {
-                if !qe.raw.is_empty() {
-                    let qidx = self.add_string_const(&qe.raw);
-                    let qr = self.temp();
-                    self.emit(Instr::LoadConst { dst: qr, idx: qidx });
-                    self.emit(Instr::Add { dst, a: dst, b: qr });
-                }
-            }
-        }
-        Ok(dst)
     }
 
     pub(crate) fn array_literal(&mut self, elems: &[Option<ast::ArrayElem>], dst: Reg) -> R<Reg> {
@@ -2014,8 +1778,9 @@ impl<'a> FnCompiler<'a> {
     /// parentheses (`typeof (f)`), which is no longer a node, so the operand IS
     /// the identifier. A bare identifier that resolves to a global is read with
     /// the non-throwing variant so the never-declared sentinel degrades to
-    /// undefined. (`undefined`/`NaN`/`Infinity` are literals, handled by
-    /// `expr`.) Factored so the bare `typeof x` and the fused
+    /// undefined. (`undefined`/`NaN`/`Infinity` go through the normal identifier
+    /// resolver; only a proven-static global fallback becomes a constant.)
+    /// Factored so the bare `typeof x` and the fused
     /// `typeof x === "lit"` compile the operand IDENTICALLY.
     fn typeof_operand(&mut self, arg: &ast::Expr, dst: Reg) -> R<Reg> {
         if let ast::Expr::Ident(id) = arg {
@@ -2164,18 +1929,12 @@ impl<'a> FnCompiler<'a> {
                 return Ok(dst);
             }
         }
-        // `x instanceof Ctor`: only built-in constructors are recognised (the
-        // engine has no user prototype chain). Decided structurally in the VM.
+        // `x instanceof Ctor`: both operands are evaluated left-to-right and the
+        // LIVE RHS value governs @@hasInstance / OrdinaryHasInstance.  Never
+        // select a constructor merely from its identifier spelling: that skips
+        // the RHS read entirely and miscompiles shadowed, rebound, cross-realm,
+        // proxy and @@hasInstance-bearing constructors.
         if matches!(op, Op::Instanceof) {
-            // A built-in constructor name → structural InstanceOf; anything else
-            // (a user class value) → runtime InstanceOfDyn against its class link.
-            if let ast::Expr::Ident(id) = right {
-                if let Some(ctor) = InstanceCtor::from_name(id) {
-                    let val = self.expr(left)?;
-                    self.emit(Instr::InstanceOf { dst, val, ctor });
-                    return Ok(dst);
-                }
-            }
             let val = self.expr(left)?;
             let ctor = self.expr(right)?;
             self.emit(Instr::InstanceOfDyn { dst, val, ctor });

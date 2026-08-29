@@ -63,6 +63,21 @@ fn assert_child_ok(output: &std::process::Output, mode: &str) -> String {
     stderr
 }
 
+fn has_guarded_typed_lane(log: &str) -> bool {
+    log.lines().any(|line| {
+        let Some(rest) = line
+            .strip_prefix("[leaf] ")
+            .and_then(|line| line.split_once("TYPED-LANE (ops=").map(|(_, rest)| rest))
+        else {
+            return false;
+        };
+        rest.split_once(" guards=")
+            .and_then(|(_, guards)| guards.strip_suffix(')'))
+            .and_then(|guards| guards.parse::<u16>().ok())
+            .is_some_and(|guards| guards > 0)
+    })
+}
+
 #[test]
 fn wide_leaf_reads_live_module_globals_and_falls_back() {
     if std::env::var_os(CHILD_ENV).is_some() {
@@ -72,7 +87,9 @@ fn wide_leaf_reads_live_module_globals_and_falls_back() {
 
     let enabled = assert_child_ok(&run_fresh(None), "enabled");
     assert!(
-        enabled.contains("callee_regs=34") && enabled.contains("TYPED-LANE (ops=26 guards=7)"),
+        enabled.contains("INLINE-ELIGIBLE")
+            && enabled.contains("NESTED-INLINE")
+            && has_guarded_typed_lane(&enabled),
         "wide global-reading lane did not engage:\n{enabled}"
     );
 
@@ -84,12 +101,39 @@ fn wide_leaf_reads_live_module_globals_and_falls_back() {
         no_globals.contains("typed-lane=DECLINED(callee-value-escapes)"),
         "typed-global ablation still scheduled the lane:\n{no_globals}"
     );
+}
 
-    let no_wide = assert_child_ok(&run_fresh(Some("ZIPP_NO_WIDE_LEAF")), "wide-leaf ablation");
+fn run_route_fresh(ablate: Option<&str>) -> std::process::Output {
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test exe"));
+    command
+        .arg("--exact")
+        .arg("wide_leaf_route_change_falls_back_before_raw_global_read")
+        .arg("--nocapture")
+        .env(ROUTE_CHILD_ENV, "1")
+        .env("ZIPP_JITLOG", "1")
+        .env("ZIPP_JIT_THRESHOLD", "1")
+        .env_remove("ZIPP_NOJIT")
+        .env_remove("ZIPP_NO_WIDE_LEAF")
+        .env_remove("ZIPP_NO_TYPED_GLOBAL_LOAD");
+    if let Some(flag) = ablate {
+        command.env(flag, "1");
+    }
+    command.output().expect("spawn route-change child")
+}
+
+fn assert_route_child_ok(output: &std::process::Output, mode: &str) -> String {
     assert!(
-        no_wide.contains("DECLINE (not leaf-eligible)") && !no_wide.contains("callee_regs=34"),
-        "wide-leaf ablation still admitted the 34-register callee:\n{no_wide}"
+        output.status.success(),
+        "{mode} child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains(ROUTE_OUTPUT_MARKER),
+        "{mode} child omitted route output marker:\n{stderr}"
+    );
+    stderr
 }
 
 /// A route change is stronger than a live slot write: after an accessor appears
@@ -112,28 +156,23 @@ fn wide_leaf_route_change_falls_back_before_raw_global_read() {
         return;
     }
 
-    let output = std::process::Command::new(std::env::current_exe().expect("test exe"))
-        .arg("--exact")
-        .arg("wide_leaf_route_change_falls_back_before_raw_global_read")
-        .arg("--nocapture")
-        .env(ROUTE_CHILD_ENV, "1")
-        .env("ZIPP_JITLOG", "1")
-        .env("ZIPP_JIT_THRESHOLD", "1")
-        .env_remove("ZIPP_NOJIT")
-        .env_remove("ZIPP_NO_WIDE_LEAF")
-        .env_remove("ZIPP_NO_TYPED_GLOBAL_LOAD")
-        .output()
-        .expect("spawn route-change child");
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = assert_route_child_ok(&run_route_fresh(None), "enabled route-change");
     assert!(
-        output.status.success(),
-        "route-change child failed:\nstdout:\n{}\nstderr:\n{stderr}",
-        String::from_utf8_lossy(&output.stdout)
+        stderr.contains("INLINE-ELIGIBLE")
+            && stderr.contains("slot_guard=g")
+            && stderr.contains("INT splice")
+            && has_guarded_typed_lane(&stderr),
+        "guarded wide lane did not engage:\n{stderr}"
+    );
+
+    let no_wide = assert_route_child_ok(
+        &run_route_fresh(Some("ZIPP_NO_WIDE_LEAF")),
+        "wide-leaf ablation",
     );
     assert!(
-        stderr.contains(ROUTE_OUTPUT_MARKER)
-            && stderr.contains("callee_regs=40")
-            && stderr.contains("TYPED-LANE"),
-        "guarded wide lane did not engage:\n{stderr}"
+        no_wide.contains("DECLINE (not leaf-eligible)")
+            && !has_guarded_typed_lane(&no_wide)
+            && !no_wide.contains("INT splice"),
+        "wide-leaf ablation still scheduled the guarded lane:\n{no_wide}"
     );
 }

@@ -47,25 +47,58 @@ object supplied by a guest, or a host that dispatches guest strings to arbitrary
 properties, URLs, commands, database collections, or tenant resources violates
 this model.
 
-### Native `zipp sandbox`
+### Benchmark and PGO provenance
 
-`zipp sandbox` is defense in depth, not an OS isolation boundary. It supervises
-a child process, clears its environment and stdin, restricts module resolution,
-disables native VM and regex JIT execution for the run, and applies time,
-instruction, heap, source, and output limits. These controls reduce attack
-surface and contain many language-level failures.
+Publication benchmarks execute private read-only copies of every selected input
+and declared dependency rather than reopening mutable checkout files for each
+repetition. Canonical PGO builds compile both stages from one private read-only
+clone of an exact clean commit, and record the selected Rust tools and MSVC
+`cl.exe`/`lib.exe` drivers. The MSVC backend DLLs, SDK headers, and import
+libraries are path-scoped by the validated developer environment rather than
+byte-manifested. Hash, identity, clean-HEAD, and atomic-publication checks address
+ordinary editor/build races and accidental replacement; they do not defend
+against a malicious process already running as the builder account, which could
+alter tools or process memory. Use an isolated build account or host for that
+threat.
+
+### Native `zipp-sandbox`
+
+`zipp-sandbox` is a separately resolved executable whose zipp-vm dependency
+uses `default-features = false` and `safe-sandbox`. The VM and regex JITs are
+therefore absent rather than disabled at runtime, and unsafe code is forbidden
+at compile time in both engines. Release builds keep integer-overflow checks
+enabled and use mimalloc's secure mode. The executable supervises a child
+process, clears its environment and stdin, restricts module resolution, and
+applies time, instruction, heap, source, and output limits.
 
 The child still runs under the invoking user's OS identity in a native process.
 It does not independently deny filesystem or network system calls, and it is not
-a memory-safety boundary. A bug in native code, unsafe dependency code, the
-parser, VM, garbage collector, or a native builtin can invalidate the
-language-level assumptions. Resource meters are also not exact RSS accounting,
-and a single expensive native operation may run between instruction polls.
+a complete memory-safety boundary: the native allocator, standard library,
+toolchain output, and OS remain outside the engines' unsafe-code prohibition.
+Resource meters are also not exact RSS accounting, and a single expensive
+native operation may run between instruction polls.
 
-Do not use native `zipp sandbox` as the sole boundary for arbitrary hostile code.
+In `safe-sandbox`, regular-expression execution has bounded backtracking steps,
+scratch space, captures, scan results, and replacement-result retention.
+Native transient reservations are VM-wide and scoped, so a functional replacer
+that recursively starts another expression cannot hide the outer match buffers
+from the nested heap allowance; terminal exhaustion remains sticky. These are
+defense-in-depth limits, not a substitute for the supervisor deadline: bounded
+native prefix/suffix scans can still do work between VM instruction polls.
+
+Do not use native `zipp-sandbox` as the sole boundary for arbitrary hostile code.
 For the strongest isolation, add a dedicated unprivileged account plus platform
 controls, or run it in an appropriately hardened OS sandbox, container, or
 microVM with explicit filesystem, network, process, memory, and CPU policy.
+
+The fast JIT-enabled CLI retains `zipp sandbox` and `zipp js --sandbox` as
+compatibility aliases. They share the same supervisor and resource policy, but
+the containing executable also includes the ordinary CLI's unsafe/JIT code and
+defaults to the throughput allocator profile. A JIT CLI can opt in to mimalloc's
+secure mode with `--features secure-allocator`, but that does not remove its JIT
+or unsafe-code trust boundary.
+Treat those aliases as defense in depth, not as substitutes for the separately
+built `zipp-sandbox` artifact.
 
 ### WebAssembly embedding
 
@@ -96,7 +129,7 @@ layer when the risk warrants it.
 ## Deployment checklist
 
 - Use `zipp-wasm` in a dedicated Worker for hostile code, or add an external OS
-  isolation layer around the native runner.
+  isolation layer around the separately built `zipp-sandbox` runner.
 - Build with committed lockfiles and the documented safe profile; do not combine
   `safe-sandbox` with native JIT features through Cargo feature unification.
 - Start with no imports and no host capabilities, then grant the minimum needed.

@@ -52,10 +52,6 @@ fn assert_matches_node(body: &str) {
     assert_eq!(run_ok(&src), node_output(&src), "zipp != node for:\n{src}");
 }
 
-fn assert_source_matches_node(src: &str) {
-    assert_eq!(run_ok(src), node_output(src), "zipp != node for:\n{src}");
-}
-
 /// Runtime dispatch covers all admitted integer keys; every non-canonical or
 /// uncovered key must replay the original computed call, including its throw.
 /// After the native region is warm, receiver/element/accessor/hole mutations
@@ -207,14 +203,29 @@ fn computed_mechanism_probe() {
     );
 }
 
-/// The original hostile target is wide enough to exceed the physical 14-home
-/// planner cap.  It must reach the computed-only symbolic plan and bounded
-/// spill mapper, not quietly test only the smaller ordinary GPR retry.
+/// Dedicated bounded-pressure target: the loop carries enough overlapping
+/// live-outs to overflow the physical-home plan while the computed-only
+/// symbolic retry remains within its documented spill budget.
 #[test]
-fn computed_virtual_retry_probe() {
-    assert_source_matches_node(include_str!(
-        "../../../bench/hostile/endurance/bytecode-vm.js"
-    ));
+fn computed_parity_virtual_retry_probe() {
+    assert_matches_node(
+        r#"
+        function a(x) { return (Math.imul(x, 3) + 1) | 0; }
+        function b(x) { return ((x ^ 0x55aa) + 9) | 0; }
+        function c(x) { return (Math.imul(x + 7, 13) ^ 19) | 0; }
+        const ops = [a, b, c];
+        function pressure(n) {
+          let s=1,a0=2,a1=3,a2=5,a3=7,a4=11,a5=13;
+          for (let i=0;i<n;i++) {
+            s = ops[i % 3](s);
+            a0=(a0+i)|0; a1=(a1^s)|0; a2=(a2+a0)|0;
+            a3=(a3+a1)|0; a4=(a4^a2)|0; a5=(a5+a3)|0;
+          }
+          return [s,a0,a1,a2,a3,a4,a5].join(":");
+        }
+        console.log(pressure(N));
+        "#,
+    );
 }
 
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -261,7 +272,10 @@ fn computed_mechanism_engages_and_off_switch_restores_fallback() {
         "computed scratch entry guards chronically deopted:\n{on}"
     );
 
-    let (_, virtual_log) = child_log("computed_virtual_retry_probe", &[]);
+    let (_, virtual_log) = child_log(
+        "computed_parity_virtual_retry_probe",
+        &[("ZIPP_GPR_SPILL_SLOTS", "1")],
+    );
     for needle in [
         "INT computed splice",
         "INT-GPR computed retry",
@@ -274,6 +288,16 @@ fn computed_mechanism_engages_and_off_switch_restores_fallback() {
             "wide retry missing {needle:?}:\n{virtual_log}"
         );
     }
+    let symbolic_homes = virtual_log
+        .lines()
+        .find_map(|line| line.split_once("glob-range plan:").map(|(_, tail)| tail))
+        .and_then(|tail| tail.rsplit_once("homes=").map(|(_, homes)| homes))
+        .and_then(|homes| homes.parse::<usize>().ok())
+        .expect("computed retry must report its symbolic-home count");
+    assert!(
+        (15..=18).contains(&symbolic_homes),
+        "computed retry did not exceed the physical cap while staying bounded: {symbolic_homes}\n{virtual_log}"
+    );
     assert!(
         !virtual_log.contains("deopt at ip"),
         "wide computed region deopted during its stable run:\n{virtual_log}"
@@ -288,7 +312,9 @@ fn computed_mechanism_engages_and_off_switch_restores_fallback() {
         "computed off-switch still emitted the lane:\n{off}"
     );
     assert!(
-        off.contains("MEM dense CallMethodComputed helper emitted"),
+        off.contains("GetIndex {")
+            && off.contains("CallWithThis {")
+            && off.contains("[jit] MEM region"),
         "off-switch did not restore the ordinary computed-call fallback:\n{off}"
     );
 }
@@ -298,7 +324,11 @@ fn computed_mechanism_engages_and_off_switch_restores_fallback() {
 fn computed_post_call_receiver_use_is_a_planning_decline() {
     let (_, log) = child_log("computed_post_call_receiver_probe", &[]);
     assert!(
-        log.contains("computed flattened body is not INT-admissible"),
+        (log.contains("receiver temp is observable")
+            || log.contains("computed flattened body is not INT-admissible")
+            || log.contains("GetIndex/SetIndex (element not a pinned TypedArray)"))
+            && log.contains("[jit] INT decline")
+            && log.contains("[jit] MEM region"),
         "post-call receiver program did not take a fail-closed planning path:\n{log}"
     );
     assert!(
@@ -312,8 +342,11 @@ fn computed_post_call_receiver_use_is_a_planning_decline() {
 fn computed_effectful_prefix_is_a_planning_decline() {
     let (_, log) = child_log("computed_parity_effectful_prefix_is_not_replayed", &[]);
     assert!(
-        log.contains("non-replayable op")
-            || log.contains("computed flattened body is not INT-admissible"),
+        (log.contains("non-replayable op")
+            || log.contains("computed flattened body is not INT-admissible")
+            || log.contains("CallWithThis (not a captured pinned string/DataView)"))
+            && log.contains("[jit] INT decline")
+            && log.contains("[jit] MEM region"),
         "effectful prefix did not take a fail-closed planning path:\n{log}"
     );
     assert!(

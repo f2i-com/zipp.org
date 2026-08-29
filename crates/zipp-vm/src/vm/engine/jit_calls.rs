@@ -60,7 +60,7 @@ impl<'p> Vm<'p> {
         if needed > self.regs_hw {
             // New ground: zero-fill the freshly exposed slots and advance the mark.
             self.regs.resize(needed, Value::UNDEFINED);
-            self.regs_hw = needed;
+            self.bump_regs_hw(needed);
         } else {
             // Window lies within already-initialized memory (a previous recursion
             // reached at least this deep). Slots hold valid Value bits (stale, but
@@ -197,26 +197,35 @@ impl<'p> Vm<'p> {
         // use `len`, but the eventual return to the dispatch loop expects it
         // unchanged).
         let saved_len = self.regs.len();
-        // CRITICAL: grow `len` with `set_len`, NOT `resize`. The native fast path
-        // advanced the register windows by raw pointer WITHOUT touching
-        // `self.regs.len()`, so on entry here `len` (≈ the warmup top) is far below
-        // the live native windows, which occupy slots up to `new_base`. A
-        // `resize(needed, UNDEFINED)` would ZERO-FILL `[len, needed)` — overwriting
-        // every parked native frame's registers with `undefined` and corrupting the
-        // recursion (this was the bug that capped JIT recursion below the
-        // interpreter). The native windows hold valid `Value`s already (each native
-        // frame defs its registers before reading — the same def-before-use
-        // invariant the leaf JIT relies on), and the buffer is pinned to capacity
-        // by `reserve_jit_regs`, so simply exposing them via `set_len` is correct.
-        // Bounds: `needed ≤ capacity` (guarded above by `regs_would_overflow`).
-        // SAFETY: `needed ≤ capacity`; slots `[0, needed)` are live `Value`s —
-        // `[0, len)` from the interpreter, `[len, new_base+reg_count)` written by
-        // the native frames whose windows we're spanning.
-        unsafe {
-            self.regs.set_len(needed);
-        }
+        // A native-bail window is already within the initialized high-water
+        // guard emitted by `emit_self_call`, so changing only logical length
+        // preserves every parked native frame. A depth-limit entry can arrive
+        // before that window was written and instead grows it through `resize`.
+        // A new-ground entry arrives before native code wrote this window.
+        // Expose only the already-written native caller windows before using
+        // the safe store API to initialize the new callee tail. Starting the
+        // resize at `saved_len` would overwrite parked native frames whenever
+        // logical length trails their raw-pointer windows (and can turn fib's
+        // live `x` into undefined before interpreter replay).
         if needed > self.regs_hw {
-            self.regs_hw = needed;
+            // SAFETY: every slot through `new_base` belongs to an active caller
+            // window. The native entry/previous slow path initialized that
+            // backing before exposing the window, and RegisterFile enforces the
+            // initialized-extent bound in release builds.
+            unsafe {
+                self.regs.set_len(new_base);
+            }
+            self.regs.resize(needed, Value::UNDEFINED);
+            self.bump_regs_hw(needed);
+            self.regs.truncate(saved_len);
+            return crate::codegen::SELF_CALL_DEOPT;
+        } else {
+            // SAFETY: needed ≤ regs_hw ≤ storage.len(); a native-bail window
+            // contains valid Values and a depth-limit window is initialized
+            // stale backing.
+            unsafe {
+                self.regs.set_len(needed);
+            }
         }
         self.regs[new_base] = Value::UNDEFINED;
         let n = argc.min(params);
@@ -318,7 +327,9 @@ impl<'p> Vm<'p> {
         // first, so a later different-fid value declines without even the
         // internal `osr_deopt_exempt` mutation.
         if !SAME_PROTO_ARROW2 && self.jit_call_depth >= JIT_REGION_CALL_MAX {
-            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_DEPTH);
+            crate::vm::helpers_misc::crossstats::decline(
+                crate::vm::helpers_misc::crossstats::DECL_DEPTH,
+            );
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
@@ -336,7 +347,9 @@ impl<'p> Vm<'p> {
         let expected_reg_count = (packed & 0xFFFF) as usize;
         let cv = Value::from_bits(callee_bits);
         if !cv.is_heap() {
-            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_CALLEE_KIND);
+            crate::vm::helpers_misc::crossstats::decline(
+                crate::vm::helpers_misc::crossstats::DECL_CALLEE_KIND,
+            );
             return SELF_CALL_DEOPT;
         }
         // One match resolves everything the call needs from the callee object:
@@ -361,7 +374,9 @@ impl<'p> Vm<'p> {
                 },
             ),
             _ => {
-                crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_CALLEE_KIND);
+                crate::vm::helpers_misc::crossstats::decline(
+                    crate::vm::helpers_misc::crossstats::DECL_CALLEE_KIND,
+                );
                 return SELF_CALL_DEOPT;
             }
         };
@@ -379,18 +394,24 @@ impl<'p> Vm<'p> {
                 || (!self.closure_eval_scope.is_empty()
                     && self.closure_eval_scope.contains_key(&closure)))
         {
-            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_SP2_GUARD);
+            crate::vm::helpers_misc::crossstats::decline(
+                crate::vm::helpers_misc::crossstats::DECL_SP2_GUARD,
+            );
             return SELF_CALL_DEOPT;
         }
         if SAME_PROTO_ARROW2 && self.jit_call_depth >= JIT_REGION_CALL_MAX {
-            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_DEPTH);
+            crate::vm::helpers_misc::crossstats::decline(
+                crate::vm::helpers_misc::crossstats::DECL_DEPTH,
+            );
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
         let (entry, uninit_mask, json_walk, markdown_inline) = match self.jit.cross_entry(fid) {
             Some(e) => e,
             None => {
-                crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_NO_ENTRY);
+                crate::vm::helpers_misc::crossstats::decline(
+                    crate::vm::helpers_misc::crossstats::DECL_NO_ENTRY,
+                );
                 if std::env::var_os("ZIPP_DECLLOG").is_some() {
                     eprintln!(
                         "[decl] no-entry fid={fid} compiled={} sp2={}",
@@ -406,7 +427,9 @@ impl<'p> Vm<'p> {
         // on globalThis (Tier C never records a self-binding, so that check is
         // structurally unnecessary — asserted at install).
         if self.global_route_epoch != 0 && !self.jit_globals_still_routable(fid) {
-            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_ROUTABLE);
+            crate::vm::helpers_misc::crossstats::decline(
+                crate::vm::helpers_misc::crossstats::DECL_ROUTABLE,
+            );
             return SELF_CALL_DEOPT;
         }
         // GC safe point — the frame-transition parity point. The route this
@@ -479,7 +502,9 @@ impl<'p> Vm<'p> {
             // `this` (`closure` IS `cv.heap_index()` whenever it is not
             // NO_CLOSURE, and that match yielded `fid`).
             if closure == NO_CLOSURE {
-                crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_THIS_BIND);
+                crate::vm::helpers_misc::crossstats::decline(
+                    crate::vm::helpers_misc::crossstats::DECL_THIS_BIND,
+                );
                 return SELF_CALL_DEOPT;
             }
             lex_this_val
@@ -494,7 +519,9 @@ impl<'p> Vm<'p> {
         } else if self.global_this != 0 {
             Value::heap(self.callee_this_global(cv))
         } else {
-            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_THIS_BIND);
+            crate::vm::helpers_misc::crossstats::decline(
+                crate::vm::helpers_misc::crossstats::DECL_THIS_BIND,
+            );
             return SELF_CALL_DEOPT;
         };
         // The callee window sits contiguously above the caller's, which must be
@@ -504,7 +531,9 @@ impl<'p> Vm<'p> {
         let caller_base = unsafe { caller_base_ptr.offset_from(regs_base) } as usize;
         let new_base = caller_base + caller_regs;
         if new_base != self.regs.len() {
-            crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_CONTIG);
+            crate::vm::helpers_misc::crossstats::decline(
+                crate::vm::helpers_misc::crossstats::DECL_CONTIG,
+            );
             return SELF_CALL_DEOPT;
         }
         let needed = new_base + reg_count;
@@ -582,9 +611,7 @@ impl<'p> Vm<'p> {
             // analysis declined (`ZIPP_NO_CROSSCALL2` forces this arm for all
             // callees; `ZIPP_NO_CROSSCALL_WIDE_MASK` forces it for >64 regs).
             self.regs.resize(needed, Value::UNDEFINED);
-            if needed > self.regs_hw {
-                self.regs_hw = needed;
-            }
+            self.bump_regs_hw(needed);
             crate::vm::helpers_misc::crossstats::fill_full();
         }
         self.regs[new_base] = this_v;
@@ -598,20 +625,23 @@ impl<'p> Vm<'p> {
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
         // SAFETY: `entry` is `fid`'s Tier-C win64 code (mmap'd, never moves);
         // the window has `reg_count` valid slots; vm is valid.
-        let activation_token = match self.enter_tierc_activation(closure, cv.heap_index(), true, upvals_raw) {
-            Some(token) => token,
-            None => {
-                // All window writes are scratch above the caller. Keep the
-                // initialized high-water mark (those slots remain valid), but
-                // hide the window and take the emitted call site's ordinary
-                // Frame-backed fallback before native/user effects.
-                self.regs.truncate(new_base);
-                self.jit_call_depth -= 1;
-                crate::vm::helpers_misc::crossstats::decline(crate::vm::helpers_misc::crossstats::DECL_ACTIVATION);
-                self.osr_deopt_exempt = true;
-                return SELF_CALL_DEOPT;
-            }
-        };
+        let activation_token =
+            match self.enter_tierc_activation(closure, cv.heap_index(), true, upvals_raw) {
+                Some(token) => token,
+                None => {
+                    // All window writes are scratch above the caller. Keep the
+                    // initialized high-water mark (those slots remain valid), but
+                    // hide the window and take the emitted call site's ordinary
+                    // Frame-backed fallback before native/user effects.
+                    self.regs.truncate(new_base);
+                    self.jit_call_depth -= 1;
+                    crate::vm::helpers_misc::crossstats::decline(
+                        crate::vm::helpers_misc::crossstats::DECL_ACTIVATION,
+                    );
+                    self.osr_deopt_exempt = true;
+                    return SELF_CALL_DEOPT;
+                }
+            };
         let (bits, bail) = {
             let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Jit);
             unsafe {
@@ -887,8 +917,9 @@ impl<'p> Vm<'p> {
     }
 
     /// The implementation behind the region call helpers `jit_call_method_ic` /
-    /// `jit_call_ic` (`is_method` selects which). A compiled OSR region reached
-    /// a `CallMethod`/`Call` op: consult the SAME per-site inline cache the
+    /// `jit_call_ic` / `jit_call_with_this_ic` (`call_kind`: 0 plain, 1 legacy
+    /// method lookup, 2 captured callee + explicit receiver). A compiled OSR
+    /// region reached a call op: consult the SAME per-site inline cache the
     /// interpreter uses, push the resolved plain user function with FULL
     /// `setup_call` semantics (this-binding, rest, arguments object,
     /// MAX_FRAMES), and run it to completion via `run_loop`. Three-state
@@ -923,9 +954,11 @@ impl<'p> Vm<'p> {
         packed_fip: u64,
         packed_args: u64,
         argc: u16,
-        is_method: bool,
+        call_kind: u8,
     ) -> u64 {
         use crate::codegen::{CALL_THREW, SELF_CALL_DEOPT};
+        let is_method = call_kind == 1;
+        let has_explicit_this = call_kind == 2;
         if self.jit_call_depth >= JIT_REGION_CALL_MAX {
             // Legal-but-deep recursion: not a region-quality signal — don't
             // count it toward eviction.
@@ -1006,14 +1039,30 @@ impl<'p> Vm<'p> {
                     // next for this op (`try_builtin_method`, then a
                     // ctor-object native like `Math.floor`) — run to
                     // completion, never deopting after a side effect.
-                    return self.jit_method_builtin_fallback(func_id, recv, key, base, arg_base, argc);
+                    return self
+                        .jit_method_builtin_fallback(func_id, recv, key, base, arg_base, argc);
                 }
             }
         } else {
             let callee_reg = ((packed_args >> 16) & 0xFFFF) as u16;
             let cv = self.get(base, callee_reg);
-            match self.ic_call(func_id, ip, cv) {
-                Some((fid, closure)) => (fid, closure, Value::UNDEFINED, cv),
+            let explicit_this = if has_explicit_this {
+                let this_reg = (packed_args >> 32) as u16;
+                self.get(base, this_reg)
+            } else {
+                Value::UNDEFINED
+            };
+            // CallWithThis already carries the exact callable Value. It does
+            // not need (and the interpreter path does not populate) a separate
+            // per-site Call IC: validate the live Func/Closure discriminant
+            // directly on every execution. Plain Call retains its existing IC.
+            let resolved = if has_explicit_this {
+                self.ic_plain_fn(cv)
+            } else {
+                self.ic_call(func_id, ip, cv)
+            };
+            match resolved {
+                Some((fid, closure)) => (fid, closure, explicit_this, cv),
                 None => {
                     // A site rotating through more than IC_WAYS plain
                     // functions eventually disables its tiny identity cache.
@@ -1023,9 +1072,9 @@ impl<'p> Vm<'p> {
                     // post-IC resolution for a live Func/Closure and is fully
                     // dynamic: swapping in a native/proxy/bound/non-callable
                     // value still takes the unchanged fallback below.
-                    if jit_poly_call_fallback_enabled() {
+                    if has_explicit_this || jit_poly_call_fallback_enabled() {
                         if let Some((fid, closure)) = self.ic_plain_fn(cv) {
-                            (fid, closure, Value::UNDEFINED, cv)
+                            (fid, closure, explicit_this, cv)
                         } else {
                             if jit_call_log() {
                                 eprintln!("[call] CALL MISS fn{func_id}@{ip}");
@@ -1038,7 +1087,7 @@ impl<'p> Vm<'p> {
                             {
                                 let argv: Vec<Value> =
                                     (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                                return match self.call_value(cv, Value::UNDEFINED, &argv) {
+                                return match self.call_value(cv, explicit_this, &argv) {
                                     Ok(v) => v.bits(),
                                     Err(t) => self.jit_thrown_to_sentinel(t),
                                 };
@@ -1057,7 +1106,7 @@ impl<'p> Vm<'p> {
                         {
                             let argv: Vec<Value> =
                                 (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            return match self.call_value(cv, Value::UNDEFINED, &argv) {
+                            return match self.call_value(cv, explicit_this, &argv) {
                                 Ok(v) => v.bits(),
                                 Err(t) => self.jit_thrown_to_sentinel(t),
                             };
@@ -1068,15 +1117,11 @@ impl<'p> Vm<'p> {
             }
         };
 
-        // MI (method inlining): for a `CallMethod` whose resolved target is a
-        // trivial straight-line body over `this` + params (incl. nested
-        // `super.m()`), evaluate it OFF-FRAME — no `setup_call`, no `run_loop`,
-        // no per-call args Vec. This collapses the dominant class-method call
-        // floor (`objs[i&3].area()` over `super.area()*k`). `None` falls through
-        // to the full frame call (any non-trivial body / non-numeric operand /
-        // non-instance receiver). Only for method calls — `this = recv` is
-        // load-bearing; a plain `Call` binds `this = undefined`.
-        if is_method {
+        // MI: a legacy method lookup or an identity-safe captured
+        // `CallWithThis` whose exact target is a trivial straight-line body can
+        // evaluate it off-frame. Lexical-this arrows must go through setup_call,
+        // which substitutes their captured receiver.
+        if call_kind != 0 && !self.func(fid as usize).lexical_this {
             if let Some(bits) = self.try_method_inline(fid, this_v, base, arg_base, argc) {
                 return bits;
             }
@@ -1160,11 +1205,10 @@ impl<'p> Vm<'p> {
             recv
         };
         if !self.is_callable(prop) {
-            return self
-                .jit_thrown_to_sentinel(match self.resolve_callable_named(prop, key) {
-                    Err(t) => t,
-                    Ok(_) => Thrown(format!("TypeError: {key} is not a function")),
-                });
+            return self.jit_thrown_to_sentinel(match self.resolve_callable_named(prop, key) {
+                Err(t) => t,
+                Ok(_) => Thrown(format!("TypeError: {key} is not a function")),
+            });
         }
         let called = self.with_argv(base, arg_base, argc, |vm, argv| {
             vm.call_value(prop, this_v, argv)
@@ -1504,6 +1548,49 @@ impl<'p> Vm<'p> {
 mod own_method_preflight_tests {
     use super::*;
 
+    fn install_legacy_call_method(program: &mut crate::bytecode::Program) -> (u32, usize, usize) {
+        // `CallMethod` is a sealed legacy opcode: the compiler now captures the
+        // property read before evaluating arguments as `GetProp + CallWithThis`.
+        // Reconstitute the old opcode explicitly so these malformed-bytecode
+        // tests continue to exercise its native preflight boundary.
+        let (fid, ip, dst, obj, name, arg_base, argc) = program
+            .functions
+            .iter()
+            .enumerate()
+            .find_map(|(fid, proto)| {
+                proto.code.windows(2).enumerate().find_map(|(ip, pair)| {
+                    match (&pair[0], &pair[1]) {
+                        (
+                            Instr::GetProp {
+                                dst: callee,
+                                obj,
+                                name,
+                            },
+                            Instr::CallWithThis {
+                                dst,
+                                callee: call_callee,
+                                this_v,
+                                arg_base,
+                                argc,
+                            },
+                        ) if callee == call_callee && obj == this_v => {
+                            Some((fid, ip + 1, *dst, *obj, *name, *arg_base, *argc))
+                        }
+                        _ => None,
+                    }
+                })
+            })
+            .expect("captured method-call site");
+        program.functions[fid].code[ip] = Instr::CallMethod {
+            dst,
+            obj,
+            name,
+            arg_base,
+            argc,
+        };
+        (fid as u32, ip, arg_base as usize)
+    }
+
     fn fixture() -> (Vm<'static>, u32, usize, usize) {
         let source = r#"
             function random() { return 1; }
@@ -1511,29 +1598,12 @@ mod own_method_preflight_tests {
             var result = call({ random: random });
         "#;
         let ast = crate::front::parse_script(source).expect("source parses");
-        let program = Box::leak(Box::new(
-            crate::compile::compile_program(&ast, source).expect("source compiles"),
-        ));
-        let (fid, ip, arg_base) = program
-            .functions
-            .iter()
-            .enumerate()
-            .find_map(|(fid, proto)| {
-                proto
-                    .code
-                    .iter()
-                    .enumerate()
-                    .find_map(|(ip, instr)| match instr {
-                        Instr::CallMethod { arg_base, .. } => {
-                            Some((fid as u32, ip, *arg_base as usize))
-                        }
-                        _ => None,
-                    })
-            })
-            .expect("CallMethod site");
+        let mut program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let (fid, ip, arg_base) = install_legacy_call_method(&mut program);
+        let program = Box::leak(Box::new(program));
         let reg_count = program.functions[fid as usize].reg_count.max(1) as usize;
         let mut vm = Vm::new(program);
-        vm.regs = vec![Value::UNDEFINED; reg_count];
+        vm.regs = vec![Value::UNDEFINED; reg_count].into();
         (vm, fid, ip, arg_base)
     }
 
@@ -1575,18 +1645,8 @@ mod own_method_preflight_tests {
         let source = "function call(o) { return o.random(); }";
         let ast = crate::front::parse_script(source).expect("source parses");
         let mut program = crate::compile::compile_program(&ast, source).expect("source compiles");
-        let (fid, ip) = program
-            .functions
-            .iter()
-            .enumerate()
-            .find_map(|(fid, proto)| {
-                proto
-                    .code
-                    .iter()
-                    .position(|instr| matches!(instr, Instr::CallMethod { .. }))
-                    .map(|ip| (fid, ip))
-            })
-            .expect("CallMethod site");
+        let (fid, ip, _) = install_legacy_call_method(&mut program);
+        let fid = fid as usize;
         let Instr::CallMethod { obj, .. } = &mut program.functions[fid].code[ip] else {
             unreachable!()
         };
@@ -1595,7 +1655,7 @@ mod own_method_preflight_tests {
         let program = Box::leak(Box::new(program));
         let reg_count = program.functions[fid].reg_count.max(1) as usize;
         let mut vm = Vm::new(program);
-        vm.regs = vec![Value::UNDEFINED; reg_count];
+        vm.regs = vec![Value::UNDEFINED; reg_count].into();
         let caller = vm.regs.as_ptr() as *const u64;
         let packed = ((fid as u64) << 32) | ip as u64;
         assert_eq!(

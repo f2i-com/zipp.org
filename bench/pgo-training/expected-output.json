@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {"path": "bench/pgo-training/runtime-mix.js", "stdout": "-1307445977\n", "stderr": ""},
+    {"path": "bench/pgo-training/text-data-mix.js", "stdout": "2791024:2064265531\n", "stderr": ""},
+    {"path": "bench/pgo-training/csv-tuple-mix.js", "stdout": "csv-tuples=960995:70000:876997:158174722\n", "stderr": ""},
+    {"path": "bench/pgo-training/template-uri-mix.js", "stdout": "template-uri=36000:1810247:106620:2787392704\n", "stderr": ""},
+    {"path": "bench/pgo-training/async-dag-mix.js", "stdout": "async-dag=192:92:2743580189\n", "stderr": ""},
+    {"path": "bench/pgo-training/memory-shapes-mix.js", "stdout": "1125858648\n", "stderr": ""},
+    {"path": "bench/pgo-training/dictionary-mix.js", "stdout": "80951254\n", "stderr": ""}
+  ]
+}

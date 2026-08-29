@@ -26,10 +26,9 @@
 //!     aborted the loop four iterations early. No switch required.
 //!   * `splitwt_parity_dv_oob` — the reported shape: an out-of-bounds DataView
 //!     `get*`. `TypeError: undefined is not a function` instead of node's
-//!     `RangeError`, because the re-executed `CallMethod` found a number. This
-//!     one needed `ZIPP_NO_GLOB_RANGE=1`/`ZIPP_NO_GPR_HOMES=1`/
-//!     `ZIPP_NO_DV_GPR=1` to reach the DOUBLE tier — which is why it is swept
-//!     over the switch matrix rather than trusted at default settings.
+//!     `RangeError`, because the re-executed method call found a number. The
+//!     current capture-first bytecode hosts this case on INT-GPR at default
+//!     settings; the switch matrix still pins its fallback semantics.
 //!
 //! `pre`, the constant-folding nest in the first two, is LOAD-BEARING: it is
 //! what makes the bytecode compiler recycle the receiver's register number
@@ -185,6 +184,29 @@ fn split_recvs(log: &str) -> Vec<SplitRecv> {
         .collect()
 }
 
+/// One `[jit] INT-GPR region [S,E] B94 split receiver rN` line, parsed.
+struct IntGprSplitRecv {
+    span: String,
+    reg: u16,
+}
+
+fn int_gpr_split_recvs(log: &str) -> Vec<IntGprSplitRecv> {
+    log.lines()
+        .filter_map(|l| {
+            let rest = l.split("INT-GPR region [").nth(1)?;
+            let span = rest.split(']').next()?.to_string();
+            let reg = rest
+                .split("B94 split receiver r")
+                .nth(1)?
+                .split_whitespace()
+                .next()?
+                .parse::<u16>()
+                .ok()?;
+            Some(IntGprSplitRecv { span, reg })
+        })
+        .collect()
+}
+
 /// The ips at which a region (named by its START, as the deopt log does) took
 /// a NATIVE exit.
 fn deopt_ips(log: &str, span: &str) -> Vec<usize> {
@@ -287,19 +309,52 @@ fn splitwt_mechanism_ta_oob_store_strict() {
     assert_split_recv_mechanism("splitwt_parity_ta_oob_store_strict", &[]);
 }
 
-/// The DataView case reaches the DOUBLE tier only with glob-range off — at
-/// default settings the narrowed plan hosts it on INT-GPR, which never had the
-/// defect. Pinning it here is what keeps the fix honest if a future plan change
-/// moves the shape back onto DOUBLE at default settings.
+/// Capture-first member calls add a guarded `GetProp` before each DataView
+/// `CallWithThis`. That makes the old `ZIPP_NO_GLOB_RANGE=1` forced-DOUBLE
+/// fixture safely decline to MEM: its recycled endian Bool is live across the
+/// next potentially-deopting lookup, while type-split homes are GPR-only. Pin
+/// the production route instead: default settings must compile INT-GPR with a
+/// B94 receiver that is also a B97 candidate, and must take a native exit from
+/// that region. The two tests above retain the original DOUBLE-tier coverage.
 #[test]
-fn splitwt_mechanism_dv_oob_no_glob_range() {
-    assert_split_recv_mechanism("splitwt_parity_dv_oob", &[("ZIPP_NO_GLOB_RANGE", "1")]);
+fn splitwt_mechanism_dv_oob_int_gpr() {
+    let log = logged_child("splitwt_parity_dv_oob", &[]);
+    let srs = int_gpr_split_recvs(&log);
+    let covered = srs.iter().find(|sr| {
+        log.contains(&format!(
+            "region [{}] B97 write-through excludes B94 split receiver r{}",
+            sr.span, sr.reg
+        ))
+    });
+    let sr = covered.unwrap_or_else(|| {
+        panic!(
+            "DataView default route no longer compiles an INT-GPR B94 receiver that is also a B97 candidate: {:?}\n{log}",
+            srs.iter()
+                .map(|sr| (&sr.span, sr.reg))
+                .collect::<Vec<_>>()
+        )
+    });
+    assert!(
+        log.contains(&format!("INT region fn0 [{}] compiled", sr.span)),
+        "the intersecting INT-GPR plan was not installed:\n{log}"
+    );
+    let start = sr
+        .span
+        .split(',')
+        .next()
+        .and_then(|s| s.parse::<usize>().ok())
+        .expect("logged region start is numeric");
+    let ips = deopt_ips(&log, &sr.span);
+    assert!(
+        ips.iter().any(|&ip| ip > start),
+        "the intersecting INT-GPR region took no in-body native exit: {ips:?}\n{log}"
+    );
 }
 
-/// Every case must answer identically in every mode — including the three that
-/// route the DataView shape onto the DOUBLE tier, and `ZIPP_NO_WT_SHARE=1`,
-/// which empties `write_through` and so isolates the vector: before the fix it
-/// was the only mode in which these shapes answered correctly.
+/// Every case must answer identically in every mode — including alternate
+/// planner routes and `ZIPP_NO_WT_SHARE=1`, which empties `write_through` and so
+/// isolates the vector: before the fix it was the only mode in which these
+/// shapes answered correctly.
 #[test]
 fn all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");

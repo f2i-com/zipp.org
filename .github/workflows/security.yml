@@ -1,6 +1,6 @@
 name: Security
 
-# Manual-trigger only (was: every push + PR + weekly cron) — Actions quota.
+# Manual-trigger only because this is a deliberately broad security matrix.
 # Run from the GitHub UI (Actions -> this workflow -> Run workflow) or:
 #   gh workflow run security.yml
 on:
@@ -18,6 +18,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  benchmark-integrity:
+    name: Benchmark evidence integrity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Run benchmark harness adversarial tests
+        run: python -m unittest tools.test_bench tools.test_bench_hostile tools.test_bench_peak_rss
+
   native-workspace:
     name: Native workspace tests
     runs-on: ubuntu-24.04
@@ -31,6 +43,11 @@ jobs:
         run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Test the root native workspace
         run: cargo +stable test --locked --workspace
+      - name: Test bounded backtracking executor limits
+        run: >-
+          cargo +stable test --locked -p zipp-regress
+          --features bounded-backtracking
+          --test limited_backtracking
 
   safe-vm:
     name: Safe interpreter profile
@@ -54,11 +71,51 @@ jobs:
             --test intl_native_limits \
             --test native_iteration_limits \
             --test native_meta_recursion_limits \
+            --test regex_execution_limits \
             --test regex_memory_limits \
             --test side_table_heap_limits \
             --test string_growth_limits \
             --test syntax_nesting_limits \
             --test json_plain_stringify
+
+  native-sandbox:
+    name: Isolated native sandbox
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Select stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Prove the hardened feature boundary
+        run: |
+          cargo +stable tree --locked --manifest-path crates/zipp-sandbox/Cargo.toml \
+            -e features > sandbox-features.txt
+          grep -q 'zipp-vm feature "safe-sandbox"' sandbox-features.txt
+          grep -q 'mimalloc feature "secure"' sandbox-features.txt
+          if grep -Eq 'zipp-vm feature "jit"|zipp-regress feature "rx-jit"|dynasm' \
+              sandbox-features.txt; then
+            echo "unsafe/JIT feature entered the hardened sandbox dependency graph" >&2
+            exit 1
+          fi
+      - name: Test the separately resolved native sandbox
+        run: cargo +stable test --locked --manifest-path crates/zipp-sandbox/Cargo.toml
+
+  native-sandbox-windows:
+    name: Isolated native sandbox (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Select stable Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Test Windows supervision and path boundaries
+        run: cargo +stable test --locked --manifest-path crates/zipp-sandbox/Cargo.toml
 
   wasm-sandbox:
     name: Isolated WebAssembly sandbox
@@ -107,6 +164,8 @@ jobs:
         run: cargo +stable audit --deny warnings --file Cargo.lock
       - name: Audit isolated WebAssembly dependencies
         run: cargo +stable audit --deny warnings --file crates/zipp-wasm/Cargo.lock
+      - name: Audit isolated native-sandbox dependencies
+        run: cargo +stable audit --deny warnings --file crates/zipp-sandbox/Cargo.lock
       - name: Select Node.js for the landing-page lockfile audit
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:

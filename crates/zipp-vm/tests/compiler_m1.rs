@@ -39,6 +39,27 @@ fn global_indexes_preserve_declarations_exports_and_builtin_shadowing() {
 }
 
 #[test]
+fn console_namespace_survives_first_class_and_with_resolution() {
+    let outcome = run(r#"
+        var log = console.log;
+        var warn = console.warn;
+        log("first-class", 1);
+        with ({ console: { log: function (value) { print("shadow:" + value); } } }) {
+          console.log("with");
+        }
+        $262.createRealm().global.console.log("child-realm");
+        warn("warning");
+        "#)
+    .expect("source compiles");
+    assert_eq!(outcome.error, None);
+    assert_eq!(
+        outcome.output,
+        ["first-class 1", "shadow:with", "child-realm"]
+    );
+    assert_eq!(outcome.errput, ["warning"]);
+}
+
+#[test]
 fn expression_arrow_analysis_preserves_lexical_semantics() {
     assert_eq!(
         output(

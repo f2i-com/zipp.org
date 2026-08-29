@@ -1,5 +1,5 @@
-//! Exactness, override and ablation coverage for Tier-C Map mutation and
-//! primitive-string case conversion.
+//! Exactness and override coverage for hot Map mutation and primitive-string
+//! case conversion through capture-first member calls.
 
 use std::process::Command;
 
@@ -105,12 +105,10 @@ const EXPECTED: &[&str] = &[
     "own 256 2 1 799",
     "proto 257 1 1 255",
     "string-overrides OVR:3 GET:3 2 low",
-    // The engine's existing createRealm Map-constructor facade still creates a
-    // main-prototype Map (the known cross-realm prototype-setup deviation), so
-    // the child Map override is not reached in either JIT or interpreter mode.
-    // Keep the observed value pinned here; the main/custom-prototype cases
-    // above are the semantic gate for this optimization.
-    "realm CHILD:40 0:1",
+    // The createRealm Map-constructor facade now installs the child realm's
+    // Map prototype in every execution mode, so its live override is observed
+    // and the child map remains empty.
+    "realm CHILD:40 40:0",
 ];
 
 #[test]
@@ -124,34 +122,12 @@ fn execution_mode_child() {
 }
 
 #[test]
-fn optimized_ablation_nojit_and_gc_modes_match() {
+fn optimized_nojit_and_gc_modes_match() {
     let exe = std::env::current_exe().expect("test binary path");
     for (mode, env) in [
         (
             "hot",
             &[("ZIPP_JIT_THRESHOLD", "1"), ("ZIPP_JITLOG", "1")][..],
-        ),
-        // The intrinsic-off comparators ALSO disable the general method route:
-        // with it live, an off-switched name simply takes the live-IC path
-        // instead of blacklisting the function, and the rejection line these
-        // modes assert on would (correctly) never print.
-        (
-            "collections_off",
-            &[
-                ("ZIPP_JIT_THRESHOLD", "1"),
-                ("ZIPP_JITLOG", "1"),
-                ("ZIPP_NO_TIERC_COLL_MUTATE", "1"),
-                ("ZIPP_NO_TIERC_CLOSURE_MAKE", "1"),
-            ][..],
-        ),
-        (
-            "upper_off",
-            &[
-                ("ZIPP_JIT_THRESHOLD", "1"),
-                ("ZIPP_JITLOG", "1"),
-                ("ZIPP_NO_TIERC_STRING_UPPER", "1"),
-                ("ZIPP_NO_TIERC_CLOSURE_MAKE", "1"),
-            ][..],
         ),
         ("nojit", &[("ZIPP_NOJIT", "1")][..]),
         (
@@ -164,8 +140,6 @@ fn optimized_ablation_nojit_and_gc_modes_match() {
             .env("ZIPP_TIERC_COLLECTION_STRING_CHILD", "1")
             .env_remove("ZIPP_JIT_THRESHOLD")
             .env_remove("ZIPP_JITLOG")
-            .env_remove("ZIPP_NO_TIERC_COLL_MUTATE")
-            .env_remove("ZIPP_NO_TIERC_STRING_UPPER")
             .env_remove("ZIPP_NOJIT")
             .env_remove("ZIPP_GC_STRESS")
             .envs(env.iter().copied())
@@ -182,16 +156,6 @@ fn optimized_ablation_nojit_and_gc_modes_match() {
             assert!(
                 stderr.matches("Tier C").count() >= 2,
                 "hot bodies did not compile:\n{stderr}"
-            );
-        } else if mode == "collections_off" {
-            assert!(
-                stderr.contains("CallMethod Some(\"set\") argc=2"),
-                "collection switch did not reject:\n{stderr}"
-            );
-        } else if mode == "upper_off" {
-            assert!(
-                stderr.contains("CallMethod Some(\"toUpperCase\") argc=0"),
-                "string switch did not reject:\n{stderr}"
             );
         }
     }

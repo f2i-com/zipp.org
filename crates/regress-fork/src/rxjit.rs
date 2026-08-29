@@ -779,15 +779,15 @@ fn plan(re: &CompiledRegex) -> Option<Plan> {
             &Insn::EndCaptureGroup(g) => nodes.push(Node::End(g as u32)),
             &Insn::ResetCaptureGroup(g) => nodes.push(Node::Reset(g as u32)),
             &Insn::StartOfLine { multiline } => {
-                let lt = build_table(&mut tables, |b| ASCIICharProperties::is_line_terminator(b));
+                let lt = build_table(&mut tables, ASCIICharProperties::is_line_terminator);
                 nodes.push(Node::Sol { multiline, lt });
             }
             &Insn::EndOfLine { multiline } => {
-                let lt = build_table(&mut tables, |b| ASCIICharProperties::is_line_terminator(b));
+                let lt = build_table(&mut tables, ASCIICharProperties::is_line_terminator);
                 nodes.push(Node::Eol { multiline, lt });
             }
             &Insn::WordBoundary { invert } => {
-                let w = build_table(&mut tables, |b| ASCIICharProperties::is_word_char(b));
+                let w = build_table(&mut tables, ASCIICharProperties::is_word_char);
                 nodes.push(Node::Wb { invert, w });
             }
             &Insn::WordBoundaryUnicodeICase { invert } => {
@@ -856,6 +856,7 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
         .collect();
     // Trailer handlers emitted after the main stream:
     // (handler label, continuation/secondary label, kind).
+    #[derive(Clone, Copy)]
     enum Handler {
         Alt(DynamicLabel, DynamicLabel),
         Greedy(DynamicLabel, DynamicLabel),
@@ -1200,9 +1201,9 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
         ; jmp ->bt
     );
     for h in &handlers {
-        match h {
+        match *h {
             // Alt: restore the saved position, take the secondary branch.
-            &Handler::Alt(h, sec) => {
+            Handler::Alt(h, sec) => {
                 dynasm!(ops
                     ; =>h
                     ; mov rbx, [r14 - 24]
@@ -1211,7 +1212,7 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
                 );
             }
             // GreedyLoop1Char: retreat max one byte toward min, or pop.
-            &Handler::Greedy(h, cont) => {
+            Handler::Greedy(h, cont) => {
                 dynasm!(ops
                     ; =>h
                     ; mov rax, [r14 - 24]
@@ -1228,7 +1229,7 @@ fn compile(re: &CompiledRegex) -> Option<JitCode> {
                 );
             }
             // NonGreedyLoop1Char: advance min one byte toward max, or pop.
-            &Handler::Lazy(h, cont) => {
+            Handler::Lazy(h, cont) => {
                 dynasm!(ops
                     ; =>h
                     ; mov rax, [r14 - 24]

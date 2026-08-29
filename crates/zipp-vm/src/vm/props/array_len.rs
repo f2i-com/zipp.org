@@ -100,8 +100,9 @@ impl<'p> Vm<'p> {
             .filter_map(|(i, k)| {
                 // A spec array index is < 2^32-1: "4294967295"/"4294967296"
                 // are ORDINARY named properties — they never block a shrink.
-                canonical_index_str(k)
-                    .filter(|ki| *ki < 4_294_967_295 && *ki >= new_len && !m.attr_at(i).configurable)
+                canonical_index_str(k).filter(|ki| {
+                    *ki < 4_294_967_295 && *ki >= new_len && !m.attr_at(i).configurable
+                })
             })
             .max()
     }
@@ -140,6 +141,9 @@ impl<'p> Vm<'p> {
             // Keep the dense prefix; the JS length lives in the side table.
             self.array_js_len.insert(arr_idx, n as u32);
         }
+        // `bump_version` also advances B244's saturating Array-snapshot epoch,
+        // including the side-table-only branch where the dense Vec did not
+        // move. A post-cross-call snapshot must therefore recheck virtual len.
         self.heap.bump_version(arr_idx);
     }
 
@@ -400,6 +404,14 @@ impl<'p> Vm<'p> {
     /// unconditional means no caller can accidentally guard it wrongly.
     #[inline]
     pub(crate) fn invalidate_indexed_proto_protector(&mut self) {
+        // Pinned HasProp snapshots now carry the protector's clear state. A
+        // native cross-call may otherwise reuse an Array snapshot under B244's
+        // coarse epoch after user code installs an indexed prototype property.
+        // Dirties only the clear -> invalid transition; the protector is sticky.
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        if !self.array_proto_has_index {
+            self.heap.dirty_array_snapshots();
+        }
         self.array_proto_has_index = true;
     }
 
@@ -515,5 +527,80 @@ impl<'p> Vm<'p> {
         } else {
             Ok(false)
         }
+    }
+}
+
+#[cfg(all(test, feature = "jit", target_arch = "x86_64"))]
+mod array_snapshot_epoch_tests {
+    use super::*;
+
+    fn array_snapshot(vm: &mut Vm<'_>, idx: u32) -> crate::vm::TaSnap {
+        let mut snap = crate::vm::TaSnap {
+            obj_bits: u64::MAX,
+            base: u64::MAX,
+            len: u64::MAX,
+            flags: u64::MAX,
+        };
+        crate::vm::jit_ta_snapshot(
+            vm as *mut Vm<'_> as *mut core::ffi::c_void,
+            Value::heap(idx).bits(),
+            crate::codegen::ARR_INT_PIN_KIND as u32,
+            &mut snap,
+        );
+        snap
+    }
+
+    #[test]
+    fn side_table_only_virtual_length_changes_dirty_array_snapshots() {
+        let source = "var ready = true;";
+        let ast = crate::front::parse_script(source).expect("source parses");
+        let program = crate::compile::compile_program(&ast, source).expect("source compiles");
+        let mut vm = Vm::new(&program);
+        let idx = vm.heap.alloc(HeapObj::Array(vec![
+            Value::int(1),
+            Value::int(2),
+            Value::int(3),
+            Value::int(4),
+        ]));
+        let dense = array_snapshot(&mut vm, idx);
+        assert_eq!(dense.obj_bits, Value::heap(idx).bits());
+        assert_ne!(dense.base, 0);
+        assert_eq!(dense.len, 4);
+
+        let before = vm.heap.array_snapshot_epoch;
+        vm.array_apply_length(idx, crate::vm::MAX_DENSE_ARRAY_LEN + 1);
+        assert_eq!(vm.js_array_len(idx), crate::vm::MAX_DENSE_ARRAY_LEN + 1);
+        assert_eq!(
+            vm.heap.array_snapshot_epoch,
+            before + 1,
+            "entering virtual-length storage must invalidate a cached dense snapshot"
+        );
+        assert!(matches!(vm.heap.get(idx), HeapObj::Array(items) if items.len() == 4));
+        let declined = array_snapshot(&mut vm, idx);
+        assert_eq!(
+            (
+                declined.obj_bits,
+                declined.base,
+                declined.len,
+                declined.flags
+            ),
+            (0, 0, 0, 0),
+            "runtime snapshot validation must not publish dense len for a virtual Array"
+        );
+
+        let before = vm.heap.array_snapshot_epoch;
+        vm.array_apply_length(idx, crate::vm::MAX_DENSE_ARRAY_LEN + 9);
+        assert_eq!(vm.heap.array_snapshot_epoch, before + 1);
+        assert_eq!(
+            vm.js_array_len(idx),
+            crate::vm::MAX_DENSE_ARRAY_LEN + 9,
+            "retaining virtual storage while changing length must invalidate too"
+        );
+
+        let before = vm.heap.array_snapshot_epoch;
+        vm.array_apply_length(idx, 2);
+        assert!(vm.heap.array_snapshot_epoch > before);
+        assert_eq!(vm.js_array_len(idx), 2);
+        assert!(!vm.array_js_len.contains_key(&idx));
     }
 }

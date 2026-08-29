@@ -348,8 +348,7 @@ pub(crate) extern "win64" fn jit_cell_set_tdz_checked(
             return crate::codegen::SELF_CALL_DEOPT;
         }
         let idx = cell.heap_index();
-        if !matches!(vm.heap.get(idx), HeapObj::Cell) || vm.heap.cell_get(idx).is_uninitialized()
-        {
+        if !matches!(vm.heap.get(idx), HeapObj::Cell) || vm.heap.cell_get(idx).is_uninitialized() {
             return crate::codegen::SELF_CALL_DEOPT;
         }
         vm.heap.cell_set(idx, Value::from_bits(val_bits));
@@ -361,21 +360,25 @@ pub(crate) extern "win64" fn jit_cell_set_tdz_checked(
     }
 }
 
-/// `ArrayCtor { dst, arg_base, argc }` — the interpreter arm's dense subset:
+/// `ArrayCtor { dst, callee, arg_base, argc, .. }` — the interpreter arm's dense subset:
 /// `Array(n)` with a valid dense-capped integer length becomes `n` holes, and
 /// any other argument list becomes its elements. Invalid lengths (interpreter
 /// RangeError) and past-cap sparse lengths decline as pure prefixes.
-/// `packed = (reg_count << 32) | (arg_base << 16) | argc`.
+/// `packed = (guard_present << 63) | (reg_count << 32) |
+/// (arg_base << 16) | argc`. `guard_present` is explicit because every u64 bit
+/// pattern, including undefined/null, is a possible replaced JavaScript callee.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_array_ctor(
     vm: *mut core::ffi::c_void,
     regs: *const u64,
     packed: u64,
+    callee_bits: u64,
 ) -> u64 {
     if vm.is_null() || regs.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
-    let reg_count = (packed >> 32) as u32 as usize;
+    let guard_present = packed & (1u64 << 63) != 0;
+    let reg_count = ((packed >> 32) as u32 & 0x7fff_ffff) as usize;
     let arg_base = (packed >> 16) as u16 as usize;
     let argc = packed as u16 as usize;
     if arg_base
@@ -386,6 +389,10 @@ pub(crate) extern "win64" fn jit_array_ctor(
     }
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let vm = unsafe { &mut *(vm as *mut Vm) };
+        let callee = Value::from_bits(callee_bits);
+        if guard_present && !vm.bare_builtin_is_intrinsic(vm.array_ctor, callee) {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
         vm.maybe_gc();
         if !crate::vm::regs_window_valid(vm, regs, reg_count) {
             return crate::codegen::SELF_CALL_DEOPT;
@@ -487,7 +494,7 @@ mod tests {
             panic!("inner must capture outer's local");
         };
         let outer_regs = vm.func(fid as usize).reg_count.max(1) as usize;
-        vm.regs = vec![Value::UNDEFINED; outer_regs];
+        vm.regs = vec![Value::UNDEFINED; outer_regs].into();
         let cell = vm.heap.alloc_cell(Value::int(41));
         vm.regs[cell_reg as usize] = Value::heap(cell);
         let callee = vm.heap.alloc(HeapObj::Func(fid));
@@ -531,7 +538,7 @@ mod tests {
             _ => unreachable!(),
         };
         let cell_regs = vm.func(cell_fid as usize).reg_count.max(1) as usize;
-        vm.regs = vec![Value::UNDEFINED; cell_regs];
+        vm.regs = vec![Value::UNDEFINED; cell_regs].into();
         vm.regs[reg as usize] = Value::int(9);
         let cell_callee = vm.heap.alloc(HeapObj::Func(cell_fid));
         vm.jit_tierc_activation = TiercActivationState {

@@ -1,6 +1,10 @@
 //! Classical backtracking execution engine
 
-use crate::api::Match;
+#[cfg(feature = "bounded-backtracking")]
+use crate::api::LimitedScanResult;
+#[cfg(feature = "bounded-backtracking")]
+use crate::api::MatchLimitError;
+use crate::api::{Match, MatchLimits, MatchUsage, ScanSink};
 use crate::bytesearch;
 use crate::cursor;
 use crate::cursor::{Backward, Direction, Forward};
@@ -141,6 +145,192 @@ enum BacktrackInsn<Input: InputIndexer> {
     },
 }
 
+/// Per-search meter. The non-bounded definition is zero-sized, so calls to
+/// `consume` and the bookkeeping around stack pushes disappear completely in
+/// ordinary builds after inlining.
+#[cfg(feature = "bounded-backtracking")]
+#[derive(Debug)]
+struct MatchBudget {
+    remaining: u64,
+    used: u64,
+    max_scratch_bytes: usize,
+    max_memory_bytes: usize,
+    reserved_scratch_bytes: usize,
+    reserved_memory_bytes: usize,
+    exhaustion: Option<MatchLimitError>,
+}
+
+#[cfg(feature = "bounded-backtracking")]
+impl MatchBudget {
+    fn new(limits: MatchLimits) -> Self {
+        Self {
+            remaining: limits.max_steps,
+            used: 0,
+            max_scratch_bytes: limits.max_backtrack_bytes.min(limits.max_memory_bytes),
+            max_memory_bytes: limits.max_memory_bytes,
+            reserved_scratch_bytes: 0,
+            reserved_memory_bytes: 0,
+            exhaustion: None,
+        }
+    }
+
+    #[inline(always)]
+    fn consume(&mut self, n: usize) -> bool {
+        if self.exhaustion.is_some() {
+            return false;
+        }
+        let n = n as u64;
+        if n > self.remaining {
+            self.exhaustion = Some(MatchLimitError::Steps);
+            return false;
+        }
+        self.remaining -= n;
+        self.used = self.used.saturating_add(n);
+        true
+    }
+
+    #[inline(always)]
+    fn can_reserve_total(&mut self, bytes: usize) -> bool {
+        if self.exhaustion.is_some()
+            || bytes
+                > self
+                    .max_memory_bytes
+                    .saturating_sub(self.reserved_memory_bytes)
+        {
+            self.exhaustion
+                .get_or_insert(MatchLimitError::BacktrackMemory);
+            return false;
+        }
+        true
+    }
+
+    #[inline(always)]
+    fn can_reserve_scratch(&mut self, bytes: usize) -> bool {
+        if bytes
+            > self
+                .max_scratch_bytes
+                .saturating_sub(self.reserved_scratch_bytes)
+        {
+            self.exhaustion
+                .get_or_insert(MatchLimitError::BacktrackMemory);
+            return false;
+        }
+        self.can_reserve_total(bytes)
+    }
+
+    #[inline(always)]
+    fn reserve_scratch(&mut self, bytes: usize) {
+        self.reserved_scratch_bytes += bytes;
+        self.reserved_memory_bytes += bytes;
+    }
+
+    #[inline]
+    fn release_scratch_capacity(&mut self, bytes: usize) {
+        self.reserved_scratch_bytes = self.reserved_scratch_bytes.saturating_sub(bytes);
+        self.reserved_memory_bytes = self.reserved_memory_bytes.saturating_sub(bytes);
+    }
+
+    #[inline]
+    fn allocation_failed(&mut self) {
+        self.exhaustion
+            .get_or_insert(MatchLimitError::BacktrackMemory);
+    }
+
+    fn try_vec_with_capacity_impl<T>(&mut self, capacity: usize, scratch: bool) -> Option<Vec<T>> {
+        let element_bytes = core::mem::size_of::<T>();
+        let Some(requested) = capacity.checked_mul(element_bytes) else {
+            self.allocation_failed();
+            return None;
+        };
+        let can_reserve = if scratch {
+            self.can_reserve_scratch(requested)
+        } else {
+            self.can_reserve_total(requested)
+        };
+        if !can_reserve {
+            return None;
+        }
+        let mut values = Vec::new();
+        if values.try_reserve_exact(capacity).is_err() {
+            self.allocation_failed();
+            return None;
+        }
+        let actual = values.capacity().checked_mul(element_bytes);
+        let Some(actual) = actual else {
+            self.allocation_failed();
+            return None;
+        };
+        let can_reserve = if scratch {
+            self.can_reserve_scratch(actual)
+        } else {
+            self.can_reserve_total(actual)
+        };
+        if !can_reserve {
+            return None;
+        }
+        if scratch {
+            self.reserve_scratch(actual);
+        } else {
+            self.reserved_memory_bytes += actual;
+        }
+        Some(values)
+    }
+
+    fn try_vec_with_capacity<T>(&mut self, capacity: usize) -> Option<Vec<T>> {
+        self.try_vec_with_capacity_impl(capacity, true)
+    }
+
+    fn try_capture_vec_with_capacity<T>(&mut self, capacity: usize) -> Option<Vec<T>> {
+        self.try_vec_with_capacity_impl(capacity, false)
+    }
+
+    fn try_vec_filled<T: Clone>(&mut self, len: usize, value: T) -> Option<Vec<T>> {
+        let mut values = self.try_vec_with_capacity(len)?;
+        values.resize(len, value);
+        Some(values)
+    }
+
+    #[inline]
+    fn usage(&self) -> MatchUsage {
+        MatchUsage {
+            steps: self.used,
+            exhaustion: self.exhaustion,
+        }
+    }
+
+    #[inline(always)]
+    fn exhausted(&self) -> bool {
+        self.exhaustion.is_some()
+    }
+}
+
+#[cfg(not(feature = "bounded-backtracking"))]
+#[derive(Debug)]
+struct MatchBudget;
+
+#[cfg(not(feature = "bounded-backtracking"))]
+impl MatchBudget {
+    #[inline(always)]
+    fn new(_limits: MatchLimits) -> Self {
+        Self
+    }
+
+    #[inline(always)]
+    fn consume(&mut self, _n: usize) -> bool {
+        true
+    }
+
+    #[inline]
+    fn usage(&self) -> MatchUsage {
+        MatchUsage::UNMETERED
+    }
+
+    #[inline(always)]
+    fn exhausted(&self) -> bool {
+        false
+    }
+}
+
 #[derive(Debug, Default)]
 struct State<Position: PositionType> {
     loops: Vec<LoopData<Position>>,
@@ -170,24 +360,133 @@ pub(crate) struct MatchAttempter<'a, Input: InputIndexer> {
     // attempt. When the attempt fails, no match starts inside that run, so
     // the search may resume here instead of at start+1.
     skip_hint: Option<Input::Position>,
+    budget: MatchBudget,
 }
 
 impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
     pub(crate) fn new(re: &'a CompiledRegex, entry: Input::Position) -> Self {
-        Self {
-            re,
-            bts: vec![BacktrackInsn::Exhausted],
-            s: State {
-                loops: vec![LoopData::new(entry); re.loops as usize],
-                groups: vec![GroupData::new(); re.groups as usize],
-            },
-            skip_hint: None,
+        #[cfg(feature = "bounded-backtracking")]
+        let limits = MatchLimits::SANDBOX;
+        #[cfg(not(feature = "bounded-backtracking"))]
+        let limits = MatchLimits::UNLIMITED;
+        Self::new_with_limits(re, entry, limits)
+    }
+
+    pub(crate) fn new_with_limits(
+        re: &'a CompiledRegex,
+        entry: Input::Position,
+        limits: MatchLimits,
+    ) -> Self {
+        #[cfg(feature = "bounded-backtracking")]
+        {
+            let mut budget = MatchBudget::new(limits);
+            budget.consume((re.loops as usize).saturating_add(re.groups as usize));
+            let loops = budget
+                .try_vec_filled(re.loops as usize, LoopData::new(entry))
+                .unwrap_or_default();
+            let groups = budget
+                .try_vec_filled(re.groups as usize, GroupData::new())
+                .unwrap_or_default();
+            let mut this = Self {
+                re,
+                bts: Vec::new(),
+                s: State { loops, groups },
+                skip_hint: None,
+                budget,
+            };
+            this.push_backtrack(BacktrackInsn::Exhausted);
+            this
+        }
+        #[cfg(not(feature = "bounded-backtracking"))]
+        {
+            Self {
+                re,
+                bts: vec![BacktrackInsn::Exhausted],
+                s: State {
+                    loops: vec![LoopData::new(entry); re.loops as usize],
+                    groups: vec![GroupData::new(); re.groups as usize],
+                },
+                skip_hint: None,
+                budget: MatchBudget::new(limits),
+            }
         }
     }
 
+    #[inline]
+    fn match_usage(&self) -> MatchUsage {
+        self.budget.usage()
+    }
+
     #[inline(always)]
-    fn push_backtrack(&mut self, bt: BacktrackInsn<Input>) {
-        self.bts.push(bt)
+    fn push_backtrack(&mut self, bt: BacktrackInsn<Input>) -> bool {
+        Self::push_backtrack_parts(&mut self.bts, &mut self.budget, bt)
+    }
+
+    #[inline(always)]
+    fn push_backtrack_parts(
+        bts: &mut Vec<BacktrackInsn<Input>>,
+        budget: &mut MatchBudget,
+        bt: BacktrackInsn<Input>,
+    ) -> bool {
+        #[cfg(not(feature = "bounded-backtracking"))]
+        let _ = budget;
+        #[cfg(feature = "bounded-backtracking")]
+        {
+            let bytes = core::mem::size_of::<BacktrackInsn<Input>>();
+            if bts.len() == bts.capacity() {
+                let old_capacity = bts.capacity();
+                let available_bytes = budget
+                    .max_scratch_bytes
+                    .saturating_sub(budget.reserved_scratch_bytes)
+                    .min(
+                        budget
+                            .max_memory_bytes
+                            .saturating_sub(budget.reserved_memory_bytes),
+                    );
+                let available_entries = available_bytes / bytes.max(1);
+                let grow_by = if old_capacity == 0 {
+                    4.min(available_entries)
+                } else {
+                    old_capacity.min(available_entries)
+                };
+                if grow_by == 0 {
+                    budget.allocation_failed();
+                    return false;
+                }
+                if !budget.can_reserve_scratch(grow_by.saturating_mul(bytes)) {
+                    return false;
+                }
+                // Geometric but hard-capped growth avoids a realloc per push.
+                // `try_reserve_exact` converts allocator failure into the same
+                // fail-closed resource result rather than aborting the process.
+                if bts.try_reserve_exact(grow_by).is_err() {
+                    budget.allocation_failed();
+                    return false;
+                }
+                let capacity_growth = bts.capacity().saturating_sub(old_capacity);
+                let allocated_bytes = capacity_growth.saturating_mul(bytes);
+                if allocated_bytes
+                    > budget
+                        .max_scratch_bytes
+                        .saturating_sub(budget.reserved_scratch_bytes)
+                        .min(
+                            budget
+                                .max_memory_bytes
+                                .saturating_sub(budget.reserved_memory_bytes),
+                        )
+                {
+                    // The allocator granted more than `reserve_exact` asked
+                    // for. We cannot make that allocation disappear without a
+                    // second allocation, so fail closed and never expose a
+                    // match. Standard allocators take the exact path here.
+                    budget.allocation_failed();
+                    return false;
+                }
+                budget.reserve_scratch(allocated_bytes);
+            }
+        }
+        bts.push(bt);
+        true
     }
 
     #[inline(always)]
@@ -204,18 +503,24 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         }
     }
 
-    fn prepare_to_enter_loop(
-        bts: &mut Vec<BacktrackInsn<Input>>,
-        pos: Input::Position,
-        loop_fields: &LoopFields,
-        loop_data: &mut LoopData<Input::Position>,
-    ) {
-        bts.push(BacktrackInsn::SetLoopData {
+    #[inline]
+    fn truncate_backtrack(&mut self, len: usize) {
+        self.bts.truncate(len);
+    }
+
+    fn prepare_to_enter_loop(&mut self, pos: Input::Position, loop_fields: &LoopFields) -> bool {
+        let index = loop_fields.loop_id as usize;
+        let old = self.s.loops[index];
+        if !self.push_backtrack(BacktrackInsn::SetLoopData {
             id: loop_fields.loop_id,
-            data: *loop_data,
-        });
+            data: old,
+        }) {
+            return false;
+        }
+        let loop_data = &mut self.s.loops[index];
         loop_data.iters += 1;
         loop_data.entry = pos;
+        true
     }
 
     fn run_loop(
@@ -224,7 +529,8 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         pos: Input::Position,
         ip: IP,
     ) -> Option<IP> {
-        let loop_data = &mut self.s.loops[loop_fields.loop_id as usize];
+        let loop_index = loop_fields.loop_id as usize;
+        let loop_data = self.s.loops[loop_index];
         let iteration = loop_data.iters;
 
         let do_taken = iteration < loop_fields.max_iters;
@@ -252,29 +558,35 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
             }
             (true, false) => {
                 // Only entering is viable.
-                MatchAttempter::prepare_to_enter_loop(&mut self.bts, pos, loop_fields, loop_data);
-                Some(loop_taken_ip)
+                self.prepare_to_enter_loop(pos, loop_fields)
+                    .then_some(loop_taken_ip)
             }
             (true, true) if !loop_fields.greedy => {
                 // Both arms are viable; backtrack into the loop.
                 let orig_pos = loop_data.entry;
-                loop_data.entry = pos;
-                self.bts.push(BacktrackInsn::EnterNonGreedyLoop {
+                let mut pushed_data = loop_data;
+                pushed_data.entry = pos;
+                if !self.push_backtrack(BacktrackInsn::EnterNonGreedyLoop {
                     ip,
                     orig_pos,
-                    data: *loop_data,
-                });
+                    data: pushed_data,
+                }) {
+                    return None;
+                }
+                self.s.loops[loop_index].entry = pos;
                 Some(loop_not_taken_ip)
             }
             (true, true) => {
                 debug_assert!(loop_fields.greedy, "Should be greedy");
                 // Both arms are viable; backtrack out of the loop.
-                self.bts.push(BacktrackInsn::SetPosition {
+                if !self.push_backtrack(BacktrackInsn::SetPosition {
                     ip: loop_not_taken_ip,
                     pos,
-                });
-                MatchAttempter::prepare_to_enter_loop(&mut self.bts, pos, loop_fields, loop_data);
-                Some(loop_taken_ip)
+                }) {
+                    return None;
+                }
+                self.prepare_to_enter_loop(pos, loop_fields)
+                    .then_some(loop_taken_ip)
             }
         }
     }
@@ -289,11 +601,15 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         max: usize,
         dir: Dir,
         matcher: Scm,
+        budget: &mut MatchBudget,
     ) -> Option<(Input::Position, Input::Position)> {
         debug_assert!(min <= max, "min should be <= max");
         // Drive the iteration min times.
         // That tells us the min position.
         for _ in 0..min {
+            if !budget.consume(1) {
+                return None;
+            }
             if !matcher.matches(input, dir, &mut pos) {
                 return None;
             }
@@ -302,6 +618,9 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
 
         // Drive it up to the max.
         for _ in 0..(max - min) {
+            if !budget.consume(1) {
+                return None;
+            }
             let saved = pos;
             if !matcher.matches(input, dir, &mut pos) {
                 pos = saved;
@@ -320,15 +639,19 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         limit: usize,
         dir: Dir,
         matcher: Scm,
-    ) -> Input::Position {
+        budget: &mut MatchBudget,
+    ) -> Option<Input::Position> {
         for _ in 0..limit {
+            if !budget.consume(1) {
+                return None;
+            }
             let saved = pos;
             if !matcher.matches(input, dir, &mut pos) {
                 pos = saved;
                 break;
             }
         }
-        pos
+        Some(pos)
     }
 
     // Helper function to extract the duplicated match blocks that handle different instruction types
@@ -337,23 +660,24 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         re: &CompiledRegex,
         input: &Input,
         pos: Input::Position,
-        min: usize,
-        max: usize,
+        bounds: (usize, usize),
         dir: Dir,
         ip: IP,
+        budget: &mut MatchBudget,
     ) -> Option<(Input::Position, Input::Position)> {
+        let (min, max) = bounds;
         match re.insns.iat(ip + 1) {
             &Insn::Char(c) => {
                 let c = <<Input as InputIndexer>::Element as ElementType>::try_from(c)?;
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::Char { c })
+                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::Char { c }, budget)
             }
             &Insn::CharICase(c) => {
                 let c = <<Input as InputIndexer>::Element as ElementType>::try_from(c)?;
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::CharICase { c })
+                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::CharICase { c }, budget)
             }
             &Insn::Bracket(idx) => {
                 let bc = &re.brackets[idx];
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::Bracket { bc })
+                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::Bracket { bc }, budget)
             }
             Insn::AsciiBracket(bitmap) => Self::run_scm_loop_impl(
                 input,
@@ -362,9 +686,10 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                 max,
                 dir,
                 scm::MatchByteSet { bytes: bitmap },
+                budget,
             ),
             Insn::MatchAny => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchAny::new())
+                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchAny::new(), budget)
             }
             Insn::MatchAnyExceptLineTerminator => Self::run_scm_loop_impl(
                 input,
@@ -373,36 +698,55 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                 max,
                 dir,
                 scm::MatchAnyExceptLineTerminator::new(),
+                budget,
             ),
             Insn::CharSet(chars) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::CharSet { chars })
+                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::CharSet { chars }, budget)
             }
-            &Insn::ByteSet2(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteArraySet(bytes))
-            }
-            &Insn::ByteSet3(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteArraySet(bytes))
-            }
-            &Insn::ByteSet4(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteArraySet(bytes))
-            }
+            &Insn::ByteSet2(bytes) => Self::run_scm_loop_impl(
+                input,
+                pos,
+                min,
+                max,
+                dir,
+                scm::MatchByteArraySet(bytes),
+                budget,
+            ),
+            &Insn::ByteSet3(bytes) => Self::run_scm_loop_impl(
+                input,
+                pos,
+                min,
+                max,
+                dir,
+                scm::MatchByteArraySet(bytes),
+                budget,
+            ),
+            &Insn::ByteSet4(bytes) => Self::run_scm_loop_impl(
+                input,
+                pos,
+                min,
+                max,
+                dir,
+                scm::MatchByteArraySet(bytes),
+                budget,
+            ),
             Insn::ByteSeq1(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes))
+                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
             }
             Insn::ByteSeq2(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes))
+                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
             }
             Insn::ByteSeq3(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes))
+                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
             }
             Insn::ByteSeq4(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes))
+                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
             }
             Insn::ByteSeq5(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes))
+                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
             }
             Insn::ByteSeq6(bytes) => {
-                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes))
+                Self::run_scm_loop_impl(input, pos, min, max, dir, scm::MatchByteSeq(bytes), budget)
             }
             _ => {
                 unreachable!("Missing SCM: {:?}", re.insns.iat(ip + 1));
@@ -418,66 +762,89 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         limit: usize,
         dir: Dir,
         ip: IP,
+        budget: &mut MatchBudget,
     ) -> Option<Input::Position> {
-        let result = match re.insns.iat(ip + 1) {
+        match re.insns.iat(ip + 1) {
             &Insn::Char(c) => {
                 let c = <<Input as InputIndexer>::Element as ElementType>::try_from(c)?;
-                Self::compute_max_pos(input, pos, limit, dir, scm::Char { c })
+                Self::compute_max_pos(input, pos, limit, dir, scm::Char { c }, budget)
             }
             &Insn::CharICase(c) => {
                 let c = <<Input as InputIndexer>::Element as ElementType>::try_from(c)?;
-                Self::compute_max_pos(input, pos, limit, dir, scm::CharICase { c })
+                Self::compute_max_pos(input, pos, limit, dir, scm::CharICase { c }, budget)
             }
             &Insn::Bracket(idx) => {
                 let bc = &re.brackets[idx];
-                Self::compute_max_pos(input, pos, limit, dir, scm::Bracket { bc })
+                Self::compute_max_pos(input, pos, limit, dir, scm::Bracket { bc }, budget)
             }
-            Insn::AsciiBracket(bitmap) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSet { bytes: bitmap })
+            Insn::AsciiBracket(bitmap) => Self::compute_max_pos(
+                input,
+                pos,
+                limit,
+                dir,
+                scm::MatchByteSet { bytes: bitmap },
+                budget,
+            ),
+            Insn::MatchAny => {
+                Self::compute_max_pos(input, pos, limit, dir, scm::MatchAny::new(), budget)
             }
-            Insn::MatchAny => Self::compute_max_pos(input, pos, limit, dir, scm::MatchAny::new()),
             Insn::MatchAnyExceptLineTerminator => Self::compute_max_pos(
                 input,
                 pos,
                 limit,
                 dir,
                 scm::MatchAnyExceptLineTerminator::new(),
+                budget,
             ),
             Insn::CharSet(chars) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::CharSet { chars })
+                Self::compute_max_pos(input, pos, limit, dir, scm::CharSet { chars }, budget)
             }
-            &Insn::ByteSet2(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteArraySet(bytes))
-            }
-            &Insn::ByteSet3(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteArraySet(bytes))
-            }
-            &Insn::ByteSet4(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteArraySet(bytes))
-            }
+            &Insn::ByteSet2(bytes) => Self::compute_max_pos(
+                input,
+                pos,
+                limit,
+                dir,
+                scm::MatchByteArraySet(bytes),
+                budget,
+            ),
+            &Insn::ByteSet3(bytes) => Self::compute_max_pos(
+                input,
+                pos,
+                limit,
+                dir,
+                scm::MatchByteArraySet(bytes),
+                budget,
+            ),
+            &Insn::ByteSet4(bytes) => Self::compute_max_pos(
+                input,
+                pos,
+                limit,
+                dir,
+                scm::MatchByteArraySet(bytes),
+                budget,
+            ),
             Insn::ByteSeq1(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes))
+                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
             }
             Insn::ByteSeq2(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes))
+                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
             }
             Insn::ByteSeq3(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes))
+                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
             }
             Insn::ByteSeq4(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes))
+                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
             }
             Insn::ByteSeq5(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes))
+                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
             }
             Insn::ByteSeq6(bytes) => {
-                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes))
+                Self::compute_max_pos(input, pos, limit, dir, scm::MatchByteSeq(bytes), budget)
             }
             _ => {
                 unreachable!("Missing SCM: {:?}", re.insns.iat(ip + 1));
             }
-        };
-        Some(result)
+        }
     }
 
     // Given that ip points at a loop whose body matches exactly one character, run
@@ -501,15 +868,31 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         // We'll only compute it when we need to set up backtracking.
         let (min_pos, max_pos) = if greedy {
             // For greedy loops, compute both min and max positions
-            Self::with_scm_loop_impl(self.re, input, *pos, min, max, dir, ip)?
+            Self::with_scm_loop_impl(self.re, input, *pos, (min, max), dir, ip, &mut self.budget)?
         } else {
             // For non-greedy loops, initially only compute the minimum position
-            let (min_pos, _) = Self::with_scm_loop_impl(self.re, input, *pos, min, min, dir, ip)?;
+            let (min_pos, _) = Self::with_scm_loop_impl(
+                self.re,
+                input,
+                *pos,
+                (min, min),
+                dir,
+                ip,
+                &mut self.budget,
+            )?;
 
             // For non-greedy loops, we only compute the max position if we need to set up backtracking
             let max_pos = if min < max {
                 // We need to compute the max for backtracking purposes
-                Self::with_scm_compute_max(self.re, input, min_pos, max - min, dir, ip)?
+                Self::with_scm_compute_max(
+                    self.re,
+                    input,
+                    min_pos,
+                    max - min,
+                    dir,
+                    ip,
+                    &mut self.budget,
+                )?
             } else {
                 min_pos
             };
@@ -560,7 +943,9 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                     max: max_pos,
                 }
             };
-            self.bts.push(bti);
+            if !self.push_backtrack(bti) {
+                return None;
+            }
         }
 
         // Start at the max (min) if greedy (nongreedy).
@@ -582,39 +967,87 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         end_group: CaptureGroupID,
         negate: bool,
     ) -> bool {
-        // Copy capture groups, because if the match fails (or if we are inverted)
-        // we need to restore these.
-        let range = (start_group as usize)..(end_group as usize);
-        // TODO: consider retaining storage here?
-        // Temporarily defeat backtracking.
-        let saved_groups = self.s.groups.iat(range.clone()).to_vec();
+        #[cfg(not(feature = "bounded-backtracking"))]
+        {
+            // Copy capture groups, because a failed/inverted assertion restores them.
+            let range = (start_group as usize)..(end_group as usize);
+            let saved_groups = self.s.groups.iat(range.clone()).to_vec();
+            let mut saved_bts = Vec::new();
+            core::mem::swap(&mut self.bts, &mut saved_bts);
+            self.push_backtrack(BacktrackInsn::Exhausted);
+            let matched = self.try_at_pos(*input, ip, pos, Dir::new()).is_some();
+            core::mem::swap(&mut self.bts, &mut saved_bts);
 
-        // Start with an "empty" backtrack stack.
-        // TODO: consider using a stack-allocated array.
-        let mut saved_bts = vec![BacktrackInsn::Exhausted];
-        core::mem::swap(&mut self.bts, &mut saved_bts);
-
-        // Enter into the lookaround's instruction stream.
-        let matched = self.try_at_pos(*input, ip, pos, Dir::new()).is_some();
-
-        // Put back our bts.
-        core::mem::swap(&mut self.bts, &mut saved_bts);
-
-        // If we are a positive lookahead that successfully matched, retain the
-        // capture groups (but we need to set up backtracking). Otherwise restore
-        // them.
-        if matched && !negate {
-            for (idx, cg) in saved_groups.iter().enumerate() {
-                debug_assert!(idx + (start_group as usize) < MAX_CAPTURE_GROUPS);
-                self.push_backtrack(BacktrackInsn::SetCaptureGroup {
-                    id: (idx as CaptureGroupID) + start_group,
-                    data: *cg,
-                });
+            if matched && !negate {
+                for (idx, cg) in saved_groups.iter().enumerate() {
+                    debug_assert!(idx + (start_group as usize) < MAX_CAPTURE_GROUPS);
+                    self.push_backtrack(BacktrackInsn::SetCaptureGroup {
+                        id: (idx as CaptureGroupID) + start_group,
+                        data: *cg,
+                    });
+                }
+            } else {
+                self.s.groups.splice(range, saved_groups);
             }
-        } else {
-            self.s.groups.splice(range, saved_groups);
+            matched != negate
         }
-        matched != negate
+        #[cfg(feature = "bounded-backtracking")]
+        {
+            let range = (start_group as usize)..(end_group as usize);
+            if !self.budget.consume(range.len()) {
+                return false;
+            }
+            let Some(mut saved_groups) = self.budget.try_vec_with_capacity(range.len()) else {
+                return false;
+            };
+            saved_groups.extend_from_slice(self.s.groups.iat(range.clone()));
+            let saved_group_bytes = saved_groups
+                .capacity()
+                .saturating_mul(core::mem::size_of::<GroupData<Input::Position>>());
+
+            // Every nested assertion owns a separate explicit stack while the
+            // outer stack remains live. Both capacities stay charged.
+            let mut saved_bts = Vec::new();
+            core::mem::swap(&mut self.bts, &mut saved_bts);
+            if !self.push_backtrack(BacktrackInsn::Exhausted) {
+                core::mem::swap(&mut self.bts, &mut saved_bts);
+                let inner_bytes = saved_bts
+                    .capacity()
+                    .saturating_mul(core::mem::size_of::<BacktrackInsn<Input>>());
+                drop(saved_bts);
+                self.budget.release_scratch_capacity(inner_bytes);
+                drop(saved_groups);
+                self.budget.release_scratch_capacity(saved_group_bytes);
+                return false;
+            }
+
+            let matched = self.try_at_pos(*input, ip, pos, Dir::new()).is_some();
+            core::mem::swap(&mut self.bts, &mut saved_bts);
+            let inner_bytes = saved_bts
+                .capacity()
+                .saturating_mul(core::mem::size_of::<BacktrackInsn<Input>>());
+            drop(saved_bts);
+            self.budget.release_scratch_capacity(inner_bytes);
+
+            let mut restoration_ok = true;
+            if matched && !negate {
+                for (idx, cg) in saved_groups.iter().enumerate() {
+                    debug_assert!(idx + (start_group as usize) < MAX_CAPTURE_GROUPS);
+                    if !self.push_backtrack(BacktrackInsn::SetCaptureGroup {
+                        id: (idx as CaptureGroupID) + start_group,
+                        data: *cg,
+                    }) {
+                        restoration_ok = false;
+                        break;
+                    }
+                }
+            } else {
+                self.s.groups.splice(range, saved_groups.iter().copied());
+            }
+            drop(saved_groups);
+            self.budget.release_scratch_capacity(saved_group_bytes);
+            restoration_ok && matched != negate
+        }
     }
 
     /// Attempt to backtrack.
@@ -627,6 +1060,9 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         _dir: Dir,
     ) -> bool {
         loop {
+            if !self.budget.consume(1) {
+                return false;
+            }
             // We always have a single Exhausted instruction backstopping our stack,
             // so we do not need to check for empty bts.
             debug_assert!(!self.bts.is_empty(), "Backtrack stack should not be empty");
@@ -676,12 +1112,19 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                         },
                     };
                     *loop_data = data;
-                    MatchAttempter::prepare_to_enter_loop(
+                    let old_loop_data = *loop_data;
+                    if !Self::push_backtrack_parts(
                         &mut self.bts,
-                        *pos,
-                        loop_fields,
-                        loop_data,
-                    );
+                        &mut self.budget,
+                        BacktrackInsn::SetLoopData {
+                            id: loop_fields.loop_id,
+                            data: old_loop_data,
+                        },
+                    ) {
+                        return false;
+                    }
+                    loop_data.iters += 1;
+                    loop_data.entry = *pos;
                     return true;
                 }
 
@@ -699,7 +1142,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                     // otherwise move opposite the direction of the cursor.
                     if *max == *min {
                         // We have backtracked this loop as far as possible.
-                        self.bts.pop();
+                        self.pop_backtrack();
                         continue;
                     }
                     let newmax = if Dir::FORWARD {
@@ -730,7 +1173,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                     );
                     if *max == *min {
                         // We have backtracked this loop as far as possible.
-                        self.bts.pop();
+                        self.pop_backtrack();
                         continue;
                     }
                     // Move in the direction of the cursor.
@@ -760,6 +1203,9 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         mut pos: Input::Position,
         dir: Dir,
     ) -> Option<Input::Position> {
+        if self.budget.exhausted() {
+            return None;
+        }
         debug_assert!(
             self.bts.len() == 1,
             "Should be only initial exhausted backtrack insn"
@@ -771,6 +1217,10 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
         // to.
         #[allow(clippy::never_loop)]
         'nextinsn: loop {
+            if !self.budget.consume(1) {
+                self.truncate_backtrack(1);
+                return None;
+            }
             'backtrack: loop {
                 // Helper macro to either increment ip and go to the next insn, or backtrack.
                 macro_rules! next_or_bt {
@@ -937,11 +1387,15 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                     }
 
                     &Insn::BeginCaptureGroup(cg_idx) => {
-                        let cg = self.s.groups.mat(cg_idx as usize);
-                        self.bts.push(BacktrackInsn::SetCaptureGroup {
+                        let old = self.s.groups[cg_idx as usize];
+                        if !self.push_backtrack(BacktrackInsn::SetCaptureGroup {
                             id: cg_idx,
-                            data: *cg,
-                        });
+                            data: old,
+                        }) {
+                            self.truncate_backtrack(1);
+                            return None;
+                        }
+                        let cg = self.s.groups.mat(cg_idx as usize);
                         if Dir::FORWARD {
                             cg.start = Some(pos);
                             debug_assert!(
@@ -977,11 +1431,15 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                     }
 
                     &Insn::ResetCaptureGroup(cg_idx) => {
-                        let cg = self.s.groups.mat(cg_idx as usize);
-                        self.bts.push(BacktrackInsn::SetCaptureGroup {
+                        let old = self.s.groups[cg_idx as usize];
+                        if !self.push_backtrack(BacktrackInsn::SetCaptureGroup {
                             id: cg_idx,
-                            data: *cg,
-                        });
+                            data: old,
+                        }) {
+                            self.truncate_backtrack(1);
+                            return None;
+                        }
+                        let cg = self.s.groups.mat(cg_idx as usize);
                         cg.reset();
                         next_or_bt!(true)
                     }
@@ -996,6 +1454,10 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                         // Note we may be in the capture group we are examining, e.g. /(abc\1)/.
                         let matched;
                         if let Some(orig_range) = cg.as_range() {
+                            if !self.budget.consume(orig_range.end - orig_range.start) {
+                                self.truncate_backtrack(1);
+                                return None;
+                            }
                             if icase {
                                 matched = matchers::backref_icase(input, dir, orig_range, &mut pos);
                             } else {
@@ -1016,6 +1478,10 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                         let mut matched = true;
                         for &g in groups.iter() {
                             if let Some(orig_range) = self.s.groups.mat(g as usize).as_range() {
+                                if !self.budget.consume(orig_range.end - orig_range.start) {
+                                    self.truncate_backtrack(1);
+                                    return None;
+                                }
                                 matched = if *icase {
                                     matchers::backref_icase(input, dir, orig_range, &mut pos)
                                 } else {
@@ -1070,10 +1536,13 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                     }
 
                     &Insn::Alt { secondary } => {
-                        self.push_backtrack(BacktrackInsn::SetPosition {
+                        if !self.push_backtrack(BacktrackInsn::SetPosition {
                             ip: secondary as IP,
                             pos,
-                        });
+                        }) {
+                            self.truncate_backtrack(1);
+                            return None;
+                        }
                         next_or_bt!(true);
                     }
 
@@ -1123,7 +1592,7 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
 
                     Insn::Goal => {
                         // Keep all but the initial give-up bts.
-                        self.bts.truncate(1);
+                        self.truncate_backtrack(1);
                         return Some(pos);
                     }
 
@@ -1139,7 +1608,10 @@ impl<'a, Input: InputIndexer> MatchAttempter<'a, Input> {
                 continue 'nextinsn;
             } else {
                 // We have exhausted the backtracking stack.
-                debug_assert!(self.bts.len() == 1, "Should have exhausted backtrack stack");
+                debug_assert!(
+                    self.budget.exhausted() || self.bts.len() == 1,
+                    "Should have exhausted backtrack stack"
+                );
                 return None;
             }
         }
@@ -1164,6 +1636,18 @@ pub struct BacktrackExecutor<'r, Input: InputIndexer> {
 impl<'r, Input: InputIndexer> BacktrackExecutor<'r, Input> {
     pub(crate) fn new(input: Input, matcher: MatchAttempter<'r, Input>) -> Self {
         Self { input, matcher }
+    }
+
+    #[cfg(feature = "bounded-backtracking")]
+    pub(crate) fn new_with_limits(
+        input: Input,
+        re: &'r CompiledRegex,
+        limits: MatchLimits,
+    ) -> Self {
+        Self {
+            input,
+            matcher: MatchAttempter::new_with_limits(re, input.left_end(), limits),
+        }
     }
 }
 
@@ -1294,7 +1778,11 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
     #[inline(always)]
     fn attempt_at(&mut self, pos: Input::Position) -> Option<Input::Position> {
         let inp = self.input;
-        #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+        #[cfg(all(
+            feature = "rx-jit",
+            target_arch = "x86_64",
+            not(feature = "bounded-backtracking")
+        ))]
         if let Some(bytes) = inp.rxjit_bytes() {
             let re: &CompiledRegex = self.matcher.re;
             if let Some(code) = re.rxjit.acquire(re) {
@@ -1329,9 +1817,26 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         // We want to simultaneously map our groups to offsets, and clear the groups.
         // A for loop is the easiest way to do this while satisfying the borrow checker.
         // TODO: avoid allocating so much.
+        #[cfg(feature = "bounded-backtracking")]
+        let Some(mut captures) = self
+            .matcher
+            .budget
+            .try_capture_vec_with_capacity(self.matcher.s.groups.len())
+        else {
+            return Match {
+                range: 0..0,
+                captures: Vec::new(),
+                group_names: Default::default(),
+            };
+        };
+        #[cfg(not(feature = "bounded-backtracking"))]
         let mut captures = Vec::new();
+        #[cfg(not(feature = "bounded-backtracking"))]
         captures.reserve_exact(self.matcher.s.groups.len());
         for gd in self.matcher.s.groups.iter_mut() {
+            if !self.matcher.budget.consume(1) {
+                break;
+            }
             captures.push(match gd.as_range() {
                 Some(r) => Some(Range {
                     start: self.input.pos_to_offset(r.start),
@@ -1366,9 +1871,18 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
             } else {
                 *next_start = inp.next_right_pos(end);
             }
-            Some(self.successful_match(pos, end))
+            let matched = self.successful_match(pos, end);
+            if self.matcher.budget.exhausted() {
+                *next_start = None;
+                None
+            } else {
+                Some(matched)
+            }
         } else {
             // Anchored regex failed to match at this position, no more matches
+            if self.matcher.budget.exhausted() {
+                *next_start = None;
+            }
             None
         }
     }
@@ -1388,7 +1902,11 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         // session — the per-attempt TLS borrow and context build hoist out.
         // The loop body below is move-for-move the legacy loop's, with
         // `attempt_at` unrolled onto `Session::attempt`.
-        #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+        #[cfg(all(
+            feature = "rx-jit",
+            target_arch = "x86_64",
+            not(feature = "bounded-backtracking")
+        ))]
         if crate::rxjit::session_enabled() {
             if let Some(bytes) = inp.rxjit_bytes() {
                 let re: &CompiledRegex = self.matcher.re;
@@ -1478,7 +1996,16 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                 } else {
                     *next_start = inp.next_right_pos(end);
                 }
-                return Some(self.successful_match(pos, end));
+                let matched = self.successful_match(pos, end);
+                if self.matcher.budget.exhausted() {
+                    *next_start = None;
+                    return None;
+                }
+                return Some(matched);
+            }
+            if self.matcher.budget.exhausted() {
+                *next_start = None;
+                return None;
             }
             // Didn't find it at this position, try the next one.
             // PATCH (see possessify.rs): if the failed attempt proved a whole
@@ -1502,7 +2029,10 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
     /// map the winning attempt's group data into caller-owned offset ranges,
     /// resetting each `GroupData` exactly as `successful_match` does, without
     /// building a `Match` (no per-match captures Vec, no group-name clone).
-    fn take_group_ranges(&mut self, out: &mut Vec<Option<Range<usize>>>) {
+    fn take_group_ranges(&mut self, out: &mut Vec<Option<Range<usize>>>) -> bool {
+        if !self.matcher.budget.consume(self.matcher.s.groups.len()) {
+            return false;
+        }
         out.clear();
         for gd in self.matcher.s.groups.iter_mut() {
             out.push(gd.as_range().map(|r| Range {
@@ -1512,6 +2042,7 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
             gd.start = None;
             gd.end = None;
         }
+        true
     }
 
     /// PATCH (see VENDORED.md): drained multi-match scan (`Regex::scan_ascii`'s
@@ -1522,34 +2053,69 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
     /// instead of an allocated `Match`. \return true when the subject is
     /// exhausted (no match exists past the last emitted one), false when the
     /// scan stopped at `cap` hits.
-    pub(crate) fn scan_drain(
-        &mut self,
-        start: usize,
-        cap: usize,
-        sink: &mut dyn FnMut(Range<usize>, &[Option<Range<usize>>]),
-    ) -> bool {
+    pub(crate) fn scan_drain(&mut self, start: usize, cap: usize, sink: &mut ScanSink<'_>) -> bool {
+        #[cfg(feature = "bounded-backtracking")]
+        if cap == 0 {
+            return false;
+        }
+        #[cfg(feature = "bounded-backtracking")]
+        if self
+            .input
+            .try_move_right(self.input.left_end(), start)
+            .is_none()
+        {
+            return true;
+        }
+        #[cfg(feature = "bounded-backtracking")]
+        let Some(mut caps_buf) = self
+            .matcher
+            .budget
+            .try_vec_with_capacity(self.matcher.re.groups as usize)
+        else {
+            return true;
+        };
+        #[cfg(not(feature = "bounded-backtracking"))]
+        let mut caps_buf: Vec<Option<Range<usize>>> =
+            Vec::with_capacity(self.matcher.re.groups as usize);
+        #[cfg(feature = "bounded-backtracking")]
+        let caps_bytes = caps_buf
+            .capacity()
+            .saturating_mul(core::mem::size_of::<Option<Range<usize>>>());
+
         let re: &CompiledRegex = self.matcher.re;
-        match &re.start_pred {
-            StartPredicate::Arbitrary => {
-                self.scan_drain_with_prefix_search(start, cap, sink, &bytesearch::EmptyString {})
+        let exhausted = match &re.start_pred {
+            StartPredicate::Arbitrary => self.scan_drain_with_prefix_search(
+                start,
+                cap,
+                sink,
+                &bytesearch::EmptyString {},
+                &mut caps_buf,
+            ),
+            StartPredicate::StartAnchored => {
+                self.scan_drain_anchored(start, cap, sink, &mut caps_buf)
             }
-            StartPredicate::StartAnchored => self.scan_drain_anchored(start, cap, sink),
             StartPredicate::ByteSet1(bytes) => {
-                self.scan_drain_with_prefix_search(start, cap, sink, bytes)
+                self.scan_drain_with_prefix_search(start, cap, sink, bytes, &mut caps_buf)
             }
             StartPredicate::ByteSet2(bytes) => {
-                self.scan_drain_with_prefix_search(start, cap, sink, bytes)
+                self.scan_drain_with_prefix_search(start, cap, sink, bytes, &mut caps_buf)
             }
             StartPredicate::ByteSet3(bytes) => {
-                self.scan_drain_with_prefix_search(start, cap, sink, bytes)
+                self.scan_drain_with_prefix_search(start, cap, sink, bytes, &mut caps_buf)
             }
             StartPredicate::ByteSeq(bytes) => {
-                self.scan_drain_with_prefix_search(start, cap, sink, bytes.as_ref())
+                self.scan_drain_with_prefix_search(start, cap, sink, bytes.as_ref(), &mut caps_buf)
             }
             StartPredicate::ByteBracket(bitmap) => {
-                self.scan_drain_with_prefix_search(start, cap, sink, bitmap)
+                self.scan_drain_with_prefix_search(start, cap, sink, bitmap, &mut caps_buf)
             }
+        };
+        #[cfg(feature = "bounded-backtracking")]
+        {
+            drop(caps_buf);
+            self.matcher.budget.release_scratch_capacity(caps_bytes);
         }
+        exhausted
     }
 
     /// The drained form of `next_match_anchored`: per hit the attempt and the
@@ -1559,22 +2125,23 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         &mut self,
         start: usize,
         cap: usize,
-        sink: &mut dyn FnMut(Range<usize>, &[Option<Range<usize>>]),
+        sink: &mut ScanSink<'_>,
+        caps_buf: &mut Vec<Option<Range<usize>>>,
     ) -> bool {
         let inp = self.input;
         let Some(mut pos) = inp.try_move_right(inp.left_end(), start) else {
             return true;
         };
-        let mut caps_buf: Vec<Option<Range<usize>>> =
-            Vec::with_capacity(self.matcher.re.groups as usize);
         let mut emitted = 0usize;
         while emitted < cap {
             rxstat!(ATTEMPTS);
             let Some(end) = self.attempt_at(pos) else {
                 return true;
             };
-            self.take_group_ranges(&mut caps_buf);
-            sink(inp.pos_to_offset(pos)..inp.pos_to_offset(end), &caps_buf);
+            if !self.take_group_ranges(caps_buf) {
+                return true;
+            }
+            sink(inp.pos_to_offset(pos)..inp.pos_to_offset(end), caps_buf);
             emitted += 1;
             // If we matched the empty string, we have to increment.
             pos = if end != pos {
@@ -1600,18 +2167,21 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
         &mut self,
         start: usize,
         cap: usize,
-        sink: &mut dyn FnMut(Range<usize>, &[Option<Range<usize>>]),
+        sink: &mut ScanSink<'_>,
         prefix_search: &PrefixSearch,
+        caps_buf: &mut Vec<Option<Range<usize>>>,
     ) -> bool {
         let inp = self.input;
         let Some(mut pos) = inp.try_move_right(inp.left_end(), start) else {
             return true;
         };
         let mut suffix_active = Input::ASCII_ELEMENTS && self.matcher.re.suffix_start.is_some();
-        let mut caps_buf: Vec<Option<Range<usize>>> =
-            Vec::with_capacity(self.matcher.re.groups as usize);
         let mut emitted = 0usize;
-        #[cfg(all(feature = "rx-jit", target_arch = "x86_64"))]
+        #[cfg(all(
+            feature = "rx-jit",
+            target_arch = "x86_64",
+            not(feature = "bounded-backtracking")
+        ))]
         if crate::rxjit::session_enabled() {
             if let Some(bytes) = inp.rxjit_bytes() {
                 let re: &CompiledRegex = self.matcher.re;
@@ -1665,8 +2235,10 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                                     }
                                 };
                                 if let Some(end) = end {
-                                    self.take_group_ranges(&mut caps_buf);
-                                    sink(inp.pos_to_offset(pos)..inp.pos_to_offset(end), &caps_buf);
+                                    if !self.take_group_ranges(caps_buf) {
+                                        return true;
+                                    }
+                                    sink(inp.pos_to_offset(pos)..inp.pos_to_offset(end), caps_buf);
                                     emitted += 1;
                                     // If we matched the empty string, we have to increment.
                                     pos = if end != pos {
@@ -1718,8 +2290,10 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                 self.matcher.skip_hint = None;
                 rxstat!(ATTEMPTS);
                 if let Some(end) = self.attempt_at(pos) {
-                    self.take_group_ranges(&mut caps_buf);
-                    sink(inp.pos_to_offset(pos)..inp.pos_to_offset(end), &caps_buf);
+                    if !self.take_group_ranges(caps_buf) {
+                        return true;
+                    }
+                    sink(inp.pos_to_offset(pos)..inp.pos_to_offset(end), caps_buf);
                     emitted += 1;
                     // If we matched the empty string, we have to increment.
                     pos = if end != pos {
@@ -1731,6 +2305,9 @@ impl<Input: InputIndexer> BacktrackExecutor<'_, Input> {
                         }
                     };
                     continue 'hits;
+                }
+                if self.matcher.budget.exhausted() {
+                    return true;
                 }
                 // Didn't find it at this position, try the next one.
                 // PATCH (see possessify.rs): if the failed attempt proved a whole
@@ -1765,14 +2342,40 @@ pub(crate) fn scan_ascii_drain(
     text: &str,
     start: usize,
     cap: usize,
-    sink: &mut dyn FnMut(Range<usize>, &[Option<Range<usize>>]),
+    sink: &mut ScanSink<'_>,
 ) -> bool {
+    let input = AsciiInput::new(text, re.flags.unicode_mode());
+    #[cfg(feature = "bounded-backtracking")]
+    let matcher = MatchAttempter::new_with_limits(re, input.left_end(), MatchLimits::UNLIMITED);
+    #[cfg(not(feature = "bounded-backtracking"))]
+    let matcher = MatchAttempter::new(re, input.left_end());
+    let mut ex = BacktrackExecutor { input, matcher };
+    ex.scan_drain(start, cap, sink)
+}
+
+#[cfg(feature = "bounded-backtracking")]
+pub(crate) fn scan_ascii_drain_with_limits(
+    re: &CompiledRegex,
+    text: &str,
+    start: usize,
+    cap: usize,
+    limits: MatchLimits,
+    sink: &mut ScanSink<'_>,
+) -> LimitedScanResult {
     let input = AsciiInput::new(text, re.flags.unicode_mode());
     let mut ex = BacktrackExecutor {
         input,
-        matcher: MatchAttempter::new(re, input.left_end()),
+        matcher: MatchAttempter::new_with_limits(re, input.left_end(), limits),
     };
-    ex.scan_drain(start, cap, sink)
+    let exhausted = ex.scan_drain(start, cap, sink);
+    let usage = ex.matcher.match_usage();
+    LimitedScanResult {
+        completion: match usage.exhaustion {
+            Some(error) => Err(error),
+            None => Ok(exhausted),
+        },
+        steps: usage.steps,
+    }
 }
 
 impl<Input: InputIndexer> exec::MatchProducer for BacktrackExecutor<'_, Input> {
@@ -1818,6 +2421,11 @@ impl<Input: InputIndexer> exec::MatchProducer for BacktrackExecutor<'_, Input> {
             }
         }
     }
+
+    #[inline]
+    fn match_usage(&self) -> MatchUsage {
+        self.matcher.match_usage()
+    }
 }
 
 impl<'r, 't> exec::Executor<'r, 't> for BacktrackExecutor<'r, Utf8Input<'t>> {
@@ -1832,6 +2440,17 @@ impl<'r, 't> exec::Executor<'r, 't> for BacktrackExecutor<'r, Utf8Input<'t>> {
     }
 }
 
+#[cfg(feature = "bounded-backtracking")]
+impl<'r, 't> BacktrackExecutor<'r, Utf8Input<'t>> {
+    pub(crate) fn with_limits(re: &'r CompiledRegex, text: &'t str, limits: MatchLimits) -> Self {
+        let input = Utf8Input::new(text, re.flags.unicode_mode());
+        Self {
+            input,
+            matcher: MatchAttempter::new_with_limits(re, input.left_end(), limits),
+        }
+    }
+}
+
 impl<'r, 't> exec::Executor<'r, 't> for BacktrackExecutor<'r, AsciiInput<'t>> {
     type AsAscii = BacktrackExecutor<'r, AsciiInput<'t>>;
 
@@ -1840,6 +2459,17 @@ impl<'r, 't> exec::Executor<'r, 't> for BacktrackExecutor<'r, AsciiInput<'t>> {
         Self {
             input,
             matcher: MatchAttempter::new(re, input.left_end()),
+        }
+    }
+}
+
+#[cfg(feature = "bounded-backtracking")]
+impl<'r, 't> BacktrackExecutor<'r, AsciiInput<'t>> {
+    pub(crate) fn with_limits(re: &'r CompiledRegex, text: &'t str, limits: MatchLimits) -> Self {
+        let input = AsciiInput::new(text, re.flags.unicode_mode());
+        Self {
+            input,
+            matcher: MatchAttempter::new_with_limits(re, input.left_end(), limits),
         }
     }
 }

@@ -549,101 +549,183 @@ impl<'a> FnCompiler<'a> {
         Ok(dst)
     }
 
-    /// Build an Error-like object `{ name, message }` for `Error("msg")` (called
-    /// either with `new` or bare). `arg` is the optional message argument.
-    /// Emit `NewRegExp` for `RegExp(pattern?, flags?)` / `new RegExp(...)` — the
-    /// VM coerces a string/RegExp pattern and the flags (undefined → defaults).
-    pub(crate) fn emit_regexp(&mut self, args: &[Arg], dst: Reg, is_construct: bool) -> R<Reg> {
-        let pt = self.temp();
-        match args.first().and_then(arg_expr) {
-            Some(e) => {
-                let v = self.expr_into(e, pt)?;
-                if v != pt {
-                    self.emit(Instr::Move { dst: pt, src: v });
-                }
-            }
-            None => self.emit(Instr::LoadUndefined { dst: pt }),
+    /// Evaluate a non-member callee into a dedicated stable register. An
+    /// identifier expression may otherwise return its live local register;
+    /// argument evaluation is allowed to assign that binding, but must not
+    /// redirect the call whose callee value was already obtained.
+    pub(crate) fn capture_plain_callee(&mut self, callee_expr: &Expr) -> R<Reg> {
+        let callee = self.alloc_reg();
+        let keep = self.next_reg;
+        let live = self.expr_into(callee_expr, callee)?;
+        if live != callee {
+            self.emit(Instr::Move {
+                dst: callee,
+                src: live,
+            });
         }
-        let ft = self.temp();
-        match args.get(1).and_then(arg_expr) {
-            Some(e) => {
-                let v = self.expr_into(e, ft)?;
-                if v != ft {
-                    self.emit(Instr::Move { dst: ft, src: v });
-                }
-            }
-            None => self.emit(Instr::LoadUndefined { dst: ft }),
-        }
-        self.emit(Instr::NewRegExp {
-            dst,
-            pattern: pt,
-            flags: ft,
-            is_construct,
-        });
-        self.next_reg -= 2;
-        Ok(dst)
+        // The result has been copied into `callee`; scratch used while resolving
+        // a compound expression is dead before ArgumentListEvaluation starts.
+        self.next_reg = keep;
+        Ok(callee)
     }
 
-    pub(crate) fn build_error(&mut self, kind: &str, args: &[Arg], dst: Reg) -> R<Reg> {
-        // `new TypeError(msg)` etc. → a proto-linked error instance (NewError op
-        // sets own `name`/`message` and links the prototype so `.constructor`,
-        // `.toString`, and `instanceof` resolve). AggregateError takes the message
-        // as its SECOND argument (`new AggregateError(errors, message)`).
-        let kidx = error_kind_index(kind);
-        let msg_pos = if kidx == 7 { 1 } else { 0 };
-        // AggregateError's first argument is the `errors` iterable. Evaluate it FIRST
-        // (matching left-to-right argument evaluation); the NewError op IterableToList's
-        // it into a non-enumerable own `errors` array, AFTER coercing the message.
-        let errors = if kidx == 7 {
-            match args.first().and_then(arg_expr) {
-                Some(e) => {
-                    let t = self.temp();
-                    let v = self.expr_into(e, t)?;
-                    if v != t {
-                        self.emit(Instr::Move { dst: t, src: v });
+    /// Evaluate a member CALLEE reference into stable registers, in the exact
+    /// EvaluateCall order: receiver/reference first, then GetValue (including
+    /// RequireObjectCoercible, ToPropertyKey, Proxy traps, accessors and private
+    /// brand checks), all before the argument list.  The returned pair is the
+    /// exact callable value and `this` value which must be used later; an
+    /// argument is allowed to replace the property without changing this call.
+    ///
+    /// Keeping this in one helper prevents the ordinary, spread, optional,
+    /// specialised-static and tagged-template paths from quietly acquiring
+    /// different reference-order semantics again.
+    pub(crate) fn capture_member_callee(&mut self, m: &Member) -> R<(Reg, Reg)> {
+        if matches!(&m.object, Expr::Super) {
+            self.this_check();
+            let this_v = self.this_override.unwrap_or(0);
+            let callee = self.alloc_reg();
+            match &m.prop {
+                MemberProp::Ident(prop) => {
+                    let name = self.string_name(prop);
+                    if let Some(home_class_id) = self.super_class {
+                        if self.this_override.is_some() {
+                            self.emit(Instr::SuperGetRef {
+                                dst: callee,
+                                home_class_id,
+                                name,
+                                receiver: this_v,
+                                is_static: self.super_static,
+                            });
+                        } else {
+                            // Ordinary methods have receiver reg 0 and their
+                            // static/instance bit is baked into FuncProto, so
+                            // retain the existing JIT-supported read opcode.
+                            self.emit(Instr::SuperGet {
+                                dst: callee,
+                                home_class_id,
+                                name,
+                            });
+                        }
+                    } else if self.super_home_obj {
+                        self.emit(Instr::SuperGetObj { dst: callee, name });
+                    } else {
+                        return Err("`super.method(...)` is only valid in a method".into());
                     }
-                    Some(t)
                 }
-                None => None,
+                MemberProp::Computed(key_expr) => {
+                    // The expression is evaluated before GetSuperBase; the
+                    // SuperGet op then performs ToPropertyKey and the property
+                    // Get now, before any argument expression is evaluated.
+                    let key = self.expr(key_expr)?;
+                    if let Some(home_class_id) = self.super_class {
+                        if self.this_override.is_some() {
+                            self.emit(Instr::SuperGetRefComputed {
+                                dst: callee,
+                                home_class_id,
+                                key,
+                                receiver: this_v,
+                                is_static: self.super_static,
+                            });
+                        } else {
+                            self.emit(Instr::SuperGetComputed {
+                                dst: callee,
+                                home_class_id,
+                                key,
+                            });
+                        }
+                    } else if self.super_home_obj {
+                        self.emit(Instr::SuperGetObjComputed { dst: callee, key });
+                    } else {
+                        return Err("`super[expr](...)` is only valid in a method".into());
+                    }
+                }
+                MemberProp::Private(_) => {
+                    return Err("a private name may not be accessed through `super`".into())
+                }
             }
+            return Ok((callee, this_v));
+        }
+
+        // Snapshot the receiver even when the object expression happens to be a
+        // local register: an argument can assign that local before the call.
+        let this_v = self.alloc_reg();
+        let receiver = self.expr_into(&m.object, this_v)?;
+        if receiver != this_v {
+            self.emit(Instr::Move {
+                dst: this_v,
+                src: receiver,
+            });
+        }
+        if m.optional {
+            self.emit_optional_check(this_v);
+        }
+        let callee = self.alloc_reg();
+        match &m.prop {
+            MemberProp::Ident(prop) => {
+                let name = self.string_name(prop);
+                self.emit(Instr::GetProp {
+                    dst: callee,
+                    obj: this_v,
+                    name,
+                });
+            }
+            MemberProp::Computed(key_expr) => {
+                let key = self.expr(key_expr)?;
+                self.emit(Instr::GetIndex {
+                    dst: callee,
+                    obj: this_v,
+                    key,
+                });
+            }
+            MemberProp::Private(field) => {
+                self.check_private_declared(field)?;
+                let name = self.string_name(&private_key(field));
+                self.emit(Instr::GetProp {
+                    dst: callee,
+                    obj: this_v,
+                    name,
+                });
+            }
+        }
+        Ok((callee, this_v))
+    }
+
+    /// Emit an exact captured-reference call, retaining a RegExp-heavy method
+    /// spelling only as a runtime specialization hint. The callee Get has
+    /// already happened, so an argument may replace the property without
+    /// redirecting this call; `RegExpMethod` validates that captured Value and
+    /// otherwise has the same semantics as `CallWithThis`.
+    fn emit_captured_member_call(
+        &mut self,
+        m: &Member,
+        dst: Reg,
+        callee: Reg,
+        this_v: Reg,
+        arg_base: Reg,
+        argc: u16,
+    ) {
+        let op = match &m.prop {
+            MemberProp::Ident(name) => crate::bytecode::RegExpMethod::from_name(name),
+            _ => None,
+        };
+        if let Some(op) = op {
+            self.emit(Instr::RegExpMethod {
+                dst,
+                op,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+            });
         } else {
-            None
-        };
-        let arg = match args.get(msg_pos).and_then(arg_expr) {
-            Some(e) => {
-                let t = self.temp();
-                let v = self.expr_into(e, t)?;
-                if v != t {
-                    self.emit(Instr::Move { dst: t, src: v });
-                }
-                Some(t)
-            }
-            None => None,
-        };
-        // The options object follows the message (`new Error(msg, options)`,
-        // `new AggregateError(errors, msg, options)`) — its `cause` becomes the
-        // error's `cause` (NewError installs it).
-        let opts = match args.get(msg_pos + 1).and_then(arg_expr) {
-            Some(e) => {
-                let t = self.temp();
-                let v = self.expr_into(e, t)?;
-                if v != t {
-                    self.emit(Instr::Move { dst: t, src: v });
-                }
-                Some(t)
-            }
-            None => None,
-        };
-        self.emit(Instr::NewError {
-            dst,
-            kind: kidx,
-            arg,
-            opts,
-            errors,
-        });
-        // Reclaim the errors + message + options temps (allocated in that order).
-        self.next_reg -= errors.is_some() as Reg + arg.is_some() as Reg + opts.is_some() as Reg;
-        Ok(dst)
+            self.emit(Instr::CallWithThis {
+                dst,
+                callee,
+                this_v,
+                arg_base,
+                argc,
+            });
+        }
     }
 
     // NOTE: `Target::Call` (Annex B `f() = 1`) has no arm to add here — neither
@@ -662,132 +744,58 @@ impl<'a> FnCompiler<'a> {
             let inner: &Expr = &c.callee;
             let has_spread = c.args.iter().any(|a| matches!(a, Arg::Spread(_)));
             match inner {
-                Expr::Member(m) if !has_spread => {
-                    // `super` is not a value, so the two ordinary member arms
-                    // exclude it and it falls to the last arm below.
-                    let is_super = matches!(&m.object, Expr::Super);
-                    match &m.prop {
-                        MemberProp::Ident(prop) if !is_super => {
-                            let o = self.expr(&m.object)?;
-                            let obj = self.alloc_reg();
-                            if o != obj {
-                                self.emit(Instr::Move { dst: obj, src: o });
-                            }
-                            if m.optional {
-                                self.emit_optional_check(obj);
-                            }
-                            let name = self.string_name(prop);
-                            let callee = self.alloc_reg();
-                            self.emit(Instr::GetProp {
-                                dst: callee,
-                                obj,
-                                name,
-                            });
-                            self.emit_optional_check(callee);
-                            let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                            self.emit(Instr::CallWithThis {
-                                dst,
-                                callee,
-                                this_v: obj,
-                                arg_base,
-                                argc,
-                            });
-                            return Ok(dst);
-                        }
-                        MemberProp::Computed(key_expr) if !is_super => {
-                            let o = self.expr(&m.object)?;
-                            let obj = self.alloc_reg();
-                            if o != obj {
-                                self.emit(Instr::Move { dst: obj, src: o });
-                            }
-                            if m.optional {
-                                self.emit_optional_check(obj);
-                            }
-                            let key = self.expr(key_expr)?;
-                            let callee = self.alloc_reg();
-                            self.emit(Instr::GetIndex {
-                                dst: callee,
-                                obj,
-                                key,
-                            });
-                            self.emit_optional_check(callee);
-                            let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                            self.emit(Instr::CallWithThis {
-                                dst,
-                                callee,
-                                this_v: obj,
-                                arg_base,
-                                argc,
-                            });
-                            return Ok(dst);
-                        }
-                        MemberProp::Private(field) => {
-                            self.check_private_declared(field)?;
-                            let o = self.expr(&m.object)?;
-                            let obj = self.alloc_reg();
-                            if o != obj {
-                                self.emit(Instr::Move { dst: obj, src: o });
-                            }
-                            if m.optional {
-                                self.emit_optional_check(obj);
-                            }
-                            let name = self.string_name(&private_key(field));
-                            let callee = self.alloc_reg();
-                            self.emit(Instr::GetProp {
-                                dst: callee,
-                                obj,
-                                name,
-                            });
-                            self.emit_optional_check(callee);
-                            let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                            self.emit(Instr::CallWithThis {
-                                dst,
-                                callee,
-                                this_v: obj,
-                                arg_base,
-                                argc,
-                            });
-                            return Ok(dst);
-                        }
-                        // `super.m?.()` / `super[k]?.()`: the member lowering performs
-                        // the read (incl. the this-TDZ check); `this` is frame reg 0.
-                        _ => {
-                            let callee = self.expr(inner)?;
-                            self.emit_optional_check(callee);
-                            let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                            self.emit(Instr::CallWithThis {
-                                dst,
-                                callee,
-                                this_v: 0,
-                                arg_base,
-                                argc,
-                            });
-                            return Ok(dst);
-                        }
+                Expr::Member(m) => {
+                    let save = self.next_reg;
+                    let (callee, this_v) = self.capture_member_callee(m)?;
+                    self.emit_optional_check(callee);
+                    if has_spread {
+                        let args = self.build_spread_args(&c.args)?;
+                        self.emit(Instr::CallWithThisSpread {
+                            dst,
+                            callee,
+                            this_v,
+                            args,
+                        });
+                    } else {
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                        self.emit_captured_member_call(m, dst, callee, this_v, arg_base, argc);
                     }
+                    self.next_reg = save.max(dst + 1);
+                    return Ok(dst);
                 }
                 // `(a?.b)?.()`: a parenthesized-chain member callee still
                 // binds `this` = base; the inner chain's bail lands the
                 // callee at undefined, then the outer `?.()` bails on it.
                 // The parens are gone, but the `Chain` node they produced is
                 // exactly the boundary they established.
-                Expr::Chain(ce) if !has_spread => {
+                Expr::Chain(ce) => {
                     if let Some((callee, obj)) = self.chain_member_callee(ce)? {
                         self.emit_optional_check(callee);
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::CallWithThis {
-                            dst,
-                            callee,
-                            this_v: obj,
-                            arg_base,
-                            argc,
-                        });
+                        if has_spread {
+                            let args = self.build_spread_args(&c.args)?;
+                            self.emit(Instr::CallWithThisSpread {
+                                dst,
+                                callee,
+                                this_v: obj,
+                                args,
+                            });
+                        } else {
+                            let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                            self.emit(Instr::CallWithThis {
+                                dst,
+                                callee,
+                                this_v: obj,
+                                arg_base,
+                                argc,
+                            });
+                        }
                         return Ok(dst);
                     }
                 }
                 _ => {}
             }
-            let callee = self.expr(&c.callee)?;
+            let save = self.next_reg;
+            let callee = self.capture_plain_callee(&c.callee)?;
             self.emit_optional_check(callee);
             if has_spread {
                 // `fn?.(...xs)`: spread args after the nullish bail.
@@ -797,6 +805,7 @@ impl<'a> FnCompiler<'a> {
                     callee,
                     args: args_arr,
                 });
+                self.next_reg = save.max(dst + 1);
                 return Ok(dst);
             }
             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
@@ -806,6 +815,7 @@ impl<'a> FnCompiler<'a> {
                 arg_base,
                 argc,
             });
+            self.next_reg = save.max(dst + 1);
             return Ok(dst);
         }
         // Spread call: `f(...args)`, `obj.m(...args)`, `arr.push(...xs)`, etc.
@@ -842,133 +852,103 @@ impl<'a> FnCompiler<'a> {
                 return Ok(dst);
             }
             // `Math.max(...arr)` / `Math.min(...arr)` / `Math.hypot(...arr)` —
-            // a variadic Math reduction over the spread array.
+            // a variadic Math reduction over the spread array. Capture both the
+            // live method and receiver before iterating the spread arguments;
+            // the opcode validates them before taking its intrinsic fast path.
             if let Expr::Member(m) = &c.callee {
                 if let MemberProp::Ident(prop) = &m.prop {
                     if let Expr::Ident(obj) = &m.object {
                         if &**obj == "Math" {
                             if let Some(op) = crate::bytecode::MathFn::from_name(prop) {
+                                let save = self.next_reg;
+                                let (callee, this_v) = self.capture_member_callee(m)?;
                                 let args_arr = self.build_spread_args(&c.args)?;
                                 self.emit(Instr::MathSpread {
                                     dst,
                                     op,
+                                    callee,
+                                    this_v,
                                     args: args_arr,
                                 });
+                                self.next_reg = save.max(dst + 1);
                                 return Ok(dst);
                             }
                         }
                     }
                 }
             }
-            // Direct `eval(...args)`: a spread call of the unshadowed global
-            // `eval` is STILL a direct eval — the spread list's first element
-            // is the code argument (extras are ignored, like eval(a, b)).
+            // A syntactic `eval(...args)` remains a direct-eval candidate no
+            // matter which environment record supplied the named reference.
+            // Capture the exact callee (and WithBaseObject, when applicable)
+            // before spread iteration: an iterator may rebind `eval`, but it
+            // cannot redirect this already-resolved call.
             if let Expr::Ident(id) = &c.callee {
-                if &**id == "eval"
-                    && matches!(self.resolve("eval"), Binding::Global(_))
-                    && self.with_objs_for("eval").is_empty()
-                {
+                if &**id == "eval" {
+                    let save = self.next_reg;
+                    let with_objs = self.with_obj_regs(id);
+                    let (callee, this_v) = if with_objs.is_empty() {
+                        let callee = self.alloc_reg();
+                        let live = self.expr_into(&c.callee, callee)?;
+                        if live != callee {
+                            self.emit(Instr::Move {
+                                dst: callee,
+                                src: live,
+                            });
+                        }
+                        let this_v = self.alloc_reg();
+                        self.emit(Instr::LoadUndefined { dst: this_v });
+                        (callee, this_v)
+                    } else {
+                        self.emit_with_callee_chain(id, &with_objs)
+                    };
                     let args_arr = self.build_spread_args(&c.args)?;
-                    let arg = self.alloc_reg();
-                    let zero = self.alloc_reg();
-                    self.emit(Instr::LoadInt { dst: zero, val: 0 });
-                    self.emit(Instr::GetIndex {
-                        dst: arg,
-                        obj: args_arr,
-                        key: zero,
-                    });
-                    self.emit_direct_eval(arg, dst, false);
+                    self.emit_direct_eval(callee, this_v, args_arr, 0, true, dst, false);
+                    self.next_reg = save.max(dst + 1);
                     return Ok(dst);
                 }
             }
-            // `super.m(...args)` — a member whose object is `super` (which is not
-            // a value, so it must be handled before the generic static-member
-            // case evaluates the object).
+            // Every member reference is fully resolved before spread iteration.
+            // Carry the exact callable and receiver through the argument-list
+            // build: an iterator, getter, proxy trap or value conversion may
+            // replace the property without changing this call's target.
             if let Expr::Member(m) = &c.callee {
-                if let MemberProp::Ident(prop) = &m.prop {
-                    if matches!(&m.object, Expr::Super) {
-                        let pid = self
-                            .super_class
-                            .ok_or("`super.method(...)` is only valid in a derived class")?;
-                        self.this_check();
-                        let name = self.string_name(prop);
-                        let args_arr = self.build_spread_args(&c.args)?;
-                        self.emit(Instr::SuperMethodSpread {
-                            dst,
-                            home_class_id: pid,
-                            name,
-                            args: args_arr,
-                        });
-                        return Ok(dst);
-                    }
-                }
+                let save = self.next_reg;
+                let (callee, this_v) = self.capture_member_callee(m)?;
+                let args = self.build_spread_args(&c.args)?;
+                self.emit(Instr::CallWithThisSpread {
+                    dst,
+                    callee,
+                    this_v,
+                    args,
+                });
+                self.next_reg = save.max(dst + 1);
+                return Ok(dst);
             }
-            // Method call `obj.m(...)` — evaluate the receiver first so `this`
-            // binds correctly, then build args, then CallMethodSpread.
-            if let Expr::Member(m) = &c.callee {
-                if let MemberProp::Ident(prop) = &m.prop {
-                    let obj = self.expr(&m.object)?;
-                    if m.optional {
-                        self.emit_optional_check(obj);
-                    }
-                    let name = self.string_name(prop);
-                    let args_arr = self.build_spread_args(&c.args)?;
-                    self.emit(Instr::CallMethodSpread {
+            // `(obj?.method)(...args)` retains the member reference across the
+            // chain boundary. A nullish inner base produces an undefined
+            // callee; because this outer call is not optional, its spread list
+            // is still evaluated before the ensuing not-callable error.
+            if let Expr::Chain(ce) = &c.callee {
+                if let Some((callee, this_v)) = self.chain_member_callee(ce)? {
+                    let args = self.build_spread_args(&c.args)?;
+                    self.emit(Instr::CallWithThisSpread {
                         dst,
-                        obj,
-                        name,
-                        args: args_arr,
+                        callee,
+                        this_v,
+                        args,
                     });
                     return Ok(dst);
                 }
             }
-            // `super[key](...args)` — computed super member with spread args
-            // (must precede the generic computed arm: `super` is not a value).
-            if let Expr::Member(m) = &c.callee {
-                if let MemberProp::Computed(key_expr) = &m.prop {
-                    if matches!(&m.object, Expr::Super) {
-                        let pid = self
-                            .super_class
-                            .ok_or("`super[...](...)` is only valid in a derived class")?;
-                        self.this_check();
-                        let key = self.expr(key_expr)?;
-                        let args_arr = self.build_spread_args(&c.args)?;
-                        self.emit(Instr::SuperMethodComputedSpread {
-                            dst,
-                            home_class_id: pid,
-                            key,
-                            args: args_arr,
-                        });
-                        return Ok(dst);
-                    }
-                }
-            }
-            // Computed method call `obj[key](...)` — bind `this` = obj (a plain
-            // CallSpread on the GET result would lose the receiver).
-            if let Expr::Member(m) = &c.callee {
-                if let MemberProp::Computed(key_expr) = &m.prop {
-                    let obj = self.expr(&m.object)?;
-                    if m.optional {
-                        self.emit_optional_check(obj);
-                    }
-                    let key = self.expr(key_expr)?;
-                    let args_arr = self.build_spread_args(&c.args)?;
-                    self.emit(Instr::CallMethodComputedSpread {
-                        dst,
-                        obj,
-                        key,
-                        args: args_arr,
-                    });
-                    return Ok(dst);
-                }
-            }
-            let callee = self.expr(&c.callee)?;
+            let save = self.next_reg;
+            let callee = self.capture_plain_callee(&c.callee)?;
             let args_arr = self.build_spread_args(&c.args)?;
             self.emit(Instr::CallSpread {
                 dst,
                 callee,
                 args: args_arr,
             });
+            self.next_reg = save.max(dst + 1);
             return Ok(dst);
         }
 
@@ -1000,43 +980,34 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::Move { dst, src: 0 });
             return Ok(dst);
         }
-        // `super.method(args)` — call an inherited method with the current `this`.
-        if let Expr::Member(m) = &c.callee {
-            if let MemberProp::Ident(prop) = &m.prop {
-                if matches!(&m.object, Expr::Super) {
-                    self.this_check();
-                    let name = self.string_name(prop);
-                    if let Some(pid) = self.super_class {
-                        // MakeSuperPropertyReference captures GetSuperBase BEFORE
-                        // the argument list runs (an arg may retarget the home
-                        // object's prototype — superPropOrdering's testProp).
-                        let b = self.temp();
-                        self.emit(Instr::SuperBase {
-                            dst: b,
-                            home_class_id: pid,
+        // A syntactic `eval(args)` is a direct-eval candidate for global,
+        // local, parameter, upvalue and `with` bindings alike. Resolve and
+        // SNAPSHOT the reference before evaluating any argument. DirectEval
+        // validates the captured value against this realm's %eval%; a miss
+        // ordinary-calls that exact value with every evaluated argument.
+        if let Expr::Ident(id) = &c.callee {
+            if &**id == "eval" {
+                let save = self.next_reg;
+                let with_objs = self.with_obj_regs(id);
+                let (callee, this_v) = if with_objs.is_empty() {
+                    let callee = self.alloc_reg();
+                    let live = self.expr_into(&c.callee, callee)?;
+                    if live != callee {
+                        self.emit(Instr::Move {
+                            dst: callee,
+                            src: live,
                         });
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::SuperMethod {
-                            dst,
-                            base: b,
-                            home_class_id: pid,
-                            name,
-                            arg_base,
-                            argc,
-                        });
-                    } else if self.super_home_obj {
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::SuperMethodObj {
-                            dst,
-                            name,
-                            arg_base,
-                            argc,
-                        });
-                    } else {
-                        return Err("`super.method(...)` is only valid in a method".into());
                     }
-                    return Ok(dst);
-                }
+                    let this_v = self.alloc_reg();
+                    self.emit(Instr::LoadUndefined { dst: this_v });
+                    (callee, this_v)
+                } else {
+                    self.emit_with_callee_chain(id, &with_objs)
+                };
+                let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                self.emit_direct_eval(callee, this_v, arg_base, argc, false, dst, false);
+                self.next_reg = save.max(dst + 1);
+                return Ok(dst);
             }
         }
 
@@ -1053,115 +1024,6 @@ impl<'a> FnCompiler<'a> {
         if let Expr::Ident(id) = &c.callee {
             let with_objs = self.with_obj_regs(id);
             if !with_objs.is_empty() {
-                // `eval(...)` inside a `with` whose static binding is the
-                // unshadowed global %eval%: when NO with-object carries an
-                // `eval` binding, the IdentifierReference still resolves to
-                // %eval% (through the object envs) and the call IS a DIRECT
-                // eval — its program sees the caller's bindings AND the with
-                // chain (threaded through the eval-site map's hidden
-                // " with-object-N" cells). A with-object that DOES carry the
-                // name resolves the callee from it: when that VALUE is %eval%
-                // the call is STILL a direct eval (13.3.6.1 tests the
-                // reference's name and the callee value, not where the binding
-                // lives); any other value is an ordinary call with `this` =
-                // the with-object.
-                if &**id == "eval" && matches!(self.resolve("eval"), Binding::Global(_)) {
-                    let save = self.next_reg;
-                    let nidx = self.string_name("eval");
-                    let callee_reg = self.alloc_reg();
-                    let this_reg = self.alloc_reg();
-                    let found = self.alloc_reg();
-                    self.emit(Instr::LoadBool {
-                        dst: found,
-                        val: false,
-                    });
-                    let mut hits = Vec::new();
-                    for &obj in &with_objs {
-                        let flag = self.temp();
-                        self.emit(Instr::WithHas {
-                            dst: flag,
-                            obj,
-                            name: nidx,
-                        });
-                        let jf = self.here();
-                        self.emit(Instr::JumpIfFalse {
-                            cond: flag,
-                            target: 0,
-                        });
-                        self.next_reg -= 1;
-                        self.emit(Instr::WithGet {
-                            dst: callee_reg,
-                            obj,
-                            name: nidx,
-                            strict: self.cx.in_strict,
-                        });
-                        self.emit(Instr::Move {
-                            dst: this_reg,
-                            src: obj,
-                        });
-                        self.emit(Instr::LoadBool {
-                            dst: found,
-                            val: true,
-                        });
-                        let jd = self.here();
-                        self.emit(Instr::Jump { target: 0 });
-                        hits.push(jd);
-                        let nxt = self.here();
-                        self.patch_jump(jf, nxt);
-                    }
-                    let resolved = self.here();
-                    for j in hits {
-                        self.patch_jump(j, resolved);
-                    }
-                    // Arguments evaluate AFTER the callee reference resolved.
-                    let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                    let jf = self.here();
-                    self.emit(Instr::JumpIfFalse {
-                        cond: found,
-                        target: 0,
-                    });
-                    // A with-object carried `eval`: direct only when its value
-                    // IS %eval%; otherwise an ordinary call with `this` = the
-                    // with-object.
-                    let is_eval = self.temp();
-                    self.emit(Instr::IsEvalFn {
-                        dst: is_eval,
-                        src: callee_reg,
-                    });
-                    let jf2 = self.here();
-                    self.emit(Instr::JumpIfFalse {
-                        cond: is_eval,
-                        target: 0,
-                    });
-                    let jd = self.here();
-                    self.emit(Instr::Jump { target: 0 });
-                    let with_call = self.here();
-                    self.patch_jump(jf2, with_call);
-                    self.emit(Instr::CallWithThis {
-                        dst,
-                        callee: callee_reg,
-                        this_v: this_reg,
-                        arg_base,
-                        argc,
-                    });
-                    let je = self.here();
-                    self.emit(Instr::Jump { target: 0 });
-                    let direct = self.here();
-                    self.patch_jump(jf, direct);
-                    self.patch_jump(jd, direct);
-                    let arg = if argc == 0 {
-                        let r = self.temp();
-                        self.emit(Instr::LoadUndefined { dst: r });
-                        r
-                    } else {
-                        arg_base
-                    };
-                    self.emit_direct_eval(arg, dst, false);
-                    let end = self.here();
-                    self.patch_jump(je, end);
-                    self.next_reg = save.max(dst + 1);
-                    return Ok(dst);
-                }
                 let save = self.next_reg;
                 let (callee_reg, this_reg) = self.emit_with_callee_chain(id, &with_objs);
                 // Arguments evaluate AFTER the callee reference resolved.
@@ -1178,170 +1040,41 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // Bare `Error("msg")` call (no `new`) → same Error object. Only for the
-        // pristine global builtin — a user binding named e.g. `TypeError` is an
-        // ordinary call.
+        // Keep only the two hot bare-builtin bytecodes. Every lower-frequency
+        // constructor/function (Error, Symbol, RegExp, BigInt, Object and the
+        // host `print`) deliberately reaches the captured generic Call below.
+        // Besides avoiding a large family of guards, that path evaluates every
+        // extra argument and naturally preserves replacement/proxy semantics.
+        // Number(x) / parseInt(s,radix) / parseFloat(s) → guarded GlobalFn op.
         if let Expr::Ident(id) = &c.callee {
-            if let Some(kind) = error_ctor(id) {
-                if self.builtin_unshadowed(id) {
-                    return self.build_error(kind, &c.args, dst);
-                }
-            }
-        }
-        // Direct `eval(code)`: the evaluated string runs with the caller's
-        // strictness, `this`, new.target permission, home class and private
-        // scope. Fires only for the unshadowed global `eval` — an enclosing
-        // user binding named `eval` is an ordinary call, and inside a `with`
-        // whose object could shadow `eval` the generic dynamic path is kept.
-        // The DISPATCH arm re-checks at runtime that the live global `eval`
-        // still IS %eval% (a rebound `eval` gets an ordinary call). Indirect
-        // eval stays on the generic `Call` → `GLOBAL_EVAL` native.
-        if let Expr::Ident(id) = &c.callee {
-            if &**id == "eval"
-                && matches!(self.resolve("eval"), Binding::Global(_))
-                && self.with_objs_for("eval").is_empty()
-            {
-                let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                let arg = if argc == 0 {
-                    let r = self.temp();
-                    self.emit(Instr::LoadUndefined { dst: r });
-                    r
-                } else {
-                    arg_base
-                };
-                self.emit_direct_eval(arg, dst, false);
-                return Ok(dst);
-            }
-            // `eval(code)` where `eval` names a LOCAL binding (a parameter or
-            // `var` of this or an enclosing function): STILL a direct eval
-            // when the binding's live value IS %eval% — 13.3.6.1 tests the
-            // reference's name and the callee VALUE, not where the binding
-            // lives (`function directArg(eval, s) { var a = 1; return
-            // eval(s); } directArg(eval, 'a+1')` ⇒ 2). Probe the value and
-            // branch; any other value is an ordinary call.
-            if &**id == "eval"
-                && matches!(
-                    self.resolve("eval"),
-                    Binding::Local(_) | Binding::LocalCell(_) | Binding::Upvalue(_)
-                )
-                && self.with_objs_for("eval").is_empty()
+            if let Some(op) =
+                crate::bytecode::GlobalFn::from_name(id).filter(|_| self.builtin_unshadowed(id))
             {
                 let save = self.next_reg;
-                let callee = self.expr(&c.callee)?;
-                let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                let is_eval = self.temp();
-                self.emit(Instr::IsEvalFn {
-                    dst: is_eval,
-                    src: callee,
-                });
-                let jf = self.here();
-                self.emit(Instr::JumpIfFalse {
-                    cond: is_eval,
-                    target: 0,
-                });
-                let arg = if argc == 0 {
-                    let r = self.temp();
-                    self.emit(Instr::LoadUndefined { dst: r });
-                    r
-                } else {
-                    arg_base
-                };
-                self.emit_direct_eval(arg, dst, false);
-                let je = self.here();
-                self.emit(Instr::Jump { target: 0 });
-                let indirect = self.here();
-                self.patch_jump(jf, indirect);
-                self.emit(Instr::Call {
-                    dst,
-                    callee,
-                    arg_base,
-                    argc,
-                });
-                let end = self.here();
-                self.patch_jump(je, end);
-                self.next_reg = save.max(dst + 1);
-                return Ok(dst);
-            }
-        }
-        // `Symbol(desc?)` → a fresh Symbol primitive (MakeSymbol op). `Symbol` is
-        // not constructable, so only the call form is lowered here.
-        if let Expr::Ident(id) = &c.callee {
-            if &**id == "Symbol" {
-                let desc = match c.args.first().and_then(arg_expr) {
-                    Some(e) => {
-                        let t = self.temp();
-                        let v = self.expr_into(e, t)?;
-                        if v != t {
-                            self.emit(Instr::Move { dst: t, src: v });
-                        }
-                        Some(t)
-                    }
-                    None => None,
-                };
-                self.emit(Instr::MakeSymbol { dst, desc });
-                if desc.is_some() {
-                    self.next_reg -= 1;
-                }
-                return Ok(dst);
-            }
-        }
-        // `RegExp(pattern?, flags?)` (no `new`) → like `new RegExp(...)`, except a
-        // RegExp pattern with no flags + a RegExp `constructor` returns it unchanged
-        // (is_construct: false signals the runtime short-circuit).
-        if let Expr::Ident(id) = &c.callee {
-            if &**id == "RegExp" {
-                return self.emit_regexp(&c.args, dst, false);
-            }
-        }
-        // `BigInt(x)` → conversion (BigIntFrom op). No arg → undefined (→ TypeError
-        // at runtime, matching the spec).
-        if let Expr::Ident(id) = &c.callee {
-            if &**id == "BigInt" {
-                let t = self.temp();
-                match c.args.first().and_then(arg_expr) {
-                    Some(e) => {
-                        let v = self.expr_into(e, t)?;
-                        if v != t {
-                            self.emit(Instr::Move { dst: t, src: v });
-                        }
-                    }
-                    None => self.emit(Instr::LoadUndefined { dst: t }),
-                }
-                self.emit(Instr::BigIntFrom { dst, arg: t });
-                self.next_reg -= 1;
-                return Ok(dst);
-            }
-        }
-        // Number(x) / parseInt(s,radix) / parseFloat(s) → GlobalFn op.
-        if let Expr::Ident(id) = &c.callee {
-            if let Some(op) = crate::bytecode::GlobalFn::from_name(id) {
+                let callee = self.capture_plain_callee(&c.callee)?;
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                 self.emit(Instr::GlobalFn {
                     dst,
                     op,
+                    callee,
                     arg_base,
                     argc,
                 });
+                self.next_reg = save.max(dst + 1);
                 return Ok(dst);
             }
-            // Bare `Array(…)` / `Object()` behave like their `new` forms.
-            if &**id == "Array" {
+            if &**id == "Array" && self.builtin_unshadowed(id) {
+                let save = self.next_reg;
+                let callee = self.capture_plain_callee(&c.callee)?;
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                 self.emit(Instr::ArrayCtor {
                     dst,
+                    callee: Some(callee),
                     arg_base,
                     argc,
+                    is_construct: false,
                 });
-                return Ok(dst);
-            }
-            if &**id == "Object" {
-                // `Object()` → a fresh object; `Object(x)` → ToObject(x).
-                if let Some(arg) = c.args.first().and_then(arg_expr) {
-                    let src = self.expr(arg)?;
-                    self.emit(Instr::ToObject { dst, src });
-                } else {
-                    self.emit(Instr::NewObject { dst, hint: 0 });
-                }
+                self.next_reg = save.max(dst + 1);
                 return Ok(dst);
             }
         }
@@ -1352,6 +1085,7 @@ impl<'a> FnCompiler<'a> {
                 if let Expr::Ident(obj) = &m.object {
                     if &**obj == "console"
                         && matches!(&**prop, "log" | "info" | "warn" | "error" | "debug")
+                        && self.builtin_unshadowed("console")
                     {
                         // node routes console.error / console.warn to stderr.
                         let to_stderr = matches!(&**prop, "error" | "warn");
@@ -1368,58 +1102,23 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // Host `print(...)` → Print to stdout. JS shells (and the test262
-        // `doneprintHandle.js` harness, which calls `print('Test262:Async…')` to
-        // signal async-test completion) expect it as a global. Yield to a lexical
-        // `print` binding (local/param/upvalue) if the program defined one.
-        if let Expr::Ident(id) = &c.callee {
-            if &**id == "print"
-                && !matches!(
-                    self.resolve("print"),
-                    Binding::Local(_) | Binding::LocalCell(_) | Binding::Upvalue(_)
-                )
-            {
-                let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                self.emit(Instr::Print {
-                    arg_base,
-                    argc,
-                    to_stderr: false,
-                });
-                self.emit(Instr::LoadUndefined { dst });
-                return Ok(dst);
-            }
-        }
-
-        // Clock idioms: `performance.now()` and `Date.now()` → Now opcode. They
-        // have no real global object in the subset, so recognise the call shape.
+        // The host-only `performance.now()` pseudo-namespace has no live object
+        // to capture. Date is a real namespace and therefore deliberately falls
+        // through to the captured ordinary-call path below, so replacements,
+        // accessors and a rebound global remain observable.
         if let Expr::Member(m) = &c.callee {
             if let MemberProp::Ident(prop) = &m.prop {
                 if let Expr::Ident(obj) = &m.object {
                     let epoch = match (&**obj, &**prop) {
                         ("performance", "now") => Some(false),
-                        ("Date", "now") => Some(true),
                         _ => None,
                     };
-                    if let Some(epoch) = epoch {
+                    if let Some(epoch) = epoch.filter(|_| self.builtin_unshadowed("performance")) {
+                        // Although the host pseudo ignores its arguments, call
+                        // argument expressions are still evaluated in order.
+                        let _ = self.eval_args_contiguous(&c.args)?;
                         self.emit(Instr::Now { dst, epoch });
                         return Ok(dst);
-                    }
-                    // `Date.UTC(y, m0, …)` → ms; `Date.parse(str)` → ms.
-                    if &**obj == "Date" && &**prop == "UTC" {
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::DateUTC {
-                            dst,
-                            arg_base,
-                            argc,
-                        });
-                        return Ok(dst);
-                    }
-                    if &**obj == "Date" && &**prop == "parse" && c.args.len() == 1 {
-                        if let Some(ae) = arg_expr(&c.args[0]) {
-                            let src = self.expr(ae)?;
-                            self.emit(Instr::DateParse { dst, src });
-                            return Ok(dst);
-                        }
                     }
                 }
             }
@@ -1432,18 +1131,35 @@ impl<'a> FnCompiler<'a> {
             if let MemberProp::Ident(prop) = &m.prop {
                 if let Expr::Ident(obj) = &m.object {
                     if &**obj == "JSON" && &**prop == "parse" && c.args.len() == 1 {
-                        if let Some(ae) = arg_expr(&c.args[0]) {
-                            let a = self.expr(ae)?;
-                            self.emit(Instr::JsonParse { dst, a });
+                        if arg_expr(&c.args[0]).is_some() {
+                            let save = self.next_reg;
+                            let (callee, this_v) = self.capture_member_callee(m)?;
+                            let (arg_base, _) = self.eval_args_contiguous(&c.args)?;
+                            self.emit(Instr::JsonParse {
+                                dst,
+                                a: arg_base,
+                                callee,
+                                this_v,
+                            });
+                            self.next_reg = save.max(dst + 1);
                             return Ok(dst);
                         }
                     }
                     if &**obj == "JSON" && &**prop == "stringify" && c.args.len() == 1 {
-                        if let Some(ve) = arg_expr(&c.args[0]) {
-                            let val = self.expr(ve)?;
-                            let space = self.temp();
+                        if arg_expr(&c.args[0]).is_some() {
+                            let save = self.next_reg;
+                            let (callee, this_v) = self.capture_member_callee(m)?;
+                            let (arg_base, _) = self.eval_args_contiguous(&c.args)?;
+                            let space = self.alloc_reg();
                             self.emit(Instr::LoadUndefined { dst: space });
-                            self.emit(Instr::JsonStringify { dst, val, space });
+                            self.emit(Instr::JsonStringify {
+                                dst,
+                                val: arg_base,
+                                space,
+                                callee,
+                                this_v,
+                            });
+                            self.next_reg = save.max(dst + 1);
                             return Ok(dst);
                         }
                     }
@@ -1451,14 +1167,23 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // `Array.isArray(x)` → IsArray op.
+        // Guarded `Array.isArray(x)`: capture the live member before `x`, then
+        // validate the intrinsic identities inside the opcode.
         if let Expr::Member(m) = &c.callee {
             if let MemberProp::Ident(prop) = &m.prop {
                 if let Expr::Ident(obj) = &m.object {
                     if &**obj == "Array" && &**prop == "isArray" && c.args.len() == 1 {
-                        if let Some(arg_e) = arg_expr(&c.args[0]) {
-                            let a = self.expr(arg_e)?;
-                            self.emit(Instr::IsArray { dst, a });
+                        if arg_expr(&c.args[0]).is_some() {
+                            let save = self.next_reg;
+                            let (callee, this_v) = self.capture_member_callee(m)?;
+                            let (arg_base, _) = self.eval_args_contiguous(&c.args)?;
+                            self.emit(Instr::IsArray {
+                                dst,
+                                a: arg_base,
+                                callee,
+                                this_v,
+                            });
+                            self.next_reg = save.max(dst + 1);
                             return Ok(dst);
                         }
                     }
@@ -1466,28 +1191,48 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // `Object.keys/values/entries(o)` → dedicated ops (Object has no real
-        // global object in the subset).
+        // Guarded Object.keys/values/entries. Keep the dedicated opcodes (and
+        // Object.keys reducers) while giving every miss an ordinary-call exit.
         if let Expr::Member(m) = &c.callee {
             if let MemberProp::Ident(prop) = &m.prop {
                 if let Expr::Ident(obj) = &m.object {
-                    if &**obj == "Object" && c.args.len() == 1 {
-                        let mk = match &**prop {
+                    let kind = if &**obj == "Object" && c.args.len() == 1 {
+                        match &**prop {
                             "keys" => Some(0u8),
                             "values" => Some(1u8),
                             "entries" => Some(2u8),
                             _ => None,
-                        };
-                        if let Some(kind) = mk {
-                            if let Some(arg_e) = arg_expr(&c.args[0]) {
-                                let o = self.expr(arg_e)?;
-                                self.emit(match kind {
-                                    0 => Instr::ObjectKeys { dst, obj: o },
-                                    1 => Instr::ObjectValues { dst, obj: o },
-                                    _ => Instr::ObjectEntries { dst, obj: o },
-                                });
-                                return Ok(dst);
-                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Some(kind) = kind {
+                        if arg_expr(&c.args[0]).is_some() {
+                            let save = self.next_reg;
+                            let (callee, this_v) = self.capture_member_callee(m)?;
+                            let (arg_base, _) = self.eval_args_contiguous(&c.args)?;
+                            self.emit(match kind {
+                                0 => Instr::ObjectKeys {
+                                    dst,
+                                    obj: arg_base,
+                                    callee,
+                                    this_v,
+                                },
+                                1 => Instr::ObjectValues {
+                                    dst,
+                                    obj: arg_base,
+                                    callee,
+                                    this_v,
+                                },
+                                _ => Instr::ObjectEntries {
+                                    dst,
+                                    obj: arg_base,
+                                    callee,
+                                    this_v,
+                                },
+                            });
+                            self.next_reg = save.max(dst + 1);
+                            return Ok(dst);
                         }
                     }
                 }
@@ -1506,53 +1251,17 @@ impl<'a> FnCompiler<'a> {
                 if let Expr::Ident(obj) = &m.object {
                     if &**obj == "Math" {
                         if let Some(op) = crate::bytecode::MathFn::from_name(prop) {
+                            let save = self.next_reg;
+                            let (callee, this_v) = self.capture_member_callee(m)?;
                             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                             self.emit(Instr::MathOp {
                                 dst,
                                 op,
+                                callee,
+                                this_v,
                                 arg_base,
                                 argc,
                             });
-                            return Ok(dst);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Constructor-namespace static methods with a flat arg list:
-        // Object.assign, Array.of, String.fromCharCode, Number.isInteger/… .
-        if let Expr::Member(m) = &c.callee {
-            if let MemberProp::Ident(prop) = &m.prop {
-                if let Expr::Ident(obj) = &m.object {
-                    if let Some(op) = crate::bytecode::StaticFn::from_name(obj, prop) {
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::StaticFn {
-                            dst,
-                            op,
-                            arg_base,
-                            argc,
-                        });
-                        return Ok(dst);
-                    }
-                    // `Array.from(src[, mapFn])` — needs iteration + optional callback.
-                    // Only the 1-/2-arg form is lowered; a 3rd `thisArg` falls through
-                    // to the general call (the native honours it).
-                    if &**obj == "Array" && &**prop == "from" && (1..=2).contains(&c.args.len()) {
-                        if let Some(se) = arg_expr(&c.args[0]) {
-                            let save = self.next_reg;
-                            let src = self.expr(se)?;
-                            let mapfn = self.temp();
-                            match c.args.get(1).and_then(arg_expr) {
-                                Some(fe) => {
-                                    let f = self.expr_into(fe, mapfn)?;
-                                    if f != mapfn {
-                                        self.emit(Instr::Move { dst: mapfn, src: f });
-                                    }
-                                }
-                                None => self.emit(Instr::LoadUndefined { dst: mapfn }),
-                            }
-                            self.emit(Instr::ArrayFrom { dst, src, mapfn });
                             self.next_reg = save.max(dst + 1);
                             return Ok(dst);
                         }
@@ -1561,78 +1270,75 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // A PARENTHESIZED member callee preserves its reference — `(a.b)()` and
-        // `(a?.b)()` call with `this` = a (parens are transparent to
-        // EvaluateCall; only a comma/assignment breaks the reference). There is
-        // no parenthesized node in this AST, so such a callee simply arrives
-        // here as the member (or the chain) itself — nothing to peel.
-        let peeled: &Expr = &c.callee;
-        // `(a?.b)(args)`: a parenthesized-CHAIN member callee — the chain ends
-        // at the parens (nullish base → undefined callee → the call throws),
-        // but the member base still binds `this`. The `Chain` node IS that
-        // boundary, so the distinction from `a?.b(args)` survives.
-        if let Expr::Chain(ce) = peeled {
-            if !c.args.iter().any(|a| matches!(a, Arg::Spread(_))) {
-                if let Some((callee, obj)) = self.chain_member_callee(ce)? {
-                    let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                    self.emit(Instr::CallWithThis {
-                        dst,
-                        callee,
-                        this_v: obj,
-                        arg_base,
-                        argc,
-                    });
-                    return Ok(dst);
-                }
-            }
-        }
-        // Method call `obj.name(args…)` → CallMethod, binding `this` to obj.
-        // (Computed-member calls `obj[k](…)` fall through to the generic path.)
-        if let Expr::Member(m) = peeled {
+        // Constructor-namespace static methods with a flat argument list.
+        //
+        // EvaluateCall resolves the callee reference BEFORE evaluating any
+        // argument. Snapshot both the live namespace receiver and its method in
+        // stable registers, then let StaticFn use the specialised implementation
+        // only when both identify this realm's pristine intrinsic. A replacement,
+        // accessor, lexical shadow, or rebound global takes the ordinary call path
+        // with the captured callee/receiver; an argument which mutates the method
+        // therefore cannot retroactively change which function is invoked.
+        if let Expr::Member(m) = &c.callee {
             if let MemberProp::Ident(prop) = &m.prop {
-                let obj = self.expr(&m.object)?;
-                if m.optional {
-                    self.emit_optional_check(obj); // `obj?.method()` — short-circuit if obj nullish
-                } else if matches!(&m.object, Expr::Member(_)) {
-                    // `o.bar.gar(args)`: the callee GET (`.gar` of a possibly-
-                    // nullish `o.bar`) throws BEFORE the arguments evaluate (spec
-                    // EvaluateCall: func = GetValue(ref) precedes ArgumentList-
-                    // Evaluation). The fused CallMethod defers the get past the
-                    // args, so reject a nullish receiver here. Kept off simple
-                    // identifier/this receivers (hot path; their get cannot throw
-                    // earlier than the fused op observes).
-                    //
-                    // NOTE: this test used to be spelled as the three oxc member
-                    // variants, which a `ParenthesizedExpression` object was NOT
-                    // one of — so `(o.bar).gar(args)` skipped the check. With no
-                    // paren node in the AST that source now takes it. The bit is
-                    // unrecoverable here: parenthesization is recorded only on
-                    // `Target::Ident { covered }`, deliberately.
-                    self.emit(Instr::CheckCoercible { src: obj });
+                if let Expr::Ident(obj) = &m.object {
+                    if let Some(op) = crate::bytecode::StaticFn::from_name(obj, prop) {
+                        let save = self.next_reg;
+                        let (callee, this_v) = self.capture_member_callee(m)?;
+                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                        self.emit(Instr::StaticFn {
+                            dst,
+                            op,
+                            callee,
+                            this_v,
+                            arg_base,
+                            argc,
+                        });
+                        self.next_reg = save.max(dst + 1);
+                        return Ok(dst);
+                    }
+                    // `Array.from(src[, mapFn])` — needs iteration + optional
+                    // callback. The 3rd `thisArg` form stays generic so the native
+                    // receives it; 1-/2-arg forms keep the dedicated opcode.
+                    if &**obj == "Array" && &**prop == "from" && (1..=2).contains(&c.args.len()) {
+                        if c.args.iter().all(|a| arg_expr(a).is_some()) {
+                            let save = self.next_reg;
+                            let (callee, this_v) = self.capture_member_callee(m)?;
+                            let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                            let mapfn = if argc == 2 {
+                                arg_base + 1
+                            } else {
+                                let r = self.alloc_reg();
+                                self.emit(Instr::LoadUndefined { dst: r });
+                                r
+                            };
+                            self.emit(Instr::ArrayFrom {
+                                dst,
+                                src: arg_base,
+                                mapfn,
+                                callee,
+                                this_v,
+                                argc,
+                            });
+                            self.next_reg = save.max(dst + 1);
+                            return Ok(dst);
+                        }
+                    }
                 }
-                let name = self.string_name(prop);
-                let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                self.emit(Instr::CallMethod {
-                    dst,
-                    obj,
-                    name,
-                    arg_base,
-                    argc,
-                });
-                return Ok(dst);
             }
         }
-        // Private method call `obj.#m(args…)` → CallMethod on the "#m" key.
-        if let Expr::Member(m) = peeled {
-            if let MemberProp::Private(field) = &m.prop {
-                self.check_private_declared(field)?;
-                let obj = self.expr(&m.object)?;
-                let name = self.string_name(&private_key(field));
+
+        // A parenthesized member callee preserves its reference: `(a.b)()` and
+        // `(a?.b)()` call with `this` = a. Parentheses are absent from this AST;
+        // the optional-chain boundary is the only surviving wrapper.
+        let peeled: &Expr = &c.callee;
+        if let Expr::Chain(ce) = peeled {
+            if let Some((callee, this_v)) = self.chain_member_callee(ce)? {
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                self.emit(Instr::CallMethod {
+                self.emit(Instr::CallWithThis {
                     dst,
-                    obj,
-                    name,
+                    callee,
+                    this_v,
                     arg_base,
                     argc,
                 });
@@ -1640,93 +1346,28 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
-        // Computed method call `obj[key](args…)` → bind `this` to obj. Evaluate
-        // `super[expr](args…)` — computed inherited-method call.
+        // Resolve every member reference completely before arguments, and call
+        // the captured value with the captured receiver. Besides enforcing
+        // EvaluateCall ordering, this prevents property replacement during an
+        // argument from redirecting the invocation.
         if let Expr::Member(m) = peeled {
-            if let MemberProp::Computed(key_expr) = &m.prop {
-                if matches!(&m.object, Expr::Super) {
-                    let is_class = self.super_class;
-                    if is_class.is_none() && !self.super_home_obj {
-                        return Err("`super[x](...)` is only valid in a method".into());
-                    }
-                    self.this_check();
-                    let key = self.expr(key_expr)?;
-                    let key_reg = self.alloc_reg();
-                    if key != key_reg {
-                        self.emit(Instr::Move {
-                            dst: key_reg,
-                            src: key,
-                        });
-                    }
-                    if let Some(pid) = is_class {
-                        // GetSuperBase after the key, BEFORE the argument list.
-                        let b = self.temp();
-                        self.emit(Instr::SuperBase {
-                            dst: b,
-                            home_class_id: pid,
-                        });
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::SuperMethodComputed {
-                            dst,
-                            base: b,
-                            home_class_id: pid,
-                            key: key_reg,
-                            arg_base,
-                            argc,
-                        });
-                    } else {
-                        let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                        self.emit(Instr::SuperMethodObjComputed {
-                            dst,
-                            key: key_reg,
-                            arg_base,
-                            argc,
-                        });
-                    }
-                    return Ok(dst);
-                }
-            }
-        }
-        // obj and the key into stable registers (below the contiguous arg block).
-        if let Expr::Member(m) = peeled {
-            if let MemberProp::Computed(key_expr) = &m.prop {
-                let obj = self.expr(&m.object)?;
-                let obj_reg = self.alloc_reg();
-                if obj != obj_reg {
-                    self.emit(Instr::Move {
-                        dst: obj_reg,
-                        src: obj,
-                    });
-                }
-                if m.optional {
-                    self.emit_optional_check(obj_reg);
-                }
-                let key = self.expr(key_expr)?;
-                let key_reg = self.alloc_reg();
-                if key != key_reg {
-                    self.emit(Instr::Move {
-                        dst: key_reg,
-                        src: key,
-                    });
-                }
-                let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
-                self.emit(Instr::CallMethodComputed {
-                    dst,
-                    obj: obj_reg,
-                    key: key_reg,
-                    arg_base,
-                    argc,
-                });
-                return Ok(dst);
-            }
+            let save = self.next_reg;
+            let (callee, this_v) = self.capture_member_callee(m)?;
+            let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+            self.emit_captured_member_call(m, dst, callee, this_v, arg_base, argc);
+            self.next_reg = save.max(dst + 1);
+            return Ok(dst);
         }
 
         // (Bare-identifier calls inside a `with` were already routed through the
         // with chain near the top of this function — before the builtin
         // special-cases — so nothing with-related remains here.)
 
-        // General call: evaluate callee, then contiguous args.
-        let callee = self.expr(&c.callee)?;
+        // General call: snapshot GetValue(callee), then evaluate the complete
+        // argument list. In particular, `f(f = replacement)` still invokes the
+        // original function value.
+        let save = self.next_reg;
+        let callee = self.capture_plain_callee(&c.callee)?;
         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
         self.emit(Instr::Call {
             dst,
@@ -1734,24 +1375,27 @@ impl<'a> FnCompiler<'a> {
             arg_base,
             argc,
         });
+        self.next_reg = save.max(dst + 1);
         Ok(dst)
     }
 
-    /// Evaluate call arguments into a contiguous run of registers and return
-    /// (first register, count). The run MUST be contiguous because the
-    /// `Call`/`Print`/`NewArray` opcodes address args as
-    /// `[arg_base, arg_base+argc)`.
-    ///
-    /// Correctness subtlety: evaluating one argument may itself allocate scratch
-    /// temps (e.g. `a[i]` evaluates `a` and `i` into temps). Those temps must
-    /// NOT land inside the still-unfilled argument slots. So we reserve the
-    /// whole block first (bumping `next_reg` past it), which forces per-arg
-    /// temps to allocate ABOVE the block; we then reclaim them after each arg.
-    /// Emit the `DirectEval` op for a direct `eval(<arg>)` call site:
+    /// Emit the `DirectEval` op for a syntactic `eval(<args>)` call site:
     /// builds the visible-caller-bindings site map and the instruction.
-    /// `tail`: the site is a proper-tail-call return position, so a REBOUND
-    /// `eval` (ordinary call at runtime) reuses the frame.
-    pub(crate) fn emit_direct_eval(&mut self, arg: Reg, dst: Reg, tail: bool) {
+    /// The exact callee/reference receiver have already been captured, before
+    /// any argument evaluation. `args_array` selects the dynamically-sized
+    /// spread array held in `arg_base`; otherwise the complete argument window
+    /// is `[arg_base, arg_base + argc)`. `tail` lets a non-intrinsic captured
+    /// callee reuse the frame as an ordinary proper-tail call.
+    pub(crate) fn emit_direct_eval(
+        &mut self,
+        callee: Reg,
+        this_v: Reg,
+        arg_base: Reg,
+        argc: u16,
+        args_array: bool,
+        dst: Reg,
+        tail: bool,
+    ) {
         // The visible caller bindings (boxed cells, innermost shadowing
         // first) — the eval program closes over them. An EVAL ROOT also
         // maps its own cell locals AND its seeded caller upvalues (kind
@@ -1869,7 +1513,11 @@ impl<'a> FnCompiler<'a> {
         let this_reg = self.this_override.unwrap_or(0);
         self.emit(Instr::DirectEval {
             dst,
-            arg,
+            callee,
+            this_v,
+            arg_base,
+            argc,
+            args_array,
             new_target_ok: self.cx.new_target_ok,
             this_reg,
             home_class: self.super_class.unwrap_or(u32::MAX),
@@ -1899,6 +1547,16 @@ impl<'a> FnCompiler<'a> {
         });
     }
 
+    /// Evaluate call arguments into a contiguous run of registers and return
+    /// (first register, count). The run MUST be contiguous because the
+    /// `Call`/`Print`/`NewArray` opcodes address args as
+    /// `[arg_base, arg_base+argc)`.
+    ///
+    /// Correctness subtlety: evaluating one argument may itself allocate scratch
+    /// temps (e.g. `a[i]` evaluates `a` and `i` into temps). Those temps must
+    /// NOT land inside the still-unfilled argument slots. So we reserve the
+    /// whole block first (bumping `next_reg` past it), which forces per-arg
+    /// temps to allocate ABOVE the block; we then reclaim them after each arg.
     pub(crate) fn eval_args_contiguous(&mut self, args: &[Arg]) -> R<(Reg, u16)> {
         let exprs: Vec<&Expr> = args
             .iter()

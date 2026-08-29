@@ -808,19 +808,16 @@ impl<'a> FnCompiler<'a> {
                         dst: f,
                         func_id: fid,
                     });
-                    let argb = self.temp();
-                    self.emit(Instr::Move {
-                        dst: argb,
-                        src: cls,
-                    });
                     let trash = self.temp();
-                    let call_idx = self.string_name("call");
-                    self.emit(Instr::CallMethod {
+                    // A static block executes the compiler-created function
+                    // with the class as its this-value; it must not perform an
+                    // observable lookup of a replaceable Function.prototype.call.
+                    self.emit(Instr::CallWithThis {
                         dst: trash,
-                        obj: f,
-                        name: call_idx,
-                        arg_base: argb,
-                        argc: 1,
+                        callee: f,
+                        this_v: cls,
+                        arg_base: f,
+                        argc: 0,
                     });
                     self.next_reg = save;
                 }

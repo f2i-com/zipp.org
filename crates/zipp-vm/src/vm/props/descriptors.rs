@@ -444,7 +444,7 @@ impl<'p> Vm<'p> {
                 .into_iter()
                 .filter(|k| k.is_heap() && self.heap.is_str_like(k.heap_index()))
                 .collect();
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(strs))));
+            return Ok(self.alloc_array_current_realm(strs));
         }
         // Collect the key strings under the (immutable) heap borrow, then allocate
         // the result strings afterwards (alloc needs `&mut self`).
@@ -781,7 +781,7 @@ impl<'p> Vm<'p> {
             }
         }
         let names: Vec<Value> = keys.into_iter().map(|k| self.alloc_str(k)).collect();
-        Ok(Value::heap(self.heap.alloc(HeapObj::Array(names))))
+        Ok(self.alloc_array_current_realm(names))
     }
 
     /// `Reflect.ownKeys(obj)` — every own property key: the String keys (in
@@ -790,7 +790,7 @@ impl<'p> Vm<'p> {
     /// already returns the full Strings+Symbols list, so pass it through.
     pub(crate) fn object_own_keys(&mut self, obj: Value) -> Result<Value, Thrown> {
         if let Some(keys) = self.proxy_own_keys(obj)? {
-            return Ok(Value::heap(self.heap.alloc(HeapObj::Array(keys))));
+            return Ok(self.alloc_array_current_realm(keys));
         }
         // String keys (reuses the [[OwnPropertyKeys]] string ordering).
         let names = self.object_own_property_names(obj)?;
@@ -841,7 +841,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        Ok(Value::heap(self.heap.alloc(HeapObj::Array(out))))
+        Ok(self.alloc_array_current_realm(out))
     }
 
     /// `__lookupGetter__`/`__lookupSetter__`'s chain walk using the SPEC abstract
@@ -877,7 +877,11 @@ impl<'p> Vm<'p> {
                 if let Some(i) = m.pos(key) {
                     let attr = m.attr_at(i);
                     if attr.accessor {
-                        return Ok(if want_setter { attr.setter } else { m.val_at(i) });
+                        return Ok(if want_setter {
+                            attr.setter
+                        } else {
+                            m.val_at(i)
+                        });
                     }
                     return Ok(Value::UNDEFINED);
                 }

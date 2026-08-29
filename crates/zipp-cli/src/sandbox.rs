@@ -27,6 +27,28 @@ const MAX_STEPS: u64 = 100_000_000;
 const MAX_HEAP_MB: usize = 256;
 const MAX_OUTPUT_BYTES: usize = 4 << 20;
 
+#[derive(Clone, Copy)]
+enum Frontend {
+    Integrated,
+    Hardened,
+}
+
+impl Frontend {
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Integrated => "zipp sandbox [options] <file.js>",
+            Self::Hardened => "zipp-sandbox [options] <file.js>",
+        }
+    }
+
+    fn executable(self) -> &'static str {
+        match self {
+            Self::Integrated => "zipp",
+            Self::Hardened => "zipp-sandbox",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Config {
     script: PathBuf,
@@ -82,19 +104,31 @@ impl Drop for ChildGuard {
 }
 
 pub(crate) fn run(args: &[String]) -> Result<(), String> {
-    run_supervisor(args).map_err(|error| sanitize_diagnostic(&error))
+    run_supervisor(args, Frontend::Integrated).map_err(|error| sanitize_diagnostic(&error))
 }
 
-fn run_supervisor(args: &[String]) -> Result<(), String> {
+/// Standalone entry point for the separately resolved, interpreter-only
+/// `zipp-sandbox` crate. Keeping both frontends on this implementation avoids
+/// security fixes drifting between two copies of the supervisor/worker code.
+#[allow(dead_code)] // used by the path-shared standalone crate, not zipp-cli
+pub(crate) fn run_standalone(args: &[String]) -> Result<(), String> {
+    run_supervisor(args, Frontend::Hardened).map_err(|error| sanitize_diagnostic(&error))
+}
+
+fn run_supervisor(args: &[String], frontend: Frontend) -> Result<(), String> {
     if matches!(args, [arg] if arg == "--help" || arg == "-h") {
-        print_help();
+        print_help(frontend);
         return Ok(());
     }
-    let config = parse_public(args)?;
+    let config = parse_public(args, frontend)?;
     validate_script(&config.script)?;
 
-    let exe =
-        std::env::current_exe().map_err(|e| format!("cannot locate the zipp executable: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| {
+        format!(
+            "cannot locate the {} executable: {e}",
+            frontend.executable()
+        )
+    })?;
     // The child process must not start in the untrusted script directory. On
     // Windows the process cwd participates in DLL search and device/path
     // resolution before the VM has installed any of its language-level
@@ -228,10 +262,17 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn print_help() {
-    println!("usage: zipp sandbox [options] <file.js>");
+fn print_help(frontend: Frontend) {
+    println!("usage: {}", frontend.usage());
     println!();
-    println!("Applies defense-in-depth limits to a classic script in a supervised child.");
+    match frontend {
+        Frontend::Integrated => {
+            println!("Applies defense-in-depth limits to a classic script in a supervised child.")
+        }
+        Frontend::Hardened => {
+            println!("Runs a classic script in a supervised, interpreter-only safe-sandbox child.")
+        }
+    }
     println!("Imports are denied unless --allow-imports is supplied.");
     println!();
     println!("options:");
@@ -242,8 +283,18 @@ fn print_help() {
     println!("  --allow-imports <root>  confine module loading to a canonical directory");
     println!("  --module               unsupported (fails closed; classic scripts only)");
     println!();
-    println!("This is not an OS or memory-safety sandbox; use zipp-wasm in a dedicated Worker");
-    println!("for hostile code when an OS sandbox or VM is unavailable.");
+    match frontend {
+        Frontend::Integrated => {
+            println!(
+                "This is not an OS or memory-safety sandbox; use zipp-sandbox with OS isolation"
+            );
+            println!("or zipp-wasm in a dedicated Worker for hostile code.");
+        }
+        Frontend::Hardened => {
+            println!("This build excludes both JITs and forbids unsafe code in zipp-vm/regress.");
+            println!("It is not an OS sandbox; add platform isolation for hostile code.");
+        }
+    }
 }
 
 /// The child half. This is intentionally callable only through a hidden CLI
@@ -320,7 +371,7 @@ fn run_child_inner(args: &[String]) -> Result<(), String> {
     }
 }
 
-fn parse_public(args: &[String]) -> Result<Config, String> {
+fn parse_public(args: &[String], frontend: Frontend) -> Result<Config, String> {
     let mut config = Config {
         script: PathBuf::new(),
         import_root: None,
@@ -364,7 +415,7 @@ fn parse_public(args: &[String]) -> Result<Config, String> {
         config.script = canonical_file(arg, "script")?;
         i += 1;
     }
-    validate_config(&config)?;
+    validate_config(&config, frontend.usage())?;
     Ok(config)
 }
 
@@ -408,13 +459,16 @@ fn parse_child(args: &[String]) -> Result<Config, String> {
         }
         return Err(format!("invalid sandbox worker argument '{arg}'"));
     }
-    validate_config(&config)?;
+    validate_config(
+        &config,
+        "zipp sandbox [limits] [--allow-imports <root>] <file.js>",
+    )?;
     Ok(config)
 }
 
-fn validate_config(config: &Config) -> Result<(), String> {
+fn validate_config(config: &Config, usage: &str) -> Result<(), String> {
     if config.script.as_os_str().is_empty() {
-        return Err("usage: zipp sandbox [limits] [--allow-imports <root>] <file.js>".into());
+        return Err(format!("usage: {usage}"));
     }
     if config.timeout_ms == 0 || config.timeout_ms > MAX_TIMEOUT_MS {
         return Err(format!("--timeout-ms must be in 1..={MAX_TIMEOUT_MS}"));

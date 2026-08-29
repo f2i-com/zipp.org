@@ -31,14 +31,16 @@
 //! `split_recv_writethrough.rs` already pins: **the memory slot is authoritative,
 //! so every exit is correct without knowing which path reached it.**
 //!
-//! The eight parity cases below all THREW or answered wrong before the fix, and
-//! between them cover every emitter that has the elided-`LoadGlobal` arm (INT
-//! xmm, INT-GPR, DOUBLE) and four different guards that reach the deopt (unsigned
-//! bounds, negative index, an out-of-bounds TypedArray STORE — a spec no-op — and
-//! a `charCodeAt` past the end of a pinned flat-ASCII string). `coldrecv_mechanism_*`
-//! reads the plan back out of a child's `ZIPP_JITLOG` and fails if a shape stops
-//! carrying a pinned receiver, or stops taking a native exit after the receiver's
-//! `LoadGlobal` — i.e. if it stops covering the hazard at all.
+//! The eight parity cases below all THREW or answered wrong before the fix. The
+//! array/TypedArray shapes cover every emitter that has the elided-`LoadGlobal`
+//! arm (INT xmm, INT-GPR, DOUBLE) and guards including unsigned bounds, negative
+//! index, and an out-of-bounds TypedArray STORE (a spec no-op).
+//!
+//! `charCodeAt` uses capture-first `GetProp` + `CallWithThis` lowering, so the
+//! callee and receiver are materialized before the argument is evaluated. Its
+//! register-tier mechanism test therefore pins that capture, an interior native
+//! deopt, and the fact that method lookup is never mistaken for a hoistable
+//! string `.length` read.
 
 // The mechanism half drives the x86-64 JIT tiers through a spawned CLI's
 // `ZIPP_JITLOG`; in a no-JIT config (safe-sandbox) those plans cannot exist,
@@ -203,10 +205,11 @@ try { console.log(kernel(20) + " " + a.length + " " + a[0]); }
 catch (e) { console.log("THREW " + e.constructor.name); }
 "#;
 
-/// A pinned flat-ASCII STRING receiver (`STR_PIN_KIND`) reached through
-/// `charCodeAt` — a `CallMethod`, not an index op, and a different emitter arm
-/// with the same receiver contract. Past the end it yields `NaN`; on the stale
-/// slot the re-executed `CallMethod` found `undefined` and threw.
+/// A flat-ASCII STRING receiver reached through `charCodeAt`. The original
+/// lowering used a pinned `CallMethod` and therefore shared the receiver-slot
+/// contract above. The current captured-reference lowering uses `GetProp` +
+/// `CallWithThis`; past the end still yields `NaN`, and this remains the semantic
+/// regression case for either implementation.
 const STR_CHARCODEAT_OOB: &str = r#"
 var s = "abc";
 function kernel(n) {
@@ -392,7 +395,46 @@ fn coldrecv_mechanism_int_gpr_oob() {
 
 #[test]
 fn coldrecv_mechanism_str_charcodeat_oob() {
-    assert_pinned_recv_mechanism("coldrecv_parity_str_charcodeat_oob", "INT");
+    let bytecode = zipp_vm::compile_to_text(STR_CHARCODEAT_OOB, false)
+        .expect("charCodeAt mechanism source compiles");
+    let get = bytecode
+        .find("GetProp {")
+        .expect("charCodeAt callee must be captured with GetProp");
+    let arg = bytecode
+        .find("val: 9999")
+        .expect("the out-of-bounds argument must remain in the bytecode");
+    let call = bytecode
+        .find("CallWithThis {")
+        .expect("captured charCodeAt must be called with its receiver");
+    assert!(
+        get < arg && arg < call,
+        "EvaluateCall order regressed: GetProp must precede the argument and call"
+    );
+    assert!(
+        !bytecode.contains("CallMethod {"),
+        "legacy CallMethod resolves the property after argument evaluation"
+    );
+
+    let test = "coldrecv_parity_str_charcodeat_oob";
+    let log = logged_child(test);
+    let recvs = pinned_recvs(&log);
+    let interior_deopt = recvs.iter().any(|pr| {
+        pr.tier == "INT"
+            && pr
+                .span
+                .split(',')
+                .next()
+                .and_then(|s| s.parse::<usize>().ok())
+                .is_some_and(|start| deopt_ips(&log, &pr.span).iter().any(|&ip| ip > start))
+    });
+    assert!(
+        interior_deopt,
+        "captured charCodeAt did not take an interior INT-tier deopt:\n{log}"
+    );
+    assert!(
+        log.contains("guard-hoist pins=1/1 len-fills=0"),
+        "captured charCodeAt GetProp was mistaken for a hoistable .length read:\n{log}"
+    );
 }
 
 /// Every case must answer identically in every mode. `ZIPP_NOJIT=1` is the
