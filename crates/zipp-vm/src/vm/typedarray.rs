@@ -178,17 +178,16 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// Resolve one DataView `get*` method only when the receiver still has the
-    /// exact main-realm intrinsic chain.  Native register lanes bypass ordinary
+    /// Resolve one DataView prototype method only when the receiver still has
+    /// the exact main-realm intrinsic chain. Both the interpreter's
+    /// receiver-kind dispatcher and native register lanes bypass ordinary
     /// `[[Get]]`, so an own shadow, custom prototype, accessor, deleted slot,
     /// replacement callable, or child-realm prototype must fail closed.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn dataview_method_is_intrinsic(&self, view_idx: u32, name: &str) -> Option<Value> {
         let method = crate::vm::native::DV_PROTO_METHODS
             .iter()
             .position(|&candidate| candidate == name)?;
-        if !name.starts_with("get")
-            || !matches!(self.heap.get(view_idx), HeapObj::DataView { .. })
+        if !matches!(self.heap.get(view_idx), HeapObj::DataView { .. })
             || self
                 .arr_props
                 .get(&view_idx)
@@ -217,8 +216,14 @@ impl<'p> Vm<'p> {
                 self.heap.get(value.heap_index()),
                 HeapObj::Native(id)
                     if *id == crate::vm::native::DV_METHOD_BASE + method as u16
-            ))
-        .then_some(value)
+            )
+            // A child realm owns fresh Native objects with the same numeric
+            // ids. Calling one must install that callee realm (not execute it
+            // as the main intrinsic), so same-id is insufficient once realms
+            // exist. The empty-table branch keeps the common main-only proof
+            // to one load.
+            && (self.obj_realm.is_empty() || self.get_function_realm(value) == 0))
+            .then_some(value)
     }
 
     /// `IsTypedArrayFixedLength(O)`: is this view's length settled for good?

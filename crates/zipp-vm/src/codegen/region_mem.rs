@@ -39,6 +39,37 @@ fn emit_refetch_ta_partition(
     }
 }
 
+/// Re-derive only snapshots that license a direct builtin-method lane.
+///
+/// A call-free `SetProp` can overwrite one of those live prototype slots
+/// without reallocating the heap or changing the holder's layout/version.  In
+/// that case r13/r14 remain valid, and element/length-only snapshots remain
+/// valid, but a STR/Array/DataView method snapshot must repeat its intrinsic
+/// proof before another direct access.  Keep each pin's original stack index:
+/// `TaPinPlan::access` addresses these slots by plan position.
+fn emit_refetch_ta_methods(
+    ops: &mut dynasmrt::x64::Assembler,
+    snapshot_helper: usize,
+    plan: &TaPinPlan,
+) {
+    for (j, pin) in plan.pins.iter().enumerate() {
+        if pin.method_mask == 0 {
+            continue;
+        }
+        match pin.src {
+            TaPinSrc::Global(g) => dynasm!(ops ; mov rdx, [r12 + (g as i32) * 8]),
+            TaPinSrc::Reg(r) => dynasm!(ops ; mov rdx, [rbx + dreg(r)]),
+        }
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov r8d, pin.snapshot_tag() as i32
+            ; lea r9, [rsp + ta_slot_off(j)]
+            ; mov rax, QWORD snapshot_helper as i64
+            ; call rax
+        );
+    }
+}
+
 #[inline]
 fn cross_array_epoch_cache_off(c3_off: i32, plan: &TaPinPlan) -> Option<i32> {
     (cross_array_snapshot_epoch_enabled() && plan.pins.iter().any(|p| is_arr_pin(p.kind)))
@@ -345,6 +376,12 @@ pub(crate) fn compile_region_mem(
     let leaf_flag_off = frame - 8;
     // Re-derive the pins after any helper that can run user code.
     let ta_refetch = (n_ta > 0).then_some((heap.ta_snapshot, ta_plan));
+    // A SetProp data-way hit runs no user code, but it can still replace a
+    // prototype method whose live identity licensed a raw method lane.  Only
+    // plans carrying such a licence need the post-store repair; ordinary
+    // element/length pins keep the pre-change SetProp byte stream.
+    let ta_method_refetch =
+        ta_refetch.filter(|(_, plan)| plan.pins.iter().any(|pin| pin.method_mask != 0));
     // B244 reuses the last qword of the 64-byte CROSS3 scratch as one coarse
     // Array-epoch cache for every dense-Array pin in the region. It exists only
     // when CROSS3 allocated that scratch; all other helper paths retain their
@@ -1168,8 +1205,12 @@ pub(crate) fn compile_region_mem(
                 // distinct sentinel for an own writable-data HIT or a
                 // proven-clean new append. Those two arms share the
                 // interpreter's prebuilt-key proof and cannot allocate a VM
-                // heap object, collect, or run user code, so their r13/r14 and
-                // TypedArray snapshots remain valid. Every slow case keeps the
+                // heap object, collect, or run user code, so r13/r14 and raw
+                // element/length snapshots remain valid. A pure writable hit
+                // can nevertheless replace a method-licensing slot on an
+                // ordinary prototype (`"getUint" + 32` on DataView.prototype),
+                // so method-bearing plans take the same narrow repair join as
+                // SetProp. Every slow case keeps the
                 // B86 delegation to `Vm::set_index_concat` and returns generic
                 // success / throw / deopt, which retains the historical full
                 // refetch. `ZIPP_NO_CONCAT_PURE_APPEND=1` selects the historical
@@ -1177,6 +1218,9 @@ pub(crate) fn compile_region_mem(
                 // `val` rides the stack as arg 5 (the set_prop_miss shape).
                 let packed: u64 = ((heap.func_id as u64) << 32) | (name as u64);
                 let pure_done = heap.concat_pure_append.then(|| ops.new_dynamic_label());
+                let pure_method_write = (heap.concat_pure_append && ta_method_refetch.is_some())
+                    .then(|| ops.new_dynamic_label());
+                let pure_target = pure_method_write.or(pure_done);
                 dynasm!(ops
                     ; mov rcx, rdi                       // vm
                     ; mov rdx, [rbx + dreg(obj)]         // receiver bits
@@ -1193,11 +1237,11 @@ pub(crate) fn compile_region_mem(
                     ; cmp rax, r10
                     ; je => bail                         // threw: unwind, do NOT re-execute
                 );
-                if let Some(done) = pure_done {
+                if let Some(target) = pure_target {
                     dynasm!(ops
                         ; mov r10, QWORD CONCAT_SET_PURE as i64
                         ; cmp rax, r10
-                        ; je => done                     // pure hit/add: pins stayed valid
+                        ; je => target                   // pure hit/add: repair methods if needed
                     );
                 }
                 // Generic success may have allocated or frame-called an
@@ -1205,6 +1249,18 @@ pub(crate) fn compile_region_mem(
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 if let Some((snap, plan)) = ta_refetch {
                     emit_refetch_ta(&mut ops, snap, plan);
+                }
+                if let (Some(method_write), Some(done), Some((snap, plan))) =
+                    (pure_method_write, pure_done, ta_method_refetch)
+                {
+                    // Generic success already performed the full repair.
+                    // Only the call-free pure sentinel enters the method-only
+                    // block before converging on the historical done label.
+                    dynasm!(ops
+                        ; jmp => done
+                        ; => method_write
+                    );
+                    emit_refetch_ta_methods(&mut ops, snap, plan);
                 }
                 if let Some(done) = pure_done {
                     dynasm!(ops ; => done);
@@ -1869,6 +1925,14 @@ pub(crate) fn compile_region_mem(
                 let packed = ((heap.func_id as u64) << 32) | name as u64;
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let cont = ops.new_dynamic_label();
+                // Successful call-free stores used to jump straight to
+                // `cont`, bypassing the method-intrinsic proof embedded in a
+                // STR/Array/DataView snapshot.  Give only method-licensed
+                // regions a repair join.  A normal SetProp region aliases it
+                // to `cont` and emits exactly the old control flow.
+                let method_write_cont = ta_method_refetch
+                    .map(|_| ops.new_dynamic_label())
+                    .unwrap_or(cont);
                 // B114: as in the GetProp arm — `Some` adds the accessor-way
                 // dispatch target, `None` keeps the prior byte stream.
                 // SITE-GATED as in the GetProp arm above.
@@ -1891,7 +1955,7 @@ pub(crate) fn compile_region_mem(
                         obj,
                         val,
                         true,
-                        cont,
+                        method_write_cont,
                     );
                 }
                 emit_ic_probe(
@@ -1899,7 +1963,7 @@ pub(crate) fn compile_region_mem(
                     IcProbe::Set { val },
                     obj,
                     off,
-                    cont,
+                    method_write_cont,
                     acc,
                     site_emit.direct_miss,
                 );
@@ -1916,7 +1980,7 @@ pub(crate) fn compile_region_mem(
                     ; je => bail
                     ; mov r10, QWORD PROP_VIA_IC as i64
                     ; cmp rax, r10
-                    ; jne => cont
+                    ; jne => method_write_cont
                     // ── setter / class receiver: interpreter-IC slow helper
                     // (may frame-call a setter — re-derive r13/r14 after).
                     ; mov rcx, rdi                        // vm
@@ -1961,6 +2025,16 @@ pub(crate) fn compile_region_mem(
                 // re-derive the pinned TypedArray snapshots too.
                 if let Some((snap, plan)) = ta_refetch {
                     emit_refetch_ta(&mut ops, snap, plan);
+                }
+                if let Some((snap, plan)) = ta_method_refetch {
+                    // The accessor/user-code route above already performed a
+                    // full repair.  Skip this method-only block on that path;
+                    // IC/data-miss successes enter it directly.
+                    dynasm!(ops
+                        ; jmp => cont
+                        ; => method_write_cont
+                    );
+                    emit_refetch_ta_methods(&mut ops, snap, plan);
                 }
                 dynasm!(ops ; => cont);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
@@ -2708,8 +2782,10 @@ pub(crate) fn compile_region_mem(
                     }
                     // Generic path: the dedicated win64 helper (receiver + pos
                     // + le bits in, element kind via the 5th-arg slot; result
-                    // bits out, deopt sentinel → bail). No alloc, no user code
-                    // — no re-fetch.
+                    // bits out, deopt sentinel → bail). It repeats the live
+                    // method-identity proof, so a snapshot zeroed by a
+                    // prototype replacement resumes at ordinary Get+Call.
+                    // No alloc/user code on success — no re-fetch.
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(obj)]          // receiver bits

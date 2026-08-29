@@ -1820,7 +1820,10 @@ pub(crate) extern "win64" fn jit_ta_clamp_store(addr: *mut u8, val_bits: u64) {
 /// ToIndex coercion/throws → deopt), ToBoolean(le) via the read-only `truthy`,
 /// detached / shrunk-OOB view or out-of-range read → deopt (the interpreter
 /// re-executes and throws the spec'd TypeError/RangeError). No allocation, no
-/// user code. `kind` arrives via the 5th-arg stack slot.
+/// user code. The helper also repeats the live DataView-method identity proof:
+/// a zeroed/refreshed pin falls here after a prototype replacement, and must
+/// deopt to ordinary Get+Call rather than silently execute the intrinsic by
+/// receiver kind. `kind` arrives via the 5th-arg stack slot.
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
@@ -1839,6 +1842,23 @@ pub(crate) extern "win64" fn jit_dv_get(
     }
     // SAFETY: read-only view; the running region holds no conflicting borrow.
     let vm = unsafe { &*(vm as *const Vm) };
+    let method = match kind {
+        0 => "getInt8",
+        1 => "getUint8",
+        3 => "getInt16",
+        4 => "getUint16",
+        5 => "getInt32",
+        6 => "getUint32",
+        7 => "getFloat32",
+        8 => "getFloat64",
+        _ => return crate::codegen::SELF_CALL_DEOPT,
+    };
+    if vm
+        .dataview_method_is_intrinsic(dv.heap_index(), method)
+        .is_none()
+    {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
     let (buffer, byte_offset, byte_length) = match vm.heap.get(dv.heap_index()) {
         HeapObj::DataView {
             buffer,
@@ -4426,9 +4446,9 @@ pub(crate) extern "win64" fn jit_set_prop_miss(
     0
 }
 
-/// Win64 helper: base pointer of the heap's per-object version array, pinned by a
-/// heap-op region's prologue. Stable for the run (a region never allocates a heap
-/// object, so the array doesn't reallocate).
+/// Win64 helper: base pointer of the heap's per-object version array, pinned by
+/// a native prologue. An ordinary OSR region does not allocate; Tier-C code can,
+/// so every allocating/user-code helper refetches the base before a later read.
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
@@ -4438,9 +4458,9 @@ pub(crate) extern "win64" fn jit_heap_versions_base(vm: *mut core::ffi::c_void) 
     vm.heap.versions_ptr()
 }
 
-/// Win64 helper: base pointer of the JIT inline-cache table, pinned by a heap-op
-/// region's prologue. Stable for the run (the table grows only at compile time,
-/// and a `*_miss` only updates an existing slot — never grows it).
+/// Win64 helper: base pointer of the JIT inline-cache table, pinned by a native
+/// prologue. A `*_miss` only updates existing ways, but user code can trigger
+/// nested compilation and grow the table; emitted callers refetch afterwards.
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm`.
@@ -4453,7 +4473,8 @@ pub(crate) extern "win64" fn jit_ic_base(vm: *mut core::ffi::c_void) -> *const c
 /// Win64 helper: the base pointer of `vm.globals`, fetched once by an OSR loop
 /// region's prologue and pinned in a callee-saved register for direct
 /// `LoadGlobal`/`StoreGlobal`. Sound because `globals` is allocated once at VM
-/// construction (`global_count` slots) and never reallocates at runtime.
+/// construction (`global_count + FIELD_POOL + EVAL_POOL` slots) and never
+/// reallocates at runtime.
 ///
 /// # Safety
 /// `vm` is a valid `*mut Vm` that outlives the region run.

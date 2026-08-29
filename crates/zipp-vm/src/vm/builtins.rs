@@ -1034,7 +1034,15 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Date(_) => self.date_method(idx, name, args),
             HeapObj::TypedArray { .. } => self.typed_array_method(idx, name, args),
-            HeapObj::DataView { .. } => self.dataview_method(idx, name, args),
+            // Receiver-kind dispatch must not hide an own/prototype override.
+            // The JIT's pinned DataView lanes use the same live proof before
+            // bypassing ordinary `[[Get]]`; keep the interpreter contract
+            // identical so a replacement `DataView.prototype.get*/set*`
+            // function is actually called.
+            HeapObj::DataView { .. } if self.dataview_method_is_intrinsic(idx, name).is_some() => {
+                self.dataview_method(idx, name, args)
+            }
+            HeapObj::DataView { .. } => Ok(None),
             HeapObj::ArrayBuffer { .. } => self.arraybuffer_method(idx, name, args),
             _ => Ok(None),
         }
