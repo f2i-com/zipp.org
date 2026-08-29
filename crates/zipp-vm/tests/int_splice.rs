@@ -80,11 +80,38 @@ fn prog(body: &str) -> String {
     format!("{PRELUDE}{body}")
 }
 
-/// THE target shape: the parse-large-js mix loop. Three pinned dense-Int arrays
-/// and a pinned flat-ASCII string feed three calls to an 8-op leaf that stores
-/// a global. Before the flatten this declined with three `Call` int-rejects.
+/// THE target shape: the parse-large-js mix loop, statement for statement.
+/// Three pinned dense-Int arrays and a pinned flat-ASCII string feed three
+/// calls to an 8-op leaf that stores a global. Before the flatten this
+/// declined with three `Call` int-rejects.
 #[test]
 fn intsplice_parity_mix_loop() {
+    assert_matches_node(&prog(
+        r#"var kinds = [], starts = [], ends = [];
+var src = "";
+for (var i = 0; i < 64; i++) src += "abcdefghijklmnopqrstuvwxyz0123456789 ";
+for (var i = 0; i < N; i++) { kinds.push(i % 13); starts.push(i % 2000); ends.push((i % 2000) + 3); }
+var h = 0;
+function mix(x) { h = Math.imul(h ^ x, 16777619) >>> 0; }
+function f(n) {
+  for (var ti = 0; ti < n; ti++) {
+    mix(kinds[ti]); mix(ends[ti] - starts[ti]); mix(src.charCodeAt(starts[ti]));
+  }
+}
+for (var r = 0; r < 5; r++) { h = 2166136261; f(N); }
+console.log("mix h=" + h);
+"#,
+    ));
+}
+
+/// The same loop with the `charCodeAt` hoisted into its own statement. Parity
+/// only: with the captured (spec-order) `charCodeAt` lowering, the hoisted
+/// statement's argument temporary is recycled by the next statement's
+/// receiver load, the pin planner sees a two-def pinned receiver and the
+/// flattened body declines to the memory tier — a known register-layout
+/// residual (B248), so this variant does not pin the INT tier.
+#[test]
+fn intsplice_parity_mix_loop_hoisted() {
     assert_matches_node(&prog(
         r#"var kinds = [], starts = [], ends = [];
 var src = "";

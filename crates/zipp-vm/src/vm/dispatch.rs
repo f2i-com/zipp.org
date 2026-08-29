@@ -6534,9 +6534,14 @@ impl<'p> Vm<'p> {
                                 break;
                             }
                         }
-                        let argv: Vec<Value> =
-                            (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                        let r = self.call_value(callee_v, this_val, &argv)?;
+                        // `with_argv`: a stack buffer for the common arity. A
+                        // split member call with a native callee (`arr.push(x)`
+                        // whose argument was not order-transparent) lands here
+                        // once per call; a heap `Vec` per call was a measurable
+                        // share of the interpreter's split-form tax.
+                        let r = self.with_argv(base, arg_base, argc, |vm, argv| {
+                            vm.call_value(callee_v, this_val, argv)
+                        })?;
                         self.set(base, dst, r);
                         ip += 1;
                     }
@@ -8487,15 +8492,42 @@ impl<'p> Vm<'p> {
                     _ => return None,
                 };
                 let native_id = native::MATH_METHOD_BASE + crate::bytecode::MathFn::Imul as u16;
-                self.static_builtin_is_intrinsic("Math", native_id, callee, receiver)
-                    .then(|| crate::codegen::MathIntrinsicGuard {
-                        receiver_bits: receiver.bits(),
-                        receiver_ver: self.heap.version_of(receiver_idx),
-                        receiver_vals,
-                        receiver_slot,
-                        callee_bits: callee.bits(),
-                        callee_ver: self.heap.version_of(callee.heap_index()),
-                    })
+                if !self.static_builtin_is_intrinsic("Math", native_id, callee, receiver) {
+                    return None;
+                }
+                // Bake every other Math.* intrinsic the same way, so the
+                // emitted per-op guard is three compares rather than a helper
+                // call (`emit_math_identity_guard`). An op whose property is
+                // missing, an accessor, replaced or foreign-realm stays `0`
+                // and keeps the helper-call guard.
+                use crate::bytecode::MATH_FN_COUNT;
+                debug_assert_eq!(native::MATH_METHODS.len(), MATH_FN_COUNT);
+                let mut op_callee_bits = [0u64; MATH_FN_COUNT];
+                let mut op_callee_ver = [0u32; MATH_FN_COUNT];
+                if let HeapObj::Object(map) = self.heap.get(receiver_idx) {
+                    for (i, &(name, _, _)) in native::MATH_METHODS.iter().enumerate() {
+                        let Some(slot) = map.pos(name) else { continue };
+                        if map.attr_at(slot).accessor {
+                            continue;
+                        }
+                        let v = map.val_at(slot);
+                        let id = native::MATH_METHOD_BASE + i as u16;
+                        if self.static_builtin_is_intrinsic("Math", id, v, receiver) {
+                            op_callee_bits[i] = v.bits();
+                            op_callee_ver[i] = self.heap.version_of(v.heap_index());
+                        }
+                    }
+                }
+                Some(crate::codegen::MathIntrinsicGuard {
+                    receiver_bits: receiver.bits(),
+                    receiver_ver: self.heap.version_of(receiver_idx),
+                    receiver_vals,
+                    receiver_slot,
+                    callee_bits: callee.bits(),
+                    callee_ver: self.heap.version_of(callee.heap_index()),
+                    op_callee_bits,
+                    op_callee_ver,
+                })
             })
     }
 
@@ -8529,6 +8561,14 @@ impl<'p> Vm<'p> {
             window_close: crate::vm::helpers_misc::jit_window_close as usize,
             cross3_unroot: crate::vm::helpers_misc::jit_cross3_unroot as usize,
             cross3_finish: crate::vm::helpers_misc::jit_cross3_finish as usize,
+            // B191's baseline tables hold only heap Values, so a real entry is
+            // never 0; an absent one (pre-boot, a stripped prototype) is.
+            push_intrinsic_bits: self.arr_proto_baseline.get("push").copied().unwrap_or(0),
+            char_code_at_intrinsic_bits: self
+                .str_proto_baseline
+                .get("charCodeAt")
+                .copied()
+                .unwrap_or(0),
             get_prop_slow: jit_get_prop_slow as usize,
             set_prop_slow: jit_set_prop_slow as usize,
             get_prop_acc: crate::vm::helpers_misc::jit_get_prop_acc as usize,

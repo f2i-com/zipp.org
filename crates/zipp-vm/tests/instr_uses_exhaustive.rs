@@ -136,12 +136,16 @@ const CASES: &[Case] = &[
         tail: "",
         epilogue: "function id(v) { return v; }",
     },
+    // A transparent argument list fuses a member call to `CallMethod`; the
+    // trailing member-read argument keeps the next two on the captured
+    // `GetProp` + `CallWithThis` / `RegExpMethod` lowering instead.
+    c("CallMethod", "\"keep\"", "x.concat(x)"),
     c(
         "CallWithThis",
         "\"keep\"",
-        "String.prototype.concat.call(x, \"!\")",
+        "String.prototype.concat.call(x, x.length)",
     ),
-    c("RegExpMethod", "\"keep\"", "/keep/.test(x)"),
+    c("RegExpMethod", "\"keep\"", "/keep/.test(x, x.length)"),
     c("Print", "\"keep\"", "(console.log(x), 0)"),
     c("NewArray", "\"keep\"", "JSON.stringify([x])"),
     Case {

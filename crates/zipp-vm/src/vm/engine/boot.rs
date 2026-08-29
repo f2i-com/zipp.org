@@ -149,6 +149,7 @@ impl<'p> Vm<'p> {
             eval_global_map: std::collections::HashMap::new(),
             eval_global_next: program.global_count + FIELD_POOL as u32,
             builtin_globals: std::collections::HashMap::new(),
+            builtin_ns_slots: [u32::MAX; crate::vm::helpers_misc::BUILTIN_NS_COUNT],
             class_values: vec![None; program.classes.len()],
             mi_class_epoch: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

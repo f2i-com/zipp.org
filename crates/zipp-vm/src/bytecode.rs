@@ -1780,8 +1780,13 @@ pub enum Instr {
 
     /// `dst = obj.<string_constants[name]>(args…)` — method call with `this`
     /// bound to `obj`. Arguments occupy `[arg_base, arg_base+argc)`.
-    #[allow(dead_code)]
-    // sealed legacy op: its property Get occurred after argument evaluation
+    ///
+    /// The property Get happens HERE, after the arguments were evaluated, so
+    /// the compiler emits it only when every argument is order-transparent
+    /// (`FnCompiler::arg_order_transparent`: cannot run user code, throw, or
+    /// write a binding) — then no observer can tell this from EvaluateCall's
+    /// Get-before-arguments order. Any other argument shape lowers to
+    /// `GetProp` + `CallWithThis`, which performs the Get first.
     CallMethod {
         dst: Reg,
         obj: Reg,
@@ -2383,6 +2388,11 @@ pub enum MathFn {
     Max,
     Hypot,
 }
+
+/// Number of `MathFn` variants — the discriminant range `0..MATH_FN_COUNT`
+/// indexes the per-op tables (`MathIntrinsicGuard`). Kept in step with
+/// `native::MATH_METHODS`, which the guard builder asserts.
+pub const MATH_FN_COUNT: usize = 34;
 
 impl MathFn {
     /// Map a `Math.<name>` method to its function, if supported.

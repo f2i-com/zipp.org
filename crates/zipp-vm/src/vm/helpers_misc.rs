@@ -3426,6 +3426,135 @@ fn jit_direct_miss_gate(vm: &mut Vm, site_idx: u32) -> crate::codegen::DirectMis
     vm.jit.direct_miss_gate(site_idx, &memo_sites)
 }
 
+/// Read-only twin of `get_member_slow`'s Array / String tail for a NAMED
+/// (non-`length`) key: resolve a plain DATA slot on the receiver's prototype
+/// chain — the walk `proto_member_get` performs — and hand back the live
+/// Value. This is what a split member call's `GetProp` (`arr.push`,
+/// `s.charCodeAt`, `arr.map`, a user extension on `Array.prototype`) needs,
+/// and nothing here is cached: an Array is never an own-property holder for a
+/// name the probe could guard, and `%Array.prototype%` is IC-excluded.
+///
+/// Fail-closed (`None` ⇒ the caller deopts and the interpreter runs the
+/// observable path) for: an own side-table entry (`arr_props`), an arguments
+/// object, a canonical index key, a template `raw`, a RegExp-result name, an
+/// accessor anywhere on the chain, a Proxy / constructor / class-instance /
+/// live-slot (`ic_obj_ok`) link, an explicit `null` [[Prototype]] (the
+/// interpreter's `_ => break` still consults `%Object.prototype%` there — left
+/// to it), a too-deep chain, and a foreign-realm String prototype.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn jit_proto_named_get(vm: &Vm, idx: u32, key: &str) -> Option<Value> {
+    use super::helpers_numeric::canonical_index_str;
+    let start = match vm.heap.get(idx) {
+        HeapObj::Array(_) => {
+            if key == "raw"
+                || canonical_index_str(key).is_some()
+                || vm.arguments_objs.contains_key(&idx)
+                || vm.regexp_result_prop(idx, key).is_some()
+                || vm.arr_props.get(&idx).is_some_and(|m| m.pos(key).is_some())
+            {
+                return None;
+            }
+            // `array_eff_proto`, minus the null-prototype default.
+            match vm.proto_of.get(&idx) {
+                None => vm.arr_proto,
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => return None,
+            }
+        }
+        HeapObj::Str(_) | HeapObj::Cons { .. } => {
+            if canonical_index_str(key).is_some()
+                || vm.arr_props.get(&idx).is_some_and(|m| m.pos(key).is_some())
+            {
+                return None;
+            }
+            let p = vm.active_realm_proto(vm.str_proto);
+            if p != vm.str_proto {
+                return None;
+            }
+            p
+        }
+        // The collection / Date / Promise kinds: `exotic_own_or_proto`'s
+        // resolution — an own side-table entry (fail closed here), else the
+        // subclass prototype recorded in `proto_of`, else the kind's intrinsic
+        // prototype. `map.size` / `set.size` are accessors on the prototype,
+        // so they fail closed below like every other accessor.
+        HeapObj::Map { .. }
+        | HeapObj::Set(_)
+        | HeapObj::WeakMap { .. }
+        | HeapObj::WeakSet(_)
+        | HeapObj::Date(_)
+        | HeapObj::Promise { .. } => {
+            if vm.arr_props.get(&idx).is_some_and(|m| m.pos(key).is_some()) {
+                return None;
+            }
+            let kind_proto = match vm.heap.get(idx) {
+                HeapObj::Map { .. } => vm.map_proto,
+                HeapObj::Set(_) => vm.set_proto,
+                HeapObj::WeakMap { .. } => vm.weakmap_proto,
+                HeapObj::WeakSet(_) => vm.weakset_proto,
+                HeapObj::Date(_) => vm.date_proto,
+                _ => vm.promise_proto,
+            };
+            match vm.proto_of.get(&idx) {
+                None => kind_proto,
+                Some(p) if p.is_heap() => p.heap_index(),
+                Some(_) => return None,
+            }
+        }
+        _ => return None,
+    };
+    if start == 0 {
+        return None;
+    }
+    // `proto_member_get`'s loop: `own_member` (a plain map slot) per link,
+    // then the explicit `proto_of` step. Links must be ordinary objects whose
+    // slots have no live semantics (`%Array.prototype%` itself is admitted:
+    // only its `length` is synthesized, and `length` never reaches here).
+    let link_ok = |i: u32| i == vm.arr_proto || vm.ic_obj_ok(i);
+    let mut cur = start;
+    let mut guard = 0u32;
+    while cur != 0 && guard < 64 {
+        guard += 1;
+        if !link_ok(cur) {
+            return None;
+        }
+        let m = match vm.heap.get(cur) {
+            HeapObj::Object(m) if !m.is_ctor && m.class.is_none() => m,
+            _ => return None,
+        };
+        if let Some(i) = m.pos(key) {
+            if m.attr_at(i).accessor {
+                return None;
+            }
+            return Some(m.val_at(i));
+        }
+        match vm.proto_of.get(&cur) {
+            Some(p) if p.is_heap() => cur = p.heap_index(),
+            Some(_) => return None,
+            None => break,
+        }
+    }
+    if guard >= 64 {
+        return None;
+    }
+    // The implicit `%Object.prototype%` tail of a type prototype that records
+    // no `proto_of` entry.
+    if vm.obj_proto != 0 && start != vm.obj_proto {
+        if !link_ok(vm.obj_proto) {
+            return None;
+        }
+        if let HeapObj::Object(m) = vm.heap.get(vm.obj_proto) {
+            if let Some(i) = m.pos(key) {
+                if m.attr_at(i).accessor {
+                    return None;
+                }
+                return Some(m.val_at(i));
+            }
+        }
+    }
+    Some(Value::UNDEFINED)
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_get_prop_miss(
     vm: *mut core::ffi::c_void,
@@ -3796,7 +3925,58 @@ pub(crate) extern "win64" fn jit_get_prop_miss(
         }
         HeapObj::Str(s) if key == "length" => return len_value(s.units()).bits(),
         HeapObj::Cons { len, .. } if key == "length" => return len_value(*len).bits(),
-        _ => return crate::codegen::SELF_CALL_DEOPT, // other array/string props → interpreter
+        // A NAMED read on an Array / String receiver: the spec-order `GetProp`
+        // half of a split member call (`arr.push(x)`, `s.charCodeAt(i)` lower
+        // to `GetProp; args; CallWithThis`). The probe never fills for these
+        // kinds, so every execution lands here — and this arm used to DEOPT,
+        // which resumed the interpreter at this ip, ran one iteration, and
+        // re-entered the region on the back-edge: a deopt per iteration, with
+        // clean loop exits decaying the budget so short loops never even
+        // evicted (markdown-render `closeLists` [0]: 16,983 deopts at ip 4).
+        // Serve the prototype DATA slot read-only, exactly as the interpreter's
+        // `proto_member_get` walk would, without caching (the live slot is
+        // re-read per call); anything else still deopts.
+        HeapObj::Array(_) | HeapObj::Str(_) | HeapObj::Cons { .. } => {
+            // Memo first: when the receiver carries nothing of its own for the
+            // name (no side-table shadow, no custom [[Prototype]], not an
+            // arguments object, not an index) and %Array.prototype%/%String.
+            // prototype%'s slot is provably the boot intrinsic (B191's
+            // version+slot+bits memo), the answer is that intrinsic — a few
+            // loads instead of the chain walk below. Measured as the whole of
+            // parse-large-js's `src.charCodeAt(starts[ti])` phase (94ms→300ms
+            // with the walk on ~9M split reads).
+            let is_arr = matches!(vm.heap.get(idx), HeapObj::Array(_));
+            let plain_receiver = !vm.arr_props.get(&idx).is_some_and(|m| m.pos(key).is_some())
+                && (!is_arr
+                    || (!vm.proto_of.contains_key(&idx) && !vm.arguments_objs.contains_key(&idx)))
+                && super::helpers_numeric::canonical_index_str(key).is_none();
+            if plain_receiver {
+                if let Some(bits) = vm.proto_intrinsic_bits(key, is_arr) {
+                    return bits;
+                }
+            }
+            return match jit_proto_named_get(vm, idx, key) {
+                Some(v) => v.bits(),
+                None => crate::codegen::SELF_CALL_DEOPT,
+            };
+        }
+        // The same split-member-call Get on a collection / Date / Promise
+        // receiver (`routes.get(req.path)`, `p.then(cb)`): no B191 memo for
+        // these kinds, so it is the read-only prototype walk or the deopt.
+        // Without this arm a Map receiver's `get` deopted per iteration
+        // exactly like the Array case (5M-call micro: 332ms vs 65ms fused).
+        HeapObj::Map { .. }
+        | HeapObj::Set(_)
+        | HeapObj::WeakMap { .. }
+        | HeapObj::WeakSet(_)
+        | HeapObj::Date(_)
+        | HeapObj::Promise { .. } => {
+            return match jit_proto_named_get(vm, idx, key) {
+                Some(v) => v.bits(),
+                None => crate::codegen::SELF_CALL_DEOPT,
+            };
+        }
+        _ => return crate::codegen::SELF_CALL_DEOPT, // other exotic receivers → interpreter
     };
     let version = vm.heap.version_of(idx);
     if !vm.jit.direct_miss_active(site_idx) {
@@ -6129,6 +6309,28 @@ pub(crate) extern "win64" fn jit_math_imul_prefix_is_intrinsic(
     (live.receiver_bits == receiver_bits && live.callee_bits == callee_bits) as u64
 }
 
+/// Number of entries in `Vm::builtin_ns_slots`.
+pub(crate) const BUILTIN_NS_COUNT: usize = 8;
+
+/// Index into `Vm::builtin_ns_slots` for the namespaces the intrinsic guards
+/// probe on hot paths (`MathOp`, `IsArray`, `JsonParse`/`JsonStringify`,
+/// `ObjectKeys`/`Values`/`Entries`, `ArrayFrom`, `StaticFn`). Anything else
+/// resolves through the string-keyed `builtin_globals` map.
+#[inline]
+pub(crate) fn builtin_ns_index(namespace: &str) -> Option<usize> {
+    Some(match namespace {
+        "Math" => 0,
+        "JSON" => 1,
+        "Object" => 2,
+        "Array" => 3,
+        "Number" => 4,
+        "Promise" => 5,
+        "Reflect" => 6,
+        "String" => 7,
+        _ => return None,
+    })
+}
+
 impl<'p> Vm<'p> {
     pub(crate) fn static_builtin_is_intrinsic(
         &self,
@@ -6137,8 +6339,22 @@ impl<'p> Vm<'p> {
         callee: Value,
         this_v: Value,
     ) -> bool {
-        let Some(&intrinsic_receiver) = self.builtin_globals.get(namespace) else {
-            return false;
+        // The hot namespaces are served from a fixed slot table (a length
+        // check and a short memcmp); the string-keyed map — a SipHash per
+        // lookup — was measured at tens of percent on a `Math.floor`-dense
+        // loop, once per interpreted `MathOp` and per emitted-guard bail.
+        let intrinsic_receiver = match builtin_ns_index(namespace) {
+            Some(i) => {
+                let slot = self.builtin_ns_slots[i];
+                if slot == u32::MAX {
+                    return false;
+                }
+                slot
+            }
+            None => match self.builtin_globals.get(namespace) {
+                Some(&slot) => slot,
+                None => return false,
+            },
         };
         this_v == Value::heap(intrinsic_receiver)
             && callee.is_heap()

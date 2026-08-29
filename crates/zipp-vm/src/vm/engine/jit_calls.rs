@@ -1085,9 +1085,13 @@ impl<'p> Vm<'p> {
                             if cv.is_heap()
                                 && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
                             {
-                                let argv: Vec<Value> =
-                                    (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                                return match self.call_value(cv, explicit_this, &argv) {
+                                // `with_argv`: a stack buffer for the common arity (a split
+                                // `arr.push(x)` / `s.charCodeAt(i)` lands here once per call
+                                // — a heap Vec per call was the interpreter-parity tax).
+                                let called = self.with_argv(base, arg_base, argc, |vm, argv| {
+                                    vm.call_value(cv, explicit_this, argv)
+                                });
+                                return match called {
                                     Ok(v) => v.bits(),
                                     Err(t) => self.jit_thrown_to_sentinel(t),
                                 };
@@ -1104,9 +1108,10 @@ impl<'p> Vm<'p> {
                         if cv.is_heap()
                             && matches!(self.heap.get(cv.heap_index()), HeapObj::Native(_))
                         {
-                            let argv: Vec<Value> =
-                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
-                            return match self.call_value(cv, explicit_this, &argv) {
+                            let called = self.with_argv(base, arg_base, argc, |vm, argv| {
+                                vm.call_value(cv, explicit_this, argv)
+                            });
+                            return match called {
                                 Ok(v) => v.bits(),
                                 Err(t) => self.jit_thrown_to_sentinel(t),
                             };
@@ -1549,10 +1554,27 @@ mod own_method_preflight_tests {
     use super::*;
 
     fn install_legacy_call_method(program: &mut crate::bytecode::Program) -> (u32, usize, usize) {
-        // `CallMethod` is a sealed legacy opcode: the compiler now captures the
-        // property read before evaluating arguments as `GetProp + CallWithThis`.
-        // Reconstitute the old opcode explicitly so these malformed-bytecode
-        // tests continue to exercise its native preflight boundary.
+        // The compiler fuses `o.random()` to `CallMethod` when every argument is
+        // order-transparent (a zero-argument call trivially is), and otherwise
+        // captures the property read before the arguments as `GetProp +
+        // CallWithThis`. Accept the fused site directly; reconstitute it from
+        // the captured pair only if the lowering is ever split again, so these
+        // malformed-bytecode tests keep exercising the native preflight boundary
+        // either way.
+        if let Some((fid, ip, arg_base)) =
+            program
+                .functions
+                .iter()
+                .enumerate()
+                .find_map(|(fid, proto)| {
+                    proto.code.iter().enumerate().find_map(|(ip, instr)| match instr {
+                        Instr::CallMethod { arg_base, .. } => Some((fid, ip, *arg_base as usize)),
+                        _ => None,
+                    })
+                })
+        {
+            return (fid as u32, ip, arg_base);
+        }
         let (fid, ip, dst, obj, name, arg_base, argc) = program
             .functions
             .iter()

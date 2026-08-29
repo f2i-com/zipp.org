@@ -339,14 +339,25 @@ fn arr_push3_steps(
         })
     };
     let mut base = s;
-    while base + 11 <= e {
+    // A batch is three legs of one shape. The captured (spec-order) shape is
+    // `[LoadGlobal recv; GetProp callee; arg; CallWithThis]` (stride 4); the
+    // fused shape the compiler emits for a transparent argument is
+    // `[LoadGlobal recv; arg; CallMethod]` (stride 3). Both bind the SAME
+    // helper protocol — the fused leg simply has no callee register to prove.
+    while base + 8 <= e {
+        let split = matches!(proto.code[base + 1], Instr::GetProp { .. });
+        let stride = if split { 4 } else { 3 };
+        let span = 3 * stride;
+        if base + span - 1 > e {
+            break;
+        }
         let mut pins = [0usize; 3];
         let mut calls = [0usize; 3];
         let mut args = [0u16; 3];
         let mut globals = [0u32; 3];
         let mut ok = true;
         for leg in 0..3usize {
-            let b = base + 4 * leg;
+            let b = base + stride * leg;
             let (recv, global) = match proto.code[b] {
                 Instr::LoadGlobal { dst, idx } => (dst, idx),
                 _ => {
@@ -354,62 +365,91 @@ fn arr_push3_steps(
                     break;
                 }
             };
-            let (saved_callee, get_obj) = match proto.code[b + 1] {
-                Instr::GetProp { dst, obj, .. } => (dst, obj),
-                _ => {
-                    ok = false;
-                    break;
-                }
-            };
-            let arg = match proto.code[b + 2] {
+            let arg_ip = if split { b + 2 } else { b + 1 };
+            let call_ip = b + stride - 1;
+            let arg = match proto.code[arg_ip] {
                 Instr::LoadInt { dst, .. } | Instr::Move { dst, .. } => dst,
                 _ => {
                     ok = false;
                     break;
                 }
             };
-            let (dst, callee, obj, arg_base) = match proto.code[b + 3] {
-                Instr::CallWithThis {
-                    dst,
-                    callee,
-                    this_v,
-                    arg_base,
-                    argc: 1,
-                } => (dst, callee, this_v, arg_base),
-                _ => {
+            let (dst, obj, arg_base) = if split {
+                let (saved_callee, get_obj) = match proto.code[b + 1] {
+                    Instr::GetProp { dst, obj, .. } => (dst, obj),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                };
+                let (dst, callee, obj, arg_base) = match proto.code[call_ip] {
+                    Instr::CallWithThis {
+                        dst,
+                        callee,
+                        this_v,
+                        arg_base,
+                        argc: 1,
+                    } => (dst, callee, this_v, arg_base),
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                };
+                let Some(site) = captured_arr_push(proto, call_ip, ta_plan) else {
+                    ok = false;
+                    break;
+                };
+                if get_obj != recv
+                    || callee != saved_callee
+                    || site.get_ip != b + 1
+                    || site.call_ip != call_ip
+                    || site.obj != recv
+                    || site.callee != saved_callee
+                {
                     ok = false;
                     break;
                 }
+                (dst, obj, arg_base)
+            } else {
+                match proto.code[call_ip] {
+                    Instr::CallMethod {
+                        dst,
+                        obj,
+                        name,
+                        arg_base,
+                        argc: 1,
+                    } if proto
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|k| k == "push") =>
+                    {
+                        (dst, obj, arg_base)
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
             };
-            let Some(site) = captured_arr_push(proto, b + 3, ta_plan) else {
-                ok = false;
-                break;
-            };
-            let Some(j) = arr_push_pin(proto, b + 3, ta_plan) else {
+            let Some(j) = arr_push_pin(proto, call_ip, ta_plan) else {
                 ok = false;
                 break;
             };
             if obj != recv
-                || get_obj != recv
-                || callee != saved_callee
-                || site.get_ip != b + 1
-                || site.call_ip != b + 3
-                || site.obj != recv
-                || site.callee != saved_callee
                 || arg_base != arg
                 || ta_plan.pins[j].src != TaPinSrc::Global(global)
                 || !global_is_stable(global)
                 // Prove these exact definitions dead/contained rather than
                 // rejecting a compiler register merely because a later,
                 // dominating overwrite recycles it for a boxed temporary.
-                || reg_value_is_observable_after_def(&proto.code, dst, b + 3, &[])
-                || reg_value_is_observable_after_def(&proto.code, arg, b + 2, &[b + 3])
+                || reg_value_is_observable_after_def(&proto.code, dst, call_ip, &[])
+                || reg_value_is_observable_after_def(&proto.code, arg, arg_ip, &[call_ip])
                 // A future setup is speculative until the helper commits. On
                 // decline, replay begins at `base`; no split/write-through
                 // frame value may be read before its exact argument def
                 // reconstructs it. Handler/finally paths already fail closed
                 // in the CFG proof above.
-                || proto.code[base..b + 2]
+                || proto.code[base..arg_ip]
                     .iter()
                     .any(|ins| instr_uses(ins).contains(&arg))
                 || plan.slot_consts.contains_key(&arg)
@@ -419,7 +459,7 @@ fn arr_push3_steps(
                 break;
             }
             pins[leg] = j;
-            calls[leg] = b + 3;
+            calls[leg] = call_ip;
             args[leg] = arg;
             globals[leg] = global;
         }
@@ -430,10 +470,10 @@ fn arr_push3_steps(
             && globals[0] != globals[1]
             && globals[0] != globals[2]
             && globals[1] != globals[2]
-            && !(base..=base + 11).any(|ip| cold.contains(&ip))
+            && !(base..base + span).any(|ip| cold.contains(&ip))
             // The first receiver load may itself be a branch target; it is the
             // semantic start of the batch. No control flow may enter later.
-            && !(base + 1..=base + 11).any(|ip| plan.jump_targets.contains(&ip))
+            && !(base + 1..base + span).any(|ip| plan.jump_targets.contains(&ip))
         {
             for stage in 0..3usize {
                 out.insert(
@@ -446,7 +486,7 @@ fn arr_push3_steps(
                     },
                 );
             }
-            base += 12;
+            base += span;
         } else {
             base += 1;
         }
@@ -2224,7 +2264,9 @@ pub(crate) fn compile_region_int_maybe_cold(
             // leaf call which preflights all three pins before mutating any,
             // then appends in the original order and refreshes every snapshot.
             // All three result registers are proven unread by `arr_push3_steps`.
-            Instr::CallWithThis { arg_base, .. } if push3.contains_key(&ip) => {
+            Instr::CallWithThis { arg_base, .. } | Instr::CallMethod { arg_base, .. }
+                if push3.contains_key(&ip) =>
+            {
                 let step = push3[&ip];
                 let vx = xh(&plan, arg_base);
                 dynasm!(ops ; movq [rsp + push3_vals_off + 8 * step.stage as i32], Rx(vx));

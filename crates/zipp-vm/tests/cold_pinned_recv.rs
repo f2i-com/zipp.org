@@ -395,24 +395,48 @@ fn coldrecv_mechanism_int_gpr_oob() {
 
 #[test]
 fn coldrecv_mechanism_str_charcodeat_oob() {
+    // A literal argument is order-transparent (it cannot run user code, throw,
+    // or write a binding), so `s.charCodeAt(9999)` FUSES to `CallMethod` — the
+    // lane this mechanism test exercises — and the property Get's position
+    // relative to the argument is unobservable.
     let bytecode = zipp_vm::compile_to_text(STR_CHARCODEAT_OOB, false)
         .expect("charCodeAt mechanism source compiles");
-    let get = bytecode
+    assert!(
+        bytecode.contains("val: 9999"),
+        "the out-of-bounds argument must remain in the bytecode"
+    );
+    assert!(
+        bytecode.contains("CallMethod {"),
+        "a literal-argument charCodeAt call must fuse to CallMethod"
+    );
+    // An IMPURE argument (a call) is where EvaluateCall's Get-before-arguments
+    // order is observable: that spelling must capture the callee with GetProp
+    // before the argument evaluates, then call it with the receiver.
+    let impure = STR_CHARCODEAT_OOB.replace("s.charCodeAt(9999)", "s.charCodeAt(oob())");
+    let captured = zipp_vm::compile_to_text(&impure, false)
+        .expect("impure-argument charCodeAt source compiles");
+    // Search from `kernel`'s own code: the script body (`console.log(kernel(20))`)
+    // is dumped first and carries a GetProp and a Call of its own.
+    let kernel_at = captured
+        .find("name: \"kernel\"")
+        .expect("the kernel function is in the dump");
+    let captured = &captured[kernel_at..];
+    let get = captured
         .find("GetProp {")
-        .expect("charCodeAt callee must be captured with GetProp");
-    let arg = bytecode
-        .find("val: 9999")
-        .expect("the out-of-bounds argument must remain in the bytecode");
-    let call = bytecode
+        .expect("an impure-argument charCodeAt callee must be captured with GetProp");
+    let arg = captured
+        .find("Call {")
+        .expect("the argument call must remain in the bytecode");
+    let call = captured
         .find("CallWithThis {")
-        .expect("captured charCodeAt must be called with its receiver");
+        .expect("a captured charCodeAt must be called with its receiver");
     assert!(
         get < arg && arg < call,
         "EvaluateCall order regressed: GetProp must precede the argument and call"
     );
     assert!(
-        !bytecode.contains("CallMethod {"),
-        "legacy CallMethod resolves the property after argument evaluation"
+        !captured.contains("CallMethod {"),
+        "an impure argument must not fuse (the Get would follow argument evaluation)"
     );
 
     let test = "coldrecv_parity_str_charcodeat_oob";

@@ -1148,6 +1148,10 @@ pub struct Vm<'p> {
     /// `eval("Object.keys(x)")`) instead of seeing the never-declared sentinel.
     /// Values are permanent roots (traced in gc, never pruned).
     builtin_globals: std::collections::HashMap<String, u32>,
+    /// Hash-free twin of `builtin_globals` for the namespaces the intrinsic
+    /// guards probe per operation (`helpers_misc::builtin_ns_index`);
+    /// `u32::MAX` = not registered. Filled beside the map at boot.
+    builtin_ns_slots: [u32; crate::vm::helpers_misc::BUILTIN_NS_COUNT],
     /// Most-recent class value per class_id (filled by `MakeClass`), so a
     /// `super` call can reach its lexical superclass value at runtime.
     class_values: Vec<Option<Value>>,

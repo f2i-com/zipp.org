@@ -1365,7 +1365,12 @@ fn plan_region_cold_inner(
                 }
             }
             for &r in &recv {
-                let captured_prefix_split = captured_pinned_recv.contains(&r);
+                // A captured member-call receiver is exempt from the split
+                // budget — but only while the multi-split package is on:
+                // `ZIPP_NO_MULTI_SPLIT=1` must still send a two-receiver
+                // kernel to the memory tier, or the latch measures nothing.
+                let captured_prefix_split =
+                    captured_pinned_recv.contains(&r) && crate::codegen::multi_split_enabled();
                 // Cleanly excludable when EITHER: (a) defined by exactly one
                 // LoadGlobal and used only as a pinned obj (the global-receiver
                 // case); OR (b) a live-in PARAM receiver — ZERO in-region defs and

@@ -2848,6 +2848,9 @@ impl<'p> Vm<'p> {
                 }
             }
             self.builtin_globals.insert(name.to_string(), v);
+            if let Some(i) = crate::vm::helpers_misc::builtin_ns_index(name) {
+                self.builtin_ns_slots[i] = v;
+            }
         }
         // Inject into the program's reserved global slots (collect first to end the
         // program borrow before mutating `self.globals`).

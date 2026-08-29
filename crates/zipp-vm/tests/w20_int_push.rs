@@ -934,12 +934,15 @@ fn intpush_mechanism_reaches_the_int_tier() {
         on.contains("[jit] INT region fn") && on.contains("compiled"),
         "package ON did not reach the INT tier; log was:\n{on}"
     );
-    // Rung 1 off: capture-first lowering leaves the ordinary `CallWithThis`
-    // decline in place and nothing else changes.
+    // Rung 1 off: the ordinary method-call decline is back in place and
+    // nothing else changes. `arr.push(b)` with a transparent argument fuses
+    // to `CallMethod`; an impure argument would take the captured
+    // `CallWithThis` form — either spelling of the decline is the same rung.
     let no_push = jitlog_of(&src, &[("ZIPP_NO_INT_PUSH", "1")]);
     assert!(
-        no_push.contains("CallWithThis (not a captured pinned string/DataView/Array.push)"),
-        "ZIPP_NO_INT_PUSH=1 did not restore the CallWithThis decline; log was:\n{no_push}"
+        no_push.contains("CallMethod (receiver not a pinned string/DataView)")
+            || no_push.contains("CallWithThis (not a captured pinned string/DataView/Array.push)"),
+        "ZIPP_NO_INT_PUSH=1 did not restore the method-call decline; log was:\n{no_push}"
     );
     // Rung 2 off: the region gets past `push` and declines one rung later, at
     // the bool pool — the decline string that appears on NO bench row today.

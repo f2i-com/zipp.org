@@ -1302,6 +1302,16 @@ pub struct MathIntrinsicGuard {
     pub callee_bits: u64,
     /// Heap-slot generation paired with `callee_bits`, defeating slot-reuse ABA.
     pub callee_ver: u32,
+    /// Per-op twins of `callee_bits`/`callee_ver`, indexed by the `MathFn`
+    /// discriminant: the exact main-realm intrinsic callable of EVERY `Math.*`
+    /// method that was a plain intrinsic data property when this code was
+    /// compiled (`0` bits = not baked: the emitted guard falls back to the
+    /// `jit_math_is_intrinsic` helper call for that op). This is what lets an
+    /// emitted `MathOp` validate its captured callee/receiver with three inline
+    /// compares instead of a helper call per execution — the helper's namespace
+    /// lookup alone was a string hash per `Math.floor(x)`.
+    pub op_callee_bits: [u64; crate::bytecode::MATH_FN_COUNT],
+    pub op_callee_ver: [u32; crate::bytecode::MATH_FN_COUNT],
 }
 
 #[derive(Clone, Copy)]
@@ -1361,6 +1371,12 @@ pub struct HeapHelperAddrs {
     pub window_close: usize,
     pub cross3_unroot: usize,
     pub cross3_finish: usize,
+    /// Value bits of the boot `%Array.prototype%.push` / `%String.prototype%.
+    /// charCodeAt` natives (0 = unavailable), for the split-member-call
+    /// intrinsic lane (`emit_captured_builtin_lane`): a `CallWithThis` whose
+    /// captured callee IS that native runs the dedicated helper.
+    pub push_intrinsic_bits: u64,
+    pub char_code_at_intrinsic_bits: u64,
     /// Helper for a `GetProp` the miss helper routed `PROP_VIA_IC` (accessor /
     /// class-instance receiver): interpreter-IC resolution + getter frame
     /// call. Returns the value bits / `SELF_CALL_DEOPT` / `CALL_THREW`.
@@ -1553,6 +1569,8 @@ impl HeapHelperAddrs {
             window_close: self.window_close,
             cross3_unroot: self.cross3_unroot,
             cross3_finish: self.cross3_finish,
+            push_intrinsic_bits: self.push_intrinsic_bits,
+            char_code_at_intrinsic_bits: self.char_code_at_intrinsic_bits,
             get_prop_slow: self.get_prop_slow,
             set_prop_slow: self.set_prop_slow,
             get_prop_acc: self.get_prop_acc,

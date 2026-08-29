@@ -3176,6 +3176,26 @@ pub(crate) fn compile_region_mem(
                 // target, but guards `callee` in addition to the receiver and
                 // member structure. Every miss falls through to the exact
                 // CallWithThis helper; it must never re-resolve by name.
+                //
+                // Split builtin call (`arr.push(x)` / `s.charCodeAt(i)`): the
+                // captured-intrinsic lane first — a bits-guarded direct
+                // helper call; every miss is a pure prefix of the generic
+                // path below.
+                let lane_done =
+                    captured_builtin_lane(proto, ip, callee, argc, &heap).map(
+                        |(bits, helper, grows)| {
+                            emit_captured_builtin_lane(
+                                &mut ops,
+                                callee,
+                                this_v,
+                                arg_base,
+                                dst,
+                                bits,
+                                helper,
+                                if grows { ta_refetch } else { None },
+                            )
+                        },
+                    );
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let packed_args =
                     ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
@@ -3212,6 +3232,9 @@ pub(crate) fn compile_region_mem(
                         refetch_pinned.then_some((heap.versions_base, heap.ic_base)),
                         ta_refetch,
                     );
+                }
+                if let Some(done) = lane_done {
+                    dynasm!(ops ; => done);
                 }
             }
             Instr::StrConcat { dst, a, b } => {

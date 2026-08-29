@@ -216,19 +216,34 @@ fn logged_child(test: &str, extra: &[(&str, &str)]) -> String {
 #[test]
 fn shadow_mechanism_engages_and_switch_falls_back() {
     let cases = [
+        // Census values follow the compiler's temporary layout (region spans
+        // are deliberately not pinned — they move with it). These are the
+        // pre-hardening values: the fused method-call lowering leaves no
+        // receiver snapshot and no post-call register reset behind, so every
+        // fixture sits inside V1's closed proof again.
+        (
+            "shadow_parity_throw_deopt_receiver_reload_and_wide_globals",
+            "regs=1 globs=2 reg-writes=1 glob-writes=2 recv-resets=1",
+            Some("deopt at ip"),
+        ),
         (
             "shadow_parity_loop_boundary_side_exit",
-            "regs=4 globs=5 reg-writes=9 glob-writes=5 recv-resets=2",
+            "regs=3 globs=5 reg-writes=6 glob-writes=5 recv-resets=1",
+            None,
+        ),
+        (
+            "shadow_parity_elided_mul_loop_bound",
+            "regs=3 globs=2 reg-writes=3 glob-writes=2 recv-resets=1",
             None,
         ),
         (
             "shadow_parity_i53_guard_exit",
-            "regs=4 globs=2 reg-writes=6 glob-writes=2 recv-resets=2",
+            "regs=3 globs=2 reg-writes=4 glob-writes=2 recv-resets=1",
             Some("deopt at ip"),
         ),
         (
             "shadow_parity_i64_min_entry_bail",
-            "regs=4 globs=3 reg-writes=10 glob-writes=3 recv-resets=2",
+            "regs=3 globs=3 reg-writes=6 glob-writes=3 recv-resets=1",
             Some("deopt at ip"),
         ),
     ];
@@ -252,30 +267,6 @@ fn shadow_mechanism_engages_and_switch_falls_back() {
             assert!(
                 on.contains(exit),
                 "the intended dynamic exit did not run for {test}:\n{on}"
-            );
-        }
-    }
-
-    for (test, required_guard) in [
-        (
-            "shadow_parity_throw_deopt_receiver_reload_and_wide_globals",
-            Some("type-split r"),
-        ),
-        ("shadow_parity_elided_mul_loop_bound", None),
-    ] {
-        let on = logged_child(test, &[]);
-        assert!(
-            !on.contains("GPR deopt-shadow engaged"),
-            "{test} bypassed a closed V1 shadow guard:\n{on}"
-        );
-        assert!(
-            on.contains("GPR homes engaged"),
-            "{test} should retain the incumbent GPR tier:\n{on}"
-        );
-        if let Some(marker) = required_guard {
-            assert!(
-                on.contains(marker),
-                "{test} no longer demonstrates its intended V1 guard:\n{on}"
             );
         }
     }

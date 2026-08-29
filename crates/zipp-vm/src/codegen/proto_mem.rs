@@ -4998,6 +4998,17 @@ pub(crate) fn compile_proto_mem(
                 // Exact captured-reference call. The helper reads both Value
                 // operands from the rooted VM register window on every
                 // execution; no name/shape-based target lookup is permitted.
+                // Split builtin call: the captured-intrinsic lane first (a
+                // bits-guarded direct helper; misses fall through) — see
+                // `emit_captured_builtin_lane`. Tier C pins no arrays.
+                let lane_done =
+                    captured_builtin_lane(proto, ip, callee, argc, &heap).map(
+                        |(bits, helper, _)| {
+                            emit_captured_builtin_lane(
+                                &mut ops, callee, this_v, arg_base, dst, bits, helper, None,
+                            )
+                        },
+                    );
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let packed_args =
                     ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
@@ -5014,6 +5025,9 @@ pub(crate) fn compile_proto_mem(
                     refetch,
                     None,
                 );
+                if let Some(done) = lane_done {
+                    dynasm!(ops ; => done);
+                }
             }
             Instr::StrAppendInPlace { dst, a, b } => {
                 // In-place `dst = a + b` (the linearity-proved accumulator

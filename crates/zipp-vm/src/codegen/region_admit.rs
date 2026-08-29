@@ -1566,6 +1566,10 @@ pub(crate) struct HeapHelpers {
     pub(crate) window_close: usize,
     pub(crate) cross3_unroot: usize,
     pub(crate) cross3_finish: usize,
+    /// Boot `Array.prototype.push` / `String.prototype.charCodeAt` bits (0 =
+    /// none) — see `HeapHelperAddrs::push_intrinsic_bits`.
+    pub(crate) push_intrinsic_bits: u64,
+    pub(crate) char_code_at_intrinsic_bits: u64,
     /// `PROP_VIA_IC` continuation for GetProp (accessor / class receiver).
     pub(crate) get_prop_slow: usize,
     /// `PROP_VIA_IC` continuation for SetProp.

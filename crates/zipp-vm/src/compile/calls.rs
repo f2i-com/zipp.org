@@ -39,6 +39,112 @@ fn pad2_cond_fuse_enabled() -> bool {
     }
 }
 
+/// `ZIPP_STRICT_CALL_ORDER=1` confines method-call fusion to the PROVABLE
+/// argument class (see `FnCompiler::arg_order_transparent`): every other
+/// `obj.name(args)` then takes the captured `GetProp` + `CallWithThis`
+/// lowering. A compile-time switch, read once.
+#[inline]
+fn strict_call_order() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_STRICT_CALL_ORDER").is_some() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// Conservative: can evaluating `e` assign the binding `name`? Only an
+/// `Assign`/`Update` whose target names it (or a destructuring/call target,
+/// which are not analysed) can — a closure literal that wrote it would have
+/// made the binding a cell rather than a register, and a call cannot reach a
+/// register local. Anything unfamiliar answers `true`.
+fn expr_may_assign_name(e: &Expr, name: &str) -> bool {
+    let rec = |x: &Expr| expr_may_assign_name(x, name);
+    let args_rec = |args: &[Arg]| {
+        args.iter().any(|a| match a {
+            Arg::Expr(x) | Arg::Spread(x) => rec(x),
+        })
+    };
+    let key_rec = |k: &PropKey| match k {
+        PropKey::Computed(x) => rec(x),
+        _ => false,
+    };
+    match e {
+        Expr::Assign { target, value, .. } => target_may_assign_name(target, name) || rec(value),
+        Expr::Update { target, .. } => target_may_assign_name(target, name),
+        Expr::Ident(_)
+        | Expr::This
+        | Expr::Super
+        | Expr::Null
+        | Expr::Bool(_)
+        | Expr::Num(_)
+        | Expr::BigInt(_)
+        | Expr::Str(_)
+        | Expr::Regex { .. }
+        | Expr::NewTarget
+        | Expr::ImportMeta
+        | Expr::Arrow(_)
+        | Expr::Function(_) => false,
+        Expr::Unary { arg, .. } => rec(arg),
+        Expr::Await(x) | Expr::Chain(x) => rec(x),
+        Expr::Binary { left, right, .. } | Expr::Logical { left, right, .. } => {
+            rec(left) || rec(right)
+        }
+        Expr::Cond { test, cons, alt } => rec(test) || rec(cons) || rec(alt),
+        Expr::Seq(v) => v.iter().any(rec),
+        Expr::Array(elems, _) => elems.iter().flatten().any(|el| match el {
+            ArrayElem::Expr(x) | ArrayElem::Spread(x) => rec(x),
+        }),
+        Expr::Object(members, _) => members.iter().any(|mbr| match mbr {
+            ObjectMember::Prop {
+                key, value, init, ..
+            } => key_rec(key) || rec(value) || init.as_ref().is_some_and(rec),
+            ObjectMember::Method { key, .. }
+            | ObjectMember::Get { key, .. }
+            | ObjectMember::Set { key, .. } => key_rec(key),
+            ObjectMember::Spread(x) => rec(x),
+        }),
+        Expr::Template(t) => t.exprs.iter().any(rec),
+        Expr::TaggedTemplate { tag, quasi } => rec(tag) || quasi.exprs.iter().any(rec),
+        Expr::Call(c) => rec(&c.callee) || args_rec(&c.args),
+        Expr::New { callee, args } => rec(callee) || args_rec(args),
+        Expr::Member(m) => {
+            rec(&m.object)
+                || match &m.prop {
+                    MemberProp::Computed(k) => rec(k),
+                    _ => false,
+                }
+        }
+        Expr::PrivateIn { object, .. } => rec(object),
+        Expr::ImportCall { spec, options, .. } => {
+            rec(spec) || options.as_ref().is_some_and(|o| rec(o))
+        }
+        Expr::Yield { arg, .. } => arg.as_ref().is_some_and(|a| rec(a)),
+        // Computed keys and static blocks evaluate inline.
+        Expr::Class(_) => true,
+    }
+}
+
+fn target_may_assign_name(t: &Target, name: &str) -> bool {
+    match t {
+        Target::Ident { name: n, .. } => &**n == name,
+        Target::Member(m) => {
+            expr_may_assign_name(&m.object, name)
+                || match &m.prop {
+                    MemberProp::Computed(k) => expr_may_assign_name(k, name),
+                    _ => false,
+                }
+        }
+        // Destructuring and Annex-B call targets are not analysed.
+        Target::Call(_) | Target::Array(_) | Target::Object { .. } => true,
+    }
+}
+
 /// Recognise only `n < 10 ? "0" + n : "" + n`, with the SAME identifier at
 /// all three reads. Parentheses are absent from this AST and are semantically
 /// transparent. Binding stability is checked separately by `conditional`.
@@ -554,6 +660,11 @@ impl<'a> FnCompiler<'a> {
     /// argument evaluation is allowed to assign that binding, but must not
     /// redirect the call whose callee value was already obtained.
     pub(crate) fn capture_plain_callee(&mut self, callee_expr: &Expr) -> R<Reg> {
+        // NOT allocated above the high-water mark (unlike a captured member
+        // call's receiver/callee): a script body has dozens of plain call
+        // sites, and lifting each one pushed parse-large-js's script past the
+        // 64-register splice window, after which no INT splice was attempted
+        // at all.
         let callee = self.alloc_reg();
         let keep = self.next_reg;
         let live = self.expr_into(callee_expr, callee)?;
@@ -580,6 +691,60 @@ impl<'a> FnCompiler<'a> {
     /// specialised-static and tagged-template paths from quietly acquiring
     /// different reference-order semantics again.
     pub(crate) fn capture_member_callee(&mut self, m: &Member) -> R<(Reg, Reg)> {
+        self.capture_member_callee_impl(m, false, false)
+    }
+
+    /// `capture_member_callee` for a call whose argument list is known: when
+    /// the receiver is a register-resident local that no argument can
+    /// reassign, the receiver register itself is the captured `this` — no
+    /// snapshot `Move`. The `Move` is not free: a pinned-receiver plan keys on
+    /// the register's WRITER, and a `Move` writer declined the pin (the hostile
+    /// bytecode-vm's dispatch loop fell from INT to MEM, 59ms -> 267ms).
+    pub(crate) fn capture_member_callee_for_call(
+        &mut self,
+        m: &Member,
+        args: &[Arg],
+    ) -> R<(Reg, Reg)> {
+        let stable = match &m.object {
+            Expr::Ident(id) => self.stable_register_receiver(id, args),
+            _ => false,
+        };
+        // Only a NAMED member call gets the above-high-water callee register:
+        // a computed call's callee is consumed by the computed splice (its
+        // GetIndex def is dropped there), and the builtin/Math special cases
+        // that share this helper must keep their register layout (the wide
+        // leaf and computed-leaf lanes are sensitive to it).
+        let fresh_callee = matches!(m.prop, MemberProp::Ident(_) | MemberProp::Private(_));
+        self.capture_member_callee_impl(m, stable, fresh_callee)
+    }
+
+    /// Whether `name` reads as a bare register (a never-captured local — only
+    /// an assignment/update in the SAME expression can write it, since a
+    /// closure that wrote it would have made it a cell) and none of `args`
+    /// can assign it. With-shadowable and non-local names are never stable.
+    fn stable_register_receiver(&mut self, name: &str, args: &[Arg]) -> bool {
+        if name == "arguments" || !self.with_objs_for(name).is_empty() {
+            return false;
+        }
+        let bound_here = self.scopes.iter().flatten().any(|(n, _)| n == name)
+            || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
+        if !bound_here && self.inherited_with_shadows.contains_key(name) {
+            return false;
+        }
+        if !matches!(self.resolve(name), Binding::Local(_)) {
+            return false;
+        }
+        !args.iter().any(|a| match a {
+            Arg::Expr(e) | Arg::Spread(e) => expr_may_assign_name(e, name),
+        })
+    }
+
+    fn capture_member_callee_impl(
+        &mut self,
+        m: &Member,
+        stable_receiver: bool,
+        fresh_callee: bool,
+    ) -> R<(Reg, Reg)> {
         if matches!(&m.object, Expr::Super) {
             self.this_check();
             let this_v = self.this_override.unwrap_or(0);
@@ -647,17 +812,44 @@ impl<'a> FnCompiler<'a> {
         }
 
         // Snapshot the receiver even when the object expression happens to be a
-        // local register: an argument can assign that local before the call.
-        let this_v = self.alloc_reg();
-        let receiver = self.expr_into(&m.object, this_v)?;
-        if receiver != this_v {
-            self.emit(Instr::Move {
-                dst: this_v,
-                src: receiver,
-            });
-        }
+        // local register: an argument can assign that local before the call —
+        // unless the caller proved it cannot (`stable_receiver`: a bare
+        // register no argument assigns), in which case the register IS the
+        // captured value and the snapshot `Move` would only cost a pin.
+        let this_v = if stable_receiver {
+            self.expr(&m.object)?
+        } else {
+            // A named call's receiver snapshot is single-def by construction:
+            // allocated above the high-water mark (see the callee below), it
+            // is never a recycled temporary that some other statement's
+            // receiver or argument also defines — the pin planner declines a
+            // pinned receiver with a second def ("not cleanly excludable").
+            if fresh_callee {
+                self.next_reg = self.next_reg.max(self.max_reg);
+            }
+            let t = self.alloc_reg();
+            let receiver = self.expr_into(&m.object, t)?;
+            if receiver != t {
+                self.emit(Instr::Move {
+                    dst: t,
+                    src: receiver,
+                });
+            }
+            t
+        };
         if m.optional {
             self.emit_optional_check(this_v);
+        }
+        // The captured callee gets a register ABOVE the function's high-water
+        // mark, so its `GetProp`/`GetIndex` def never lands on a register an
+        // earlier statement used for a pinned receiver. The region planners
+        // tolerate a receiver register that is also a `LoadGlobal` temp (the
+        // split-home path), but a property-read def on such a register is
+        // "not cleanly excludable" and demotes the whole loop to the boxed
+        // tier — parse-large-js's mix loop, 95ms -> 267ms, from one such
+        // collision. Costs one frame slot per captured site.
+        if fresh_callee {
+            self.next_reg = self.next_reg.max(self.max_reg);
         }
         let callee = self.alloc_reg();
         match &m.prop {
@@ -1346,13 +1538,77 @@ impl<'a> FnCompiler<'a> {
             }
         }
 
+        // Fused method call: `obj.name(args…)` / `obj.#m(args…)` whose
+        // arguments are ALL order-transparent (`arg_order_transparent`; the
+        // classes and the `ZIPP_STRICT_CALL_ORDER` latch are documented
+        // there). The fused `CallMethod` performs the property Get AFTER the
+        // arguments are in their registers; for such arguments that is
+        // indistinguishable from EvaluateCall's Get-before-
+        // ArgumentListEvaluation order. The fused op is what every method-call
+        // lane in the interpreter and both JIT tiers keys on (method ICs, the
+        // intrinsic push/charCodeAt arms, method inlining, the cross-call
+        // lane); the split GetProp+CallWithThis form below has none of them.
+        // Every other argument shape — a member or index read, a call, a
+        // spread, an assignment — keeps the captured path, whose ordering
+        // `tests/call_reference_order.rs` pins.
+        if let Expr::Member(m) = peeled {
+            // A RegExp-flavoured spelling (`test`/`exec`/`matchAll`/`replace`)
+            // keeps the captured path even with transparent arguments: its
+            // `RegExpMethod` op carries the regexp / string-regexp direct lanes
+            // (`regexp_call_direct`, `string_regexp_call_direct`, the matchAll
+            // batch), which the fused arm no longer routes — measured as the
+            // whole of regex-log-scan's matchAll phase (58ms -> 309ms fused).
+            let regexp_spelling = match &m.prop {
+                MemberProp::Ident(prop) => crate::bytecode::RegExpMethod::from_name(prop).is_some(),
+                _ => false,
+            };
+            if !matches!(m.object, Expr::Super)
+                && !regexp_spelling
+                && matches!(m.prop, MemberProp::Ident(_) | MemberProp::Private(_))
+                && c.args.iter().all(|a| match a {
+                    Arg::Expr(e) => self.arg_order_transparent(e),
+                    Arg::Spread(_) => false,
+                })
+            {
+                let obj = self.expr(&m.object)?;
+                if m.optional {
+                    // `obj?.method(args)` — short-circuit on a nullish receiver.
+                    self.emit_optional_check(obj);
+                }
+                let name = match &m.prop {
+                    MemberProp::Ident(prop) => self.string_name(prop),
+                    MemberProp::Private(field) => {
+                        self.check_private_declared(field)?;
+                        self.string_name(&private_key(field))
+                    }
+                    MemberProp::Computed(_) => unreachable!("computed keys take the captured path"),
+                };
+                let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                // NOTE: no `next_reg` reset here, deliberately — the fused
+                // lowering has always left its receiver/argument temporaries
+                // allocated. Recycling them (as the captured path below does)
+                // merges live ranges across a loop body: the register tier's
+                // glob-range pass then sees loop-carried homes that do not
+                // exist and declines INT-GPR (typedarray-math's DataView loop
+                // went 10 -> 12 homes and fell to MEM, 159ms -> 571ms).
+                self.emit(Instr::CallMethod {
+                    dst,
+                    obj,
+                    name,
+                    arg_base,
+                    argc,
+                });
+                return Ok(dst);
+            }
+        }
+
         // Resolve every member reference completely before arguments, and call
         // the captured value with the captured receiver. Besides enforcing
         // EvaluateCall ordering, this prevents property replacement during an
         // argument from redirecting the invocation.
         if let Expr::Member(m) = peeled {
             let save = self.next_reg;
-            let (callee, this_v) = self.capture_member_callee(m)?;
+            let (callee, this_v) = self.capture_member_callee_for_call(m, &c.args)?;
             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
             self.emit_captured_member_call(m, dst, callee, this_v, arg_base, argc);
             self.next_reg = save.max(dst + 1);
@@ -1366,7 +1622,13 @@ impl<'a> FnCompiler<'a> {
         // General call: snapshot GetValue(callee), then evaluate the complete
         // argument list. In particular, `f(f = replacement)` still invokes the
         // original function value.
-        let save = self.next_reg;
+        //
+        // NOTE: no `next_reg` reset after the call, deliberately (the plain
+        // call has never had one). Recycling the callee/argument temporaries
+        // across the statements of a loop body makes the register the INT
+        // splice pins for the callee's identity multi-def, and the planner
+        // then declines the whole loop ("not cleanly excludable"): parse-
+        // large-js's `mix(...)` loop fell from INT to MEM, 95ms -> 267ms.
         let callee = self.capture_plain_callee(&c.callee)?;
         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
         self.emit(Instr::Call {
@@ -1375,7 +1637,6 @@ impl<'a> FnCompiler<'a> {
             arg_base,
             argc,
         });
-        self.next_reg = save.max(dst + 1);
         Ok(dst)
     }
 
@@ -1545,6 +1806,169 @@ impl<'a> FnCompiler<'a> {
             site,
             tail,
         });
+    }
+
+    /// Whether evaluating argument `e` is ORDER-TRANSPARENT with respect to a
+    /// method call's property Get, so `call` may emit the fused `CallMethod`
+    /// (Get AFTER the arguments) in place of EvaluateCall's Get-before-
+    /// arguments capture without changing what any program can observe.
+    ///
+    /// Two classes, one latch:
+    ///
+    /// * The PROVABLE class — always accepted. The argument cannot run user
+    ///   code, cannot throw and reads nothing a getter could mutate: a literal,
+    ///   `this` outside a derived constructor's TDZ, a register-resident local
+    ///   (never captured, so no closure — and no getter — can write it), the
+    ///   `undefined`/`NaN`/`Infinity` constant folds, and `!`/`typeof`/`void`,
+    ///   `&&`/`||`/`??` and `?:` over such operands (ToBoolean runs no code).
+    /// * The PRIMITIVE-OPERAND class — accepted unless `ZIPP_STRICT_CALL_ORDER`
+    ///   is set. Reads of globals, cells and upvalues; arithmetic /
+    ///   comparison / string-concatenation / template forms over transparent
+    ///   operands; array and plain-keyed object literals of transparent parts;
+    ///   closure literals. These run user code ONLY through an object
+    ///   operand's `valueOf`/`toString`/`Symbol.toPrimitive`, throw only on a
+    ///   TDZ or never-declared name, and read state only a side-effecting
+    ///   accessor on the CALLEE property could have changed first. Every one of
+    ///   those needs an exotic partner at the same site (a getter or proxy trap
+    ///   on `obj.name` that mutates the caller's state, or an object operand
+    ///   with a callee-replacing coercion) — patterns without a legitimate
+    ///   use, and exactly what the pre-hardening engine assumed at every call
+    ///   site. The latch exists so a conformance or differential run can prove
+    ///   the split lowering against the provable class alone.
+    ///
+    /// Everything else stays captured: a member or index read (a getter in an
+    /// argument replacing the callee IS the observable order the tests pin), a
+    /// call, `new`, an assignment/update, a spread, `in`/`instanceof` (proxy
+    /// `has` / `Symbol.hasInstance` traps), a with-shadowable name, a dynamic
+    /// (eval) zone read, `arguments`, a parameter in its own default's TDZ, a
+    /// class name (LoadClassValue's TDZ). A new kind must prove its class.
+    pub(crate) fn arg_order_transparent(&mut self, e: &Expr) -> bool {
+        let relaxed = !strict_call_order();
+        self.arg_transparent_in(e, relaxed)
+    }
+
+    fn arg_transparent_in(&mut self, e: &Expr, relaxed: bool) -> bool {
+        match e {
+            Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
+            // `this` is a plain register read, except in a derived constructor
+            // (before `super()` it is in TDZ: `this_check` emits a throwing
+            // check) unless a static initializer redirected it.
+            Expr::This => !self.in_derived_ctor || self.this_override.is_some(),
+            // ToBoolean / typeof / void never invoke user code or throw.
+            Expr::Unary {
+                op: UnaryOp::Not | UnaryOp::Typeof | UnaryOp::Void,
+                arg,
+            } => self.arg_transparent_in(arg, relaxed),
+            Expr::Logical { left, right, .. } => {
+                self.arg_transparent_in(left, relaxed) && self.arg_transparent_in(right, relaxed)
+            }
+            Expr::Cond { test, cons, alt } => {
+                self.arg_transparent_in(test, relaxed)
+                    && self.arg_transparent_in(cons, relaxed)
+                    && self.arg_transparent_in(alt, relaxed)
+            }
+            Expr::Ident(id) => self.ident_order_transparent(id, relaxed),
+            // ── primitive-operand class ──────────────────────────────────
+            // ToNumber / ToPrimitive on an OBJECT operand is user code.
+            Expr::Unary {
+                op: UnaryOp::Minus | UnaryOp::Plus | UnaryOp::BitNot,
+                arg,
+            } => relaxed && self.arg_transparent_in(arg, relaxed),
+            // `in` probes (proxy `has`) and `instanceof` (Symbol.hasInstance)
+            // run user code on ordinary operands; every other operator only
+            // through an object operand's coercion.
+            Expr::Binary { op, left, right } => {
+                relaxed
+                    && !matches!(op, BinaryOp::In | BinaryOp::Instanceof)
+                    && self.arg_transparent_in(left, relaxed)
+                    && self.arg_transparent_in(right, relaxed)
+            }
+            // ToString of an object substitution is user code.
+            Expr::Template(t) => {
+                relaxed && t.exprs.iter().all(|x| self.arg_transparent_in(x, relaxed))
+            }
+            // An allocation; holes are fine, a spread iterates user code.
+            Expr::Array(elems, _) => {
+                relaxed
+                    && elems.iter().all(|el| match el {
+                        None => true,
+                        Some(ArrayElem::Expr(x)) => self.arg_transparent_in(x, relaxed),
+                        Some(ArrayElem::Spread(_)) => false,
+                    })
+            }
+            // An allocation with plain (identifier / string / number) keys and
+            // transparent values; a method/accessor DEFINITION only allocates
+            // its closure. A computed key runs ToPropertyKey and a spread
+            // enumerates (ownKeys/get traps) — both user code.
+            Expr::Object(members, _) => {
+                relaxed
+                    && members.iter().all(|mbr| match mbr {
+                        ObjectMember::Prop {
+                            key,
+                            value,
+                            init: None,
+                            ..
+                        } => {
+                            matches!(key, PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_))
+                                && self.arg_transparent_in(value, relaxed)
+                        }
+                        ObjectMember::Method { key, .. }
+                        | ObjectMember::Get { key, .. }
+                        | ObjectMember::Set { key, .. } => {
+                            matches!(key, PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_))
+                        }
+                        _ => false,
+                    })
+            }
+            // A closure literal is an allocation (its captures are already
+            // cells); a class expression evaluates computed keys and static
+            // blocks, so it stays captured.
+            Expr::Arrow(_) | Expr::Function(_) => relaxed,
+            _ => false,
+        }
+    }
+
+    /// The identifier case of `arg_transparent_in`. Provable: a bare register
+    /// reference or a constant fold. Primitive-operand class (`relaxed`): a
+    /// `LoadGlobal`, `CellGet` or `UpvalGet` — a data read whose only failure
+    /// is a TDZ / never-declared ReferenceError.
+    fn ident_order_transparent(&mut self, name: &str, relaxed: bool) -> bool {
+        // `arguments` materializes the arguments object (and `resolve` flags
+        // the function); a parameter in its own default's TDZ throws.
+        if name == "arguments" || self.param_tdz.contains(name) {
+            return false;
+        }
+        // A with-object — own or inherited from an enclosing function — may
+        // shadow the name; its HasBinding/Get probes are observable. This
+        // mirrors `with_obj_regs` without materializing its probe registers.
+        if !self.with_objs_for(name).is_empty() {
+            return false;
+        }
+        let bound_here = self.scopes.iter().flatten().any(|(n, _)| n == name)
+            || self.self_name.as_ref().is_some_and(|(n, _)| n == name);
+        if !bound_here && self.inherited_with_shadows.contains_key(name) {
+            return false;
+        }
+        match self.resolve(name) {
+            // Register-resident: the read is the register itself.
+            Binding::Local(_) => true,
+            Binding::Global(_) => {
+                // A dynamic (eval) zone resolves through LoadGlobalDyn, whose
+                // EvalScope probe may find a TDZ binding.
+                if self.box_all_locals || self.cx.dyn_global_zone {
+                    return false;
+                }
+                // `undefined`/`NaN`/`Infinity` fold to constant loads under
+                // exactly these conditions (see the identifier read in exprs.rs).
+                if matches!(name, "undefined" | "NaN" | "Infinity") {
+                    return true;
+                }
+                relaxed
+            }
+            Binding::LocalCell(_) | Binding::Upvalue(_) => relaxed,
+            // Lexical: LoadClassValue throws in the class's TDZ.
+            Binding::ClassName(_) => false,
+        }
     }
 
     /// Evaluate call arguments into a contiguous run of registers and return

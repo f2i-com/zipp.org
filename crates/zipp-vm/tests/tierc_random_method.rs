@@ -233,12 +233,18 @@ fn capture_first_member_calls_reach_tier_c() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    // Every `o.random()` here is a zero-argument call: nothing can observe
+    // the property Get's position relative to (no) arguments, so the compiler
+    // fuses it to `CallMethod` — the lane the rotation/accessor/throw checks
+    // above exercise. A call with an impure argument is what takes the
+    // capture-first `GetProp` + `CallWithThis` lowering (pinned in
+    // `tests/call_reference_order.rs`).
     assert!(
-        stderr.contains("CallWithThis {") && !stderr.contains("CallMethod {"),
-        "member calls were not lowered to capture-first CallWithThis bytecode:\n{stderr}"
+        stderr.contains("CallMethod {"),
+        "zero-argument member calls were not lowered to the fused CallMethod:\n{stderr}"
     );
     assert!(
         stderr.contains("Tier C fn"),
-        "capture-first member-call bodies did not reach Tier C:\n{stderr}"
+        "member-call bodies did not reach Tier C:\n{stderr}"
     );
 }

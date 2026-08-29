@@ -264,20 +264,28 @@ pub(crate) fn emit_math_identity_guard(
     bail: dynasmrt::DynamicLabel,
     imul_guard: Option<MathIntrinsicGuard>,
 ) {
-    if matches!(op, MathFn::Imul) {
-        if let Some(guard) = imul_guard {
+    // Every op whose intrinsic callable was baked at compile time takes the
+    // same three-compare guard `Math.imul` always had (the `imul` entry of the
+    // table equals `callee_bits`/`callee_ver`); an op that was not a plain
+    // intrinsic data property then keeps the helper-call guard below.
+    if let Some(guard) = imul_guard {
+        let (callee_bits, callee_ver) = (
+            guard.op_callee_bits[op as usize],
+            guard.op_callee_ver[op as usize],
+        );
+        if callee_bits != 0 {
             dynasm!(ops
                 ; mov rax, [rbx + dreg(this_v)]
                 ; mov r10, QWORD guard.receiver_bits as i64
                 ; cmp rax, r10
                 ; jne => bail
                 ; mov rax, [rbx + dreg(callee)]
-                ; mov r10, QWORD guard.callee_bits as i64
+                ; mov r10, QWORD callee_bits as i64
                 ; cmp rax, r10
                 ; jne => bail
                 // Exact heap bits make eax the validated live slot index.
                 ; mov ecx, eax
-                ; cmp DWORD [r13 + rcx * 4], guard.callee_ver as i32
+                ; cmp DWORD [r13 + rcx * 4], callee_ver as i32
                 ; jne => bail
             );
             return;

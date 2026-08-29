@@ -363,6 +363,49 @@ impl<'p> Vm<'p> {
         self.proto_method_is_baseline(self.arr_proto, name, memo_id, true)
     }
 
+    /// The VALUE of `name` on %Array.prototype% (`is_arr`) / %String.prototype%
+    /// when it is provably still the boot intrinsic, else `None` — the same
+    /// proof as the two predicates above, returning the callable's bits so a
+    /// prototype-method Get on an Array/String receiver can be answered
+    /// without walking the chain. A memo hit (version + slot + bits) is a
+    /// handful of loads; the fallback proves through the baseline table.
+    /// Receiver-side exotics (an own side-table shadow, a custom
+    /// [[Prototype]], an arguments object) are the CALLER's to exclude.
+    pub(crate) fn proto_intrinsic_bits(&mut self, name: &str, is_arr: bool) -> Option<u64> {
+        let (proto, memo_id) = if is_arr {
+            (self.arr_proto, arr_memo_id(name))
+        } else {
+            (self.str_proto, str_memo_id(name))
+        };
+        if proto == 0 {
+            return None;
+        }
+        if let Some(nid) = memo_id {
+            let memo = if is_arr {
+                self.arr_intrinsic_memo[nid]
+            } else {
+                self.str_intrinsic_memo[nid]
+            };
+            if let Some((ver, slot, fn_bits)) = memo {
+                if self.active_realm_proto(proto) == proto && self.heap.version_of(proto) == ver {
+                    if let HeapObj::Object(map) = self.heap.get(proto) {
+                        if map.val_get_ref(slot as usize).map(|v| v.bits()) == Some(fn_bits) {
+                            return Some(fn_bits);
+                        }
+                    }
+                }
+            }
+        }
+        if !self.proto_method_is_baseline(proto, name, memo_id, is_arr) {
+            return None;
+        }
+        if is_arr {
+            self.arr_proto_baseline.get(name).copied()
+        } else {
+            self.str_proto_baseline.get(name).copied()
+        }
+    }
+
     fn proto_method_is_baseline(
         &mut self,
         proto: u32,
@@ -952,23 +995,39 @@ impl<'p> Vm<'p> {
                 // to the unchanged `get_prop` proof below, so the override
                 // semantics the tests observe are decided by exactly the same
                 // code as before.
+                // When the probe misses, the `get_prop` proof below IS the
+                // call's property Get — an accessor runs here, once. Its
+                // result must then be what gets called: falling through to the
+                // caller's own `get_prop` would run the getter a second time
+                // (observable; `tests/promise_pristine_dispatch.rs` counts it).
+                let mut resolved: Option<Value> = None;
                 let is_intrinsic = if let Some(want) = native::promise_proto_method_id(name) {
                     self.promise_method_is_intrinsic(idx, name, want) || {
                         let m = self.get_prop(recv, name)?;
-                        m.is_heap()
+                        let hit = m.is_heap()
                             && matches!(self.heap.get(m.heap_index()),
                                         HeapObj::Native(id) if native::proto_method(*id)
-                                            .is_some_and(|(n, k, _)| k == 7 && n == name))
+                                            .is_some_and(|(n, k, _)| k == 7 && n == name));
+                        if !hit {
+                            resolved = Some(m);
+                        }
+                        hit
                     }
                 } else {
                     let m = self.get_prop(recv, name)?;
-                    m.is_heap()
+                    let hit = m.is_heap()
                         && matches!(self.heap.get(m.heap_index()),
                                     HeapObj::Native(id) if native::proto_method(*id)
-                                        .is_some_and(|(n, k, _)| k == 7 && n == name))
+                                        .is_some_and(|(n, k, _)| k == 7 && n == name));
+                    if !hit {
+                        resolved = Some(m);
+                    }
+                    hit
                 };
                 if is_intrinsic {
                     self.promise_method(idx, name, args)
+                } else if let Some(m) = resolved {
+                    Ok(Some(self.call_value(m, recv, args)?))
                 } else {
                     Ok(None)
                 }

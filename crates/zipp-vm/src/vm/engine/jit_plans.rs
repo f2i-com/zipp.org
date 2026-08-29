@@ -4489,6 +4489,12 @@ fn slot_guard_def(i: &Instr) -> Option<Option<u16>> {
         | Instr::Call { dst, .. }
         | Instr::RegExpMethod { dst, .. }
         | Instr::CallMethod { dst, .. }
+        // The captured member-call form defines exactly `dst`, like `Call`;
+        // without this arm a split `s.charCodeAt(a[i])` between a callee's
+        // LoadGlobal and its Call read as "unmodelled-op-in-scan", the slot
+        // guard declined, and the INT splice with it (parse-large-js's `mix`
+        // loop fell from INT to MEM: 95ms -> 267ms).
+        | Instr::CallWithThis { dst, .. }
         | Instr::UpvalGet { dst, .. }
         | Instr::CellGet { dst, .. } => Some(dst),
         Instr::StoreGlobal { .. }

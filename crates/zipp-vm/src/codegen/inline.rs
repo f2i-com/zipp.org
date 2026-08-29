@@ -92,6 +92,91 @@ pub(crate) fn emit_region_call_ic(
     emit_region_bail(ops, ip, bail, epilogue);
 }
 
+/// The split-member-call intrinsic lane for a `CallWithThis` at `ip`, if its
+/// captured callee was (syntactically) loaded by a `GetProp` of `push` /
+/// `charCodeAt`: `(boot intrinsic bits, dedicated helper, grows_array)`. The
+/// pairing is a HINT that picks the lane; soundness rests on the emitted
+/// runtime bits compare alone (`emit_captured_builtin_lane`).
+pub(crate) fn captured_builtin_lane(
+    proto: &FuncProto,
+    ip: usize,
+    callee: u16,
+    argc: u16,
+    heap: &HeapHelpers,
+) -> Option<(u64, usize, bool)> {
+    if argc != 1 {
+        return None;
+    }
+    let name = proto.code[..ip].iter().rev().find_map(|i| match *i {
+        Instr::GetProp { dst, name, .. } if dst == callee => Some(name),
+        _ => None,
+    })?;
+    match proto.string_constants.get(name as usize).map(|s| s.as_str()) {
+        Some("push") if heap.push_intrinsic_bits != 0 => {
+            Some((heap.push_intrinsic_bits, heap.array_push, true))
+        }
+        Some("charCodeAt") if heap.char_code_at_intrinsic_bits != 0 => {
+            Some((heap.char_code_at_intrinsic_bits, heap.char_code_at, false))
+        }
+        _ => None,
+    }
+}
+
+/// A split member call on a builtin receiver — `arr.push(x)` / `s.charCodeAt(i)`
+/// lowered in spec order as `GetProp; <args>; CallWithThis` — reaches the
+/// generic captured-callee helper with a NATIVE callee: a helper crossing, a
+/// `call_value` dispatch and the name-keyed builtin lookup per call, where the
+/// fused `CallMethod` form ran the dedicated win64 helper directly. This lane
+/// restores that: when the captured callee's bits ARE the boot intrinsic's
+/// (the natives live in pinned slots below the GC floor, so bits-identity is
+/// the same tamper-proof "still the boot intrinsic" proof
+/// `capture_proto_baselines` licenses), call the dedicated helper with the
+/// captured receiver — exactly `callee.[[Call]](this_v, arg0)` for that
+/// intrinsic. The helper re-proves the receiver kind and the live prototype
+/// slot on every call and answers `SELF_CALL_DEOPT` for anything it will not
+/// handle BEFORE mutating; here that is a pure-prefix MISS that falls through
+/// to the unchanged generic call (never a region deopt). Returns the join
+/// label the caller must define after its generic path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_captured_builtin_lane(
+    ops: &mut dynasmrt::x64::Assembler,
+    callee: u16,
+    this_v: u16,
+    arg_base: u16,
+    dst: u16,
+    intrinsic_bits: u64,
+    helper: usize,
+    ta_refetch: Option<(usize, &TaPinPlan)>,
+) -> dynasmrt::DynamicLabel {
+    let done = ops.new_dynamic_label();
+    let miss = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(callee)]         // captured callee bits
+        ; mov r10, QWORD intrinsic_bits as i64  // the boot intrinsic
+        ; cmp rax, r10
+        ; jne => miss
+        ; mov rcx, rdi                          // vm
+        ; mov rdx, [rbx + dreg(this_v)]         // receiver bits
+        ; mov r8, [rbx + dreg(arg_base)]        // arg0 bits
+        ; mov rax, QWORD helper as i64
+        ; call rax
+        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+        ; cmp rax, r10
+        ; je => miss                            // helper declined -> generic call
+        ; mov [rbx + dreg(dst)], rax
+    );
+    // `arr.push(x)` grows the array's own Vec — re-derive any pinned
+    // dense-Array snapshot (the caller passes `None` for `charCodeAt`).
+    if let Some((snap, plan)) = ta_refetch {
+        emit_refetch_ta(ops, snap, plan);
+    }
+    dynasm!(ops
+        ; jmp => done
+        ; => miss
+    );
+    done
+}
+
 /// Q4 leaf-call inlining (v1): emit a guarded INLINE expansion of a monomorphic
 /// plain-leaf callee for a region `Call` op, with a fallback to the unchanged
 /// per-call helper. Emitted INSTEAD of `emit_region_call_ic` when a `LeafInlinePlan`
