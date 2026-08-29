@@ -11,7 +11,6 @@ fn run_ok(src: &str) -> Vec<String> {
 }
 
 const PROBE: &str = r#"
-  "use strict";
   let defaultRuns = 0;
 
   function makeInvoker() {
@@ -95,15 +94,59 @@ const PROBE: &str = r#"
   }
   const arrowDefault = arrows[7](1, undefined);
 
+  // Static captures are a different live-instance shape even when every
+  // closure shares one FuncProto.  The planner normally excludes it; the
+  // emitted guard's zero-upvalue-mirror check is the defensive second line.
+  function makeCaptured(seed) {
+    return function (value) { return (value + seed) | 0; };
+  }
+  function callCaptured(target, value) {
+    let pad = (value ^ value) | 0;
+    pad = (pad + 9) | 0;
+    pad = (pad - 9) | 0;
+    return (target((value + pad) | 0) - pad) | 0;
+  }
+  const captured = [];
+  for (let i = 0; i < 8; i++) captured.push(makeCaptured(10 + i));
+  let capturedSum = 0;
+  for (let i = 0; i < 20000; i++) {
+    capturedSum = (capturedSum + callCaptured(captured[i & 7], i & 31)) | 0;
+  }
+
+  // Sloppy direct eval creates a dynamic EvalScope.  The nested function's
+  // source-level `dynamicBias` looks global to the compiler, but a real call
+  // must resolve the per-instance eval binding.  Rotating these capture-free
+  // FuncProto peers through one hot Call site exercises the eval-scope blocker:
+  // raw inlining would read the deliberately-wrong global fallback.
+  var dynamicBias = -1000;
+  function makeEvalScoped(seed) {
+    eval("var dynamicBias = " + seed);
+    return function (value) { return (value + dynamicBias) | 0; };
+  }
+  function callEvalScoped(target, value) {
+    let pad = (value ^ value) | 0;
+    pad = (pad + 11) | 0;
+    pad = (pad - 11) | 0;
+    return (target((value + pad) | 0) - pad) | 0;
+  }
+  const evalScoped = [];
+  for (let i = 0; i < 4; i++) evalScoped.push(makeEvalScoped(40 + i));
+  let evalSum = 0;
+  for (let i = 0; i < 12000; i++) {
+    evalSum = (evalSum + callEvalScoped(evalScoped[i & 3], i & 15)) | 0;
+  }
+
   console.log(
     "poly-leaf:" + checksum + ":" + numeric + ":" + explicitUndefined +
     ":" + missing + ":" + crossProto + ":" + bound + ":" +
     boundDefault + ":" + native + ":" + realmThis + ":" + nonCallableThrew + ":" +
-    defaultRuns + ":" + arrowSum + ":" + arrowDefault
+    defaultRuns + ":" + arrowSum + ":" + arrowDefault + ":" +
+    capturedSum + ":" + evalSum
   );
 "#;
 
-const WANT: &str = "poly-leaf:2146897088:439041033:96:96:12:18:96:7:705:true:3:2420000:113";
+const WANT: &str =
+    "poly-leaf:2146897088:439041033:96:96:12:18:96:7:705:true:3:2420000:113:580000:588000";
 
 #[test]
 fn guarded_poly_leaf_defaults_and_fallbacks_are_exact() {
@@ -122,8 +165,9 @@ fn guarded_poly_leaf_mechanism_child() {
 #[test]
 fn guarded_poly_leaf_mechanism_engages() {
     let exe = std::env::current_exe().expect("test binary path");
-    let out = std::process::Command::new(exe)
-        .args([
+    let run = |helper_guard: bool| {
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args([
             "guarded_poly_leaf_mechanism_child",
             "--exact",
             "--nocapture",
@@ -133,18 +177,34 @@ fn guarded_poly_leaf_mechanism_engages() {
         .env("ZIPP_JIT_THRESHOLD", "1")
         .env_remove("ZIPP_NOJIT")
         .env_remove("ZIPP_NO_POLY_LEAF_INLINE")
-        .output()
-        .expect("spawn mechanism child");
-    assert!(
-        out.status.success(),
-        "mechanism child failed:\n{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
+        .env_remove("ZIPP_NO_INLINE_SAME_PROTO_GUARD");
+        if helper_guard {
+            cmd.env("ZIPP_NO_INLINE_SAME_PROTO_GUARD", "1");
+        }
+        let out = cmd.output().expect("spawn mechanism child");
+        assert!(
+            out.status.success(),
+            "mechanism child (helper_guard={helper_guard}) failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let stderr = run(false);
     assert!(
         stderr.contains("SAME-PROTO-INLINE (default_mask=0x2)"),
         "same-proto/default leaf did not engage:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("INLINE-SAME-PROTO-GUARD fid=")
+            && stderr.contains("INLINE-SAME-PROTO-GUARD HIT"),
+        "same-proto mirror guard did not both emit and hit:\n{stderr}"
+    );
+    let helper = run(true);
+    assert!(
+        helper.contains("SAME-PROTO-INLINE (default_mask=0x2)")
+            && !helper.contains("INLINE-SAME-PROTO-GUARD"),
+        "off-switch did not restore the helper guard emission:\n{helper}"
     );
 }
 
@@ -154,6 +214,10 @@ fn guarded_poly_leaf_modes_are_identical() {
     for (name, env) in [
         ("default", None),
         ("off", Some(("ZIPP_NO_POLY_LEAF_INLINE", "1"))),
+        (
+            "helper-guard",
+            Some(("ZIPP_NO_INLINE_SAME_PROTO_GUARD", "1")),
+        ),
         ("gc-stress", Some(("ZIPP_GC_STRESS", "1"))),
         ("interpreter", Some(("ZIPP_NOJIT", "1"))),
     ] {
@@ -165,6 +229,7 @@ fn guarded_poly_leaf_modes_are_identical() {
         ])
         .env_remove("ZIPP_NOJIT")
         .env_remove("ZIPP_NO_POLY_LEAF_INLINE")
+        .env_remove("ZIPP_NO_INLINE_SAME_PROTO_GUARD")
         .env_remove("ZIPP_GC_STRESS");
         if let Some((key, value)) = env {
             cmd.env(key, value);

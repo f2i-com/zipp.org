@@ -40,6 +40,30 @@ pub(crate) fn span_code_unit_pair_enabled() -> bool {
     }
 }
 
+env_off_switch! {
+    /// `ZIPP_NO_INLINE_SAME_PROTO_GUARD=1` restores the read-only
+    /// `jit_leaf_same_func_proto` helper call at each polymorphic leaf site.
+    /// The default emits the same proof from VM-relative mirrors and falls
+    /// through to the unchanged call helper on every miss.
+    fn inline_same_proto_guard_enabled() = "ZIPP_NO_INLINE_SAME_PROTO_GUARD"
+}
+
+/// JITLOG-only runtime witness for the inline same-`FuncProto` guard.  The
+/// generated call is absent from production code; its first invocation proves
+/// that execution passed every mirror/upvalue/environment comparison instead
+/// of merely compiling the guard and falling back forever.
+#[inline(never)]
+extern "win64" fn note_inline_same_proto_guard_hit() {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    if HITS.fetch_add(1, Ordering::Relaxed) == 0 {
+        // Do not let a closed diagnostic pipe panic across the native ABI.
+        let _ = std::io::stderr().write_all(b"[leaf] INLINE-SAME-PROTO-GUARD HIT\n");
+    }
+}
+
 /// Emit a generic `CallMethod` / `Call` region op as a `jit_call_method_ic` /
 /// `jit_call_ic` helper call (vm/helpers_misc.rs). The helper consults the
 /// interpreter's per-site inline cache, frame-calls the resolved plain user
@@ -243,19 +267,73 @@ pub(crate) fn emit_inline_leaf_call(
     let done = ops.new_dynamic_label();
     let w = plan.reg_window;
     if let Some(fid) = plan.same_proto_fid {
-        // The live callee may be any of the rotating function identities seen
-        // at this site, but it must still be an ordinary capture-free function
-        // for the planned FuncProto. The read-only helper rejects bound/native/
-        // wrapped/proxy/non-callable/cross-proto replacements to the real call.
-        dynasm!(ops
-            ; mov rcx, rdi
-            ; mov rdx, [rbx + dreg(callee)]
-            ; mov r8d, fid as i32
-            ; mov rax, QWORD plan.same_proto_guard as i64
-            ; call rax
-            ; test rax, rax
-            ; jz => fallback
-        );
+        if inline_same_proto_guard_enabled() {
+            use crate::vm::host_api::{
+                JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_HOT_FID_OFF, JIT_HOT_MIRROR_LEN_OFFSET,
+                JIT_HOT_MIRROR_RAW_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
+                JIT_REALM_GLOBALS_NONEMPTY_OFFSET, JIT_UPVALS_MIRROR_RAW_OFFSET,
+            };
+            let jitlog = std::env::var_os("ZIPP_JITLOG").is_some();
+            if jitlog {
+                eprintln!("[leaf] call@{call_ip} INLINE-SAME-PROTO-GUARD fid={fid}");
+            }
+            // The live callee may be any of the rotating function identities
+            // seen at this site.  Its heap tag + hot-mirror fid prove the
+            // immutable FuncProto; a zero upvalue-base repeats the helper's
+            // defensive live-instance check.  The three VM blocker bytes are
+            // deliberately global/conservative: if any realm/eval routing
+            // table is populated, the ordinary helper decides this callee's
+            // exact environment.  Bound/native/proxy/wrapped/non-callables
+            // carry no matching fid and likewise take `fallback`.
+            //
+            // `r10d` is a live rooted heap index after the tag check.  The hot
+            // and upvalue mirrors are parallel to `Heap::objs`, and their raw
+            // bases are reloaded through rdi so vector growth cannot stale the
+            // generated access (the B189b cross3 guard uses the same contract).
+            dynasm!(ops
+                ; mov rax, [rbx + dreg(callee)]
+                ; mov r10, rax
+                ; shr r10, 48
+                ; cmp r10d, TAG_HEAP_HI as i32
+                ; jne => fallback
+                ; mov r10d, eax
+                ; cmp r10d, DWORD [rdi + JIT_HOT_MIRROR_LEN_OFFSET as i32]
+                ; jae => fallback
+                ; mov r11, [rdi + JIT_HOT_MIRROR_RAW_OFFSET as i32]
+                ; lea r11, [r11 + r10 * 8]
+                ; cmp DWORD [r11 + r10 * 8 + JIT_HOT_FID_OFF as i32], fid as i32
+                ; jne => fallback
+                ; mov r11, [rdi + JIT_UPVALS_MIRROR_RAW_OFFSET as i32]
+                ; cmp QWORD [r11 + r10 * 8], 0
+                ; jne => fallback
+                ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
+                ; jne => fallback
+                ; cmp BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32], 0
+                ; jne => fallback
+                ; cmp BYTE [rdi + JIT_REALM_GLOBALS_NONEMPTY_OFFSET as i32], 0
+                ; jne => fallback
+            );
+            if jitlog {
+                // Diagnostic builds alone pay this call.  The marker is a
+                // runtime hit witness, not just an emission witness.
+                dynasm!(ops
+                    ; mov rax, QWORD note_inline_same_proto_guard_hit as usize as i64
+                    ; call rax
+                );
+            }
+        } else {
+            // Dedicated ablation: the pre-change read-only helper performs the
+            // same per-callee checks.  Its miss is the same pure prefix.
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rdx, [rbx + dreg(callee)]
+                ; mov r8d, fid as i32
+                ; mov rax, QWORD plan.same_proto_guard as i64
+                ; call rax
+                ; test rax, rax
+                ; jz => fallback
+            );
+        }
     } else if let Some((gen_addr, gen_val)) = plan.slot_guard {
         // ── W12 slot-generation guard ── the planner proved the callee
         // register holds global slot g's value at this call and every write

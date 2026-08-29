@@ -3274,6 +3274,10 @@ pub struct Jit {
     /// which the region re-derives its pinned base pointer); a `*_miss` helper
     /// only UPDATES existing ways (no growth).
     ic_table: Vec<IcEntry>,
+    /// Raw base of `ic_table`, loaded through the live VM by Tier-C entry
+    /// code. `reserve_ic_sites` is the only growth point and refreshes this
+    /// mirror immediately after every resize. Miss helpers only mutate ways.
+    pub(crate) ic_table_raw: u64,
     /// Round-robin fill cursor per site (parallel to `ic_table` / JIT_IC_WAYS).
     ///
     /// Its WIDTH is load-bearing. A thrashing site's SUPPRESSED miss still
@@ -3398,6 +3402,7 @@ impl Jit {
             .filter(|n| *n >= 1)
             .unwrap_or(0);
         jit.dense_backedge = std::env::var_os("ZIPP_NO_DENSE_BACKEDGE").is_none();
+        jit.ic_table_raw = jit.ic_table.as_ptr() as u64;
         jit
     }
 
@@ -4603,6 +4608,7 @@ impl Jit {
         let base = (self.ic_table.len() / JIT_IC_WAYS) as u32;
         self.ic_table
             .resize(self.ic_table.len() + n * JIT_IC_WAYS, IcEntry::default());
+        self.ic_table_raw = self.ic_table.as_ptr() as u64;
         self.ic_rot.resize(self.ic_rot.len() + n, 0);
         self.ic_site_meta
             .resize(self.ic_site_meta.len() + n, IcSiteMeta::default());

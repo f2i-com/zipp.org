@@ -52,6 +52,25 @@ pub(crate) const JIT_GLOBAL_ROUTE_EPOCH_OFFSET: usize =
 pub(crate) const JIT_MI_CLASS_EPOCH_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, mi_class_epoch);
 
+/// VM-relative bases pinned by Tier-C whole-function entry code. These are
+/// explicit mirrors rather than offsets into `Vec`: Rust does not expose a
+/// stable `Vec` layout. Globals never grow after boot; the versions and IC
+/// mirrors are refreshed at their sole growth sites.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_GLOBALS_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, globals_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_VERSIONS_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, versions_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_IC_TABLE_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, jit)
+    + core::mem::offset_of!(crate::codegen::Jit, ic_table_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    assert!(JIT_GLOBALS_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
+    assert!(JIT_VERSIONS_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
+    assert!(JIT_IC_TABLE_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
+};
+
 /// VM-relative byte offsets of the heap's shape/vals mirror bases (B178).
 /// The shape-way probes load the base pointers through the live VM argument
 /// on EVERY access — the mirror vectors grow when helpers allocate, and
@@ -60,6 +79,12 @@ pub(crate) const JIT_MI_CLASS_EPOCH_OFFSET: usize =
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_HOT_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
     + core::mem::offset_of!(crate::heap::Heap, hot_mirror_raw);
+/// Number of valid entries behind `JIT_HOT_MIRROR_RAW_OFFSET`.  A tagged heap
+/// payload is still bounds-checked before emitted code indexes the mirror,
+/// matching the defensive check made by the helper fallback.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_HOT_MIRROR_LEN_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, hot_mirror_len);
 /// B195: the hot record's compile-checked layout — the emitted probes
 /// address `base + idx*16` (one `lea` doubling the scale-8 index) and then
 /// read the shape at +0, the fid at +4 and the vals base at +8.
@@ -76,6 +101,7 @@ const _: () = {
     assert!(core::mem::offset_of!(H, fid) == JIT_HOT_FID_OFF);
     assert!(core::mem::offset_of!(H, vals) == JIT_HOT_VALS_OFF);
     assert!(core::mem::size_of::<H>() == 16);
+    assert!(JIT_HOT_MIRROR_LEN_OFFSET % core::mem::align_of::<u32>() == 0);
 };
 /// VM-relative byte offset of the heap's cell-value mirror base (B189): same
 /// derive-per-access rule as the mirrors above.

@@ -4506,14 +4506,23 @@ pub struct Heap {
     /// `refresh_mirror`) and `free_slot` covering occupancy changes. The mirror carries the
     /// UNINITIALIZED sentinel verbatim — the emitted TDZ check depends on it.
     cell_vals_mirror: Vec<u64>,
-    /// Raw bases of the two mirrors, re-cached whenever the vectors grow. The
-    /// emitted probes load these THROUGH the VM (`[rdi + offset]`) on every
-    /// access, so growth during a native run (helper allocations) is safe —
-    /// unlike the pinned `r13` versions base, nothing re-derives these.
+    /// Raw bases of the mirrors and version table, re-cached whenever the
+    /// vectors grow. Shape/cell/closure probes load their bases THROUGH the VM
+    /// (`[rdi + offset]`) on every access. Tier-C loads `versions_raw` only on
+    /// entry; an allocation or user-code call still re-derives its pinned r13
+    /// through the existing helper before any later version read.
     pub(crate) hot_mirror_raw: u64,
+    /// Number of entries addressable through `hot_mirror_raw`.  Emitted
+    /// guards check this before dereferencing a heap-tagged value so a
+    /// malformed/corrupted payload fails closed instead of reading past the
+    /// mirror. Kept beside the raw base and refreshed by the same chokepoint.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) hot_mirror_len: u32,
     pub(crate) cell_vals_mirror_raw: u64,
     pub(crate) this_mirror_raw: u64,
     pub(crate) upvals_mirror_raw: u64,
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) versions_raw: u64,
     /// Dead payloads collected by the CURRENT sweep, shipped to the courier
     /// thread at `note_gc_done`/`note_minor_done` (see [`gc_courier`]).
     courier_batch: Vec<gc_courier::Item>,
@@ -4962,9 +4971,13 @@ impl Heap {
             this_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
             upvals_mirror: vec![0; versions.len()],
             hot_mirror_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            hot_mirror_len: 0,
             cell_vals_mirror_raw: 0,
             this_mirror_raw: 0,
             upvals_mirror_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            versions_raw: 0,
             versions,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             array_snapshot_epoch: 0,
@@ -5006,14 +5019,22 @@ impl Heap {
         h
     }
 
-    /// Re-cache the raw bases the emitted shape-way probes read through the
-    /// VM. Called after any growth of the mirror vectors (and once at boot).
+    /// Re-cache the raw bases emitted probes and Tier-C entry code read through
+    /// the VM. Called after any growth of the parallel vectors (and at boot).
     #[inline]
     fn recache_mirror_raws(&mut self) {
         self.hot_mirror_raw = self.hot_mirror.as_ptr() as u64;
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.hot_mirror_len = self.hot_mirror.len() as u32;
+        }
         self.cell_vals_mirror_raw = self.cell_vals_mirror.as_ptr() as u64;
         self.this_mirror_raw = self.this_mirror.as_ptr() as u64;
         self.upvals_mirror_raw = self.upvals_mirror.as_ptr() as u64;
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.versions_raw = self.versions.as_ptr() as u64;
+        }
     }
 
     /// The B189b upvalue-base mirror entry for `idx` (0 = none) — the

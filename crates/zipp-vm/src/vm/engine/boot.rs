@@ -162,6 +162,8 @@ impl<'p> Vm<'p> {
             const_string_cache_funcs: rustc_hash::FxHashMap::default(),
             const_string_cache_enabled: std::env::var_os("ZIPP_NO_CONST_STRING_CACHE").is_none(),
             heap,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            globals_raw: globals.as_mut_ptr().expose_provenance() as u64,
             globals,
             global_gens,
             bytecode_stored_slots,

@@ -1225,6 +1225,13 @@ pub struct Vm<'p> {
     const_string_cache_enabled: bool,
     heap: Heap,
     globals: Vec<Value>,
+    /// Raw base of `globals`, loaded by Tier-C code through the live VM on
+    /// entry. The vector is allocated to its final FIELD_POOL + EVAL_POOL
+    /// extent at boot and never grows, so moving `Vm` does not invalidate the
+    /// allocation address. Kept explicit: emitted code must not depend on
+    /// Rust's private `Vec` field layout.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    globals_raw: u64,
     /// One contiguous register file shared by all live frames; each frame owns
     /// the window `[base, base + reg_count)`.
     regs: RegisterFile,

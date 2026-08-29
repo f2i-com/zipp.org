@@ -2649,13 +2649,19 @@ pub(crate) fn compile_proto_mem(
         || proto.code.iter().any(direct_global)
         || leaf_plan.values().any(|p| p.body.iter().any(direct_global))
         || do_method;
+    // The three pointers are already mirrored in VM-owned state and refreshed
+    // at their sole growth sites. Loading them rdi-relative avoids three Win64
+    // helper round-trips on every tiny Tier-C entry. The off-switch restores
+    // the historical helper prologue for a same-binary process A/B.
+    let direct_entry_bases = std::env::var_os("ZIPP_NO_TIERC_DIRECT_BASES").is_none();
     if precise_entry_pins && std::env::var_os("ZIPP_JITLOG").is_some() {
         eprintln!(
-            "[jit] fn{func_id} Tier-C entry-pins globals={} version-ic={} headroom={} method-global={}",
+            "[jit] fn{func_id} Tier-C entry-pins globals={} version-ic={} headroom={} method-global={} bases={}",
             needs_globals as u8,
             refetch_pinned as u8,
             (do_leaf || method_needs_headroom) as u8,
             do_method as u8,
+            if direct_entry_bases { "direct" } else { "helpers" },
         );
     }
 
@@ -2676,27 +2682,41 @@ pub(crate) fn compile_proto_mem(
         ; mov rdi, r8                     // vm
     );
     if needs_globals {
-        dynasm!(ops
-            ; mov rcx, rdi                    // arg0 = vm
-            ; mov rax, QWORD globals_base_helper as i64
-            ; call rax
-            ; mov r12, rax                    // pinned globals base pointer
-        );
+        if direct_entry_bases {
+            dynasm!(ops
+                ; mov r12, [rdi + crate::vm::host_api::JIT_GLOBALS_RAW_OFFSET as i32]
+            );
+        } else {
+            dynasm!(ops
+                ; mov rcx, rdi                    // arg0 = vm
+                ; mov rax, QWORD globals_base_helper as i64
+                ; call rax
+                ; mov r12, rax                    // pinned globals base pointer
+            );
+        }
     }
     if refetch_pinned {
         // Pin the heap version-array base (r13) and the IC table base (r14) —
         // copied from the region prologue. Read by the GetProp IC probe and the
-        // leaf-inline identity version guard.
-        dynasm!(ops
-            ; mov rcx, rdi
-            ; mov rax, QWORD heap.versions_base as i64
-            ; call rax
-            ; mov r13, rax
-            ; mov rcx, rdi
-            ; mov rax, QWORD heap.ic_base as i64
-            ; call rax
-            ; mov r14, rax
-        );
+        // leaf-inline identity version guard. Later allocation/user-code ops
+        // retain their helper refetches: this shortcut is entry-only.
+        if direct_entry_bases {
+            dynasm!(ops
+                ; mov r13, [rdi + crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32]
+                ; mov r14, [rdi + crate::vm::host_api::JIT_IC_TABLE_RAW_OFFSET as i32]
+            );
+        } else {
+            dynasm!(ops
+                ; mov rcx, rdi
+                ; mov rax, QWORD heap.versions_base as i64
+                ; call rax
+                ; mov r13, rax
+                ; mov rcx, rdi
+                ; mov rax, QWORD heap.ic_base as i64
+                ; call rax
+                ; mov r14, rax
+            );
+        }
     }
     // ── Q4 leaf-inline headroom check (once per entry) ── `jit_regs_fits` → 1 if
     // every carved scratch window lies inside the pinned register file. Each
