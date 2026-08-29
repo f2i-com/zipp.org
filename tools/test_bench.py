@@ -955,6 +955,19 @@ class BenchResultTests(unittest.TestCase):
             ["benchmark input one.js changed during run (before -> after)"],
         )
 
+    def test_git_publication_pathspecs_are_split_into_bounded_batches(self):
+        paths = [f"directory-{'x' * 180}/{index:04d}.js" for index in range(257)]
+        batches = list(bench._git_pathspec_batches(paths))
+
+        self.assertGreater(len(batches), 1)
+        self.assertEqual([item for batch in batches for item in batch], paths)
+        for batch in batches:
+            self.assertLessEqual(len(batch), bench._GIT_PATHSPEC_BATCH_MAX_ARGS)
+            self.assertLessEqual(
+                sum(len(item) + 3 for item in batch),
+                bench._GIT_PATHSPEC_BATCH_MAX_CHARS,
+            )
+
     def test_publication_paths_must_be_tracked_and_clean_against_head(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -48,6 +48,8 @@ SCHEMA_VERSION = 2
 DEFAULT_SEED = 0x5A17_2026
 BOOTSTRAP_SAMPLES = 10_000
 MIN_PUBLISHABLE_REPS = 15
+_GIT_PATHSPEC_BATCH_MAX_ARGS = 64
+_GIT_PATHSPEC_BATCH_MAX_CHARS = 12_000
 ROOT = Path(__file__).resolve().parent.parent
 BENCH_DIR = ROOT / "bench" / "real"
 BENCHMARK_INPUT_STAGING_POLICY = (
@@ -1874,6 +1876,34 @@ def git_revision() -> str | None:
         return None
 
 
+def _git_pathspec_batches(pathspec: Iterable[str]) -> Iterator[list[str]]:
+    """Keep Git argv bounded on Windows and other low-ARG_MAX hosts.
+
+    Publication verification can cover every tracked file. Passing the whole
+    repository to one ``git ls-tree`` command eventually exceeds Windows'
+    command-line limit, so use conservative batches by both count and encoded
+    command length. A single unusually long path is still yielded on its own;
+    Git then decides whether the host can represent it and verification fails
+    closed if it cannot.
+    """
+
+    batch: list[str] = []
+    characters = 0
+    for item in pathspec:
+        cost = len(item) + 3  # surrounding quotes plus an argument separator
+        if batch and (
+            len(batch) >= _GIT_PATHSPEC_BATCH_MAX_ARGS
+            or characters + cost > _GIT_PATHSPEC_BATCH_MAX_CHARS
+        ):
+            yield batch
+            batch = []
+            characters = 0
+        batch.append(item)
+        characters += cost
+    if batch:
+        yield batch
+
+
 def git_paths_match_head(
     paths: Iterable[Path], *, root: Path = ROOT
 ) -> tuple[bool, str | None]:
@@ -1895,31 +1925,32 @@ def git_paths_match_head(
 
     pathspec = sorted(relative_paths)
     try:
-        tree_probe = subprocess.run(
-            ["git", "ls-tree", "-r", "-z", "HEAD", "--", *pathspec],
-            cwd=resolved_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-            check=False,
-        )
-        if tree_probe.returncode != 0:
-            return False, "could not verify publication sources against HEAD"
         head_entries: dict[str, tuple[str, str, str]] = {}
-        for item in tree_probe.stdout.split(b"\0"):
-            if not item:
-                continue
-            try:
-                metadata, raw_path = item.split(b"\t", 1)
-                raw_mode, raw_kind, raw_oid = metadata.split(b" ", 2)
-            except ValueError:
-                return False, "could not parse publication sources from HEAD"
-            rel = raw_path.decode("utf-8", errors="surrogateescape")
-            head_entries[rel] = (
-                raw_mode.decode("ascii", errors="strict"),
-                raw_kind.decode("ascii", errors="strict"),
-                raw_oid.decode("ascii", errors="strict"),
+        for batch in _git_pathspec_batches(pathspec):
+            tree_probe = subprocess.run(
+                ["git", "ls-tree", "-r", "-z", "HEAD", "--", *batch],
+                cwd=resolved_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
             )
+            if tree_probe.returncode != 0:
+                return False, "could not verify publication sources against HEAD"
+            for item in tree_probe.stdout.split(b"\0"):
+                if not item:
+                    continue
+                try:
+                    metadata, raw_path = item.split(b"\t", 1)
+                    raw_mode, raw_kind, raw_oid = metadata.split(b" ", 2)
+                except ValueError:
+                    return False, "could not parse publication sources from HEAD"
+                rel = raw_path.decode("utf-8", errors="surrogateescape")
+                head_entries[rel] = (
+                    raw_mode.decode("ascii", errors="strict"),
+                    raw_kind.decode("ascii", errors="strict"),
+                    raw_oid.decode("ascii", errors="strict"),
+                )
         if not relative_paths.issubset(head_entries):
             return False, "publication sources include untracked files"
 
