@@ -213,6 +213,24 @@ impl<'p> Vm<'p> {
             let n = self.bigint_from(args.first().copied().unwrap_or(Value::UNDEFINED))?;
             return Ok(self.make_bigint_val(n));
         }
+        // `RegExp(pattern)` WITHOUT `new` (22.2.4.1 steps 2-3): when
+        // IsRegExp(pattern) holds and flags is undefined, `pattern.constructor`
+        // SameValue the active function returns `pattern` itself. The direct
+        // `RegExp(x)` form used to be compile-lowered to `NewRegExp` with
+        // `is_construct: false`, which carries this step; since the lowering
+        // routes it through the plain call, the step lives here as well.
+        // (IsRegExp — a Get of `@@match` — precedes the `constructor` Get, as
+        // the spec orders them; `test262/built-ins/RegExp/S15.10.3.1_A1_T*`.)
+        if ci == self.regexp_ctor && self.regexp_ctor != 0 {
+            let pattern = args.first().copied().unwrap_or(Value::UNDEFINED);
+            let flags = args.get(1).copied().unwrap_or(Value::UNDEFINED);
+            if self.is_regexp(pattern)? && flags == Value::UNDEFINED {
+                let c = self.get_prop(pattern, "constructor")?;
+                if self.same_value(c, callee) {
+                    return Ok(pattern);
+                }
+            }
+        }
         let proto = match self.heap.get(callee.heap_index()) {
             HeapObj::Object(m) => m
                 .get("prototype")
