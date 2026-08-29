@@ -312,9 +312,7 @@ fn computed_mechanism_engages_and_off_switch_restores_fallback() {
         "computed off-switch still emitted the lane:\n{off}"
     );
     assert!(
-        off.contains("GetIndex {")
-            && off.contains("CallWithThis {")
-            && off.contains("[jit] MEM region"),
+        off.contains("CallMethodComputed {") && off.contains("[jit] MEM region"),
         "off-switch did not restore the ordinary computed-call fallback:\n{off}"
     );
 }

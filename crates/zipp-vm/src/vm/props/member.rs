@@ -835,8 +835,15 @@ impl<'p> Vm<'p> {
                                      // Inside a ShadowRealm's evaluate, `globalThis.x` reads the REALM's
                                      // own binding for x when one exists (bare `x` and `globalThis.x`
                                      // alias the same realm slot).
+        // (A `$262.createRealm()` child has a global object of its OWN — a
+        // reference to the main global from child code is an OrdinaryGet
+        // (10.1.8) on that object, never the child's binding table.)
         if let Some(rid) = self.active_realm {
-            if obj.is_heap() && self.global_this != 0 && obj.heap_index() == self.global_this {
+            if obj.is_heap()
+                && self.global_this != 0
+                && obj.heap_index() == self.global_this
+                && !self.realm_global_objs.contains_key(&rid)
+            {
                 if let Some(&s) = self.realm_globals.get(&rid).and_then(|m| m.get(key)) {
                     let v = self
                         .globals

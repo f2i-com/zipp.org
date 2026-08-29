@@ -553,7 +553,16 @@ pub(crate) fn int_unadmitted_ips(
     let (s, e) = (start as usize, end as usize);
     let captured_math = crate::codegen::captured_math_sites(proto, s, e);
     let math_get = |ip: usize| captured_math.iter().any(|site| site.get_ip == ip);
-    let math_call = |ip: usize| captured_math.iter().any(|site| site.call_ip == ip);
+    let math_call = |ip: usize| {
+        captured_math.iter().any(|site| site.call_ip == ip)
+            || matches!(
+                proto.code[ip],
+                Instr::MathOp {
+                    callee: crate::bytecode::NO_REG,
+                    ..
+                }
+            )
+    };
     // B192: `LoadUndefined` into a reg that is NEVER READ in-region (module
     // top-level statement-COMPLETION bookkeeping — `LoadUndefined dst` at a
     // loop head, `Move dst, value` per statement, no in-region reader). Such
@@ -815,7 +824,8 @@ pub(crate) fn compile_region_int_maybe_cold(
 ) -> Option<JitFn> {
     let (s, e) = (start as usize, end as usize);
     let captured_math = crate::codegen::captured_math_sites(proto, s, e);
-    if !captured_math.is_empty() && math_imul_guard.is_none() {
+    let bare_math_globals = crate::codegen::bare_math_globals(proto, s, e);
+    if (!captured_math.is_empty() || !bare_math_globals.is_empty()) && math_imul_guard.is_none() {
         return None;
     }
     let unadmitted = int_unadmitted_ips(proto, start, end, ta_plan, false)?;
@@ -1370,9 +1380,10 @@ pub(crate) fn compile_region_int_maybe_cold(
     // `captured_math_site` proves the global is never stored and no edge enters
     // the captured span; the admitted call-free body cannot mutate Math, so
     // this guard remains authoritative for every loop iteration.
-    if !captured_math.is_empty() {
+    if !captured_math.is_empty() || !bare_math_globals.is_empty() {
         let guard = math_imul_guard.expect("captured Math requires an intrinsic guard");
         let mut guarded_globals: Vec<u32> = captured_math.iter().map(|site| site.global).collect();
+        guarded_globals.extend_from_slice(&bare_math_globals);
         guarded_globals.sort_unstable();
         guarded_globals.dedup();
         // With a pin the frame starts with Win64's 32-byte shadow space and

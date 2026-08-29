@@ -525,139 +525,21 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::LoadGlobal { dst, idx } => {
+                        // Fast path: a live slot the global object does not
+                        // shadow. Everything else — never declared, TDZ, a
+                        // deleted builtin, a real own-property route — is
+                        // `load_global_slow` (the former inline arm, verbatim).
                         let v = self.globals[idx as usize];
-                        if v.is_uninitialized() {
-                            // Referenced but never declared â†’ ReferenceError. The
-                            // name is in `program.global_names`, or â€” for a slot an
-                            // `eval` drew from the EVAL_POOL â€” in `eval_global_map`.
-                            let name = self
-                                .program
-                                .global_names
-                                .get(idx as usize)
-                                .map(|s| s.as_str())
-                                .or_else(|| {
-                                    self.eval_global_map
-                                        .iter()
-                                        .find(|(_, &v)| v == idx)
-                                        .map(|(k, _)| k.as_str())
-                                })
-                                .unwrap_or("?")
-                                .to_string();
-                            // A binding created on the global OBJECT in sloppy code
-                            // (`this.x = v` / `globalThis.x = v`) lives as an own
-                            // property there, not in this slot. The global object's
-                            // own properties ARE global bindings, so a bare read
-                            // resolves to it. Slot-only names (`global_by_name`)
-                            // are excluded by checking the ObjMap directly,
-                            // preserving their uninitialized ReferenceError.
-                            let has_own = self.global_this != 0
-                                && matches!(
-                                    self.heap.get(self.global_this),
-                                    HeapObj::Object(m) if m.pos(&name).is_some()
-                                );
-                            if !has_own {
-                                // HasBinding consults the global object's PROTO
-                                // CHAIN too (9.1.1.4.4 -> HasProperty on the
-                                // binding object): an inherited property — or a
-                                // Proxy prototype's `has` trap — resolves an
-                                // otherwise-undeclared name, and GetBindingValue
-                                // then reads it through [[Get]] with the global
-                                // object as receiver (staging/sm/Proxy/
-                                // global-receiver).
-                                let gobj = Value::heap(self.global_this);
-                                let proto = if self.global_this != 0 {
-                                    self.object_get_prototype_of(gobj)
-                                } else {
-                                    Value::NULL
-                                };
-                                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
-                                    let val = self.get_prop(gobj, &name)?;
-                                    self.set(base, dst, val);
-                                    ip += 1;
-                                    continue;
-                                }
-                                // Value-properties such as undefined/NaN/Infinity
-                                // are represented virtually rather than in the
-                                // heap-backed builtin slot table.  This path is
-                                // also the static fallback of a `with` chain, so
-                                // consult the live global object only after every
-                                // object-environment probe has missed.
-                                if let Some(val) = self.global_by_name(&name) {
-                                    self.set(base, dst, val);
-                                    ip += 1;
-                                    continue;
-                                }
-                                // Name the enclosing function, as the
-                                // not-a-function and property-read errors do:
-                                // Error.stack is empty, so a bare identifier is
-                                // not enough to find the reference in minified
-                                // code. Built only on the throw path.
-                                let f = self.func(func_id as usize);
-                                let fname: &str = if f.name.is_empty() {
-                                    "<anonymous>"
-                                } else {
-                                    &f.name
-                                };
-                                return Err(Thrown(format!(
-                                    "ReferenceError: {name} is not defined (in {fname})"
-                                )));
-                            }
-                            let gobj = Value::heap(self.global_this);
-                            let val = self.get_prop(gobj, &name)?;
+                        if v.is_uninitialized()
+                            || (self.global_route_epoch != 0 && self.global_real_own_route(idx))
+                        {
+                            let val = self.load_global_slow(idx, func_id)?;
                             self.set(base, dst, val);
                             ip += 1;
-                        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
-                            // A LIVE slot whose name the global object shadows with a
-                            // REAL own property: the property is the binding, so
-                            // GetBindingValue reads it through [[Get]] — running a
-                            // getter, and seeing a `writable: false` value the slot
-                            // never received.
-                            //
-                            // `StoreGlobal` has routed this case for a while;
-                            // `LoadGlobal` did not, so after
-                            // `defineProperty(globalThis, "imp", {get, set})` the
-                            // setter ran on every write while the read still returned
-                            // the stale slot — `imp` read `2999` where node reads `G`.
-                            // Both zipp tiers agreed, which is why B66 filed it as a
-                            // conformance gap alongside the tier divergence.
-                            //
-                            // A global LEXICAL is not an object property (same
-                            // exception `StoreGlobal` makes): its slot stays
-                            // authoritative.
-                            //
-                            // GATED ON THE EPOCH, and that is a measured decision.
-                            // Reading ground truth instead — one heap load plus
-                            // `keys.is_empty()` through globalThis's cold `ObjMap`
-                            // box — cost **+12%** on a hot top-level global loop
-                            // (585ms -> 655ms, `ZIPP_NOJIT=1`, 20M iterations),
-                            // which showed up as `map-set-heavy` +3.9% and
-                            // `polymorphic-objects` +2.4% in the 21-pair A/B. Both
-                            // are top-level scripts whose hot loops read globals,
-                            // so every iteration paid it. `LoadGlobal` is far too
-                            // hot to touch the heap speculatively.
-                            //
-                            // The epoch is bumped by `note_global_own_property_change`
-                            // (a descriptor or assignment on globalThis shadowing a
-                            // live slot) and by `uninitialize_global`. If a future
-                            // path adds such a shadow without bumping, this arm is
-                            // skipped and the read falls back to the SLOT — i.e. to
-                            // the pre-B67 answer. Wrong, but no worse than before,
-                            // and NOT a tier divergence: the JIT gates read ground
-                            // truth via `global_slot_directly_routable`, so they
-                            // decline and the interpreter answers, consistently.
-                            let name = self.global_slot_name(idx).unwrap_or_default();
-                            if self.global_name_is_lexical(&name) {
-                                self.set(base, dst, v);
-                            } else {
-                                let gobj = Value::heap(self.global_this);
-                                let val = self.get_prop(gobj, &name)?;
-                                self.set(base, dst, val);
-                            }
-                            ip += 1;
-                        } else {
-                            self.set(base, dst, v);
-                            ip += 1;
+                            continue;
                         }
+                        self.set(base, dst, v);
+                        ip += 1;
                     }
                     Instr::LoadGlobalOrUndefined { dst, idx } => {
                         let v = self.globals[idx as usize];
@@ -3534,6 +3416,33 @@ impl<'p> Vm<'p> {
                         arg_base,
                         argc,
                     } => {
+                        if callee == crate::bytecode::NO_REG {
+                            // BARE form: validate the live global + own slot.
+                            if self.math_bare_is_intrinsic(op, this_v as u32) {
+                                let r = self.eval_math(op, base, arg_base, argc)?;
+                                self.set(base, dst, Value::num(r));
+                                ip += 1;
+                                continue;
+                            }
+                            // Miss: the ordinary member call, performed on the
+                            // LIVE global — exactly `LoadGlobal Math; GetProp
+                            // <op>; CallWithThis` (nothing between the two can
+                            // have run user code: the arguments are transparent).
+                            let Some(gslot) = self.bare_math_slot(this_v as u32) else {
+                                return Err(Thrown(
+                                    "ReferenceError: Math is not defined".to_string(),
+                                ));
+                            };
+                            let recv = self.load_global_value(gslot, func_id)?;
+                            let name = native::MATH_METHODS[op as usize].0;
+                            let f = self.get_prop(recv, name)?;
+                            let args: Vec<Value> =
+                                (0..argc).map(|i| self.get(base, arg_base + i)).collect();
+                            let result = self.call_value(f, recv, &args)?;
+                            self.set(base, dst, result);
+                            ip += 1;
+                            continue;
+                        }
                         let callee = self.get(base, callee);
                         let this_v = self.get(base, this_v);
                         let native_id = native::MATH_METHOD_BASE + op as u16;
@@ -8504,6 +8413,7 @@ impl<'p> Vm<'p> {
                 debug_assert_eq!(native::MATH_METHODS.len(), MATH_FN_COUNT);
                 let mut op_callee_bits = [0u64; MATH_FN_COUNT];
                 let mut op_callee_ver = [0u32; MATH_FN_COUNT];
+                let mut op_slot = [u32::MAX; MATH_FN_COUNT];
                 if let HeapObj::Object(map) = self.heap.get(receiver_idx) {
                     for (i, &(name, _, _)) in native::MATH_METHODS.iter().enumerate() {
                         let Some(slot) = map.pos(name) else { continue };
@@ -8515,6 +8425,7 @@ impl<'p> Vm<'p> {
                         if self.static_builtin_is_intrinsic("Math", id, v, receiver) {
                             op_callee_bits[i] = v.bits();
                             op_callee_ver[i] = self.heap.version_of(v.heap_index());
+                            op_slot[i] = slot as u32;
                         }
                     }
                 }
@@ -8527,6 +8438,7 @@ impl<'p> Vm<'p> {
                     callee_ver: self.heap.version_of(callee.heap_index()),
                     op_callee_bits,
                     op_callee_ver,
+                    op_slot,
                 })
             })
     }
@@ -9652,5 +9564,223 @@ mod forin_canon_tests {
                 "key {s:?}"
             );
         }
+    }
+}
+
+impl<'p> Vm<'p> {
+    /// `LoadGlobal`'s slow half — the slot is uninitialized (never declared, a
+    /// lexical in its TDZ, a deleted builtin) or the global object shadows the
+    /// live slot with a real own property. Every comment and branch is the
+    /// dispatch arm's; the arm keeps only its two-load fast path inline (the
+    /// arm is far too hot to touch the heap speculatively — see the epoch
+    /// note below). Shared with the bare `MathOp` miss path, whose `Math`
+    /// read must be exactly a `LoadGlobal`.
+    #[inline(never)]
+    pub(crate) fn load_global_slow(&mut self, idx: u32, func_id: u32) -> Result<Value, Thrown> {
+        let v = self.globals[idx as usize];
+        if v.is_uninitialized() {
+            // Referenced but never declared â†’ ReferenceError. The
+            // name is in `program.global_names`, or â€” for a slot an
+            // `eval` drew from the EVAL_POOL â€” in `eval_global_map`.
+            let name = self
+                .program
+                .global_names
+                .get(idx as usize)
+                .map(|s| s.as_str())
+                .or_else(|| {
+                    self.eval_global_map
+                        .iter()
+                        .find(|(_, &v)| v == idx)
+                        .map(|(k, _)| k.as_str())
+                })
+                .unwrap_or("?")
+                .to_string();
+            // A binding created on the global OBJECT in sloppy code
+            // (`this.x = v` / `globalThis.x = v`) lives as an own
+            // property there, not in this slot. The global object's
+            // own properties ARE global bindings, so a bare read
+            // resolves to it. Slot-only names (`global_by_name`)
+            // are excluded by checking the ObjMap directly,
+            // preserving their uninitialized ReferenceError.
+            let has_own = self.global_this != 0
+                && matches!(
+                    self.heap.get(self.global_this),
+                    HeapObj::Object(m) if m.pos(&name).is_some()
+                );
+            if !has_own {
+                // HasBinding consults the global object's PROTO
+                // CHAIN too (9.1.1.4.4 -> HasProperty on the
+                // binding object): an inherited property — or a
+                // Proxy prototype's `has` trap — resolves an
+                // otherwise-undeclared name, and GetBindingValue
+                // then reads it through [[Get]] with the global
+                // object as receiver (staging/sm/Proxy/
+                // global-receiver).
+                let gobj = Value::heap(self.global_this);
+                let proto = if self.global_this != 0 {
+                    self.object_get_prototype_of(gobj)
+                } else {
+                    Value::NULL
+                };
+                if proto.is_heap() && self.has_property_str_dyn(proto, &name)? {
+                    let val = self.get_prop(gobj, &name)?;
+                    return Ok(val);
+                }
+                // Value-properties such as undefined/NaN/Infinity
+                // are represented virtually rather than in the
+                // heap-backed builtin slot table.  This path is
+                // also the static fallback of a `with` chain, so
+                // consult the live global object only after every
+                // object-environment probe has missed.
+                if let Some(val) = self.global_by_name(&name) {
+                    return Ok(val);
+                }
+                // Name the enclosing function, as the
+                // not-a-function and property-read errors do:
+                // Error.stack is empty, so a bare identifier is
+                // not enough to find the reference in minified
+                // code. Built only on the throw path.
+                let f = self.func(func_id as usize);
+                let fname: &str = if f.name.is_empty() {
+                    "<anonymous>"
+                } else {
+                    &f.name
+                };
+                return Err(Thrown(format!(
+                    "ReferenceError: {name} is not defined (in {fname})"
+                )));
+            }
+            let gobj = Value::heap(self.global_this);
+            let val = self.get_prop(gobj, &name)?;
+            return Ok(val);
+        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
+            // A LIVE slot whose name the global object shadows with a
+            // REAL own property: the property is the binding, so
+            // GetBindingValue reads it through [[Get]] — running a
+            // getter, and seeing a `writable: false` value the slot
+            // never received.
+            //
+            // `StoreGlobal` has routed this case for a while;
+            // `LoadGlobal` did not, so after
+            // `defineProperty(globalThis, "imp", {get, set})` the
+            // setter ran on every write while the read still returned
+            // the stale slot — `imp` read `2999` where node reads `G`.
+            // Both zipp tiers agreed, which is why B66 filed it as a
+            // conformance gap alongside the tier divergence.
+            //
+            // A global LEXICAL is not an object property (same
+            // exception `StoreGlobal` makes): its slot stays
+            // authoritative.
+            //
+            // GATED ON THE EPOCH, and that is a measured decision.
+            // Reading ground truth instead — one heap load plus
+            // `keys.is_empty()` through globalThis's cold `ObjMap`
+            // box — cost **+12%** on a hot top-level global loop
+            // (585ms -> 655ms, `ZIPP_NOJIT=1`, 20M iterations),
+            // which showed up as `map-set-heavy` +3.9% and
+            // `polymorphic-objects` +2.4% in the 21-pair A/B. Both
+            // are top-level scripts whose hot loops read globals,
+            // so every iteration paid it. `LoadGlobal` is far too
+            // hot to touch the heap speculatively.
+            //
+            // The epoch is bumped by `note_global_own_property_change`
+            // (a descriptor or assignment on globalThis shadowing a
+            // live slot) and by `uninitialize_global`. If a future
+            // path adds such a shadow without bumping, this arm is
+            // skipped and the read falls back to the SLOT — i.e. to
+            // the pre-B67 answer. Wrong, but no worse than before,
+            // and NOT a tier divergence: the JIT gates read ground
+            // truth via `global_slot_directly_routable`, so they
+            // decline and the interpreter answers, consistently.
+            let name = self.global_slot_name(idx).unwrap_or_default();
+            if self.global_name_is_lexical(&name) {
+                return Ok(v);
+            } else {
+                let gobj = Value::heap(self.global_this);
+                let val = self.get_prop(gobj, &name)?;
+                return Ok(val);
+            }
+        } else {
+            return Ok(v);
+        }
+    
+    }
+
+    /// `LoadGlobal` as a value: the inline fast path, else `load_global_slow`.
+    #[inline]
+    pub(crate) fn load_global_value(&mut self, idx: u32, func_id: u32) -> Result<Value, Thrown> {
+        let v = self.globals[idx as usize];
+        if v.is_uninitialized() || (self.global_route_epoch != 0 && self.global_real_own_route(idx)) {
+            return self.load_global_slow(idx, func_id);
+        }
+        Ok(v)
+    }
+
+    /// The global slot a bare `MathOp` reads `Math` from: its `this_v` operand,
+    /// or -- for the by-name form the eval/module re-index produces when the
+    /// mapped slot does not fit the field -- the slot found by name.
+    pub(crate) fn bare_math_slot(&self, gidx: u32) -> Option<u32> {
+        if gidx != crate::bytecode::BARE_MATH_BY_NAME as u32 {
+            return Some(gidx);
+        }
+        self.program
+            .global_names
+            .iter()
+            .position(|n| n == "Math")
+            .map(|i| i as u32)
+            .or_else(|| self.eval_global_map.get("Math").copied())
+    }
+
+    /// The bare `MathOp` guard: the live global slot `gidx` still holds this
+    /// realm's `Math` object and its live own `<op>` data slot still holds the
+    /// intrinsic. Per-op memo of the slot index, keyed on the object's heap
+    /// generation (a structural change — add/delete/accessor/relocation —
+    /// bumps it; an in-place overwrite does not, which is why the slot VALUE is
+    /// re-read every time). A real own-property route on the global (an
+    /// accessor `Math` on globalThis) fails closed to the miss path, whose
+    /// `load_global_value` honours it.
+    pub(crate) fn math_bare_is_intrinsic(&mut self, op: crate::bytecode::MathFn, gidx: u32) -> bool {
+        let math_idx = self.builtin_ns_slots[0];
+        if math_idx == u32::MAX {
+            return false;
+        }
+        let Some(gidx) = self.bare_math_slot(gidx) else {
+            return false;
+        };
+        let Some(&live) = self.globals.get(gidx as usize) else {
+            return false;
+        };
+        if live != Value::heap(math_idx) {
+            return false;
+        }
+        if self.global_route_epoch != 0 && self.global_real_own_route(gidx) {
+            return false;
+        }
+        let ver = self.heap.version_of(math_idx);
+        let k = op as usize;
+        let slot = if self.math_bare_memo[k].0 == ver && self.math_bare_memo[k].1 != u32::MAX {
+            self.math_bare_memo[k].1
+        } else {
+            let name = native::MATH_METHODS[k].0;
+            let HeapObj::Object(map) = self.heap.get(math_idx) else {
+                return false;
+            };
+            let Some(slot) = map.pos(name) else {
+                return false;
+            };
+            self.math_bare_memo[k] = (ver, slot as u32);
+            slot as u32
+        };
+        let HeapObj::Object(map) = self.heap.get(math_idx) else {
+            return false;
+        };
+        if map.attr_at(slot as usize).accessor {
+            return false;
+        }
+        let v = map.val_at(slot as usize);
+        let native_id = native::MATH_METHOD_BASE + op as u16;
+        v.is_heap()
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Native(id) if *id == native_id)
+            && (self.obj_realm.is_empty() || self.get_function_realm(v) == 0)
     }
 }

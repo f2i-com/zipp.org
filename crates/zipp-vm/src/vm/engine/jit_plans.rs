@@ -887,6 +887,17 @@ impl<'p> Vm<'p> {
                 Instr::GetProp { dst, obj, .. } => {
                     dst != 0 && obj != 0 && captured_math.iter().any(|site| site.get_ip == ip)
                 }
+                // A BARE imul carries no captured pair: its guard is emitted
+                // at the op (or hoisted to the region entry) from the global
+                // index in `this_v`.
+                Instr::MathOp {
+                    dst,
+                    op: crate::bytecode::MathFn::Imul,
+                    callee: crate::bytecode::NO_REG,
+                    arg_base,
+                    argc: 2,
+                    ..
+                } => dst != 0 && arg_base != 0,
                 Instr::MathOp {
                     dst,
                     op: crate::bytecode::MathFn::Imul,
@@ -4429,8 +4440,8 @@ fn shift_leaf_regs(i: &Instr, off: u16, const_off: u32) -> Option<Instr> {
         } => Instr::MathOp {
             dst: s(dst),
             op,
-            callee: s(callee),
-            this_v: s(this_v),
+            callee: if callee == crate::bytecode::NO_REG { callee } else { s(callee) },
+            this_v: if callee == crate::bytecode::NO_REG { this_v } else { s(this_v) },
             arg_base: s(arg_base),
             argc,
         },

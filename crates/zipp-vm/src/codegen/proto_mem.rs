@@ -1353,7 +1353,11 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 argc,
                 ..
             } => (
-                Uses::range(arg_base, argc).plus(callee).plus(this_v),
+                if callee == crate::bytecode::NO_REG {
+                    Uses::range(arg_base, argc)
+                } else {
+                    Uses::range(arg_base, argc).plus(callee).plus(this_v)
+                },
                 Some(dst),
             ),
             Instr::GlobalFn {
@@ -2602,26 +2606,15 @@ pub(crate) fn compile_proto_mem(
     let leaf_needs_version_pins = leaf_plan
         .values()
         .any(|p| (p.same_proto_fid.is_none() && p.slot_guard.is_none()) || !p.nested.is_empty());
+    // EVERY `MathOp` whose op was baked takes the direct guard, which reads
+    // the callee's (and, for the BARE form, the receiver's) heap generation
+    // through r13; the captured form always carried a `GetProp` that pinned
+    // r13 anyway, the bare form carries no other reader.
     let has_direct_math_guard = heap.math_imul_guard.is_some()
-        && (proto.code.iter().any(|i| {
-            matches!(
-                i,
-                Instr::MathOp {
-                    op: MathFn::Imul,
-                    ..
-                }
-            )
-        }) || leaf_plan.values().any(|p| {
-            p.body.iter().any(|i| {
-                matches!(
-                    i,
-                    Instr::MathOp {
-                        op: MathFn::Imul,
-                        ..
-                    }
-                )
-            })
-        }));
+        && (proto.code.iter().any(|i| matches!(i, Instr::MathOp { .. }))
+            || leaf_plan
+                .values()
+                .any(|p| p.body.iter().any(|i| matches!(i, Instr::MathOp { .. }))));
     let refetch_pinned = has_prop
         || do_method
         || has_direct_math_guard
@@ -2645,6 +2638,11 @@ pub(crate) fn compile_proto_mem(
                 | Instr::StoreGlobal { .. }
                 | Instr::StoreGlobalStrict { .. }
                 | Instr::StoreGlobalResolved { .. }
+                // A BARE MathOp reads the `Math` global slot in its guard.
+                | Instr::MathOp {
+                    callee: crate::bytecode::NO_REG,
+                    ..
+                }
         )
     };
     let needs_globals = !precise_entry_pins

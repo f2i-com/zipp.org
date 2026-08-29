@@ -660,6 +660,16 @@ impl<'p> Vm<'p> {
                 }
             }
             for e in &imports {
+                // The synthetic `<module source>` host module has no file to
+                // canonicalize (`resolve_module_path` would report it as
+                // missing): its (module, ~source~) binding — the shared slot
+                // holding the %AbstractModuleSource%-linked object — was
+                // created in the pre-pass, and the record never loads, links
+                // or evaluates (InitializeEnvironment 7.c binds the local
+                // straight to [[ModuleSource]]). Nothing further to do.
+                if matches!(e.import, IN::Source) && e.specifier == "<module source>" {
+                    continue;
+                }
                 let dep_raw = match dir.as_deref() {
                     Some(d) => d.join(&e.specifier),
                     None => std::path::PathBuf::from(&e.specifier),
@@ -681,23 +691,21 @@ impl<'p> Vm<'p> {
                         }
                     }
                     IN::Source => {
-                        // The synthetic `<module source>` host module needs
-                        // nothing further. A REAL target is a Source Text
+                        // The synthetic `<module source>` host module was
+                        // skipped above. A REAL target is a Source Text
                         // Module Record, and SourceTextModule.GetModuleSource
                         // throws a SyntaxError at link time — only host-defined
                         // module types carry a [[ModuleSource]] (source-phase
                         // imports proposal). The target's request graph still
                         // resolves FIRST: loading errors precede link errors.
-                        if e.specifier != "<module source>" {
-                            if !is_self && !in_flight {
-                                let mut seen = std::collections::HashSet::new();
-                                self.prescan_module_requests(&dep_canon, &mut seen)?;
-                            }
-                            return Err(Thrown(format!(
-                                "SyntaxError: The requested module '{}' does not provide a module source",
-                                e.specifier
-                            )));
+                        if !is_self && !in_flight {
+                            let mut seen = std::collections::HashSet::new();
+                            self.prescan_module_requests(&dep_canon, &mut seen)?;
                         }
+                        return Err(Thrown(format!(
+                            "SyntaxError: The requested module '{}' does not provide a module source",
+                            e.specifier
+                        )));
                     }
                     IN::DeferNamespace => {
                         let ns = self.deferred_namespace_for(&dep_raw, e.mtype.as_deref())?;

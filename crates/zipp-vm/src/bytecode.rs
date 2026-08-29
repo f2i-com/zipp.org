@@ -15,6 +15,16 @@ use crate::value::Value;
 /// A register index within a function's frame.
 pub type Reg = u16;
 
+/// "No register" for an operand slot that an op may leave unused. Today only
+/// `MathOp` uses it: `callee == NO_REG` marks the BARE form (see the op).
+pub const NO_REG: Reg = Reg::MAX;
+
+/// A bare `MathOp` whose `Math` global slot could not be encoded in `this_v`
+/// (an eval/module re-index landed above the field's range): the op resolves
+/// the slot by NAME at execution instead. Correct, slow, and never emitted by
+/// the compiler itself -- only the re-index pass produces it.
+pub const BARE_MATH_BY_NAME: Reg = Reg::MAX - 1;
+
 /// Engine-private prefix carried by the Array returned from `ForInKeys`.
 ///
 /// The snapshot is never exposed to JavaScript. Slots 0..6 hold the receiver,
@@ -1044,6 +1054,21 @@ pub enum Instr {
     },
     /// `dst = Math.<op>(args…)` — a builtin Math function over `argc` contiguous
     /// argument registers starting at `arg_base`.
+    ///
+    /// Two forms. CAPTURED: `callee`/`this_v` hold the `Math.<op>` callable and
+    /// the `Math` receiver read BEFORE the arguments (`LoadGlobal Math; GetProp
+    /// <op>`), the exact EvaluateCall order; the op runs the intrinsic only if
+    /// both still name the main realm's pristine intrinsic, else it ordinary-
+    /// calls the captured pair. BARE (`callee == NO_REG`, `this_v` = the
+    /// `LoadGlobal` index of `Math`): nothing is captured because every
+    /// argument is order-transparent (`arg_order_transparent`), so validating
+    /// the LIVE global slot and the LIVE `Math.<op>` own data slot at execution
+    /// (`math_bare_is_intrinsic`; the JIT's `emit_math_identity_guard`) is
+    /// indistinguishable from the pre-argument Get; a miss performs that Get
+    /// on the live global and ordinary-calls the result. The bare form is the
+    /// pre-hardening register layout — no pair in the loop body — with the
+    /// hardening's semantics (a replaced method, a rebound `Math`, an accessor
+    /// or a deleted slot are all observed).
     MathOp {
         dst: Reg,
         op: MathFn,

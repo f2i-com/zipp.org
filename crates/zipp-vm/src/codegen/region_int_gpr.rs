@@ -1435,6 +1435,7 @@ fn gpr_home_map(
         || (!gpr_split_enabled()
             && (!plan.split_recvs.is_empty() || !plan.split_recv_lg.is_empty()))
     {
+        crate::codegen::region_int_gpr::gpr_decline_note("wt/dv-flag needs dv_gpr, or split needs gpr_split");
         return Err(false);
     }
     // Engage only where the mode pays: at least one op that would round-trip
@@ -1451,6 +1452,7 @@ fn gpr_home_map(
         )
     });
     if !pays {
+        crate::codegen::region_int_gpr::gpr_decline_note("no Bitwise/imul to pay for the lane");
         return Err(false);
     }
     // Hoisted constants: reg → i32 value (from the hoist ips' own opcodes).
@@ -1464,7 +1466,10 @@ fn gpr_home_map(
                 // region admission guaranteed the constant is Int-tagged.
                 hoist_c.insert(dst, proto.constants[idx as usize].bits() as u32 as i32);
             }
-            _ => return Err(false), // not a shape this emitter hoists
+            _ => {
+                crate::codegen::region_int_gpr::gpr_decline_note("hoist shape");
+                return Err(false);
+            }
         }
     }
     // Slot-materialized consts read as immediates too — but their defining op
@@ -1574,7 +1579,18 @@ fn gpr_home_map(
                 Some(&Home::Xmm(x)) if used.contains(&x) => {
                     forced.insert(x);
                 }
-                _ => return Err(false),
+                other => {
+                    let home = match other {
+                        Some(&Home::Xmm(x)) => format!("xmm{x} (unused)"),
+                        Some(_) => "non-xmm".to_string(),
+                        None => "none".to_string(),
+                    };
+                    crate::codegen::region_int_gpr::gpr_decline_note(&format!(
+                        "split receiver r{r} has no used xmm home (home {home}, splits {:?})",
+                        plan.split_recvs
+                    ));
+                    return Err(false);
+                }
             }
         }
         n_spill = used.len() - pool.len();
@@ -1635,7 +1651,10 @@ fn gpr_home_map(
     for r in plan.split_recvs.iter() {
         match plan.reg_home.get(r) {
             Some(&Home::Xmm(x)) if matches!(map.get(&x), Some(Loc::R(_))) => {}
-            _ => return Err(false),
+            _ => {
+                crate::codegen::region_int_gpr::gpr_decline_note("split receiver home not resident");
+                return Err(false);
+            }
         }
     }
     for r in plan.write_through.iter() {
@@ -1687,7 +1706,10 @@ fn gpr_home_map(
             Some(&Home::Gpr(_))
                 if (spilled_path || !plan.narrow_globs.is_empty())
                     && plan.bool_regs.iter().any(|&(br, _)| br == *r) => {}
-            _ => return Err(false),
+            _ => {
+                crate::codegen::region_int_gpr::gpr_decline_note("write-through register home unmapped");
+                return Err(false);
+            }
         }
     }
     Ok((map, hoist_c, inline_guards, n_spill))
@@ -2458,6 +2480,7 @@ pub(crate) fn compile_region_int_gpr(
 ) -> GprAttempt {
     let (s, e) = (start as usize, end as usize);
     let captured_math = crate::codegen::captured_math_sites(proto, s, e);
+    let bare_math_globals = crate::codegen::bare_math_globals(proto, s, e);
     // Captured Math is admitted only with the allocation-free direct identity
     // guard; the helper fallback would clobber this allocator's mixed volatile
     // and non-volatile home set.
@@ -2466,6 +2489,7 @@ pub(crate) fn compile_region_int_gpr(
         .any(|i| matches!(i, Instr::MathOp { .. }))
         && math_imul_guard.is_none()
     {
+        crate::codegen::region_int_gpr::gpr_decline_note("MathOp without a baked imul guard");
         return GprAttempt::OutOfScope;
     }
     // W20 M2: a region with an admitted `arr.push(int)` is out of scope for the
@@ -2477,6 +2501,7 @@ pub(crate) fn compile_region_int_gpr(
     // `gpr_home_map` already requires a Bitwise/imul to engage, which a
     // push-bearing scan loop does not have.
     if region_has_arr_push(proto, s, e, ta_plan) {
+        crate::codegen::region_int_gpr::gpr_decline_note("region has arr.push");
         return GprAttempt::OutOfScope;
     }
     let rip = |ip: usize| -> i32 {
@@ -2689,9 +2714,10 @@ pub(crate) fn compile_region_int_gpr(
     // Exact entry guard for a folded `Math.imul` captured-reference prefix.
     // The recogniser proves the guarded global is stable for the region and no
     // edge can enter after its LoadGlobal, so this stays outside the hot loop.
-    if !captured_math.is_empty() {
+    if !captured_math.is_empty() || !bare_math_globals.is_empty() {
         let guard = math_imul_guard.expect("captured Math requires an intrinsic guard");
         let mut guarded_globals: Vec<u32> = captured_math.iter().map(|site| site.global).collect();
+        guarded_globals.extend_from_slice(&bare_math_globals);
         guarded_globals.sort_unstable();
         guarded_globals.dedup();
         for global in guarded_globals {
@@ -3544,7 +3570,10 @@ pub(crate) fn compile_region_int_gpr(
                         Some(IntTaLoadKind::I32) => {
                             dynasm!(ops ; movsxd Rq(d), DWORD [rdx + rcx * 4])
                         }
-                        None => return GprAttempt::OutOfScope,
+                        None => {
+                            crate::codegen::region_int_gpr::gpr_decline_note("pinned element kind not an int TA load");
+                            return GprAttempt::OutOfScope;
+                        }
                     }
                 }
                 store_dst(&mut ops, dl); // W10.3 spilled dst: park the canonical qword
@@ -4311,4 +4340,11 @@ fn emit_gpr_region_restore(ops: &mut dynasmrt::x64::Assembler, frame: i32) {
         ; pop rbx
         ; ret
     );
+}
+
+/// `ZIPP_JITLOG` note for the GPR sub-mode's otherwise silent declines.
+pub(crate) fn gpr_decline_note(tag: &str) {
+    if std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!("[jit] INT-GPR decline: {tag}");
+    }
 }

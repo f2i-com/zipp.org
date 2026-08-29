@@ -779,7 +779,13 @@ pub(crate) fn emit_inline_leaf_call(
                 argc: ac,
             } => {
                 let bail = ops.new_dynamic_label();
-                emit_math_identity_guard(ops, op, rg(callee), rg(this_v), bail, math_imul_guard);
+                // A bare op's `this_v` is a global index, not a register.
+                let (gc, gt) = if callee == crate::bytecode::NO_REG {
+                    (callee, this_v)
+                } else {
+                    (rg(callee), rg(this_v))
+                };
+                emit_math_identity_guard(ops, op, gc, gt, bail, math_imul_guard);
                 if ac == 1 {
                     load_num_xmm(ops, rg(ab), 0, bail);
                     dynasm!(ops
@@ -2238,7 +2244,13 @@ fn lane_use_def(ins: &Instr) -> Option<(([u16; 4], u8), Option<u16>)> {
             arg_base,
             argc: 2,
             ..
-        } => u4(callee, this_v, arg_base, arg_base + 1, Some(dst)),
+        } => {
+            if callee == crate::bytecode::NO_REG {
+                u2(arg_base, arg_base + 1, Some(dst))
+            } else {
+                u4(callee, this_v, arg_base, arg_base + 1, Some(dst))
+            }
+        }
         Instr::UpvalSet { src, .. }
         | Instr::StoreGlobal { src, .. }
         | Instr::StoreGlobalStrict { src, .. }
@@ -3563,13 +3575,25 @@ fn build_lane_inner(
                 arg_base: ab,
                 argc: 2,
             } => {
-                let receiver_g = match b.binds.get(&this_v).map(|&sid| b.slots[sid]) {
-                    Some(Av::Callee { g }) => g,
-                    _ => return Err("math-receiver-not-captured"),
-                };
-                match b.binds.get(&callee).map(|&sid| b.slots[sid]) {
-                    Some(Av::MathCallee { g }) if g == receiver_g => {}
-                    _ => return Err("math-callee-not-captured"),
+                if callee == crate::bytecode::NO_REG {
+                    // BARE form: the guard is scheduled at the op itself (the
+                    // lane is straight-line and call-free, so the position is
+                    // immaterial); `this_v` is the global index.
+                    let guard = b.math_imul_guard.ok_or("math-guard-missing")?;
+                    b.steps.push(LaneStep::MathImulGuard {
+                        gidx: this_v as u32,
+                        guard,
+                    });
+                    b.n_guards += 1;
+                } else {
+                    let receiver_g = match b.binds.get(&this_v).map(|&sid| b.slots[sid]) {
+                        Some(Av::Callee { g }) => g,
+                        _ => return Err("math-receiver-not-captured"),
+                    };
+                    match b.binds.get(&callee).map(|&sid| b.slots[sid]) {
+                        Some(Av::MathCallee { g }) if g == receiver_g => {}
+                        _ => return Err("math-callee-not-captured"),
+                    }
                 }
                 let sa = b.resolve(i, ab)?;
                 let sb = b.resolve(i, ab + 1)?;

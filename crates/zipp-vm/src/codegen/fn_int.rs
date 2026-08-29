@@ -449,6 +449,29 @@ pub(crate) fn captured_math_sites(
         .collect()
 }
 
+/// The `Math` global indices read by the BARE `Math.imul` ops in `[start,
+/// end]` (sorted, deduplicated): each needs the same entry validation a
+/// captured site's prefix gets (`jit_math_imul_prefix_is_intrinsic`), after
+/// which the call-free region's imul arm runs guard-free.
+pub(crate) fn bare_math_globals(proto: &FuncProto, start: usize, end: usize) -> Vec<u32> {
+    let mut v: Vec<u32> = proto.code[start..=end.min(proto.code.len() - 1)]
+        .iter()
+        .filter_map(|ins| match *ins {
+            Instr::MathOp {
+                op: crate::bytecode::MathFn::Imul,
+                callee: crate::bytecode::NO_REG,
+                this_v,
+                argc: 2,
+                ..
+            } => Some(this_v as u32),
+            _ => None,
+        })
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 /// If this single-parameter function opens with a base case of the shape
 /// `if (param <cmp> K) return param;` — i.e. it returns its argument UNCHANGED
 /// for small inputs — report `(cmp, K)`. A self-call to such a function can then

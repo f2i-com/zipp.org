@@ -1312,6 +1312,10 @@ pub struct MathIntrinsicGuard {
     /// lookup alone was a string hash per `Math.floor(x)`.
     pub op_callee_bits: [u64; crate::bytecode::MATH_FN_COUNT],
     pub op_callee_ver: [u32; crate::bytecode::MATH_FN_COUNT],
+    /// Own data slot of each baked `Math.<op>` in the receiver's values
+    /// vector (`u32::MAX` = not baked): what the BARE `MathOp` guard re-reads
+    /// through `receiver_vals` after validating `receiver_ver`.
+    pub op_slot: [u32; crate::bytecode::MATH_FN_COUNT],
 }
 
 #[derive(Clone, Copy)]

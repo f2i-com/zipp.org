@@ -1110,11 +1110,18 @@ impl<'p> Vm<'p> {
             return self.primitive_base_set(obj, key, val, strict);
         }
         // ShadowRealm evaluate: `globalThis.x = v` binds the REALM's x (the
-        // same slot a bare `x` resolves to inside the realm).
+        // same slot a bare `x` resolves to inside the realm). Only a
+        // ShadowRealm models its global AS the main global object; a
+        // `$262.createRealm()` child has a global object of its own, so a
+        // reference to the main global from child code (`mainGlobal.x = v`
+        // in a child-realm callback that `Array.from` invokes) is an ordinary
+        // OrdinarySet (10.1.9) on the main global and must not be redirected
+        // into the child's binding table.
         if let Some(rid) = self.active_realm {
             if self.global_this != 0
                 && obj.heap_index() == self.global_this
                 && !key.starts_with("@@")
+                && !self.realm_global_objs.contains_key(&rid)
             {
                 let s = self.realm_global_slot(rid, key)?;
                 self.globals[s as usize] = val;

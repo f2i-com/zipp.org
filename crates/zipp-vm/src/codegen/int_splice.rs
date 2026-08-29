@@ -102,6 +102,16 @@ struct Site<'a> {
     /// a live range spanning the whole region — 5 more permanent homes on the
     /// mix loop, which overflows the pool before any emitter runs.
     win: u16,
+    /// Callee-local registers that take a DEDICATED caller slot instead of
+    /// `win + reg`: the captured `Math` receiver/callee pairs of a computed
+    /// arm. The pair holds boxed identities that the region planner keeps out
+    /// of the numeric homes only while nothing else in the region writes the
+    /// register; in a window shared by mutually-exclusive arms another arm's
+    /// numeric temporary lands on exactly that register, which turns the pair
+    /// into recycled pinned receivers whose split the GPR emitter refuses (the
+    /// hostile bytecode-vm's helper table -- arm 0 `Math.imul(...)`, arm 1 a
+    /// rotate -- dropped its whole dispatch loop to MEM that way).
+    pair_map: Vec<(u16, u16)>,
     plan: &'a LeafInlinePlan,
 }
 
@@ -406,6 +416,7 @@ pub(crate) fn plan_int_splice(
             dst,
             arg_base,
             win: win as u16,
+            pair_map: Vec::new(),
             plan: lp,
         });
     }
@@ -651,6 +662,31 @@ fn plan_int_computed_splice(
         }
         wins.push(arm_win as u16);
     }
+    // Dedicated slots for each arm's captured `Math` pairs (see `Site::pair_map`).
+    let mut pair_maps: Vec<Vec<(u16, u16)>> = Vec::with_capacity(cp.variants.len());
+    for lp in &cp.variants {
+        let mut pm: Vec<(u16, u16)> = Vec::new();
+        for ins in &lp.body {
+            // A BARE MathOp (`callee == NO_REG`) captures nothing: its
+            // `this_v` is a global index, not a register.
+            if let Instr::MathOp { callee, this_v, .. } = *ins {
+                if callee == crate::bytecode::NO_REG {
+                    continue;
+                }
+                for r in [this_v, callee] {
+                    if !pm.iter().any(|(from, _)| *from == r) {
+                        let to = u16::try_from(win_top).ok()?;
+                        pm.push((r, to));
+                        win_top += 1;
+                    }
+                }
+            }
+        }
+        pair_maps.push(pm);
+    }
+    if win_top > MAX_SPLICE_WINDOW_TOP {
+        decline!("@{call_ip} computed windows exceed register headroom");
+    }
 
     let mut code = proto.code.clone();
     let mut constants = proto.constants.clone();
@@ -704,6 +740,7 @@ fn plan_int_computed_splice(
                 dst,
                 arg_base,
                 win,
+                pair_map: pair_maps[index].clone(),
                 plan: lp,
             };
             emit_splice(
@@ -849,7 +886,9 @@ fn emit_splice(
     // Callee reg 0 is `this` and 1..=n the params; `uninit_mask == 0` proved no
     // other local is read before it is written, so nothing else needs seeding.
     let map = |reg: u16| -> u16 {
-        if reg >= 1 && reg <= n && alias(reg - 1) {
+        if let Some(&(_, to)) = site.pair_map.iter().find(|(from, _)| *from == reg) {
+            to
+        } else if reg >= 1 && reg <= n && alias(reg - 1) {
             site.arg_base + (reg - 1)
         } else {
             w + reg
@@ -1005,8 +1044,8 @@ fn map_body_instr(
         } => Instr::MathOp {
             dst: m(dst),
             op: crate::bytecode::MathFn::Imul,
-            callee: m(callee),
-            this_v: m(this_v),
+            callee: if callee == crate::bytecode::NO_REG { callee } else { m(callee) },
+            this_v: if callee == crate::bytecode::NO_REG { this_v } else { m(this_v) },
             arg_base: m(arg_base),
             argc: 2,
         },
@@ -1433,8 +1472,10 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
             ..
         } => {
             let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
-            v.push(callee);
-            v.push(this_v);
+            if callee != crate::bytecode::NO_REG {
+                v.push(callee);
+                v.push(this_v);
+            }
             r(v, Some(dst))
         }
         Instr::GlobalFn {

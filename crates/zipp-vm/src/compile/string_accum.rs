@@ -363,7 +363,10 @@ pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
             arg_base,
             argc,
             ..
-        } => callee == r || this_v == r || in_args(arg_base, argc),
+        } => {
+            (callee != crate::bytecode::NO_REG && (callee == r || this_v == r))
+                || in_args(arg_base, argc)
+        }
         Instr::StaticFn {
             callee,
             this_v,

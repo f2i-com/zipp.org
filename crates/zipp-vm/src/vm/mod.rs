@@ -1152,6 +1152,10 @@ pub struct Vm<'p> {
     /// guards probe per operation (`helpers_misc::builtin_ns_index`);
     /// `u32::MAX` = not registered. Filled beside the map at boot.
     builtin_ns_slots: [u32; crate::vm::helpers_misc::BUILTIN_NS_COUNT],
+    /// Per-`MathFn` memo for the bare `MathOp` guard: (heap generation of the
+    /// `Math` object when the slot was resolved, own slot index of `Math.<op>`);
+    /// `u32::MAX` slot = not resolved. See `Vm::math_bare_is_intrinsic`.
+    math_bare_memo: [(u32, u32); crate::bytecode::MATH_FN_COUNT],
     /// Most-recent class value per class_id (filled by `MakeClass`), so a
     /// `super` call can reach its lexical superclass value at runtime.
     class_values: Vec<Option<Value>>,
@@ -2562,6 +2566,8 @@ pub(crate) use helpers_misc::call_inline_stats;
 pub(crate) use helpers_misc::computed_call_stats;
 pub(crate) use helpers_misc::concat_set_stats;
 pub(crate) use helpers_misc::cross_decline_stats;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_math_bare_is_intrinsic;
 pub(crate) use helpers_misc::cross_fill_stats;
 pub(crate) use helpers_misc::hasprop_pin_absent_stats;
 pub(crate) use helpers_misc::ic_stats;

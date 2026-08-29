@@ -6279,6 +6279,22 @@ pub(crate) extern "win64" fn jit_math_is_intrinsic(
     ) as u64
 }
 
+/// Identity guard for a JIT-emitted BARE `MathOp` whose op was not baked into
+/// the direct guard (`op_callee_bits == 0`): the interpreter's own check on
+/// the live global slot `gidx` and the live own data slot.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_math_bare_is_intrinsic(
+    vm: *mut core::ffi::c_void,
+    code: u32,
+    gidx: u32,
+) -> u64 {
+    let Some(&(_, op, _)) = native::MATH_METHODS.get(code as usize) else {
+        return 0;
+    };
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    vm.math_bare_is_intrinsic(op, gidx) as u64
+}
+
 /// Entry guard for a register-tier region which folds the compiler's
 /// `LoadGlobal Math; GetProp "imul"` captured-reference prefix.  Unlike
 /// `jit_math_is_intrinsic`, this re-reads both the live global and the live own

@@ -680,6 +680,25 @@ impl<'a> FnCompiler<'a> {
         Ok(callee)
     }
 
+    /// `capture_plain_callee` for a call whose argument list is known: a
+    /// register-resident local that no argument can reassign IS its own
+    /// stable snapshot, so the call reads the binding's register directly
+    /// (the pre-hardening lowering). The snapshot `Move` is not free: it is
+    /// one more def in the loop body for every planner that keys on a
+    /// register's writer, and one more live temporary across the arguments.
+    pub(crate) fn capture_plain_callee_for_call(
+        &mut self,
+        callee_expr: &Expr,
+        args: &[Arg],
+    ) -> R<Reg> {
+        if let Expr::Ident(id) = callee_expr {
+            if self.stable_register_receiver(id, args) {
+                return self.expr(callee_expr);
+            }
+        }
+        self.capture_plain_callee(callee_expr)
+    }
+
     /// Evaluate a member CALLEE reference into stable registers, in the exact
     /// EvaluateCall order: receiver/reference first, then GetValue (including
     /// RequireObjectCoercible, ToPropertyKey, Proxy traps, accessors and private
@@ -716,6 +735,29 @@ impl<'a> FnCompiler<'a> {
         // leaf and computed-leaf lanes are sensitive to it).
         let fresh_callee = matches!(m.prop, MemberProp::Ident(_) | MemberProp::Private(_));
         self.capture_member_callee_impl(m, stable, fresh_callee)
+    }
+
+    /// The `LoadGlobal` index of `Math` when a bare `Math.<op>(…)` may read it
+    /// straight from the global slot: `Math` resolves to a global (not a local,
+    /// cell, upvalue or class name), no `with` object can shadow it, the
+    /// function is not a dynamic (eval) zone, and the index fits the op's
+    /// `this_v` field. Anything else takes the captured form.
+    fn bare_math_global(&mut self) -> Option<Reg> {
+        if self.box_all_locals || self.cx.dyn_global_zone {
+            return None;
+        }
+        if !self.with_objs_for("Math").is_empty() {
+            return None;
+        }
+        let bound_here = self.scopes.iter().flatten().any(|(n, _)| n == "Math")
+            || self.self_name.as_ref().is_some_and(|(n, _)| n == "Math");
+        if !bound_here && self.inherited_with_shadows.contains_key("Math") {
+            return None;
+        }
+        match self.resolve("Math") {
+            Binding::Global(idx) => Reg::try_from(idx).ok().filter(|&r| r != crate::bytecode::NO_REG),
+            _ => None,
+        }
     }
 
     /// Whether `name` reads as a bare register (a never-captured local — only
@@ -1443,7 +1485,41 @@ impl<'a> FnCompiler<'a> {
                 if let Expr::Ident(obj) = &m.object {
                     if &**obj == "Math" {
                         if let Some(op) = crate::bytecode::MathFn::from_name(prop) {
-                            let save = self.next_reg;
+                            // BARE form (see `Instr::MathOp`): every argument is
+                            // order-transparent and `Math` is a plain global
+                            // read, so no receiver/callee pair is captured and
+                            // the op validates the live global + own slot at
+                            // execution. The captured pair was two registers
+                            // per site in the loop body, and its recycling was
+                            // what turned pinned receivers into split receivers
+                            // (the hostile bytecode-vm's dispatch loop fell from
+                            // INT-GPR to MEM, 68ms -> 260ms; multi_split's string
+                            // receiver lost its split; a wide leaf lost its
+                            // register budget). `ZIPP_STRICT_CALL_ORDER=1`
+                            // narrows the transparent class exactly as it does
+                            // for `CallMethod`.
+                            let bare = c.args.iter().all(|a| match a {
+                                Arg::Expr(e) => self.arg_order_transparent(e),
+                                Arg::Spread(_) => false,
+                            });
+                            if bare {
+                                if let Some(gidx) = self.bare_math_global() {
+                                    let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                                    self.emit(Instr::MathOp {
+                                        dst,
+                                        op,
+                                        callee: crate::bytecode::NO_REG,
+                                        this_v: gidx,
+                                        arg_base,
+                                        argc,
+                                    });
+                                    return Ok(dst);
+                                }
+                            }
+                            // CAPTURED form. NOTE: no `next_reg` reset after the
+                            // op: recycling the pair as numeric temporaries made
+                            // the planner see a "recycled pinned receiver" and
+                            // route it through the split machinery.
                             let (callee, this_v) = self.capture_member_callee(m)?;
                             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                             self.emit(Instr::MathOp {
@@ -1454,7 +1530,6 @@ impl<'a> FnCompiler<'a> {
                                 arg_base,
                                 argc,
                             });
-                            self.next_reg = save.max(dst + 1);
                             return Ok(dst);
                         }
                     }
@@ -1548,8 +1623,8 @@ impl<'a> FnCompiler<'a> {
         // lane in the interpreter and both JIT tiers keys on (method ICs, the
         // intrinsic push/charCodeAt arms, method inlining, the cross-call
         // lane); the split GetProp+CallWithThis form below has none of them.
-        // Every other argument shape — a member or index read, a call, a
-        // spread, an assignment — keeps the captured path, whose ordering
+        // Every other argument shape — a call, a `new`, a spread, an
+        // assignment — keeps the captured path, whose ordering
         // `tests/call_reference_order.rs` pins.
         if let Expr::Member(m) = peeled {
             // A RegExp-flavoured spelling (`test`/`exec`/`matchAll`/`replace`)
@@ -1564,7 +1639,6 @@ impl<'a> FnCompiler<'a> {
             };
             if !matches!(m.object, Expr::Super)
                 && !regexp_spelling
-                && matches!(m.prop, MemberProp::Ident(_) | MemberProp::Private(_))
                 && c.args.iter().all(|a| match a {
                     Arg::Expr(e) => self.arg_order_transparent(e),
                     Arg::Spread(_) => false,
@@ -1575,13 +1649,41 @@ impl<'a> FnCompiler<'a> {
                     // `obj?.method(args)` — short-circuit on a nullish receiver.
                     self.emit_optional_check(obj);
                 }
+                if let MemberProp::Computed(key_expr) = &m.prop {
+                    // Fused computed call `obj[key](args…)`: the receiver
+                    // and key are snapshotted into fresh temporaries and the
+                    // op performs ToPropertyKey + Get at call time. With
+                    // transparent arguments nothing between the snapshot and
+                    // the op can observe that order. The INT computed splice
+                    // (dense small-int keys over an array of closures) and
+                    // the MEM computed lane key on this op; the split
+                    // GetIndex + CallWithThis form only has the generic path.
+                    let obj_reg = self.alloc_reg();
+                    if obj != obj_reg {
+                        self.emit(Instr::Move { dst: obj_reg, src: obj });
+                    }
+                    let key = self.expr(key_expr)?;
+                    let key_reg = self.alloc_reg();
+                    if key != key_reg {
+                        self.emit(Instr::Move { dst: key_reg, src: key });
+                    }
+                    let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                    self.emit(Instr::CallMethodComputed {
+                        dst,
+                        obj: obj_reg,
+                        key: key_reg,
+                        arg_base,
+                        argc,
+                    });
+                    return Ok(dst);
+                }
                 let name = match &m.prop {
                     MemberProp::Ident(prop) => self.string_name(prop),
                     MemberProp::Private(field) => {
                         self.check_private_declared(field)?;
                         self.string_name(&private_key(field))
                     }
-                    MemberProp::Computed(_) => unreachable!("computed keys take the captured path"),
+                    MemberProp::Computed(_) => unreachable!("handled above"),
                 };
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                 // NOTE: no `next_reg` reset here, deliberately — the fused
@@ -1606,12 +1708,17 @@ impl<'a> FnCompiler<'a> {
         // the captured value with the captured receiver. Besides enforcing
         // EvaluateCall ordering, this prevents property replacement during an
         // argument from redirecting the invocation.
+        // NOTE: no `next_reg` reset after the call (the fused lowering above
+        // and the plain call below never had one either). Recycling the
+        // callee/receiver temporaries lets the next statement of a loop body
+        // redefine them, and the register tier's glob-range pass then sees
+        // one merged live range across the call instead of two short ones:
+        // the hostile bytecode-vm's spliced dispatch loop went 15 -> 16 homes,
+        // one over the pool, and fell from INT-GPR to MEM (68ms -> 260ms).
         if let Expr::Member(m) = peeled {
-            let save = self.next_reg;
             let (callee, this_v) = self.capture_member_callee_for_call(m, &c.args)?;
             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
             self.emit_captured_member_call(m, dst, callee, this_v, arg_base, argc);
-            self.next_reg = save.max(dst + 1);
             return Ok(dst);
         }
 
@@ -1629,7 +1736,7 @@ impl<'a> FnCompiler<'a> {
         // splice pins for the callee's identity multi-def, and the planner
         // then declines the whole loop ("not cleanly excludable"): parse-
         // large-js's `mix(...)` loop fell from INT to MEM, 95ms -> 267ms.
-        let callee = self.capture_plain_callee(&c.callee)?;
+        let callee = self.capture_plain_callee_for_call(&c.callee, &c.args)?;
         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
         self.emit(Instr::Call {
             dst,
@@ -1825,9 +1932,12 @@ impl<'a> FnCompiler<'a> {
     ///   is set. Reads of globals, cells and upvalues; arithmetic /
     ///   comparison / string-concatenation / template forms over transparent
     ///   operands; array and plain-keyed object literals of transparent parts;
-    ///   closure literals. These run user code ONLY through an object
-    ///   operand's `valueOf`/`toString`/`Symbol.toPrimitive`, throw only on a
-    ///   TDZ or never-declared name, and read state only a side-effecting
+    ///   closure literals; property, element and private reads over
+    ///   transparent parts. These run user code ONLY through an object
+    ///   operand's `valueOf`/`toString`/`Symbol.toPrimitive` or an accessor /
+    ///   proxy trap on a read's own base, throw only on a TDZ, a never-declared
+    ///   name, a nullish base or a private brand miss, and read state only a
+    ///   side-effecting
     ///   accessor on the CALLEE property could have changed first. Every one of
     ///   those needs an exotic partner at the same site (a getter or proxy trap
     ///   on `obj.name` that mutates the caller's state, or an object operand
@@ -1836,8 +1946,7 @@ impl<'a> FnCompiler<'a> {
     ///   site. The latch exists so a conformance or differential run can prove
     ///   the split lowering against the provable class alone.
     ///
-    /// Everything else stays captured: a member or index read (a getter in an
-    /// argument replacing the callee IS the observable order the tests pin), a
+    /// Everything else stays captured: a
     /// call, `new`, an assignment/update, a spread, `in`/`instanceof` (proxy
     /// `has` / `Symbol.hasInstance` traps), a with-shadowable name, a dynamic
     /// (eval) zone read, `arguments`, a parameter in its own default's TDZ, a
@@ -1924,6 +2033,21 @@ impl<'a> FnCompiler<'a> {
             // cells); a class expression evaluates computed keys and static
             // blocks, so it stays captured.
             Expr::Arrow(_) | Expr::Function(_) => relaxed,
+            // A plain property / element / private read (optional or not)
+            // over transparent parts: `x.prop`, `x[i]`, `this.#p`. It runs
+            // user code ONLY through an accessor or proxy trap on the
+            // ARGUMENT's own base — an exotic partner in exactly the sense
+            // of the class above — and throws only on a nullish base or a
+            // private brand miss. `super.x` is refused by the object
+            // recursion (`Expr::Super` is not transparent).
+            Expr::Member(m) => {
+                relaxed
+                    && self.arg_transparent_in(&m.object, relaxed)
+                    && match &m.prop {
+                        MemberProp::Ident(_) | MemberProp::Private(_) => true,
+                        MemberProp::Computed(k) => self.arg_transparent_in(k, relaxed),
+                    }
+            }
             _ => false,
         }
     }

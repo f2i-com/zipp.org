@@ -490,13 +490,18 @@ impl<'p> Vm<'p> {
                     // Top-level let/const are NOT global-object properties, a
                     // never-initialized slot does not exist, and a
                     // `delete globalThis.X`'d builtin stays gone.
-                    // (Skipped inside a child-realm evaluation: the realm's
-                    // global surface is its OWN binding table, and a
-                    // ShadowRealm's globalThis must expose only configurable
-                    // properties.)
+                    // (Skipped inside a ShadowRealm evaluation, whose global
+                    // the main global object stands in for: the realm's global
+                    // surface is its OWN binding table, and a ShadowRealm's
+                    // globalThis must expose only configurable properties. A
+                    // `$262.createRealm()` child has a global object of its
+                    // own, so from child code the main global's own keys are
+                    // the ordinary ones.)
                     if idx == self.global_this
                         && self.global_this != 0
-                        && self.active_realm.is_none()
+                        && !self
+                            .active_realm
+                            .is_some_and(|rid| !self.realm_global_objs.contains_key(&rid))
                     {
                         let mut seen: std::collections::HashSet<String> =
                             keys.iter().cloned().collect();

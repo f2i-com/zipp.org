@@ -3884,6 +3884,24 @@ fn plan_region_cold_inner(
                         .count();
                     eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
                         glob_order.len(), nregs - perm);
+                    if std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+                        // Which numeric registers hold a permanent home, and
+                        // why: `o` = read outside the region, `i` = live-in,
+                        // `h` = hoisted.
+                        let list: Vec<String> = reg_order
+                            .iter()
+                            .filter(|r| ty[r] == VTy::Num && !shareable(**r))
+                            .map(|r| {
+                                format!(
+                                    "r{r}{}{}{}",
+                                    if read_outside.contains(r) { "o" } else { "" },
+                                    if first_seen.get(r) == Some(&false) { "i" } else { "" },
+                                    if hoisted.contains(r) { "h" } else { "" }
+                                )
+                            })
+                            .collect();
+                        eprintln!("[pool] region [{s},{e}] permanent: {}", list.join(" "));
+                    }
                 }
                 decline!("xmm pool exhausted even with home reuse")
             }
@@ -3940,6 +3958,21 @@ fn plan_region_cold_inner(
                             .count();
                         eprintln!("[pool] region [{s},{e}] numeric regs={nregs} globals={} | PERMANENT={perm} (read_outside={ro} live_in={li} hoisted={ho}) shareable={}",
                             glob_order.len(), nregs - perm);
+                        if std::env::var_os("ZIPP_GLOBRANGE_DEBUG").is_some() {
+                            let list: Vec<String> = reg_order
+                                .iter()
+                                .filter(|r| ty[r] == VTy::Num && !shareable(**r))
+                                .map(|r| {
+                                    format!(
+                                        "r{r}{}{}{}",
+                                        if read_outside.contains(r) { "o" } else { "" },
+                                        if first_seen.get(r) == Some(&false) { "i" } else { "" },
+                                        if hoisted.contains(r) { "h" } else { "" }
+                                    )
+                                })
+                                .collect();
+                            eprintln!("[pool] region [{s},{e}] permanent: {}", list.join(" "));
+                        }
                     }
                     decline!("xmm pool exhausted even with home reuse")
                 }
@@ -5228,13 +5261,21 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
             argc,
             ..
         } => win(&[callee, this_v], arg_base, argc),
+        // A BARE MathOp (`callee == NO_REG`) reads only its argument window —
+        // `this_v` is a global index there, not a register.
         Instr::MathOp {
             callee,
             this_v,
             arg_base,
             argc,
             ..
-        } => win(&[callee, this_v], arg_base, argc),
+        } => {
+            if callee == crate::bytecode::NO_REG {
+                win(&[], arg_base, argc)
+            } else {
+                win(&[callee, this_v], arg_base, argc)
+            }
+        }
         Instr::GlobalFn { callee, arg_base, argc, .. } => win(&[callee], arg_base, argc),
         Instr::ArrayCtor { callee, arg_base, argc, .. } => {
             match callee {

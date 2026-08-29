@@ -197,6 +197,20 @@ impl<'p> Vm<'p> {
                     Instr::DeleteGlobal { slot, .. } => {
                         *slot = gmap[*slot as usize];
                     }
+                    // A BARE MathOp carries the `Math` global slot in `this_v`
+                    // (a u16 field): map it like every other global reference;
+                    // a slot the field cannot hold degrades to the by-name form.
+                    Instr::MathOp {
+                        callee: crate::bytecode::NO_REG,
+                        this_v,
+                        ..
+                    } => {
+                        let mapped = gmap[*this_v as usize];
+                        *this_v = u16::try_from(mapped)
+                            .ok()
+                            .filter(|&v| v < crate::bytecode::BARE_MATH_BY_NAME)
+                            .unwrap_or(crate::bytecode::BARE_MATH_BY_NAME);
+                    }
                     // The upvalue index is the eval closure's own; only the
                     // NAME handle is a global slot.
                     Instr::LoadUpvalDyn { name, .. } | Instr::StoreUpvalDyn { name, .. } => {

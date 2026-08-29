@@ -264,6 +264,52 @@ pub(crate) fn emit_math_identity_guard(
     bail: dynasmrt::DynamicLabel,
     imul_guard: Option<MathIntrinsicGuard>,
 ) {
+    if callee == crate::bytecode::NO_REG {
+        // BARE `MathOp`: `this_v` is the `LoadGlobal` index of `Math`. Validate
+        // the LIVE global slot (r12 = globals base), the receiver's heap
+        // generation (r13 = versions base; a structural change invalidates the
+        // baked slot address), the live own slot value and the callable's
+        // generation — the typed lane's `MathImulGuard`, generalised per op.
+        let gidx = this_v as i32;
+        if let Some(guard) = imul_guard {
+            let (bits, ver, slot) = (
+                guard.op_callee_bits[op as usize],
+                guard.op_callee_ver[op as usize],
+                guard.op_slot[op as usize],
+            );
+            if bits != 0 && slot != u32::MAX && this_v < crate::bytecode::BARE_MATH_BY_NAME {
+                dynasm!(ops
+                    ; mov rax, [r12 + gidx * 8]
+                    ; mov r10, QWORD guard.receiver_bits as i64
+                    ; cmp rax, r10
+                    ; jne => bail
+                    ; mov ecx, eax
+                    ; cmp DWORD [r13 + rcx * 4], guard.receiver_ver as i32
+                    ; jne => bail
+                    ; mov rcx, QWORD guard.receiver_vals as i64
+                    ; mov rax, [rcx + (slot as i32) * 8]
+                    ; mov r10, QWORD bits as i64
+                    ; cmp rax, r10
+                    ; jne => bail
+                    ; mov ecx, eax
+                    ; cmp DWORD [r13 + rcx * 4], ver as i32
+                    ; jne => bail
+                );
+                return;
+            }
+        }
+        let identity = crate::vm::jit_math_bare_is_intrinsic as usize;
+        dynasm!(ops
+            ; mov rcx, rdi
+            ; mov edx, op as i32
+            ; mov r8d, gidx
+            ; mov rax, QWORD identity as i64
+            ; call rax
+            ; test rax, rax
+            ; jz => bail
+        );
+        return;
+    }
     // Every op whose intrinsic callable was baked at compile time takes the
     // same three-compare guard `Math.imul` always had (the `imul` entry of the
     // table equals `callee_bits`/`callee_ver`); an op that was not a plain
