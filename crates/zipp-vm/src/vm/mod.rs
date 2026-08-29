@@ -499,6 +499,19 @@ pub(crate) struct DeferredModuleExec {
     pub full2: Vec<(String, u32)>,
 }
 
+/// The phase of a static module request (ModuleRequest Record [[Phase]]).
+/// Evaluation-time walks — InnerModuleEvaluation's request loop,
+/// GatherAsynchronousTransitiveDependencies, ReadyForSyncExecution — follow
+/// EVALUATION and DEFER requests only; a SOURCE request (`import source`,
+/// and the bindingless load-only phase form) is loaded but never linked or
+/// evaluated, so it is an edge of the load graph alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModuleRequestPhase {
+    Evaluation,
+    Defer,
+    Source,
+}
+
 /// The deferred Annex B legacy statics: a ROOTED subject plus unit ranges for
 /// `regexp_last` slots 2..=13 (lastParen, leftContext, rightContext, `$1`..`$9`).
 ///
@@ -2096,6 +2109,51 @@ pub struct Vm<'p> {
     /// permanent — every later import re-throws it without re-running the
     /// body. Values are GC ROOTS.
     module_errors: std::collections::HashMap<std::path::PathBuf, Value>,
+    /// Spec [[DFSIndex]] / [[DFSAncestorIndex]] of every module on an
+    /// evaluation DFS stack (InnerModuleEvaluation's `stack`): canonical
+    /// path → (index, ancestor index). A module is present exactly while its
+    /// [[Status]] is EVALUATING — from the start of its link until its
+    /// strongly connected component closes — so membership is the engine's
+    /// EVALUATING test: it covers `module_loading`, `executing_modules` AND
+    /// the finished members of a component whose root has not closed yet.
+    /// Holds paths only (nothing to root).
+    module_dfs: std::collections::HashMap<std::path::PathBuf, (u32, u32)>,
+    /// The evaluation DFS stack itself: pushed at link entry, popped when
+    /// the component closes or the evaluation aborts.
+    module_dfs_stack: Vec<std::path::PathBuf>,
+    /// The next [[DFSIndex]]. Monotonic for the life of the Vm so segment
+    /// bases stay comparable.
+    module_dfs_next: u32,
+    /// The [[DFSIndex]] at which the CURRENT Evaluate() invocation's stack
+    /// segment starts. A dynamic import, a deferred-namespace trigger and
+    /// the entry load are each a fresh Evaluate() with a stack of their own;
+    /// the engine runs some of them inline while an outer body executes, so
+    /// a module below the base belongs to that OUTER evaluation and is not
+    /// "on this stack" for cycle bookkeeping.
+    module_dfs_seg_base: u32,
+    /// Modules whose LINK (dependency loop + re-export link) is in flight,
+    /// innermost last, each with its `link_pending_deps` mark: the top is
+    /// the requester of every static request edge taken right now.
+    module_link_stack: Vec<(std::path::PathBuf, usize)>,
+    /// Recorded [[CycleRoot]] of every module that closed as a member of a
+    /// NON-TRIVIAL strongly connected component (a module that is its own
+    /// root has no entry): canonical path → root path. Evaluate step 2.a
+    /// redirects a later import of a member to this root: its error, its
+    /// pending capability. Recorded at DFS time (InnerModuleEvaluation step
+    /// 16), never re-derived from the static graph — an `import defer` or
+    /// `import source` request is not an evaluation edge and creates no
+    /// component. Paths only.
+    module_cycle_root: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+    /// Parsed request lists (LoadRequestedModules' view of a file): canonical
+    /// path → its direct requests in source order, each with its phase.
+    /// Filled on first use — module source is immutable for the life of the
+    /// loader, so no walk re-reads or re-parses a file. Paths only.
+    module_requests_cache: std::collections::HashMap<
+        std::path::PathBuf,
+        std::sync::Arc<Vec<(std::path::PathBuf, ModuleRequestPhase)>>,
+    >,
+    /// Memoised [[HasTLA]] per canonical path (the check compiles the file).
+    module_tla_cache: std::collections::HashMap<std::path::PathBuf, bool>,
     /// Per-module DEFERRED namespace singleton (`import defer * as ns`):
     /// canonical path → the deferred namespace object. Values are GC ROOTS.
     deferred_ns_cache: std::collections::HashMap<(std::path::PathBuf, Option<String>), Value>,

@@ -264,13 +264,44 @@ impl<'p> Vm<'p> {
     /// compile error, a missing dependency, or a throw during evaluation propagates as
     /// `Err`. The given `path` is canonicalized; relative re-export specifiers resolve
     /// against the module's own directory.
+    ///
+    /// This entry runs the load as a FRESH Evaluate() invocation — a dynamic
+    /// `import()`, a deferred-namespace trigger, the entry load. It gets a
+    /// DFS stack segment of its own: nothing an outer body left on the
+    /// stack counts as EVALUATING for its cycle bookkeeping. A static
+    /// request edge of a link in flight goes through `import_module_dep`.
     pub(crate) fn import_module(
         &mut self,
         raw_path: &std::path::Path,
         mtype: Option<&str>,
     ) -> Result<Value, Thrown> {
         self.require_external_code_enabled()?;
+        self.with_fresh_dfs_segment(|vm| {
+            vm.with_confined_module_depth(|vm| vm.import_module_inner(raw_path, mtype))
+        })
+    }
+
+    /// `import_module` for a static request edge taken by the link in
+    /// flight (InnerModuleEvaluation step 11): the same stack segment, so a
+    /// dependency that reaches back into an ancestor lowers the requester's
+    /// [[DFSAncestorIndex]] (see `module_dfs_edge`).
+    pub(crate) fn import_module_dep(
+        &mut self,
+        raw_path: &std::path::Path,
+        mtype: Option<&str>,
+    ) -> Result<Value, Thrown> {
+        self.require_external_code_enabled()?;
         self.with_confined_module_depth(|vm| vm.import_module_inner(raw_path, mtype))
+    }
+
+    /// Run `f` as a fresh Evaluate() invocation: modules pushed on the DFS
+    /// stack by an enclosing evaluation are not "on this stack" inside it.
+    pub(crate) fn with_fresh_dfs_segment<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = self.module_dfs_seg_base;
+        self.module_dfs_seg_base = self.module_dfs_next;
+        let r = f(self);
+        self.module_dfs_seg_base = saved;
+        r
     }
 
     fn import_module_inner(
@@ -289,63 +320,41 @@ impl<'p> Vm<'p> {
         }
         if mtype.is_none() {
             if let Some(&ns) = self.module_cache.get(&path) {
-                // A cached module that SUSPENDED (top-level await): later
-                // importers settle from the same body promise — never from
-                // the incomplete namespace directly.
-                if let Some(&(bp, _)) = self.module_body_promise.get(&path) {
-                    let pending = bp.is_heap()
-                        && matches!(
-                            self.heap.get(bp.heap_index()),
-                            HeapObj::Promise {
-                                state: crate::heap::PromiseState::Pending,
-                                ..
-                            }
-                        );
-                    // NOT for a SELF-import from the module's own (still
-                    // executing) body: chaining its import promise on its own
-                    // body promise is a deadlock cycle — the spec resolves a
-                    // self-import against the in-progress record directly.
-                    if pending && !self.executing_modules.contains(&path) {
-                        // A suspended module inside a CYCLE completes only
-                        // when its CYCLE ROOT does (InnerModuleEvaluation
-                        // 11.c.iv waits on requiredModule.[[CycleRoot]]):
-                        // prefer a pending ANCESTOR capability (a cap-kind
-                        // registration) whose request graph reaches this
-                        // module.
-                        let mut chosen = bp;
-                        let mut candidates: Vec<(std::path::PathBuf, Value)> = Vec::new();
-                        for (p2, &(b2, cap2)) in &self.module_body_promise {
-                            let p2_pending = cap2
-                                && *p2 != path
-                                && b2.is_heap()
-                                && matches!(
-                                    self.heap.get(b2.heap_index()),
-                                    HeapObj::Promise {
-                                        state: crate::heap::PromiseState::Pending,
-                                        ..
-                                    }
-                                );
-                            if p2_pending {
-                                candidates.push((p2.clone(), b2));
-                            }
-                        }
-                        candidates.sort_by(|a, b| a.0.cmp(&b.0));
-                        for (p2, b2) in candidates {
-                            let mut seen = std::collections::HashSet::new();
-                            if self.module_graph_reaches(&p2, &path, &mut seen) {
-                                chosen = b2;
-                                break;
-                            }
-                        }
-                        self.pending_module_body = Some(chosen);
+                // EVALUATING-ASYNC / EVALUATED: Evaluate step 2.a redirects
+                // the module to its recorded [[CycleRoot]], and
+                // InnerModuleEvaluation step 2.b returns that root's
+                // [[EvaluationError]] — a member of an errored component
+                // re-throws the component's error even when ITS OWN body
+                // finished cleanly before a peer rejected. A requester on
+                // the evaluation stack fails with it (Evaluate step 9).
+                if let Some(e) = self.module_cycle_error(&path) {
+                    self.module_dfs_fail(e);
+                    let msg = self.throw_message(e);
+                    self.pending_throw = Some(e);
+                    return Err(Thrown(msg));
+                }
+                // A cached module that SUSPENDED (top-level await) — or whose
+                // component's root did — settles later importers from the
+                // ROOT's still-pending promise (InnerModuleEvaluation
+                // 11.c.iv/v wait on requiredModule.[[CycleRoot]]), never from
+                // the incomplete namespace directly. NOT for a SELF-import
+                // from the module's own (still executing) body: chaining its
+                // import promise on its own body promise is a deadlock cycle
+                // — the spec resolves a self-import against the in-progress
+                // record directly.
+                if !self.executing_modules.contains(&path) {
+                    if let Some(bp) = self.module_pending_promise(&path) {
+                        self.pending_module_body = Some(bp);
                     }
                 }
                 return Ok(ns);
             }
         }
         // A module that already FAILED evaluation re-throws the SAME error on
-        // every later import (its abrupt completion is permanent).
+        // every later import (its abrupt completion is permanent); a
+        // requester on the evaluation stack fails with it (Evaluate step 9).
         if let Some(&e) = self.module_errors.get(&path) {
+            self.module_dfs_fail(e);
             let msg = self.throw_message(e);
             self.pending_throw = Some(e);
             return Err(Thrown(msg));
@@ -630,6 +639,8 @@ impl<'p> Vm<'p> {
         // mark (nested links use their own marks via the same discipline).
         let lp_mark = self.link_pending_deps.len();
         self.module_loading.insert(path.clone());
+        // InnerModuleEvaluation steps 5-10: EVALUATING, on the DFS stack.
+        self.module_dfs_enter(&path, lp_mark);
         let import_res = (|| -> Result<(), Thrown> {
             // LOADING phase: every requested module (including phase-import
             // requests) must resolve to a readable file BEFORE linking starts.
@@ -843,11 +854,25 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
+                // InnerModuleEvaluation step 11.c for an EVALUATION-phase
+                // request of a JS module record: cycle bookkeeping, the
+                // requested component's recorded error, its pending async
+                // root. A typed request is a distinct synthetic record and a
+                // phase request is not an evaluation edge.
+                if e.mtype.is_none()
+                    && matches!(
+                        e.import,
+                        IN::SideEffect | IN::Named(_) | IN::Default | IN::Namespace
+                    )
+                {
+                    self.module_dfs_edge(&dep_canon)?;
+                }
             }
             Ok(())
         })();
         self.module_loading.remove(&path);
         let cleanup_on_err = |vm: &mut Self| {
+            vm.module_dfs_unwind(&path);
             vm.module_cache.remove(&path);
             vm.module_namespaces.remove(&ns_idx);
             vm.module_own.remove(&path);
@@ -925,6 +950,8 @@ impl<'p> Vm<'p> {
             &ns_reexports,
             dir.as_deref(),
         );
+        // The link is over: no further static edge originates here.
+        self.module_link_pop(&path);
         let linked = match linked {
             Ok((full2, ambiguous)) => {
                 // EARLY ObjMap fill: reflection DURING the body (Object.keys,
@@ -971,6 +998,8 @@ impl<'p> Vm<'p> {
                     self.pending_module_body = Some(Value::heap(cap));
                     self.module_body_promise
                         .insert(path.clone(), (Value::heap(cap), true));
+                    // EVALUATING-ASYNC: InnerModuleEvaluation step 16.
+                    self.module_dfs_close(&path);
                     return {
                         self.module_own.remove(&path);
                         self.module_pending_reexports.remove(&path);
@@ -1016,6 +1045,11 @@ impl<'p> Vm<'p> {
                                 }
                                 let msg = self.throw_message(r);
                                 self.module_errors.insert(path.clone(), r);
+                                // Evaluate step 9: every module still on
+                                // this stack — the requesters above and the
+                                // finished members of the unclosed component
+                                // — is EVALUATED with this error.
+                                self.module_dfs_fail(r);
                                 self.pending_throw = Some(r);
                                 Err(Thrown(msg))
                             }
@@ -1048,11 +1082,14 @@ impl<'p> Vm<'p> {
                 if !ambiguous.is_empty() {
                     self.module_ambiguous.insert(ns_idx, ambiguous);
                 }
+                // EVALUATED / EVALUATING-ASYNC: InnerModuleEvaluation step 16.
+                self.module_dfs_close(&path);
                 Ok(Value::heap(ns_idx))
             }
             Err(e) => {
                 // The module threw / a dependency failed: discard the half-built entry
                 // so a later import re-evaluates rather than seeing a partial namespace.
+                self.module_dfs_unwind(&path);
                 self.module_cache.remove(&path);
                 self.module_namespaces.remove(&ns_idx);
                 Err(e)
@@ -1089,6 +1126,7 @@ impl<'p> Vm<'p> {
             let canon = self.resolve_module_path(&dep)?;
             let slot = self.module_ns_slot(&canon)?;
             let ns = self.import_module_sync(&dep, None)?;
+            self.module_dfs_edge(&canon)?;
             self.globals[slot as usize] = ns;
             self.bump_global_gen(slot);
             full.push((exported.clone(), slot));
@@ -1105,6 +1143,10 @@ impl<'p> Vm<'p> {
                     "SyntaxError: The requested module '{spec}' does not provide an export named '{imported}'"
                 )));
             }
+            // `resolve_export` answers from the namespace maps without
+            // re-entering the loader: the evaluation edge is taken here.
+            let canon = self.resolve_module_path(&dep)?;
+            self.module_dfs_edge(&canon)?;
         }
         let own: std::collections::HashSet<String> = full.iter().map(|(n, _)| n.clone()).collect();
         let mut star_seen: std::collections::HashMap<String, u32> =
@@ -1130,6 +1172,8 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
+            let canon = self.resolve_module_path(&dep)?;
+            self.module_dfs_edge(&canon)?;
         }
         if !ambiguous.is_empty() {
             full.retain(|(n, _)| !ambiguous.contains(n));
@@ -1245,33 +1289,61 @@ impl<'p> Vm<'p> {
         if !non_js {
             let mut seen = std::collections::HashSet::new();
             self.prescan_module_requests(&path, &mut seen)?;
-            // The proposal evaluates a deferred graph's ASYNC subgraphs EAGERLY
-            // at load time (so a later trigger can stay synchronous): import any
-            // reachable module with top-level await now — its own dependencies
-            // evaluate with it; sync-only parts of the graph stay deferred.
-            // DFS request order (deterministic — evaluation logs are observable).
-            let mut graph: Vec<std::path::PathBuf> = Vec::new();
+            // GatherAsynchronousTransitiveDependencies: the proposal evaluates
+            // a deferred graph's ASYNC subgraphs EAGERLY at the importer's
+            // link (so a later trigger can stay synchronous). Each async
+            // dependency found is a static edge of the importer
+            // (InnerModuleEvaluation 11.b.ii): imported through the link in
+            // flight, whose body then waits for it; sync-only parts of the
+            // graph stay deferred. DFS request order (deterministic —
+            // evaluation logs are observable).
             let mut gseen = std::collections::HashSet::new();
             let mut stack = vec![path.clone()];
             while let Some(m) = stack.pop() {
                 if !gseen.insert(m.clone()) {
                     continue;
                 }
-                graph.push(m.clone());
-                if let Ok(reqs) = self.module_requests(&m) {
-                    // Reverse so the explicit stack pops requests in source order.
-                    for r in reqs.into_iter().rev() {
-                        stack.push(r);
-                    }
+                // Step 6: EVALUATING — on an evaluation stack (linking,
+                // executing, or a finished member of a component whose root
+                // has not closed). The walk stops HERE: its requests belong
+                // to that evaluation, not to this importer.
+                if self.module_dfs.contains_key(&m) {
+                    continue;
                 }
-            }
-            for m in graph {
-                if !self.module_cache.contains_key(&m)
-                    && !self.module_loading.contains(&m)
-                    && !self.executing_modules.contains(&m)
-                    && self.module_has_tla(&m)
-                {
+                if self.module_cache.contains_key(&m) || self.module_errors.contains_key(&m) {
+                    // EVALUATING-ASYNC / EVALUATED. Step 6 also stops at an
+                    // EVALUATED component (IsModuleSCCEvaluated: its ROOT
+                    // settled — an errored component counts, its error
+                    // surfaces at the trigger). A component whose root is
+                    // still pending is an additional async dependency of the
+                    // importer, reached through this member: the cache-hit
+                    // path publishes the root's promise for the link. A
+                    // HasTLA member ends the walk (step 7); a sync member's
+                    // requests are walked on (step 8).
+                    if self.module_pending_promise(&m).is_none() {
+                        continue;
+                    }
                     self.import_module_sync(&m, None)?;
+                    self.module_dfs_edge(&m)?;
+                    if self.module_has_tla(&m) {
+                        continue;
+                    }
+                } else if self.module_has_tla(&m) {
+                    // Step 7: an unevaluated async module is gathered — it
+                    // evaluates now, its own dependencies with it.
+                    self.import_module_sync(&m, None)?;
+                    self.module_dfs_edge(&m)?;
+                    continue;
+                }
+                // Step 8: the EVALUATION and DEFER requests; a SOURCE request
+                // is never evaluated. Reverse so the explicit stack pops
+                // requests in source order.
+                if let Ok(reqs) = self.module_requests(&m) {
+                    for (r, phase) in reqs.iter().rev() {
+                        if *phase != ModuleRequestPhase::Source {
+                            stack.push(r.clone());
+                        }
+                    }
                 }
             }
         }
@@ -1378,6 +1450,9 @@ impl<'p> Vm<'p> {
         let Ok(path) = self.resolve_module_path(path) else {
             return false;
         };
+        if let Some(&tla) = self.module_tla_cache.get(&path) {
+            return tla;
+        }
         let Ok(code) = self.read_module_text(&path) else {
             return false;
         };
@@ -1402,7 +1477,8 @@ impl<'p> Vm<'p> {
         ) else {
             return false;
         };
-        prog.functions
+        let tla = prog
+            .functions
             .first()
             .map(|f| {
                 f.code.iter().any(|i| {
@@ -1413,7 +1489,9 @@ impl<'p> Vm<'p> {
                     )
                 })
             })
-            .unwrap_or(false)
+            .unwrap_or(false);
+        self.module_tla_cache.insert(path, tla);
+        tla
     }
 
     /// Whether a [[Get]]/[[Has]]/[[Delete]]/[[DefineOwnProperty]] key
@@ -1449,17 +1527,21 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
-    /// The spec's LOADING phase for a module that is never evaluated (a phase
-    /// import's target): read + parse it and resolve its requested specifiers
-    /// recursively — an unreadable file is a host TypeError, a parse failure a
-    /// SyntaxError. Already-cached / already-seen modules are done.
     /// The canonical paths of `path`'s DIRECT module requests (import /
-    /// export-from / export-* sources), resolving each against its dir.
+    /// export-from / export-* sources) in source order, each with its
+    /// phase, resolving each against the file's dir. Parsed ONCE per
+    /// canonical path (module source is immutable for the life of the
+    /// loader); every later call is one map probe — the walks that call this
+    /// per graph node never re-read or re-parse a file. A file that fails to
+    /// read, parse or resolve is not cached: its error surfaces at link.
     pub(crate) fn module_requests(
         &mut self,
         path: &std::path::PathBuf,
-    ) -> Result<Vec<std::path::PathBuf>, Thrown> {
+    ) -> Result<std::sync::Arc<Vec<(std::path::PathBuf, ModuleRequestPhase)>>, Thrown> {
         let path = self.resolve_module_path(path)?;
+        if let Some(cached) = self.module_requests_cache.get(&path) {
+            return Ok(cached.clone());
+        }
         let confined = self.module_root.is_some();
         let code = self.read_module_text(&path).map_err(|err| {
             if confined || err.0 != MODULE_NOT_FOUND {
@@ -1475,19 +1557,28 @@ impl<'p> Vm<'p> {
         let dir = path.parent().map(|p| p.to_path_buf());
         let mut out = Vec::new();
         for s in &ast.body {
-            use crate::parse::ast::{ExportDecl, Stmt};
-            let spec: Option<String> = match s {
-                Stmt::Import(d) => Some(d.source.to_lossy_string()),
+            use crate::parse::ast::{ExportDecl, ImportPhase, Stmt};
+            let spec: Option<(String, ModuleRequestPhase)> = match s {
+                Stmt::Import(d) => Some((
+                    d.source.to_lossy_string(),
+                    match d.phase {
+                        ImportPhase::Evaluation => ModuleRequestPhase::Evaluation,
+                        ImportPhase::Defer => ModuleRequestPhase::Defer,
+                        ImportPhase::Source => ModuleRequestPhase::Source,
+                    },
+                )),
                 Stmt::Export(e) => match &**e {
                     ExportDecl::Named {
                         source: Some(src), ..
-                    } => Some(src.to_lossy_string()),
-                    ExportDecl::All { source, .. } => Some(source.to_lossy_string()),
+                    } => Some((src.to_lossy_string(), ModuleRequestPhase::Evaluation)),
+                    ExportDecl::All { source, .. } => {
+                        Some((source.to_lossy_string(), ModuleRequestPhase::Evaluation))
+                    }
                     _ => None,
                 },
                 _ => None,
             };
-            if let Some(spec) = spec {
+            if let Some((spec, phase)) = spec {
                 // The synthetic `<module source>` host module (source-phase
                 // imports) has no file and never evaluates — not a request.
                 if spec == "<module source>" {
@@ -1497,7 +1588,6 @@ impl<'p> Vm<'p> {
                     Some(d) => d.join(&spec),
                     None => std::path::PathBuf::from(&spec),
                 };
-                let confined = self.module_root.is_some();
                 let canon = self.resolve_module_path(&raw).map_err(|err| {
                     if confined {
                         err
@@ -1507,44 +1597,249 @@ impl<'p> Vm<'p> {
                         ))
                     }
                 })?;
-                out.push(canon);
+                out.push((canon, phase));
             }
         }
+        let out = std::sync::Arc::new(out);
+        self.module_requests_cache.insert(path, out.clone());
         Ok(out)
     }
 
-    /// Whether `from`'s static request graph reaches `target` (cycle-root
-    /// detection for late importers of a suspended cycle member).
-    pub(crate) fn module_graph_reaches(
-        &mut self,
-        from: &std::path::PathBuf,
-        target: &std::path::PathBuf,
-        seen: &mut std::collections::HashSet<std::path::PathBuf>,
-    ) -> bool {
-        self.with_confined_module_depth(|vm| Ok(vm.module_graph_reaches_inner(from, target, seen)))
-            .unwrap_or(false)
+    /// InnerModuleEvaluation steps 5-10 for a module entering its link:
+    /// status EVALUATING, [[DFSIndex]] = [[DFSAncestorIndex]] = the next
+    /// index, pushed on the stack; and it becomes the requester of every
+    /// static edge until `module_link_pop`.
+    fn module_dfs_enter(&mut self, path: &std::path::PathBuf, lp_mark: usize) {
+        let idx = self.module_dfs_next;
+        self.module_dfs_next += 1;
+        self.module_dfs.insert(path.clone(), (idx, idx));
+        self.module_dfs_stack.push(path.clone());
+        self.module_link_stack.push((path.clone(), lp_mark));
     }
 
-    fn module_graph_reaches_inner(
-        &mut self,
-        from: &std::path::PathBuf,
-        target: &std::path::PathBuf,
-        seen: &mut std::collections::HashSet<std::path::PathBuf>,
-    ) -> bool {
-        if !seen.insert(from.clone()) {
-            return false;
+    /// The link of `path` (dependency loop + re-export link) is over.
+    fn module_link_pop(&mut self, path: &std::path::Path) {
+        if self
+            .module_link_stack
+            .last()
+            .is_some_and(|(p, _)| p.as_path() == path)
+        {
+            self.module_link_stack.pop();
         }
-        let Ok(reqs) = self.module_requests(from) else {
-            return false;
+    }
+
+    /// `m`'s (index, ancestor index) if it is EVALUATING on the CURRENT
+    /// Evaluate()'s stack segment.
+    fn module_on_dfs_stack(&self, m: &std::path::Path) -> Option<(u32, u32)> {
+        match self.module_dfs.get(m) {
+            Some(&(idx, anc)) if idx >= self.module_dfs_seg_base => Some((idx, anc)),
+            _ => None,
+        }
+    }
+
+    /// InnerModuleEvaluation step 16: `path`'s evaluation phase is over (its
+    /// body ran, suspended at top-level await, or was deferred behind
+    /// pending async dependencies). A ROOT — ancestor index == own index —
+    /// closes its strongly connected component: every member above it on
+    /// the stack is popped, leaves EVALUATING, and records `path` as its
+    /// [[CycleRoot]]. A non-root stays on the stack until its root closes.
+    fn module_dfs_close(&mut self, path: &std::path::PathBuf) {
+        self.module_link_pop(path);
+        let Some(&(idx, anc)) = self.module_dfs.get(path) else {
+            return;
         };
-        for dep in reqs {
-            if dep == *target || self.module_graph_reaches(&dep, target, seen) {
-                return true;
+        if anc != idx {
+            return;
+        }
+        while let Some(m) = self.module_dfs_stack.pop() {
+            self.module_dfs.remove(&m);
+            if m == *path {
+                break;
+            }
+            self.module_cycle_root.insert(m, path.clone());
+        }
+    }
+
+    /// The evaluation of `path` aborted — a link error, or an evaluation
+    /// error `module_dfs_fail` has already recorded on the stack: drop it
+    /// and everything above it from the stack. No [[CycleRoot]] is recorded
+    /// (Evaluate step 9 leaves an errored stack's roots EMPTY; each module
+    /// answers with its own recorded error).
+    fn module_dfs_unwind(&mut self, path: &std::path::PathBuf) {
+        self.module_link_pop(path);
+        if let Some(pos) = self.module_dfs_stack.iter().rposition(|m| m == path) {
+            for m in self.module_dfs_stack.drain(pos..) {
+                self.module_dfs.remove(&m);
             }
         }
-        false
     }
 
+    /// Evaluate step 9: an abrupt InnerModuleEvaluation completion makes
+    /// EVERY module still on this Evaluate()'s stack EVALUATED with
+    /// [[EvaluationError]] = `err` — the requesters up the chain and the
+    /// finished members of a component that never closed. A module that
+    /// already recorded an error keeps it. A no-op outside a link (a
+    /// dynamic import of an errored module has an empty stack).
+    pub(crate) fn module_dfs_fail(&mut self, err: Value) {
+        let base = self.module_dfs_seg_base;
+        for m in self.module_dfs_stack.iter().rev() {
+            match self.module_dfs.get(m) {
+                Some(&(idx, _)) if idx >= base => {}
+                _ => break,
+            }
+            self.module_errors.entry(m.clone()).or_insert(err);
+        }
+    }
+
+    /// InnerModuleEvaluation step 11.c for the static request edge from the
+    /// link in flight (top of `module_link_stack`) to `dep`, taken AFTER the
+    /// request was resolved / evaluated:
+    /// - iii. `dep` still EVALUATING on this stack (a back-edge, or a fresh
+    ///   dependency that joined an ancestor's component): the requester's
+    ///   [[DFSAncestorIndex]] drops to `dep`'s.
+    /// - iv. otherwise `dep` stands for its [[CycleRoot]]: a recorded
+    ///   [[EvaluationError]] aborts the evaluation (Evaluate step 9).
+    /// - v. an async-evaluating `dep` (its root's pending promise) becomes a
+    ///   pending async dependency of the requester.
+    /// Named / default imports and `export … from` resolve through the
+    /// namespace maps without re-entering the loader, so this is the ONLY
+    /// place those edges get their evaluation-time bookkeeping. A no-op
+    /// outside a link and for a self-request.
+    pub(crate) fn module_dfs_edge(&mut self, dep: &std::path::PathBuf) -> Result<(), Thrown> {
+        let Some((parent, _)) = self.module_link_stack.last().cloned() else {
+            return Ok(());
+        };
+        if parent == *dep {
+            return Ok(());
+        }
+        if let Some((_, dep_anc)) = self.module_on_dfs_stack(dep) {
+            if let Some(p) = self.module_dfs.get_mut(&parent) {
+                p.1 = p.1.min(dep_anc);
+            }
+        } else if let Some(e) = self.module_cycle_error(dep) {
+            self.module_dfs_fail(e);
+            let msg = self.throw_message(e);
+            self.pending_throw = Some(e);
+            return Err(Thrown(msg));
+        }
+        if let Some(bp) = self.module_pending_promise(dep) {
+            self.link_collect_pending(bp);
+        }
+        Ok(())
+    }
+
+    /// Record a pending dependency promise for the link in flight — the
+    /// importer's body waits for it — once per link frame (the same root
+    /// is reached through several members of its component).
+    pub(crate) fn link_collect_pending(&mut self, bp: Value) {
+        let mark = self.module_link_stack.last().map_or(0, |(_, m)| *m);
+        let mark = mark.min(self.link_pending_deps.len());
+        if !self.link_pending_deps[mark..].contains(&bp) {
+            self.link_pending_deps.push(bp);
+        }
+    }
+
+    /// `m`'s registered promise if it is still PENDING.
+    fn module_registered_pending(&self, m: &std::path::Path) -> Option<Value> {
+        let &(bp, _) = self.module_body_promise.get(m)?;
+        let pending = bp.is_heap()
+            && matches!(
+                self.heap.get(bp.heap_index()),
+                HeapObj::Promise {
+                    state: crate::heap::PromiseState::Pending,
+                    ..
+                }
+            );
+        pending.then_some(bp)
+    }
+
+    /// The still-pending promise a requester of `m` must wait on, if any:
+    /// its recorded [[CycleRoot]]'s while the component is evaluating-async
+    /// (InnerModuleEvaluation 11.c.iv/v wait on the root; the root's
+    /// completion transitively covers every async member), else `m`'s own
+    /// suspended body. Two map probes.
+    pub(crate) fn module_pending_promise(&self, m: &std::path::Path) -> Option<Value> {
+        if let Some(root) = self.module_cycle_root.get(m) {
+            if let Some(bp) = self.module_registered_pending(root) {
+                return Some(bp);
+            }
+        }
+        self.module_registered_pending(m)
+    }
+
+    /// `m`'s own [[EvaluationError]]: recorded synchronously in
+    /// `module_errors`, or — AsyncModuleExecutionRejected step 5 — its
+    /// registered body / capability promise having REJECTED after it
+    /// suspended, memoised into `module_errors` on first sight (the loader
+    /// consumes the rejection).
+    fn module_recorded_error(&mut self, m: &std::path::PathBuf) -> Option<Value> {
+        if let Some(&e) = self.module_errors.get(m) {
+            return Some(e);
+        }
+        let &(bp, _) = self.module_body_promise.get(m)?;
+        if !bp.is_heap() {
+            return None;
+        }
+        let r = match self.heap.get(bp.heap_index()) {
+            HeapObj::Promise {
+                state: crate::heap::PromiseState::Rejected,
+                result,
+                ..
+            } => *result,
+            _ => return None,
+        };
+        if let HeapObj::Promise { handled, .. } = self.heap.get_mut(bp.heap_index()) {
+            *handled = true;
+        }
+        self.module_errors.insert(m.clone(), r);
+        Some(r)
+    }
+
+    /// The permanent [[EvaluationError]] a re-import of an already-cached
+    /// (EVALUATING-ASYNC / EVALUATED) module must re-throw, or None when it
+    /// evaluated — or is still evaluating — cleanly.
+    ///
+    /// Evaluate step 2.a redirects the module to its recorded [[CycleRoot]]
+    /// and InnerModuleEvaluation step 2.b returns the root's error: a
+    /// rejection anywhere in a component propagates up
+    /// [[AsyncParentModules]] to its root, so a member whose own body
+    /// finished cleanly still re-throws the component's error — and the
+    /// root's error wins even over the member's OWN later rejection
+    /// (AsyncModuleExecutionRejected step 2 leaves an already-errored root's
+    /// [[EvaluationError]] in place, and the root's [[TopLevelCapability]]
+    /// is what the import settles from). A module with no recorded root
+    /// (its own root, or errored synchronously — Evaluate step 9 records no
+    /// root) answers for itself. The effective error is memoised under the
+    /// member's own path.
+    ///
+    /// Cost: two `is_empty` checks when nothing ever failed or suspended;
+    /// otherwise at most four map probes — the root is RECORDED at DFS
+    /// time, never re-derived from the request graph.
+    pub(crate) fn module_cycle_error(&mut self, path: &std::path::PathBuf) -> Option<Value> {
+        if self.module_errors.is_empty() && self.module_body_promise.is_empty() {
+            return None;
+        }
+        if let Some(&e) = self.module_errors.get(path) {
+            return Some(e);
+        }
+        // EVALUATING (on a stack): InnerModuleEvaluation step 3 — no error yet.
+        if self.module_dfs.contains_key(path) {
+            return None;
+        }
+        if let Some(root) = self.module_cycle_root.get(path).cloned() {
+            if let Some(e) = self.module_recorded_error(&root) {
+                self.module_errors.insert(path.clone(), e);
+                return Some(e);
+            }
+        }
+        self.module_recorded_error(path)
+    }
+
+    /// The spec's LOADING phase for a module that is never evaluated (a phase
+    /// import's target): read + parse it and resolve its requested specifiers
+    /// recursively — an unreadable file is a host TypeError, a parse failure a
+    /// SyntaxError. Already-cached / already-seen modules are done. Every
+    /// phase of request loads (LoadRequestedModules).
     pub(crate) fn prescan_module_requests(
         &mut self,
         path: &std::path::PathBuf,
@@ -1561,8 +1856,9 @@ impl<'p> Vm<'p> {
         if !seen.insert(path.clone()) || self.module_cache.contains_key(path) {
             return Ok(());
         }
-        for canon in self.module_requests(path)? {
-            self.prescan_module_requests(&canon, seen)?;
+        let reqs = self.module_requests(path)?;
+        for (canon, _) in reqs.iter() {
+            self.prescan_module_requests(canon, seen)?;
         }
         Ok(())
     }
@@ -1587,27 +1883,18 @@ impl<'p> Vm<'p> {
         if !seen.insert(path.clone()) {
             return true;
         }
-        // BEFORE the cache check: a namespace is pre-registered (cached)
-        // while its module is still evaluating / mid-link.
-        if self.executing_modules.contains(path) || self.module_loading.contains(path) {
-            return false; // evaluating / link in flight
+        // EVALUATING — on an evaluation stack (linking, executing, or a
+        // finished member of a component whose root has not closed). BEFORE
+        // the cache check: a namespace is pre-registered (cached) while its
+        // module is still evaluating / mid-link.
+        if self.module_dfs.contains_key(path) {
+            return false;
         }
-        // A body suspended at top-level await = evaluating-async.
-        if let Some(&(bp, _)) = self.module_body_promise.get(path) {
-            if bp.is_heap()
-                && matches!(
-                    self.heap.get(bp.heap_index()),
-                    HeapObj::Promise {
-                        state: crate::heap::PromiseState::Pending,
-                        ..
-                    }
-                )
-            {
-                return false;
-            }
-        }
-        if self.module_cache.contains_key(path) {
-            return true; // evaluated
+        if self.module_cache.contains_key(path) || self.module_errors.contains_key(path) {
+            // EVALUATED / EVALUATING-ASYNC: IsModuleSCCEvaluated — ready once
+            // the component's root (and this member) settled; an errored
+            // component is EVALUATED (the trigger re-throws its error).
+            return self.module_pending_promise(path).is_none();
         }
         if self.module_has_tla(path) {
             return false; // HasTLA, not yet evaluated
@@ -1615,8 +1902,12 @@ impl<'p> Vm<'p> {
         let Ok(reqs) = self.module_requests(path) else {
             return true; // resolution errors surface at evaluation
         };
-        for dep in reqs {
-            if !self.ready_for_sync_execution(&dep, seen) {
+        for (dep, phase) in reqs.iter() {
+            // A SOURCE request is never evaluated.
+            if *phase == ModuleRequestPhase::Source {
+                continue;
+            }
+            if !self.ready_for_sync_execution(dep, seen) {
                 return false;
             }
         }

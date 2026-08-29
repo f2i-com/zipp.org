@@ -5263,9 +5263,13 @@ impl<'p> Vm<'p> {
                                     // promise waiting on them.
                                     match self.module_base_dir.as_ref().map(|d| d.join(&spec_str)) {
                                         None => Err(self.make_error(1, None)),
-                                        Some(p) => match self
-                                            .deferred_namespace_for(&p, mtype.as_deref())
-                                        {
+                                        // A fresh Evaluate() for the eager
+                                        // async subgraph: its own DFS stack
+                                        // segment, never an edge of a body
+                                        // that happens to be executing.
+                                        Some(p) => match self.with_fresh_dfs_segment(|vm| {
+                                            vm.deferred_namespace_for(&p, mtype.as_deref())
+                                        }) {
                                             Ok(ns) => {
                                                 let canon = std::fs::canonicalize(&p).unwrap_or(p);
                                                 if ns.is_heap()

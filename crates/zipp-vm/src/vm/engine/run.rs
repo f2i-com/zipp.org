@@ -267,14 +267,16 @@ impl<'p> Vm<'p> {
     /// top-level await is COLLECTED (the importer defers its own body until
     /// every pending dependency settles — async module evaluation). Bindings
     /// are already linked; the values arrive through the shared live slots.
+    /// The request is an edge of the evaluation DFS in flight (same stack
+    /// segment), not a fresh Evaluate().
     pub(crate) fn import_module_sync(
         &mut self,
         raw_path: &std::path::Path,
         mtype: Option<&str>,
     ) -> Result<Value, Thrown> {
-        let r = self.import_module(raw_path, mtype)?;
+        let r = self.import_module_dep(raw_path, mtype)?;
         if let Some(bp) = self.pending_module_body.take() {
-            self.link_pending_deps.push(bp);
+            self.link_collect_pending(bp);
         }
         Ok(r)
     }
