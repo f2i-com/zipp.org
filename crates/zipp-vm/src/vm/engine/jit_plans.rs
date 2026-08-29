@@ -344,6 +344,100 @@ fn captured_span_code_unit_pred_plan(
     Some((plan, normalized))
 }
 
+/// Does every native path from the region entry to `lookup_ip` carry a live
+/// result of some plain `Call` in `obj`?
+///
+/// This is a forward MUST analysis over the whole region, not a lexical
+/// nearest-writer test: a NanoID-shaped diamond may define the same register by
+/// one `Call` in each arm and converge before the pinned string access.  Entry
+/// starts false, a `Call` definition of `obj` sets true, every other definition
+/// sets false, and joins meet with AND.  Walking the whole `[s, e]` CFG to a
+/// fixed point makes inner/outer backedges part of the proof as well.
+///
+/// Handler/finally control is deliberately outside this tiny model.  Those
+/// regions keep the ordinary helper path rather than guessing at exceptional
+/// predecessors.  Likewise, an instruction outside the closed def table makes
+/// the proof fail closed.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn call_result_reaches_lookup_on_all_paths(
+    code: &[Instr],
+    s: usize,
+    e: usize,
+    lookup_ip: usize,
+    obj: u16,
+) -> bool {
+    if s > lookup_ip || lookup_ip > e || e >= code.len() {
+        return false;
+    }
+    if code[s..=e].iter().any(|ins| {
+        matches!(
+            ins,
+            Instr::PushHandler { .. }
+                | Instr::PopHandler
+                | Instr::PushFinally { .. }
+                | Instr::PopFinally
+                | Instr::JumpFinally { .. }
+                | Instr::EndFinally { .. }
+                | Instr::IterCloseFinally { .. }
+        )
+    }) {
+        return false;
+    }
+
+    // None = unreachable so far; Some(true/false) is the all-predecessor meet.
+    // A state can change at most None -> true -> false, so this worklist is
+    // linear in the small two-successor bytecode CFG rather than an O(n^2)
+    // repeated full scan on adversarially long functions.
+    let mut incoming = vec![None; e - s + 1];
+    let mut work = std::collections::VecDeque::new();
+    incoming[0] = Some(false);
+    work.push_back(s);
+
+    while let Some(ip) = work.pop_front() {
+        let Some(mut out) = incoming[ip - s] else {
+            continue;
+        };
+        let Some(def) = slot_guard_def(&code[ip]) else {
+            return false;
+        };
+        if def == Some(obj) {
+            out = matches!(code[ip], Instr::Call { dst, .. } if dst == obj);
+        }
+
+        let (target, falls_through) = match code[ip] {
+            Instr::Jump { target } => (Some(target as usize), false),
+            Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => (Some(target as usize), true),
+            Instr::Return { .. }
+            | Instr::ReturnUndefined
+            | Instr::Throw { .. }
+            | Instr::TailCall { .. } => (None, false),
+            _ => (None, true),
+        };
+        let mut merge = |next: usize| {
+            if !(s..=e).contains(&next) {
+                return;
+            }
+            let slot = &mut incoming[next - s];
+            let merged = Some(slot.map_or(out, |prior| prior && out));
+            if *slot != merged {
+                *slot = merged;
+                work.push_back(next);
+            }
+        };
+        if let Some(target) = target {
+            merge(target);
+        }
+        if falls_through && ip < e {
+            merge(ip + 1);
+        }
+    }
+
+    incoming[lookup_ip - s] == Some(true)
+}
+
 impl<'p> Vm<'p> {
     /// Build the TypedArray pin plan for the OSR region `[start, end]` from
     /// LIVE VM state (called right before `compile_region`, frame `base` on
@@ -549,29 +643,68 @@ impl<'p> Vm<'p> {
             let writer = (s..lookup_ip)
                 .rev()
                 .find(|&wip| writes(&proto.code[wip], obj));
-            let src = match writer.map(|wip| &proto.code[wip]) {
-                Some(&Instr::LoadGlobal { idx, .. }) if !stored_globals.contains(&idx) => {
-                    TaPinSrc::Global(idx)
+            // A plain call result may feed a string `.length` /
+            // `charCodeAt` scan later in the same MEM region. Calls are a
+            // safepoint, so the old rule declined the receiver even though
+            // every MEM call exit already re-derives every pin snapshot.
+            // Admit only the immutable-string family here: the snapshot taken
+            // at region entry is merely an initial value, and the ordinary /
+            // cross-call post-call refresh publishes the just-written receiver
+            // before its first pinned access. The allocation-free leaf-inline
+            // path may retain the entry snapshot; when its return identity
+            // differs, the existing per-access identity guard takes the exact
+            // generic fallback. A non-string, non-ASCII result or a shadowed
+            // `charCodeAt` likewise snapshots zero and takes that fallback.
+            //
+            // This deliberately does not admit call-written Arrays,
+            // TypedArrays or DataViews. User code can mutate their backing
+            // storage through aliases between the call and access; their
+            // broader admission needs a separate proof. Register tiers still
+            // reject the arbitrary Call itself, while the MEM tier owns the
+            // post-call refresh contract used here.
+            let call_result_candidate = matches!(recv, Recv::Str | Recv::Len)
+                && std::env::var_os("ZIPP_NO_CALL_RESULT_STR_PIN").is_none()
+                && writer.is_some_and(|wip| matches!(proto.code[wip], Instr::Call { .. }));
+            let call_written = call_result_candidate
+                && call_result_reaches_lookup_on_all_paths(&proto.code, s, e, lookup_ip, obj);
+            if call_result_candidate && !call_written {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!(
+                        "[pin] fn{func_id}@{aip} decline: call result not defined on every path"
+                    );
                 }
-                Some(other) => {
-                    if std::env::var_os("ZIPP_JITLOG").is_some() {
-                        eprintln!("[pin] fn{func_id}@{aip} decline: writer {other:?}");
+                continue;
+            }
+            let src = if call_written {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!("[pin] fn{func_id}@{aip} call-result reaching-def all-paths");
+                }
+                TaPinSrc::Reg(obj)
+            } else {
+                match writer.map(|wip| &proto.code[wip]) {
+                    Some(&Instr::LoadGlobal { idx, .. }) if !stored_globals.contains(&idx) => {
+                        TaPinSrc::Global(idx)
                     }
-                    continue;
-                }
-                None => {
-                    // Live-in receiver: pin only if NOTHING in the region
-                    // writes it (so the prologue/refetch reg read stays the
-                    // value the accesses see).
-                    if proto.code[s..=e].iter().any(|i| writes(i, obj)) {
+                    Some(other) => {
                         if std::env::var_os("ZIPP_JITLOG").is_some() {
-                            eprintln!(
-                                "[pin] fn{func_id}@{aip} decline: live-in reg written in-region"
-                            );
+                            eprintln!("[pin] fn{func_id}@{aip} decline: writer {other:?}");
                         }
                         continue;
                     }
-                    TaPinSrc::Reg(obj)
+                    None => {
+                        // Live-in receiver: pin only if NOTHING in the region
+                        // writes it (so the prologue/refetch reg read stays the
+                        // value the accesses see).
+                        if proto.code[s..=e].iter().any(|i| writes(i, obj)) {
+                            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                                eprintln!(
+                                "[pin] fn{func_id}@{aip} decline: live-in reg written in-region"
+                            );
+                            }
+                            continue;
+                        }
+                        TaPinSrc::Reg(obj)
+                    }
                 }
             };
             let live = match src {
@@ -676,6 +809,14 @@ impl<'p> Vm<'p> {
                 }
                 _ => continue,
             };
+            // `Recv::Len` can describe an Array or TypedArray as well as a
+            // String.  Call-written backing stores are outside this feature's
+            // immutable-receiver proof; keep only the String kind promised by
+            // the admission arm above.  The later `charCodeAt` access then
+            // coalesces onto this same source/kind snapshot.
+            if call_written && kind != crate::codegen::STR_PIN_KIND {
+                continue;
+            }
             let key = captured
                 .and_then(|site| proto.string_constants.get(site.name as usize))
                 .map(String::as_str);
