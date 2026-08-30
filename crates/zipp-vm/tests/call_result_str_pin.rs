@@ -121,6 +121,34 @@ function scan(n) {
 console.log(scan(20000));
 "#;
 
+// A declined pin is encoded as an all-zero snapshot. A JIT f64 home can flush
+// raw +0 with those same bits, so the MEM direct-length guard must reject the
+// marker and preserve ordinary Number.prototype lookup semantics.
+const ZERO_AFTER_LIVE_PIN: &str = r#"
+Object.defineProperty(Number.prototype, "length", {
+  value: 13, configurable: true
+});
+var zeroes = new Float64Array(8);
+function rawZero(n) {
+  var x = 1.5;
+  for (var j = 0; j < n; j++) x = zeroes[j & 7];
+  return x;
+}
+for (var w = 0; w < 300; w++) rawZero(200);
+function makeValue(i) {
+  return i < 2000 || (i & 1) ? "plainASCII" : rawZero(2);
+}
+function scan(n) {
+  var h = 1;
+  for (var i = 0; i < n; i++) {
+    var text = makeValue(i);
+    h = (Math.imul(h, 33) + text.length) | 0;
+  }
+  return h;
+}
+console.log(scan(12000));
+"#;
+
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
     assert!(
@@ -178,6 +206,11 @@ fn call_result_str_pin_parity_two_call_convergence() {
     assert_matches_node(TWO_CALL_CONVERGENCE);
 }
 
+#[test]
+fn call_result_str_pin_declined_zero_snapshot_is_not_a_hit() {
+    assert_matches_node(ZERO_AFTER_LIVE_PIN);
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn child_log(test: &str, envs: &[(&str, &str)]) -> String {
     let exe = std::env::current_exe().expect("test exe path");
@@ -185,7 +218,9 @@ fn child_log(test: &str, envs: &[(&str, &str)]) -> String {
     cmd.args([test, "--exact", "--nocapture"])
         .env("ZIPP_JITLOG", "1")
         .env_remove("ZIPP_NOJIT")
-        .env_remove("ZIPP_NO_CALL_RESULT_STR_PIN");
+        .env_remove("ZIPP_NO_CALL_RESULT_STR_PIN")
+        .env_remove("ZIPP_NO_PINNED_STR_LEN")
+        .env_remove("ZIPP_NO_QUICK_LEN");
     for &(key, value) in envs {
         cmd.env(key, value);
     }
@@ -212,6 +247,32 @@ fn call_result_str_pin_mechanism_and_off_switch() {
     assert!(
         !on.contains("decline: writer Call"),
         "enabled call-result pin was still declined:\n{on}"
+    );
+    assert!(
+        on.contains("pinned-str-length"),
+        "MEM string-length snapshot lane was not emitted:\n{on}"
+    );
+
+    let len_off = child_log(
+        "call_result_str_pin_parity_stable_ascii",
+        &[("ZIPP_NO_PINNED_STR_LEN", "1")],
+    );
+    assert!(
+        len_off.contains("built pins=1")
+            && len_off.contains("[jit] MEM region")
+            && !len_off.contains("pinned-str-length"),
+        "direct-length off-switch changed the pin plan or still emitted the lane:\n{len_off}"
+    );
+
+    let quick_off = child_log(
+        "call_result_str_pin_parity_stable_ascii",
+        &[("ZIPP_NO_QUICK_LEN", "1")],
+    );
+    assert!(
+        quick_off.contains("built pins=1")
+            && quick_off.contains("[jit] MEM region")
+            && !quick_off.contains("pinned-str-length"),
+        "B190 off-switch did not suppress its direct pinned-string sub-lane:\n{quick_off}"
     );
 
     let off = child_log(

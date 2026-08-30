@@ -12,6 +12,13 @@ env_off_switch!(
     fn cross_array_snapshot_epoch_enabled() = "ZIPP_NO_CROSS_ARRAY_SNAPSHOT_EPOCH"
 );
 
+env_off_switch!(
+    /// Inline a pinned flat-ASCII string's immutable UTF-16 unit length in a
+    /// MEM region. The existing B190 quick-length helper remains the guarded
+    /// fallback; disabling this switch isolates only the direct snapshot load.
+    fn pinned_str_len_enabled() = "ZIPP_NO_PINNED_STR_LEN"
+);
+
 /// Emit one half of a pin-plan refresh without renumbering its stack slots.
 /// The split lets cross-call completions always refresh TypedArrays/DataViews/
 /// strings while guarding only dense Arrays with the B244 mutation epoch.
@@ -1802,6 +1809,49 @@ pub(crate) fn compile_region_mem(
                         cont,
                     );
                 }
+                let quick_length = quick_len_enabled()
+                    && proto
+                        .string_constants
+                        .get(name as usize)
+                        .is_some_and(|s| s == "length");
+                // A STR pin already stores `{obj_bits, bytes, units}` for
+                // direct string operations. Put this prefix BEFORE the IC:
+                // primitive-string lengths are deliberately uncachable, so a
+                // hit can bypass both the eight-way probe and B190's helper.
+                // Snapshot failure is represented by all zeroes. Since a JIT
+                // f64 home may carry raw +0 with the same bits, reject zero
+                // after the identity match and bypass the zero-filled IC ways;
+                // otherwise `(+0).length` could dereference an empty IC entry.
+                let str_len_pin = (quick_length && pinned_str_len_enabled())
+                    .then(|| ta_plan.access.get(&ip))
+                    .flatten()
+                    .filter(|&&j| ta_plan.pins[j as usize].kind == STR_PIN_KIND)
+                    .map(|&j| j as usize);
+                let ql_no_probe = str_len_pin.map(|_| ops.new_dynamic_label());
+                if let Some(slot) = str_len_pin {
+                    let off = ta_slot_off(slot);
+                    let ql_generic = ops.new_dynamic_label();
+                    let ql_no_probe = ql_no_probe.expect("string pin bypass label");
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!(
+                            "[jit] MEM region fn{} [{start},{end}] pinned-str-length ip={ip} slot={slot}",
+                            heap.func_id
+                        );
+                    }
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(obj)]          // live receiver bits
+                        ; cmp rax, [rsp + off]                // identity vs snapshot
+                        ; jne => ql_generic                   // stale/reassigned → ordinary path
+                        ; test rax, rax                       // raw +0 also matches declined {0,0,0}
+                        ; je => ql_no_probe                   // skip zero-filled IC ways as well
+                        ; mov eax, [rsp + off + 16]           // UTF-16 units (<= 2^28)
+                    );
+                    box_eax(&mut ops, dst);
+                    dynasm!(ops
+                        ; jmp => cont
+                        ; => ql_generic
+                    );
+                }
                 emit_ic_probe(
                     &mut ops,
                     IcProbe::Get { dst },
@@ -1818,12 +1868,10 @@ pub(crate) fn compile_region_mem(
                 // gap). One tiny helper answers those kinds; the sentinel
                 // falls through to the unchanged miss path (objects with an
                 // own `length`, TypedArrays, Boxed receivers).
-                if quick_len_enabled()
-                    && proto
-                        .string_constants
-                        .get(name as usize)
-                        .is_some_and(|s| s == "length")
-                {
+                if quick_length {
+                    if let Some(ql_no_probe) = ql_no_probe {
+                        dynasm!(ops ; => ql_no_probe);
+                    }
                     let ql_miss = ops.new_dynamic_label();
                     dynasm!(ops
                         ; mov rcx, rdi
