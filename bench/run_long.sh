@@ -8,7 +8,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 ZIPP=./target/release/zipp.exe
 ENGINE=${ENGINE:-js-vm}
-OUT=bench/results_long.txt
+RESULT_DIR=target/bench-results
+mkdir -p "$RESULT_DIR"
+OUT=$RESULT_DIR/legacy-long.txt
 ITERS=${ITERS:-7}
 BENCHES="fib loop array string object sort"
 [[ $ITERS =~ ^[1-9][0-9]*$ ]] || { echo "ITERS must be a positive integer" >&2; exit 2; }

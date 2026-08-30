@@ -2,7 +2,7 @@
 crates/zipp-wasm/target/
 crates/zipp-sandbox/target/
 **/*.rs.bk
-# Cargo.lock is committed — zipp-lang ships a binary (the `zipp` CLI), so a
+# Cargo.lock is committed — Zipp ships the `zipp` CLI, so a
 # locked dependency set keeps builds reproducible.
 
 
@@ -16,9 +16,9 @@ __pycache__/
 # Agent worktrees and session state
 .claude/
 
-# A/B comparison binaries. The raw schema-v2 JSON in bench/ IS retained (it carries
-# each side's sha256, so a run stays attributable), but the ~6MB executables it was
-# measured from are rebuildable from the commit the JSON names.
+# A/B comparison binaries. Routine JSON also belongs under ignored target/;
+# bench/ retains only deliberately reviewed canonical or historical evidence.
+# Executables are rebuildable from the commit recorded by the retained artifact.
 bench/bin/
 zipp_profiling.map
 target-hard1/

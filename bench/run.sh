@@ -9,7 +9,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 ZIPP=./target/release/zipp.exe
 ENGINE=${ENGINE:-js-vm}
-OUT=bench/results.txt
+RESULT_DIR=target/bench-results
+mkdir -p "$RESULT_DIR"
+OUT=$RESULT_DIR/legacy-micros.txt
 ITERS=5
 BENCHES="fib loop array string object sort"
 

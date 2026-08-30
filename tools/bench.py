@@ -8,10 +8,10 @@ Every schedule decision and raw observation is retained in schema-v2 JSON.
 
 Examples:
 
-  python tools/bench.py --reps 15 --json bench/run.json
+  python tools/bench.py --reps 15 --json target/bench-results/run.json
   python tools/bench.py --ab old.exe new.exe --reps 21
   python tools/bench.py --metric adjusted --readme
-  python tools/bench.py --read-json bench/results.json --historical
+  python tools/bench.py --read-json target/bench-results/run.json --historical
 
 This is a trusted developer benchmark harness, not an untrusted-code sandbox:
 it deliberately measures engines with their production JITs. External benchmark

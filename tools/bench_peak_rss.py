@@ -22,7 +22,7 @@ is below about 381 MiB).  Raise either threshold only for a recorded calibration
 Example::
 
     python tools/bench_peak_rss.py --ab old-zipp.exe new-zipp.exe \
-      --reps 6 --json bench/hostile/objmap-rss.json
+      --reps 6 --json target/bench-results/objmap-rss.json
 
 This is a trusted developer harness, not an untrusted-code sandbox.  It runs
 the selected engine binaries and generated sources with host permissions.

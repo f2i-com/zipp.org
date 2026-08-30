@@ -11,7 +11,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.." || exit 1
 ZIPP=${ZIPP:-./target/release/zipp.exe}
-OUT=bench/results_real.txt
+RESULT_DIR=target/bench-results
+mkdir -p "$RESULT_DIR"
+OUT=$RESULT_DIR/legacy-real.txt
 ITERS=${ITERS:-5}
 ALLBENCHES="parse-large-js json-large markdown-render map-set-heavy typedarray-math regex-log-scan class-prototype-hot async-promise-chain polymorphic-objects sparse-array"
 # M0.3 diagnostic siblings. DELIBERATELY NOT in ALLBENCHES: the retained headline
