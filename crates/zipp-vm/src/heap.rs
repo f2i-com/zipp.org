@@ -2034,6 +2034,22 @@ impl ObjMap {
     /// `finalized_from_store` overwrites applied on top.
     #[cfg(not(feature = "safe-sandbox"))]
     fn refit_finalized(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
+        self.refit_finalized_inner(plan, vals, shape);
+        static_key_stats::object();
+        static_key_stats::bulk_appends(plan.len());
+    }
+
+    /// `refit_finalized` for the construction-latched thin path. That path is
+    /// reachable only while static-key telemetry is disabled, so avoid the
+    /// two otherwise-redundant atomic latch loads per literal.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn refit_finalized_no_stats(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
+        self.refit_finalized_inner(plan, vals, shape);
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    fn refit_finalized_inner(&mut self, plan: &StaticKeyPlan, vals: ValStore, shape: u32) {
         debug_assert!(plan.runtime_valid());
         debug_assert_eq!(vals.len(), plan.len());
         let n = plan.len();
@@ -2091,14 +2107,28 @@ impl ObjMap {
         if n >= PROP_INDEX_THRESHOLD {
             self.index = Some(PropIndex::build(&self.keys));
         }
-        static_key_stats::object();
-        static_key_stats::bulk_appends(n);
     }
 
     /// Store-generic finalize constructor (B187 stage 2): identical to
     /// `finalized_from_plan` in every observable respect, over either value
     /// representation. Only [`Heap::alloc_finalized`] passes a `Slab` store.
     fn finalized_from_store(plan: StaticKeyPlan, vals: ValStore, shape: u32) -> ObjMap {
+        let n = plan.len();
+        let m = Self::finalized_from_store_inner(plan, vals, shape);
+        static_key_stats::object();
+        static_key_stats::bulk_appends(n);
+        m
+    }
+
+    /// `finalized_from_store` without static-key telemetry probes. See
+    /// `refit_finalized_no_stats`.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn finalized_from_store_no_stats(plan: StaticKeyPlan, vals: ValStore, shape: u32) -> ObjMap {
+        Self::finalized_from_store_inner(plan, vals, shape)
+    }
+
+    fn finalized_from_store_inner(plan: StaticKeyPlan, vals: ValStore, shape: u32) -> ObjMap {
         debug_assert!(plan.runtime_valid());
         debug_assert_eq!(vals.len(), plan.len());
         let n = plan.len();
@@ -2127,8 +2157,6 @@ impl ObjMap {
         if n >= PROP_INDEX_THRESHOLD {
             m.index = Some(PropIndex::build(&m.keys));
         }
-        static_key_stats::object();
-        static_key_stats::bulk_appends(n);
         m
     }
 
@@ -4160,7 +4188,9 @@ fn settled_alloc_enabled() -> bool {
 /// B257 latch: `ZIPP_NO_THIN_ALLOC=1` disables the thin literal-allocation
 /// paths — the finalize helper's direct window copy and read-range check,
 /// the known-variant slot writes for objects/arrays/functions/closures and
-/// the plain `MakeFunc` lane — restoring the pre-B257 code byte for byte.
+/// the plain `MakeFunc` lane. This is a semantic fallback through the general
+/// allocation paths, not a byte-identical B256 binary: the shared wrappers
+/// and Heap field remain. Use an actual B256 executable to measure net cost.
 /// Latched on first use; codegen reads it at emit time and the heap folds it
 /// into [`Heap::thin_alloc`] at construction.
 #[allow(dead_code)] // the sandbox build folds it away
@@ -4178,9 +4208,10 @@ pub(crate) fn thin_alloc_enabled() -> bool {
 }
 
 /// B257: the construction-time fold behind [`Heap::thin_alloc`] — true only
-/// when every latch the thin paths would otherwise read per allocation is
-/// at its default, so those paths read none and any non-default
-/// configuration takes the general, latch-reading code unchanged.
+/// when every relevant allocation-mode latch is at its default. The thin
+/// paths can therefore omit those probes, including the static-key telemetry
+/// loads via their explicit no-stats constructors; any non-default
+/// configuration takes the general, latch-reading code.
 #[cfg(not(feature = "safe-sandbox"))]
 fn thin_alloc_default() -> bool {
     thin_alloc_enabled()
@@ -4940,12 +4971,12 @@ pub struct Heap {
     /// address-sort routes. Updated once per sorted pool, never per object.
     #[cfg(not(feature = "safe-sandbox"))]
     obj_pool_sort_stats: [u64; 4],
-    /// B257: ONE Heap-resident bool standing in for the five per-allocation
-    /// latch loads the literal pipeline used to make (`ZIPP_NO_THIN_ALLOC`,
+    /// B257: one Heap-resident bool standing in for the five allocation-mode
+    /// latches in the literal pipeline (`ZIPP_NO_THIN_ALLOC`,
     /// `ZIPP_NO_VAL_SLAB`, `ZIPP_NO_SHELL_REFIT`, `ZIPP_NO_SETTLED_ALLOC`,
     /// `ZIPP_STATIC_KEY_STATS`): true only when every one of them is at its
-    /// default, so the thin paths never consult a latch and any other
-    /// configuration takes the general paths unchanged. Read once at
+    /// default, so the thin paths can omit their probes and any other
+    /// configuration takes the general paths. Read once at
     /// construction (`thin_alloc_default`).
     thin_alloc: bool,
     /// `ZIPP_GCSTATS=1` only: thin-path serve counts — [finalized literals,
@@ -5556,8 +5587,8 @@ impl Heap {
     }
 
     /// B257: the thin twin of [`Heap::alloc_finalized`] — the same slab
-    /// cell, pool pop and in-place refit, with every latch already folded
-    /// into `thin_alloc` (none is read here) and the occupant installed by
+    /// cell, pool pop and in-place refit, with the allocation-mode latches
+    /// already folded into `thin_alloc` and the occupant installed by
     /// the known-variant slot write instead of the generic 80-byte-enum
     /// move. Reachable only with `thin_alloc` set, which implies the slab,
     /// the shell refit and the settled mirror are all on and the static-key
@@ -5608,10 +5639,14 @@ impl Heap {
                 if self.oracle {
                     self.obj_pool_stats[1] += 1;
                 }
-                b.refit_finalized(plan, store, shape);
+                b.refit_finalized_no_stats(plan, store, shape);
                 b
             }
-            None => Box::new(ObjMap::finalized_from_store(plan.clone(), store, shape)),
+            None => Box::new(ObjMap::finalized_from_store_no_stats(
+                plan.clone(),
+                store,
+                shape,
+            )),
         };
         if self.oracle {
             self.thin_stats[0] += 1;

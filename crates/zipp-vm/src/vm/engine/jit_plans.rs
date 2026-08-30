@@ -1408,9 +1408,9 @@ impl<'p> Vm<'p> {
     /// the immutable-bytecode facts `make_func_preflight` re-derives on
     /// every call — so the emitted site can bake the child id and, when the
     /// realm and eval-scope side tables are empty (two VM bytes the emitted
-    /// code guards), skip the activation lookup entirely. Empty under
-    /// `ZIPP_NO_THIN_ALLOC` / `ZIPP_NO_MAKEFUNC_PLAIN` (byte-identical Tier-C
-    /// code).
+    /// code guards), skip the activation lookup entirely. The plan is empty
+    /// under `ZIPP_NO_THIN_ALLOC` / `ZIPP_NO_MAKEFUNC_PLAIN`, so those sites
+    /// keep the general Tier-C lowering.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn build_plain_makefunc_plan(
         &self,

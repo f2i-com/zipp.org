@@ -11,7 +11,7 @@
 //!
 //! Every expected line is node's (v24.12.0), byte for byte. The driver test
 //! re-runs the in-process probes in child processes under each mode so every
-//! tier — and the latched-off pre-B257 code — answers identically, and a
+//! tier — and the latched-off general allocation paths — answers identically, and a
 //! second driver reads the `ZIPP_GCSTATS=1` `[thinalloc]` telemetry to prove
 //! the thin paths actually served (a mechanism that never engages is not a
 //! passing test).
@@ -133,7 +133,10 @@ fn tl_small_lit_in_process() {
 
 #[test]
 fn tl_small_eval_in_process() {
-    assert_eq!(run_ok(EVAL_LITERALS), vec![EVAL_LITERALS_EXPECTED.to_string()]);
+    assert_eq!(
+        run_ok(EVAL_LITERALS),
+        vec![EVAL_LITERALS_EXPECTED.to_string()]
+    );
 }
 
 #[test]
@@ -162,10 +165,7 @@ fn child(filter: &str, envs: &[(&str, &str)], nocapture: bool) -> std::process::
 fn assert_child_ok(out: &std::process::Output, what: &str) {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        out.status.success(),
-        "{what} failed:\n{stdout}\n{stderr}"
-    );
+    assert!(out.status.success(), "{what} failed:\n{stdout}\n{stderr}");
     assert!(
         !stdout.contains("running 0 tests"),
         "the filter matched nothing under {what}:\n{stdout}"
