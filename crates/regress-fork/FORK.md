@@ -3,7 +3,7 @@
 The ECMAScript regex engine. This is a FORK, not a vendored copy waiting to be
 dropped: `zipp-vm` calls `Regex::from_unicode_byteopt` (`src/api.rs`), which
 does not exist upstream, so the crates.io crate does not compile against this
-code at all. On top of that it carries six correctness patches for bugs test262
+code at all. On top of that it carries seven correctness patches for bugs test262
 hits (`built-ins/RegExp/regexp-modifiers`, `named-groups`, `property-escapes`,
 and the `staging/sm/RegExp` unicode-flag cluster).
 
@@ -15,9 +15,11 @@ deliberately supports neither in order to guarantee linear time. `fancy-regex`
 adds both but implements its own dialect, not ES semantics: no `/v` unicode
 sets, different property-escape handling, and none of the `lastIndex`/sticky
 protocol. `regress` is the only Rust crate written to the ECMAScript grammar,
-which is why it was chosen. Replacing it means writing an engine — that is
-Stage 5A of PERF_ROADMAP.md, and it is also where the regex benchmark's ~10.7x
-gap has to be closed eventually.
+which is why it was chosen. Replacing it means writing an engine. The former
+Stage 5A plan and its ~10.7× regex gap belong to the
+[archived performance ledger](../../docs/archive/PERF_LEDGER-B001-B252.md), not
+the current baseline: the canonical `regex-log-scan` row is now 1.02× Node.
+Current priorities live in [`PERF_ROADMAP.md`](../../PERF_ROADMAP.md).
 
 ## Relationship to upstream
 

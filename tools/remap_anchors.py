@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Rewrite `foo.rs:N` doc anchors after tools/split_rs.py split `foo.rs`.
 
-PERF_ROADMAP.md's main asset is its file:line precision. Splitting a monolith
-into `foo/` invalidates every anchor into it, so this translates each one to the
-submodule and line it now lives at.
+The historical performance ledger's main asset is its file:line precision.
+Splitting a Rust monolith into `foo/` invalidates every anchor into it, so this
+translates each one to the submodule and line it now lives at.
 
 Method: read the PRE-SPLIT file out of git, take the exact text of line N plus a
 context window, and locate that window in the emitted submodules. A unique
@@ -11,7 +11,7 @@ window match is accepted; anything ambiguous or missing is reported and left
 untouched, so the tool can never silently point an anchor at the wrong code.
 
 Usage:
-  python tools/remap_anchors.py --doc PERF_ROADMAP.md --rev HEAD \
+  python tools/remap_anchors.py --doc docs/archive/PERF_LEDGER-B001-B252.md --rev HEAD \
       --split crates/zipp-vm/src/codegen.rs [--split ...] [--apply]
 """
 import argparse

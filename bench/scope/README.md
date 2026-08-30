@@ -1,5 +1,10 @@
 # Scope sensitivity of the guarded reducers
 
+> **Historical research snapshot (2026-08-24).** The measurements below answer
+> a still-useful lowering question, but they are not the current public Zipp
+> score. Use the root README and `bench/README.md` for current captures and
+> runner policy.
+
 These programs answer one question: **does a mechanism that wins on a benchmark
 still win when the same code is written the way real programs are written?**
 

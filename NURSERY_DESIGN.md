@@ -1,9 +1,11 @@
 # B6 — Generational / nursery GC: design study and costing (W5)
 
-Status: DESIGN ONLY. No code changed. All numbers below are either the roadmap's own
-measured entries (cited by B-number) or file:line reads of the current tree.
-No engine binary existed in this worktree to re-run `ZIPP_GCSTATS`; the B84 table IS
-that instrument's output and is used as the primary input, per B101's costing method.
+Status: **historical design basis, now implemented and superseded where noted.**
+This document records the reasoning and edge inventory that led to the default
+non-moving index-state nursery. Its original estimates and "recommended"
+language are preserved as design history, not as current benchmark claims. The
+live implementation is in `heap.rs` and `vm/gc.rs`; current measurements and
+prior B entries are indexed by `PERF_ROADMAP.md` and its archived ledger.
 
 ## 0. The fact that decides the whole design space
 
