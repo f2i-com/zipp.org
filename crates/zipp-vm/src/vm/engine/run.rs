@@ -495,10 +495,7 @@ impl<'p> Vm<'p> {
         // An [[IsHTMLDDA]] exotic (`document.all`) is callable: its [[Call]] returns
         // null when called with NO arguments or a first argument that is the empty
         // String, and undefined otherwise (Annex B).
-        if callee.is_heap()
-            && !self.is_htmldda.is_empty()
-            && self.is_htmldda.contains(&callee.heap_index())
-        {
+        if callee.is_heap() && self.is_htmldda_index(callee.heap_index()) {
             let first_is_empty_str = args.first().is_some_and(|a| {
                 a.is_heap()
                     && self.heap.is_str_like(a.heap_index())

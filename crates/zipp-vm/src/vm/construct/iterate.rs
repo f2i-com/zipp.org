@@ -390,10 +390,7 @@ impl<'p> Vm<'p> {
     pub(crate) fn is_callable(&self, mut v: Value) -> bool {
         loop {
             // An [[IsHTMLDDA]] exotic (`document.all`) is callable (returns undefined).
-            if v.is_heap()
-                && !self.is_htmldda.is_empty()
-                && self.is_htmldda.contains(&v.heap_index())
-            {
+            if v.is_heap() && self.is_htmldda_index(v.heap_index()) {
                 return true;
             }
             if !v.is_heap() {

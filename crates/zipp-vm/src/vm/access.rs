@@ -7,6 +7,51 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// `ZIPP_ICSTATS=1` mechanism counters for HTMLDDA membership checks:
+/// `(scalar_mirror_checks, fallback_set_checks)`.
+mod htmlddastats {
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
+    static ENABLED: AtomicU8 = AtomicU8::new(0);
+    static SCALAR: AtomicU64 = AtomicU64::new(0);
+    static SET: AtomicU64 = AtomicU64::new(0);
+
+    #[inline(always)]
+    fn enabled() -> bool {
+        match ENABLED.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var_os("ZIPP_ICSTATS").is_some();
+                ENABLED.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn scalar() {
+        if enabled() {
+            SCALAR.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn set() {
+        if enabled() {
+            SET.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(super) fn dump() -> (u64, u64) {
+        (SCALAR.load(Ordering::Relaxed), SET.load(Ordering::Relaxed))
+    }
+}
+
+pub(crate) fn htmldda_membership_stats() -> (u64, u64) {
+    htmlddastats::dump()
+}
+
 /// Outcome of walking the prototype chain for an OrdinarySet `[[Set]]` whose
 /// receiver has no own data property for the key.
 enum ProtoSet {
@@ -30,6 +75,23 @@ enum ProtoSet {
 }
 
 impl<'p> Vm<'p> {
+    /// Whether `idx` is the engine's singleton `[[IsHTMLDDA]]` exotic.
+    ///
+    /// `setup_globals` is the sole insertion site and installs exactly one
+    /// below-GC-floor object. Keep the set as the authority/fallback while the
+    /// hot path answers with one scalar compare. The explicit sentinel makes
+    /// pre-setup queries false, matching the still-empty set.
+    #[inline(always)]
+    pub(crate) fn is_htmldda_index(&self, idx: u32) -> bool {
+        if self.htmldda_scalar_enabled && self.is_htmldda.len() == 1 {
+            htmlddastats::scalar();
+            self.htmldda_idx != u32::MAX && idx == self.htmldda_idx
+        } else {
+            htmlddastats::set();
+            self.is_htmldda.contains(&idx)
+        }
+    }
+
     /// JS `typeof` type-name. `null` is `"object"` (a historic quirk); functions
     /// and closures are `"function"`; arrays and objects are `"object"`.
     /// `typeof v` as a heap string Value, using the eight PERMANENTLY interned
@@ -76,7 +138,7 @@ impl<'p> Vm<'p> {
                 return "undefined";
             }
             // An [[IsHTMLDDA]] exotic (`document.all`): `typeof` is "undefined".
-            if self.is_htmldda.contains(&v.heap_index()) {
+            if self.is_htmldda_index(v.heap_index()) {
                 return "undefined";
             }
             return match self.heap.get(v.heap_index()) {

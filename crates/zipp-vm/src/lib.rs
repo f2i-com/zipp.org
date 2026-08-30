@@ -241,6 +241,13 @@ pub fn async_inline_await_stats() -> u64 {
     vm::async_inline_await_stats()
 }
 
+/// `ZIPP_ICSTATS=1` HTMLDDA membership counters:
+/// `(scalar_mirror_checks, fallback_set_checks)`. The second counter is nonzero
+/// only when `ZIPP_NO_HTMLDDA_SCALAR=1` restores the incumbent HashSet lookup.
+pub fn htmldda_membership_stats() -> (u64, u64) {
+    vm::htmldda_membership_stats()
+}
+
 /// `ZIPP_ICSTATS=1` native property-cache miss breakdown:
 /// `(get_miss, get_shape_known, get_shape_new, get_dict, set_miss, set_guardable,
 /// set_dict, get_acc_hit, set_acc_hit)`. Every miss count is one native access

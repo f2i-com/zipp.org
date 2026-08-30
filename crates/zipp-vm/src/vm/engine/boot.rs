@@ -408,6 +408,8 @@ impl<'p> Vm<'p> {
             realm_ctor_main: std::collections::HashMap::new(),
             fn_proto_override: std::collections::HashMap::new(),
             is_htmldda: std::collections::HashSet::new(),
+            htmldda_idx: u32::MAX,
+            htmldda_scalar_enabled: std::env::var_os("ZIPP_NO_HTMLDDA_SCALAR").is_none(),
             proxy_ctor: 0,
             temporal_ns: 0,
             duration_ctor: 0,

@@ -2338,6 +2338,15 @@ pub struct Vm<'p> {
     /// yet it is otherwise an ordinary object (and `Object.is`/`===` do NOT treat
     /// it as undefined).
     is_htmldda: std::collections::HashSet<u32>,
+    /// Scalar mirror of the singleton `is_htmldda` member, or `u32::MAX` before
+    /// globals are installed / if the set ever stops being a singleton. The set
+    /// remains the authoritative representation and the
+    /// `ZIPP_NO_HTMLDDA_SCALAR=1` fallback; setup is the sole insertion site, so
+    /// an exact integer comparison can replace a randomized hash-table probe on
+    /// the hot `typeof` / loose-null / truthiness paths.
+    htmldda_idx: u32,
+    /// VM-construction-latched same-binary ablation for `htmldda_idx`.
+    htmldda_scalar_enabled: bool,
     /// The `Proxy` constructor object (no `.prototype`). 0 until setup.
     proxy_ctor: u32,
     /// The `Temporal` namespace object + `Temporal.Duration`/`PlainDate` ctors/protos.
@@ -2616,6 +2625,7 @@ mod temporal;
 mod typedarray;
 mod values;
 
+pub(crate) use access::htmldda_membership_stats;
 pub(crate) use async_runtime::async_inline_await_stats;
 pub(crate) use async_runtime::async_stats;
 pub(crate) use coerce::concat_pair_stats;

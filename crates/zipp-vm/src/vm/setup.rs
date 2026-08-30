@@ -2687,7 +2687,13 @@ impl<'p> Vm<'p> {
         // object tagged in `is_htmldda` (typeof "undefined", == null/undefined,
         // falsy, callable→undefined).
         let d262_htmldda = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
-        self.is_htmldda.insert(d262_htmldda);
+        let inserted = self.is_htmldda.insert(d262_htmldda);
+        debug_assert!(inserted);
+        self.htmldda_idx = if self.is_htmldda.len() == 1 {
+            d262_htmldda
+        } else {
+            u32::MAX
+        };
         // `$262.agent`: the full multi-agent surface (vm/agents.rs). getReport
         // must exist (returning null on empty) even before any worker agent
         // starts — atomicsHelper.js binds it unconditionally at load. The

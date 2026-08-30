@@ -462,8 +462,8 @@ pub(crate) extern "win64" fn jit_loose_null_eq(
             return crate::codegen::SELF_CALL_DEOPT;
         }
         let equal = (a.is_nullish() && b.is_nullish())
-            || (a.is_heap() && b.is_nullish() && vm.is_htmldda.contains(&a.heap_index()))
-            || (b.is_heap() && a.is_nullish() && vm.is_htmldda.contains(&b.heap_index()));
+            || (a.is_heap() && b.is_nullish() && vm.is_htmldda_index(a.heap_index()))
+            || (b.is_heap() && a.is_nullish() && vm.is_htmldda_index(b.heap_index()));
         Value::bool(equal).bits()
     }))
     .unwrap_or(crate::codegen::SELF_CALL_DEOPT)
@@ -1062,7 +1062,9 @@ mod tests {
             eq(Value::int(0), Value::int(0)),
             crate::codegen::SELF_CALL_DEOPT
         );
-        let htmldda = Value::heap(*vm.is_htmldda.iter().next().expect("$262.IsHTMLDDA"));
+        let htmldda = Value::heap(vm.htmldda_idx);
+        assert_ne!(vm.htmldda_idx, u32::MAX);
+        assert!(vm.is_htmldda.contains(&vm.htmldda_idx));
         assert_eq!(eq(htmldda, Value::NULL), Value::TRUE.bits());
     }
 }

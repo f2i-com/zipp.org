@@ -1197,11 +1197,13 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn loose_eq(&mut self, a: Value, b: Value) -> Result<bool, Thrown> {
         // An [[IsHTMLDDA]] exotic (`document.all`) loosely equals null/undefined.
-        if !self.is_htmldda.is_empty() {
-            if a.is_heap() && b.is_nullish() && self.is_htmldda.contains(&a.heap_index()) {
+        if a.is_heap() && b.is_nullish() {
+            if self.is_htmldda_index(a.heap_index()) {
                 return Ok(true);
             }
-            if b.is_heap() && a.is_nullish() && self.is_htmldda.contains(&b.heap_index()) {
+        }
+        if b.is_heap() && a.is_nullish() {
+            if self.is_htmldda_index(b.heap_index()) {
                 return Ok(true);
             }
         }
@@ -2193,7 +2195,7 @@ impl<'p> Vm<'p> {
             return *n != 0;
         }
         // An [[IsHTMLDDA]] exotic (`document.all`) is falsy.
-        if !self.is_htmldda.is_empty() && self.is_htmldda.contains(&v.heap_index()) {
+        if self.is_htmldda_index(v.heap_index()) {
             return false;
         }
         true
