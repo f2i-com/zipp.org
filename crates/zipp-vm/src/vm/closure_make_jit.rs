@@ -306,11 +306,10 @@ pub(crate) extern "win64" fn jit_make_closure(
         };
         let eval_scope = vm.closure_eval_scope.get(&site.active).copied();
 
-        let idx = vm.heap.alloc(HeapObj::Closure {
-            func: child as u32,
-            upvalues: cells,
-            this_val,
-        });
+        // B257: the three mirror lines are settled from the values in hand
+        // (the heap falls back to the re-reading `alloc` when the thin fold
+        // is off).
+        let idx = vm.heap.alloc_closure_settled(child as u32, cells, this_val);
         if let Some(home) = inherited_home {
             vm.record_closure_home(idx, home);
         }

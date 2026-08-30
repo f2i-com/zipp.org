@@ -2625,6 +2625,8 @@ pub(crate) fn compile_proto_mem(
     yield_heads: &[u32],
     // B205: fused random-scale windows (window-start ip -> plan).
     random_fuse: &FxHashMap<usize, crate::codegen::RandomScaleFusePlan>,
+    // B257: `MakeFunc` ips licensed for the plain lane (ip -> child id).
+    plain_makefunc: &FxHashMap<usize, u32>,
 ) -> Option<JitFn> {
     if !mem_can_compile(proto, const_strs) {
         return None;
@@ -3308,16 +3310,53 @@ pub(crate) fn compile_proto_mem(
                 // any panic after allocation is fail-stop in the helper.
                 let helper = crate::vm::jit_make_func as usize;
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
-                dynasm!(ops
-                    ; mov rcx, rdi
-                    ; mov rdx, QWORD packed_fip as i64
-                    ; mov rax, QWORD helper as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov [rbx + dreg(dst)], rax
-                );
+                if let Some(&child) = plain_makefunc.get(&ip) {
+                    // B257 plain lane: with the realm and eval-scope side
+                    // tables both empty (two VM bytes) the full helper's
+                    // answer is fixed — realm 0, no EvalScope — so a
+                    // poll-and-allocate helper with the child id baked
+                    // replaces the activation lookup. Either path returns
+                    // the callable's bits or the deopt sentinel, so the
+                    // join shares one check and one store.
+                    use crate::vm::host_api::{
+                        JIT_EVAL_SCOPE_NONEMPTY_OFFSET, JIT_OBJ_REALM_NONEMPTY_OFFSET,
+                    };
+                    let plain = crate::vm::jit_make_func_plain as usize;
+                    let full = ops.new_dynamic_label();
+                    let join = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; cmp BYTE [rdi + JIT_OBJ_REALM_NONEMPTY_OFFSET as i32], 0
+                        ; jne => full
+                        ; cmp BYTE [rdi + JIT_EVAL_SCOPE_NONEMPTY_OFFSET as i32], 0
+                        ; jne => full
+                        ; mov rcx, rdi
+                        ; mov rdx, QWORD child as i64
+                        ; mov rax, QWORD plain as i64
+                        ; call rax
+                        ; jmp => join
+                        ; => full
+                        ; mov rcx, rdi
+                        ; mov rdx, QWORD packed_fip as i64
+                        ; mov rax, QWORD helper as i64
+                        ; call rax
+                        ; => join
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                } else {
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, QWORD packed_fip as i64
+                        ; mov rax, QWORD helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                }
                 // The allocation can move all backing Vec storage even though
                 // heap indices themselves are stable.
                 if let Some((vb, icb)) = refetch {
@@ -3812,21 +3851,44 @@ pub(crate) fn compile_proto_mem(
                     None
                 };
                 if let Some((plan_ptr, shape)) = baked {
-                    let helper = crate::vm::jit_finalize_object_baked as usize;
                     let packed = ((shape as u64) << 32) | ((val_base as u64) << 16) | count as u64;
-                    dynasm!(ops
-                        ; mov rcx, rdi
-                        ; mov rdx, rbx
-                        ; mov r8, QWORD plan_ptr as i64
-                        ; mov r9, QWORD packed as i64
-                        ; mov DWORD [rsp + 32], proto.reg_count as i32
-                        ; mov rax, QWORD helper as i64
-                        ; call rax
-                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                        ; cmp rax, r10
-                        ; je => bail
-                        ; mov [rbx + dreg(dst)], rax
-                    );
+                    // B257: the thin helper validates only the slots it
+                    // reads, so the window-bound the baked helper checks per
+                    // call is proved here instead and the 5th (stack)
+                    // argument is gone; the values go window -> slab in one
+                    // copy. `ZIPP_NO_THIN_ALLOC` keeps the baked form.
+                    let thin = crate::heap::thin_alloc_enabled()
+                        && (val_base as usize + count as usize) <= proto.reg_count as usize;
+                    if thin {
+                        let helper = crate::vm::jit_finalize_object_thin as usize;
+                        dynasm!(ops
+                            ; mov rcx, rdi
+                            ; mov rdx, rbx
+                            ; mov r8, QWORD plan_ptr as i64
+                            ; mov r9, QWORD packed as i64
+                            ; mov rax, QWORD helper as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                    } else {
+                        let helper = crate::vm::jit_finalize_object_baked as usize;
+                        dynasm!(ops
+                            ; mov rcx, rdi
+                            ; mov rdx, rbx
+                            ; mov r8, QWORD plan_ptr as i64
+                            ; mov r9, QWORD packed as i64
+                            ; mov DWORD [rsp + 32], proto.reg_count as i32
+                            ; mov rax, QWORD helper as i64
+                            ; call rax
+                            ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                            ; cmp rax, r10
+                            ; je => bail
+                            ; mov [rbx + dreg(dst)], rax
+                        );
+                    }
                 } else {
                     let helper = crate::vm::jit_finalize_object as usize;
                     let packed_plan = ((func_id as u64) << 32) | plan as u64;

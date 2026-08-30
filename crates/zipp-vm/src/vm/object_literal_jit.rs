@@ -303,6 +303,95 @@ pub(crate) extern "win64" fn jit_finalize_object_baked(
     }
 }
 
+/// B257: the window slots a baked `FinalizeObject` READS — `regs[val_base ..
+/// val_base + count]` — checked against `vm.regs` directly instead of the
+/// whole declared window. That range is all the helper touches, and the
+/// emitter proved `val_base + count <= reg_count` at compile time, so the
+/// thin form carries no `reg_count` (the 5th, stack) argument. Returns the
+/// first slot's address; `None` declines (only a malformed direct call can
+/// fail this — the emitted site never does).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn window_read_range(
+    vm: &Vm<'_>,
+    regs: *const u64,
+    val_base: usize,
+    count: usize,
+) -> Option<*const u64> {
+    let vm_start = vm.regs.as_ptr() as usize;
+    let win_start = regs as usize;
+    if win_start < vm_start {
+        return None;
+    }
+    let offset = win_start - vm_start;
+    if offset % std::mem::size_of::<u64>() != 0 {
+        return None;
+    }
+    // `count <= FINALIZE_STAGE_SLOTS` and `val_base < 2^16`: no overflow.
+    let first = offset / std::mem::size_of::<u64>() + val_base;
+    if first + count > vm.regs.len() {
+        return None;
+    }
+    // SAFETY: `val_base` slots past `regs` lies inside `vm.regs`'s live
+    // prefix by the check above.
+    Some(unsafe { regs.add(val_base) })
+}
+
+/// B257: the THIN form of [`jit_finalize_object_baked`] — the same baked
+/// plan pointer and shape fold, but the values reach the heap as a slice of
+/// the register window itself (no 16-slot staging copy: the slab copy is
+/// the only copy), only the read range is validated, and the `reg_count`
+/// stack argument is gone. The GC poll precedes the read, the window is a
+/// root and the collector is non-moving, so the slice is valid for exactly
+/// the copy that consumes it. Emitted while `ZIPP_NO_THIN_ALLOC` is unset;
+/// the latch restores the baked helper above.
+///
+/// `packed = (shape << 32) | (val_base << 16) | count`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_finalize_object_thin(
+    vm: *mut core::ffi::c_void,
+    regs: *const u64,
+    plan_ptr: u64,
+    packed: u64,
+) -> u64 {
+    if vm.is_null() || regs.is_null() || plan_ptr == 0 {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    let shape = (packed >> 32) as u32;
+    let val_base = (packed >> 16) as u16 as usize;
+    let count = packed as u16 as usize;
+    if count == 0 || count > FINALIZE_STAGE_SLOTS {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        vm.maybe_gc();
+        let Some(src) = window_read_range(vm, regs, val_base, count) else {
+            return crate::codegen::SELF_CALL_DEOPT;
+        };
+        // SAFETY: the plan address comes from the live root FuncProto table
+        // (see `jit_finalize_object_baked`); the `count` slots at `src` are
+        // initialized `Value`s inside `vm.regs` (`Value` is a transparent
+        // `u64`), and nothing writes the window before the copy completes.
+        let plan = unsafe { &*(plan_ptr as usize as *const crate::bytecode::StaticKeyPlan) };
+        debug_assert!(plan.runtime_valid() && plan.len() == count);
+        let vals = unsafe { std::slice::from_raw_parts(src as *const Value, count) };
+        let idx = vm.heap.alloc_finalized(plan, vals, shape);
+        vm.realm_born(idx, vm.obj_proto);
+        // The thin heap fold implies the static-key statistics are off; the
+        // counter call is reachable (and needed) only otherwise.
+        if !vm.heap.thin_alloc() {
+            crate::heap::note_static_key_jit_object();
+        }
+        Value::heap(idx).bits()
+    })) {
+        Ok(bits) => bits,
+        // Allocation/realm bookkeeping may already be committed. Never replay
+        // after an unwind across this boundary.
+        Err(_) => std::process::abort(),
+    }
+}
+
 pub(crate) extern "win64" fn jit_finalize_object(
     vm: *mut core::ffi::c_void,
     regs: *const u64,
@@ -403,7 +492,10 @@ pub(crate) extern "win64" fn jit_new_array(
             let bits = unsafe { *regs.add(arg_base + offset) };
             items.push(Value::from_bits(bits));
         }
-        let idx = vm.heap.alloc(HeapObj::Array(items));
+        // B257: an Array's mirror is CLEAR by construction; the settled path
+        // skips the occupant re-read (the heap falls back to `alloc` when
+        // the thin fold is off).
+        let idx = vm.heap.alloc_array_settled(items);
         vm.realm_born(idx, vm.arr_proto);
         Value::heap(idx).bits()
     })) {

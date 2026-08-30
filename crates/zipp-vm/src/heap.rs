@@ -860,7 +860,7 @@ mod static_key_stats {
     static JIT_OBJECTS: AtomicU64 = AtomicU64::new(0);
 
     #[inline]
-    fn enabled() -> bool {
+    pub(super) fn enabled() -> bool {
         match STATE.load(Ordering::Relaxed) {
             1 => true,
             2 => false,
@@ -4157,6 +4157,45 @@ fn settled_alloc_enabled() -> bool {
     }
 }
 
+/// B257 latch: `ZIPP_NO_THIN_ALLOC=1` disables the thin literal-allocation
+/// paths — the finalize helper's direct window copy and read-range check,
+/// the known-variant slot writes for objects/arrays/functions/closures and
+/// the plain `MakeFunc` lane — restoring the pre-B257 code byte for byte.
+/// Latched on first use; codegen reads it at emit time and the heap folds it
+/// into [`Heap::thin_alloc`] at construction.
+#[allow(dead_code)] // the sandbox build folds it away
+pub(crate) fn thin_alloc_enabled() -> bool {
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_THIN_ALLOC").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// B257: the construction-time fold behind [`Heap::thin_alloc`] — true only
+/// when every latch the thin paths would otherwise read per allocation is
+/// at its default, so those paths read none and any non-default
+/// configuration takes the general, latch-reading code unchanged.
+#[cfg(not(feature = "safe-sandbox"))]
+fn thin_alloc_default() -> bool {
+    thin_alloc_enabled()
+        && val_slab_enabled()
+        && shell_refit_enabled()
+        && settled_alloc_enabled()
+        && !static_key_stats::enabled()
+}
+
+/// The sandbox build has no unsafe fast paths to fold.
+#[cfg(feature = "safe-sandbox")]
+fn thin_alloc_default() -> bool {
+    false
+}
+
 /// B212: memo size — 2048 entries x 20B = 40KB, charged in `resident_bytes`.
 #[cfg(not(feature = "safe-sandbox"))]
 const CONCAT_MEMO_SLOTS: usize = 2048;
@@ -4901,6 +4940,18 @@ pub struct Heap {
     /// address-sort routes. Updated once per sorted pool, never per object.
     #[cfg(not(feature = "safe-sandbox"))]
     obj_pool_sort_stats: [u64; 4],
+    /// B257: ONE Heap-resident bool standing in for the five per-allocation
+    /// latch loads the literal pipeline used to make (`ZIPP_NO_THIN_ALLOC`,
+    /// `ZIPP_NO_VAL_SLAB`, `ZIPP_NO_SHELL_REFIT`, `ZIPP_NO_SETTLED_ALLOC`,
+    /// `ZIPP_STATIC_KEY_STATS`): true only when every one of them is at its
+    /// default, so the thin paths never consult a latch and any other
+    /// configuration takes the general paths unchanged. Read once at
+    /// construction (`thin_alloc_default`).
+    thin_alloc: bool,
+    /// `ZIPP_GCSTATS=1` only: thin-path serve counts — [finalized literals,
+    /// object slot reuses, arrays, funcs, closures, plain `MakeFunc` helper
+    /// calls]. Bumped only under `oracle`.
+    thin_stats: [u64; 6],
     /// Free list of reclaimed slot indices (filled by the mark-sweep GC's sweep,
     /// drained by `alloc`). A reused slot is overwritten and its version bumped so
     /// any stale JIT inline-cache entry misses. Empty until the first collection.
@@ -5265,6 +5316,8 @@ impl Heap {
             obj_pool_stats: [0; 3],
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_sort_stats: [0; 4],
+            thin_alloc: thin_alloc_default(),
+            thin_stats: [0; 6],
             hot_mirror: vec![HotMirror::CLEAR; versions.len()],
             cell_vals_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
             this_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
@@ -5443,6 +5496,10 @@ impl Heap {
         shape: u32,
     ) -> u32 {
         #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc {
+            return self.alloc_finalized_thin(plan, vals, shape);
+        }
+        #[cfg(not(feature = "safe-sandbox"))]
         let store = match val_slab_class(vals.len()) {
             Some(class) if val_slab_enabled() => {
                 let cap = val_slab_class_cap(class);
@@ -5496,6 +5553,280 @@ impl Heap {
         // B238: the shape came in as an argument and the store pointer is in
         // hand, so the mirror needs no rediscovery.
         self.alloc_object_settled(boxed, shape)
+    }
+
+    /// B257: the thin twin of [`Heap::alloc_finalized`] — the same slab
+    /// cell, pool pop and in-place refit, with every latch already folded
+    /// into `thin_alloc` (none is read here) and the occupant installed by
+    /// the known-variant slot write instead of the generic 80-byte-enum
+    /// move. Reachable only with `thin_alloc` set, which implies the slab,
+    /// the shell refit and the settled mirror are all on and the static-key
+    /// statistics are off — exactly the configuration whose general-path
+    /// behaviour this reproduces.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn alloc_finalized_thin(
+        &mut self,
+        plan: &crate::bytecode::StaticKeyPlan,
+        vals: &[Value],
+        shape: u32,
+    ) -> u32 {
+        debug_assert!(self.thin_alloc);
+        let store = match val_slab_class(vals.len()) {
+            Some(class) => {
+                let cap = val_slab_class_cap(class);
+                let owner = &mut self.val_slab[class as usize];
+                let owner_addr = std::ptr::from_mut(&mut *owner).expose_provenance();
+                debug_assert_eq!(owner_addr & VAL_SLAB_OWNER_LEN_MASK, 0);
+                debug_assert!((1..=16).contains(&vals.len()));
+                let owner_and_len = owner_addr | vals.len();
+                let base = owner.alloc_cell(cap);
+                // SAFETY: as in `alloc_finalized` — a fresh cell of `cap >=
+                // vals.len()` slots inside a live, immovable chunk this heap
+                // owns, aliased by nothing. `vals` may point straight into
+                // the VM's register window (the JIT helper passes it through
+                // without staging): the window is a root, the collector is
+                // non-moving and cannot run between the caller's poll and
+                // this copy, and the slab cell is not part of the window.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        vals.as_ptr(),
+                        std::ptr::with_exposed_provenance_mut::<Value>(base),
+                        vals.len(),
+                    );
+                }
+                ValStore::Slab {
+                    base,
+                    owner_and_len,
+                }
+            }
+            None => ValStore::Vec(vals.to_vec()),
+        };
+        let boxed = match self.obj_pool.pop() {
+            Some(mut b) => {
+                self.obj_pool_pops += 1;
+                if self.oracle {
+                    self.obj_pool_stats[1] += 1;
+                }
+                b.refit_finalized(plan, store, shape);
+                b
+            }
+            None => Box::new(ObjMap::finalized_from_store(plan.clone(), store, shape)),
+        };
+        if self.oracle {
+            self.thin_stats[0] += 1;
+        }
+        self.alloc_object_settled_thin(boxed, shape)
+    }
+
+    /// B257: install a finalized object whose mirror is known, writing the
+    /// slot as `HeapObj::Object(boxed)` in place (tag + pointer) instead of
+    /// building the 80-byte enum on the stack and moving it through the
+    /// out-of-line [`Heap::alloc_settled`]. The slot-reuse path is the whole
+    /// point; growth and the accounting-on audit mode keep the one general
+    /// body — B238 showed a second inlined copy of the growth path costs
+    /// 664KB of code for nothing.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn alloc_object_settled_thin(&mut self, boxed: Box<ObjMap>, shape: u32) -> u32 {
+        debug_assert_eq!(
+            boxed.shape(),
+            shape,
+            "settled mirror must carry the map's own shape"
+        );
+        let hot = HotMirror {
+            shape,
+            fid: FID_MIRROR_NONE,
+            vals: boxed.vals.as_ptr() as u64,
+        };
+        if self.payload_accounting.get() {
+            return self.alloc_settled(HeapObj::Object(boxed), Some(hot));
+        }
+        let Some(idx) = self.free.pop() else {
+            return self.alloc_settled(HeapObj::Object(boxed), Some(hot));
+        };
+        self.reuse_slot_begin();
+        self.reuse_slot_write(idx, HeapObj::Object(boxed));
+        self.hot_mirror[idx as usize] = hot;
+        self.reuse_slot_stamp(idx);
+        if self.oracle {
+            self.thin_stats[1] += 1;
+        }
+        idx
+    }
+
+    /// B257: the live-count half of a slot reuse — what `alloc_settled` does
+    /// before its own `free.pop`.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn reuse_slot_begin(&mut self) {
+        self.live += 1;
+        if self.live >= self.gc_threshold {
+            self.gc_requested = true;
+        }
+    }
+
+    /// B257: install `obj` into a slot just popped from `free` WITHOUT the
+    /// occupant's drop-glue dispatch. Sound because the free list has exactly
+    /// one producer — the tail of [`Heap::free_slot`] — and by then the slot
+    /// holds the `Date(NaN)` tombstone that function installed with
+    /// `mem::replace` (payload `f64`: no destructor, nothing to leak), and no
+    /// other writer touches a free slot's `objs` entry before an allocation
+    /// pops it. `ptr::write` is therefore observably identical to the
+    /// assignment `objs[idx] = obj` minus the discriminant read and match.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn reuse_slot_write(&mut self, idx: u32, obj: HeapObj) {
+        let slot: &mut HeapObj = &mut self.objs[idx as usize];
+        debug_assert!(
+            matches!(slot, HeapObj::Date(d) if d.is_nan()),
+            "a free-list slot must hold the sweep's tombstone"
+        );
+        // SAFETY: `slot` is a valid, aligned, exclusively borrowed `HeapObj`;
+        // the value it holds is the drop-free tombstone argued above.
+        unsafe { std::ptr::write(slot, obj) };
+    }
+
+    /// B257: the bookkeeping tail of a slot reuse — `alloc_settled`'s version
+    /// bump, young-log entry and oracle stamp, unchanged.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn reuse_slot_stamp(&mut self, idx: u32) {
+        self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+        if self.nursery {
+            if self.pretenure == 0 {
+                self.young.push(idx);
+                self.gen[idx as usize] = GEN_YOUNG;
+            } else {
+                self.gen[idx as usize] = GEN_OLD;
+            }
+        }
+        if self.oracle {
+            self.born[idx as usize] = if self.pretenure == 0 {
+                self.epoch
+            } else {
+                self.epoch.saturating_sub(1)
+            };
+            self.allocs_epoch += 1;
+        }
+    }
+
+    /// B257: allocate a dense array with its mirror settled by construction.
+    /// An `Array` owns no mirror line — `refresh_mirror`'s arm for it writes
+    /// `CLEAR`, which is what `free_slot` already left in a recycled slot —
+    /// so the reuse path skips both the occupant re-read and the redundant
+    /// mirror store. Growth and every non-default configuration go through
+    /// [`Heap::alloc`] unchanged.
+    #[allow(dead_code)] // the x86 JIT helpers are the callers
+    pub(crate) fn alloc_array_settled(&mut self, items: Vec<Value>) -> u32 {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc && !self.payload_accounting.get() {
+            if let Some(idx) = self.free.pop() {
+                debug_assert_eq!(
+                    self.hot_mirror[idx as usize],
+                    HotMirror::CLEAR,
+                    "free_slot leaves a recycled slot's mirror cleared"
+                );
+                self.reuse_slot_begin();
+                self.reuse_slot_write(idx, HeapObj::Array(items));
+                self.reuse_slot_stamp(idx);
+                if self.oracle {
+                    self.thin_stats[2] += 1;
+                }
+                return idx;
+            }
+        }
+        self.alloc(HeapObj::Array(items))
+    }
+
+    /// B257: allocate a capture-free function value with its mirror
+    /// (`{DICT, fid, 0}`, exactly `refresh_mirror`'s `Func` arm) written
+    /// directly instead of re-read from the slot.
+    #[allow(dead_code)] // the x86 JIT helpers are the callers
+    pub(crate) fn alloc_func_settled(&mut self, fid: u32) -> u32 {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc && !self.payload_accounting.get() {
+            if let Some(idx) = self.free.pop() {
+                self.reuse_slot_begin();
+                self.reuse_slot_write(idx, HeapObj::Func(fid));
+                self.hot_mirror[idx as usize] = HotMirror {
+                    shape: crate::shape::DICT,
+                    fid,
+                    vals: 0,
+                };
+                self.reuse_slot_stamp(idx);
+                if self.oracle {
+                    self.thin_stats[3] += 1;
+                }
+                return idx;
+            }
+        }
+        self.alloc(HeapObj::Func(fid))
+    }
+
+    /// B257: allocate a closure with its three mirror lines (hot, `this`,
+    /// upvalue base) written from the values in hand — the same values
+    /// `refresh_mirror`'s `Closure` arm reads back out of the slot.
+    #[allow(dead_code)] // the x86 JIT helpers are the callers
+    pub(crate) fn alloc_closure_settled(
+        &mut self,
+        func: u32,
+        upvalues: Vec<u32>,
+        this_val: Value,
+    ) -> u32 {
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self.thin_alloc && !self.payload_accounting.get() {
+            if let Some(idx) = self.free.pop() {
+                // A Vec's buffer address survives the move into the slot.
+                let upvals_raw = if upvalues.is_empty() {
+                    0
+                } else {
+                    upvalues.as_ptr() as u64
+                };
+                self.reuse_slot_begin();
+                self.reuse_slot_write(
+                    idx,
+                    HeapObj::Closure {
+                        func,
+                        upvalues,
+                        this_val,
+                    },
+                );
+                self.this_mirror[idx as usize] = this_val.bits();
+                self.upvals_mirror[idx as usize] = upvals_raw;
+                self.hot_mirror[idx as usize] = HotMirror {
+                    shape: crate::shape::DICT,
+                    fid: func,
+                    vals: 0,
+                };
+                self.reuse_slot_stamp(idx);
+                if self.oracle {
+                    self.thin_stats[4] += 1;
+                }
+                return idx;
+            }
+        }
+        self.alloc(HeapObj::Closure {
+            func,
+            upvalues,
+            this_val,
+        })
+    }
+
+    /// B257: whether the thin literal paths are live (see the field doc).
+    #[inline]
+    #[allow(dead_code)] // read by the x86 JIT helpers only
+    pub(crate) fn thin_alloc(&self) -> bool {
+        self.thin_alloc
+    }
+
+    /// B257 oracle telemetry: one plain `MakeFunc` helper call served.
+    #[inline]
+    #[allow(dead_code)] // the x86 JIT helper is the only caller
+    pub(crate) fn note_makefunc_plain(&mut self) {
+        if self.oracle {
+            self.thin_stats[5] += 1;
+        }
     }
 
     /// B238: allocate an object whose hot mirror is ALREADY KNOWN.
@@ -7607,6 +7938,88 @@ mod tests {
         (plan, vals, shape)
     }
 
+    /// B257: the thin paths reuse a swept slot in place — tombstone
+    /// overwritten without drop glue, mirrors settled from the values in
+    /// hand — and agree with `refresh_mirror` on every mirror line.
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[test]
+    fn thin_paths_reuse_swept_slots_with_settled_mirrors() {
+        let (plan, vals, shape) = slab_fixture();
+        let mut heap = Heap::new();
+        if !heap.thin_alloc() {
+            // Latched off for this process (`ZIPP_NO_THIN_ALLOC` or a
+            // sibling latch); the general paths are covered elsewhere.
+            return;
+        }
+        let first = heap.alloc_finalized(&plan, &vals, shape);
+        let arr = heap.alloc_array_settled(vec![Value::int(7)]);
+        let func = heap.alloc_func_settled(3);
+        let clo = heap.alloc_closure_settled(4, vec![first], Value::int(9));
+        for idx in [first, arr, func, clo] {
+            heap.free_slot(idx);
+        }
+        assert!(matches!(heap.get(clo), HeapObj::Date(d) if d.is_nan()));
+        assert_eq!(heap.hot_mirror[clo as usize], HotMirror::CLEAR);
+        assert_eq!(heap.this_mirror[clo as usize], Value::UNDEFINED.bits());
+        // LIFO: the reuse order is the reverse of the free order.
+        let clo2 = heap.alloc_closure_settled(5, vec![], Value::int(1));
+        assert_eq!(clo2, clo);
+        assert_eq!(
+            heap.hot_mirror[clo2 as usize],
+            HotMirror {
+                shape: crate::shape::DICT,
+                fid: 5,
+                vals: 0
+            }
+        );
+        assert_eq!(heap.this_mirror[clo2 as usize], Value::int(1).bits());
+        assert_eq!(heap.upvals_mirror[clo2 as usize], 0);
+        let func2 = heap.alloc_func_settled(6);
+        assert_eq!(func2, func);
+        assert_eq!(
+            heap.hot_mirror[func2 as usize],
+            HotMirror {
+                shape: crate::shape::DICT,
+                fid: 6,
+                vals: 0
+            }
+        );
+        let arr2 = heap.alloc_array_settled(vec![Value::int(1), Value::int(2)]);
+        assert_eq!(arr2, arr);
+        assert_eq!(heap.hot_mirror[arr2 as usize], HotMirror::CLEAR);
+        let obj2 = heap.alloc_finalized(&plan, &vals, shape);
+        assert_eq!(obj2, first);
+        let HeapObj::Object(m) = heap.get(obj2) else {
+            panic!("reused slot is not an object")
+        };
+        assert_eq!(
+            heap.hot_mirror[obj2 as usize],
+            HotMirror {
+                shape: m.shape(),
+                fid: FID_MIRROR_NONE,
+                vals: m.vals.as_ptr() as u64
+            }
+        );
+        assert_eq!(m.vals.as_slice(), &vals);
+        // Born by growth at version 0, +1 at the sweep, +1 at the reuse.
+        assert_eq!(heap.versions[obj2 as usize], 2);
+        // Every settled mirror equals what a re-read of the occupant yields.
+        for idx in [obj2, arr2, func2, clo2] {
+            let before = (
+                heap.hot_mirror[idx as usize],
+                heap.this_mirror[idx as usize],
+                heap.upvals_mirror[idx as usize],
+            );
+            heap.refresh_mirror(idx);
+            let after = (
+                heap.hot_mirror[idx as usize],
+                heap.this_mirror[idx as usize],
+                heap.upvals_mirror[idx as usize],
+            );
+            assert_eq!(before, after, "slot {idx}");
+        }
+    }
+
     #[cfg(not(feature = "safe-sandbox"))]
     fn object_slab_identity(heap: &Heap, idx: u32) -> (usize, usize) {
         let HeapObj::Object(map) = heap.get(idx) else {
@@ -8841,6 +9254,13 @@ impl Drop for Heap {
             eprintln!(
                 "[keypool] served={ks} missed={km} recycled={kr} resident={}",
                 self.key_pool.len()
+            );
+        }
+        if self.oracle {
+            let [fin, obj, arr, func, clo, mf] = self.thin_stats;
+            eprintln!(
+                "[thinalloc] on={} finalized={fin} obj_reuse={obj} array={arr} func={func} closure={clo} makefunc_plain={mf}",
+                self.thin_alloc
             );
         }
     }

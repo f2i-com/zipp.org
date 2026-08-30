@@ -112,13 +112,55 @@ pub(crate) extern "win64" fn jit_make_func(vm: *mut core::ffi::c_void, packed_fi
         // explicit roots. The collector is non-moving; the preflighted ids
         // remain valid after this safe point.
         vm.maybe_gc();
-        let idx = vm.heap.alloc(HeapObj::Func(plan.child));
+        // B257: the mirror (`{DICT, fid, 0}`) is settled directly; the heap
+        // falls back to the re-reading `alloc` when the thin fold is off.
+        let idx = vm.heap.alloc_func_settled(plan.child);
         if let Some(scope) = plan.eval_scope {
             vm.closure_eval_scope.insert(idx, scope);
         }
         if plan.realm != 0 {
             vm.obj_realm.insert(idx, plan.realm);
         }
+        Value::heap(idx).bits()
+    })) {
+        Ok(bits) => bits,
+        Err(_) => std::process::abort(),
+    }
+}
+
+/// B257: the PLAIN `MakeFunc` lane. The emitted site reaches it only after
+/// proving, at compile time from immutable bytecode, that `child` is a
+/// JIT-eligible capture-free non-arrow proto (`build_plain_makefunc_plan`
+/// — the same facts `make_func_preflight` re-derives per call) and, at run
+/// time, that the realm and eval-scope side tables are both EMPTY (two VM
+/// bytes: `JIT_OBJ_REALM_NONEMPTY_OFFSET`, `JIT_EVAL_SCOPE_NONEMPTY_OFFSET`).
+/// Under those facts the full helper's answer is fixed — realm 0, no
+/// EvalScope — whatever the active callable is, and so is the interpreter's
+/// (`ensure_frame_eval_scope` finds nothing: a body with a sloppy direct
+/// eval never compiles, and a frame's inherited scope would have made the
+/// table non-empty). The lane is therefore poll + allocate; the activation
+/// lookup, the bytecode re-read and the two probes are gone. The bytes are
+/// re-checked here as a pure-prefix decline so a malformed direct call
+/// cannot mint an unstamped function.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_make_func_plain(vm: *mut core::ffi::c_void, child: u64) -> u64 {
+    if vm.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let vm = unsafe { &mut *(vm as *mut Vm) };
+        let child = child as u32;
+        if vm.obj_realm.nonempty_raw != 0
+            || vm.closure_eval_scope.nonempty_raw != 0
+            || child as usize >= vm.main_func_count.saturating_add(vm.eval_funcs.len())
+        {
+            return crate::codegen::SELF_CALL_DEOPT;
+        }
+        // Every live Value is in the native frame's window or an explicit
+        // root; the child id is immutable bytecode metadata.
+        vm.maybe_gc();
+        let idx = vm.heap.alloc_func_settled(child);
+        vm.heap.note_makefunc_plain();
         Value::heap(idx).bits()
     })) {
         Ok(bits) => bits,

@@ -612,6 +612,13 @@ env_off_switch!(
 );
 
 env_off_switch!(
+    /// B257 sub-latch: `ZIPP_NO_MAKEFUNC_PLAIN=1` keeps every Tier-C
+    /// `MakeFunc` site on the full activation-validating helper (the plain
+    /// lane is also off under `ZIPP_NO_THIN_ALLOC`).
+    fn makefunc_plain_enabled() = "ZIPP_NO_MAKEFUNC_PLAIN"
+);
+
+env_off_switch!(
     /// Default-on kill switch for NATIVE SHAPE WAYS at direct-miss `GetProp`
     /// sites (B178): guard the receiver's live shape mirror, read
     /// `vals[slot]` through the vals mirror, no helper call. Off restores
@@ -3849,6 +3856,8 @@ impl Jit {
         yield_heads: &[u32],
         // B205: fused random-scale windows, keyed by the window's first ip.
         random_fuse: &FxHashMap<usize, RandomScaleFusePlan>,
+        // B257: `MakeFunc` ips licensed for the plain lane (ip -> child id).
+        plain_makefunc: &FxHashMap<usize, u32>,
     ) {
         if self.compiled.contains_key(&func_id) || self.blacklist.contains(&func_id) {
             return;
@@ -3925,6 +3934,7 @@ impl Jit {
                 meter,
                 yield_heads,
                 random_fuse,
+                plain_makefunc,
             ) {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {
                     eprintln!(

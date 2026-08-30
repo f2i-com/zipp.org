@@ -59,7 +59,13 @@ const TAG_LO: u64 = 0x7FF9;
 const TAG_HI: u64 = 0x7FFD;
 
 /// A NaN-boxed JavaScript value. `Copy` and exactly 8 bytes.
+///
+/// `repr(transparent)`: the register file and every emitted-code window are
+/// addressed as raw `u64` slots, and the B257 finalize helper reads a window
+/// range as a `&[Value]` — the layout identity is a declared guarantee, not
+/// an accident of a single-field struct.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct Value(u64);
 
 impl Value {

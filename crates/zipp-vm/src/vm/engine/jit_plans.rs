@@ -1402,6 +1402,44 @@ impl<'p> Vm<'p> {
     /// loop has executed `OSR_THRESHOLD` times by OSR-compile, so a hot
     /// monomorphic call already has its `Callee` way filled. A polymorphic /
     /// unfilled site simply isn't inlined.
+    /// B257: the `MakeFunc` ips of `func_id` licensed for the PLAIN helper
+    /// lane (`jit_make_func_plain`), each mapped to its child id. Licensed
+    /// means the child is a JIT-eligible, capture-free, non-arrow proto —
+    /// the immutable-bytecode facts `make_func_preflight` re-derives on
+    /// every call — so the emitted site can bake the child id and, when the
+    /// realm and eval-scope side tables are empty (two VM bytes the emitted
+    /// code guards), skip the activation lookup entirely. Empty under
+    /// `ZIPP_NO_THIN_ALLOC` / `ZIPP_NO_MAKEFUNC_PLAIN` (byte-identical Tier-C
+    /// code).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn build_plain_makefunc_plan(
+        &self,
+        func_id: u32,
+    ) -> rustc_hash::FxHashMap<usize, u32> {
+        let mut out = rustc_hash::FxHashMap::default();
+        if !crate::heap::thin_alloc_enabled() || !crate::codegen::makefunc_plain_enabled() {
+            return out;
+        }
+        let func_count = self.main_func_count.saturating_add(self.eval_funcs.len());
+        if func_id as usize >= func_count || !self.jit_func_eligible(func_id) {
+            return out;
+        }
+        for (ip, instr) in self.func(func_id as usize).code.iter().enumerate() {
+            let Instr::MakeFunc { func_id: child, .. } = *instr else {
+                continue;
+            };
+            if child as usize >= func_count || !self.jit_func_eligible(child) {
+                continue;
+            }
+            let child_proto = self.func(child as usize);
+            if child_proto.lexical_this || !child_proto.upvalues.is_empty() {
+                continue;
+            }
+            out.insert(ip, child);
+        }
+        out
+    }
+
     /// Tier C cross-call plan (B83): the `Call` ips worth emitting the native
     /// cross-call attempt at. The emitted attempt is CORRECT at any Call site
     /// (the helper re-resolves the live callee Value every call and deopts for

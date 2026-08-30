@@ -309,6 +309,7 @@ impl<'p> Vm<'p> {
             let method_plan = rustc_hash::FxHashMap::default();
             let (cross_plan, cross_pending, _cross_baked) = self.build_cross_call_plan(fid, None);
             self.jit.note_cross_pending(fid, &cross_pending);
+            let plain_makefunc = self.build_plain_makefunc_plan(fid);
             self.jit.compile(
                 fid,
                 proto_ref,
@@ -322,6 +323,7 @@ impl<'p> Vm<'p> {
                 &cross_plan,
                 &[],
                 &rustc_hash::FxHashMap::default(),
+                &plain_makefunc,
             );
         }
         let entry = self.jit.get(fid)?.entry();

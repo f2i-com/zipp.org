@@ -357,6 +357,7 @@ impl<'p> Vm<'p> {
                             self.jit.note_cross_pending(func_id, &cross_pending);
                             self.jit.note_cross_baked(func_id, &cross_baked);
                             let random_fuse = self.build_random_fuse_plan(func_id, Some(base));
+                            let plain_makefunc = self.build_plain_makefunc_plan(func_id);
                             self.jit.compile(
                                 func_id,
                                 proto_ref,
@@ -370,6 +371,7 @@ impl<'p> Vm<'p> {
                                 &cross_plan,
                                 &yield_heads,
                                 &random_fuse,
+                                &plain_makefunc,
                             );
                         }
                     }
