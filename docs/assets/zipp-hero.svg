@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">Zipp JavaScript engine</title>
+  <desc id="desc">A dark violet banner with a lightning mark, the Zipp name, and the words Rust, JavaScript, and native JIT.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="0.55" stop-color="#24124d"/>
+      <stop offset="1" stop-color="#083b4c"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#c4b5fd"/>
+      <stop offset="0.5" stop-color="#7c3aed"/>
+      <stop offset="1" stop-color="#22d3ee"/>
+    </linearGradient>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="15" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1200" height="360" rx="30" fill="url(#bg)"/>
+  <g opacity="0.18" stroke="#a78bfa" stroke-width="2">
+    <path d="M0 67h270M0 105h215M0 143h160"/>
+    <path d="M930 217h270M985 255h215M1040 293h160"/>
+  </g>
+  <circle cx="225" cy="180" r="108" fill="#7c3aed" opacity="0.14" filter="url(#glow)"/>
+  <circle cx="225" cy="180" r="91" fill="none" stroke="#a78bfa" stroke-opacity="0.35" stroke-width="2"/>
+  <path d="M92 0 0 122h58l-25 86L142 69h-62z" transform="translate(154 76)" fill="url(#bolt)" filter="url(#glow)"/>
+  <text x="370" y="176" fill="#ffffff" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="108" font-weight="750" letter-spacing="-5">Zipp</text>
+  <text x="376" y="228" fill="#d8d4fe" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="27" letter-spacing="1.2">A CLEAN-SHEET JAVASCRIPT ENGINE IN RUST</text>
+  <g font-family="Inter,Segoe UI,Arial,sans-serif" font-size="19" font-weight="600">
+    <rect x="376" y="260" width="98" height="42" rx="21" fill="#ffffff" opacity="0.10"/>
+    <text x="401" y="287" fill="#ede9fe">Rust</text>
+    <rect x="488" y="260" width="150" height="42" rx="21" fill="#ffffff" opacity="0.10"/>
+    <text x="514" y="287" fill="#ede9fe">JavaScript</text>
+    <rect x="652" y="260" width="145" height="42" rx="21" fill="#ffffff" opacity="0.10"/>
+    <text x="680" y="287" fill="#cffafe">Native JIT</text>
+  </g>
+</svg>
