@@ -759,7 +759,7 @@ pub(crate) fn emit_ic_probe(
         ; lea r9, [r14 + ic_off]              // way 0 of this site
         ; mov r8d, JIT_IC_WAYS as i32
         ; => probe
-        ; cmp rax, [r9]                       // identity (empty 0 never matches)
+        ; cmp rax, [r9]                       // identity (impossible empty marker never matches)
         ; jne => next
         ; mov ecx, eax                        // recv heap idx (low 32)
         ; mov edx, [r13 + rcx*4]              // live recv version

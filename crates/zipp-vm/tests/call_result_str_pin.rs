@@ -234,6 +234,28 @@ fn child_log(test: &str, envs: &[(&str, &str)]) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+fn assert_call_result_mem_region(log: &str, mode: &str) {
+    let target_fn = log
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("[pin] fn")?;
+            if !line.contains("call-result reaching-def all-paths")
+                && !line.contains("decline: writer Call")
+            {
+                return None;
+            }
+            rest.split(['@', ' ']).next()
+        })
+        .expect("call-result pin diagnostic identifies the target function");
+    let target_region = format!("[jit] MEM region fn{target_fn} ");
+    assert!(
+        log.lines()
+            .any(|line| line.contains(&target_region) && line.contains("compiled")),
+        "call-result property loop did not compile as a MEM region with {mode} disabled:\n{log}"
+    );
+}
+
 #[test]
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 fn call_result_str_pin_mechanism_and_off_switch() {
@@ -274,6 +296,21 @@ fn call_result_str_pin_mechanism_and_off_switch() {
             && !quick_off.contains("pinned-str-length"),
         "B190 off-switch did not suppress its direct pinned-string sub-lane:\n{quick_off}"
     );
+
+    for (name, envs) in [
+        ("direct-length", &[("ZIPP_NO_PINNED_STR_LEN", "1")][..]),
+        ("quick-length", &[("ZIPP_NO_QUICK_LEN", "1")][..]),
+        (
+            "call-result-pin",
+            &[("ZIPP_NO_CALL_RESULT_STR_PIN", "1")][..],
+        ),
+    ] {
+        let zero = child_log(
+            "call_result_str_pin_declined_zero_snapshot_is_not_a_hit",
+            envs,
+        );
+        assert_call_result_mem_region(&zero, name);
+    }
 
     let off = child_log(
         "call_result_str_pin_parity_stable_ascii",

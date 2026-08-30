@@ -2785,6 +2785,13 @@ pub const JIT_IC_STRIDE: usize = 64;
 /// the deepest the real-world benches walk).
 pub const JIT_IC_MAX_HOPS: usize = 5;
 
+/// Empty marker for an IDENTITY inline-cache way. Tag selector 6 is outside
+/// the five Value tags and denotes a NaN bit pattern; every numeric boundary
+/// canonicalizes NaN to `QNAN_BITS`, so no script-visible Value can equal it.
+/// Direct SHAPE sites deliberately retain all-zero storage because their four
+/// packed pattern slots use zero as the free marker.
+pub(crate) const JIT_IC_EMPTY_BITS: u64 = 0x7FFE_0000_0000_0001;
+
 /// Element type of [`Jit::ic_rot`]. Aliased so that [`IC_ROT_PERIOD`] — the
 /// rotation-escape window a widening would silently stretch — is DERIVED from
 /// the cursor rather than written down beside it.
@@ -2813,7 +2820,7 @@ const DIRECT_MISS_RECOMPILE_CAP: u8 = 4;
 /// `vals_ptr`/`slot` the hit reads); any chain mutation bumps a guarded hop.
 /// Writes only ever fill OWN entries (`nhops == 0`). On a full match it
 /// reads/writes `vals_ptr[slot]` with NO call (slots never move without a
-/// version bump). `obj_bits == 0` means empty (no real object Value is 0).
+/// version bump). `obj_bits == JIT_IC_EMPTY_BITS` means an empty identity way.
 /// `slot` is packed into 24 bits (an ObjMap with 16M+ keys is unreachable —
 /// fills exceeding it are skipped defensively).
 ///
@@ -2843,6 +2850,20 @@ const _: () = assert!(
     std::mem::size_of::<IcEntry>() == JIT_IC_STRIDE,
     "IcEntry layout and JIT_IC_STRIDE disagree; the emitted probes index by the constant"
 );
+
+#[cfg(test)]
+mod identity_ic_marker_tests {
+    use super::*;
+
+    #[test]
+    fn empty_identity_marker_cannot_survive_numeric_boxing() {
+        let raw = f64::from_bits(JIT_IC_EMPTY_BITS);
+        assert!(raw.is_nan());
+        assert_eq!(Value::num(raw).bits(), QNAN_BITS);
+        assert_ne!(Value::num(raw).bits(), JIT_IC_EMPTY_BITS);
+        assert!(!Value::from_bits(JIT_IC_EMPTY_BITS).is_heap());
+    }
+}
 
 /// Bit 31 of [`IcEntry::slot_nhops`]: the way is an ACCESSOR resolution. A hit
 /// dispatches to the accessor helper (`jit_get_prop_acc` / `jit_set_prop_acc`)
@@ -2956,9 +2977,9 @@ pub(crate) fn regalloc_getprop_enabled() -> bool {
 ///
 /// This exists to MEASURE the wave-20 map's mechanism, which specified exactly
 /// that ("the miss must deopt and not call") and gated it on a plan-time
-/// zero-miss check. It cannot work: `reserve_ic_sites` hands every fresh compile
-/// eight ZEROED ways, and `Jit::set_ic` — the only thing that ever fills one — is
-/// reachable only from the miss helpers. A probe that never calls the helper
+/// zero-miss check. It cannot work: `register_ic_sites` hands every identity
+/// probe eight empty-marker ways, and only the miss helpers reach `Jit::set_ic`
+/// to fill one. A probe that never calls the helper
 /// therefore never fills a way, misses on every access forever, and evicts the
 /// region. The default is the call form; this switch reproduces the deopt form
 /// so the claim is a measurement rather than an argument.
@@ -4602,7 +4623,8 @@ impl Jit {
 
     /// Reserve `n` fresh inline-cache sites (one per heap-op site in a region;
     /// `JIT_IC_WAYS` ways each), returning the base global site id. The ways
-    /// start empty (`obj_bits == 0` ⇒ always miss on first use).
+    /// start zeroed; registration marks identity ways with
+    /// `JIT_IC_EMPTY_BITS`, while direct shape-pair sites retain zeroes.
     pub fn reserve_ic_sites(&mut self, n: usize) -> u32 {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::JitCompile);
         let base = (self.ic_table.len() / JIT_IC_WAYS) as u32;
@@ -4654,6 +4676,17 @@ impl Jit {
                         acc_emitted: acc,
                         direct_miss_emitted: direct_miss,
                     };
+                }
+                if !direct_miss {
+                    let way_base = (base as usize + flags.len()) * JIT_IC_WAYS;
+                    let ways = self
+                        .ic_table
+                        .get_mut(way_base..way_base + JIT_IC_WAYS)
+                        .expect("fresh identity IC site");
+                    for way in ways {
+                        debug_assert_eq!(way.obj_bits, 0, "identity IC site was not fresh");
+                        way.obj_bits = JIT_IC_EMPTY_BITS;
+                    }
                 }
                 flags.push(IcSiteEmit { acc, direct_miss });
             }
@@ -4991,7 +5024,10 @@ impl Jit {
             *w = e;
             return;
         }
-        if let Some(w) = ways.iter_mut().find(|w| w.obj_bits == 0) {
+        if let Some(w) = ways
+            .iter_mut()
+            .find(|w| matches!(w.obj_bits, JIT_IC_EMPTY_BITS | 0))
+        {
             *w = e;
             return;
         }

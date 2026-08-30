@@ -291,10 +291,9 @@ fn field_read_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool 
 ///
 /// ── the miss must CALL, and this is a measured claim ──
 /// The wave-20 map specified a DEOPT here, gated on a plan-time zero-miss check.
-/// That cannot work. `Jit::reserve_ic_sites` hands every fresh compile eight
-/// ZEROED ways and `Jit::set_ic` — the only writer of a way anywhere in the
-/// engine — is reachable only from the miss helpers. A probe that never calls
-/// one never fills a way, misses on every access for the life of the region, and
+/// That cannot work. `register_ic_sites` hands every identity probe eight
+/// empty-marker ways, and only the miss helpers reach `Jit::set_ic` to fill one.
+/// A probe that never calls one misses on every access for the life of the region, and
 /// evicts it. `ZIPP_BOXREF_MISS=deopt` emits that form so the claim is a
 /// measurement rather than an argument; the default is the call.
 ///
@@ -340,7 +339,7 @@ fn emit_regalloc_ic_probe(
         // an L1 hit, and it keeps `rax` free for the hop walk (which clobbers it
         // and can no longer return here -- see the `jne => miss` below).
         ; mov rax, [rbx + dreg(obj)]           // receiver bits (the box slot)
-        ; cmp rax, [rcx]                       // identity (an empty 0 never matches)
+        ; cmp rax, [rcx]                       // identity (impossible empty marker never matches)
         ; jne => next
         ; mov eax, eax                         // receiver heap index = low 32
         ; mov eax, [r13 + rax * 4]             // live receiver version
