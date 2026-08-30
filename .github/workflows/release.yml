@@ -1,0 +1,519 @@
+name: Release
+
+# A release is always built from an existing immutable-looking version tag.
+# The manual entry point is useful for retrying infrastructure failures, but it
+# deliberately does not create a tag or release an arbitrary branch/SHA.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (for example, v0.0.1)
+        required: true
+        default: v0.0.1
+        type: string
+
+# Build jobs can only read the repository. The release job raises this to
+# contents:write for the one step that publishes the already-built assets.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  WASM_BINDGEN_CLI: "0.2.126"
+
+jobs:
+  validate:
+    name: Validate release tag and package versions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.requested-tag.outputs.tag }}
+      version: ${{ steps.package-version.outputs.version }}
+      commit: ${{ steps.package-version.outputs.commit }}
+      tag_object: ${{ steps.package-version.outputs.tag_object }}
+    steps:
+      - name: Validate requested tag format
+        id: requested-tag
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "release tags must use canonical vMAJOR.MINOR.PATCH form" >&2
+            exit 1
+          fi
+          echo "tag=$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the tagged source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # A push run checks out the event object rather than re-resolving a
+          # tag that could have moved while the run was queued. The validation
+          # below then proves the current tag still names this object/commit.
+          ref: ${{ github.event_name == 'push' && github.sha || format('refs/tags/{0}', steps.requested-tag.outputs.tag) }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prove the checkout and manifests match the tag
+        id: package-version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.requested-tag.outputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          tag_object="$(git rev-parse "$RELEASE_TAG")"
+          tag_commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          head_commit="$(git rev-parse HEAD)"
+          if [[ "$tag_commit" != "$head_commit" ]]; then
+            echo "checkout $head_commit does not match $RELEASE_TAG ($tag_commit)" >&2
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == "push" \
+                && "$EVENT_SHA" != "$tag_object" \
+                && "$EVENT_SHA" != "$tag_commit" ]]; then
+            echo "tag moved after this push event: event=$EVENT_SHA current=$tag_object/$tag_commit" >&2
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          python3 - "$version" <<'PY'
+          import json
+          import pathlib
+          import sys
+          import tomllib
+
+          expected = sys.argv[1]
+          root = tomllib.loads(pathlib.Path("Cargo.toml").read_text(encoding="utf-8"))
+          wasm = tomllib.loads(
+              pathlib.Path("crates/zipp-wasm/Cargo.toml").read_text(encoding="utf-8")
+          )
+          actual = {
+              "native workspace": root["workspace"]["package"]["version"],
+              "zipp-wasm": wasm["package"]["version"],
+              "landing": json.loads(
+                  pathlib.Path("landing/package.json").read_text(encoding="utf-8")
+              )["version"],
+          }
+          mismatches = [f"{name}={value}" for name, value in actual.items() if value != expected]
+          if mismatches:
+              raise SystemExit(
+                  f"tag version {expected} does not match " + ", ".join(mismatches)
+              )
+          PY
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
+          echo "tag_object=$tag_object" >> "$GITHUB_OUTPUT"
+
+  native:
+    name: Native CLI (${{ matrix.rust_target }})
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            rust_target: x86_64-unknown-linux-gnu
+            archive_suffix: .tar.gz
+          - os: windows-2022
+            rust_target: x86_64-pc-windows-msvc
+            archive_suffix: .zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: "1.92.0"
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain and target
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup target add ${{ matrix.rust_target }} --toolchain 1.92.0
+
+      - name: Build the release CLI from the locked workspace
+        run: >-
+          cargo build --locked --release --package zipp-cli --bin zipp
+          --target ${{ matrix.rust_target }}
+
+      - name: Smoke-test and package Linux CLI
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          binary="target/$RUST_TARGET/release/zipp"
+          smoke_file="$RUNNER_TEMP/zipp-release-smoke.js"
+          printf '%s\n' 'console.log("zipp-release-smoke");' > "$smoke_file"
+          actual="$("$binary" js "$smoke_file")"
+          [[ "$actual" == "zipp-release-smoke" ]]
+
+          bundle="zipp-$RELEASE_VERSION-$RUST_TARGET"
+          mkdir -p "dist/$bundle"
+          install -m 0755 "$binary" "dist/$bundle/zipp"
+          install -m 0644 README.md LICENSE-APACHE "dist/$bundle/"
+          "$binary" --version --json > "dist/$bundle/BUILD-INFO.json"
+          jq -e --arg version "$RELEASE_VERSION" \
+            '.name == "zipp" and .version == $version' \
+            "dist/$bundle/BUILD-INFO.json" >/dev/null
+          (
+            cd dist
+            tar -czf "$bundle.tar.gz" "$bundle"
+          )
+
+      - name: Smoke-test and package Windows CLI
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = Join-Path $PWD "target/$env:RUST_TARGET/release/zipp.exe"
+          $smokeFile = Join-Path $env:RUNNER_TEMP 'zipp-release-smoke.js'
+          [IO.File]::WriteAllText($smokeFile, "console.log(`"zipp-release-smoke`");`n")
+          $actual = (& $binary js $smokeFile | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ($actual -ne 'zipp-release-smoke') {
+            throw "unexpected smoke-test output: $actual"
+          }
+
+          $bundle = "zipp-$env:RELEASE_VERSION-$env:RUST_TARGET"
+          $bundlePath = Join-Path $PWD "dist/$bundle"
+          New-Item -ItemType Directory -Path $bundlePath -Force | Out-Null
+          Copy-Item -LiteralPath $binary -Destination (Join-Path $bundlePath 'zipp.exe')
+          Copy-Item -LiteralPath @('README.md', 'LICENSE-APACHE') -Destination $bundlePath
+          $buildInfo = & $binary --version --json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $identity = $buildInfo | ConvertFrom-Json
+          if ($identity.name -ne 'zipp' -or $identity.version -ne $env:RELEASE_VERSION) {
+            throw "binary identity does not match release $env:RELEASE_VERSION"
+          }
+          [IO.File]::WriteAllText(
+            (Join-Path $bundlePath 'BUILD-INFO.json'),
+            ($buildInfo + "`n"),
+            [Text.UTF8Encoding]::new($false)
+          )
+          $archivePath = Join-Path $PWD "dist/$bundle.zip"
+          Compress-Archive -LiteralPath $bundlePath -DestinationPath $archivePath -CompressionLevel Optimal
+
+      - name: Upload native release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-native-${{ matrix.rust_target }}
+          path: dist/zipp-${{ needs.validate.outputs.version }}-${{ matrix.rust_target }}${{ matrix.archive_suffix }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  wasm:
+    name: Browser WebAssembly package
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    defaults:
+      run:
+        working-directory: crates/zipp-wasm
+    env:
+      RUSTUP_TOOLCHAIN: "1.92.0"
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain and wasm32 target
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
+
+      - name: Select the Node.js smoke-test runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Test the isolated host workspace
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: cargo test --locked
+
+      - name: Install the exact matching wasm-bindgen CLI
+        run: |
+          set -euo pipefail
+          cargo install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
+          test "$(wasm-bindgen --version)" = "wasm-bindgen $WASM_BINDGEN_CLI"
+
+      - name: Build the locked production WebAssembly module
+        # RUSTFLAGS overrides target config, so repeat both security-critical
+        # linker limits while making compiler warnings fatal.
+        env:
+          RUSTFLAGS: >-
+            -Dwarnings
+            -C link-arg=--max-memory=268435456
+            -C link-arg=-zstack-size=1048576
+        run: cargo build --locked --release --target wasm32-unknown-unknown
+
+      - name: Exercise the production host boundary under Node
+        run: |
+          set -euo pipefail
+          wasm-bindgen --target nodejs --out-dir tests/node/pkg \
+            target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          node tests/node/check-wasm-memory.cjs tests/node/pkg/zipp_wasm_bg.wasm
+          node tests/node/host-contract.cjs
+          node tests/node/worker-deadline.cjs
+
+      - name: Package browser JS, TypeScript declarations, and WebAssembly
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          bundle="zipp-wasm-$RELEASE_VERSION-web"
+          archive="$bundle.zip"
+          mkdir -p "dist/$bundle"
+          wasm-bindgen --target web --out-dir "dist/$bundle" \
+            target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          node --input-type=module --check < "dist/$bundle/zipp_wasm.js"
+          node tests/node/check-wasm-memory.cjs "dist/$bundle/zipp_wasm_bg.wasm"
+          BUNDLE_PATH="$(pwd)/dist/$bundle" node --input-type=module <<'JS'
+          import fs from "node:fs";
+          import path from "node:path";
+          import { pathToFileURL } from "node:url";
+
+          const bundle = process.env.BUNDLE_PATH;
+          const zipp = await import(pathToFileURL(path.join(bundle, "zipp_wasm.js")));
+          await zipp.default({
+            module_or_path: fs.readFileSync(path.join(bundle, "zipp_wasm_bg.wasm")),
+          });
+          const engine = new zipp.Engine();
+          try {
+            engine.initScript('console.log("zipp-web-release-smoke");');
+            const output = engine.takeOutput();
+            if (JSON.stringify(output) !== '["zipp-web-release-smoke"]') {
+              throw new Error(`unexpected browser-package output: ${JSON.stringify(output)}`);
+            }
+          } finally {
+            engine.dispose();
+          }
+          JS
+          install -m 0644 README.md ../../LICENSE-APACHE "dist/$bundle/"
+          {
+            printf 'version=%s\n' "$RELEASE_VERSION"
+            printf 'commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'rustc=%s\n' "$(rustc --version)"
+            printf 'wasm-bindgen=%s\n' "$(wasm-bindgen --version)"
+            printf 'target=wasm32-unknown-unknown\n'
+          } > "dist/$bundle/BUILD-INFO.txt"
+          (
+            cd "dist/$bundle"
+            find . -type f ! -name SHA256SUMS -printf '%P\0' \
+              | sort -z \
+              | xargs -0 sha256sum > SHA256SUMS
+          )
+          (
+            cd dist
+            zip -q -9 -r "$archive" "$bundle"
+          )
+
+      - name: Upload browser WebAssembly release archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-wasm-web
+          path: crates/zipp-wasm/dist/zipp-wasm-${{ needs.validate.outputs.version }}-web.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validate, native, wasm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Revalidate the tag before publishing
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prove the release tag still names the built commit
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+          EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+          current_object="$(git rev-parse "$RELEASE_TAG")"
+          current_commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          if [[ "$current_object" != "$EXPECTED_TAG_OBJECT" \
+                || "$current_commit" != "$EXPECTED_COMMIT" ]]; then
+            echo "tag moved during the release: expected=$EXPECTED_TAG_OBJECT/$EXPECTED_COMMIT current=$current_object/$current_commit" >&2
+            exit 1
+          fi
+
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify the asset set and write release checksums
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected=(
+            "zipp-$RELEASE_VERSION-x86_64-unknown-linux-gnu.tar.gz"
+            "zipp-$RELEASE_VERSION-x86_64-pc-windows-msvc.zip"
+            "zipp-wasm-$RELEASE_VERSION-web.zip"
+          )
+          for asset in "${expected[@]}"; do
+            test -f "dist/$asset"
+          done
+          mapfile -t actual < <(find dist -maxdepth 1 -type f -printf '%f\n' | sort)
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | sort)
+          if [[ "${actual[*]}" != "${wanted[*]}" ]]; then
+            printf 'unexpected release asset set:\n%s\n' "${actual[*]}" >&2
+            exit 1
+          fi
+          (
+            cd dist
+            sha256sum "${expected[@]}" > SHA256SUMS
+          )
+
+      - name: Publish the existing tag and immutable asset set
+        shell: bash
+        env:
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+          EXPECTED_TAG_OBJECT: ${{ needs.validate.outputs.tag_object }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          verify_remote_tag() {
+            remote_object="$(
+              gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.sha
+            )"
+            if [[ "$remote_object" != "$EXPECTED_TAG_OBJECT" ]]; then
+              echo "remote tag moved during the release: expected=$EXPECTED_TAG_OBJECT current=$remote_object" >&2
+              exit 1
+            fi
+          }
+
+          verify_remote_tag
+          if gh release view "$RELEASE_TAG" \
+              --json isDraft,isImmutable,isPrerelease,url > existing-release.json 2>/dev/null; then
+            is_draft="$(jq -r .isDraft existing-release.json)"
+            is_prerelease="$(jq -r .isPrerelease existing-release.json)"
+            if [[ "$is_draft" == "true" ]]; then
+              # A previous upload may have stopped midway. Drafts are not
+              # public or immutable, so remove that partial attempt and
+              # recreate it from the newly verified complete asset set.
+              gh release delete "$RELEASE_TAG" --yes
+            else
+              if [[ "$is_prerelease" == "true" ]]; then
+                echo "existing $RELEASE_TAG is a prerelease; refusing to mutate it" >&2
+                exit 1
+              fi
+              mkdir existing-assets
+              gh release download "$RELEASE_TAG" --dir existing-assets
+              expected_existing=(
+                "SHA256SUMS"
+                "zipp-${{ needs.validate.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz"
+                "zipp-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip"
+                "zipp-wasm-${{ needs.validate.outputs.version }}-web.zip"
+              )
+              mapfile -t actual_existing < <(
+                find existing-assets -maxdepth 1 -type f -printf '%f\n' | sort
+              )
+              mapfile -t wanted_existing < <(
+                printf '%s\n' "${expected_existing[@]}" | sort
+              )
+              if [[ "${actual_existing[*]}" != "${wanted_existing[*]}" ]]; then
+                printf 'existing release has an unexpected asset set:\n%s\n' \
+                  "${actual_existing[*]}" >&2
+                exit 1
+              fi
+              (cd existing-assets && sha256sum --check SHA256SUMS)
+
+              linux_bundle="zipp-$RELEASE_VERSION-x86_64-unknown-linux-gnu"
+              windows_bundle="zipp-$RELEASE_VERSION-x86_64-pc-windows-msvc"
+              wasm_bundle="zipp-wasm-$RELEASE_VERSION-web"
+              linux_info="$(
+                tar -xOf "existing-assets/$linux_bundle.tar.gz" \
+                  "$linux_bundle/BUILD-INFO.json"
+              )"
+              windows_info="$(
+                unzip -p "existing-assets/$windows_bundle.zip" \
+                  "$windows_bundle/BUILD-INFO.json"
+              )"
+              for info in "$linux_info" "$windows_info"; do
+                jq -e \
+                  --arg version "$RELEASE_VERSION" \
+                  --arg commit "$EXPECTED_COMMIT" \
+                  '.name == "zipp" and .version == $version and
+                   .commit == $commit and .dirty == false' \
+                  <<< "$info" >/dev/null
+              done
+              wasm_info="$(
+                unzip -p "existing-assets/$wasm_bundle.zip" \
+                  "$wasm_bundle/BUILD-INFO.txt"
+              )"
+              grep -Fxq "version=$RELEASE_VERSION" <<< "$wasm_info"
+              grep -Fxq "commit=$EXPECTED_COMMIT" <<< "$wasm_info"
+              verify_remote_tag
+
+              release_url="$(jq -r .url existing-release.json)"
+              printf 'Existing [%s](%s) is complete and checksum-valid; no changes made.\n' \
+                "$RELEASE_TAG" "$release_url" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+
+          gh release create "$RELEASE_TAG" dist/* \
+            --draft \
+            --verify-tag \
+            --target "$EXPECTED_COMMIT" \
+            --title "ZIPP $RELEASE_TAG" \
+            --generate-notes
+          verify_remote_tag
+          gh release edit "$RELEASE_TAG" \
+            --draft=false \
+            --latest \
+            --target "$EXPECTED_COMMIT" \
+            --verify-tag
+          verify_remote_tag
+          gh release view "$RELEASE_TAG" \
+            --json isImmutable,url > published-release.json
+          release_url="$(jq -r .url published-release.json)"
+          immutable="$(jq -r .isImmutable published-release.json)"
+          printf 'Published [%s](%s); immutable=%s\n' \
+            "$RELEASE_TAG" "$release_url" "$immutable" >> "$GITHUB_STEP_SUMMARY"

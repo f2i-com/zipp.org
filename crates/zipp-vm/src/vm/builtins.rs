@@ -371,6 +371,7 @@ impl<'p> Vm<'p> {
     /// handful of loads; the fallback proves through the baseline table.
     /// Receiver-side exotics (an own side-table shadow, a custom
     /// [[Prototype]], an arguments object) are the CALLER's to exclude.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn proto_intrinsic_bits(&mut self, name: &str, is_arr: bool) -> Option<u64> {
         let (proto, memo_id) = if is_arr {
             (self.arr_proto, arr_memo_id(name))

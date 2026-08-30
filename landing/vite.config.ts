@@ -16,7 +16,10 @@ export default defineConfig(({ command }) => ({
         // Keep the production document strict while allowing the dev server to
         // render the same page engineers will build.
         return html
-          .replace("script-src 'self';", "script-src 'self' 'unsafe-inline';")
+          .replace(
+            "script-src 'self' 'wasm-unsafe-eval';",
+            "script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline';",
+          )
           .replace("style-src 'self';", "style-src 'self' 'unsafe-inline';")
       },
     },

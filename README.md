@@ -38,12 +38,59 @@ implementation can be read end to end.
 
 ## Quick start
 
-Stable Rust is the only build requirement for the ordinary CLI.
+The [`v0.0.1` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.1)
+contains ready-to-run x86-64 binaries and a browser WebAssembly package.
+
+### Windows
+
+Download, extract, and run the native Windows executable from PowerShell:
+
+```powershell
+$version = '0.0.1'
+$archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
+Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
+Expand-Archive -LiteralPath $archive -DestinationPath .
+
+& ".\zipp-$version-x86_64-pc-windows-msvc\zipp.exe" js .\app.js
+```
+
+Use `mjs` instead of `js` for an ES module entry, including top-level `await`.
+
+### Linux
+
+Download, extract, and run the native Linux binary:
+
+```sh
+version=0.0.1
+archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
+curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
+tar -xzf "$archive"
+
+"./zipp-$version-x86_64-unknown-linux-gnu/zipp" js ./app.js
+```
+
+The archive preserves the executable bit. If another tool removes it, restore it
+with `chmod +x zipp-0.0.1-x86_64-unknown-linux-gnu/zipp`.
+
+### Build from source
+
+Install stable Rust and its platform toolchain (MSVC Build Tools on Windows, or
+a C compiler and linker on Linux). On Windows, run this in PowerShell:
+
+```powershell
+git clone https://github.com/f2i-com/zipp.org.git zipp
+Set-Location zipp
+cargo build --locked --release
+
+.\target\release\zipp.exe js .\app.js
+```
+
+On Linux:
 
 ```sh
 git clone https://github.com/f2i-com/zipp.org.git zipp
 cd zipp
-cargo build --release
+cargo build --locked --release
 
 ./target/release/zipp js app.js
 ./target/release/zipp mjs app.mjs   # ES module entry, including top-level await
@@ -52,6 +99,105 @@ cargo build --release
 A release build uses fat LTO and one codegen unit, so the final link is
 deliberately slower than a development build. The resulting executable has no
 runtime data-file dependency.
+
+### Embed Zipp WebAssembly in a web app
+
+Download the browser bundle, then serve its JavaScript and WebAssembly files
+from the same origin as your app:
+
+```sh
+version=0.0.1
+archive="zipp-wasm-$version-web.zip"
+curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
+unzip "$archive"
+
+mkdir -p public/zipp-wasm
+cp "zipp-wasm-$version-web/zipp_wasm.js" \
+   "zipp-wasm-$version-web/zipp_wasm_bg.wasm" \
+   public/zipp-wasm/
+```
+
+For arbitrary code, do not run the synchronous engine on the page's main
+thread. Add this dedicated module Worker as `public/zipp-wasm/worker.js`:
+
+```js
+import init, { Engine } from "./zipp_wasm.js";
+
+await init({
+  module_or_path: new URL("./zipp_wasm_bg.wasm", import.meta.url),
+});
+
+self.onmessage = ({ data }) => {
+  let engine;
+  try {
+    engine = new Engine();
+    engine.initScript(data.source);
+    self.postMessage({ type: "result", output: engine.takeOutput() });
+  } catch (error) {
+    self.postMessage({ type: "error", error: String(error) });
+  } finally {
+    engine?.dispose();
+  }
+};
+
+self.postMessage({ type: "ready" });
+```
+
+Start one fresh Worker per run from responsive page code. The page owns both
+the load deadline and the execution deadline, so it can forcibly terminate a
+Worker even while guest JavaScript is blocking it:
+
+```js
+export function runZipp(source, timeoutMs = 2_500) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker("/zipp-wasm/worker.js", { type: "module" });
+    let settled = false;
+    let timer = setTimeout(
+      () => finish(reject, new Error("Zipp WebAssembly failed to load")),
+      15_000,
+    );
+
+    function finish(callback, value) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.terminate();
+      callback(value);
+    }
+
+    worker.onmessage = ({ data }) => {
+      if (data.type === "ready") {
+        clearTimeout(timer);
+        timer = setTimeout(
+          () => finish(reject, new Error("JavaScript execution timed out")),
+          timeoutMs,
+        );
+        worker.postMessage({ source });
+      } else if (data.type === "result") {
+        finish(resolve, data.output);
+      } else if (data.type === "error") {
+        finish(reject, new Error(data.error));
+      }
+    };
+
+    worker.onerror = (event) =>
+      finish(reject, event.error ?? new Error(event.message));
+  });
+}
+
+const lines = await runZipp('console.log("Hello from Zipp");');
+document.querySelector("#output").textContent = lines.join("\n");
+```
+
+Serve the app over HTTP(S), not `file://`, configure `.wasm` as
+`application/wasm`, and adjust `/zipp-wasm/worker.js` if the app is hosted below
+a URL prefix. A Content Security Policy must allow `'wasm-unsafe-eval'` in
+`script-src` and the Worker URL in `worker-src`. `Engine` also enforces
+instruction, heap, output, source, and WebAssembly-memory ceilings; Worker
+termination supplies the separate wall-clock boundary. The browser build is
+interpreter-only and grants no host capabilities by default. See the
+[`zipp-wasm` guide](crates/zipp-wasm/README.md) before exposing bridges or
+accepting multi-tenant input.
 
 ## Choose the right execution profile
 

@@ -5,6 +5,23 @@ const DOCS_URL = `${GITHUB_URL}/blob/main/DOC.md#embedding`
 const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_21288c1_pgo_2026-08-30.json`
 const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_21288c1_pgo_2026-08-30.json`
 
+const playgroundExample = `const orders = [
+  { id: "A-104", total: 48 },
+  { id: "B-208", total: 73 },
+  { id: "C-512", total: 29 },
+];
+
+const summary = orders
+  .filter((order) => order.total >= 40)
+  .map((order) => order.id + ": $" + order.total)
+  .join(" | ");
+
+console.log("priority orders", summary);
+console.log("total", orders.reduce((sum, order) => sum + order.total, 0));`
+
+const PLAYGROUND_BOOT_TIMEOUT_MS = 15_000
+const PLAYGROUND_RUN_TIMEOUT_MS = 2_500
+
 const installCommands = `git clone https://github.com/f2i-com/zipp.org.git zipp
 cd zipp
 cargo build --release
@@ -141,6 +158,176 @@ function ExternalLink({ className, href, children }: { className?: string; href:
   )
 }
 
+type PlaygroundStatus = 'idle' | 'loading' | 'running' | 'success' | 'error' | 'timeout'
+
+type PlaygroundWorkerMessage =
+  | { type: 'started'; runId: number }
+  | { type: 'result'; runId: number; output: string[]; elapsedMs: number }
+  | { type: 'error'; runId: number; message: string }
+
+function Playground() {
+  const [source, setSource] = useState(playgroundExample)
+  const [output, setOutput] = useState('Run the sample to see console output from Zipp WASM.')
+  const [status, setStatus] = useState<PlaygroundStatus>('idle')
+  const [elapsedMs, setElapsedMs] = useState<number | null>(null)
+  const workerRef = useRef<Worker | null>(null)
+  const timerRef = useRef<number | undefined>(undefined)
+  const runIdRef = useRef(0)
+
+  const stopWorker = () => {
+    window.clearTimeout(timerRef.current)
+    timerRef.current = undefined
+    workerRef.current?.terminate()
+    workerRef.current = null
+  }
+
+  useEffect(() => () => stopWorker(), [])
+
+  const armTimeout = (runId: number, delay: number, phase: 'boot' | 'run') => {
+    window.clearTimeout(timerRef.current)
+    timerRef.current = window.setTimeout(() => {
+      if (runId !== runIdRef.current) return
+      stopWorker()
+      setStatus(phase === 'boot' ? 'error' : 'timeout')
+      setElapsedMs(null)
+      setOutput(phase === 'boot'
+        ? 'Zipp WASM did not finish loading. Check the connection and try again.'
+        : `Execution stopped after ${(PLAYGROUND_RUN_TIMEOUT_MS / 1000).toFixed(1)} seconds. The Worker was discarded.`)
+    }, delay)
+  }
+
+  const runSource = () => {
+    stopWorker()
+    const runId = ++runIdRef.current
+    const worker = new Worker(new URL('./playground.worker.ts', import.meta.url), { type: 'module' })
+    const packageBase = new URL(`${import.meta.env.BASE_URL}wasm/`, document.baseURI)
+
+    workerRef.current = worker
+    setStatus('loading')
+    setElapsedMs(null)
+    setOutput('Loading the browser-safe Zipp runtime…')
+    armTimeout(runId, PLAYGROUND_BOOT_TIMEOUT_MS, 'boot')
+
+    worker.onmessage = (event: MessageEvent<PlaygroundWorkerMessage>) => {
+      const message = event.data
+      if (message.runId !== runIdRef.current) return
+
+      if (message.type === 'started') {
+        setStatus('running')
+        setOutput('Running in an isolated Worker…')
+        armTimeout(runId, PLAYGROUND_RUN_TIMEOUT_MS, 'run')
+        return
+      }
+
+      stopWorker()
+      if (message.type === 'result') {
+        setStatus('success')
+        setElapsedMs(message.elapsedMs)
+        setOutput(message.output.length > 0 ? message.output.join('\n') : '(script completed with no console output)')
+      } else {
+        setStatus('error')
+        setElapsedMs(null)
+        setOutput(message.message)
+      }
+    }
+
+    worker.onerror = (event) => {
+      if (runId !== runIdRef.current) return
+      stopWorker()
+      setStatus('error')
+      setElapsedMs(null)
+      setOutput(event.message || 'The Zipp Worker could not start.')
+    }
+
+    worker.postMessage({
+      type: 'run',
+      runId,
+      source,
+      moduleUrl: new URL('zipp_wasm.js', packageBase).href,
+      wasmUrl: new URL('zipp_wasm_bg.wasm', packageBase).href,
+    })
+  }
+
+  const resetSource = () => {
+    ++runIdRef.current
+    stopWorker()
+    setSource(playgroundExample)
+    setStatus('idle')
+    setElapsedMs(null)
+    setOutput('Run the sample to see console output from Zipp WASM.')
+  }
+
+  const statusLabel = {
+    idle: 'ready',
+    loading: 'loading WASM',
+    running: 'running',
+    success: elapsedMs === null ? 'complete' : `complete · ${elapsedMs.toFixed(1)} ms`,
+    error: 'error',
+    timeout: 'stopped',
+  }[status]
+
+  return (
+    <section className="playground-section section-wrap" id="playground">
+      <div className="playground-heading">
+        <div>
+          <p className="section-kicker">Live browser runtime</p>
+          <h2>Try JavaScript in Zipp.</h2>
+        </div>
+        <p>
+          This editor runs the interpreter-only WASM build in a disposable Worker. It has no
+          ambient network, filesystem, Node, or browser authority, and a hung run is terminated
+          from the responsive page outside the guest runtime.
+        </p>
+      </div>
+
+      <div className="playground-shell">
+        <div className="playground-pane playground-editor-pane">
+          <div className="playground-toolbar">
+            <div>
+              <span className="terminal-dots" aria-hidden="true"><i /><i /><i /></span>
+              <span>playground.js</span>
+            </div>
+            <span className={`playground-status status-${status}`}><i />{statusLabel}</span>
+          </div>
+          <label className="sr-only" htmlFor="playground-source">JavaScript source</label>
+          <textarea
+            id="playground-source"
+            value={source}
+            spellCheck={false}
+            onChange={(event) => setSource(event.target.value)}
+            onKeyDown={(event) => {
+              if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+                event.preventDefault()
+                runSource()
+              }
+            }}
+          />
+          <div className="playground-actions">
+            <button className="button playground-run" type="button" onClick={runSource} disabled={status === 'loading' || status === 'running'}>
+              {status === 'loading' ? 'Loading…' : status === 'running' ? 'Running…' : 'Run with Zipp'}
+              <span aria-hidden="true">Ctrl/⌘ + Enter</span>
+            </button>
+            <button className="playground-reset" type="button" onClick={resetSource}>Reset sample</button>
+          </div>
+        </div>
+
+        <div className="playground-pane playground-output-pane">
+          <div className="playground-toolbar">
+            <div><span className="output-mark" aria-hidden="true">›_</span><span>Console output</span></div>
+            <span>WASM · safe-sandbox</span>
+          </div>
+          <pre aria-live="polite" aria-label="Zipp console output"><code>{output}</code></pre>
+          <div className="playground-boundary">
+            <span><i />50m instruction lifetime cap</span>
+            <span><i />128 MiB VM heap ceiling</span>
+            <span><i />2.5 s host deadline</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
 function App() {
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
   const [menuOpen, setMenuOpen] = useState(false)
@@ -199,6 +386,7 @@ function App() {
         </button>
 
         <nav className={`nav-links ${menuOpen ? 'nav-open' : ''}`} id="primary-navigation" aria-label="Primary navigation">
+          <a href="#playground" onClick={closeMenu}>Playground</a>
           <a href="#use-cases" onClick={closeMenu}>Use cases</a>
           <a href="#controls" onClick={closeMenu}>Controls</a>
           <a href="#benchmarks" onClick={closeMenu}>Benchmarks</a>
@@ -228,7 +416,8 @@ function App() {
             </p>
 
             <div className="hero-actions">
-              <ExternalLink className="button button-primary" href={GITHUB_URL}>Explore on GitHub</ExternalLink>
+              <a className="button button-primary" href="#playground">Try Zipp in browser <span aria-hidden="true">↓</span></a>
+              <ExternalLink className="button button-secondary" href={GITHUB_URL}>Explore on GitHub</ExternalLink>
               <a className="button button-secondary" href="#benchmarks">See the numbers <span aria-hidden="true">↓</span></a>
             </div>
 
@@ -322,6 +511,8 @@ function App() {
             </div>
           </div>
         </section>
+
+        <Playground />
 
         <section className="use-case-section section-wrap" id="use-cases">
           <div className="section-heading split-heading">
