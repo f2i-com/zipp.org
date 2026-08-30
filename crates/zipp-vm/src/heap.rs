@@ -689,6 +689,120 @@ fn obj_pool_sort_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_OBJ_POOL_RUN_SORT=1` restores the full address sort at every
+/// post-major pool flush. By default the sorter first proves the common
+/// recycle shape -- an already-sorted retained prefix followed by one
+/// monotone sweep run -- and joins those runs in linear time. Any uncertainty
+/// falls back to the exact pre-existing full sort. Latched on first use.
+#[cfg(not(feature = "safe-sandbox"))]
+#[inline]
+fn obj_pool_run_sort_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_OBJ_POOL_RUN_SORT").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Address-order one recycle pool while preserving the FULL sort's result.
+///
+/// `split` is the pool length captured immediately before the sweep began.
+/// The prefix must still be sorted from the previous flush; allocations only
+/// pop its tail, and the sweep appends the newly-dead entries as a suffix. The
+/// common suffix is monotone because those entries were themselves handed out
+/// from the sorted tail. We accept only proofs that produce one globally
+/// ascending sequence:
+///
+/// * ascending prefix + ascending suffix with a non-overlapping boundary;
+/// * the same after reversing a descending suffix; or
+/// * two non-overlapping runs in the opposite range order, joined by rotate.
+///
+/// A first-major prefix, stale/unsorted prefix, irregular suffix, overlapping
+/// ranges, or a split invalidated by trimming takes the old full sort. The
+/// bool result is mechanism telemetry only: true means the linear proof won.
+#[cfg(not(feature = "safe-sandbox"))]
+fn sort_recycle_pool_by_address<T, F>(
+    pool: &mut [T],
+    split: usize,
+    prefix_sorted: bool,
+    run_sort_enabled: bool,
+    addr: F,
+) -> bool
+where
+    F: Fn(&T) -> usize + Copy,
+{
+    #[inline]
+    fn full<T, F>(pool: &mut [T], addr: F) -> bool
+    where
+        F: Fn(&T) -> usize + Copy,
+    {
+        pool.sort_unstable_by_key(|item| addr(item));
+        false
+    }
+
+    if !run_sort_enabled || !prefix_sorted || split > pool.len() {
+        return full(pool, addr);
+    }
+
+    // Validate the retained-prefix invariant in release builds too. This is
+    // still O(n), versus the O(n log n) comparison sort it licenses us to
+    // skip, and makes stale bookkeeping a performance miss rather than an
+    // address-order change.
+    if pool[..split]
+        .windows(2)
+        .any(|pair| addr(&pair[0]) > addr(&pair[1]))
+    {
+        return full(pool, addr);
+    }
+
+    let mut rises = false;
+    let mut falls = false;
+    for pair in pool[split..].windows(2) {
+        let left = addr(&pair[0]);
+        let right = addr(&pair[1]);
+        rises |= left < right;
+        falls |= left > right;
+        if rises && falls {
+            return full(pool, addr);
+        }
+    }
+    if falls {
+        pool[split..].reverse();
+    }
+
+    if split == 0 || split == pool.len() {
+        debug_assert!(pool.windows(2).all(|pair| addr(&pair[0]) <= addr(&pair[1])));
+        return true;
+    }
+
+    let prefix_last = addr(&pool[split - 1]);
+    let suffix_first = addr(&pool[split]);
+    if prefix_last <= suffix_first {
+        debug_assert!(pool.windows(2).all(|pair| addr(&pair[0]) <= addr(&pair[1])));
+        return true;
+    }
+
+    // The two individually-sorted runs may be disjoint in the other order.
+    // Rotation joins them without allocation and preserves each run exactly.
+    let suffix_last = addr(pool.last().expect("non-empty suffix"));
+    let prefix_first = addr(&pool[0]);
+    if suffix_last <= prefix_first {
+        pool.rotate_left(split);
+        debug_assert!(pool.windows(2).all(|pair| addr(&pair[0]) <= addr(&pair[1])));
+        return true;
+    }
+
+    // Interleaving address ranges need a real merge; retaining the existing
+    // in-place full sort is smaller and fail-closed for that uncommon shape.
+    full(pool, addr)
+}
+
 /// Largest element-buffer CAPACITY the array pool retains: bounds both the
 /// per-entry memory and the waste when a pop's capacity exceeds the ask.
 #[cfg(not(feature = "safe-sandbox"))]
@@ -4603,6 +4717,19 @@ pub struct Heap {
     /// are what deep retention causes, and no-major workloads keep warmth.
     #[cfg(not(feature = "safe-sandbox"))]
     obj_pool_addr_order: bool,
+    /// Pool lengths immediately before the current sweep starts appending
+    /// deaths. A post-major address sort leaves the whole retained pool
+    /// ascending; intervening allocations pop only its tail, so these lengths
+    /// delimit the still-sorted prefixes from the new sweep runs.
+    #[cfg(not(feature = "safe-sandbox"))]
+    obj_pool_refill_start: usize,
+    #[cfg(not(feature = "safe-sandbox"))]
+    arr_pool_refill_start: usize,
+    /// Whether the captured prefixes came from an earlier address-ordered
+    /// flush. False for the first major; the helper also validates the prefix
+    /// itself, so stale bookkeeping can only force the full-sort fallback.
+    #[cfg(not(feature = "safe-sandbox"))]
+    pool_refill_prefixes_sorted: bool,
     /// True only while a MINOR sweep runs: the recycle arm refills the pool
     /// from young deaths (the literal churn it exists for) and never from a
     /// major's burst — a promotion-heavy workload retires its whole live set
@@ -4614,6 +4741,10 @@ pub struct Heap {
     /// when the heap drops. Plain counters — bumped only under the latch.
     #[cfg(not(feature = "safe-sandbox"))]
     obj_pool_stats: [u64; 3],
+    /// `ZIPP_GCSTATS=1` only: [object run, object full, array run, array full]
+    /// address-sort routes. Updated once per sorted pool, never per object.
+    #[cfg(not(feature = "safe-sandbox"))]
+    obj_pool_sort_stats: [u64; 4],
     /// Free list of reclaimed slot indices (filled by the mark-sweep GC's sweep,
     /// drained by `alloc`). A reused slot is overwritten and its version bumped so
     /// any stale JIT inline-cache entry misses. Empty until the first collection.
@@ -4955,6 +5086,12 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_addr_order: false,
             #[cfg(not(feature = "safe-sandbox"))]
+            obj_pool_refill_start: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
+            arr_pool_refill_start: 0,
+            #[cfg(not(feature = "safe-sandbox"))]
+            pool_refill_prefixes_sorted: false,
+            #[cfg(not(feature = "safe-sandbox"))]
             arr_pool: Vec::new(),
             #[cfg(not(feature = "safe-sandbox"))]
             key_pool: Vec::new(),
@@ -4966,6 +5103,8 @@ impl Heap {
             obj_pool_refill: false,
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_stats: [0; 3],
+            #[cfg(not(feature = "safe-sandbox"))]
+            obj_pool_sort_stats: [0; 4],
             hot_mirror: vec![HotMirror::CLEAR; versions.len()],
             cell_vals_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
             this_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
@@ -5498,6 +5637,16 @@ impl Heap {
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
     pub(crate) fn obj_pool_refill_scope(&mut self, on: bool) {
+        // `major_refill_enabled()` may start a major with `on == false`.
+        // Capture that no-append window too; the matching trailing false call
+        // may harmlessly refresh it because no pool entry was pushed. For an
+        // enabled scope, the true -> false close deliberately preserves the
+        // pre-sweep boundary recorded here.
+        if on || !self.obj_pool_refill {
+            self.obj_pool_refill_start = self.obj_pool.len();
+            self.arr_pool_refill_start = self.arr_pool.len();
+            self.pool_refill_prefixes_sorted = self.obj_pool_addr_order;
+        }
         self.obj_pool_refill = on;
     }
 
@@ -5519,7 +5668,7 @@ impl Heap {
         let mut swept = 0;
         #[cfg(not(feature = "safe-sandbox"))]
         {
-            self.obj_pool_refill = true;
+            self.obj_pool_refill_scope(true);
         }
         for &idx in &log {
             if !marks[idx as usize] {
@@ -5534,7 +5683,7 @@ impl Heap {
         }
         #[cfg(not(feature = "safe-sandbox"))]
         {
-            self.obj_pool_refill = false;
+            self.obj_pool_refill_scope(false);
         }
         log.clear();
         self.young = log;
@@ -6098,6 +6247,11 @@ impl Heap {
         // this same courier batch.
         #[cfg(not(feature = "safe-sandbox"))]
         {
+            let address_sort = self.obj_pool_addr_order && obj_pool_sort_enabled();
+            let run_sort = address_sort && obj_pool_run_sort_enabled();
+            let obj_refill_start = self.obj_pool_refill_start;
+            let arr_refill_start = self.arr_pool_refill_start;
+            let refill_prefix_sorted = self.pool_refill_prefixes_sorted;
             // `len/2` bounds the decay at one halving per note: a major
             // landing right after a minor sees pops≈0 (barely any allocs
             // between their notes), and snapping to the floor there dumps
@@ -6124,9 +6278,17 @@ impl Heap {
             // retires the survivor-fraction refill gate: the +8.7%
             // mutator-side scatter on allocation-survival was that gate's
             // whole reason to exist.
-            if self.obj_pool_addr_order && obj_pool_sort_enabled() {
-                self.obj_pool
-                    .sort_unstable_by_key(|b| &**b as *const ObjMap as usize);
+            if address_sort {
+                let run = sort_recycle_pool_by_address(
+                    &mut self.obj_pool,
+                    obj_refill_start,
+                    refill_prefix_sorted,
+                    run_sort,
+                    |b| (&**b as *const ObjMap) as usize,
+                );
+                if self.oracle {
+                    self.obj_pool_sort_stats[(!run) as usize] += 1;
+                }
             }
             let keep = self
                 .arr_pool_pops
@@ -6156,8 +6318,17 @@ impl Heap {
                     self.courier_stats[4] += bytes as u64;
                 }
             }
-            if self.obj_pool_addr_order && obj_pool_sort_enabled() {
-                self.arr_pool.sort_unstable_by_key(|v| v.as_ptr() as usize);
+            if address_sort {
+                let run = sort_recycle_pool_by_address(
+                    &mut self.arr_pool,
+                    arr_refill_start,
+                    refill_prefix_sorted,
+                    run_sort,
+                    |v| v.as_ptr() as usize,
+                );
+                if self.oracle {
+                    self.obj_pool_sort_stats[2 + (!run) as usize] += 1;
+                }
             }
         }
         if !self.courier_batch.is_empty() {
@@ -6867,6 +7038,61 @@ pub(crate) mod gcoracle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[test]
+    fn recycle_pool_run_sort_joins_only_proven_address_runs() {
+        for (label, mut values, split) in [
+            ("ascending suffix", vec![1usize, 3, 5, 6, 8, 10], 3),
+            ("descending suffix", vec![1, 3, 5, 10, 8, 6], 3),
+            ("suffix before prefix", vec![7, 9, 11, 5, 3, 1], 3),
+            ("empty prefix", vec![9, 7, 5, 3, 1], 0),
+            ("empty suffix", vec![1, 3, 5, 7, 9], 5),
+        ] {
+            assert!(
+                sort_recycle_pool_by_address(&mut values, split, true, true, |v| *v),
+                "{label} should use the linear run proof"
+            );
+            assert!(
+                values.windows(2).all(|pair| pair[0] <= pair[1]),
+                "{label} did not finish in exact ascending order: {values:?}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[test]
+    fn recycle_pool_run_sort_falls_back_on_every_uncertain_shape() {
+        for (label, mut values, split, prefix_sorted, run_enabled) in [
+            (
+                "irregular suffix",
+                vec![1usize, 3, 5, 9, 7, 8],
+                3,
+                true,
+                true,
+            ),
+            ("overlapping runs", vec![1, 5, 9, 3, 7, 11], 3, true, true),
+            ("stale prefix", vec![3, 1, 5, 7], 2, true, true),
+            ("first major", vec![1, 3, 5, 7], 2, false, true),
+            ("trim uncertainty", vec![1, 3, 5], 4, true, true),
+            ("kill switch", vec![1, 3, 5, 9, 7], 3, true, false),
+        ] {
+            assert!(
+                !sort_recycle_pool_by_address(
+                    &mut values,
+                    split,
+                    prefix_sorted,
+                    run_enabled,
+                    |v| *v,
+                ),
+                "{label} unexpectedly bypassed the full sort"
+            );
+            assert!(
+                values.windows(2).all(|pair| pair[0] <= pair[1]),
+                "{label} fallback did not finish in exact ascending order: {values:?}"
+            );
+        }
+    }
 
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[test]
@@ -8167,6 +8393,10 @@ impl Drop for Heap {
             eprintln!(
                 "[objpool] pushed={pushed} popped={popped} trimmed={trimmed} resident={}",
                 self.obj_pool.len()
+            );
+            let [obj_run, obj_full, arr_run, arr_full] = self.obj_pool_sort_stats;
+            eprintln!(
+                "[poolsort] obj_run={obj_run} obj_full={obj_full} arr_run={arr_run} arr_full={arr_full}"
             );
             let [fl, si, sb, gi, gb, mb] = self.courier_stats;
             eprintln!(

@@ -486,6 +486,10 @@ const MODES: &[Mode] = &[
         env: &[("ZIPP_NO_OBJ_POOL_SORT", "1")],
     },
     Mode {
+        name: "noobjpoolrunsort",
+        env: &[("ZIPP_NO_OBJ_POOL_RUN_SORT", "1")],
+    },
+    Mode {
         name: "noobjpoolmajor",
         env: &[("ZIPP_NO_OBJ_POOL_MAJOR", "1")],
     },
