@@ -63,6 +63,44 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B256 LANDED — dense-array pin snapshots stay warm across stores and helper calls
+
+Commit `b1435c7`. PC-profiling the object-lifetime cluster (a `profiling`
+build with the linker map, 30 accumulated `ZIPP_PROF_PC` runs per row,
+`tools/pcmap.py` over the numeric dump files only) showed
+`jit_ta_snapshot` + `dense_array_snap_flags` at 7–8.5% of allocation-survival,
+shapes-stable and shapes-megamorphic: every cross call AND every
+`jit_set_index` / method-IC helper re-derived the region's dense-Array pin
+snapshots through the helper. Two causes, both fixed behind latches:
+
+- `Heap::get_mut` advances `array_snapshot_epoch` on every Array borrow, and
+  `jit_set_index` used it for an in-range element store, so B244's per-call
+  epoch cache never hit inside a loop storing into the array it pins. An
+  in-range store (present element, or a hole-fill below `len` the protector
+  checks already licensed) now writes through `Heap::array_store_in_place`,
+  which leaves base and length — the only facts a snapshot licenses —
+  untouched. `ZIPP_NO_ARRAY_STORE_NOBUMP=1` restores the bump.
+- Twenty-plus post-helper refetch sites in `region_mem.rs` / `inline.rs`
+  called `emit_refetch_ta` unconditionally; they now go through
+  `emit_cross_refetch_ta` (epoch + live-source identity check), the
+  `ta_refetch` tuple carrying the region's epoch-cache offset.
+- `emit_refetch_pinned` re-pins r13/r14 from the `versions_raw` /
+  `ic_table_raw` mirrors (the B250 Tier-C entry loads) instead of two helper
+  calls. `ZIPP_NO_DIRECT_REFETCH_BASES=1` restores the calls.
+
+| DIAGNOSTIC A/B (same binary unless noted, 16 pairs, exact output) | Result |
+|---|---|
+| store no-bump latch: allocation-survival | **−3.7%** [−5.7, −1.7] |
+| store no-bump latch: shapes-stable / shapes-megamorphic | **−2.4%** [−3.2, −2.0] / **−3.2%** [−4.8, −2.0] |
+| cached post-helper refetch, two-binary over the first: shapes-stable / megamorphic / survival | **−4.5%** [−5.3, −3.6] / **−4.1%** [−4.8, −3.2] / −3.1% [−4.2, +0.1] |
+| direct base refetch latch: warm-router / reactish-reconcile | **−3.7%** [−5.3, −2.5] / **−1.5%** [−2.8, −0.7] |
+| all other cluster rows | null |
+
+Method lessons recorded: a build-then-copy chain must gate the copy on the
+`Finished` line (a failed build silently re-measured the previous binary,
+producing plausible "results" for two runs); and `tools/pcmap.py` must be
+fed only the numeric dump files, never the `[profpc]` stderr summaries.
+
 ### B255 LANDED — hostile-path routing and append cursor
 
 Commit `21288c1` brings four independently guarded mechanisms together:
