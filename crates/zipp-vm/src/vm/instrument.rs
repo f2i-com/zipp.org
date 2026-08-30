@@ -272,6 +272,15 @@ const ABORT_CHECK_MASK: u64 = 0xFFF;
 /// this audit catches capacity growth of already-existing collections.
 const HEAP_AUDIT_MASK: u64 = 0xFFFF;
 
+
+/// Host re-entries between forced full heap audits in the postflight. The
+/// interpreter reconciles on a tick stride; a host that re-enters without
+/// running bytecode ticks nothing, so it needs a stride of its own or in-place
+/// capacity growth would go uncounted indefinitely. 256 keeps the amortised
+/// cost near zero while bounding the drift window to a fixed number of calls
+/// rather than to whatever the embedding happens to do.
+const POSTFLIGHT_AUDIT_STRIDE: u32 = 256;
+
 /// Per-VM instrumentation state. Allocated only when a host asks for it.
 pub(crate) struct Recorder {
     /// Instructions the script may still execute, NOT counting any chunk
@@ -318,6 +327,13 @@ pub(crate) struct Recorder {
     /// the opcodes, so the two must agree — never emit a RETURN at depth 0.
     depth: u64,
     ticks: u64,
+    /// Host re-entries since the last full heap audit. The postflight check is
+    /// O(1) and reads a figure that lags in-place capacity growth, so it is
+    /// reconciled on a fixed stride the way the interpreter reconciles on
+    /// `HEAP_AUDIT_MASK` ticks. Without it a workload that only ever crosses
+    /// the host boundary — which is what SoftN does between frames — would
+    /// never reconcile at all.
+    postflight_since_audit: u32,
 }
 
 impl Recorder {
@@ -331,6 +347,7 @@ impl Recorder {
             output_used: 0,
             output_exhausted: false,
             exhaustion: None,
+            postflight_since_audit: 0,
             dynamic_limits: DynamicCodeLimits::UNLIMITED,
             dynamic_calls: 0,
             dynamic_source_bytes: 0,
@@ -790,14 +807,67 @@ impl super::Vm<'_> {
     /// Return the recorder's typed terminal status, first turning a heap
     /// overshoot that happened outside the bytecode loop (for example during a
     /// host-to-guest write) into the same sticky status as an in-loop check.
+    /// Postflight for one host re-entry: the ceiling check every crossing of
+    /// the embedding boundary pays for.
+    ///
+    /// This used to open with an unconditional `audit_heap_bytes()`, which walks
+    /// every slot in `Heap::objs` — including the slots of objects long since
+    /// freed, because the slot table only ever grows. On an embedding that
+    /// re-enters constantly, which is the one this crate exists for, that turned
+    /// a periodic reconciliation into a per-call tax proportional to everything
+    /// the script had ever allocated: measured at 0.8us per round-trip against
+    /// 2,478us once 200k objects were live, and it did not come back down when
+    /// they were freed. The interpreter had it right — it reconciles once per
+    /// `HEAP_AUDIT_MASK` ticks precisely because the walk is expensive.
+    ///
+    /// `Heap::resident_bytes` answers the same question in O(1) from the
+    /// monotonic payload high-water mark. Allocation charges into that mark
+    /// eagerly (see `alloc_settled`), so nothing a script or a host write
+    /// allocates is invisible here. What it lags is capacity growing *inside* an
+    /// object already counted, which is exactly what an audit reconciles — so
+    /// the walk still happens, on a stride, and immediately whenever the cheap
+    /// figure alone is enough to convict.
     pub(crate) fn instrument_resource_limit_error(&mut self) -> Option<&'static str> {
-        let heap_bytes = self.audit_heap_bytes();
+        let ceiling = match self.instr_rec.as_ref() {
+            Some(rec) if rec.exhaustion.is_none() => rec.heap_limit,
+            // No recorder, or already exhausted: nothing compares against a heap
+            // figure, so nothing should be spent computing one.
+            _ => usize::MAX,
+        };
+
+        let heap_bytes = if ceiling == usize::MAX {
+            None
+        } else {
+            let stride = match self.instr_rec.as_mut() {
+                Some(rec) => {
+                    rec.postflight_since_audit = rec.postflight_since_audit.saturating_add(1);
+                    if rec.postflight_since_audit >= POSTFLIGHT_AUDIT_STRIDE {
+                        rec.postflight_since_audit = 0;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            };
+            // Convict on the cheap figure, then confirm with the exact one: the
+            // estimate holds a freed-memory overshoot the audit is what settles,
+            // and killing a VM is not a thing to do on an estimate.
+            if stride || self.heap.resident_bytes() > ceiling {
+                Some(self.audit_heap_bytes())
+            } else {
+                None
+            }
+        };
+
         let rec = self.instr_rec.as_mut()?;
         if rec.exhaustion.is_none() && rec.output_exhausted {
             rec.exhaust(ResourceExhaustion::Output);
         }
-        if rec.exhaustion.is_none() && rec.heap_limit != usize::MAX && heap_bytes > rec.heap_limit {
-            rec.exhaust(ResourceExhaustion::Heap);
+        if let Some(bytes) = heap_bytes {
+            if rec.exhaustion.is_none() && rec.heap_limit != usize::MAX && bytes > rec.heap_limit {
+                rec.exhaust(ResourceExhaustion::Heap);
+            }
         }
         rec.terminal_message()
     }
