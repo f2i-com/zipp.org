@@ -308,6 +308,39 @@ fn ccf_parity_hot_chain_into_heap() {
     );
 }
 
+/// B253's exact hostile shape: B212 freezes `"item " + id`, a pinned colon
+/// bridges that stable head, then the varying revision is the final int memo.
+/// Held generations and effectful final coercions make accidental mutation or
+/// skipped/reordered semantics observable while the loop drives memo hits.
+#[test]
+fn ccf_parity_frozen_head_ascii_suffix() {
+    assert_matches_node(
+        r#"
+        "use strict";
+        function item(id, revision, separator) {
+            return "item " + id + separator + revision;
+        }
+        var held = [], hash = 0;
+        for (var pass = 0; pass < 4200; pass++) {
+            var revision = (pass / 8) | 0;
+            for (var id = 0; id < 28; id++) {
+                var text = item(id, revision, ':');
+                if ((pass & 1023) === 0 && id < 2) held.push(text);
+                hash = (Math.imul(hash, 33) + text.length +
+                        text.charCodeAt(5) + text.charCodeAt(text.length - 1)) | 0;
+            }
+        }
+        console.log(hash, held.length, held.join('|'));
+        console.log(item(-2147483648, 0, ':'), item(2147483647, -1, '/'));
+        var log = [];
+        var effect = { valueOf: function () { log.push('V'); return 9; } };
+        console.log(item(7, effect, ':'), log.join(''));
+        var old = item(7, 3, ':'), next = item(7, 4, ':');
+        console.log(old, next, old === 'item 7:3');
+        "#,
+    );
+}
+
 /// Self-aliasing accumulators (`a += a` shapes, chains whose leaves are the
 /// destination var) and exotic primitive leaves (double/bool/null/undefined)
 /// on a live builder: the single-dispatch fast link must route every one of
@@ -466,6 +499,7 @@ fn all_modes_answer_identically() {
     for (key, val) in [
         ("ZIPP_NO_CONCAT_FUSE", "1"),
         ("ZIPP_NO_CHAIN_FAST", "1"),
+        ("ZIPP_NO_CONCAT_SUFFIX_MEMO", "1"),
         ("ZIPP_NOJIT", "1"),
         ("ZIPP_JIT_THRESHOLD", "1"),
         ("ZIPP_GC_STRESS", "1"),

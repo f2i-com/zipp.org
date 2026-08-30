@@ -2633,6 +2633,7 @@ pub(crate) use coerce::pad2_concat_stats;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use coerce::pad2_concat_stats_enabled;
 pub(crate) use coerce::pad2_conditional_stats;
+pub(crate) use coerce::SMALL_CONCAT_FLAT_UNITS;
 pub(crate) use gc::gc_gen_stats;
 pub(crate) use gc::gc_nursery_stats;
 pub(crate) use gc::gc_stats;
@@ -2641,12 +2642,12 @@ pub(crate) use helpers_misc::call_inline_stats;
 pub(crate) use helpers_misc::computed_call_stats;
 pub(crate) use helpers_misc::concat_set_stats;
 pub(crate) use helpers_misc::cross_decline_stats;
-#[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) use helpers_misc::jit_math_bare_is_intrinsic;
 pub(crate) use helpers_misc::cross_fill_stats;
 pub(crate) use helpers_misc::hasprop_pin_absent_stats;
 pub(crate) use helpers_misc::ic_stats;
 pub(crate) use helpers_misc::iter_region_stats;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use helpers_misc::jit_math_bare_is_intrinsic;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use helpers_misc::jit_shape_set_barrier;
 pub(crate) use proxy_regexp::regexp_call_direct_enabled;

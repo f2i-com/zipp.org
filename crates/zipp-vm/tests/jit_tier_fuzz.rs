@@ -540,6 +540,12 @@ const MODES: &[Mode] = &[
         name: "noconcatmemo",
         env: &[("ZIPP_NO_CONCAT_MEMO", "1")],
     },
+    // B253: the weak frozen-head + pinned-ASCII suffix bridge vs the exact
+    // ordinary pairwise concat fallback.
+    Mode {
+        name: "noconcatsuffixmemo",
+        env: &[("ZIPP_NO_CONCAT_SUFFIX_MEMO", "1")],
+    },
     // B209: `SetHomeObject` elision for super-free literal methods is
     // compile-time; the off-row proves the always-wire fallback answers
     // identically (the generator's literal methods + prototype walks).

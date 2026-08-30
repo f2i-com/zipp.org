@@ -5019,14 +5019,13 @@ pub(crate) fn compile_proto_mem(
                 // Split builtin call: the captured-intrinsic lane first (a
                 // bits-guarded direct helper; misses fall through) — see
                 // `emit_captured_builtin_lane`. Tier C pins no arrays.
-                let lane_done =
-                    captured_builtin_lane(proto, ip, callee, argc, &heap).map(
-                        |(bits, helper, _)| {
-                            emit_captured_builtin_lane(
-                                &mut ops, callee, this_v, arg_base, dst, bits, helper, None,
-                            )
-                        },
-                    );
+                let lane_done = captured_builtin_lane(proto, ip, callee, argc, &heap).map(
+                    |(bits, helper, _)| {
+                        emit_captured_builtin_lane(
+                            &mut ops, callee, this_v, arg_base, dst, bits, helper, None,
+                        )
+                    },
+                );
                 let packed_fip = ((func_id as u64) << 32) | ip as u64;
                 let packed_args =
                     ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
@@ -5249,12 +5248,34 @@ pub(crate) fn compile_proto_mem(
                         a,
                         proto.code.len() - 1,
                     );
+                    let next_leaf = if crate::heap::concat_suffix_memo_enabled() {
+                        super::region_mem::chain_next_leaf(&proto.code, ip, a)
+                    } else {
+                        None
+                    };
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(a)]            // acc bits
                         ; mov r8, [rbx + dreg(b)]             // leaf bits
                         ; mov r9d, hint as i32                // capacity hint
-                        ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                    );
+                    if let Some(next_b) = next_leaf {
+                        let helper_ready = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                            ; mov r10, [rbx + dreg(next_b)]
+                            ; shr r10, 48
+                            ; cmp r10d, INT_TAG_HI as i32
+                            ; jne => helper_ready
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_suffix_fast as usize as i64
+                            ; => helper_ready
+                        );
+                    } else {
+                        dynasm!(ops
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                        );
+                    }
+                    dynasm!(ops
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10

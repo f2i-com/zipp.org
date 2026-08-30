@@ -38,7 +38,7 @@ use std::fmt::Write as _;
 /// the adversarial shape — building many strings up to the threshold one small
 /// piece at a time, which is O(n²) copying and the reason this cannot simply be
 /// raised without bound. Above 512 that term dominates and the curve inverts.
-const SMALL_CONCAT_FLAT_UNITS: usize = 256;
+pub(crate) const SMALL_CONCAT_FLAT_UNITS: usize = 256;
 
 /// Decimal ASCII form of an i32 written into a stack buffer: the digits live
 /// in `buf[start..]` of the returned `(buf, start)`. No allocation — the
@@ -1604,7 +1604,10 @@ impl<'p> Vm<'p> {
     ) -> Result<Value, Thrown> {
         let mutable = a.is_heap()
             && a.heap_index() > crate::heap::INTERN_PINNED_END
-            && matches!(self.heap.get(a.heap_index()), HeapObj::Str(s) if s.is_ascii());
+            // B253 audit: AddRightPair predates B212's frozen bit and was a
+            // third direct mutation licence. Decline before taking the slot;
+            // the unchanged pairwise helper below allocates a fresh result.
+            && matches!(self.heap.get(a.heap_index()), HeapObj::Str(s) if s.is_ascii() && !s.frozen());
         let distinct = b.is_heap()
             && b.heap_index() != a.heap_index()
             && (!c.is_heap() || c.heap_index() != a.heap_index());
@@ -1928,6 +1931,14 @@ impl<'p> Vm<'p> {
             // flat Str, exactly like the interpreter fallback, without coercion.
             return self.str_append_inplace(acc, Value::heap(byte as u32));
         }
+        // The compiler creates StrAppendIndex only by fusing an already
+        // licensed StrAppendInPlace accumulator: its sole pre-loop write is a
+        // string literal and its buffer cannot escape before the loop ends
+        // (`rewrite_{local,string}_accumulators` + `rewrite_append_indexes`).
+        // Therefore a concat-memo result cannot reach this direct push. Keep
+        // NanoID's 4.3M-call preflight byte-for-byte equivalent to B252; the
+        // `push_ascii` debug assertion pins the compiler premise in debug
+        // builds instead of adding a release load/branch to an impossible case.
         if !self.inplace_string_growth_fits(acc.heap_index(), 1, 1) {
             return None;
         }
@@ -4086,6 +4097,32 @@ mod pad2_pinned_mutation_tests {
             assert_eq!(vm.display(native), "07x");
             assert_eq!(vm.display(cached), "07");
         }
+    }
+
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+    #[test]
+    fn memo_frozen_user_strings_decline_pair_mutation() {
+        let mut vm = vm();
+        let seed = vm
+            .heap
+            .alloc(HeapObj::Str(crate::heap::JsStr::new("item ".into())));
+        let head = vm
+            .heap
+            .alloc_concat_str_ascii(seed, b"7")
+            .expect("flat memo head");
+        vm.heap.concat_memo_put(seed, 7, head);
+        let cached = Value::heap(head);
+        assert_eq!(vm.display(cached), "item 7");
+
+        // AddRightPair owns a raw `push_ascii` path. A frozen user slot must
+        // take its unchanged fresh-result fallback, not merely rely on the
+        // pinned-index exclusion covered by the pad2 test above.
+        let paired = vm
+            .add_values_right_pair_inplace(cached, Value::heap(b'/' as u32), Value::int(1))
+            .expect("pairwise fallback");
+        assert_ne!(paired, cached);
+        assert_eq!(vm.display(paired), "item 7/1");
+        assert_eq!(vm.display(cached), "item 7");
     }
 }
 

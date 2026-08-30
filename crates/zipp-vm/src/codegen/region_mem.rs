@@ -3257,21 +3257,20 @@ pub(crate) fn compile_region_mem(
                 // captured-intrinsic lane first — a bits-guarded direct
                 // helper call; every miss is a pure prefix of the generic
                 // path below.
-                let lane_done =
-                    captured_builtin_lane(proto, ip, callee, argc, &heap).map(
-                        |(bits, helper, grows)| {
-                            emit_captured_builtin_lane(
-                                &mut ops,
-                                callee,
-                                this_v,
-                                arg_base,
-                                dst,
-                                bits,
-                                helper,
-                                if grows { ta_refetch } else { None },
-                            )
-                        },
-                    );
+                let lane_done = captured_builtin_lane(proto, ip, callee, argc, &heap).map(
+                    |(bits, helper, grows)| {
+                        emit_captured_builtin_lane(
+                            &mut ops,
+                            callee,
+                            this_v,
+                            arg_base,
+                            dst,
+                            bits,
+                            helper,
+                            if grows { ta_refetch } else { None },
+                        )
+                    },
+                );
                 let packed_fip = ((heap.func_id as u64) << 32) | ip as u64;
                 let packed_args =
                     ((this_v as u64) << 32) | ((callee as u64) << 16) | arg_base as u64;
@@ -3512,12 +3511,34 @@ pub(crate) fn compile_region_mem(
                     // never a redo; SELF_CALL_DEOPT is never returned, the
                     // check is kept for uniformity with the siblings.
                     let hint = chain_capacity_hint(&proto.code, ip, a, e);
+                    let next_leaf = if crate::heap::concat_suffix_memo_enabled() {
+                        chain_next_leaf(&proto.code, ip, a)
+                    } else {
+                        None
+                    };
                     dynasm!(ops
                         ; mov rcx, rdi                        // vm
                         ; mov rdx, [rbx + dreg(a)]            // acc bits
                         ; mov r8, [rbx + dreg(b)]             // leaf bits
                         ; mov r9d, hint as i32                // capacity hint
-                        ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                    );
+                    if let Some(next_b) = next_leaf {
+                        let helper_ready = ops.new_dynamic_label();
+                        dynasm!(ops
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                            ; mov r10, [rbx + dreg(next_b)]
+                            ; shr r10, 48
+                            ; cmp r10d, INT_TAG_HI as i32
+                            ; jne => helper_ready
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_suffix_fast as usize as i64
+                            ; => helper_ready
+                        );
+                    } else {
+                        dynasm!(ops
+                            ; mov rax, QWORD crate::vm::jit_concat_chain_fast as usize as i64
+                        );
+                    }
+                    dynasm!(ops
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64
                         ; cmp rax, r10
@@ -3967,6 +3988,50 @@ pub(crate) fn compile_region_mem(
 /// of the capacity's value range (a capacity is <= 256) and below bit 31, so
 /// `hint as i32` stays positive and r9d zero-extends cleanly.
 pub(crate) const CHAIN_HINT_LAST: u32 = 1 << 30;
+
+/// B253: the chain's FINAL link immediately after this one consumes a tagged
+/// Int at runtime. The emitter derives this from the exact
+/// `StrConcatChain`/`Move` tail and a tag check before calling the helper. This
+/// licenses the suffix memo only when its frozen result feeds B212's terminal
+/// `string + int` memo; otherwise a shared suffix could turn a later in-place
+/// string link into an extra allocation.
+/// Return the adjacent next link's leaf register only when it continues the
+/// same accumulator and is followed by the lowering's exact trailing Move.
+/// Any intervening instruction or later chain link declines the hint; the
+/// emitted runtime Int-tag check remains the authoritative type proof.
+#[inline]
+pub(crate) fn chain_next_leaf(code: &[Instr], ip: usize, acc: u16) -> Option<u16> {
+    match (code.get(ip + 1), code.get(ip + 2)) {
+        (Some(Instr::StrConcatChain { a, b, .. }), Some(Instr::Move { src, .. }))
+            if *a == acc && *src == acc =>
+        {
+            Some(*b)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod concat_suffix_hint_tests {
+    use super::*;
+
+    fn link(b: u16) -> Instr {
+        Instr::StrConcatChain { dst: 0, a: 0, b }
+    }
+
+    #[test]
+    fn suffix_hint_requires_the_adjacent_final_chain_link() {
+        let exact_tail = [link(1), link(2), Instr::Move { dst: 3, src: 0 }];
+        assert_eq!(chain_next_leaf(&exact_tail, 0, 0), Some(2));
+
+        let longer = [link(1), link(2), link(3), Instr::Move { dst: 4, src: 0 }];
+        assert_eq!(chain_next_leaf(&longer, 0, 0), None);
+        assert_eq!(chain_next_leaf(&longer, 1, 0), Some(3));
+
+        let wrong_move = [link(1), link(2), Instr::Move { dst: 3, src: 9 }];
+        assert_eq!(chain_next_leaf(&wrong_move, 0, 0), None);
+    }
+}
 
 /// Byte-capacity hint for `jit_concat_chain_fast` (r9d at each fused link).
 /// A chain's statically-recognised FIRST link — the one whose accumulator's

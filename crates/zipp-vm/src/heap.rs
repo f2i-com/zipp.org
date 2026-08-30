@@ -2571,14 +2571,16 @@ pub struct JsStr {
     units: usize,
     ascii: bool,
     wellformed: bool,
-    /// B212: set on a string the const+int concat memo hands out. Every
-    /// in-place growth licence (the append/chain accumulators' linearity
-    /// proofs) additionally requires `!frozen` — a memoized result is aliased
-    /// by the memo and by every consumer it was served to, so growing its
-    /// buffer in place would corrupt all of them. Frozen strings take the
-    /// fresh-copy fallback those paths already have.
-    frozen: bool,
+    /// Bit zero freezes every concat-memo result against in-place mutation;
+    /// bit one marks only a size-bounded B212 head as eligible for B253's
+    /// one-link suffix memo. Replacing B212's former `bool` with this `u8`
+    /// keeps the exact 40-byte layout and one-byte constructor initialization.
+    memo_state: u8,
 }
+
+const STR_MEMO_FROZEN: u8 = 1;
+#[cfg(not(feature = "safe-sandbox"))]
+const STR_MEMO_SUFFIX_HEAD: u8 = 2;
 
 /// UTF-16 code units contributed by one Unicode scalar: 1 for BMP, 2 for an
 /// astral (supplementary-plane) scalar. This is THE unit/scalar switch — every
@@ -2906,7 +2908,7 @@ impl JsStr {
             units,
             ascii,
             wellformed: true,
-            frozen: false,
+            memo_state: 0,
         }
     }
 
@@ -2926,7 +2928,7 @@ impl JsStr {
             bytes,
             ascii: true,
             wellformed: true,
-            frozen: false,
+            memo_state: 0,
         }
     }
 
@@ -2937,7 +2939,7 @@ impl JsStr {
                 bytes,
                 ascii: true,
                 wellformed: true,
-                frozen: false,
+                memo_state: 0,
             };
         }
         let wellformed = wtf8_is_wellformed(&bytes);
@@ -2964,7 +2966,7 @@ impl JsStr {
             units,
             ascii: false,
             wellformed,
-            frozen: false,
+            memo_state: 0,
         }
     }
 
@@ -3053,20 +3055,36 @@ impl JsStr {
     /// to make both leaves share one capacity growth.
     #[inline]
     pub(crate) fn reserve_bytes(&mut self, additional: usize) {
+        debug_assert!(!self.frozen(), "reserved a frozen concat-memo string");
         self.bytes.reserve(additional);
     }
 
-    /// B212: is this string a memo-served (aliased, never-grow-in-place)
-    /// result? See the field doc.
+    /// Is this a memo-served (aliased, never-grow-in-place) result?
     #[inline]
     pub(crate) fn frozen(&self) -> bool {
-        self.frozen
+        self.memo_state & STR_MEMO_FROZEN != 0
+    }
+
+    /// True only for a size-bounded B212 `const + int` result. B253 may use
+    /// this stable head once; its own frozen results deliberately clear the
+    /// provenance so suffix chaining remains bounded to one link.
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn suffix_memo_head(&self) -> bool {
+        self.memo_state & STR_MEMO_SUFFIX_HEAD != 0
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[inline]
+    fn freeze_for_concat_memo(&mut self, suffix_head: bool) {
+        self.memo_state = STR_MEMO_FROZEN | if suffix_head { STR_MEMO_SUFFIX_HEAD } else { 0 };
     }
 
     /// Append one ASCII byte (the `s += digit` fast path), updating metadata.
     #[inline]
     pub fn push_ascii(&mut self, b: u8) {
         debug_assert!(b < 128);
+        debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
         self.bytes.push(b);
         self.units += 1;
     }
@@ -3083,6 +3101,7 @@ impl JsStr {
     /// kept as the natural `&str` entry of the accessor layer.)
     #[allow(dead_code)]
     pub fn push_str(&mut self, add: &str) {
+        debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
         self.units += str_units(add);
         self.ascii &= add.is_ascii();
         self.bytes.extend_from_slice(add.as_bytes());
@@ -3091,6 +3110,7 @@ impl JsStr {
     /// Append WTF-8 bytes (an exact `+=` of another string's content),
     /// canonicalizing the seam. Unit length stays additive across the merge.
     pub fn push_wtf8(&mut self, add: &[u8]) {
+        debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
         let add_ascii = add.is_ascii();
         self.units += if add_ascii {
             add.len()
@@ -3962,6 +3982,41 @@ struct ConcatMemoEntry {
     res_ver: u32,
 }
 
+/// B253: one weak `frozen-left + pinned-ASCII-suffix` concat memo entry.
+/// The pinned RHS needs no version: slots 0..127 are permanent immutable
+/// single-byte strings. The left and result retain B212's full ABA defence.
+#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+#[derive(Clone, Copy)]
+struct ConcatSuffixMemoEntry {
+    left_idx: u32,
+    left_ver: u32,
+    right_idx: u32,
+    res_idx: u32,
+    res_ver: u32,
+}
+
+/// A B253 suffix result must leave enough of B212's flat window for every
+/// possible following i32. B253 adds exactly one pinned ASCII unit, so the
+/// maximum eligible head is derived from the shared B212 threshold and the
+/// longest i32 spelling rather than duplicating either number. Longer B212
+/// results remain frozen for their own memo but cannot seed the bridge:
+/// freezing the bridge result there would replace the next chain link's
+/// in-place int append with a rope allocation.
+#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+const CONCAT_SUFFIX_MEMO_MAX_LEFT_UNITS: usize =
+    crate::vm::SMALL_CONCAT_FLAT_UNITS - 1 - "-2147483648".len();
+
+#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+impl ConcatSuffixMemoEntry {
+    const EMPTY: ConcatSuffixMemoEntry = ConcatSuffixMemoEntry {
+        left_idx: u32::MAX,
+        left_ver: 0,
+        right_idx: 0,
+        res_idx: 0,
+        res_ver: 0,
+    };
+}
+
 #[cfg(not(feature = "safe-sandbox"))]
 impl ConcatMemoEntry {
     const EMPTY: ConcatMemoEntry = ConcatMemoEntry {
@@ -3978,6 +4033,13 @@ impl ConcatMemoEntry {
 #[inline]
 fn concat_memo_slot(li: u32, n: i32) -> usize {
     ((li ^ (n as u32).wrapping_mul(0x9E37_79B1)) as usize) & (CONCAT_MEMO_SLOTS - 1)
+}
+
+/// B253: direct-map slot for a (frozen left, pinned one-byte RHS) key.
+#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn concat_suffix_memo_slot(li: u32, ri: u32) -> usize {
+    ((li ^ ri.wrapping_mul(0x85EB_CA6B)) as usize) & (CONCAT_SUFFIX_MEMO_SLOTS - 1)
 }
 
 /// B220: caps on the recycled key-buffer pool.
@@ -4040,6 +4102,10 @@ fn settled_alloc_enabled() -> bool {
 #[cfg(not(feature = "safe-sandbox"))]
 const CONCAT_MEMO_SLOTS: usize = 2048;
 
+/// B253: 256 x 20B = 5KB, allocated only after the first eligible miss.
+#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+const CONCAT_SUFFIX_MEMO_SLOTS: usize = 256;
+
 /// B212 latch: `ZIPP_NO_CONCAT_MEMO=1` disables the memo (every lookup
 /// misses, every insert is skipped, no string is ever frozen).
 #[cfg(not(feature = "safe-sandbox"))]
@@ -4055,6 +4121,31 @@ fn concat_memo_enabled() -> bool {
             on
         }
     }
+}
+
+/// B253 pricing switch. This leaves B212's const+int memo enabled so the
+/// same binary isolates only the stable-suffix bridge between two int memos.
+/// The JIT emitters consult it too, so disabling the bridge also removes its
+/// next-leaf tag proof from generated code.
+#[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+pub(crate) fn concat_suffix_memo_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CONCAT_SUFFIX_MEMO").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+#[cfg(all(feature = "safe-sandbox", feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn concat_suffix_memo_enabled() -> bool {
+    false
 }
 
 /// B210: the per-sweep small-payload mass at or above which the NEXT sweep
@@ -4650,6 +4741,12 @@ pub struct Heap {
     /// B212 oracle telemetry: [hits, misses]. Printed at heap drop.
     #[cfg(not(feature = "safe-sandbox"))]
     concat_memo_stats: [u64; 2],
+    /// B253 weak suffix table, allocated only after the first eligible insert.
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+    concat_suffix_memo: Option<Box<[ConcatSuffixMemoEntry; CONCAT_SUFFIX_MEMO_SLOTS]>>,
+    /// B253 oracle telemetry: [hits, misses]. Printed at heap drop.
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+    concat_suffix_memo_stats: [u64; 2],
     /// B210 oracle telemetry: [flushes, shipped items, shipped bytes,
     /// inline-gated items, inline-gated bytes, max batch len]. Bytes are the
     /// same buffer-capacity charges the size gate reads (an `Obj` charges its
@@ -5071,6 +5168,10 @@ impl Heap {
             concat_memo: vec![ConcatMemoEntry::EMPTY; CONCAT_MEMO_SLOTS],
             #[cfg(not(feature = "safe-sandbox"))]
             concat_memo_stats: [0; 2],
+            #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+            concat_suffix_memo: None,
+            #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+            concat_suffix_memo_stats: [0; 2],
             courier_small_mass: 0,
             courier_bulk: false,
             #[cfg(not(feature = "safe-sandbox"))]
@@ -5932,6 +6033,18 @@ impl Heap {
                             .sum::<usize>()
                         + vec_capacity_bytes(&self.arr_pool)
                         + self.concat_memo.len() * std::mem::size_of::<ConcatMemoEntry>()
+                        + {
+                            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                            {
+                                self.concat_suffix_memo
+                                    .as_ref()
+                                    .map_or(0, |memo| std::mem::size_of_val(memo.as_ref()))
+                            }
+                            #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                            {
+                                0
+                            }
+                        }
                         + self.key_pool.iter().map(|k| k.capacity()).sum::<usize>()
                         + vec_capacity_bytes(&self.key_pool)
                 }
@@ -6626,7 +6739,7 @@ impl Heap {
             (&self.objs[left as usize], &self.objs[right as usize])
         {
             if l.wellformed && r.wellformed {
-                debug_assert_eq!(l.units + r.units, units);
+                debug_assert_eq!(l.units() + r.units(), units);
                 let mut bytes = Vec::with_capacity(l.bytes.len() + r.bytes.len());
                 bytes.extend_from_slice(&l.bytes);
                 bytes.extend_from_slice(&r.bytes);
@@ -6636,7 +6749,7 @@ impl Heap {
                     units,
                     ascii,
                     wellformed: true,
-                    frozen: false,
+                    memo_state: 0,
                 }));
             }
         }
@@ -6662,10 +6775,10 @@ impl Heap {
                 bytes.extend_from_slice(tail);
                 JsStr {
                     bytes,
-                    units: l.units + tail.len(),
+                    units: l.units() + tail.len(),
                     ascii: l.ascii,
                     wellformed: l.wellformed,
-                    frozen: false,
+                    memo_state: 0,
                 }
             }
             _ => return None,
@@ -6712,7 +6825,13 @@ impl Heap {
             return;
         }
         match &mut self.objs[res as usize] {
-            HeapObj::Str(js) => js.frozen = true,
+            HeapObj::Str(js) => {
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                let suffix_head = js.units() <= CONCAT_SUFFIX_MEMO_MAX_LEFT_UNITS;
+                #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                let suffix_head = false;
+                js.freeze_for_concat_memo(suffix_head);
+            }
             _ => return,
         }
         self.concat_memo[concat_memo_slot(li, n)] = ConcatMemoEntry {
@@ -6724,11 +6843,110 @@ impl Heap {
         };
     }
 
+    /// B253: serve a weakly memoized `frozen_left + one_ascii_char` result.
+    /// The exact key is checked before either version lookup, so an empty or
+    /// collided direct-map entry cannot make its placeholder result observable.
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub fn concat_suffix_memo_get(&mut self, li: u32, ri: u32) -> Option<u32> {
+        if !concat_suffix_memo_enabled() || ri >= INTERN_EMPTY {
+            return None;
+        }
+        debug_assert!(
+            matches!(self.get(ri), HeapObj::Str(s) if s.as_bytes() == [ri as u8]),
+            "pinned ASCII suffix invariant"
+        );
+        let entry = self
+            .concat_suffix_memo
+            .as_ref()
+            .map(|memo| memo[concat_suffix_memo_slot(li, ri)]);
+        let Some(e) = entry else {
+            if self.oracle {
+                self.concat_suffix_memo_stats[1] += 1;
+            }
+            return None;
+        };
+        if e.left_idx == li
+            && e.right_idx == ri
+            && e.left_ver == self.versions[li as usize]
+            && e.res_ver == self.versions[e.res_idx as usize]
+        {
+            if self.oracle {
+                self.concat_suffix_memo_stats[0] += 1;
+            }
+            return Some(e.res_idx);
+        }
+        if self.oracle {
+            self.concat_suffix_memo_stats[1] += 1;
+        }
+        None
+    }
+
+    /// B253: freeze and publish a freshly-created flat suffix result. The map
+    /// is weak: neither index is traced, and free/reuse invalidates the entry
+    /// through the same two-version ABA discipline as B212. The kill switch
+    /// returns before both freezing and the lazy 5KB allocation.
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub fn concat_suffix_memo_put(&mut self, li: u32, ri: u32, res: u32) {
+        if !concat_suffix_memo_enabled()
+            || ri >= INTERN_EMPTY
+            || res <= INTERN_PINNED_END
+            || res == li
+            || !matches!(
+                self.objs.get(li as usize),
+                Some(HeapObj::Str(s)) if s.frozen() && s.suffix_memo_head()
+            )
+        {
+            return;
+        }
+        debug_assert!(
+            matches!(self.get(ri), HeapObj::Str(s) if s.as_bytes() == [ri as u8]),
+            "pinned ASCII suffix invariant"
+        );
+        match self.objs.get_mut(res as usize) {
+            Some(HeapObj::Str(js)) => {
+                js.freeze_for_concat_memo(false);
+            }
+            _ => return,
+        }
+        let entry = ConcatSuffixMemoEntry {
+            left_idx: li,
+            left_ver: self.versions[li as usize],
+            right_idx: ri,
+            res_idx: res,
+            res_ver: self.versions[res as usize],
+        };
+        let memo = self.concat_suffix_memo.get_or_insert_with(|| {
+            Box::new([ConcatSuffixMemoEntry::EMPTY; CONCAT_SUFFIX_MEMO_SLOTS])
+        });
+        memo[concat_suffix_memo_slot(li, ri)] = entry;
+    }
+
+    /// Return `(frozen, suffix-head)` for a flat string. The native chain
+    /// helper uses both facts from one heap lookup: every memo result refuses
+    /// mutation, while only a B212-origin result may key B253's one-link memo.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub fn str_memo_state(&self, idx: u32) -> (bool, bool) {
+        #[cfg(not(feature = "safe-sandbox"))]
+        {
+            match self.get(idx) {
+                HeapObj::Str(s) => (s.frozen(), s.suffix_memo_head()),
+                _ => (false, false),
+            }
+        }
+        #[cfg(feature = "safe-sandbox")]
+        {
+            let _ = idx;
+            (false, false)
+        }
+    }
+
     /// B212: is the occupant a frozen (memo-served) flat string? The in-place
     /// growth predicates call this; non-strings answer false (their arms
-    /// re-match the kind anyway). (Its one caller today is the JIT chain
-    /// helper — the interpreter's predicate reads the flag inline — hence
-    /// the cfg.)
+    /// re-match the kind anyway). (Its one caller today is the established JIT
+    /// chain helper; B253's specialized sibling reads both memo bits above.)
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub fn str_frozen(&self, idx: u32) -> bool {
@@ -6753,10 +6971,10 @@ impl Heap {
                 bytes.extend_from_slice(&r.bytes);
                 JsStr {
                     bytes,
-                    units: head.len() + r.units,
+                    units: head.len() + r.units(),
                     ascii: r.ascii,
                     wellformed: r.wellformed,
-                    frozen: false,
+                    memo_state: 0,
                 }
             }
             _ => return None,
@@ -7158,10 +7376,135 @@ mod tests {
         );
     }
 
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit", target_arch = "x86_64"))]
+    #[test]
+    fn concat_suffix_memo_is_lazy_exact_weak_and_bounded_to_b212_heads() {
+        let suffix_allocated = |heap: &Heap| heap.concat_suffix_memo.is_some();
+        let mut excluded = Heap::new();
+        let excluded_left = excluded.alloc(HeapObj::Str(JsStr::new("item 0".into())));
+        let HeapObj::Str(left) = excluded.get_mut(excluded_left) else {
+            unreachable!()
+        };
+        left.freeze_for_concat_memo(true);
+        let ordinary = excluded.alloc(HeapObj::Str(JsStr::new("ordinary".into())));
+
+        // Empty/pad2 RHS values are not permanent one-byte ASCII suffixes.
+        excluded.concat_suffix_memo_put(excluded_left, INTERN_EMPTY, ordinary);
+        excluded.concat_suffix_memo_put(excluded_left, INTERN_PAD2_START, ordinary);
+        assert!(!suffix_allocated(&excluded));
+        assert!(!matches!(excluded.get(ordinary), HeapObj::Str(s) if s.frozen()));
+
+        // A rope result is never published or frozen, even for an exact key.
+        let colon = b':' as u32;
+        let rope = excluded.alloc_cons(excluded_left, colon, 7);
+        excluded.concat_suffix_memo_put(excluded_left, colon, rope);
+        assert!(!suffix_allocated(&excluded));
+
+        let mut heap = Heap::new();
+        let seed = heap.alloc(HeapObj::Str(JsStr::new("item ".into())));
+        let head = heap
+            .alloc_concat_str_ascii(seed, b"7")
+            .expect("flat B212 head");
+        heap.concat_memo_put(seed, 7, head);
+        assert_eq!(heap.str_memo_state(head), (true, true));
+        assert!(!suffix_allocated(&heap), "table must stay lazy");
+        assert_eq!(heap.concat_suffix_memo_get(head, colon), None);
+
+        let result = heap.alloc_concat_flat(head, colon, 7);
+        heap.concat_suffix_memo_put(head, colon, result);
+        assert!(suffix_allocated(&heap));
+        assert_eq!(heap.str_memo_state(result), (true, false));
+        assert_eq!(heap.concat_suffix_memo_get(head, colon), Some(result));
+        assert_eq!(heap.concat_suffix_memo_get(head, b'/' as u32), None);
+
+        // Preserve the next link's in-place path at B212's flat/rope
+        // boundary. A 244-unit B212 head may bridge one suffix (245), leaving
+        // room for every i32 decimal (11). A 245-unit head is still frozen by
+        // B212 itself, but cannot acquire suffix provenance or freeze its
+        // 246-unit bridge result.
+        let boundary_seed = heap.alloc(HeapObj::Str(JsStr::new("x".repeat(243))));
+        let boundary_head = heap
+            .alloc_concat_str_ascii(boundary_seed, b"7")
+            .expect("244-unit B212 head");
+        heap.concat_memo_put(boundary_seed, 7, boundary_head);
+        assert_eq!(heap.str_memo_state(boundary_head), (true, true));
+        let boundary_result = heap.alloc_concat_flat(boundary_head, colon, 245);
+        heap.concat_suffix_memo_put(boundary_head, colon, boundary_result);
+        assert_eq!(heap.str_memo_state(boundary_result), (true, false));
+        assert_eq!(
+            heap.concat_suffix_memo_get(boundary_head, colon),
+            Some(boundary_result)
+        );
+
+        let over_seed = heap.alloc(HeapObj::Str(JsStr::new("x".repeat(244))));
+        let over_head = heap
+            .alloc_concat_str_ascii(over_seed, b"7")
+            .expect("245-unit B212 head");
+        heap.concat_memo_put(over_seed, 7, over_head);
+        assert_eq!(heap.str_memo_state(over_head), (true, false));
+        let over_result = heap.alloc_concat_flat(over_head, colon, 246);
+        heap.concat_suffix_memo_put(over_head, colon, over_result);
+        assert_eq!(heap.str_memo_state(over_result), (false, false));
+        assert_eq!(heap.concat_suffix_memo_get(over_head, colon), None);
+
+        // B253 results stay frozen for alias safety but cannot recursively
+        // become suffix heads and widen cold multi-character chains.
+        let transitive = heap.alloc_concat_flat(result, b'/' as u32, 8);
+        heap.concat_suffix_memo_put(result, b'/' as u32, transitive);
+        assert_eq!(heap.str_memo_state(transitive), (false, false));
+        assert_eq!(heap.concat_suffix_memo_get(result, b'/' as u32), None);
+
+        // A direct-map collision must evict, never alias, an exact key. Find
+        // one deterministically from live frozen heads rather than depending
+        // on today's heap prefix length.
+        let original_slot = concat_suffix_memo_slot(head, colon);
+        let (collision_left, collision_right) = (0..=CONCAT_SUFFIX_MEMO_SLOTS)
+            .find_map(|n| {
+                let candidate = heap.alloc(HeapObj::Str(JsStr::new(format!("collision {n}"))));
+                let HeapObj::Str(s) = heap.get_mut(candidate) else {
+                    unreachable!()
+                };
+                s.freeze_for_concat_memo(true);
+                (0..INTERN_EMPTY)
+                    .find(|&ri| concat_suffix_memo_slot(candidate, ri) == original_slot)
+                    .map(|ri| (candidate, ri))
+            })
+            .expect("256 left residues must expose a direct-map collision");
+        let collision_units = heap.str_units(collision_left).unwrap() + 1;
+        let collision_result =
+            heap.alloc_concat_flat(collision_left, collision_right, collision_units);
+        heap.concat_suffix_memo_put(collision_left, collision_right, collision_result);
+        assert_eq!(heap.concat_suffix_memo_get(head, colon), None);
+        assert_eq!(
+            heap.concat_suffix_memo_get(collision_left, collision_right),
+            Some(collision_result)
+        );
+        heap.concat_suffix_memo_put(head, colon, result);
+        assert_eq!(heap.concat_suffix_memo_get(head, colon), Some(result));
+
+        // The table is weak. Death/reuse of the result and then of the left
+        // occupant independently invalidate the same-index cache entry.
+        heap.free_slot(result);
+        assert_eq!(heap.concat_suffix_memo_get(head, colon), None);
+        let replacement = heap.alloc(HeapObj::Str(JsStr::new("replacement".into())));
+        assert_eq!(replacement, result, "test must cover result-slot ABA");
+        assert_eq!(heap.concat_suffix_memo_get(head, colon), None);
+
+        let result2 = heap.alloc_concat_flat(head, colon, 7);
+        heap.concat_suffix_memo_put(head, colon, result2);
+        assert_eq!(heap.concat_suffix_memo_get(head, colon), Some(result2));
+        heap.free_slot(head);
+        assert_eq!(heap.concat_suffix_memo_get(head, colon), None);
+        let left_replacement = heap.alloc(HeapObj::Str(JsStr::new("other head".into())));
+        assert_eq!(left_replacement, head, "test must cover left-slot ABA");
+        assert_eq!(heap.concat_suffix_memo_get(head, colon), None);
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn static_key_plan_keeps_hot_layout_sizes_exact() {
         assert_eq!(std::mem::size_of::<StaticKeyPlan>(), 8);
+        assert_eq!(std::mem::size_of::<JsStr>(), 40);
         assert_eq!(std::mem::size_of::<PropKeys>(), 24);
         assert_eq!(std::mem::size_of::<ValStore>(), 24);
         assert_eq!(std::mem::size_of::<ObjMap>(), 112);
@@ -8404,6 +8747,11 @@ impl Drop for Heap {
             );
             let [h, m] = self.concat_memo_stats;
             eprintln!("[concatmemo] hits={h} misses={m}");
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            {
+                let [sh, sm] = self.concat_suffix_memo_stats;
+                eprintln!("[concatsuffixmemo] hits={sh} misses={sm}");
+            }
             let [ks, km, kr] = self.key_pool_stats;
             eprintln!(
                 "[keypool] served={ks} missed={km} recycled={kr} resident={}",

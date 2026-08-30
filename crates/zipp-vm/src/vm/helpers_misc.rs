@@ -2782,6 +2782,75 @@ pub(crate) extern "win64" fn jit_concat_chain_fast(
     }
 }
 
+/// B253's terminal `frozen B212 head + pinned ASCII suffix` sibling. Emitters
+/// select this helper only after proving the immediately following and final
+/// chain leaf is an Int. The established helper above stays unchanged for the
+/// kill-switch and every non-candidate site, making same-binary ablation price
+/// the complete proof/cache lane rather than shared scaffolding.
+///
+/// A weak hit returns the previously frozen suffix result. A miss delegates to
+/// `jit_concat_chain_fast` for the exact pairwise semantics, then publishes its
+/// fresh flat result when the size-bounded B212 provenance still qualifies.
+///
+/// # Safety
+/// `vm` is a valid `*mut Vm`.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_concat_chain_suffix_fast(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+    cap_hint: u64,
+) -> u64 {
+    #[cfg(test)]
+    chainstats::suffix_attempt();
+
+    #[cfg(feature = "safe-sandbox")]
+    {
+        return jit_concat_chain_fast(vm, a_bits, b_bits, cap_hint);
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    {
+        let a = Value::from_bits(a_bits);
+        let b = Value::from_bits(b_bits);
+        let suffix_key = {
+            // SAFETY: this borrow ends before delegating through the raw VM
+            // pointer to the established helper below.
+            let vm = unsafe { &mut *(vm as *mut Vm) };
+            let key = if a.is_heap()
+                && a.heap_index() > crate::heap::INTERN_PINNED_END
+                && vm.heap.str_memo_state(a.heap_index()).1
+                && b.is_heap()
+                && b.heap_index() < crate::heap::INTERN_EMPTY
+            {
+                Some((a.heap_index(), b.heap_index()))
+            } else {
+                None
+            };
+            if let Some((li, ri)) = key {
+                if let Some(idx) = vm.heap.concat_suffix_memo_get(li, ri) {
+                    debug_assert_ne!(idx, li, "a non-empty suffix cannot alias its left input");
+                    chainstats::suffix_hit();
+                    return Value::heap(idx).bits();
+                }
+            }
+            key
+        };
+
+        let result_bits = jit_concat_chain_fast(vm, a_bits, b_bits, cap_hint);
+        if let Some((li, ri)) = suffix_key {
+            let result = Value::from_bits(result_bits);
+            if result.is_heap() {
+                // SAFETY: the delegated call has returned and no other VM
+                // borrow is live.
+                let vm = unsafe { &mut *(vm as *mut Vm) };
+                vm.heap.concat_suffix_memo_put(li, ri, result.heap_index());
+            }
+        }
+        result_bits
+    }
+}
+
 /// `dst = a + b` for the OSR region's `StrAppendInPlace` op: appends into `a`'s
 /// buffer in place when uniquely owned (see `str_append_inplace`). Deopts
 /// (SELF_CALL_DEOPT) when the appended value needs real ToPrimitive — a user
@@ -3180,10 +3249,11 @@ pub use activationrootstats::dump as tierc_activation_root_stats;
 
 /// `ZIPP_ICSTATS=1` — chain-link fast-helper counters: `fast_int`/`fast_str`
 /// count `StrConcatChain` links served by `jit_concat_chain_fast`'s in-place
-/// arms (one heap lookup, no VM alloc, no take/put dance); `fallback` counts
-/// links that fell to the full pairwise `+`; `reseat`/`trim` count the
-/// capacity-hint buffer moves at a chain's first and last link. Off, one
-/// relaxed atomic load on a path that already made an FFI helper call.
+/// arms (one heap lookup, no VM alloc, no take/put dance); `suffix_hit` counts
+/// frozen-prefix links served by B253's weak memo; `fallback` counts links that
+/// fell to the full pairwise `+`; `reseat`/`trim` count the capacity-hint buffer
+/// moves at a chain's first and last link. Off, one relaxed atomic load on a
+/// path that already made an FFI helper call.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) mod chainstats {
     use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -3191,6 +3261,9 @@ pub(crate) mod chainstats {
     static ON: AtomicU8 = AtomicU8::new(2);
     static FAST_INT: AtomicU64 = AtomicU64::new(0);
     static FAST_STR: AtomicU64 = AtomicU64::new(0);
+    #[cfg(test)]
+    static SUFFIX_ATTEMPT: AtomicU64 = AtomicU64::new(0);
+    static SUFFIX_HIT: AtomicU64 = AtomicU64::new(0);
     static FALLBACK: AtomicU64 = AtomicU64::new(0);
     static RESEAT: AtomicU64 = AtomicU64::new(0);
     static TRIM: AtomicU64 = AtomicU64::new(0);
@@ -3227,6 +3300,25 @@ pub(crate) mod chainstats {
         }
     }
 
+    /// One frozen-prefix + pinned-ASCII link served by B253's weak memo.
+    #[inline]
+    pub(crate) fn suffix_hit() {
+        if enabled() {
+            SUFFIX_HIT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Test-only proof that generated code selected B253's helper. Keeping the
+    /// counter out of production avoids charging the candidate merely to test
+    /// that its kill switch removes the emitted tag proof and helper route.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn suffix_attempt() {
+        if enabled() {
+            SUFFIX_ATTEMPT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// One chain link that fell to the full pairwise `+`.
     #[inline]
     pub(crate) fn fallback() {
@@ -3251,12 +3343,14 @@ pub(crate) mod chainstats {
         }
     }
 
-    /// `(fast_int, fast_str, fallback, reseat, trim)`
+    /// `(fast_int, fast_str, suffix_attempt, suffix_hit, fallback, reseat, trim)`
     #[cfg(test)]
-    pub fn dump() -> (u64, u64, u64, u64, u64) {
+    pub fn dump() -> (u64, u64, u64, u64, u64, u64, u64) {
         (
             FAST_INT.load(Ordering::Relaxed),
             FAST_STR.load(Ordering::Relaxed),
+            SUFFIX_ATTEMPT.load(Ordering::Relaxed),
+            SUFFIX_HIT.load(Ordering::Relaxed),
             FALLBACK.load(Ordering::Relaxed),
             RESEAT.load(Ordering::Relaxed),
             TRIM.load(Ordering::Relaxed),
@@ -6812,6 +6906,23 @@ mod chain_fast_tests {
         console.log(lens);
     "#;
 
+    /// B253's exact emitted shape: the pinned colon link is immediately
+    /// followed by the chain's final runtime Int leaf.
+    const SUFFIX_SRC: &str = r#"
+        "use strict";
+        function item(id, revision) { return "item " + id + ":" + revision; }
+        var hash = 0;
+        for (var pass = 0; pass < 6000; pass++) {
+            var revision = (pass / 8) | 0;
+            for (var id = 0; id < 32; id++) {
+                var text = item(id, revision);
+                hash = (Math.imul(hash, 33) + text.length +
+                        text.charCodeAt(text.length - 1)) | 0;
+            }
+        }
+        console.log(hash);
+    "#;
+
     fn fixture(src: &str) -> (crate::bytecode::Program, ()) {
         let ast = crate::front::parse_script(src).expect("source parses");
         (
@@ -6887,6 +6998,111 @@ mod chain_fast_tests {
         );
         assert_eq!(vm.display(Value::from_bits(r)), "x5");
         assert_eq!(vm.display(interned), "x");
+
+        // B253: a B212-frozen head plus a pinned ASCII suffix allocates and
+        // freezes once, then returns that exact weakly-cached result without
+        // another allocation. Its result stays mutation-frozen but is not a
+        // recursive suffix head (bounded one-link bridge).
+        let memo_seed = vm
+            .heap
+            .alloc(HeapObj::Str(crate::heap::JsStr::new("item ".into())));
+        let memo_head = vm
+            .heap
+            .alloc_concat_str_ascii(memo_seed, b"7")
+            .expect("flat B212 head");
+        vm.heap.concat_memo_put(memo_seed, 7, memo_head);
+        let memo_head = Value::heap(memo_head);
+        let colon = Value::heap(b':' as u32);
+        let first = Value::from_bits(jit_concat_chain_suffix_fast(
+            vm_ptr,
+            memo_head.bits(),
+            colon.bits(),
+            0,
+        ));
+        assert_ne!(first, memo_head);
+        assert_eq!(vm.display(first), "item 7:");
+        assert_eq!(vm.display(memo_head), "item 7");
+        assert_eq!(vm.heap.str_memo_state(first.heap_index()), (true, false));
+        let len_after_first = vm.heap.len();
+        let second = Value::from_bits(jit_concat_chain_suffix_fast(
+            vm_ptr,
+            memo_head.bits(),
+            colon.bits(),
+            0,
+        ));
+        assert_eq!(second, first, "exact suffix key must reuse its result");
+        assert_eq!(vm.heap.len(), len_after_first, "suffix hit allocated");
+
+        let slash = Value::heap(b'/' as u32);
+        // Without the emitted next-Int proof, an otherwise eligible suffix
+        // stays on the fresh mutable path. This preserves markdown-style
+        // chains where another string leaf follows the suffix.
+        let unfrozen = Value::from_bits(jit_concat_chain_fast(
+            vm_ptr,
+            memo_head.bits(),
+            slash.bits(),
+            0,
+        ));
+        let unfrozen_again = Value::from_bits(jit_concat_chain_fast(
+            vm_ptr,
+            memo_head.bits(),
+            slash.bits(),
+            0,
+        ));
+        assert_ne!(unfrozen_again, unfrozen, "unlicensed suffix was memoized");
+        assert_eq!(
+            vm.heap.str_memo_state(unfrozen.heap_index()),
+            (false, false)
+        );
+        let grown = Value::from_bits(jit_concat_chain_fast(
+            vm_ptr,
+            unfrozen.bits(),
+            Value::heap(b'x' as u32).bits(),
+            0,
+        ));
+        assert_eq!(grown, unfrozen, "unlicensed suffix lost in-place growth");
+        assert_eq!(vm.display(grown), "item 7/x");
+
+        // The suffix licence also declines when the B212 head is one unit too
+        // long to leave room for every possible following i32. Otherwise the
+        // 246-unit bridge would be frozen even though `+ i32::MIN` cannot use
+        // B212's 256-unit flat memo and would lose this in-place append.
+        let long_seed = vm
+            .heap
+            .alloc(HeapObj::Str(crate::heap::JsStr::new("x".repeat(244))));
+        let long_head = vm
+            .heap
+            .alloc_concat_str_ascii(long_seed, b"7")
+            .expect("245-unit B212 head");
+        vm.heap.concat_memo_put(long_seed, 7, long_head);
+        assert_eq!(vm.heap.str_memo_state(long_head), (true, false));
+        let long_suffix = Value::from_bits(jit_concat_chain_suffix_fast(
+            vm_ptr,
+            Value::heap(long_head).bits(),
+            colon.bits(),
+            0,
+        ));
+        assert_eq!(
+            vm.heap.str_memo_state(long_suffix.heap_index()),
+            (false, false)
+        );
+        let long_grown = Value::from_bits(jit_concat_chain_fast(
+            vm_ptr,
+            long_suffix.bits(),
+            Value::int(i32::MIN).bits(),
+            0,
+        ));
+        assert_eq!(
+            long_grown, long_suffix,
+            "boundary suffix lost in-place growth"
+        );
+        assert_eq!(vm.heap.str_units(long_grown.heap_index()), Some(257));
+
+        let nonrecursive =
+            Value::from_bits(jit_concat_chain_fast(vm_ptr, first.bits(), slash.bits(), 0));
+        assert_ne!(nonrecursive, first);
+        assert_eq!(vm.display(nonrecursive), "item 7:/");
+        assert_eq!(vm.display(first), "item 7:");
 
         // Rope accumulator: generic path (rope semantics inherited).
         let li = vm
@@ -6995,8 +7211,10 @@ mod chain_fast_tests {
     fn chain_fast_gen_child() {
         let out = crate::run(GEN_SRC).expect("gen source compiles");
         assert!(out.error.is_none(), "gen child error: {:?}", out.error);
-        let (fi, fs, fb, rs, tr) = chainstats::dump();
-        println!("CHAINSTATS fast_int={fi} fast_str={fs} fallback={fb} reseat={rs} trim={tr}");
+        let (fi, fs, sa, sh, fb, rs, tr) = chainstats::dump();
+        println!(
+            "CHAINSTATS fast_int={fi} fast_str={fs} suffix_attempt={sa} suffix_hit={sh} fallback={fb} reseat={rs} trim={tr}"
+        );
     }
 
     /// Engagement census: the compiled chain arms must actually route links
@@ -7063,6 +7281,77 @@ mod chain_fast_tests {
         );
     }
 
+    /// Child half of B253's emitted-lane pin. The parent supplies IC stats and
+    /// optionally the kill switch in a fresh process so both latches are exact.
+    #[test]
+    fn chain_suffix_memo_child() {
+        let out = crate::run(SUFFIX_SRC).expect("suffix source compiles");
+        assert!(out.error.is_none(), "suffix child error: {:?}", out.error);
+        let (fi, fs, sa, sh, fb, rs, tr) = chainstats::dump();
+        println!(
+            "CHAINSTATS fast_int={fi} fast_str={fs} suffix_attempt={sa} suffix_hit={sh} fallback={fb} reseat={rs} trim={tr}"
+        );
+    }
+
+    fn suffix_child_counts(disabled: bool) -> (u64, u64, u64, u64) {
+        let exe = std::env::current_exe().expect("test exe path");
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("chain_suffix_memo_child")
+            .arg("--nocapture")
+            .env("ZIPP_ICSTATS", "1");
+        if disabled {
+            cmd.env("ZIPP_NO_CONCAT_SUFFIX_MEMO", "1");
+        } else {
+            cmd.env_remove("ZIPP_NO_CONCAT_SUFFIX_MEMO");
+        }
+        let out = cmd.output().expect("spawn suffix census child");
+        assert!(
+            out.status.success(),
+            "suffix census child failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find(|line| line.trim_start().starts_with("CHAINSTATS"))
+            .unwrap_or_else(|| panic!("no CHAINSTATS line in:\n{stdout}"));
+        let field = |name: &str| {
+            line.split_whitespace()
+                .find_map(|part| part.strip_prefix(name))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("bad {name} field in: {line}"))
+        };
+        (
+            field("suffix_attempt="),
+            field("suffix_hit="),
+            field("fast_int="),
+            field("fallback="),
+        )
+    }
+
+    #[test]
+    fn chain_suffix_memo_emits_and_switch_removes_it() {
+        let (enabled_attempts, enabled_hits, _, _) = suffix_child_counts(false);
+        let (disabled_attempts, disabled_hits, disabled_fast_int, disabled_fallback) =
+            suffix_child_counts(true);
+        assert!(
+            enabled_attempts > 10_000,
+            "emitted suffix helper barely engaged: suffix_attempt={enabled_attempts}"
+        );
+        assert!(
+            enabled_hits > 10_000,
+            "suffix memo barely hit: suffix_hit={enabled_hits}"
+        );
+        assert!(
+            disabled_fast_int > 10_000 && disabled_fallback > 10_000,
+            "kill-switch child did not engage the legacy chain helper: \
+             fast_int={disabled_fast_int} fallback={disabled_fallback}"
+        );
+        assert_eq!(disabled_attempts, 0, "kill switch left the helper routed");
+        assert_eq!(disabled_hits, 0, "kill switch left suffix hits");
+    }
+
     /// Evidence harness for the real bench row; not part of the suite.
     /// `ZIPP_ICSTATS=1 cargo test --release -p zipp-vm --lib chain_fast_row_counters -- --ignored --nocapture`
     #[test]
@@ -7075,7 +7364,9 @@ mod chain_fast_tests {
         let src = std::fs::read_to_string(path).expect("bench row readable");
         let out = crate::run(&src).expect("row compiles");
         assert!(out.error.is_none(), "row error: {:?}", out.error);
-        let (fi, fs, fb, rs, tr) = chainstats::dump();
-        println!("CHAINSTATS row fast_int={fi} fast_str={fs} fallback={fb} reseat={rs} trim={tr}");
+        let (fi, fs, sa, sh, fb, rs, tr) = chainstats::dump();
+        println!(
+            "CHAINSTATS row fast_int={fi} fast_str={fs} suffix_attempt={sa} suffix_hit={sh} fallback={fb} reseat={rs} trim={tr}"
+        );
     }
 }
