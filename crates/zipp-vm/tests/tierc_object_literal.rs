@@ -129,10 +129,13 @@ fn run_child(filter: &str, marker: &str, env: &[(&str, &str)]) -> std::process::
         .env_remove("ZIPP_NO_TIERC_PLANNED_APPEND_PROBE")
         .env_remove("ZIPP_NO_TIERC_NEW_ARRAY")
         .env_remove("ZIPP_NO_TIERC_LOOSE_NULL_EQ")
+        .env_remove("ZIPP_NO_TIERC_LOOSE_NULL_INLINE")
+        .env_remove("ZIPP_NO_HTMLDDA_SCALAR")
         .env_remove("ZIPP_NO_TIERC_INT_STRING")
         .env_remove("ZIPP_NO_TIERC_COLD_DELETE")
         .env_remove("ZIPP_NOJIT")
-        .env_remove("ZIPP_GC_STRESS");
+        .env_remove("ZIPP_GC_STRESS")
+        .env_remove("ZIPP_ICSTATS");
     for &(key, value) in env {
         cmd.env(key, value);
     }
@@ -210,6 +213,30 @@ fn object_literal_ablation_nojit_and_gc_modes_match() {
                 ("ZIPP_NO_TIERC_LOOSE_NULL_EQ", "1"),
             ][..],
         ),
+        (
+            "loose_null_inline_off",
+            &[
+                ("ZIPP_JIT_THRESHOLD", "1"),
+                ("ZIPP_JITLOG", "1"),
+                ("ZIPP_NO_TIERC_LOOSE_NULL_INLINE", "1"),
+            ][..],
+        ),
+        (
+            "loose_null_set_fallback",
+            &[
+                ("ZIPP_JIT_THRESHOLD", "1"),
+                ("ZIPP_JITLOG", "1"),
+                ("ZIPP_NO_HTMLDDA_SCALAR", "1"),
+            ][..],
+        ),
+        (
+            "loose_null_icstats",
+            &[
+                ("ZIPP_JIT_THRESHOLD", "1"),
+                ("ZIPP_JITLOG", "1"),
+                ("ZIPP_ICSTATS", "1"),
+            ][..],
+        ),
         ("nojit", &[("ZIPP_NOJIT", "1")][..]),
         (
             "hot_gc",
@@ -221,7 +248,14 @@ fn object_literal_ablation_nojit_and_gc_modes_match() {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         let stderr = String::from_utf8_lossy(&out.stderr);
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if mode == "hot" || mode == "planned_probe_off" {
+        if matches!(
+            mode,
+            "hot"
+                | "planned_probe_off"
+                | "loose_null_inline_off"
+                | "loose_null_set_fallback"
+                | "loose_null_icstats"
+        ) {
             assert!(
                 stderr.contains("Tier C"),
                 "{mode} object body did not compile:\n{stderr}"

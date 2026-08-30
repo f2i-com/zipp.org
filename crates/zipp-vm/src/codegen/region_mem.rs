@@ -372,7 +372,7 @@ pub(crate) fn compile_region_mem(
     // `c3_off` is its base.
     let do_cross3 = cross_plan
         .values()
-        .any(|site| site.cross3.is_some() || site.cross3m.is_some());
+        .any(|site| !site.cross3.is_empty() || site.cross3m.is_some());
     let c3_off = 40 + 32 * n_ta as i32;
     let frame = 40
         + 32 * n_ta as i32
@@ -1016,6 +1016,17 @@ pub(crate) fn compile_region_mem(
                     ; mov rax, QWORD heap.typeof_is as i64
                     ; call rax
                     ; mov [rbx + dreg(dst)], rax         // Bool Value bits
+                );
+            }
+            Instr::TypeOfSame { dst, a, b, neg } => {
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(a)]
+                    ; mov r8, [rbx + dreg(b)]
+                    ; mov r9d, neg as i32
+                    ; mov rax, QWORD heap.typeof_same as i64
+                    ; call rax
+                    ; mov [rbx + dreg(dst)], rax
                 );
             }
             Instr::LoadNull { dst } => {
@@ -3042,8 +3053,8 @@ pub(crate) fn compile_region_mem(
                     // falls through to the unchanged helper block below (a
                     // pure prefix). Metered regions keep the helper route so
                     // the interpreter-parity charging stays exact.
-                    if let Some(c3plan) = site.cross3 {
-                        if blocks.is_none() {
+                    if blocks.is_none() {
+                        for c3plan in site.cross3.iter() {
                             emit_cross3_call(
                                 &mut ops,
                                 c3plan,

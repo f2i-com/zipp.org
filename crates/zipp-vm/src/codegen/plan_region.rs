@@ -5169,6 +5169,7 @@ pub(crate) fn instr_uses(i: &Instr) -> Vec<u16> {
         | Instr::ToStr { a, .. }
         | Instr::TypeOf { a, .. }
         | Instr::TypeOfIs { a, .. } => vec![a],
+        Instr::TypeOfSame { a, b, .. } => vec![a, b],
         Instr::JsonParse {
             a, callee, this_v, ..
         } => vec![a, callee, this_v],

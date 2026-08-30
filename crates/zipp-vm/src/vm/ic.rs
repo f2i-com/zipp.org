@@ -1570,10 +1570,10 @@ impl<'p> Vm<'p> {
     /// Read-only profitability witness for a genuinely polymorphic plain-call
     /// site: at least two filled `Callee` ways, every filled way names a
     /// structurally cross-callable plain function, and at least two distinct
-    /// immutable FuncProto ids occur. The first way is returned only as a
-    /// representative for the planner's existing shape checks; generated code
-    /// never trusts it. The generic cross-call helper resolves the LIVE callee
-    /// Value, fid and native entry again on every invocation.
+    /// immutable FuncProto ids occur. Returned witnesses are de-duplicated by
+    /// fid and bounded by this site's filled ways. The planner may use them to
+    /// emit independently guarded CROSS3 arms; the generic cross-call helper
+    /// remains the final live-resolution miss path.
     ///
     /// Requiring every filled way to be `Callee` keeps natives, bound functions,
     /// generators, async functions and other exotic callables out of the
@@ -1581,23 +1581,24 @@ impl<'p> Vm<'p> {
     /// still correct: the live helper declines before effects and the ordinary
     /// call path runs unchanged.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-    pub(crate) fn ic_call_poly_fid(&self, func_id: u32, ip: usize) -> Option<(u64, u32, u32, u32)> {
+    pub(crate) fn ic_call_poly_fids(
+        &self,
+        func_id: u32,
+        ip: usize,
+    ) -> Option<Vec<(u64, u32, u32, u32)>> {
         let site = self.ic_site(func_id, ip)?;
         if site.n < 2 {
             return None;
         }
-        let first = match site.entries[0] {
-            IcEntry::Callee {
+        let mut out: Vec<(u64, u32, u32, u32)> = Vec::with_capacity(site.n as usize);
+        for entry in &site.entries[..site.n as usize] {
+            let IcEntry::Callee {
                 bits,
                 ver,
                 fid,
                 closure,
-            } => (bits, ver, fid, closure),
-            _ => return None,
-        };
-        let mut different_fid = false;
-        for entry in &site.entries[..site.n as usize] {
-            let IcEntry::Callee { fid, .. } = *entry else {
+            } = *entry
+            else {
                 return None;
             };
             let callee = self.func(fid as usize);
@@ -1608,9 +1609,11 @@ impl<'p> Vm<'p> {
             {
                 return None;
             }
-            different_fid |= fid != first.2;
+            if !out.iter().any(|witness| witness.2 == fid) {
+                out.push((bits, ver, fid, closure));
+            }
         }
-        different_fid.then_some(first)
+        (out.len() >= 2).then_some(out)
     }
 
     /// Read-only: the resolved class-method `fid` and exact callable Value for a

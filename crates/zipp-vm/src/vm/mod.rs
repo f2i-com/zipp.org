@@ -2633,6 +2633,15 @@ pub(crate) use coerce::pad2_concat_stats;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use coerce::pad2_concat_stats_enabled;
 pub(crate) use coerce::pad2_conditional_stats;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) use coerce::{
+    jit_str_append_cursor_begin, jit_str_append_cursor_commit, STR_APPEND_CURSOR_ACC_BITS_OFF,
+    STR_APPEND_CURSOR_ACTIVE_OFF, STR_APPEND_CURSOR_FRAME_BYTES,
+    STR_APPEND_CURSOR_OUT_CAPACITY_OFF, STR_APPEND_CURSOR_OUT_LEN_OFF,
+    STR_APPEND_CURSOR_OUT_PTR_OFF, STR_APPEND_CURSOR_SOURCE_BITS_OFF,
+    STR_APPEND_CURSOR_SOURCE_LEN_OFF, STR_APPEND_CURSOR_SOURCE_PTR_OFF,
+    STR_APPEND_CURSOR_SOURCE_VERSION_OFF,
+};
 pub(crate) use coerce::SMALL_CONCAT_FLAT_UNITS;
 pub(crate) use gc::gc_gen_stats;
 pub(crate) use gc::gc_nursery_stats;

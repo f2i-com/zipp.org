@@ -295,6 +295,7 @@ pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
         | Instr::TypeOf { a, .. }
         | Instr::TypeOfIs { a, .. }
         | Instr::BitNot { a, .. } => a == r,
+        Instr::TypeOfSame { a, b, .. } => a == r || b == r,
         Instr::Add { a, b, .. }
         | Instr::Sub { a, b, .. }
         | Instr::Mul { a, b, .. }
@@ -403,6 +404,7 @@ pub(crate) fn accum_touches(i: &Instr, r: Reg) -> bool {
         | Instr::ToStr { dst, .. }
         | Instr::TypeOf { dst, .. }
         | Instr::TypeOfIs { dst, .. }
+        | Instr::TypeOfSame { dst, .. }
         | Instr::BitNot { dst, .. }
         | Instr::Add { dst, .. }
         | Instr::Sub { dst, .. }
@@ -477,6 +479,7 @@ pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
         | Instr::ToStr { dst, .. }
         | Instr::TypeOf { dst, .. }
         | Instr::TypeOfIs { dst, .. }
+        | Instr::TypeOfSame { dst, .. }
         | Instr::BitNot { dst, .. }
         | Instr::Add { dst, .. }
         | Instr::Sub { dst, .. }
@@ -528,7 +531,7 @@ pub(crate) fn accum_writes(i: &Instr, r: Reg) -> bool {
 /// different branch uses as a genuine scratch, so "never read anywhere" is
 /// too blunt — the reuse always re-writes the register first, and this scan
 /// proves exactly that.
-fn write_dst_unobservable(
+pub(crate) fn write_dst_unobservable(
     code: &[Instr],
     targets: &[bool],
     t: Reg,

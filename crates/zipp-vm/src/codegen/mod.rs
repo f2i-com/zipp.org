@@ -399,6 +399,16 @@ pub(crate) fn yield_entry_enabled() -> bool {
     }
 }
 
+env_off_switch!(
+    /// Allow a genuinely different-FuncProto plain-call IC to carry one emitted
+    /// CROSS3 guard arm for each eligible fid it has already observed. The arms
+    /// are bounded by the IC's fixed way count and chain into the incumbent
+    /// generic live-resolution helper on any miss. This is independent of
+    /// `ZIPP_NO_POLY_FID_CROSSCALL`, which removes the whole generic route.
+    /// `ZIPP_NO_CROSS3_POLY_FID=1` restores helper-only routing.
+    fn cross3_poly_fid_enabled() = "ZIPP_NO_CROSS3_POLY_FID"
+);
+
 pub(crate) fn cross_retry_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);
@@ -791,13 +801,61 @@ pub type CrossCallPlan = FxHashMap<usize, CrossCallSitePlan>;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CrossCallSitePlan {
     pub same_proto2: Option<SameProtoCross2Plan>,
-    /// B189b: the fully-emitted native call lane for this site (rotating
-    /// closures of ONE FuncProto). `None` keeps the helper-only route.
-    pub cross3: Option<SameProtoCross3Plan>,
+    /// B189b: the fully-emitted native call lanes for this site. Mono and
+    /// same-proto sites carry one arm; a bounded different-fid site may carry
+    /// one arm per eligible filled IC way. An empty set keeps the helper-only
+    /// route, and every arm miss falls through to the next arm and ultimately
+    /// that unchanged helper.
+    pub cross3: Cross3CallPlan,
     /// B193: the emitted lane for a `CallMethod` site (rotating same-shape
     /// receivers, one method fid). Keyed in the same per-ip map — Call and
     /// CallMethod ips never collide.
     pub cross3m: Option<Cross3MethodPlan>,
+}
+
+/// Fixed-size emitted-call guard chain. Keeping this `Copy` preserves the
+/// plan maps' cheap by-value lookups while making the machine-code expansion
+/// impossible to exceed the call IC's own eight-way bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cross3CallPlan {
+    arms: [Option<SameProtoCross3Plan>; JIT_IC_WAYS],
+    len: u8,
+}
+
+impl Default for Cross3CallPlan {
+    fn default() -> Self {
+        Self {
+            arms: [None; JIT_IC_WAYS],
+            len: 0,
+        }
+    }
+}
+
+impl Cross3CallPlan {
+    pub(crate) fn push(&mut self, arm: SameProtoCross3Plan) -> bool {
+        if self.iter().any(|old| old.fid == arm.fid) {
+            return true;
+        }
+        let len = usize::from(self.len);
+        let Some(slot) = self.arms.get_mut(len) else {
+            return false;
+        };
+        *slot = Some(arm);
+        self.len += 1;
+        true
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub(crate) fn len(self) -> usize {
+        usize::from(self.len)
+    }
+
+    pub(crate) fn iter(self) -> impl Iterator<Item = SameProtoCross3Plan> {
+        self.arms.into_iter().take(usize::from(self.len)).flatten()
+    }
 }
 
 /// B189b: everything the emitted same-proto call lane bakes. All of it is
@@ -1496,6 +1554,7 @@ pub struct HeapHelperAddrs {
     /// the `strict_eq` slow path). Allocates ⇒ post-call refetch when has_prop.
     pub typeof_str: usize,
     pub typeof_is: usize,
+    pub typeof_same: usize,
     pub static_fn: usize,
     pub to_concat_key: usize,
     /// Historical delegated entry (selected by
@@ -1616,6 +1675,7 @@ impl HeapHelperAddrs {
             regs_fits: self.regs_fits,
             typeof_str: self.typeof_str,
             typeof_is: self.typeof_is,
+            typeof_same: self.typeof_same,
             static_fn: self.static_fn,
             to_concat_key: self.to_concat_key,
             set_index_concat: if concat_pure_append {

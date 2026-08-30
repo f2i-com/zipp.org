@@ -6600,6 +6600,21 @@ pub(crate) extern "win64" fn jit_typeof_is(
     Value::bool(m != (code_neg & 0x100 != 0)).bits()
 }
 
+/// Fused `(typeof a) === (typeof b)` classifier. `neg` flips the result for
+/// `!=`/`!==`. Both JavaScript operands were evaluated before this pure helper
+/// is entered, so classifying in either internal order is unobservable.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_typeof_same(
+    vm: *mut core::ffi::c_void,
+    a_bits: u64,
+    b_bits: u64,
+    neg: u32,
+) -> u64 {
+    let vm = unsafe { &*(vm as *const Vm) };
+    let same = vm.type_of(Value::from_bits(a_bits)) == vm.type_of(Value::from_bits(b_bits));
+    Value::bool(same != (neg != 0)).bits()
+}
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) extern "win64" fn jit_typeof(vm: *mut core::ffi::c_void, v_bits: u64) -> u64 {
     let vm = unsafe { &mut *(vm as *mut Vm) };

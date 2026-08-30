@@ -51,6 +51,15 @@ pub(crate) const JIT_GLOBAL_ROUTE_EPOCH_OFFSET: usize =
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_MI_CLASS_EPOCH_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, mi_class_epoch);
+/// Exact `[[IsHTMLDDA]]` singleton mirror used by call-free loose-null
+/// comparisons. The companion byte preserves `ZIPP_NO_HTMLDDA_SCALAR`'s
+/// HashSet/counter ablation by routing heap operands back to the helper when
+/// the scalar lane is disabled.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_HTMLDDA_IDX_OFFSET: usize = core::mem::offset_of!(Vm<'static>, htmldda_idx);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_HTMLDDA_SCALAR_ENABLED_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, htmldda_scalar_enabled);
 
 /// VM-relative bases pinned by Tier-C whole-function entry code. These are
 /// explicit mirrors rather than offsets into `Vec`: Rust does not expose a

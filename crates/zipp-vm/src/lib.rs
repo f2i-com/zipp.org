@@ -1811,6 +1811,74 @@ mod tests {
     }
 
     #[test]
+    fn typeof_same_fusion_semantics() {
+        // Dynamic `typeof` equality fuses to one classifier/comparison opcode.
+        // Pin all four equality polarities in a hot mixed-type loop, then the
+        // observable corners: undeclared identifiers, left-to-right operand
+        // effects, callable/non-callable proxies, and every uncommon typeof
+        // class. Expectations are from node.
+        assert_jit_matches(
+            "var out=[];\
+             (function(){\
+              var f=function(){}; var g=function(){};\
+              var a=[1,1,null,[],f,Symbol('a'),1n,true,undefined,null];\
+              var b=[2,'x',{},null,g,Symbol('b'),2n,false,void 0,f];\
+              var c=0; for(var i=0;i<600000;i++){var x=a[i%10],y=b[i%10];\
+               if(typeof x===typeof y)c+=1; if(typeof x!==typeof y)c+=2;\
+               if(typeof x==typeof y)c+=4; if(typeof x!=typeof y)c+=8;}\
+              out.push(c);})();\
+             (function(){out.push(typeof missingTypeofSame===typeof undefined,\
+                                  typeof missingTypeofSame!==typeof 0);})();\
+             (function(){var order=''; function l(){order+='l';return 1;}\
+              function r(){order+='r';return 'x';}\
+              out.push(typeof l()===typeof r(),order);})();\
+             (function(){var x={}; out.push(typeof x===typeof (x=1));})();\
+             (function(){var pf=new Proxy(function(){},{}), f=function(){};\
+              var po=new Proxy({},{}),o={},a=10n,b=1n,s1=Symbol(),s2=Symbol();\
+              out.push(typeof pf===typeof f,typeof po===typeof o,\
+                       typeof a===typeof b,typeof s1===typeof s2);})();\
+             console.log(out.join('|'))",
+            &["3600000|true|true|false|lr|false|true|true|true|true"],
+        );
+    }
+
+    #[test]
+    fn typeof_same_fusion_bytecode_shape() {
+        let text = compile_to_text(
+            "function same(a,b){ return typeof a === typeof b; } same(1,2);",
+            false,
+        )
+        .expect("source compiles");
+        if std::env::var_os("ZIPP_NO_TYPEOF_SAME").is_none() {
+            assert!(text.contains("TypeOfSame"), "fusion missing:\n{text}");
+        } else {
+            assert!(!text.contains("TypeOfSame"), "switch ignored:\n{text}");
+        }
+
+        let cell_text = compile_to_text(
+            "function sameCell(a,b){ function capture(){return a;} return typeof a === typeof b; } sameCell(1,2);",
+            false,
+        )
+        .expect("cell source compiles");
+        if std::env::var_os("ZIPP_NO_TYPEOF_SAME").is_none() {
+            assert!(
+                cell_text.contains("TypeOfSame"),
+                "LocalCell fusion missing:\n{cell_text}"
+            );
+        }
+
+        let alias_text = compile_to_text(
+            "function alias(){let x={};return typeof x === typeof (x=1);} alias();",
+            false,
+        )
+        .expect("alias source compiles");
+        assert!(
+            !alias_text.contains("TypeOfSame"),
+            "effectful RHS must retain immediate LHS classification:\n{alias_text}"
+        );
+    }
+
+    #[test]
     fn topropkey_regalloc_key_semantics() {
         // `x[i] *= v` emits ToPropKey, which the regalloc (f64) tier now
         // compiles as a register copy — sound ONLY because a numeric key is

@@ -85,6 +85,28 @@ pub(crate) fn tierc_loose_null_eq_enabled() -> bool {
     }
 }
 
+/// Call-free Tier-C implementation of the already-admitted adjacent
+/// `x == null` subset. `ZIPP_NO_TIERC_LOOSE_NULL_INLINE=1` retains admission
+/// but restores the incumbent `jit_loose_null_eq` call for isolated A/B.
+/// `ZIPP_ICSTATS=1` also keeps the helper so its public HTMLDDA mechanism
+/// counters remain complete.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn tierc_loose_null_inline_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TIERC_LOOSE_NULL_INLINE").is_none()
+                && std::env::var_os("ZIPP_ICSTATS").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Independent same-binary ablation for Tier C's primitive tagged-Int
 /// `String(value)` lane.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

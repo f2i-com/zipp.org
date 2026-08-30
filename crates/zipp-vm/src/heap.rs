@@ -3094,6 +3094,65 @@ impl JsStr {
         self.bytes.capacity()
     }
 
+    /// Prepare this proven-linear flat ASCII string for a native append
+    /// cursor. The returned allocation pointer stays valid until another
+    /// operation mutates this string's `Vec`; the cursor planner admits no
+    /// such operation (nor any allocation/call/observation of the builder)
+    /// before its matching commit.
+    ///
+    /// `target_capacity` is advisory. Reserving here, while the `Vec` length
+    /// is still authoritative, makes every later native byte store a simple
+    /// capacity-guarded write into initialized-on-commit spare storage.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn prepare_ascii_append_cursor(
+        &mut self,
+        target_capacity: usize,
+    ) -> Option<(*mut u8, usize, usize)> {
+        if !self.ascii || self.frozen() {
+            return None;
+        }
+        if self.bytes.capacity() < target_capacity {
+            self.bytes
+                .reserve(target_capacity.saturating_sub(self.bytes.len()));
+        }
+        Some((
+            self.bytes.as_mut_ptr(),
+            self.bytes.len(),
+            self.bytes.capacity(),
+        ))
+    }
+
+    /// Publish bytes written by [`Self::prepare_ascii_append_cursor`].
+    ///
+    /// # Safety
+    ///
+    /// Every byte in `old_len..new_len` must have been initialized through
+    /// the returned allocation pointer, that allocation must not have moved,
+    /// and no safe reference may have observed the string while its physical
+    /// bytes were ahead of its logical length. The Tier-C cursor planner and
+    /// shared native epilogue jointly establish those conditions.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) unsafe fn commit_ascii_append_cursor(
+        &mut self,
+        allocation: *mut u8,
+        new_len: usize,
+    ) -> bool {
+        let old_len = self.bytes.len();
+        if !self.ascii
+            || self.frozen()
+            || self.bytes.as_mut_ptr() != allocation
+            || new_len < old_len
+            || new_len > self.bytes.capacity()
+        {
+            return false;
+        }
+        // SAFETY: the caller's contract proves the newly exposed range was
+        // initialized in-bounds through this exact allocation.
+        unsafe { self.bytes.set_len(new_len) };
+        self.units += new_len - old_len;
+        true
+    }
+
     /// Append a well-formed string, updating the cached metadata. No seam
     /// canonicalization is needed: a `&str` can never START with a low
     /// surrogate, so a trailing high surrogate in `self` stays lone.

@@ -1767,6 +1767,87 @@ impl<'p> Vm<'p> {
         out
     }
 
+    /// Build one emitted plain-call arm using the complete incumbent CROSS3
+    /// admission proof. Different-fid sites call this once per distinct IC
+    /// witness so no representative can accidentally license a weaker arm.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn build_cross3_call_arm(
+        &self,
+        caller_fid: u32,
+        call_ip: usize,
+        fid: u32,
+        argc: u16,
+        pending: &mut Vec<u32>,
+        baked: &mut Vec<u32>,
+    ) -> Option<crate::codegen::SameProtoCross3Plan> {
+        if (fid as usize)
+            >= self
+                .main_func_count
+                .checked_add(self.eval_funcs.len())
+                .unwrap_or(usize::MAX)
+        {
+            return None;
+        }
+        let callee = self.func(fid as usize);
+        if callee.is_generator
+            || callee.is_async
+            || callee.rest_reg.is_some()
+            || callee.arguments_reg.is_some()
+            || (crate::codegen::handler_callee_skip_enabled()
+                && crate::codegen::proto_has_handler_ops(callee))
+            || usize::from(callee.param_count) != usize::from(argc)
+            || argc > 6
+            || !(callee.lexical_this || callee.is_strict)
+        {
+            return None;
+        }
+        let Some((_entry, uninit_mask, json_walk, markdown_inline)) = self.jit.cross_entry(fid)
+        else {
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!(
+                    "[cross] fn{caller_fid}@{call_ip} CROSS3 decline: no entry yet for callee fn{fid} (regs={}, params={}, argc={argc})",
+                    callee.reg_count, callee.param_count
+                );
+            }
+            pending.push(fid);
+            return None;
+        };
+        let reg_count = callee.reg_count.max(1);
+        // B228: a wide callee (> 64 registers) always reports the inline mask
+        // as MAX. An exact all-zero wide mask needs no emitted fill, so zero
+        // describes it without constraining the window size.
+        let wide_empty = uninit_mask == u64::MAX
+            && crate::codegen::cross3_wide_enabled()
+            && self.jit.cross_wide_uninit_mask(fid).is_some_and(|m| {
+                m.len() == (reg_count as usize).div_ceil(64) && m.iter().all(|&w| w == 0)
+            });
+        let uninit_mask = if wide_empty { 0 } else { uninit_mask };
+        if json_walk.is_some()
+            || markdown_inline.is_some()
+            || uninit_mask == u64::MAX
+            || (reg_count > 64 && !wide_empty)
+        {
+            if std::env::var_os("ZIPP_JITLOG").is_some() {
+                eprintln!(
+                    "[cross] fn{caller_fid}@{call_ip} CROSS3 decline: plans={} mask_max={} regs={}",
+                    json_walk.is_some() || markdown_inline.is_some(),
+                    uninit_mask == u64::MAX,
+                    reg_count
+                );
+            }
+            return None;
+        }
+        baked.push(fid);
+        Some(crate::codegen::SameProtoCross3Plan {
+            fid,
+            callee_regs: reg_count,
+            argc,
+            arrow_this: callee.lexical_this,
+            mask_gen: self.jit.cross_mask_gen(fid),
+            uninit_mask,
+        })
+    }
+
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn build_cross_call_plan(
         &self,
@@ -1791,27 +1872,30 @@ impl<'p> Vm<'p> {
             // polymorphic extension accepts multiple identities sharing one
             // FuncProto (the rotating-closure shape). The second accepts a
             // fully-filled plain-function set containing different FuncProto
-            // ids and deliberately selects ONLY the generic helper: no callee
-            // identity, fid, executable entry or realm state is baked.
-            let (live, same_proto, poly_fid) = if let Some(live) = self.ic_call_mono(func_id, ip) {
-                (Some(live), false, false)
+            // ids. Its fixed-size witnesses can now seed one independently
+            // guarded CROSS3 arm per eligible fid; the generic helper remains
+            // the final live-resolution miss path.
+            let (live, same_proto, poly_fids) = if let Some(live) = self.ic_call_mono(func_id, ip) {
+                (Some(live), false, None)
             } else {
                 let same = crate::codegen::poly_crosscall_enabled()
                     .then(|| self.ic_call_same_proto(func_id, ip))
                     .flatten();
                 if same.is_some() {
-                    (same, true, false)
+                    (same, true, None)
                 } else {
                     #[cfg(feature = "instrument")]
                     let unmetered = self.instr_rec.is_none();
                     #[cfg(not(feature = "instrument"))]
                     let unmetered = true;
                     let mixed = (unmetered && poly_fid_crosscall_enabled())
-                        .then(|| self.ic_call_poly_fid(func_id, ip))
+                        .then(|| self.ic_call_poly_fids(func_id, ip))
                         .flatten();
-                    (mixed, false, mixed.is_some())
+                    let live = mixed.as_ref().and_then(|ways| ways.first().copied());
+                    (live, false, mixed)
                 }
             };
+            let poly_fid = poly_fids.is_some();
             let Some((_bits, _ver, fid, _closure)) = live else {
                 continue;
             };
@@ -1886,64 +1970,49 @@ impl<'p> Vm<'p> {
             // same-proto site, so a mono exemplar is strictly the easier case.
             // `ZIPP_NO_CROSS3_MONO=1` restores the same-proto-only admission.
             let mono_ok = !same_proto && !poly_fid && crate::codegen::cross3_mono_enabled();
-            let cross3 = ((same_proto || mono_ok)
-                && crate::codegen::cross3_enabled()
-                && cross3_unmetered
-                && usize::from(callee.param_count) == usize::from(argc)
-                && argc <= 6
-                && (callee.lexical_this || callee.is_strict))
-                .then(|| {
-                    let Some((_entry, uninit_mask, json_walk, markdown_inline)) =
-                        self.jit.cross_entry(fid)
-                    else {
-                        if std::env::var_os("ZIPP_JITLOG").is_some() {
-                            eprintln!("[cross] fn{func_id}@{ip} CROSS3 decline: no entry yet for callee fn{fid} (regs={}, params={}, argc={argc})", callee.reg_count, callee.param_count);
-                        }
-                        pending.push(fid);
-                        return None;
-                    };
-                    let reg_count = callee.reg_count.max(1);
-                    // B228: a wide callee (> 64 registers) always reports the
-                    // inline mask as MAX. When the JIT's own wide mask says
-                    // NOTHING may be read before written there is no fill to
-                    // emit, so zero describes it exactly and the register count
-                    // stops mattering (`callee_regs` is only a window size).
-                    let wide_empty = uninit_mask == u64::MAX
-                        && crate::codegen::cross3_wide_enabled()
-                        && self.jit.cross_wide_uninit_mask(fid).is_some_and(|m| {
-                            m.len() == (reg_count as usize).div_ceil(64)
-                                && m.iter().all(|&w| w == 0)
-                        });
-                    let uninit_mask = if wide_empty { 0 } else { uninit_mask };
-                    if json_walk.is_some()
-                        || markdown_inline.is_some()
-                        || uninit_mask == u64::MAX
-                        || (reg_count > 64 && !wide_empty)
-                    {
-                        if std::env::var_os("ZIPP_JITLOG").is_some() {
-                            eprintln!(
-                                "[cross] fn{func_id}@{ip} CROSS3 decline: plans={} mask_max={} regs={}",
-                                json_walk.is_some() || markdown_inline.is_some(),
-                                uninit_mask == u64::MAX,
-                                reg_count
-                            );
-                        }
-                        return None;
+            let mut cross3 = crate::codegen::Cross3CallPlan::default();
+            if (same_proto || mono_ok) && crate::codegen::cross3_enabled() && cross3_unmetered {
+                if let Some(arm) =
+                    self.build_cross3_call_arm(func_id, ip, fid, argc, &mut pending, &mut baked)
+                {
+                    let inserted = cross3.push(arm);
+                    debug_assert!(inserted);
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!("[cross] fn{func_id}@{ip} CROSS3 fn{fid} native-emitted lane");
                     }
-                    baked.push(fid);
-                    Some(crate::codegen::SameProtoCross3Plan {
-                        fid,
-                        callee_regs: reg_count,
+                }
+            }
+            // Different-FuncProto sites retain the generic helper selected
+            // above, but prepend one complete incumbent guard/invoke arm per
+            // eligible distinct fid. Eight filled IC ways is the hard code-size
+            // bound. Each arm is licensed independently by the same admission
+            // routine used for mono/same-proto CROSS3.
+            if poly_fid
+                && crate::codegen::cross3_enabled()
+                && crate::codegen::cross3_poly_fid_enabled()
+                && cross3_unmetered
+            {
+                for &(_bits, _ver, poly_arm_fid, _closure) in
+                    poly_fids.as_deref().unwrap_or_default()
+                {
+                    if let Some(arm) = self.build_cross3_call_arm(
+                        func_id,
+                        ip,
+                        poly_arm_fid,
                         argc,
-                        arrow_this: callee.lexical_this,
-                        mask_gen: self.jit.cross_mask_gen(fid),
-                        uninit_mask,
-
-                    })
-                })
-                .flatten();
-            if cross3.is_some() && std::env::var_os("ZIPP_JITLOG").is_some() {
-                eprintln!("[cross] fn{func_id}@{ip} CROSS3 fn{fid} native-emitted lane");
+                        &mut pending,
+                        &mut baked,
+                    ) {
+                        let inserted = cross3.push(arm);
+                        debug_assert!(inserted, "poly-FID CROSS3 exceeded IC ways");
+                    }
+                }
+                if !cross3.is_empty() && std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!(
+                        "[cross] fn{func_id}@{ip} CROSS3-POLY-FID arms={} native-emitted lane",
+                        cross3.len()
+                    );
+                }
             }
             plan.insert(
                 ip,
@@ -4581,8 +4650,16 @@ fn shift_leaf_regs(i: &Instr, off: u16, const_off: u32) -> Option<Instr> {
         } => Instr::MathOp {
             dst: s(dst),
             op,
-            callee: if callee == crate::bytecode::NO_REG { callee } else { s(callee) },
-            this_v: if callee == crate::bytecode::NO_REG { this_v } else { s(this_v) },
+            callee: if callee == crate::bytecode::NO_REG {
+                callee
+            } else {
+                s(callee)
+            },
+            this_v: if callee == crate::bytecode::NO_REG {
+                this_v
+            } else {
+                s(this_v)
+            },
             arg_base: s(arg_base),
             argc,
         },
@@ -4619,6 +4696,7 @@ fn slot_guard_def(i: &Instr) -> Option<Option<u16>> {
         | Instr::Not { dst, .. }
         | Instr::TypeOf { dst, .. }
         | Instr::TypeOfIs { dst, .. }
+        | Instr::TypeOfSame { dst, .. }
         | Instr::IsArray { dst, .. }
         | Instr::LenOf { dst, .. }
         | Instr::ForInKeys { dst, .. }

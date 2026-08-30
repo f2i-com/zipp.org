@@ -109,6 +109,25 @@ pub(crate) fn fused_cmp_jump_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_TYPEOF_SAME=1` restores the unfused
+/// `TypeOf; TypeOf; Eq/Ne/LooseEq/LooseNe` lowering.  This is a compiler-side
+/// switch so a single binary can attribute the dynamic-`typeof` comparison
+/// fusion without changing any runtime layout.
+#[inline]
+pub(crate) fn typeof_same_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_TYPEOF_SAME").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
 /// Flatten the LEFT-leaning `+` spine: `L1+L2+…+Ln` parses as
 /// `Binary{Add, Binary{Add, …}, Ln}`, so only the LEFT child is walked — a
 /// parenthesized right operand (`a + (b + c)`) is its own subexpression with
@@ -1807,6 +1826,20 @@ impl<'a> FnCompiler<'a> {
         self.expr(arg)
     }
 
+    /// Whether delaying a `typeof` classification until after the other
+    /// operand's evaluation is unobservable. A plain local/cell read cannot
+    /// run user code, and `CellGet` snapshots the contained Value. Keep every
+    /// expression, global/upvalue lookup, and `with`-shadowable name on the
+    /// ordinary two-`TypeOf` lowering: its RHS may run user code or mutate an
+    /// aliased binding before this combined opcode classifies the LHS.
+    fn typeof_same_stable_local(&mut self, arg: &ast::Expr) -> bool {
+        let ast::Expr::Ident(id) = arg else {
+            return false;
+        };
+        self.with_objs_for(id).is_empty()
+            && matches!(self.resolve(id), Binding::Local(_) | Binding::LocalCell(_))
+    }
+
     /// Compile a branch TEST and emit the jump taken when it is FALSY,
     /// returning the jump's ip for `patch_jump`. A test that is a bare
     /// `a < b` / `a <= b` fuses into `JumpIfNotLt`/`JumpIfNotLe`: the fused
@@ -1892,6 +1925,43 @@ impl<'a> FnCompiler<'a> {
         dst: Reg,
     ) -> R<Reg> {
         use ast::BinaryOp as Op;
+        // `typeof a === typeof b` (and every equality polarity) compares two
+        // members of the same fixed eight-name domain. Evaluate both operands
+        // in source order, then classify them in one total opcode. This is
+        // observably identical to materialising the two primitive strings:
+        // equality between strings is exactly equality between their names.
+        if typeof_same_enabled()
+            && matches!(op, Op::StrictEq | Op::StrictNotEq | Op::Eq | Op::NotEq)
+        {
+            if let (
+                ast::Expr::Unary {
+                    op: ast::UnaryOp::Typeof,
+                    arg: left_arg,
+                },
+                ast::Expr::Unary {
+                    op: ast::UnaryOp::Typeof,
+                    arg: right_arg,
+                },
+            ) = (left, right)
+            {
+                // The combined opcode classifies both raw Values after their
+                // evaluation. Only fuse reads for which the intervening RHS
+                // evaluation cannot change the LHS classification. In
+                // particular, `typeof x === typeof (x = 1)` must classify the
+                // old x before performing the assignment.
+                if self.typeof_same_stable_local(left_arg)
+                    && self.typeof_same_stable_local(right_arg)
+                {
+                    let a_dst = self.temp();
+                    let a = self.typeof_operand(left_arg, a_dst)?;
+                    let b_dst = self.temp();
+                    let b = self.typeof_operand(right_arg, b_dst)?;
+                    let neg = matches!(op, Op::StrictNotEq | Op::NotEq);
+                    self.emit(Instr::TypeOfSame { dst, a, b, neg });
+                    return Ok(dst);
+                }
+            }
+        }
         // ── `typeof x === "lit"` → TypeOfIs ── (also `!==`, and the loose
         // forms, which agree with strict when both sides are strings — one side
         // is a string literal and `typeof` always produces a string). The

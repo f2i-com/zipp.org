@@ -715,12 +715,13 @@ pub(crate) fn region_can_compile(
             // are not an i64 or an f64 — so it takes the MEM path, exactly as
             // `LoadBool` does.
             Instr::LoadUndefined { .. } | Instr::LoadNull { .. } => {}
-            // Fused `typeof a === "lit"` — MEM path via the PURE `jit_typeof_is`
+            // Fused `typeof` comparisons — MEM paths via PURE classifier
+            // helpers. They allocate nothing, run no user code and are total.
             // helper (no alloc, no user code, total). The UNFUSED `TypeOf` is
             // still not admitted here: it allocates its result string, and after
             // this fusion the bare form is rare enough not to be worth the
             // refetch plumbing.
-            Instr::TypeOfIs { .. } => {}
+            Instr::TypeOfIs { .. } | Instr::TypeOfSame { .. } => {}
             // `Promise.resolve(x)` / `Number.is*(x)` at exactly one argument —
             // MEM path via `jit_static_fn`. `Promise.resolve` was async-
             // promise-chain's fill-loop's ONLY blocker (`a[j] =
@@ -1404,6 +1405,7 @@ pub(crate) fn hoistable_length(
             | Instr::Ne { .. }
             | Instr::TypeOf { .. }
             | Instr::TypeOfIs { .. }
+            | Instr::TypeOfSame { .. }
             | Instr::IsArray { .. }
             | Instr::StrConcatChain { .. }
             | Instr::StrAppendInPlace { .. }
@@ -1641,6 +1643,7 @@ pub(crate) struct HeapHelpers {
     /// Tier C `TypeOf` helper (v bits → heap-string Value bits).
     pub(crate) typeof_str: usize,
     pub(crate) typeof_is: usize,
+    pub(crate) typeof_same: usize,
     pub(crate) static_fn: usize,
     pub(crate) to_concat_key: usize,
     /// Selected historical or pure-success helper entry.

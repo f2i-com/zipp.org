@@ -11,6 +11,8 @@ const CHILD_ENV: &str = "ZIPP_POLY_FID_CROSS_CHILD";
 const METER_CHILD_ENV: &str = "ZIPP_POLY_FID_CROSS_METER_CHILD";
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const MARKER: &str = "POLY-FID generic live-resolution";
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const EMITTED_MARKER: &str = "CROSS3-POLY-FID arms=2 native-emitted lane";
 const EXPECTED: &str = "7010000:104950:1007:9:150000:42:1:poly";
 
 // `dispatch` exercises an arrow closure plus strict and sloppy ordinary
@@ -76,6 +78,7 @@ fn run_child(env: &[(&str, &str)]) -> Output {
         .env(CHILD_ENV, "1")
         .env("ZIPP_JITLOG", "1")
         .env_remove("ZIPP_NO_POLY_FID_CROSSCALL")
+        .env_remove("ZIPP_NO_CROSS3_POLY_FID")
         .env_remove("ZIPP_NO_POLY_CROSSCALL")
         .env_remove("ZIPP_NO_CROSSCALL")
         .env_remove("ZIPP_NOJIT")
@@ -112,6 +115,23 @@ fn different_fids_use_generic_live_cross_call_and_switch_restores_old_plan() {
             enabled.contains(MARKER),
             "different-fid site did not select the generic cross-call prefix:\n{enabled}"
         );
+        assert!(
+            enabled.contains(EMITTED_MARKER),
+            "eligible different-fid arms were not emitted:\n{enabled}"
+        );
+
+        let helper_only = assert_child(
+            "helper-only",
+            &run_child(&[("ZIPP_NO_CROSS3_POLY_FID", "1")]),
+        );
+        assert!(
+            helper_only.contains(MARKER),
+            "emitted-lane switch incorrectly removed generic poly-fid routing:\n{helper_only}"
+        );
+        assert!(
+            !helper_only.contains(EMITTED_MARKER),
+            "emitted-lane switch still planted poly-fid CROSS3 arms:\n{helper_only}"
+        );
 
         let disabled = assert_child(
             "disabled",
@@ -121,6 +141,10 @@ fn different_fids_use_generic_live_cross_call_and_switch_restores_old_plan() {
             !disabled.contains(MARKER),
             "off switch still selected the different-fid prefix:\n{disabled}"
         );
+        assert!(
+            !disabled.contains(EMITTED_MARKER),
+            "generic-route switch still planted different-fid CROSS3 arms:\n{disabled}"
+        );
 
         // Collection at every allocation/safe point exercises the helper's
         // retained `maybe_gc()` transition and explicit native closure roots.
@@ -128,6 +152,10 @@ fn different_fids_use_generic_live_cross_call_and_switch_restores_old_plan() {
         assert!(
             stress.contains(MARKER),
             "GC-stress run did not reach the planned route:\n{stress}"
+        );
+        assert!(
+            stress.contains(EMITTED_MARKER),
+            "GC-stress run did not build the guarded different-fid arms:\n{stress}"
         );
     }
 

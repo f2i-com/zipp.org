@@ -117,6 +117,7 @@ const CASES: &[Case] = &[
     // ── unary value ops ──
     c("TypeOf", "undefined", "typeof x"),
     c("TypeOfIs", "undefined", "(typeof x === \"undefined\")"),
+    c("TypeOfSame", "undefined", "(typeof x === typeof i)"),
     c("ToNum", "undefined", "(+x)"),
     c("BitNot", "5", "(~x)"),
     c("Not", "5", "(!x)"),

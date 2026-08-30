@@ -5,6 +5,268 @@
 #![allow(unused_imports)]
 use super::*;
 
+/// Mark explicit returns whose bytecode lies in a structured `PushFinally`
+/// protected interval. The compiler lays each protected body out strictly
+/// between its push and the forward handler target; the target itself runs
+/// after that handler has been popped. Nested intervals naturally raise the
+/// depth above one.
+///
+/// This is deliberately a compile-time map: unprotected returns retain their
+/// byte-identical `NO_BAIL` epilogue, while a protected return can hand its
+/// exact instruction back to the interpreter to perform completion routing.
+/// The difference sweep is linear even for hostile deeply-nested source.
+fn tierc_protected_return_map(code: &[Instr]) -> Vec<bool> {
+    let mut depth_delta = vec![0i32; code.len() + 1];
+    for (push_ip, instr) in code.iter().enumerate() {
+        let Instr::PushFinally { target, .. } = *instr else {
+            continue;
+        };
+        let start = push_ip + 1;
+        let end = (target as usize).min(code.len());
+        if start < end {
+            depth_delta[start] += 1;
+            depth_delta[end] -= 1;
+        }
+    }
+
+    let mut depth = 0i32;
+    let mut protected = vec![false; code.len()];
+    for (ip, instr) in code.iter().enumerate() {
+        depth += depth_delta[ip];
+        debug_assert!(depth >= 0, "unbalanced structured finally intervals");
+        protected[ip] = depth != 0
+            && matches!(instr, Instr::Return { .. } | Instr::ReturnUndefined);
+    }
+    protected
+}
+
+env_off_switch!(
+    /// Defer flat-ASCII builder metadata across a compiler-proved call-free
+    /// Tier-C loop. `ZIPP_NO_STR_APPEND_CURSOR=1` restores one
+    /// `jit_str_append_index_ascii` boundary crossing per appended character.
+    fn str_append_cursor_enabled() = "ZIPP_NO_STR_APPEND_CURSOR"
+);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TiercStrAppendCursorPlan {
+    append_ip: usize,
+    acc: u16,
+    obj: u16,
+    key: u16,
+}
+
+/// A cursor may carry the mutable builder only in its canonical accumulator
+/// register. The local-accumulator lowering already proves its in-loop
+/// statement-result copies dead, but cursor lifetime extends through the
+/// function epilogue, where post-loop bytecode is otherwise unrestricted.
+/// Re-run the compiler's whole-function dominating-write proof for every
+/// non-self copy so no copied builder bits can reach a later read, including a
+/// truthiness helper, another Move, a store, or Return.
+fn tierc_str_append_cursor_moves_safe(code: &[Instr], header: usize, acc: u16) -> bool {
+    let mut targets = vec![false; code.len()];
+    for instr in code {
+        if let Some(target) = bytecode_control_target(instr).map(|target| target as usize) {
+            if target < targets.len() {
+                targets[target] = true;
+            }
+        }
+    }
+    for (ip, instr) in code.iter().enumerate().skip(header) {
+        if let Instr::Move { dst, src } = *instr {
+            if src == acc
+                && dst != acc
+                && !crate::compile::write_dst_unobservable(code, &targets, dst, ip, None)
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Once a cursor is active, native control may not leave the audited
+/// `header..code.len()` span except through Return/fallthrough and the shared
+/// epilogue. The selected unconditional loop back-edge is the sole permitted
+/// backward edge; in particular a backward conditional must not jump into
+/// unaudited bytecode while raw bytes are still unpublished.
+fn tierc_str_append_cursor_flow_closed(code: &[Instr], header: usize, backedge: usize) -> bool {
+    for (ip, instr) in code.iter().enumerate().skip(header) {
+        let Some(target) = bytecode_control_target(instr).map(|target| target as usize) else {
+            continue;
+        };
+        if target < header || target > code.len() {
+            return false;
+        }
+        if target < ip
+            && !(ip == backedge && target == header && matches!(instr, Instr::Jump { .. }))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Admit one deferred ASCII append cursor only when the bytecode and the
+/// already-selected Tier-C reductions prove its whole live span contains no
+/// allocation, helper/user call, or observation of the builder's contents.
+///
+/// The sole nontrivial allowance is a B205 random-scale head: its covered
+/// `Math.random()*k|0` source window contains a CallMethod in bytecode, but the
+/// emitter replaces that entire window with guarded xorshift arithmetic. Any
+/// guard miss exits through the shared epilogue before interpreter replay.
+fn tierc_str_append_cursor_plan(
+    proto: &FuncProto,
+    random_fuse: &FxHashMap<usize, crate::codegen::RandomScaleFusePlan>,
+    random_fuse_covered: &[bool],
+    meter: Option<crate::codegen::meter::Meter>,
+) -> Option<TiercStrAppendCursorPlan> {
+    if !str_append_cursor_enabled() || meter.is_some() || proto.code.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    for (ip, instr) in proto.code.iter().enumerate() {
+        if let Instr::StrAppendIndex {
+            dst, a, obj, key, ..
+        } = *instr
+        {
+            if found.is_some() || dst != a || obj == a || key == a {
+                return None;
+            }
+            found = Some(TiercStrAppendCursorPlan {
+                append_ip: ip,
+                acc: a,
+                obj,
+                key,
+            });
+        }
+    }
+    let plan = found?;
+
+    // The append must be inside one explicit back-edge. Starting the proof at
+    // that header covers every later iteration after the cursor becomes live;
+    // extending it to function end covers all loop exits before Return.
+    let (header, backedge) = proto
+        .code
+        .iter()
+        .enumerate()
+        .skip(plan.append_ip + 1)
+        .find_map(|(ip, instr)| match *instr {
+            Instr::Jump { target }
+                if (target as usize) <= plan.append_ip && plan.append_ip <= ip =>
+            {
+                Some((target as usize, ip))
+            }
+            _ => None,
+        })?;
+
+    if !tierc_str_append_cursor_flow_closed(&proto.code, header, backedge)
+        || !tierc_str_append_cursor_moves_safe(&proto.code, header, plan.acc)
+    {
+        return None;
+    }
+
+    for ip in header..proto.code.len() {
+        if random_fuse_covered.get(ip).copied().unwrap_or(false) {
+            continue;
+        }
+        if random_fuse.contains_key(&ip)
+            && random_fuse_covered.get(ip + 1).copied().unwrap_or(false)
+        {
+            continue;
+        }
+        let instr = &proto.code[ip];
+
+        // `Move` only transports Value bits. The independent whole-function
+        // check above proves every non-self accumulator copy is overwritten
+        // before any read, so no copied builder alias can reach these uses.
+        if instr_uses(instr).contains(&plan.acc)
+            && !matches!(
+                instr,
+                Instr::StrAppendIndex { .. }
+                    | Instr::Move { .. }
+                    | Instr::Return { .. }
+            )
+        {
+            return None;
+        }
+        let allowed_acc_write = matches!(instr, Instr::StrAppendIndex { .. })
+            || matches!(instr, Instr::Move { dst, src } if dst == src);
+        if writes_reg(instr) == Some(plan.acc) && !allowed_acc_write {
+            return None;
+        }
+
+        // Closed call-free emission set. Every runtime type mismatch in these
+        // arms jumps directly to the epilogue; none calls a helper before it.
+        let pure = matches!(
+            instr,
+            Instr::LoadInt { .. }
+                | Instr::LoadBool { .. }
+                | Instr::LoadNull { .. }
+                | Instr::LoadUndefined { .. }
+                | Instr::LoadConst { .. }
+                | Instr::LoadGlobal { .. }
+                | Instr::Move { .. }
+                | Instr::AddInt { .. }
+                | Instr::Mul { .. }
+                | Instr::Bitwise { .. }
+                | Instr::Gt { .. }
+                | Instr::Jump { .. }
+                | Instr::JumpIfFalse { .. }
+                | Instr::StrAppendIndex { .. }
+                | Instr::Return { .. }
+                | Instr::ReturnUndefined
+        ) || matches!(instr, Instr::UpvalGet { .. }) && tierc_upval_inline_enabled();
+        if !pure {
+            return None;
+        }
+
+    }
+    Some(plan)
+}
+
+#[cfg(test)]
+mod str_append_cursor_proof_tests {
+    use super::*;
+
+    #[test]
+    fn copied_accumulator_must_be_overwritten_before_any_read() {
+        let observable = vec![
+            Instr::Move { dst: 3, src: 2 },
+            Instr::JumpIfFalse { cond: 3, target: 3 },
+            Instr::Return { src: 2 },
+            Instr::Return { src: 2 },
+        ];
+        assert!(!tierc_str_append_cursor_moves_safe(&observable, 0, 2));
+
+        let overwritten = vec![
+            Instr::Move { dst: 3, src: 2 },
+            Instr::LoadInt { dst: 3, val: 1 },
+            Instr::JumpIfFalse { cond: 3, target: 3 },
+            Instr::Return { src: 2 },
+        ];
+        assert!(tierc_str_append_cursor_moves_safe(&overwritten, 0, 2));
+    }
+
+    #[test]
+    fn conditional_backedge_cannot_escape_the_audited_span() {
+        let closed = vec![
+            Instr::LoadInt { dst: 1, val: 1 },
+            Instr::JumpIfFalse { cond: 1, target: 3 },
+            Instr::Jump { target: 0 },
+            Instr::Return { src: 1 },
+        ];
+        assert!(tierc_str_append_cursor_flow_closed(&closed, 0, 2));
+
+        let escaping = vec![
+            Instr::LoadInt { dst: 1, val: 1 },
+            Instr::JumpIfFalse { cond: 1, target: 0 },
+            Instr::Jump { target: 1 },
+            Instr::Return { src: 1 },
+        ];
+        assert!(!tierc_str_append_cursor_flow_closed(&escaping, 1, 2));
+    }
+}
+
 /// Admit numeric remainder into Tier C.  The emitted prefix handles only
 /// integer-valued Number operands; zero divisors, fractional values, BigInts,
 /// and observable ToNumeric coercions decline before doing any work and resume
@@ -796,6 +1058,7 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
             | Instr::Ne { .. }
             | Instr::TypeOf { .. }
             | Instr::TypeOfIs { .. }
+            | Instr::TypeOfSame { .. }
             | Instr::IsArray { .. }
             | Instr::LenOf { .. }
             | Instr::ForInKeys { .. }
@@ -1262,6 +1525,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
             | Instr::Not { dst, a }
             | Instr::TypeOf { dst, a }
             | Instr::TypeOfIs { dst, a, .. } => (u1(a), Some(dst)),
+            Instr::TypeOfSame { dst, a, b, .. } => (u2(a, b), Some(dst)),
             Instr::IsArray {
                 dst,
                 a,
@@ -2399,6 +2663,7 @@ pub(crate) fn compile_proto_mem(
     }
     let mut ops = dynasmrt::x64::Assembler::new().ok()?;
     let n = proto.code.len();
+    let protected_returns = tierc_protected_return_map(&proto.code);
     let method_own_slot_direct = meter.is_none() && tierc_method_own_slot_direct_enabled();
     if method_own_slot_direct && std::env::var_os("ZIPP_JITLOG").is_some() {
         let sites = proto
@@ -2542,6 +2807,20 @@ pub(crate) fn compile_proto_mem(
             }
         }
     }
+    let str_append_cursor = tierc_str_append_cursor_plan(
+        proto,
+        random_fuse,
+        &random_fuse_covered,
+        meter,
+    );
+    if let Some(plan) = str_append_cursor {
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            eprintln!(
+                "[jit] fn{func_id} Tier-C str-append-cursor ip={} acc=r{} source=r{} key=r{}",
+                plan.append_ip, plan.acc, plan.obj, plan.key
+            );
+        }
+    }
     let n_global_xorshift_chains = global_xorshift.iter().flatten().count();
     let n_global_xorshift_steps: usize = global_xorshift
         .iter()
@@ -2574,15 +2853,36 @@ pub(crate) fn compile_proto_mem(
     // activation 24B @ c3, window base|flags @ c3+24, result @ c3+32, bail
     // slot @ c3+40); + a 16B leaf-headroom-flag slot when inlining (48 and 16
     // both keep the frame's 16-alignment after the 6 pushes).
-    let do_cross3 = meter.is_none() && cross_plan.values().any(|site| site.cross3.is_some());
-    let c3_off: i32 = 40;
+    let do_cross3 = meter.is_none() && cross_plan.values().any(|site| !site.cross3.is_empty());
+    let cursor_off: i32 = 40;
+    let c3_off: i32 = cursor_off
+        + if str_append_cursor.is_some() {
+            crate::vm::STR_APPEND_CURSOR_FRAME_BYTES
+        } else {
+            0
+        };
     let frame: i32 = 40
+        + if str_append_cursor.is_some() {
+            crate::vm::STR_APPEND_CURSOR_FRAME_BYTES
+        } else {
+            0
+        }
         + if do_cross3 { 64 } else { 0 }
         + if do_leaf || method_needs_headroom {
             16
         } else {
             0
         };
+    let cursor_active_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACTIVE_OFF;
+    let cursor_acc_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACC_BITS_OFF;
+    let cursor_source_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_BITS_OFF;
+    let cursor_source_version_off =
+        cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_VERSION_OFF;
+    let cursor_source_ptr_off = cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_PTR_OFF;
+    let cursor_source_len_off = cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_LEN_OFF;
+    let cursor_out_ptr_off = cursor_off + crate::vm::STR_APPEND_CURSOR_OUT_PTR_OFF;
+    let cursor_out_len_off = cursor_off + crate::vm::STR_APPEND_CURSOR_OUT_LEN_OFF;
+    let cursor_out_capacity_off = cursor_off + crate::vm::STR_APPEND_CURSOR_OUT_CAPACITY_OFF;
     // Byte offset of the headroom flag (1 = the carved window fits → inline; 0 =
     // fall back to the per-call helper). MUST equal the prologue store offset.
     let leaf_flag_off = frame - 8;
@@ -2681,6 +2981,23 @@ pub(crate) fn compile_proto_mem(
         ; mov rsi, rdx                    // bail_ip out-pointer
         ; mov rdi, r8                     // vm
     );
+    if str_append_cursor.is_some() {
+        dynasm!(ops
+            // `jit_str_append_cursor_begin` forms `&mut StrAppendCursor`
+            // before replacing it with `empty()`. Initialize every field to a
+            // valid value first; zeroing only `active` would leave the typed
+            // reference containing uninitialized integers/pointers (UB).
+            ; mov QWORD [rsp + cursor_active_off], 0
+            ; mov QWORD [rsp + cursor_acc_bits_off], 0
+            ; mov QWORD [rsp + cursor_source_bits_off], 0
+            ; mov QWORD [rsp + cursor_source_version_off], 0
+            ; mov QWORD [rsp + cursor_source_ptr_off], 0
+            ; mov QWORD [rsp + cursor_source_len_off], 0
+            ; mov QWORD [rsp + cursor_out_ptr_off], 0
+            ; mov QWORD [rsp + cursor_out_len_off], 0
+            ; mov QWORD [rsp + cursor_out_capacity_off], 0
+        );
+    }
     if needs_globals {
         if direct_entry_bases {
             dynasm!(ops
@@ -3552,21 +3869,92 @@ pub(crate) fn compile_proto_mem(
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::LooseEq { dst, a, b } => {
-                // Admission restricts this to the compiler's adjacent nullish
-                // comparison.  The helper still checks live values and handles
-                // [[IsHTMLDDA]] exactly; a non-nullish edge is a pure bail.
                 let helper = crate::vm::jit_loose_null_eq as usize;
-                dynasm!(ops
-                    ; mov rcx, rdi
-                    ; mov rdx, [rbx + dreg(a)]
-                    ; mov r8, [rbx + dreg(b)]
-                    ; mov rax, QWORD helper as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov [rbx + dreg(dst)], rax
-                );
+                if crate::vm::tierc_loose_null_inline_enabled() {
+                    use crate::vm::host_api::{
+                        JIT_HTMLDDA_IDX_OFFSET, JIT_HTMLDDA_SCALAR_ENABLED_OFFSET,
+                    };
+                    let a_nullish = ops.new_dynamic_label();
+                    let b_nullish = ops.new_dynamic_label();
+                    let check_other = ops.new_dynamic_label();
+                    let equal = ops.new_dynamic_label();
+                    let not_equal = ops.new_dynamic_label();
+                    let heap_slow = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    // Admission restricts this to an adjacent `x == null`, but
+                    // recheck both live operands so an unusual internal entry
+                    // still declines exactly like the helper. Once one is
+                    // proven nullish, the other is equal iff it is nullish or
+                    // the singleton [[IsHTMLDDA]] exotic. The scalar-disabled
+                    // heap edge preserves the HashSet/counter ablation through
+                    // the incumbent helper; all ordinary values are call-free.
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(a)]
+                        ; mov r10, [rbx + dreg(b)]
+                        ; mov r11, QWORD Value::NULL.bits() as i64
+                        ; cmp rax, r11
+                        ; je => a_nullish
+                        ; mov r11, QWORD Value::UNDEFINED.bits() as i64
+                        ; cmp rax, r11
+                        ; je => a_nullish
+                        ; mov r11, QWORD Value::NULL.bits() as i64
+                        ; cmp r10, r11
+                        ; je => b_nullish
+                        ; mov r11, QWORD Value::UNDEFINED.bits() as i64
+                        ; cmp r10, r11
+                        ; je => b_nullish
+                        ; jmp => bail
+                        ; => a_nullish
+                        ; mov rax, r10
+                        ; jmp => check_other
+                        ; => b_nullish
+                        // rax already holds the other operand.
+                        ; => check_other
+                        ; mov r11, QWORD Value::NULL.bits() as i64
+                        ; cmp rax, r11
+                        ; je => equal
+                        ; mov r11, QWORD Value::UNDEFINED.bits() as i64
+                        ; cmp rax, r11
+                        ; je => equal
+                        ; mov r10, rax
+                        ; shr r10, 48
+                        ; cmp r10d, TAG_HEAP_HI as i32
+                        ; jne => not_equal
+                        ; cmp BYTE [rdi + JIT_HTMLDDA_SCALAR_ENABLED_OFFSET as i32], 0
+                        ; je => heap_slow
+                        ; cmp eax, DWORD [rdi + JIT_HTMLDDA_IDX_OFFSET as i32]
+                        ; je => equal
+                        ; => not_equal
+                        ; mov rax, QWORD Value::FALSE.bits() as i64
+                        ; jmp => done
+                        ; => equal
+                        ; mov rax, QWORD Value::TRUE.bits() as i64
+                        ; jmp => done
+                        ; => heap_slow
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(a)]
+                        ; mov r8, [rbx + dreg(b)]
+                        ; mov rax, QWORD helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; => done
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                } else {
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(a)]
+                        ; mov r8, [rbx + dreg(b)]
+                        ; mov rax, QWORD helper as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::DeleteProp { .. } => {
@@ -4274,6 +4662,17 @@ pub(crate) fn compile_proto_mem(
                     ; mov [rbx + dreg(dst)], rax          // Bool Value bits
                 );
             }
+            Instr::TypeOfSame { dst, a, b, neg } => {
+                dynasm!(ops
+                    ; mov rcx, rdi
+                    ; mov rdx, [rbx + dreg(a)]
+                    ; mov r8, [rbx + dreg(b)]
+                    ; mov r9d, neg as i32
+                    ; mov rax, QWORD heap.typeof_same as i64
+                    ; call rax
+                    ; mov [rbx + dreg(dst)], rax
+                );
+            }
             Instr::IsArray {
                 dst,
                 a,
@@ -4806,8 +5205,8 @@ pub(crate) fn compile_proto_mem(
                     // pure prefix). Whole-fn callers run under a frame-free
                     // activation when cross-called themselves; the enter
                     // helper's root-stack duplication handles exactly that.
-                    if let Some(c3plan) = site.cross3 {
-                        if do_cross3 {
+                    if do_cross3 {
+                        for c3plan in site.cross3.iter() {
                             emit_cross3_call(
                                 &mut ops,
                                 c3plan,
@@ -5071,27 +5470,111 @@ pub(crate) fn compile_proto_mem(
             Instr::StrAppendIndex {
                 dst, a, obj, key, ..
             } => {
-                // Pure ASCII prefix; the deopt sentinel means no mutation and
-                // re-executes the fused opcode's exact generic fallback.
-                dynasm!(ops
-                    ; mov rcx, rdi
-                    ; mov rdx, [rbx + dreg(a)]
-                    ; mov r8, [rbx + dreg(obj)]
-                    ; mov r9, [rbx + dreg(key)]
-                    ; mov rax, QWORD heap.str_append_index as i64
-                    ; call rax
-                    ; mov r10, QWORD SELF_CALL_DEOPT as i64
-                    ; cmp rax, r10
-                    ; je => bail
-                    ; mov [rbx + dreg(dst)], rax
-                );
-                // The first append may replace an interned seed with a freshly
-                // allocated mutable builder; preserve the usual post-allocation
-                // versions/IC pin invariant before continuing the native loop.
-                if let Some((vb, icb)) = refetch {
-                    emit_refetch_pinned(&mut ops, vb, Some(icb));
+                if str_append_cursor.is_some_and(|plan| plan.append_ip == ip) {
+                    let begin = ops.new_dynamic_label();
+                    let cursor_miss = ops.new_dynamic_label();
+                    let done = ops.new_dynamic_label();
+                    dynasm!(ops
+                        // Once active, every field in the stack record is
+                        // authoritative until the shared epilogue commits it.
+                        ; cmp QWORD [rsp + cursor_active_off], 0
+                        ; je => begin
+                        // Builder identity: a surprising internal overwrite
+                        // commits prior bytes, then replays this append.
+                        ; mov rax, [rbx + dreg(a)]
+                        ; cmp rax, [rsp + cursor_acc_bits_off]
+                        ; jne => cursor_miss
+                        // Immutable flat-ASCII source identity plus slot
+                        // generation defeats heap-index reuse (ABA).
+                        ; mov rax, [rbx + dreg(obj)]
+                        ; cmp rax, [rsp + cursor_source_bits_off]
+                        ; jne => cursor_miss
+                        ; mov ecx, eax
+                        ; mov r11, [rdi + crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32]
+                        ; mov rdx, [rsp + cursor_source_version_off]
+                        ; cmp DWORD [r11 + rcx * 4], edx
+                        ; jne => cursor_miss
+                        // The exact tagged-Int/in-range index proof the old
+                        // helper repeated on every character.
+                        ; mov rax, [rbx + dreg(key)]
+                        ; mov rcx, rax
+                        ; shr rcx, 48
+                        ; cmp ecx, INT_TAG_HI as i32
+                        ; jne => cursor_miss
+                        ; test eax, eax
+                        ; js => cursor_miss
+                        ; mov ecx, eax
+                        ; cmp rcx, [rsp + cursor_source_len_off]
+                        ; jae => cursor_miss
+                        ; mov r11, [rsp + cursor_source_ptr_off]
+                        ; movzx r10d, BYTE [r11 + rcx]
+                        // Never call Vec::push with deferred metadata: write
+                        // one initialized byte only after the explicit spare-
+                        // capacity guard, then advance the private cursor.
+                        ; mov rax, [rsp + cursor_out_len_off]
+                        ; cmp rax, [rsp + cursor_out_capacity_off]
+                        ; jae => cursor_miss
+                        ; mov r11, [rsp + cursor_out_ptr_off]
+                        ; mov BYTE [r11 + rax], r10b
+                        ; inc rax
+                        ; mov [rsp + cursor_out_len_off], rax
+                        ; mov rax, [rsp + cursor_acc_bits_off]
+                        ; mov [rbx + dreg(dst)], rax
+                        ; jmp => done
+                        // First character: the helper performs the ordinary
+                        // exact append, reserves, and publishes cursor fields.
+                        ; => begin
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(a)]
+                        ; mov r8, [rbx + dreg(obj)]
+                        ; mov r9, [rbx + dreg(key)]
+                        ; lea r10, [rsp + cursor_off]
+                        ; mov [rsp + 32], r10
+                        ; mov rax, QWORD crate::vm::jit_str_append_cursor_begin as usize as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    // Begin may allocate the first builder. Preserve every
+                    // existing Tier-C versions/IC pin obligation.
+                    if let Some((vb, icb)) = refetch {
+                        emit_refetch_pinned(&mut ops, vb, Some(icb));
+                    }
+                    dynasm!(ops
+                        ; jmp => done
+                        // Previous direct bytes are committed by epilogue;
+                        // interpreter replay starts at this untouched append.
+                        ; => cursor_miss
+                        ; mov DWORD [rsi], ip as i32
+                        ; jmp => epilogue
+                        ; => done
+                    );
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
+                } else {
+                    // Pure ASCII prefix; the deopt sentinel means no mutation
+                    // and re-executes the fused opcode's exact generic fallback.
+                    dynasm!(ops
+                        ; mov rcx, rdi
+                        ; mov rdx, [rbx + dreg(a)]
+                        ; mov r8, [rbx + dreg(obj)]
+                        ; mov r9, [rbx + dreg(key)]
+                        ; mov rax, QWORD heap.str_append_index as i64
+                        ; call rax
+                        ; mov r10, QWORD SELF_CALL_DEOPT as i64
+                        ; cmp rax, r10
+                        ; je => bail
+                        ; mov [rbx + dreg(dst)], rax
+                    );
+                    // The first append may replace an interned seed with a
+                    // freshly allocated mutable builder; preserve the usual
+                    // post-allocation versions/IC pin invariant.
+                    if let Some((vb, icb)) = refetch {
+                        emit_refetch_pinned(&mut ops, vb, Some(icb));
+                    }
+                    emit_region_bail(&mut ops, ip, bail, epilogue);
                 }
-                emit_region_bail(&mut ops, ip, bail, epilogue);
             }
             Instr::AddRightPair {
                 dst,
@@ -5331,20 +5814,37 @@ pub(crate) fn compile_proto_mem(
                 }
             }
             Instr::Return { src } => {
-                // Whole-function return: NO_BAIL + result Value (UNLIKE the region,
-                // which records the ip and lets the interpreter perform the return).
-                dynasm!(ops
-                    ; mov DWORD [rsi], NO_BAIL as i32
-                    ; mov rax, [rbx + dreg(src)]
-                    ; jmp => epilogue
-                );
+                if protected_returns[ip] {
+                    // A return completion must traverse every still-active
+                    // for-of/user finally. Resume on the untouched Return so
+                    // `route_through_finally` deposits and propagates it.
+                    dynasm!(ops
+                        ; mov DWORD [rsi], ip as i32
+                        ; jmp => epilogue
+                    );
+                } else {
+                    // Whole-function return: NO_BAIL + result Value (UNLIKE the region,
+                    // which records the ip and lets the interpreter perform the return).
+                    dynasm!(ops
+                        ; mov DWORD [rsi], NO_BAIL as i32
+                        ; mov rax, [rbx + dreg(src)]
+                        ; jmp => epilogue
+                    );
+                }
             }
             Instr::ReturnUndefined => {
-                dynasm!(ops
-                    ; mov DWORD [rsi], NO_BAIL as i32
-                    ; mov rax, QWORD Value::UNDEFINED.bits() as i64
-                    ; jmp => epilogue
-                );
+                if protected_returns[ip] {
+                    dynasm!(ops
+                        ; mov DWORD [rsi], ip as i32
+                        ; jmp => epilogue
+                    );
+                } else {
+                    dynasm!(ops
+                        ; mov DWORD [rsi], NO_BAIL as i32
+                        ; mov rax, QWORD Value::UNDEFINED.bits() as i64
+                        ; jmp => epilogue
+                    );
+                }
             }
             // Proper-tail-call prefix to the Call+Return the compiler emits
             // right after it. Emitting nothing would be value-sound, but it
@@ -5392,8 +5892,19 @@ pub(crate) fn compile_proto_mem(
 
     // ── epilogue ── restore and return; rax = result (or garbage on bail), [rsi]
     // = NO_BAIL or the resume ip. Mirrors `compile_region_mem`'s 6-pop epilogue.
+    dynasm!(ops ; => epilogue);
+    if str_append_cursor.is_some() {
+        dynasm!(ops
+            // Preserve a clean whole-function result across the commit call;
+            // on a bail rax is ignored, but the same sequence covers both.
+            ; mov rcx, rdi
+            ; lea rdx, [rsp + cursor_off]
+            ; mov r8, rax
+            ; mov r11, QWORD crate::vm::jit_str_append_cursor_commit as usize as i64
+            ; call r11
+        );
+    }
     dynasm!(ops
-        ; => epilogue
         ; add rsp, frame
         ; pop r14
         ; pop r13

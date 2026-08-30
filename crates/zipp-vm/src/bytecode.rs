@@ -126,6 +126,18 @@ pub enum Instr {
         code: u8,
         neg: bool,
     },
+    /// `dst = (typeof a) === (typeof b)` (`neg` flips it). Both operands have
+    /// already been evaluated left-to-right, and the lowering must additionally
+    /// prove that delaying the LHS classification across the RHS evaluation is
+    /// unobservable (currently only stable local/cell identifier reads). This
+    /// compares the classifier's fixed names directly instead of materialising
+    /// two interned string Values and dispatching a separate equality opcode.
+    TypeOfSame {
+        dst: Reg,
+        a: Reg,
+        b: Reg,
+        neg: bool,
+    },
     LoadGlobalOrUndefined {
         dst: Reg,
         idx: u32,

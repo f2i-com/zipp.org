@@ -16,6 +16,34 @@ const COPY_SOURCE: &str = r#"
     }
 "#;
 
+const CURSOR_SOURCE: &str = r#"
+    "use strict";
+    let randomState = 0x9e3779b9;
+    Math.random = function seededRandom() {
+        randomState ^= randomState << 13;
+        randomState ^= randomState >>> 17;
+        randomState ^= randomState << 5;
+        return (randomState >>> 0) / 4294967296;
+    };
+    const alphabet = "useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict";
+    function makeId(size) {
+        let id = "";
+        let i = size | 0;
+        while (i-- > 0) id += alphabet[(Math.random() * 64) | 0];
+        return id;
+    }
+    let checksum = 0;
+    let characters = 0;
+    for (let n = 0; n < 400; n++) {
+        const id = makeId((n & 1) === 0 ? 21 : 80);
+        characters += id.length;
+        for (let i = 0; i < id.length; i++) {
+            checksum = ((checksum * 33) ^ id.charCodeAt(i)) >>> 0;
+        }
+    }
+    console.log(checksum, characters, randomState >>> 0);
+"#;
+
 fn run_ok(src: &str) -> Vec<String> {
     let outcome = run(src).expect("source compiles");
     assert!(
@@ -209,6 +237,135 @@ fn all_execution_modes_preserve_answers() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+/// Fresh children isolate the process-latched cursor switch. The 21-byte IDs
+/// take the clean-return commit path; 80-byte IDs exhaust the initial reserve,
+/// commit on a capacity guard miss, and replay that untouched append in the
+/// interpreter. GC stress collects at the first-builder allocation.
+#[test]
+fn cursor_runtime_child() {
+    if std::env::var_os("ZIPP_CURSOR_RUNTIME_CHILD").is_none() {
+        return;
+    }
+    let outcome = run(CURSOR_SOURCE).expect("cursor source compiles");
+    assert!(
+        outcome.error.is_none(),
+        "cursor runtime error: {:?}",
+        outcome.error
+    );
+    println!("CURSOR_RESULT={:?}", outcome.output);
+}
+
+#[test]
+fn cursor_switch_gc_and_capacity_bail_preserve_answers() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let mut reference = None;
+    for (mode, env) in [
+        ("nojit", &[("ZIPP_NOJIT", "1")][..]),
+        ("cursor", &[("ZIPP_JITLOG", "1")][..]),
+        (
+            "cursor_gc",
+            &[("ZIPP_JITLOG", "1"), ("ZIPP_GC_STRESS", "1")][..],
+        ),
+        (
+            "cursor_off",
+            &[("ZIPP_JITLOG", "1"), ("ZIPP_NO_STR_APPEND_CURSOR", "1")][..],
+        ),
+    ] {
+        let mut cmd = Command::new(&exe);
+        cmd.args(["cursor_runtime_child", "--exact", "--nocapture"])
+            .env("ZIPP_CURSOR_RUNTIME_CHILD", "1")
+            .env_remove("ZIPP_NOJIT")
+            .env_remove("ZIPP_JITLOG")
+            .env_remove("ZIPP_GC_STRESS")
+            .env_remove("ZIPP_NO_STR_APPEND_CURSOR");
+        for &(key, value) in env {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("spawn cursor child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && !stdout.contains("running 0 tests"),
+            "{mode} child failed:\n{stdout}\n{stderr}"
+        );
+        let marker = stdout
+            .find("CURSOR_RESULT=")
+            .map(|start| stdout[start..].lines().next().unwrap().to_owned())
+            .expect("cursor child omitted result marker");
+        if let Some(reference) = &reference {
+            assert_eq!(&marker, reference, "{mode} changed the answer");
+        } else {
+            reference = Some(marker);
+        }
+        match mode {
+            "cursor" | "cursor_gc" => assert!(
+                stderr.contains("Tier-C str-append-cursor"),
+                "{mode} did not compile the cursor:\n{stderr}"
+            ),
+            "cursor_off" => assert!(
+                !stderr.contains("Tier-C str-append-cursor"),
+                "kill switch still compiled the cursor:\n{stderr}"
+            ),
+            _ => {}
+        }
+    }
+}
+
+/// A source-level call inside the accumulator loop is admissible to the old
+/// linear string mutation proof, but not to a raw deferred cursor. Unless the
+/// exact B205 random window removes it, cursor planning must fail closed.
+#[test]
+fn cursor_declines_an_unfused_call_span_child() {
+    if std::env::var_os("ZIPP_CURSOR_CALL_CHILD").is_none() {
+        return;
+    }
+    let outcome = run(
+        r#"
+        "use strict";
+        const alphabet = "abcd";
+        function pick(i) { return i & 3; }
+        function makeId(size) {
+            let id = "";
+            for (let i = 0; i < size; i++) id += alphabet[pick(i)];
+            return id;
+        }
+        let total = 0;
+        for (let n = 0; n < 200; n++) total += makeId(40).length;
+        console.log(total, makeId(7));
+        "#,
+    )
+    .expect("call-span source compiles");
+    assert!(outcome.error.is_none(), "call-span error: {:?}", outcome.error);
+    assert_eq!(outcome.output, ["8000 abcdabc"]);
+}
+
+#[test]
+fn cursor_plan_rejects_unfused_calls() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = Command::new(exe)
+        .args([
+            "cursor_declines_an_unfused_call_span_child",
+            "--exact",
+            "--nocapture",
+        ])
+        .env("ZIPP_CURSOR_CALL_CHILD", "1")
+        .env("ZIPP_JITLOG", "1")
+        .env_remove("ZIPP_NO_STR_APPEND_CURSOR")
+        .output()
+        .expect("spawn call-span child");
+    assert!(
+        out.status.success(),
+        "call-span child failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("Tier-C str-append-cursor"),
+        "unfused call span received a cursor:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// The reserve changes only a Rust backing buffer's spare capacity. Native and

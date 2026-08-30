@@ -128,6 +128,98 @@ fn str_append_index_reserve_enabled() -> bool {
     }
 }
 
+/// Stack-resident state shared by Tier C's deferred ASCII append cursor and
+/// its two Win64 boundary helpers. Native code never depends on `Vec`'s Rust
+/// layout: the begin helper publishes explicit source/output allocation
+/// pointers and lengths, and the shared epilogue hands this record back to the
+/// commit helper before any JavaScript can observe the builder.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[repr(C)]
+#[derive(Debug)]
+pub(crate) struct StrAppendCursor {
+    active: u64,
+    acc_bits: u64,
+    source_bits: u64,
+    source_version: u64,
+    source_ptr: *const u8,
+    source_len: usize,
+    out_ptr: *mut u8,
+    out_len: usize,
+    out_capacity: usize,
+}
+
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+impl StrAppendCursor {
+    #[inline]
+    fn empty() -> Self {
+        Self {
+            active: 0,
+            acc_bits: 0,
+            source_bits: 0,
+            source_version: 0,
+            source_ptr: core::ptr::null(),
+            source_len: 0,
+            out_ptr: core::ptr::null_mut(),
+            out_len: 0,
+            out_capacity: 0,
+        }
+    }
+}
+
+/// Logical end of the cursor's directly writable ASCII range. A `Vec` may
+/// retain spare allocation beyond the engine's byte/unit ceilings; exposing
+/// that raw capacity would let generated stores bypass the ordinary
+/// `inplace_string_growth_fits` check. Each direct ASCII byte consumes one
+/// physical byte and one UTF-16 unit.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn str_append_cursor_logical_capacity(
+    current_bytes: usize,
+    current_units: usize,
+    allocation_capacity: usize,
+) -> usize {
+    allocation_capacity.min(MAX_STRING_BYTES).min(
+        current_bytes.saturating_add(MAX_STRING_UNITS.saturating_sub(current_units)),
+    )
+}
+
+/// The cursor record is 72 bytes; native frames reserve the next 16-byte
+/// multiple so their Win64 call alignment is unchanged.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const STR_APPEND_CURSOR_FRAME_BYTES: i32 = 80;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const STR_APPEND_CURSOR_ACTIVE_OFF: i32 =
+    core::mem::offset_of!(StrAppendCursor, active) as i32;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const STR_APPEND_CURSOR_ACC_BITS_OFF: i32 =
+    core::mem::offset_of!(StrAppendCursor, acc_bits) as i32;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const STR_APPEND_CURSOR_SOURCE_BITS_OFF: i32 =
+    core::mem::offset_of!(StrAppendCursor, source_bits) as i32;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const STR_APPEND_CURSOR_SOURCE_VERSION_OFF: i32 =
+    core::mem::offset_of!(StrAppendCursor, source_version) as i32;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const STR_APPEND_CURSOR_SOURCE_PTR_OFF: i32 =
+    core::mem::offset_of!(StrAppendCursor, source_ptr) as i32;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const STR_APPEND_CURSOR_SOURCE_LEN_OFF: i32 =
+    core::mem::offset_of!(StrAppendCursor, source_len) as i32;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const STR_APPEND_CURSOR_OUT_PTR_OFF: i32 =
+    core::mem::offset_of!(StrAppendCursor, out_ptr) as i32;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const STR_APPEND_CURSOR_OUT_LEN_OFF: i32 =
+    core::mem::offset_of!(StrAppendCursor, out_len) as i32;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const STR_APPEND_CURSOR_OUT_CAPACITY_OFF: i32 =
+    core::mem::offset_of!(StrAppendCursor, out_capacity) as i32;
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = {
+    assert!(core::mem::size_of::<StrAppendCursor>() == 72);
+    assert!(STR_APPEND_CURSOR_FRAME_BYTES % 16 == 0);
+};
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn markdown_push_escaped_ascii(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -1951,6 +2043,132 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Execute the first append of a compiler-proved Tier-C ASCII cursor and
+    /// publish the raw, capacity-bounded state used by later call-free loop
+    /// iterations. A preflight miss is pristine. Once the ordinary fused
+    /// append succeeds, failure to establish a cursor merely leaves `active`
+    /// clear and returns that already-committed result; the next iteration may
+    /// retry this helper without replaying the first byte.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn str_append_cursor_begin(
+        &mut self,
+        acc: Value,
+        obj: Value,
+        key: Value,
+        state: &mut StrAppendCursor,
+    ) -> Option<Value> {
+        *state = StrAppendCursor::empty();
+        if !acc.is_heap() || !obj.is_heap() || !key.is_int() {
+            return None;
+        }
+        let key_i = key.as_int();
+        if key_i < 0 {
+            return None;
+        }
+        let source_ok = matches!(
+            self.heap.get(obj.heap_index()),
+            HeapObj::Str(s) if s.is_ascii() && (key_i as usize) < s.as_bytes().len()
+        );
+        if !source_ok {
+            return None;
+        }
+        // A mutable `acc === obj` evolves the indexed source as it grows. The
+        // ordinary fused helper handles that defensive shape exactly; a
+        // retained source pointer would not. A pinned seed alias is safe: the
+        // first append creates a distinct user builder while the source stays
+        // permanently immutable.
+        if acc == obj && acc.heap_index() > crate::heap::INTERN_PINNED_END {
+            return None;
+        }
+
+        let result = self.str_append_index_ascii_fast(acc, obj, key)?;
+        if !result.is_heap()
+            || result.heap_index() <= crate::heap::INTERN_PINNED_END
+            || result == obj
+        {
+            return Some(result);
+        }
+
+        // The first-append helper normally leaves a 32-byte builder. An OSR or
+        // a prior pristine decline may enter with a smaller user string, so
+        // establish the same bounded capacity here before exposing its base.
+        let (out_ptr, out_len, out_capacity) = match self.heap.get_mut(result.heap_index()) {
+            HeapObj::Str(out) => {
+                let current_units = out.units();
+                match out.prepare_ascii_append_cursor(STR_APPEND_INDEX_FIRST_RESERVE) {
+                    Some((out_ptr, out_len, allocation_capacity)) => {
+                        let logical_capacity = str_append_cursor_logical_capacity(
+                            out_len,
+                            current_units,
+                            allocation_capacity,
+                        );
+                        if logical_capacity < out_len {
+                            return Some(result);
+                        }
+                        (out_ptr, out_len, logical_capacity)
+                    }
+                    None => return Some(result),
+                }
+            }
+            _ => return Some(result),
+        };
+        let (source_ptr, source_len) = match self.heap.get(obj.heap_index()) {
+            HeapObj::Str(source) if source.is_ascii() => {
+                (source.as_bytes().as_ptr(), source.as_bytes().len())
+            }
+            _ => return Some(result),
+        };
+
+        state.acc_bits = result.bits();
+        state.source_bits = obj.bits();
+        state.source_version = self.heap.version_of(obj.heap_index()) as u64;
+        state.source_ptr = source_ptr;
+        state.source_len = source_len;
+        state.out_ptr = out_ptr;
+        state.out_len = out_len;
+        state.out_capacity = out_capacity;
+        // Publish last: generated code treats nonzero as authority to use every
+        // pointer/length field above.
+        state.active = 1;
+        Some(result)
+    }
+
+    /// Publish every capacity-guarded byte stored by a Tier-C append cursor.
+    /// This is called from the single shared native epilogue, so returns,
+    /// guard deopts, committed throws, and metering/defensive exits all pass
+    /// through it before interpreter code can inspect the string.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn str_append_cursor_commit(&mut self, state: &mut StrAppendCursor) -> bool {
+        if state.active == 0 {
+            return true;
+        }
+        let acc = Value::from_bits(state.acc_bits);
+        let ok = acc.is_heap()
+            && match self.heap.get_mut(acc.heap_index()) {
+                HeapObj::Str(out) => {
+                    let old_len = out.as_bytes().len();
+                    let within_string_limits = state
+                        .out_len
+                        .checked_sub(old_len)
+                        .and_then(|added| out.units().checked_add(added))
+                        .is_some_and(|units| {
+                            state.out_len <= MAX_STRING_BYTES && units <= MAX_STRING_UNITS
+                        });
+                    // SAFETY: cursor admission excludes calls, allocation, and
+                    // builder observation; generated stores guard source bounds
+                    // and `out_len < out_capacity`; this epilogue is the only
+                    // path back to JavaScript.
+                    within_string_limits
+                        && unsafe {
+                            out.commit_ascii_append_cursor(state.out_ptr, state.out_len)
+                        }
+                }
+                _ => false,
+            };
+        state.active = 0;
+        ok
+    }
+
     /// Heap index of a string-like object representing `v`: `v`'s own index when
     /// it is already a string (flat or rope), else a freshly allocated flat
     /// string from `v`'s string coercion. Used to build rope children.
@@ -3353,6 +3571,60 @@ pub(crate) extern "win64" fn jit_str_append_index_ascii(
     }
 }
 
+/// First-iteration boundary for Tier C's deferred ASCII append cursor. The
+/// fifth Win64 argument points at the cursor's stack record. A miss returns the
+/// ordinary pristine deopt sentinel; a served append returns its result even
+/// when cursor setup conservatively declines after the append committed.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_str_append_cursor_begin(
+    vm: *mut core::ffi::c_void,
+    acc_bits: u64,
+    obj_bits: u64,
+    key_bits: u64,
+    state: *mut StrAppendCursor,
+) -> u64 {
+    if vm.is_null() || state.is_null() {
+        return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // SAFETY: a native activation owns both the VM and its stack record for
+    // the duration of this call.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let state = unsafe { &mut *state };
+    match vm.str_append_cursor_begin(
+        Value::from_bits(acc_bits),
+        Value::from_bits(obj_bits),
+        Value::from_bits(key_bits),
+        state,
+    ) {
+        Some(v) => v.bits(),
+        None => crate::codegen::SELF_CALL_DEOPT,
+    }
+}
+
+/// Shared-epilogue boundary for Tier C's deferred ASCII append cursor. The
+/// third argument/return value preserves the whole-function result in `rax`
+/// while the helper publishes the pending `Vec` length and cached JS units.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) extern "win64" fn jit_str_append_cursor_commit(
+    vm: *mut core::ffi::c_void,
+    state: *mut StrAppendCursor,
+    result_bits: u64,
+) -> u64 {
+    if vm.is_null() || state.is_null() {
+        std::process::abort();
+    }
+    // SAFETY: the generated epilogue owns the VM and its frame-local record.
+    let vm = unsafe { &mut *(vm as *mut Vm) };
+    let state = unsafe { &mut *state };
+    if !vm.str_append_cursor_commit(state) {
+        // A failed commit means an internal proof invariant was violated after
+        // raw bytes were already written. Continuing could expose a malformed
+        // string; fail-stop is the only memory-safe response.
+        std::process::abort();
+    }
+    result_bits
+}
+
 /// Exact ordering of an i128 (a BigInt) against an f64, comparing mathematical
 /// values without rounding the integer. `None` means unordered (the f64 is NaN).
 pub(crate) fn cmp_i128_f64(x: i128, y: f64) -> Option<std::cmp::Ordering> {
@@ -3919,6 +4191,102 @@ mod str_append_index_ascii_tests {
         assert_eq!(vm.heap.len(), heap_len + 1);
         assert_eq!(vm.display(seed), "00");
         assert_eq!(vm.display(out), "000");
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[test]
+    fn zeroed_cursor_record_is_a_valid_empty_state() {
+        // SAFETY: every field is an integer, usize, or raw pointer; all-zero is
+        // valid for each and is exactly what the native prologue materializes.
+        let cursor: StrAppendCursor = unsafe { core::mem::MaybeUninit::zeroed().assume_init() };
+        assert_eq!(cursor.active, 0);
+        assert_eq!(cursor.acc_bits, 0);
+        assert_eq!(cursor.source_bits, 0);
+        assert_eq!(cursor.source_version, 0);
+        assert!(cursor.source_ptr.is_null());
+        assert_eq!(cursor.source_len, 0);
+        assert!(cursor.out_ptr.is_null());
+        assert_eq!(cursor.out_len, 0);
+        assert_eq!(cursor.out_capacity, 0);
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[test]
+    fn cursor_capacity_is_capped_by_bytes_units_and_allocation() {
+        assert_eq!(
+            str_append_cursor_logical_capacity(7, MAX_STRING_UNITS - 2, usize::MAX),
+            9,
+            "two remaining UTF-16 units permit exactly two ASCII bytes"
+        );
+        assert_eq!(
+            str_append_cursor_logical_capacity(MAX_STRING_BYTES - 1, 0, usize::MAX),
+            MAX_STRING_BYTES,
+            "raw spare allocation must not cross the byte ceiling"
+        );
+        assert_eq!(
+            str_append_cursor_logical_capacity(7, 7, 8),
+            8,
+            "the logical cap must never exceed the real allocation"
+        );
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[test]
+    fn deferred_cursor_publishes_direct_bytes_only_at_commit() {
+        let mut vm = vm();
+        let source = flat(&mut vm, crate::heap::JsStr::new("ABC".into()));
+        let mut cursor = StrAppendCursor::empty();
+        let out = vm
+            .str_append_cursor_begin(
+                Value::heap(crate::heap::INTERN_EMPTY),
+                source,
+                Value::int(0),
+                &mut cursor,
+            )
+            .expect("cursor begins on the first indexed append");
+
+        assert_eq!(cursor.active, 1);
+        assert_eq!(cursor.acc_bits, out.bits());
+        assert_eq!(cursor.source_bits, source.bits());
+        assert_eq!(
+            cursor.source_version,
+            vm.heap.version_of(source.heap_index()) as u64
+        );
+        assert!(cursor.out_capacity >= 3);
+
+        for byte in [b'B', b'C'] {
+            assert!(cursor.out_len < cursor.out_capacity);
+            // SAFETY: the test mirrors generated code's explicit capacity
+            // guard and initializes each byte before advancing the cursor.
+            unsafe { cursor.out_ptr.add(cursor.out_len).write(byte) };
+            cursor.out_len += 1;
+        }
+        assert_eq!(vm.display(out), "A", "metadata published before epilogue");
+        assert!(vm.str_append_cursor_commit(&mut cursor));
+        assert_eq!(cursor.active, 0);
+        assert_eq!(vm.display(out), "ABC");
+        match vm.heap.get(out.heap_index()) {
+            HeapObj::Str(s) => {
+                assert_eq!(s.units(), 3);
+                assert_eq!(s.as_bytes(), b"ABC");
+                assert!(s.is_ascii());
+            }
+            other => panic!("cursor result changed heap kind: {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[test]
+    fn deferred_cursor_declines_a_mutable_source_alias_pristinely() {
+        let mut vm = vm();
+        let out = flat(&mut vm, crate::heap::JsStr::new("abc".into()));
+        let mut cursor = StrAppendCursor::empty();
+        assert_eq!(
+            vm.str_append_cursor_begin(out, out, Value::int(1), &mut cursor),
+            None
+        );
+        assert_eq!(cursor.active, 0);
+        assert_eq!(vm.display(out), "abc");
     }
 
     #[test]

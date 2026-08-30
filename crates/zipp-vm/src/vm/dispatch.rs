@@ -1457,6 +1457,13 @@ impl<'p> Vm<'p> {
                         self.set(base, dst, Value::bool(m != neg));
                         ip += 1;
                     }
+                    Instr::TypeOfSame { dst, a, b, neg } => {
+                        let va = self.get(base, a);
+                        let vb = self.get(base, b);
+                        let same = self.type_of(va) == self.type_of(vb);
+                        self.set(base, dst, Value::bool(same != neg));
+                        ip += 1;
+                    }
                     Instr::IsArray {
                         dst,
                         a,
@@ -8530,6 +8537,7 @@ impl<'p> Vm<'p> {
             regs_fits: jit_regs_fits as usize,
             typeof_str: jit_typeof as usize,
             typeof_is: crate::vm::helpers_misc::jit_typeof_is as usize,
+            typeof_same: crate::vm::helpers_misc::jit_typeof_same as usize,
             static_fn: crate::vm::helpers_misc::jit_static_fn as usize,
             to_concat_key: crate::vm::helpers_misc::jit_to_concat_key as usize,
             set_index_concat: crate::vm::helpers_misc::jit_set_index_concat as usize,
@@ -9707,7 +9715,6 @@ impl<'p> Vm<'p> {
         } else {
             return Ok(v);
         }
-    
     }
 
     /// `LoadGlobal` as a value: the inline fast path, else `load_global_slow`.

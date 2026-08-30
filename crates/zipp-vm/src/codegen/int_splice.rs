@@ -1400,6 +1400,7 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
         | Instr::ToStr { dst, a }
         | Instr::TypeOf { dst, a }
         | Instr::TypeOfIs { dst, a, .. } => r(vec![a], Some(dst)),
+        Instr::TypeOfSame { dst, a, b, .. } => r(vec![a, b], Some(dst)),
         Instr::IsArray {
             dst,
             a,
