@@ -1016,6 +1016,25 @@ fn jit_sparse_get_enabled() -> bool {
     }
 }
 
+/// B256 same-binary switch: `ZIPP_NO_ARRAY_STORE_NOBUMP=1` makes every JIT'd
+/// dense-Array element store advance the array snapshot epoch again (the
+/// pre-B256 route through `Heap::get_mut`).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+#[inline]
+fn array_store_nobump_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_ARRAY_STORE_NOBUMP").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Read one absent Array index through the exact default intrinsic chain.
 /// `None` means the shape can run user code or has a custom chain and the JIT
 /// must replay in the interpreter; `Some(undefined)` is a proven chain miss.
@@ -1336,6 +1355,22 @@ pub(crate) extern "win64" fn jit_set_index(
             || vm.proto_of.contains_key(&arr.heap_index()))
     {
         return crate::codegen::SELF_CALL_DEOPT;
+    }
+    // B256: an in-range store (present element or hole-fill below `len` —
+    // the protector checks above already licensed the fill) leaves the Vec's
+    // base and length untouched, so no emitted raw snapshot is invalidated.
+    // Write it through the non-bumping accessor: `get_mut` advances
+    // `array_snapshot_epoch` on every borrow, which made every cross call
+    // after a pinned-array store re-snapshot its pins through
+    // `jit_ta_snapshot` (7-8% of allocation-survival / shapes-*). Appends
+    // (`i == len`) may reallocate and keep the bumping chokepoint below.
+    // `ZIPP_NO_ARRAY_STORE_NOBUMP=1` restores the unconditional bump.
+    if array_store_nobump_enabled()
+        && vm
+            .heap
+            .array_store_in_place(arr.heap_index(), i, Value::from_bits(val_bits))
+    {
+        return 0;
     }
     match vm.heap.get_mut(arr.heap_index()) {
         HeapObj::Array(items) => {

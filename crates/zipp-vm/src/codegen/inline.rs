@@ -87,7 +87,7 @@ pub(crate) fn emit_region_call_ic(
     argc: u16,
     dst: u16,
     refetch: Option<(usize, usize)>,
-    ta_refetch: Option<(usize, &TaPinPlan)>,
+    ta_refetch: Option<(usize, &TaPinPlan, Option<i32>)>,
 ) {
     dynasm!(ops
         ; mov rcx, rdi                          // vm
@@ -110,8 +110,10 @@ pub(crate) fn emit_region_call_ic(
     }
     // The call ran user code, which may have detached/resized a pinned
     // TypedArray's buffer (or reassigned its source) — re-derive the snapshots.
-    if let Some((snap, plan)) = ta_refetch {
-        emit_refetch_ta(ops, snap, plan);
+    if let Some((snap, plan, cache)) = ta_refetch {
+        // B256: skip the snapshot helper when the Array epoch and the pin's
+        // live source identity both still match (the cross-call rule).
+        super::region_mem::emit_cross_refetch_ta(ops, snap, plan, cache);
     }
     emit_region_bail(ops, ip, bail, epilogue);
 }
@@ -170,7 +172,7 @@ pub(crate) fn emit_captured_builtin_lane(
     dst: u16,
     intrinsic_bits: u64,
     helper: usize,
-    ta_refetch: Option<(usize, &TaPinPlan)>,
+    ta_refetch: Option<(usize, &TaPinPlan, Option<i32>)>,
 ) -> dynasmrt::DynamicLabel {
     let done = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
@@ -191,8 +193,8 @@ pub(crate) fn emit_captured_builtin_lane(
     );
     // `arr.push(x)` grows the array's own Vec — re-derive any pinned
     // dense-Array snapshot (the caller passes `None` for `charCodeAt`).
-    if let Some((snap, plan)) = ta_refetch {
-        emit_refetch_ta(ops, snap, plan);
+    if let Some((snap, plan, cache)) = ta_refetch {
+        super::region_mem::emit_cross_refetch_ta(ops, snap, plan, cache);
     }
     dynasm!(ops
         ; jmp => done
@@ -257,7 +259,7 @@ pub(crate) fn emit_inline_leaf_call(
     packed_fip: u64,
     packed_args: u64,
     refetch: Option<(usize, usize)>,
-    ta_refetch: Option<(usize, &TaPinPlan)>,
+    ta_refetch: Option<(usize, &TaPinPlan, Option<i32>)>,
     // `Some` only for an exact adjacent predicate pair.  A fused helper result
     // resumes at the pair's shared branch; helper fallback still falls through
     // to the first call's next bytecode.
@@ -1667,7 +1669,7 @@ pub(crate) fn emit_inline_method_call(
     packed_fip: u64,
     packed_args: u64,
     refetch: Option<(usize, usize)>,
-    ta_refetch: Option<(usize, &TaPinPlan)>,
+    ta_refetch: Option<(usize, &TaPinPlan, Option<i32>)>,
     // A fused captured GetProp prefix supplies `(fallback, success)` labels:
     // miss continues with the original GetProp, while success skips its paired
     // CallWithThis. `None` emits the ordinary helper fallback locally.

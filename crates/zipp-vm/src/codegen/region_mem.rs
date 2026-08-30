@@ -93,7 +93,7 @@ fn cross_array_epoch_cache_off(c3_off: i32, plan: &TaPinPlan) -> Option<i32> {
 /// `obj_bits`. The identity half is required for `globalA = preexistingB`,
 /// which changes no Heap payload and therefore cannot advance the epoch.
 /// Any mismatch refreshes every Array pin and advances the stack cache.
-fn emit_cross_refetch_ta(
+pub(crate) fn emit_cross_refetch_ta(
     ops: &mut dynasmrt::x64::Assembler,
     snapshot_helper: usize,
     plan: &TaPinPlan,
@@ -382,20 +382,24 @@ pub(crate) fn compile_region_mem(
     // scratch window fits → inline; 0 = fall back to the per-call helper).
     let leaf_flag_off = frame - 8;
     // Re-derive the pins after any helper that can run user code.
-    let ta_refetch = (n_ta > 0).then_some((heap.ta_snapshot, ta_plan));
+    // B244/B256: the region-lifetime Array-epoch cache rides in the refetch
+    // tuple so EVERY post-helper pin refresh (not only the cross-call one)
+    // can skip the snapshot helper while the epoch and the pin's live source
+    // identity both still match.
+    let array_epoch_cache = do_cross3
+        .then(|| cross_array_epoch_cache_off(c3_off, ta_plan))
+        .flatten();
+    let ta_refetch = (n_ta > 0).then_some((heap.ta_snapshot, ta_plan, array_epoch_cache));
     // A SetProp data-way hit runs no user code, but it can still replace a
     // prototype method whose live identity licensed a raw method lane.  Only
     // plans carrying such a licence need the post-store repair; ordinary
     // element/length pins keep the pre-change SetProp byte stream.
     let ta_method_refetch =
-        ta_refetch.filter(|(_, plan)| plan.pins.iter().any(|pin| pin.method_mask != 0));
+        ta_refetch.filter(|(_, plan, _)| plan.pins.iter().any(|pin| pin.method_mask != 0));
     // B244 reuses the last qword of the 64-byte CROSS3 scratch as one coarse
     // Array-epoch cache for every dense-Array pin in the region. It exists only
     // when CROSS3 allocated that scratch; all other helper paths retain their
     // unconditional snapshot refresh.
-    let array_epoch_cache = do_cross3
-        .then(|| cross_array_epoch_cache_off(c3_off, ta_plan))
-        .flatten();
     // Registers fed by a DOUBLE constant (`x * 1.5`, `i * 2654435761`): their
     // arithmetic skips the Int+Int fast path (it would fail every iteration).
     // Pure perf heuristic — a multiply-defined reg merely keeps the check.
@@ -515,7 +519,7 @@ pub(crate) fn compile_region_mem(
         );
     }
     // Pin each TypedArray's `{obj_bits, base, len}` snapshot (entry derivation).
-    if let Some((snap, plan)) = ta_refetch {
+    if let Some((snap, plan, _)) = ta_refetch {
         emit_refetch_ta(&mut ops, snap, plan);
     }
     if let Some(cache) = array_epoch_cache {
@@ -768,8 +772,8 @@ pub(crate) fn compile_region_mem(
                     }
                     // `add_values` can run user coercion code (valueOf) —
                     // re-derive the pinned TypedArray snapshots.
-                    if let Some((snap, plan)) = ta_refetch {
-                        emit_refetch_ta(&mut ops, snap, plan);
+                    if let Some((snap, plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                     }
                 }
                 dynasm!(ops ; => done_a);
@@ -1208,8 +1212,8 @@ pub(crate) fn compile_region_mem(
                     ; mov [rbx + dreg(dst)], rax
                 );
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
@@ -1265,10 +1269,10 @@ pub(crate) fn compile_region_mem(
                 // Generic success may have allocated or frame-called an
                 // inherited setter, so every pinned address/snapshot is stale.
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
-                if let (Some(method_write), Some(done), Some((snap, plan))) =
+                if let (Some(method_write), Some(done), Some((snap, plan, _))) =
                     (pure_method_write, pure_done, ta_method_refetch)
                 {
                     // Generic success already performed the full repair.
@@ -1962,8 +1966,8 @@ pub(crate) fn compile_region_mem(
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 // The slow helper may have frame-called user code (accessor) —
                 // re-derive the pinned TypedArray snapshots too.
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 dynasm!(ops ; => cont);
                 emit_region_bail(&mut ops, ip, bail, epilogue);
@@ -2082,10 +2086,10 @@ pub(crate) fn compile_region_mem(
                 emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 // The slow helper may have frame-called user code (accessor) —
                 // re-derive the pinned TypedArray snapshots too.
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
-                if let Some((snap, plan)) = ta_method_refetch {
+                if let Some((snap, plan, _)) = ta_method_refetch {
                     // The accessor/user-code route above already performed a
                     // full repair.  Skip this method-only block on that path;
                     // IC/data-miss successes enter it directly.
@@ -2451,8 +2455,8 @@ pub(crate) fn compile_region_mem(
                 // Array base in this region. Re-derive every snapshot, exactly
                 // as for a detach/resize. (Cheap when there are no array pins;
                 // `ta_refetch` is None then.)
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 if pinned.is_some() {
                     dynasm!(ops ; => ta_done);
@@ -2942,8 +2946,8 @@ pub(crate) fn compile_region_mem(
                     // above jumps to `cc_done` before this call, so it correctly
                     // skips the refetch.
                     if key == "push" {
-                        if let Some((snap, plan)) = ta_refetch {
-                            emit_refetch_ta(&mut ops, snap, plan);
+                        if let Some((snap, plan, cache)) = ta_refetch {
+                            emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                         }
                     }
                     if str_pin.is_some() {
@@ -3108,7 +3112,7 @@ pub(crate) fn compile_region_mem(
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                     }
-                    if let Some((snap, plan)) = ta_refetch {
+                    if let Some((snap, plan, _)) = ta_refetch {
                         emit_cross_refetch_ta(&mut ops, snap, plan, array_epoch_cache);
                     }
                     dynasm!(ops
@@ -3215,8 +3219,8 @@ pub(crate) fn compile_region_mem(
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                     }
-                    if let Some((snap, pin_plan)) = ta_refetch {
-                        emit_refetch_ta(&mut ops, snap, pin_plan);
+                    if let Some((snap, pin_plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(&mut ops, snap, pin_plan, cache);
                     }
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                     continue;
@@ -3269,8 +3273,8 @@ pub(crate) fn compile_region_mem(
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                     }
-                    if let Some((snap, plan)) = ta_refetch {
-                        emit_refetch_ta(&mut ops, snap, plan);
+                    if let Some((snap, plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                     }
                     emit_region_bail(&mut ops, ip, direct_bail, epilogue);
                     dynasm!(ops
@@ -3396,8 +3400,8 @@ pub(crate) fn compile_region_mem(
                 if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
@@ -3437,8 +3441,8 @@ pub(crate) fn compile_region_mem(
                 if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
@@ -3496,8 +3500,8 @@ pub(crate) fn compile_region_mem(
                 if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 dynasm!(ops ; => done);
@@ -3544,8 +3548,8 @@ pub(crate) fn compile_region_mem(
                 if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
                 dynasm!(ops ; => done);
@@ -3622,8 +3626,8 @@ pub(crate) fn compile_region_mem(
                         if refetch_pinned {
                             emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                         }
-                        if let Some((snap, plan)) = ta_refetch {
-                            emit_refetch_ta(&mut ops, snap, plan);
+                        if let Some((snap, plan, cache)) = ta_refetch {
+                            emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                         }
                         dynasm!(ops ; => skip);
                     }
@@ -3658,8 +3662,8 @@ pub(crate) fn compile_region_mem(
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                     }
-                    if let Some((snap, plan)) = ta_refetch {
-                        emit_refetch_ta(&mut ops, snap, plan);
+                    if let Some((snap, plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                     }
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                 }
@@ -3706,8 +3710,8 @@ pub(crate) fn compile_region_mem(
                 if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
@@ -3734,8 +3738,8 @@ pub(crate) fn compile_region_mem(
                 if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
@@ -3837,8 +3841,8 @@ pub(crate) fn compile_region_mem(
                     if refetch_pinned {
                         emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                     }
-                    if let Some((snap, pin_plan)) = ta_refetch {
-                        emit_refetch_ta(&mut ops, snap, pin_plan);
+                    if let Some((snap, pin_plan, cache)) = ta_refetch {
+                        emit_cross_refetch_ta(&mut ops, snap, pin_plan, cache);
                     }
                     emit_region_bail(&mut ops, ip, bail, epilogue);
                     continue;
@@ -3879,8 +3883,8 @@ pub(crate) fn compile_region_mem(
                 if refetch_pinned {
                     emit_refetch_pinned(&mut ops, heap.versions_base, Some(heap.ic_base));
                 }
-                if let Some((snap, plan)) = ta_refetch {
-                    emit_refetch_ta(&mut ops, snap, plan);
+                if let Some((snap, plan, cache)) = ta_refetch {
+                    emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);
             }
@@ -4226,7 +4230,7 @@ pub(crate) fn emit_cross3_call(
     bail: dynasmrt::DynamicLabel,
     cross_done: dynasmrt::DynamicLabel,
     refetch_pinned: bool,
-    ta_refetch: Option<(usize, &crate::codegen::TaPinPlan)>,
+    ta_refetch: Option<(usize, &crate::codegen::TaPinPlan, Option<i32>)>,
 ) {
     use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET};
     let fb = ops.new_dynamic_label();
@@ -4297,7 +4301,7 @@ pub(crate) fn emit_cross3_method_call(
     bail: dynasmrt::DynamicLabel,
     cross_done: dynasmrt::DynamicLabel,
     refetch_pinned: bool,
-    ta_refetch: Option<(usize, &crate::codegen::TaPinPlan)>,
+    ta_refetch: Option<(usize, &crate::codegen::TaPinPlan, Option<i32>)>,
 ) {
     use crate::vm::host_api::{JIT_HOT_FID_OFF, JIT_HOT_MIRROR_RAW_OFFSET, JIT_HOT_VALS_OFF};
     let fb = ops.new_dynamic_label();
@@ -4395,7 +4399,7 @@ fn emit_cross3_invoke(
     cross_done: dynasmrt::DynamicLabel,
     fb: dynasmrt::DynamicLabel,
     refetch_pinned: bool,
-    ta_refetch: Option<(usize, &crate::codegen::TaPinPlan)>,
+    ta_refetch: Option<(usize, &crate::codegen::TaPinPlan, Option<i32>)>,
 ) {
     use crate::vm::host_api::{
         JIT_ACTIVATION_OFFSET, JIT_CALL_DEPTH_OFFSET, JIT_CROSS_TABLE_RAW_OFFSET,
@@ -4415,7 +4419,7 @@ fn emit_cross3_invoke(
         .filter(|enabled| *enabled)
         .map(|_| crate::vm::activationrootstats::nested_counter_addr());
     let array_epoch_cache =
-        ta_refetch.and_then(|(_, plan)| cross_array_epoch_cache_off(iv.c3, plan));
+        ta_refetch.and_then(|(_, plan, _)| cross_array_epoch_cache_off(iv.c3, plan));
     let zeroed = ops.new_dynamic_label();
     let noroot = ops.new_dynamic_label();
     let inline_noroot = ops.new_dynamic_label();
@@ -4693,7 +4697,7 @@ fn emit_cross3_invoke(
     if refetch_pinned {
         emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));
     }
-    if let Some((snap, plan_ta)) = ta_refetch {
+    if let Some((snap, plan_ta, _)) = ta_refetch {
         emit_cross_refetch_ta(ops, snap, plan_ta, array_epoch_cache);
     }
     dynasm!(ops
@@ -4720,7 +4724,7 @@ fn emit_cross3_invoke(
     if refetch_pinned {
         emit_refetch_pinned(ops, heap.versions_base, Some(heap.ic_base));
     }
-    if let Some((snap, plan_ta)) = ta_refetch {
+    if let Some((snap, plan_ta, _)) = ta_refetch {
         emit_cross_refetch_ta(ops, snap, plan_ta, array_epoch_cache);
     }
     dynasm!(ops

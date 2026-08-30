@@ -6724,6 +6724,32 @@ impl Heap {
         &mut self.objs[idx as usize]
     }
 
+    /// B256: overwrite ONE present element of a dense Array in place —
+    /// `i < len` — WITHOUT advancing `array_snapshot_epoch`.
+    ///
+    /// The epoch licenses emitted raw `{base, len}` snapshots (B244). An
+    /// in-range element overwrite changes neither the Vec's base nor its
+    /// length, so every snapshot stays exact; only growth, shrink, reorder,
+    /// replacement and slot reuse can move the storage, and those still go
+    /// through the bumping `get_mut` chokepoint. A hole-fill below `len` is
+    /// equally invisible to a snapshot: raw element reads re-check the hole
+    /// tag per access and never trust the snapshot for presence.
+    ///
+    /// Returns `false` (and writes nothing) when the slot is not a dense
+    /// Array or `i` is not in range — the caller then takes the ordinary
+    /// bumping path (an append reallocates).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    pub(crate) fn array_store_in_place(&mut self, idx: u32, i: usize, v: Value) -> bool {
+        match &mut self.objs[idx as usize] {
+            HeapObj::Array(items) if i < items.len() => {
+                items[i] = v;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Visit every compiled RegExp program held directly by a live heap slot.
     /// Both the authoritative Unicode program and its optional ASCII byte-opt
     /// twin participate. Callers deduplicate the shared `Arc` identities.

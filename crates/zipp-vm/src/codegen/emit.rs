@@ -861,11 +861,31 @@ pub(crate) fn emit_ic_probe(
 /// 1.4%.
 const PROBE_ALIGN_PAD: bool = true;
 
+env_off_switch!(
+    /// B256: after a helper that may have grown the heap or the IC table,
+    /// re-pin r13/r14 from the VM's raw base mirrors (`versions_raw`,
+    /// `ic_table_raw` — refreshed at their sole growth sites, the same
+    /// mirrors Tier-C entry loads under B250) instead of two helper calls.
+    /// `ZIPP_NO_DIRECT_REFETCH_BASES=1` restores the helper-call refetch.
+    fn direct_refetch_bases_enabled() = "ZIPP_NO_DIRECT_REFETCH_BASES"
+);
+
 pub(crate) fn emit_refetch_pinned(
     ops: &mut dynasmrt::x64::Assembler,
     versions_base: usize,
     ic_base: Option<usize>,
 ) {
+    if direct_refetch_bases_enabled() {
+        dynasm!(ops
+            ; mov r13, [rdi + crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32]
+        );
+        if ic_base.is_some() {
+            dynasm!(ops
+                ; mov r14, [rdi + crate::vm::host_api::JIT_IC_TABLE_RAW_OFFSET as i32]
+            );
+        }
+        return;
+    }
     dynasm!(ops
         ; mov rcx, rdi
         ; mov rax, QWORD versions_base as i64
