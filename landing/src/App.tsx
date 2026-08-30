@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
 const DOCS_URL = `${GITHUB_URL}/blob/main/DOC.md#embedding`
-const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/four_engine_cc0d557_pgo_2026-08-24.json`
+const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_0bff482_pgo_2026-08-30.json`
 const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/README.md`
 
 const installCommands = `git clone https://github.com/f2i-com/zipp.org.git zipp
@@ -21,7 +21,6 @@ script.run_init()?;
 script.call_slot(on_event, &[event])?;`
 
 type Engine = 'node' | 'bun' | 'deno' | 'zipp'
-type AlternativeEngine = Exclude<Engine, 'zipp'>
 type BenchmarkGroup = 'headline' | 'diagnostic'
 type BenchmarkFilter = 'all' | BenchmarkGroup
 
@@ -30,24 +29,23 @@ type BenchmarkRow = {
   name: string
   group: BenchmarkGroup
   times: Record<Engine, number>
-  nearest: AlternativeEngine
-  lead: number
+  nodeRatio: number
 }
 
 const benchmarkRows: BenchmarkRow[] = [
-  { id: 'map-set-heavy', name: 'Map / Set', group: 'headline', times: { node: 658, bun: 777, deno: 1093, zipp: 479 }, nearest: 'node', lead: 27.2 },
-  { id: 'typedarray-math', name: 'TypedArray math', group: 'headline', times: { node: 207, bun: 915, deno: 138, zipp: 136 }, nearest: 'deno', lead: 1.4 },
-  { id: 'class-prototype-hot', name: 'Class / prototype', group: 'headline', times: { node: 299, bun: 340, deno: 296, zipp: 237 }, nearest: 'deno', lead: 19.9 },
-  { id: 'parse-large-js', name: 'Parse JavaScript', group: 'headline', times: { node: 274, bun: 236, deno: 254, zipp: 227 }, nearest: 'bun', lead: 3.9 },
-  { id: 'async-promise-chain', name: 'Async / promises', group: 'headline', times: { node: 335, bun: 377, deno: 324, zipp: 315 }, nearest: 'deno', lead: 2.7 },
-  { id: 'json-large', name: 'JSON', group: 'headline', times: { node: 262, bun: 201, deno: 282, zipp: 190 }, nearest: 'bun', lead: 5.6 },
-  { id: 'markdown-render', name: 'Markdown render', group: 'headline', times: { node: 270, bun: 218, deno: 283, zipp: 185 }, nearest: 'bun', lead: 15.0 },
-  { id: 'regex-log-scan', name: 'RegExp log scan', group: 'headline', times: { node: 456, bun: 568, deno: 428, zipp: 381 }, nearest: 'deno', lead: 11.0 },
-  { id: 'sparse-array', name: 'Sparse array', group: 'headline', times: { node: 86, bun: 108, deno: 95, zipp: 73 }, nearest: 'node', lead: 14.4 },
-  { id: 'polymorphic-objects', name: 'Polymorphic objects', group: 'headline', times: { node: 331, bun: 338, deno: 302, zipp: 281 }, nearest: 'deno', lead: 6.9 },
-  { id: 'sparse-array-v2', name: 'Sparse array v2', group: 'diagnostic', times: { node: 175, bun: 377, deno: 150, zipp: 96 }, nearest: 'deno', lead: 35.9 },
-  { id: 'polymorphic-objects-v2', name: 'Polymorphic objects v2', group: 'diagnostic', times: { node: 87, bun: 98, deno: 98, zipp: 26 }, nearest: 'node', lead: 69.4 },
-  { id: 'property-ic-shapes', name: 'Property IC shapes', group: 'diagnostic', times: { node: 266, bun: 167, deno: 278, zipp: 12 }, nearest: 'bun', lead: 92.6 },
+  { id: 'async-promise-chain', name: 'Async / promises', group: 'headline', times: { node: 329, bun: 360, deno: 353, zipp: 410 }, nodeRatio: 1.24 },
+  { id: 'class-prototype-hot', name: 'Class / prototype', group: 'headline', times: { node: 296, bun: 326, deno: 325, zipp: 221 }, nodeRatio: 0.75 },
+  { id: 'json-large', name: 'JSON', group: 'headline', times: { node: 255, bun: 185, deno: 304, zipp: 267 }, nodeRatio: 1.04 },
+  { id: 'map-set-heavy', name: 'Map / Set', group: 'headline', times: { node: 571, bun: 715, deno: 1048, zipp: 534 }, nodeRatio: 0.93 },
+  { id: 'markdown-render', name: 'Markdown render', group: 'headline', times: { node: 266, bun: 202, deno: 305, zipp: 224 }, nodeRatio: 0.83 },
+  { id: 'parse-large-js', name: 'Parse JavaScript', group: 'headline', times: { node: 268, bun: 224, deno: 281, zipp: 240 }, nodeRatio: 0.90 },
+  { id: 'polymorphic-objects', name: 'Polymorphic objects', group: 'headline', times: { node: 325, bun: 325, deno: 332, zipp: 303 }, nodeRatio: 0.93 },
+  { id: 'regex-log-scan', name: 'RegExp log scan', group: 'headline', times: { node: 457, bun: 552, deno: 452, zipp: 461 }, nodeRatio: 1.02 },
+  { id: 'sparse-array', name: 'Sparse array', group: 'headline', times: { node: 80, bun: 94, deno: 123, zipp: 80 }, nodeRatio: 1.01 },
+  { id: 'typedarray-math', name: 'TypedArray math', group: 'headline', times: { node: 201, bun: 898, deno: 167, zipp: 132 }, nodeRatio: 0.66 },
+  { id: 'polymorphic-objects-v2', name: 'Polymorphic objects v2', group: 'diagnostic', times: { node: 81, bun: 84, deno: 124, zipp: 23 }, nodeRatio: 0.29 },
+  { id: 'property-ic-shapes', name: 'Property IC shapes', group: 'diagnostic', times: { node: 259, bun: 151, deno: 306, zipp: 10 }, nodeRatio: 0.04 },
+  { id: 'sparse-array-v2', name: 'Sparse array v2', group: 'diagnostic', times: { node: 169, bun: 361, deno: 180, zipp: 100 }, nodeRatio: 0.59 },
 ]
 
 const useCases = [
@@ -90,7 +88,7 @@ const controls = [
   {
     number: '02',
     title: 'Meter and interrupt',
-    copy: 'Optional native instrumentation charges matching bytecode units in the interpreter and JIT, polls a host abort flag, and reports work used.',
+    copy: 'Optional instrumentation charges matching bytecode units, polls a host abort flag, and reports work used. On x86-64 it stays consistent across interpreter and JIT execution.',
   },
   {
     number: '03',
@@ -115,13 +113,21 @@ function ArrowIcon() {
 }
 
 function Brand() {
+  const gradientId = `zipp-bolt-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`
+
   return (
     <span className="brand-lockup">
-      <svg className="brand-symbol" viewBox="0 0 38 38" aria-hidden="true">
-        <path d="M7 9h24L10 29h21" />
-        <path className="brand-signal" d="M4 19h7m16 0h7" />
+      <svg className="brand-symbol" viewBox="0 0 142 208" aria-hidden="true">
+        <defs>
+          <linearGradient id={gradientId} x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stopColor="#c4b5fd" />
+            <stop offset="0.5" stopColor="#7c3aed" />
+            <stop offset="1" stopColor="#22d3ee" />
+          </linearGradient>
+        </defs>
+        <path d="M92 0 0 122h58l-25 86L142 69h-62z" fill={`url(#${gradientId})`} />
       </svg>
-      <span>zipp</span>
+      <span>Zipp</span>
     </span>
   )
 }
@@ -206,8 +212,8 @@ function App() {
         <section className="hero section-wrap" id="top">
           <div className="hero-copy">
             <a className="result-pill" href="#benchmarks">
-              <span>Retained benchmark</span>
-              <strong>Lowest median in 13 / 13 workloads</strong>
+              <span>Canonical PGO · exact output</span>
+              <strong>0.918× Node across the retained ten</strong>
               <span aria-hidden="true">↓</span>
             </a>
 
@@ -218,7 +224,7 @@ function App() {
             <p className="hero-intro">
               Zipp is a Rust-native, embeddable JavaScript engine for user-authored rules,
               plugin logic, workflow steps, and interactive scripts. Keep a VM alive,
-              expose only the host capabilities you choose, and optionally meter native execution.
+              expose only the host capabilities you choose, and put hard limits around hostile jobs.
             </p>
 
             <div className="hero-actions">
@@ -227,13 +233,13 @@ function App() {
             </div>
 
             <div className="hero-trust" aria-label="Zipp highlights">
-              <span><i />99.994% test262</span>
+              <span><i />99.997% test262</span>
               <span><i />Native + WASM</span>
               <span><i />Open source</span>
             </div>
           </div>
 
-          <aside className="sandbox-card" aria-label="Capability-controlled Zipp session">
+          <aside className="sandbox-card" aria-label="Illustrative capability-controlled Zipp session">
             <div className="sandbox-card-header">
               <span className="terminal-dots" aria-hidden="true"><i /><i /><i /></span>
               <span>execution / session-042</span>
@@ -251,7 +257,7 @@ function App() {
                 <i />
               </div>
               <div className="boundary-node vm-node">
-                <span className="node-label">Contained</span>
+                <span className="node-label">Guest</span>
                 <strong>Zipp VM</strong>
                 <small>user-script.js</small>
               </div>
@@ -296,22 +302,22 @@ function App() {
           <div className="section-wrap proof-grid">
             <div className="proof-lead">
               <span className="metric-index">01</span>
-              <strong>13 / 13</strong>
-              <p>lowest cold medians</p>
+              <strong>9 / 13</strong>
+              <p>faster than Node</p>
             </div>
             <div>
               <span className="metric-index">02</span>
-              <strong>0.786×</strong>
+              <strong>0.918×</strong>
               <p>Node time · retained ten</p>
             </div>
             <div>
               <span className="metric-index">03</span>
-              <strong>10.7 ms</strong>
+              <strong>7.3 ms</strong>
               <p>median process launch</p>
             </div>
             <div>
               <span className="metric-index">04</span>
-              <strong>95,936</strong>
+              <strong>95,939</strong>
               <p>passing test262 runs</p>
             </div>
           </div>
@@ -369,7 +375,7 @@ function App() {
 
               <div className="security-note">
                 <span aria-hidden="true">!</span>
-                <p><strong>One layer, honestly described.</strong> Engine controls are not a security audit or process isolation. For hostile code, pair Zipp with OS/process isolation, a process-level timeout, and Zipp’s cooperative abort flag.</p>
+                <p><strong>One layer, honestly described.</strong> Use the separately resolved, no-JIT <code>zipp-sandbox</code> runner for hostile native code, then add OS/process isolation when the threat model requires it.</p>
               </div>
             </div>
 
@@ -383,7 +389,7 @@ function App() {
               <div className="code-window-status">
                 <span><i /> host surface</span><strong>explicit</strong>
                 <span><i /> VM state</span><strong>persistent</strong>
-                <span><i /> JIT metering</span><strong>enabled</strong>
+                <span><i /> execution meter</span><strong>enabled</strong>
               </div>
               <ExternalLink className="text-link" href={DOCS_URL}>Read the embedding guide</ExternalLink>
             </div>
@@ -394,11 +400,11 @@ function App() {
           <div className="benchmark-heading">
             <div>
               <p className="section-kicker">Measured performance</p>
-              <h2>The lowest median. Every retained row.</h2>
+              <h2>Fast where it counts. Honest where work remains.</h2>
             </div>
             <div className="benchmark-statement">
-              <strong>13<span>/13</span></strong>
-              <p>against Node, Bun, and Deno</p>
+              <strong>29<span>/39</span></strong>
+              <p>pairwise point wins · every miss visible</p>
             </div>
           </div>
 
@@ -406,27 +412,27 @@ function App() {
             <article className="headline-result">
               <div>
                 <span>Retained ten-workload headline</span>
-                <strong>0.7860×</strong>
+                <strong>0.918×</strong>
                 <p>Zipp / Node paired geomean</p>
               </div>
-              <div className="confidence-pill">95% CI&nbsp; 0.7820–0.7905</div>
+              <div className="confidence-pill">95% CI&nbsp; 0.914–0.922</div>
             </article>
 
             <article className="ratio-card">
-              <span>All-13 median geomean</span>
-              <div className="ratio-row"><b>vs Node</b><span><i style={{ width: '57.2%' }} /></span><strong>0.572×</strong></div>
-              <div className="ratio-row"><b>vs Bun</b><span><i style={{ width: '48.4%' }} /></span><strong>0.484×</strong></div>
-              <div className="ratio-row"><b>vs Deno</b><span><i style={{ width: '56.9%' }} /></span><strong>0.569×</strong></div>
+              <span>All-13 paired geomean</span>
+              <div className="ratio-row"><b>vs Node</b><span><i className="bar-geomean-node" /></span><strong>0.635×</strong></div>
+              <div className="ratio-row"><b>vs Bun</b><span><i className="bar-geomean-bun" /></span><strong>0.556×</strong></div>
+              <div className="ratio-row"><b>vs Deno</b><span><i className="bar-geomean-deno" /></span><strong>0.546×</strong></div>
               <small>Lower wall time is better.</small>
             </article>
 
             <article className="startup-card">
               <span>Median startup</span>
               <div className="startup-race">
-                <div><b>Zipp</b><span><i style={{ width: '17%' }} /></span><strong>10.7</strong></div>
-                <div><b>Node</b><span><i style={{ width: '54%' }} /></span><strong>34.5</strong></div>
-                <div><b>Deno</b><span><i style={{ width: '80%' }} /></span><strong>51.5</strong></div>
-                <div><b>Bun</b><span><i style={{ width: '100%' }} /></span><strong>64.0</strong></div>
+                <div><b>Zipp</b><span><i className="bar-startup-zipp" /></span><strong>7.3</strong></div>
+                <div><b>Node</b><span><i className="bar-startup-node" /></span><strong>30.8</strong></div>
+                <div><b>Bun</b><span><i className="bar-startup-bun" /></span><strong>40.9</strong></div>
+                <div><b>Deno</b><span><i className="bar-startup-deno" /></span><strong>79.6</strong></div>
               </div>
               <small>Milliseconds · paired empty launches</small>
             </article>
@@ -462,11 +468,11 @@ function App() {
                 <thead>
                   <tr>
                     <th scope="col">Workload</th>
-                    <th scope="col" className="zipp-column">Zipp <span>fastest</span></th>
+                    <th scope="col" className="zipp-column">Zipp <span>focus</span></th>
                     <th scope="col">Node</th>
                     <th scope="col">Bun</th>
                     <th scope="col">Deno</th>
-                    <th scope="col">vs nearest</th>
+                    <th scope="col">Zipp / Node</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -477,13 +483,13 @@ function App() {
                           <span>{row.name}</span>
                           <small>{row.group === 'headline' ? 'Headline' : 'Diagnostic'}</small>
                         </th>
-                        <td className="zipp-time" data-label="Zipp"><strong>{row.times.zipp}</strong><span className="sr-only"> milliseconds, fastest</span></td>
+                        <td className="zipp-time" data-label="Zipp"><strong>{row.times.zipp}</strong><span className="sr-only"> milliseconds</span></td>
                         <td data-label="Node">{row.times.node}</td>
                         <td data-label="Bun">{row.times.bun}</td>
                         <td data-label="Deno">{row.times.deno}</td>
-                        <td className="lead-cell" data-label="Median lead">
-                          <strong>{row.lead.toFixed(1)}%</strong>
-                          <span>less than {row.nearest}</span>
+                        <td className="lead-cell" data-label="Zipp divided by Node">
+                          <strong className={row.nodeRatio < 1 ? 'ratio-win' : 'ratio-gap'}>{row.nodeRatio.toFixed(2)}×</strong>
+                          <span>{row.nodeRatio < 1 ? 'faster than Node' : 'slower than Node'}</span>
                         </td>
                       </tr>
                     )
@@ -497,9 +503,9 @@ function App() {
             <span className="methodology-mark">i</span>
             <p>
               Windows x86-64, high-performance power mode. Cold wall time includes process launch;
-              21 paired repetitions with deterministically shuffled engine and benchmark order;
+              15 paired repetitions with deterministically shuffled engine and benchmark order;
               10,000 paired-bootstrap samples; exact-byte outputs. Node 24.12.0, Bun 1.3.14,
-              Deno 2.6.10, Zipp 0.0.1 at clean PGO source <code>cc0d557</code>. The three diagnostics
+              Deno 2.6.10, Zipp 0.0.1 at clean PGO source <code>0bff482</code>. The three diagnostics
               remain separate from the retained-ten headline, and these workloads are not a claim
               of universal runtime superiority. A separate hostile application corpus tracks
               closures, mixed shapes and types, modules, allocation pressure, and npm source; it is
@@ -543,10 +549,10 @@ function App() {
                 <div><span>Persistent VM</span><span>Native JIT</span><span>Host controls</span></div>
               </article>
               <article>
-                <span className="runtime-platform">Portable / aarch64</span>
-                <h3>The same engine, interpreter-first.</h3>
-                <p>The register VM and runtime remain available where the x86-64 code generator does not apply.</p>
-                <div><span>Register VM</span><span>Same semantics</span></div>
+                <span className="runtime-platform">Native / aarch64</span>
+                <h3>A guarded baseline for integer hot paths.</h3>
+                <p>Bounded call-free integer functions and numeric loops can run natively, with exact-instruction fallback whenever a guard declines.</p>
+                <div><span>Baseline JIT</span><span>Register VM</span><span>Exact fallback</span></div>
               </article>
               <article>
                 <span className="runtime-platform">Browser / wasm32</span>
