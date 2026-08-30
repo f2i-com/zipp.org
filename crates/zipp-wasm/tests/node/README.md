@@ -12,10 +12,11 @@ wasm-bindgen --target nodejs --out-dir tests/node/pkg \
 node tests/node/check-wasm-memory.cjs tests/node/pkg/zipp_wasm_bg.wasm
 node tests/node/host-contract.cjs
 node tests/node/worker-deadline.cjs
+node tests/node/syntax-corpus.cjs
 SOFTN_REPO=../softn.com node tests/node/softn-snakegame.cjs
 ```
 
-Both expect the generated glue at `tests/node/pkg/` (adjust the `require` at the
+They all expect the generated glue at `tests/node/pkg/` (adjust the `require` at the
 top of each file if you put it elsewhere).
 
 - **check-wasm-memory.cjs** — verifies the final wasm-bindgen artifact still has
@@ -28,6 +29,13 @@ top of each file if you put it elsewhere).
 - **worker-deadline.cjs** — proves a responsive supervisor can terminate a
   Worker blocked in synchronous runaway WASM, then serve the next tenant in a
   fresh Worker/WASM instance.
+- **syntax-corpus.cjs** — the hardened profile's parse-shape limits, checked
+  against the artifact they are calibrated for. Parses the reduced real
+  application sources in `tests/syntax-corpus/` (they must be accepted) and a
+  set of deliberately over-deep shapes (they must come back as a SyntaxError
+  with the instance still usable, never as a linear-memory trap). v0.0.1 shipped
+  limits that rejected two working applications; the only browser check in the
+  release workflow at the time parsed a three-token source.
 - **softn-snakegame.cjs** — a real SoftN bundle's `.logic`, unmodified, driven the
   way its runtime drives it: `_init`, listener registration, arrow keys through
   `window.__snakeNextDir`, the tick loop, eating, game over, and a high score

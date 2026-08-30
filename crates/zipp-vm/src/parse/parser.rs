@@ -68,16 +68,57 @@ pub type PResult<T> = Result<T, SyntaxError>;
 /// JavaScript source file is data supplied by the guest; letting its grammar
 /// nesting map one-for-one onto the native (or WebAssembly) call stack turns a
 /// syntax error into a process abort.  This is a parser-stack limit, not the VM
-/// call-stack limit used while executing JavaScript.
+/// call-stack limit used while executing JavaScript.  It is the load-bearing
+/// one of the three: the completed-AST validator below cannot help here,
+/// because with this counter disabled a deeply nested `if` kills the process
+/// while still being parsed, long before there is a tree to validate.
+///
+/// MEASURED 2026-08-30 against the shipped hardened profile — rustc 1.92.0,
+/// wasm-bindgen 0.2.126, linked with the release workflow's own
+/// `-C link-arg=-zstack-size=1048576`.  The counter reaches 795 before the
+/// shadow stack walks off the bottom of linear memory; the module then traps
+/// with `RuntimeError: memory access out of bounds` and cannot be re-entered,
+/// so there is no softer failure past this point to fall back on.  The worst
+/// shape is an `else if` ladder at roughly 1.3 KB of stack per counter unit.
+/// Doubling `-zstack-size` doubles that ceiling to within 2%, which is how we
+/// know the linker's stack is the only thing bounding it.
+///
+/// 48 rejected working code.  Across a 36-file real-application corpus the
+/// deepest file needs 51 (a 26-branch `else if` ladder, one counter unit per
+/// branch), and the host preamble spends 23 of the budget before the guest's
+/// first token.  192 is 3.8x what the deepest real program needs and 4.1x
+/// below the trap.  Prefer that 4x to a tighter fit: the same source measured
+/// ~5% differently between two builds of it, so 795 is a property of this
+/// compiler's frame layout rather than of the grammar.  Re-run the bisection
+/// after a rustc or wasm-bindgen bump instead of trusting the number.
 #[cfg(feature = "safe-sandbox")]
-const MAX_SAFE_SYNTAX_RECURSION: usize = 48;
+pub const MAX_SAFE_SYNTAX_RECURSION: usize = 192;
 
 /// Left-associated operator/member chains are built iteratively by the parser,
 /// but produce a recursively-shaped AST consumed by the compiler and capture
 /// analysis.  Bound each individual grammar tier before constructing a tree
 /// deep enough to overflow those later walks.
+///
+/// Read the units before changing this.  `check_syntax_chain` is called with
+/// the number of links ALREADY accepted and rejects on `>=`, so the constant is
+/// a count of links and admits one more operand than that.  16 therefore
+/// rejected an 18-term sum, which is ordinary arithmetic, not an attack — that
+/// is how it broke a shipped application whose one-line state hash adds 22
+/// register buffers together.
+///
+/// MEASURED 2026-08-30, same profile as MAX_SAFE_SYNTAX_RECURSION: the
+/// post-parse recursive walks survive roughly 2131 links on a left spine
+/// before the shadow stack traps, so 16 sat two orders of magnitude below the
+/// hardware.  The deepest chain in the real-application corpus is 21 links.
+/// 128 is 6x that and 16x below the trap.
+///
+/// It is deliberately equal to `limits::MAX_SAFE_AST_NESTING`, because an
+/// N-link chain builds a tree of depth N+1: anything this guard let past would
+/// be rejected by the completed-AST validator regardless, and this guard's job
+/// is only to reject it before the tree is built.  Raise the two together or
+/// not at all — raising this one alone changes nothing a guest can observe.
 #[cfg(feature = "safe-sandbox")]
-const MAX_SAFE_SYNTAX_CHAIN: usize = 16;
+pub const MAX_SAFE_SYNTAX_CHAIN: usize = 128;
 
 /// Grammar parameters — the `[Yield]`, `[Await]`, `[In]`, `[Return]` subscripts
 /// the spec threads through its productions, plus strictness.

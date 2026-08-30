@@ -112,6 +112,16 @@ mod heap;
 /// Hand-written front end (lexer/AST/parser) being built to replace
 /// `oxc_parser` — see the module docs for why. Not yet wired in.
 mod parse;
+
+/// The hardened profile's three parse-shape limits, so a test can build a
+/// source from the numbers instead of copying them.  A shape hard-coded against
+/// the old values silently stopped exercising the guard it was written for when
+/// these were last changed; deriving it keeps that from happening twice.
+#[cfg(feature = "safe-sandbox")]
+pub mod safe_syntax_limits {
+    pub use crate::parse::limits::MAX_SAFE_AST_NESTING;
+    pub use crate::parse::parser::{MAX_SAFE_SYNTAX_CHAIN, MAX_SAFE_SYNTAX_RECURSION};
+}
 mod shape;
 mod slot_table;
 

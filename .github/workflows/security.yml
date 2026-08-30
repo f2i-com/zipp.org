@@ -71,6 +71,7 @@ jobs:
             --test intl_native_limits \
             --test native_iteration_limits \
             --test native_meta_recursion_limits \
+            --test real_program_corpus \
             --test regex_execution_limits \
             --test regex_memory_limits \
             --test side_table_heap_limits \

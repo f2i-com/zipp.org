@@ -11,8 +11,28 @@ use super::parser::PResult;
 #[cfg(feature = "safe-sandbox")]
 use super::parser::SyntaxError;
 
+/// The backstop for tree shapes the other two guards cannot see the whole of:
+/// nested functions, chains and operator spines each stay under their own tier
+/// limit while composing into one tree deeper than any of them.
+///
+/// MEASURED 2026-08-30 against the shipped hardened profile (rustc 1.92.0,
+/// wasm-bindgen 0.2.126, `-C link-arg=-zstack-size=1048576`).  Two facts shape
+/// the number.  First, this validator cannot protect the parser and must not be
+/// relied on to: with `MAX_SAFE_SYNTAX_RECURSION` disabled, a deeply nested
+/// `if` traps while being parsed, before there is a completed tree to walk.
+/// What it protects is the recursive consumers named above.  Second, those
+/// consumers are the tighter budget: they stop surviving at a tree depth of
+/// ~294 on the most expensive shape measured (a chain of arrows), and at ~2100
+/// on the iteratively-parsed spines this guard exists for.
+///
+/// 32 rejected working code — the deepest file in a 36-file real-application
+/// corpus builds a tree 41 deep.  128 is 3.1x that, and stays 2.3x below the
+/// 294 worst case without depending on the recursion guard to cut that shape
+/// off first, which is what keeps all three limits independently justifiable.
+/// If `MAX_SAFE_SYNTAX_RECURSION` is ever raised far beyond 192, re-derive this
+/// one rather than leaving it alone.
 #[cfg(feature = "safe-sandbox")]
-const MAX_SAFE_AST_NESTING: usize = 32;
+pub const MAX_SAFE_AST_NESTING: usize = 128;
 
 pub(crate) fn validate_program_nesting(program: &Program) -> PResult<()> {
     #[cfg(not(feature = "safe-sandbox"))]

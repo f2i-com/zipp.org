@@ -279,6 +279,11 @@ jobs:
           node tests/node/check-wasm-memory.cjs tests/node/pkg/zipp_wasm_bg.wasm
           node tests/node/host-contract.cjs
           node tests/node/worker-deadline.cjs
+          # The parse-shape limits are calibrated against the artifact built by
+          # the step above, with its 1 MiB linker stack. v0.0.1 shipped limits
+          # that rejected two working applications because the only browser
+          # check below parses three tokens.
+          node tests/node/syntax-corpus.cjs
 
       - name: Package browser JS, TypeScript declarations, and WebAssembly
         shell: bash
