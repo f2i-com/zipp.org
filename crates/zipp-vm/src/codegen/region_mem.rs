@@ -4049,9 +4049,20 @@ pub(crate) const CHAIN_HINT_LAST: u32 = 1 << 30;
 /// emitted runtime Int-tag check remains the authoritative type proof.
 #[inline]
 pub(crate) fn chain_next_leaf(code: &[Instr], ip: usize, acc: u16) -> Option<u16> {
-    match (code.get(ip + 1), code.get(ip + 2)) {
-        (Some(Instr::StrConcatChain { a, b, .. }), Some(Instr::Move { src, .. }))
-            if *a == acc && *src == acc =>
+    match (code.get(ip), code.get(ip + 1), code.get(ip + 2)) {
+        (
+            Some(Instr::StrConcatChain { dst, a, .. }),
+            Some(Instr::StrConcatChain {
+                dst: next_dst,
+                a: next_a,
+                b,
+            }),
+            Some(Instr::Move { src, .. }),
+        ) if *dst == acc
+            && *a == acc
+            && *next_dst == acc
+            && *next_a == acc
+            && *src == acc =>
         {
             Some(*b)
         }
@@ -4078,6 +4089,34 @@ mod concat_suffix_hint_tests {
 
         let wrong_move = [link(1), link(2), Instr::Move { dst: 3, src: 9 }];
         assert_eq!(chain_next_leaf(&wrong_move, 0, 0), None);
+
+        let wrong_current_dst = [
+            Instr::StrConcatChain { dst: 9, a: 0, b: 1 },
+            link(2),
+            Instr::Move { dst: 3, src: 0 },
+        ];
+        assert_eq!(chain_next_leaf(&wrong_current_dst, 0, 0), None);
+
+        let wrong_current_src = [
+            Instr::StrConcatChain { dst: 0, a: 9, b: 1 },
+            link(2),
+            Instr::Move { dst: 3, src: 0 },
+        ];
+        assert_eq!(chain_next_leaf(&wrong_current_src, 0, 0), None);
+
+        let wrong_next_dst = [
+            link(1),
+            Instr::StrConcatChain { dst: 9, a: 0, b: 2 },
+            Instr::Move { dst: 3, src: 0 },
+        ];
+        assert_eq!(chain_next_leaf(&wrong_next_dst, 0, 0), None);
+
+        let wrong_next_src = [
+            link(1),
+            Instr::StrConcatChain { dst: 0, a: 9, b: 2 },
+            Instr::Move { dst: 3, src: 0 },
+        ];
+        assert_eq!(chain_next_leaf(&wrong_next_src, 0, 0), None);
     }
 }
 
