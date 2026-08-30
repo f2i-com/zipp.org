@@ -33,38 +33,36 @@ observation.
 ## Current canonical result
 
 The public hostile result is the clean PGO capture
-[`head_clean_0bff482_pgo_2026-08-30.json`](head_clean_0bff482_pgo_2026-08-30.json):
+[`head_clean_21288c1_pgo_2026-08-30.json`](head_clean_21288c1_pgo_2026-08-30.json):
 
-| Metric | Zipp / Node | 95% descriptive interval |
-|---|---:|---:|
-| ordinary cold geomean | **0.866177×** | [0.858901, 0.870652] |
-| category-balanced cold geomean | **0.906139×** | [0.899437, 0.911396] |
+| Metric | Node | Bun | Deno |
+|---|---:|---:|---:|
+| ordinary cold geomean | **0.880739×** [0.874459, 0.886343] | **0.670217×** [0.664847, 0.676923] | **0.455125×** [0.450307, 0.460797] |
+| category-balanced cold geomean | **0.913207×** [0.907014, 0.919216] | **0.685584×** [0.677898, 0.694681] | **0.467181×** [0.462099, 0.472631] |
 
-It uses commit `0bff482`, a provenance-stamped PGO executable, the complete
+It uses commit `21288c1`, a provenance-stamped PGO executable, the complete
 manifest, 15 counterbalanced repetitions, exact output on all 17 cases, and
-`publishable:true`.
+`publishable:true`. There are 36 / 51 point and Bonferroni exact-sign wins
+across the three competitors; seven rows beat all three engines.
 
-The clean capture is an aggregate win, not all-row parity. Its largest open
-Node ratios include allocation survival **1.705×**, React reconcile **1.682×**,
-and warm router **1.616×**; NanoID was **1.396×**. The root README keeps the
-literal every-row gate false.
+The clean capture is an aggregate win, not all-row parity. Against Node, eight
+rows are point wins and nine are point gaps:
 
-### Post-capture development evidence
+| Node point gap | Zipp / Node | 95% descriptive interval |
+|---|---:|---:|
+| calls-closures | **1.307092×** | [1.282812, 1.312543] |
+| shapes-stable | **1.493168×** | [1.445199, 1.517249] |
+| shapes-megamorphic | **1.483728×** | [1.451539, 1.518934] |
+| allocation-survival | **1.771741×** | [1.702678, 1.804336] |
+| async-lived | **1.082465×** | [1.078418, 1.132905] |
+| reactish-reconcile | **1.645608×** | [1.629964, 1.709540] |
+| warm-router | **1.673820×** | [1.644515, 1.707009] |
+| bytecode-vm | **1.013865×** | [0.983551, 1.020502] |
+| npm-nanoid | **1.000406×** | [0.991579, 1.025564] |
 
-B253 and B254 are not folded into the canonical table. Their focused artifacts
-are diagnostic and `publishable:false`:
-
-- B253 stable concat suffix memo: React reconcile **−4.14%**, ratio 0.958636
-  [0.949720, 0.965530], 31 / 32 same-binary wins.
-- B254 final pinned string length: NanoID **−13.11%**, ratio 0.868869
-  [0.860467, 0.873758], 31 / 32 same-binary wins.
-- Final B254 versus the nearer frozen B253 feature build: all-17 ordinary
-  **0.987230×** [0.984695, 0.991308], category-balanced **0.982579×**
-  [0.979742, 0.987197], with exact output and no supported cold regression.
-- A fresh filtered Node diagnostic puts final NanoID at **1.169× Node** and
-  React at **1.673× Node**. Both remain open.
-
-A new clean full PGO engine capture is required before the public table moves.
+The last two are literal point gaps whose descriptive intervals cross parity;
+they are not supported slowdowns. The root README therefore keeps the every-row
+gate false instead of hiding these rows behind the aggregate.
 
 ## Run the corpus
 
@@ -114,8 +112,12 @@ listed in the case's `inputs`.
 
 The aspirational corpus gate is a cold category-balanced geomean at or below
 `1.05× Node`, no cold category above `1.15×`, and no individual cold row above
-`1.50×`. The runner reports the evidence; it does not claim the current tree
-meets this gate.
+`1.50×`. The current capture clears the aggregate bound, but not the category or
+row bounds: applications are **1.646×**, server **1.674×**, and objects
+**1.488×** Node by category; allocation-survival (**1.772×**), warm-router
+(**1.674×**), and reactish-reconcile (**1.646×**) exceed the individual-row cap.
+The runner reports the evidence; it does not claim the current tree meets this
+gate.
 
 ## Manifest and vendored inputs
 

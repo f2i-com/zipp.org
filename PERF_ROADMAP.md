@@ -27,19 +27,27 @@ tables; below `1.0×` is faster.
 
 ### Public canonical capture
 
-The public score remains the clean PGO capture at `0bff482`:
+The public score is the clean four-engine PGO capture at `21288c1`:
 
-| Corpus | Zipp / Node | Status |
-|---|---:|---|
-| retained ten | **0.918×** [0.914, 0.922] | 6 point wins, four gaps/parity rows |
-| diagnostics three | **0.186×** [0.184, 0.188] | Zipp wins all three |
-| all 13 | **0.635×** [0.633, 0.637] | 9 / 13 Node point wins |
-| hostile all 17, ordinary | **0.866177×** [0.858901, 0.870652] | separate stress corpus |
-| hostile category-balanced | **0.906139×** [0.899437, 0.911396] | separate stress corpus |
+| Corpus | Node | Bun | Deno | Node point wins |
+|---|---:|---:|---:|---:|
+| retained ten | **0.921×** [0.913, 0.928] | 0.782× [0.778, 0.789] | 0.797× [0.790, 0.806] | 6 / 10 |
+| diagnostics three | **0.192×** [0.191, 0.195] | 0.171× [0.168, 0.174] | 0.152× [0.150, 0.155] | 3 / 3 |
+| all 13 | **0.642×** [0.638, 0.646] | 0.550× [0.547, 0.555] | 0.544× [0.540, 0.549] | 9 / 13 |
+| hostile all 17, ordinary | **0.881×** [0.874, 0.886] | 0.670× [0.665, 0.677] | 0.455× [0.450, 0.461] | 8 / 17 |
+| hostile category-balanced | **0.913×** [0.907, 0.919] | 0.686× [0.678, 0.695] | 0.467× [0.462, 0.473] | — |
+| all 30, equal row weight | **0.768×** [0.764, 0.771] | 0.615× [0.613, 0.620] | 0.492× [0.489, 0.496] | 17 / 30 |
 
-Across Node, Bun, and Deno, 29 / 39 point comparisons and 29 / 39
-Bonferroni exact-sign comparisons are wins. The literal all-row target remains
-false. See [`README.md`](README.md#performance-measured-honestly) for the table.
+Both source artifacts are `publishable:true`, `ALL_CORRECT=1`, use 15
+counterbalanced repetitions and 10,000 bootstrap samples, and have empty drift
+and failure lists. The all-30 interval is a stratified descriptive bootstrap:
+normal and hostile repetitions are resampled independently, while every row
+inside one suite shares the same repetition indices.
+
+Across Node, Bun, and Deno, the normal suite has 29 / 39 point and exact-sign
+wins; hostile has 36 / 51. The literal all-row target remains false. See
+[`README.md`](README.md#performance-measured-honestly) for the tables and raw
+artifact links.
 
 ### Correctness
 
@@ -54,6 +62,30 @@ Do not edit historical B entries merely because their old pass counts were
 correct for their own commit.
 
 ## Latest experiment registry
+
+### B255 LANDED — hostile-path routing and append cursor
+
+Commit `21288c1` brings four independently guarded mechanisms together:
+
+- stable paired-`typeof` fusion (`ZIPP_NO_TYPEOF_SAME=1` restores the prior
+  route);
+- call-free Tier-C loose-null checks
+  (`ZIPP_NO_TIERC_LOOSE_NULL_INLINE=1`);
+- a polymorphic-function-id Cross3 call router
+  (`ZIPP_NO_CROSS3_POLY_FID=1`); and
+- a deferred flat-ASCII append cursor (`ZIPP_NO_STR_APPEND_CURSOR=1`).
+
+The same commit fixes protected returns that cross `finally` and adds focused
+coverage for that control-flow boundary. The final PGO executable is
+`c2ddb9e6…6a3cb5`, built from source `21288c1` with profile
+`fbe16992…e91743`. Its complete normal and hostile captures are the current
+public results above. Exact output held in all 1,800 four-engine observations.
+
+The aggregate result is not the finish line. Current Node point gaps are the
+four normal rows async-promise-chain, json-large, regex-log-scan, and
+sparse-array, plus nine hostile rows: calls-closures, shapes-stable,
+shapes-megamorphic, allocation-survival, async-lived, reactish-reconcile,
+warm-router, bytecode-vm, and npm-nanoid.
 
 ### B254 LANDED — pinned call-result string length
 
@@ -82,8 +114,10 @@ allocation-ephemeral case had no usable adjusted ratio; the cold analysis is
 complete. The B253 comparator is a frozen dirty feature build, so the sweep is
 not publication evidence.
 
-Filtered 16-pair Node diagnostics put final NanoID at **1.169× Node** [1.160,
-1.195] and React at **1.673× Node** [1.618, 1.715]. The target remains open.
+At the B254 checkpoint, filtered 16-pair Node diagnostics put NanoID at
+**1.169× Node** [1.160, 1.195] and React at **1.673× Node** [1.618, 1.715].
+Those dated figures are retained as attribution evidence; B255's canonical
+ratios above supersede them for the current engine comparison.
 
 ### B254 hardening LANDED — impossible identity-IC empty marker
 
@@ -148,7 +182,7 @@ B249 restored fused direct and computed method calls where argument evaluation
 cannot observe the property read, stopped recycling captured temporaries, and
 added bare guarded `MathOp` lowering. The clean `0bff482` PGO capture moved the
 retained-ten result to 0.918× Node, all-13 to 0.635×, and hostile ordinary to
-0.866×. It is the current public baseline.
+0.866×. It was the public baseline before B255's `21288c1` capture.
 
 Earlier entries, designs, hazards, and refutations remain searchable in the
 [historical ledger](docs/archive/PERF_LEDGER-B001-B252.md).
@@ -158,45 +192,37 @@ Earlier entries, designs, hazards, and refutations remain searchable in the
 Priorities are ordered by current measured gap and by whether the next question
 can be answered with a bounded experiment.
 
-### 1. React-shaped reconcile — 1.673× Node
+### 1. Allocation survival — 1.772× Node
 
-B251 and B253 removed two known taxes. Re-profile the final B254 layout before
-acting on the older attribution. Measure these terms independently:
+This is the largest current Node gap and one of three hostile rows above the
+aspirational 1.50× individual cap, alongside warm-router and
+reactish-reconcile. Profile nursery promotion, survivor tracing, and
+free-list/pool maintenance separately; do not infer the term from the much
+faster allocation-ephemeral row.
 
-- recursive framed self-calls and same-prototype guard/fallback traffic;
-- handler-bearing `for-of` loop admission (`PushFinally` / `IterCloseFinally`);
-- repeated `typeof` and loose-null helper traffic after HTMLDDA scalarization;
-- allocation throughput and sweep share after suffix memoization; and
-- object-pattern argument allocation if it remains visible.
+### 2. Warm router and React reconcile — 1.674× / 1.646× Node
 
-Kill any proposal whose focused lane does not explain at least 3% of the row or
-whose safety tax reaches unrelated normal cases.
+Both application-shaped rows need fresh attribution on B255. For the router,
+separate closure dispatch from property and URL/string work. For React, measure
+recursive framed calls, handler-bearing loops, shape checks, and allocation
+before attempting another combined shortcut.
 
-### 2. NanoID — 1.169× Node
+### 3. Object shapes — 1.493× / 1.484× Node
 
-The call-result pin and direct `.length` lane have moved the row materially.
-Profile again. Likely questions, not pre-approved fixes:
+Stable and megamorphic shapes are almost equally slow, which argues against
+assuming this is only an IC-polymorphism problem. Compare lookup, guard failure,
+transition, and allocation counters on the same binary.
 
-- remaining per-character `charCodeAt` helper/lane cost;
-- why the outer MEM region still owns the inner integer loop;
-- whether a direct pinned ASCII char load can be reused without widening the
-  receiver or mutation proof; and
-- whether the residual is launch/layout rather than runtime work.
+### 4. Calls, async, and retained normal gaps
 
-Do not retry the nested-OSR host handoff refuted by B252.
+Closure calls are **1.307× Node** and async-promise-chain is **1.232×**.
+Long-lived hostile async is **1.082×**. JSON and sparse-array are about
+**1.05×**, while regex is **1.017×** with an interval crossing parity. Scout one
+mechanism at a time and require a complete normal-plus-hostile safety sweep.
 
-### 3. Fresh canonical capture
-
-After documentation and the repository-wide release gate, build one clean PGO
-artifact and run the complete normal and hostile Node/Bun/Deno/Zipp protocols.
-Until then, public ratios stay at `0bff482`.
-
-### 4. Remaining canonical Node gaps
-
-The last clean hostile capture still has substantial Node gaps in allocation
-survival, warm router, closures, and shapes; the normal retained set still has
-async-promise-chain and smaller json/regex/sparse gaps. Each needs a current
-profile because B250–B254 changed code shape and attribution.
+Bytecode-vm (**1.014×**) and NanoID (**1.000×**) are point gaps but currently
+near parity; neither should outrank a supported double-digit gap without a
+cheap, isolated explanation.
 
 ## Standing gate
 

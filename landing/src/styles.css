@@ -1258,27 +1258,39 @@ svg {
 }
 
 .bar-geomean-node {
-  width: 63.5%;
+  width: 76.8%;
 }
 
 .bar-geomean-bun {
-  width: 55.6%;
+  width: 61.5%;
 }
 
 .bar-geomean-deno {
-  width: 54.6%;
+  width: 49.2%;
+}
+
+.bar-suite-normal {
+  width: 64.2%;
+}
+
+.bar-suite-hostile {
+  width: 88.1%;
+}
+
+.suite-card .ratio-row {
+  grid-template-columns: 72px 1fr 58px;
 }
 
 .bar-startup-zipp {
-  width: 9.2%;
+  width: 9.6%;
 }
 
 .bar-startup-node {
-  width: 38.7%;
+  width: 36%;
 }
 
 .bar-startup-bun {
-  width: 51.4%;
+  width: 54.6%;
 }
 
 .bar-startup-deno {

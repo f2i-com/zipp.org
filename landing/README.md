@@ -1,8 +1,11 @@
 # Zipp landing page
 
 The standalone React + TypeScript landing page for Zipp, built with Vite. Its
-performance copy mirrors the clean canonical capture in
-[`../bench/real13_0bff482_pgo_2026-08-30.json`](../bench/real13_0bff482_pgo_2026-08-30.json);
+performance copy mirrors the clean four-engine canonical captures in
+[`../bench/real13_21288c1_pgo_2026-08-30.json`](../bench/real13_21288c1_pgo_2026-08-30.json)
+and
+[`../bench/hostile/head_clean_21288c1_pgo_2026-08-30.json`](../bench/hostile/head_clean_21288c1_pgo_2026-08-30.json).
+The all-30 headline is the equal-row geomean of the normal 13 and hostile 17;
 development-only A/Bs do not silently change the public ratios.
 
 ```sh

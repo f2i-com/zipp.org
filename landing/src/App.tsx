@@ -2,8 +2,8 @@ import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'rea
 
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
 const DOCS_URL = `${GITHUB_URL}/blob/main/DOC.md#embedding`
-const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_0bff482_pgo_2026-08-30.json`
-const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/README.md`
+const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_21288c1_pgo_2026-08-30.json`
+const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_21288c1_pgo_2026-08-30.json`
 
 const installCommands = `git clone https://github.com/f2i-com/zipp.org.git zipp
 cd zipp
@@ -33,19 +33,19 @@ type BenchmarkRow = {
 }
 
 const benchmarkRows: BenchmarkRow[] = [
-  { id: 'async-promise-chain', name: 'Async / promises', group: 'headline', times: { node: 329, bun: 360, deno: 353, zipp: 410 }, nodeRatio: 1.24 },
-  { id: 'class-prototype-hot', name: 'Class / prototype', group: 'headline', times: { node: 296, bun: 326, deno: 325, zipp: 221 }, nodeRatio: 0.75 },
-  { id: 'json-large', name: 'JSON', group: 'headline', times: { node: 255, bun: 185, deno: 304, zipp: 267 }, nodeRatio: 1.04 },
-  { id: 'map-set-heavy', name: 'Map / Set', group: 'headline', times: { node: 571, bun: 715, deno: 1048, zipp: 534 }, nodeRatio: 0.93 },
-  { id: 'markdown-render', name: 'Markdown render', group: 'headline', times: { node: 266, bun: 202, deno: 305, zipp: 224 }, nodeRatio: 0.83 },
-  { id: 'parse-large-js', name: 'Parse JavaScript', group: 'headline', times: { node: 268, bun: 224, deno: 281, zipp: 240 }, nodeRatio: 0.90 },
-  { id: 'polymorphic-objects', name: 'Polymorphic objects', group: 'headline', times: { node: 325, bun: 325, deno: 332, zipp: 303 }, nodeRatio: 0.93 },
-  { id: 'regex-log-scan', name: 'RegExp log scan', group: 'headline', times: { node: 457, bun: 552, deno: 452, zipp: 461 }, nodeRatio: 1.02 },
-  { id: 'sparse-array', name: 'Sparse array', group: 'headline', times: { node: 80, bun: 94, deno: 123, zipp: 80 }, nodeRatio: 1.01 },
-  { id: 'typedarray-math', name: 'TypedArray math', group: 'headline', times: { node: 201, bun: 898, deno: 167, zipp: 132 }, nodeRatio: 0.66 },
-  { id: 'polymorphic-objects-v2', name: 'Polymorphic objects v2', group: 'diagnostic', times: { node: 81, bun: 84, deno: 124, zipp: 23 }, nodeRatio: 0.29 },
-  { id: 'property-ic-shapes', name: 'Property IC shapes', group: 'diagnostic', times: { node: 259, bun: 151, deno: 306, zipp: 10 }, nodeRatio: 0.04 },
-  { id: 'sparse-array-v2', name: 'Sparse array v2', group: 'diagnostic', times: { node: 169, bun: 361, deno: 180, zipp: 100 }, nodeRatio: 0.59 },
+  { id: 'async-promise-chain', name: 'Async / promises', group: 'headline', times: { node: 328.786, bun: 363.605, deno: 354.774, zipp: 403.520 }, nodeRatio: 1.231865623 },
+  { id: 'class-prototype-hot', name: 'Class / prototype', group: 'headline', times: { node: 295.190, bun: 332.877, deno: 326.413, zipp: 224.388 }, nodeRatio: 0.763521730 },
+  { id: 'json-large', name: 'JSON', group: 'headline', times: { node: 258.640, bun: 189.975, deno: 308.320, zipp: 268.906 }, nodeRatio: 1.050831813 },
+  { id: 'map-set-heavy', name: 'Map / Set', group: 'headline', times: { node: 687.650, bun: 784.031, deno: 1155.782, zipp: 578.761 }, nodeRatio: 0.851300473 },
+  { id: 'markdown-render', name: 'Markdown render', group: 'headline', times: { node: 269.243, bun: 207.020, deno: 310.900, zipp: 232.357 }, nodeRatio: 0.869559492 },
+  { id: 'parse-large-js', name: 'Parse JavaScript', group: 'headline', times: { node: 270.157, bun: 227.320, deno: 286.377, zipp: 239.810 }, nodeRatio: 0.890355724 },
+  { id: 'polymorphic-objects', name: 'Polymorphic objects', group: 'headline', times: { node: 325.768, bun: 329.732, deno: 334.570, zipp: 306.949 }, nodeRatio: 0.939821866 },
+  { id: 'regex-log-scan', name: 'RegExp log scan', group: 'headline', times: { node: 464.885, bun: 555.160, deno: 458.206, zipp: 476.285 }, nodeRatio: 1.017445258 },
+  { id: 'sparse-array', name: 'Sparse array', group: 'headline', times: { node: 79.779, bun: 101.962, deno: 125.291, zipp: 81.723 }, nodeRatio: 1.050387229 },
+  { id: 'typedarray-math', name: 'TypedArray math', group: 'headline', times: { node: 198.452, bun: 909.489, deno: 167.531, zipp: 133.305 }, nodeRatio: 0.673612550 },
+  { id: 'polymorphic-objects-v2', name: 'Polymorphic objects v2', group: 'diagnostic', times: { node: 80.647, bun: 87.478, deno: 128.792, zipp: 23.823 }, nodeRatio: 0.294970167 },
+  { id: 'property-ic-shapes', name: 'Property IC shapes', group: 'diagnostic', times: { node: 259.169, bun: 158.105, deno: 311.346, zipp: 10.526 }, nodeRatio: 0.040193527 },
+  { id: 'sparse-array-v2', name: 'Sparse array v2', group: 'diagnostic', times: { node: 168.055, bun: 365.806, deno: 182.312, zipp: 100.959 }, nodeRatio: 0.601139082 },
 ]
 
 const useCases = [
@@ -212,8 +212,8 @@ function App() {
         <section className="hero section-wrap" id="top">
           <div className="hero-copy">
             <a className="result-pill" href="#benchmarks">
-              <span>Canonical PGO · exact output</span>
-              <strong>0.918× Node across the retained ten</strong>
+              <span>Canonical PGO · 30/30 exact outputs</span>
+              <strong>0.768× Node across all 30 measured rows</strong>
               <span aria-hidden="true">↓</span>
             </a>
 
@@ -302,23 +302,23 @@ function App() {
           <div className="section-wrap proof-grid">
             <div className="proof-lead">
               <span className="metric-index">01</span>
-              <strong>9 / 13</strong>
-              <p>faster than Node</p>
+              <strong>17 / 30</strong>
+              <p>point-estimate wins vs Node</p>
             </div>
             <div>
               <span className="metric-index">02</span>
-              <strong>0.918×</strong>
-              <p>Node time · retained ten</p>
+              <strong>0.768×</strong>
+              <p>Node time · equal-row all 30</p>
             </div>
             <div>
               <span className="metric-index">03</span>
-              <strong>7.3 ms</strong>
+              <strong>7.9 ms</strong>
               <p>median process launch</p>
             </div>
             <div>
               <span className="metric-index">04</span>
-              <strong>95,939</strong>
-              <p>passing test262 runs</p>
+              <strong>30 / 30</strong>
+              <p>exact-output parity</p>
             </div>
           </div>
         </section>
@@ -403,45 +403,41 @@ function App() {
               <h2>Fast where it counts. Honest where work remains.</h2>
             </div>
             <div className="benchmark-statement">
-              <strong>29<span>/39</span></strong>
-              <p>pairwise point wins · every miss visible</p>
+              <strong>17<span>/30</span></strong>
+              <p>Node point wins · every gap visible</p>
             </div>
           </div>
 
           <div className="benchmark-summary">
             <article className="headline-result">
               <div>
-                <span>Retained ten-workload headline</span>
-                <strong>0.918×</strong>
-                <p>Zipp / Node paired geomean</p>
+                <span>Equal-row all-30 headline</span>
+                <strong>0.7679×</strong>
+                <p>Zipp / Node paired geomean · lower is better</p>
               </div>
-              <div className="confidence-pill">95% CI&nbsp; 0.914–0.922</div>
+              <div className="confidence-pill">95% CI&nbsp; 0.7642–0.7712</div>
             </article>
 
             <article className="ratio-card">
-              <span>All-13 paired geomean</span>
-              <div className="ratio-row"><b>vs Node</b><span><i className="bar-geomean-node" /></span><strong>0.635×</strong></div>
-              <div className="ratio-row"><b>vs Bun</b><span><i className="bar-geomean-bun" /></span><strong>0.556×</strong></div>
-              <div className="ratio-row"><b>vs Deno</b><span><i className="bar-geomean-deno" /></span><strong>0.546×</strong></div>
-              <small>Lower wall time is better.</small>
+              <span>All-30 paired geomeans</span>
+              <div className="ratio-row"><b>vs Node</b><span><i className="bar-geomean-node" /></span><strong>0.7679×</strong></div>
+              <div className="ratio-row"><b>vs Bun</b><span><i className="bar-geomean-bun" /></span><strong>0.6154×</strong></div>
+              <div className="ratio-row"><b>vs Deno</b><span><i className="bar-geomean-deno" /></span><strong>0.4918×</strong></div>
+              <small>95% CIs: Node 0.7642–0.7712 · Bun 0.6125–0.6199 · Deno 0.4885–0.4958. Normal 13 + hostile 17; equal weight per row.</small>
             </article>
 
-            <article className="startup-card">
-              <span>Median startup</span>
-              <div className="startup-race">
-                <div><b>Zipp</b><span><i className="bar-startup-zipp" /></span><strong>7.3</strong></div>
-                <div><b>Node</b><span><i className="bar-startup-node" /></span><strong>30.8</strong></div>
-                <div><b>Bun</b><span><i className="bar-startup-bun" /></span><strong>40.9</strong></div>
-                <div><b>Deno</b><span><i className="bar-startup-deno" /></span><strong>79.6</strong></div>
-              </div>
-              <small>Milliseconds · paired empty launches</small>
+            <article className="ratio-card suite-card">
+              <span>Suite geomeans vs Node</span>
+              <div className="ratio-row"><b>Normal 13</b><span><i className="bar-suite-normal" /></span><strong>0.6419×</strong></div>
+              <div className="ratio-row"><b>Hostile 17</b><span><i className="bar-suite-hostile" /></span><strong>0.8807×</strong></div>
+              <small>95% CIs: normal 0.6378–0.6457 · hostile 0.8745–0.8863. Node point wins: 9/13 + 8/17.</small>
             </article>
           </div>
 
           <div className="scoreboard">
             <div className="scoreboard-toolbar">
               <div>
-                <p>Cold wall time <span>milliseconds · lower is better</span></p>
+                <p>Canonical normal 13 · cold wall time <span>milliseconds · lower is better</span></p>
               </div>
               <div className="filter-tabs" role="group" aria-label="Filter benchmark rows">
                 {([
@@ -464,7 +460,7 @@ function App() {
 
             <div className="benchmark-table-wrap">
               <table className="benchmark-table">
-                <caption>Cold wall-time medians for Zipp, Node, Bun, and Deno</caption>
+                <caption>Canonical cold wall-time medians for Zipp, Node, Bun, and Deno</caption>
                 <thead>
                   <tr>
                     <th scope="col">Workload</th>
@@ -483,12 +479,12 @@ function App() {
                           <span>{row.name}</span>
                           <small>{row.group === 'headline' ? 'Headline' : 'Diagnostic'}</small>
                         </th>
-                        <td className="zipp-time" data-label="Zipp"><strong>{row.times.zipp}</strong><span className="sr-only"> milliseconds</span></td>
-                        <td data-label="Node">{row.times.node}</td>
-                        <td data-label="Bun">{row.times.bun}</td>
-                        <td data-label="Deno">{row.times.deno}</td>
+                        <td className="zipp-time" data-label="Zipp"><strong>{row.times.zipp.toFixed(3)}</strong><span className="sr-only"> milliseconds</span></td>
+                        <td data-label="Node">{row.times.node.toFixed(3)}</td>
+                        <td data-label="Bun">{row.times.bun.toFixed(3)}</td>
+                        <td data-label="Deno">{row.times.deno.toFixed(3)}</td>
                         <td className="lead-cell" data-label="Zipp divided by Node">
-                          <strong className={row.nodeRatio < 1 ? 'ratio-win' : 'ratio-gap'}>{row.nodeRatio.toFixed(2)}×</strong>
+                          <strong className={row.nodeRatio < 1 ? 'ratio-win' : 'ratio-gap'}>{row.nodeRatio.toFixed(3)}×</strong>
                           <span>{row.nodeRatio < 1 ? 'faster than Node' : 'slower than Node'}</span>
                         </td>
                       </tr>
@@ -505,15 +501,20 @@ function App() {
               Windows x86-64, high-performance power mode. Cold wall time includes process launch;
               15 paired repetitions with deterministically shuffled engine and benchmark order;
               10,000 paired-bootstrap samples; exact-byte outputs. Node 24.12.0, Bun 1.3.14,
-              Deno 2.6.10, Zipp 0.0.1 at clean PGO source <code>0bff482</code>. The three diagnostics
-              remain separate from the retained-ten headline, and these workloads are not a claim
-              of universal runtime superiority. A separate hostile application corpus tracks
-              closures, mixed shapes and types, modules, allocation pressure, and npm source; it is
-              deliberately not folded into this result.
+              Deno 2.6.10, Zipp 0.0.1 at clean PGO source <code>21288c1</code>; binary SHA-256
+              <code>c2ddb9e6…6a3cb5</code>. Median startup: Zipp 7.9 ms, Node 29.6 ms, Bun 44.9 ms,
+              Deno 82.1 ms. The all-30 result gives equal weight to all normal and hostile rows;
+              its bootstrap intervals are descriptive. Zipp has 17/30 Node point wins and 30/30
+              exact outputs. Ratios above one remain point gaps even when an interval crosses one.
+              Normal gaps: async-promise-chain 1.232×, json-large 1.051×, regex-log-scan 1.017×,
+              sparse-array 1.050×. Hostile gaps: calls-closures 1.307×, shapes-stable 1.493×,
+              shapes-megamorphic 1.484×, allocation-survival 1.772×, async-lived 1.082×,
+              reactish-reconcile 1.646×, warm-router 1.674×, bytecode-vm 1.014×, and npm-nanoid
+              1.0004×. These workloads are evidence, not a claim of universal runtime superiority.
             </p>
             <div className="methodology-links">
-              <ExternalLink className="text-link" href={BENCHMARK_URL}>Raw capture</ExternalLink>
-              <ExternalLink className="text-link" href={HOSTILE_BENCHMARK_URL}>Hostile corpus</ExternalLink>
+              <ExternalLink className="text-link" href={BENCHMARK_URL}>Normal capture</ExternalLink>
+              <ExternalLink className="text-link" href={HOSTILE_BENCHMARK_URL}>Hostile capture</ExternalLink>
             </div>
           </div>
         </section>

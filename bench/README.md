@@ -124,10 +124,39 @@ The benchmark runners stage reviewed inputs into private read-only trees and
 fail closed on drift. A diagnostic override can permit measurement; it can
 never turn a noncanonical run into publishable evidence.
 
-The canonical public artifacts at the time of writing are:
+The current canonical public artifacts are:
 
-- [`real13_0bff482_pgo_2026-08-30.json`](real13_0bff482_pgo_2026-08-30.json)
-- [`hostile/head_clean_0bff482_pgo_2026-08-30.json`](hostile/head_clean_0bff482_pgo_2026-08-30.json)
+- [`real13_21288c1_pgo_2026-08-30.json`](real13_21288c1_pgo_2026-08-30.json)
+- [`hostile/head_clean_21288c1_pgo_2026-08-30.json`](hostile/head_clean_21288c1_pgo_2026-08-30.json)
+
+Both report `publishable:true`, `ALL_CORRECT=1`, the complete four-engine order,
+15 repetitions, 10,000 bootstrap samples, and empty failure and drift lists.
+
+### Explicit all-30 view
+
+The normal and hostile suites keep separate ownership and publication gates.
+When one project-wide number is useful, the documented equal-row point is:
+
+```text
+G30 = exp((13 × ln(G13) + 17 × ln(G17)) / 30)
+```
+
+For the `21288c1` artifacts it is **0.767921× Node**, **0.615368× Bun**, and
+**0.491764× Deno**. The descriptive 95% intervals are respectively
+[0.764219, 0.771162], [0.612514, 0.619948], and [0.488545, 0.495795].
+
+Each bootstrap replicate draws one shared repetition-index multiset for all 13
+normal rows and an independent shared multiset for all 17 hostile rows, then
+recomputes every row median and the equal-row geomean. This preserves pairing
+inside each capture without inventing pairing between two separately scheduled
+suites. These intervals are descriptive, not hypothesis tests, and do not model
+machine-to-machine variability.
+
+The calculation uses 10,000 replicates and the harness's deterministic
+`derived_seed(0x5a172026, "all-30", "cold", competitor)` convention. The
+resulting seeds are 6046835812270333583 for Node, 3287513117674852669 for Bun,
+and 12378474950957855952 for Deno, so an independent replay can reproduce the
+reported percentiles exactly.
 
 ## PGO boundary
 

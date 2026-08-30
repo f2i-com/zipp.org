@@ -338,7 +338,19 @@ complete, provenance-stamped capture.
 
 ## Performance evidence
 
-The canonical engine table lives in the root README and its committed JSON.
+The canonical engine table lives in the root README. Its current clean PGO
+inputs are `bench/real13_21288c1_pgo_2026-08-30.json` and
+`bench/hostile/head_clean_21288c1_pgo_2026-08-30.json`; both are complete
+four-engine captures with `publishable:true` and exact output throughout.
+
+At engine commit `21288c1`, Zipp's paired cold geomean is **0.642× Node** across
+the normal 13 and **0.881× Node** across the hostile 17. The explicitly derived
+equal-row all-30 view is **0.768× Node** [0.764, 0.771]. That aggregate does not
+erase suite ownership: its point is
+`exp((13 × ln(G13) + 17 × ln(G17)) / 30)`, and its descriptive bootstrap treats
+the two separately captured suites as independent strata. Thirteen Node point
+gaps remain, so it is not an every-row superiority claim.
+
 Current optimization evidence and next work live in `PERF_ROADMAP.md`. Detailed
 B001–B252 measurements and refutations live in the archive.
 

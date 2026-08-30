@@ -1,145 +1,107 @@
 # Zipp performance handoff
 
 This is the current continuation note. Historical snapshots through B252 are
-archived in [`docs/archive/HANDOFF-through-B252.md`](docs/archive/HANDOFF-through-B252.md).
-The current roadmap is [`PERF_ROADMAP.md`](PERF_ROADMAP.md); the full B001–B252
-experiment ledger is preserved separately in
+archived in [`docs/archive/HANDOFF-through-B252.md`](docs/archive/HANDOFF-through-B252.md),
+and the B001–B252 experiment ledger is preserved in
 [`docs/archive/PERF_LEDGER-B001-B252.md`](docs/archive/PERF_LEDGER-B001-B252.md).
 
 ## Current engine baseline
 
-The reviewed engine baseline is `2869e91` on `main`, pushed to `origin/main`.
-The clean release binary frozen for the final development gates is:
+The reviewed engine source is commit
+`21288c1219b06f1c4c30128b5eb9beb02a996503` on `main`. It lands:
+
+- stable paired-`typeof` fusion (`ZIPP_NO_TYPEOF_SAME=1`);
+- call-free Tier-C loose-null checks
+  (`ZIPP_NO_TIERC_LOOSE_NULL_INLINE=1`);
+- polymorphic-function-id Cross3 routing (`ZIPP_NO_CROSS3_POLY_FID=1`);
+- a deferred flat-ASCII append cursor (`ZIPP_NO_STR_APPEND_CURSOR=1`); and
+- correct protected returns through `finally`, with new parity coverage.
+
+The clean publication executable is:
 
 ```text
-target/bench-binaries/zipp-b254-final-2869e91.exe
-commit  2869e9195a18d383ca020c79fbc2668c3bdbe13d
-sha256 bf85742b29500e1623f4ccaec1b56cae37de10084ef9ade1b3ad119f5ef85952
+target/canonical-21288c1/zipp-21288c1-pgo.exe
+commit  21288c1219b06f1c4c30128b5eb9beb02a996503
+sha256 c2ddb9e6562edd165310362c918670b4a1539385b0912924aef1fbf4fb6a3cb5
+profile fbe1699292bc6ff3c7fd5c4609dee59a648c3213e375dd339dd73dc5ffe91743
 dirty  false
 ```
 
-The latest small commits are:
-
-| Commit | Result |
-|---|---|
-| `ff1c737` | B253: memoize the stable pinned-ASCII suffix between guarded integer-concat memos. |
-| `4ff3bdf` | B254: serve `.length` for a proven pinned flat-ASCII call result directly from its immutable MEM snapshot. |
-| `6f945ce` | Safety hardening: identity IC empty ways use an impossible canonicalized-NaN marker, so raw numeric `+0` cannot match an empty way under feature off-switches. |
-| `2869e91` | Safety hardening: suffix admission verifies both concat links have `dst == a == accumulator` and the trailing move consumes that accumulator. |
-
-The two hardening commits deliberately claim no speed delta.
-
 ## Canonical public state
 
-Do not replace the public engine ratios with development A/B results.
+The current raw captures are:
 
-- Canonical normal capture: `bench/real13_0bff482_pgo_2026-08-30.json`
-- Canonical hostile capture: `bench/hostile/head_clean_0bff482_pgo_2026-08-30.json`
-- Zipp commit: `0bff482`, provenance-stamped PGO, `publishable:true`
-- Normal retained-ten: `0.918× Node` [0.914, 0.922]
-- Normal all-13: `0.635× Node` [0.633, 0.637]
-- Hostile all-17 ordinary: `0.866177× Node` [0.858901, 0.870652]
-- Hostile category-balanced: `0.906139× Node` [0.899437, 0.911396]
-- Literal all-engine/all-row gate: false; 29/39 point and exact-sign wins
-- Conformance: 95,939 / 95,942 required test262 executions
+- `bench/real13_21288c1_pgo_2026-08-30.json`
+- `bench/hostile/head_clean_21288c1_pgo_2026-08-30.json`
 
-A fresh clean PGO Node/Bun/Deno/Zipp capture is required before any of those
-engine-facing ratios changes.
+Both use Node v24.12.0, Bun 1.3.14, Deno 2.6.10, and Zipp 0.0.1. Both report
+`publishable:true`, `ALL_CORRECT=1`, 15 complete counterbalanced repetitions,
+10,000 bootstrap samples, and empty provenance, publication, correctness,
+health, source-drift, engine-drift, input-drift, and harness-drift failures.
 
-## Latest development evidence
+| Corpus | vs Node | vs Bun | vs Deno |
+|---|---:|---:|---:|
+| retained ten | **0.921×** [0.913, 0.928] | 0.782× [0.778, 0.789] | 0.797× [0.790, 0.806] |
+| diagnostics three | **0.192×** [0.191, 0.195] | 0.171× [0.168, 0.174] | 0.152× [0.150, 0.155] |
+| normal all 13 | **0.642×** [0.638, 0.646] | 0.550× [0.547, 0.555] | 0.544× [0.540, 0.549] |
+| hostile all 17 | **0.881×** [0.874, 0.886] | 0.670× [0.665, 0.677] | 0.455× [0.450, 0.461] |
+| hostile category-balanced | **0.913×** [0.907, 0.919] | 0.686× [0.678, 0.695] | 0.467× [0.462, 0.473] |
+| all 30, equal row weight | **0.768×** [0.764, 0.771] | 0.615× [0.613, 0.620] | 0.492× [0.489, 0.496] |
 
-All results below are exact-output diagnostics with `publishable:false`.
+The all-30 point is
+`exp((13 × ln(G13) + 17 × ln(G17)) / 30)`. Its 10,000-sample descriptive
+bootstrap shares resampled repetition indices within a suite and resamples the
+normal and hostile captures independently. It is not a hypothesis test and does
+not estimate machine-to-machine variability.
 
-### B253 — React-shaped stable suffix
+Normal has 29 / 39 point and Bonferroni exact-sign wins across all competitors;
+hostile has 36 / 51. Against Node alone, Zipp has 17 / 30 point and exact-sign
+wins. The literal all-row target remains false.
 
-On one feature-candidate binary, 32 balanced pairs of `reactish-reconcile`
-measured:
+## Current Node gaps
 
-```text
-81.4764 ms -> 77.9637 ms
-new / old  0.958636
-95% CI     [0.949720, 0.965530]
-strict     31 / 32 wins
-```
-
-The complete same-binary normal and hostile safety sweeps were neutral. The
-mechanism is guarded by `ZIPP_NO_CONCAT_SUFFIX_MEMO=1`.
-
-### B254 final — NanoID pinned length
-
-Final reviewed same-binary latch, 32 balanced pairs:
-
-```text
-119.0435 ms -> 103.0110 ms
-new / old    0.868869  (-13.11%)
-95% CI       [0.860467, 0.873758]
-strict       31 / 32 wins
-```
-
-Final versus B252, 32 balanced pairs:
-
-```text
-117.631 ms -> 102.625 ms
-new / old   0.871516  (-12.85%)
-95% CI      [0.866427, 0.881037]
-strict      32 / 32 wins
-```
-
-Final versus the nearer frozen B253 feature build, complete hostile corpus,
-32 balanced pairs:
-
-| Metric | New / old | Descriptive 95% CI |
+| Row | Zipp / Node | Descriptive 95% interval |
 |---|---:|---:|
-| all-17 cold geomean | **0.987230** | [0.984695, 0.991308] |
-| category-balanced cold geomean | **0.982579** | [0.979742, 0.987197] |
-| NanoID | **0.871198** | [0.866817, 0.877921] |
-| React-shaped reconcile | **0.978798** | [0.974462, 0.991749] |
+| allocation-survival | **1.772×** | [1.703, 1.804] |
+| warm-router | **1.674×** | [1.645, 1.707] |
+| reactish-reconcile | **1.646×** | [1.630, 1.710] |
+| shapes-stable | **1.493×** | [1.445, 1.517] |
+| shapes-megamorphic | **1.484×** | [1.452, 1.519] |
+| calls-closures | **1.307×** | [1.283, 1.313] |
+| async-promise-chain | **1.232×** | [1.218, 1.247] |
+| async-lived | **1.082×** | [1.078, 1.133] |
+| json-large | **1.051×** | [1.019, 1.074] |
+| sparse-array | **1.050×** | [1.022, 1.061] |
+| regex-log-scan | **1.017×** | [0.983, 1.079] |
+| bytecode-vm | **1.014×** | [0.984, 1.021] |
+| npm-nanoid | **1.000×** | [0.992, 1.026] |
 
-Every output was exact and no cold row had a supported regression. The runner
-reported `analysis_complete:false` only because startup-adjusted work was
-unavailable for the very short `allocation-ephemeral` case; its cold evidence
-is intact. The old B253 comparator is a frozen dirty feature build, so this is
-decision evidence rather than publication evidence.
-
-The final normal all-13 safety sweep used 16 balanced pairs and was neutral:
-`0.9950×` [0.9873, 1.0017], `ALL_CORRECT=1`.
-
-The direct filtered Node diagnostic is also honest about what remains:
-
-| Case | Final Zipp / Node | Status |
-|---|---:|---|
-| npm-nanoid | **1.169×** [1.160, 1.195] | Much improved from canonical 1.396×; still behind. |
-| reactish-reconcile | **1.673×** [1.618, 1.715] | Major open target. |
+NanoID, bytecode-vm, and regex are point gaps with descriptive intervals that
+cross parity. Do not describe them as supported regressions, but do keep them in
+the literal point-estimate inventory.
 
 ## Verification completed
 
-- `cargo test -p zipp-vm --release --test call_result_str_pin`: 8 / 8
-- identity empty-marker release unit: 1 / 1
-- concat suffix invariant release unit: 1 / 1
-- `cargo test -p zipp-vm --release --test concat_chain`: 19 / 19
-- default, `--no-default-features`, and `safe-sandbox` compile checks
-- raw `+0` fallback under `ZIPP_NO_PINNED_STR_LEN=1`,
-  `ZIPP_NO_QUICK_LEN=1`, and `ZIPP_NO_CALL_RESULT_STR_PIN=1`
-- exact-output NanoID, full hostile, normal all-13, and filtered Node diagnostics
-
-The repository-wide release gate and a new canonical PGO capture should be run
-after the documentation cleanup and before changing public engine ratios.
+- `cargo test --workspace --release`
+- focused protected-return, append-cursor, poly-FID, Tier-C object-literal, and
+  instruction-use tests
+- `cargo check -p zipp-vm --no-default-features`
+- `cargo check -p zipp-vm --no-default-features --features safe-sandbox`
+- clean provenance-stamped PGO build from committed source
+- complete normal and hostile Node/Bun/Deno/Zipp captures with exact output
 
 ## Highest-value next work
 
-1. **React-shaped reconcile (`1.673× Node`).** Re-profile the post-B253 binary;
-   do not reuse the pre-B253 attribution blindly. Focus on recursive framed
-   calls, handler-bearing loop admission, repeated `typeof`/loose-null helpers,
-   and allocation inside regions only after counters confirm the current split.
-2. **NanoID (`1.169× Node`).** The `.length` term is substantially reduced.
-   Re-profile `charCodeAt` and the outer-MEM/inner-INT composition boundary;
-   price each term before adding a wider string shortcut.
-3. **Canonical refresh.** Produce one clean provenance-stamped PGO
-   Node/Bun/Deno/Zipp capture for both normal and hostile suites. This decides
-   whether the public ratios move.
-4. **Other canonical gaps.** Allocation survival, warm router,
-   async-promise-chain, and shape cases remain above Node in the last clean
-   public hostile table. Scout one row at a time and land only isolated wins.
+1. **Allocation survival (`1.772× Node`).** Separate promotion, survivor tracing,
+   free-list, and pool-maintenance costs; the ephemeral row is already fast.
+2. **Warm router and React (`1.674×` / `1.646×`).** Re-profile B255 and split
+   call dispatch from property/string/allocation costs before designing a lane.
+3. **Stable and megamorphic shapes (`1.493×` / `1.484×`).** Their similar gaps
+   make a purely polymorphic-IC explanation unlikely; compare counters directly.
+4. **Closure calls and async (`1.307×`, `1.232×`, `1.082×`).** Price one
+   mechanism at a time and require both full safety suites after each candidate.
+5. **Near-parity rows.** Only pursue JSON, sparse, regex, bytecode-vm, or NanoID
+   when a cheap isolated term is visible; avoid trading away larger wins.
 
 ## Commands for the next session
 
@@ -150,7 +112,7 @@ cargo build -p zipp-cli --release
 & target\release\zipp.exe --version --json
 ```
 
-Run a normal binary A/B:
+Run a focused normal binary A/B:
 
 ```powershell
 python tools\bench.py `
@@ -163,7 +125,7 @@ python tools\bench.py `
   --allow-nonhead-engine
 ```
 
-Run a filtered hostile engine diagnostic:
+Run a focused hostile engine diagnostic:
 
 ```powershell
 python tools\bench_hostile.py `
@@ -174,22 +136,13 @@ python tools\bench_hostile.py `
   --json target\bench-results\focused-node.json
 ```
 
-Build the publication PGO binary from an x64 Visual Studio Developer
-PowerShell:
-
-```powershell
-& 'C:\Program Files\Git\bin\bash.exe' tools/pgo.sh
-```
-
 ## Working rules
 
-- Keep implementation, validation, docs, and cleanup in small commits; push
-  each verified win.
+- Keep implementation, validation, documentation, and cleanup in small commits.
 - Prefer a same-binary off-switch A/B for attribution, then compare frozen
-  binaries for layout/generalisation.
-- Cold time is the gate. Treat adjusted time as diagnostic on short rows.
-- Preserve exact output and empty health/correctness/drift failure lists.
+  binaries for layout and generalisation.
+- Cold time is the publication gate; adjusted time is diagnostic on short rows.
+- Preserve exact output and empty health, correctness, and drift failure lists.
 - Keep routine artifacts under ignored `target/bench-results/`.
-- Never promote a dirty, filtered, non-PGO, or incomplete-engine artifact as a
-  public score.
-- Record neutral and refuted ideas in the roadmap so they are not repeated.
+- Never promote a dirty, filtered, non-PGO, or incomplete-engine artifact.
+- Record neutral and refuted ideas so they are not repeated.
