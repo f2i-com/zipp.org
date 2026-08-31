@@ -173,6 +173,15 @@ function Playground() {
   const workerRef = useRef<Worker | null>(null)
   const timerRef = useRef<number | undefined>(undefined)
   const runIdRef = useRef(0)
+  // A Worker that has already loaded the module and executed some JavaScript, so
+  // the WebAssembly functions a run needs are compiled before the click rather
+  // than during it. It is handed to the next run and immediately replaced — a run
+  // still gets a Worker of its own, so terminating one on a deadline still
+  // discards everything that run touched.
+  const spareRef = useRef<Worker | null>(null)
+  const spareReadyRef = useRef(false)
+
+  const packageBase = () => new URL(`${import.meta.env.BASE_URL}wasm/`, document.baseURI)
 
   const stopWorker = () => {
     window.clearTimeout(timerRef.current)
@@ -181,7 +190,49 @@ function Playground() {
     workerRef.current = null
   }
 
-  useEffect(() => () => stopWorker(), [])
+  const discardSpare = () => {
+    spareRef.current?.terminate()
+    spareRef.current = null
+    spareReadyRef.current = false
+  }
+
+  // V8 compiles this module's WebAssembly lazily, on first call of each function,
+  // which measured ~40 ms against ~1.2 ms for the sample's actual work. Paying it
+  // on an idle Worker ahead of time is the whole difference.
+  const prewarm = () => {
+    if (spareRef.current) return
+    const base = packageBase()
+    const worker = new Worker(new URL('./playground.worker.ts', import.meta.url), { type: 'module' })
+    spareRef.current = worker
+    spareReadyRef.current = false
+    worker.onmessage = (event: MessageEvent<{ type?: string }>) => {
+      if (event.data?.type === 'warmed') spareReadyRef.current = true
+      // A warm-up that fails is not an error the reader should see: the run path
+      // loads the module itself and will surface anything real.
+      else if (event.data?.type === 'warm-failed') discardSpare()
+    }
+    worker.onerror = () => discardSpare()
+    worker.postMessage({
+      type: 'warm',
+      moduleUrl: new URL('zipp_wasm.js', base).href,
+      wasmUrl: new URL('zipp_wasm_bg.wasm', base).href,
+    })
+  }
+
+  // Warm on intent rather than on mount, so a visitor who never touches the
+  // playground is not made to download and compile 5.7 MB to scroll past it.
+  useEffect(() => {
+    const idle = window.requestIdleCallback?.bind(window)
+    const handle = idle ? idle(() => prewarm(), { timeout: 4000 }) : undefined
+    return () => {
+      if (handle !== undefined) window.cancelIdleCallback?.(handle)
+    }
+  }, [])
+
+  useEffect(() => () => {
+    stopWorker()
+    discardSpare()
+  }, [])
 
   const armTimeout = (runId: number, delay: number, phase: 'boot' | 'run') => {
     window.clearTimeout(timerRef.current)
@@ -199,14 +250,20 @@ function Playground() {
   const runSource = () => {
     stopWorker()
     const runId = ++runIdRef.current
-    const worker = new Worker(new URL('./playground.worker.ts', import.meta.url), { type: 'module' })
-    const packageBase = new URL(`${import.meta.env.BASE_URL}wasm/`, document.baseURI)
+    const base = packageBase()
+
+    // Take the pre-warmed Worker if there is one, then start warming its
+    // replacement straight away so a second Run is as quick as the first.
+    const warmed = spareReadyRef.current
+    const worker = spareRef.current ?? new Worker(new URL('./playground.worker.ts', import.meta.url), { type: 'module' })
+    spareRef.current = null
+    spareReadyRef.current = false
 
     workerRef.current = worker
     setStatus('loading')
     setElapsedMs(null)
-    setOutput('Loading the browser-safe Zipp runtime…')
-    armTimeout(runId, PLAYGROUND_BOOT_TIMEOUT_MS, 'boot')
+    setOutput(warmed ? 'Running in an isolated Worker…' : 'Loading the browser-safe Zipp runtime…')
+    armTimeout(runId, warmed ? PLAYGROUND_RUN_TIMEOUT_MS : PLAYGROUND_BOOT_TIMEOUT_MS, warmed ? 'run' : 'boot')
 
     worker.onmessage = (event: MessageEvent<PlaygroundWorkerMessage>) => {
       const message = event.data
@@ -243,9 +300,11 @@ function Playground() {
       type: 'run',
       runId,
       source,
-      moduleUrl: new URL('zipp_wasm.js', packageBase).href,
-      wasmUrl: new URL('zipp_wasm_bg.wasm', packageBase).href,
+      moduleUrl: new URL('zipp_wasm.js', base).href,
+      wasmUrl: new URL('zipp_wasm_bg.wasm', base).href,
     })
+
+    prewarm()
   }
 
   const resetSource = () => {
