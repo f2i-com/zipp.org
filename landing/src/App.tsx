@@ -183,6 +183,20 @@ function Playground() {
 
   const packageBase = () => new URL(`${import.meta.env.BASE_URL}wasm/`, document.baseURI)
 
+  // The glue and the .wasm are hash-matched halves of one artifact; a cache that
+  // serves a new .wasm beside an older glue fails instantiation with "function
+  // import requires a callable". Neither filename is fingerprinted (they are
+  // copied verbatim out of public/), so the build id is what keeps the pair
+  // together — it changes whenever either file does.
+  const wasmUrls = () => {
+    const base = packageBase()
+    const v = `?v=${__ZIPP_WASM_BUILD__}`
+    return {
+      moduleUrl: new URL(`zipp_wasm.js${v}`, base).href,
+      wasmUrl: new URL(`zipp_wasm_bg.wasm${v}`, base).href,
+    }
+  }
+
   const stopWorker = () => {
     window.clearTimeout(timerRef.current)
     timerRef.current = undefined
@@ -201,7 +215,6 @@ function Playground() {
   // on an idle Worker ahead of time is the whole difference.
   const prewarm = () => {
     if (spareRef.current) return
-    const base = packageBase()
     const worker = new Worker(new URL('./playground.worker.ts', import.meta.url), { type: 'module' })
     spareRef.current = worker
     spareReadyRef.current = false
@@ -212,11 +225,7 @@ function Playground() {
       else if (event.data?.type === 'warm-failed') discardSpare()
     }
     worker.onerror = () => discardSpare()
-    worker.postMessage({
-      type: 'warm',
-      moduleUrl: new URL('zipp_wasm.js', base).href,
-      wasmUrl: new URL('zipp_wasm_bg.wasm', base).href,
-    })
+    worker.postMessage({ type: 'warm', ...wasmUrls() })
   }
 
   // Warm on intent rather than on mount, so a visitor who never touches the
@@ -250,7 +259,6 @@ function Playground() {
   const runSource = () => {
     stopWorker()
     const runId = ++runIdRef.current
-    const base = packageBase()
 
     // Take the pre-warmed Worker if there is one, then start warming its
     // replacement straight away so a second Run is as quick as the first.
@@ -296,13 +304,7 @@ function Playground() {
       setOutput(event.message || 'The Zipp Worker could not start.')
     }
 
-    worker.postMessage({
-      type: 'run',
-      runId,
-      source,
-      moduleUrl: new URL('zipp_wasm.js', base).href,
-      wasmUrl: new URL('zipp_wasm_bg.wasm', base).href,
-    })
+    worker.postMessage({ type: 'run', runId, source, ...wasmUrls() })
 
     prewarm()
   }
