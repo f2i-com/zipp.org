@@ -8,10 +8,9 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build && node precompress.mjs",
+    "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc -b --pretty false",
-    "precompress": "node precompress.mjs"
+    "typecheck": "tsc -b --pretty false"
   },
   "dependencies": {
     "react": "^19.2.8",
