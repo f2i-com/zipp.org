@@ -428,6 +428,34 @@ impl Engine {
         Ok(out.into())
     }
 
+    /// Fingerprint many globals in one boundary crossing.
+    ///
+    /// One number per index: equal numbers mean `getGlobalsBatch` would
+    /// return an equal value, so a host can skip reading the ones that have not
+    /// moved. `NaN` means "unknown, read it", which is what a value too large
+    /// to walk reports — the fallback is always the old always-read behaviour.
+    ///
+    /// Digests are 53-bit so they land exactly in a JS number. At that width a
+    /// collision across a UI's worth of state is not a practical concern, and the
+    /// cost of one would be a skipped update, not corruption.
+    #[wasm_bindgen(js_name = getGlobalsFingerprint)]
+    pub fn get_globals_fingerprint(&mut self, indices: JsValue) -> Result<JsValue, JsValue> {
+        self.ensure_live()?;
+        let mut budget = HostValueBudget::default();
+        let indices = index_list(&indices, &mut budget).map_err(to_js_error)?;
+        let out = js_sys::Float64Array::new_with_length(indices.len() as u32);
+        if let Some(st) = self.state.as_mut() {
+            for (n, i) in indices.into_iter().enumerate() {
+                let cell = match st.fingerprint_slot(i) {
+                    Some(h) => (h & ((1u64 << 53) - 1)) as f64,
+                    None => f64::NAN,
+                };
+                out.set_index(n as u32, cell);
+            }
+        }
+        Ok(out.into())
+    }
+
     /// Write many globals in one boundary crossing.
     #[wasm_bindgen(js_name = setGlobalsBatch)]
     pub fn set_globals_batch(&mut self, indices: JsValue, values: JsValue) -> Result<(), JsValue> {

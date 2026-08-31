@@ -303,6 +303,23 @@ pub enum HostValue {
 /// graph cannot exhaust the native stack (this walk is natively recursive).
 const MAX_DEPTH: usize = 64;
 
+/// Digest of a global that is absent or never initialised.
+const FP_ABSENT: u64 = 0x9e37_79b9_7f4a_7c15;
+/// FNV-1a's offset basis. The mixer only has to turn a change in the walked
+/// graph into a change in the digest; it is not a cryptographic commitment.
+const FP_SEED: u64 = 0xcbf2_9ce4_8422_2325;
+/// Nodes one fingerprint will walk before giving up and reporting "unknown".
+/// Well above any real UI state, and far below anything that would make the
+/// walk cost more than the copy it exists to avoid.
+const FP_MAX_NODES: usize = 2_000_000;
+
+#[inline]
+fn fp_mix(h: &mut u64, x: u64) {
+    *h ^= x;
+    *h = h.wrapping_mul(0x100_0000_01b3);
+    *h ^= *h >> 29;
+}
+
 /// Default structural-conversion limits used at every host boundary.
 ///
 /// A depth limit alone is not sufficient: a guest can build a tiny shared DAG
@@ -470,6 +487,180 @@ impl<'p> Vm<'p> {
         let mut seen: Vec<u32> = Vec::new();
         let mut budget = HostValueBudget::default();
         self.host_out(v, 0, &mut seen, &mut budget)
+    }
+
+    /// A digest of what global `index` would marshal to, without marshalling it.
+    ///
+    /// A host that mirrors globals pays for what they HOLD, not for how many
+    /// changed: reading a 51 KB scene description out of the heap and rebuilding
+    /// it as host values costs the same whether or not a byte of it moved. This
+    /// walks the same graph `host_out` would, in the same order and with the
+    /// same depth and cycle rules, and hashes it instead of allocating — so an
+    /// unchanged digest means an unchanged marshalled value, and the host can
+    /// skip the copy entirely.
+    ///
+    /// Deliberately NOT a write-generation counter. `global_gens` already
+    /// exists and would be cheaper, but it moves only when the SLOT is assigned:
+    /// `arr.push(x)` mutates the array a global points at without touching
+    /// the slot, so a generation would report "unchanged" for a value that did
+    /// change. A content digest cannot miss that, because it reads the content.
+    ///
+    /// `None` means "assume it changed" — returned when the graph is larger
+    /// than this walk will traverse, so a pathological value degrades to the old
+    /// always-copy behaviour rather than to a wrong answer.
+    pub(crate) fn host_fingerprint_slot(&mut self, index: u32) -> Option<u64> {
+        let v = match self.globals.get(index as usize) {
+            Some(v) => *v,
+            None => return Some(FP_ABSENT),
+        };
+        if v.is_uninitialized() {
+            return Some(FP_ABSENT);
+        }
+        let _g = self.gc_lock_guard();
+        let mut seen: Vec<u32> = Vec::new();
+        let mut h: u64 = FP_SEED;
+        let mut nodes: usize = 0;
+        if self.host_fp(v, 0, &mut seen, &mut h, &mut nodes) {
+            Some(h)
+        } else {
+            None
+        }
+    }
+
+    /// Hash `v` into `h`. False means the node budget ran out, which makes
+    /// the whole fingerprint unusable rather than partial — a partial digest
+    /// would be stable across a change in the part it never reached.
+    fn host_fp(
+        &mut self,
+        v: Value,
+        depth: usize,
+        seen: &mut Vec<u32>,
+        h: &mut u64,
+        nodes: &mut usize,
+    ) -> bool {
+        *nodes += 1;
+        if *nodes > FP_MAX_NODES {
+            return false;
+        }
+        if v.is_undefined() || v.is_uninitialized() {
+            fp_mix(h, 1);
+            return true;
+        }
+        if v.is_null() {
+            fp_mix(h, 2);
+            return true;
+        }
+        if v.is_bool() {
+            fp_mix(h, if v.as_bool() { 3 } else { 4 });
+            return true;
+        }
+        if v.is_int() {
+            fp_mix(h, 5);
+            fp_mix(h, v.as_int() as i64 as u64);
+            return true;
+        }
+        if v.is_double() {
+            fp_mix(h, 6);
+            // The bit pattern, not the value: 0.0 and -0.0 are different
+            // marshalled values and must be different digests.
+            fp_mix(h, v.as_f64().to_bits());
+            return true;
+        }
+        if !v.is_heap() {
+            fp_mix(h, 7);
+            return true;
+        }
+        let idx = v.heap_index();
+        if depth >= MAX_DEPTH || seen.contains(&idx) {
+            fp_mix(h, 8);
+            return true;
+        }
+
+        enum Shape {
+            Str,
+            Array(Vec<Value>),
+            Object(Vec<(String, Value)>),
+            Opaque,
+        }
+        let shape = match self.heap.get(idx) {
+            HeapObj::Str(_) | HeapObj::Cons { .. } => Shape::Str,
+            HeapObj::Array(items) => Shape::Array(items.clone()),
+            HeapObj::Object(m) => {
+                let mut pairs = Vec::new();
+                for i in 0..m.keys.len() {
+                    let a = &m.attr_at(i);
+                    // The same exclusion host_out makes: an accessor is never
+                    // invoked, so it contributes nothing to the marshalled value
+                    // and must contribute nothing to the digest either.
+                    if !a.enumerable || a.accessor {
+                        continue;
+                    }
+                    pairs.push((m.keys[i].clone(), m.val_at(i)));
+                }
+                Shape::Object(pairs)
+            }
+            _ => Shape::Opaque,
+        };
+
+        match shape {
+            Shape::Opaque => {
+                fp_mix(h, 9);
+                true
+            }
+            Shape::Str => {
+                fp_mix(h, 10);
+                let s = self.to_js_string(v).unwrap_or_default();
+                fp_mix(h, s.len() as u64);
+                for chunk in s.as_bytes().chunks(8) {
+                    let mut word = 0u64;
+                    for (n, b) in chunk.iter().enumerate() {
+                        word |= (*b as u64) << (n * 8);
+                    }
+                    fp_mix(h, word);
+                }
+                true
+            }
+            Shape::Array(items) => {
+                fp_mix(h, 11);
+                fp_mix(h, items.len() as u64);
+                seen.push(idx);
+                for it in items {
+                    let ok = if it.is_hole() {
+                        fp_mix(h, 12);
+                        true
+                    } else {
+                        self.host_fp(it, depth + 1, seen, h, nodes)
+                    };
+                    if !ok {
+                        seen.pop();
+                        return false;
+                    }
+                }
+                seen.pop();
+                true
+            }
+            Shape::Object(pairs) => {
+                fp_mix(h, 13);
+                fp_mix(h, pairs.len() as u64);
+                seen.push(idx);
+                for (k, val) in pairs {
+                    fp_mix(h, k.len() as u64);
+                    for chunk in k.as_bytes().chunks(8) {
+                        let mut word = 0u64;
+                        for (n, b) in chunk.iter().enumerate() {
+                            word |= (*b as u64) << (n * 8);
+                        }
+                        fp_mix(h, word);
+                    }
+                    if !self.host_fp(val, depth + 1, seen, h, nodes) {
+                        seen.pop();
+                        return false;
+                    }
+                }
+                seen.pop();
+                true
+            }
+        }
     }
 
     /// Write global slot `index`. Returns `false` — leaving the slot untouched

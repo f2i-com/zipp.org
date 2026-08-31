@@ -355,6 +355,12 @@ impl ScriptState {
         }
     }
 
+    /// Fingerprint the global in `index` — see
+    /// [`Vm::host_fingerprint_slot`]. `None` means "treat it as changed".
+    pub fn fingerprint_slot(&mut self, index: u32) -> Option<u64> {
+        self.vm.as_mut()?.host_fingerprint_slot(index)
+    }
+
     /// Write the global in `index`. `false` means the write was declined
     /// because the slot holds something that cannot be represented as data (a
     /// function, a class, a `Map`, …) — see [`HostValue::Opaque`].
