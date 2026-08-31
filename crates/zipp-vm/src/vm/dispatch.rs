@@ -413,10 +413,22 @@ impl<'p> Vm<'p> {
                 // the current instruction: cloning the whole function on every
                 // call/return made otherwise-cheap calls an unmetered O(code)
                 // operation that hostile source could amplify.
+                // `Vm::func` returns `&'p FuncProto` — the PROGRAM lifetime, not
+                // a reborrow of `&self` (see its doc comment: callers may hold it
+                // across `&mut self` operations). Borrowing the instruction out of
+                // it therefore extends no borrow of the VM across the arms below,
+                // and the clone this replaces bought nothing.
+                //
+                // It cost a great deal. `Instr` has 228 fieldful variants and
+                // derives `Clone` without `Copy`, so `.clone()` lowered to a
+                // second 229-target `br_table` plus a 32-byte copy — the hardened
+                // interpreter dispatched TWICE per bytecode instruction, once to
+                // copy the instruction and once to execute it, with two
+                // unpredictable indirect branches where an interpreter should have
+                // one. Two of them are visible 19 KB apart in the shipped
+                // `dispatch_body`.
                 #[cfg(feature = "safe-sandbox")]
-                let owned_instr = self.func(func_id as usize).code[ip].clone();
-                #[cfg(feature = "safe-sandbox")]
-                let instr = &owned_instr;
+                let instr: &crate::bytecode::Instr = &self.func(func_id as usize).code[ip];
                 #[cfg(not(feature = "safe-sandbox"))]
                 let instr = &code[ip];
                 // Step budget / abort poll / execution trace. Compiled out
@@ -1226,7 +1238,27 @@ impl<'p> Vm<'p> {
                     Instr::Mod { dst, a, b } => {
                         let va = self.get(base, a);
                         let vb = self.get(base, b);
-                        let r = if va.is_number() && vb.is_number() {
+                        let r = if va.is_int() && vb.is_int() {
+                            // `Mul` above already narrows the int-int case; `Mod`
+                            // did not, and on wasm that is expensive out of all
+                            // proportion: there is no float-remainder instruction,
+                            // so `f64 % f64` lowers to a call to a software `fmod`
+                            // in compiler_builtins. Profiling `i % 7` in a loop put
+                            // 18.4% of samples in `fmod`, and `%` measured 39%
+                            // slower than `+` on the same loop shape.
+                            //
+                            // i32 `%` truncates toward zero, which is exactly JS
+                            // `%`. `checked_rem` covers the two results i32 cannot
+                            // represent — a zero divisor (JS: NaN) and
+                            // `i32::MIN % -1` (JS: -0) — and a zero remainder from
+                            // a NEGATIVE dividend is -0 in JS, a double. All three
+                            // fall through to the f64 path, which produces them.
+                            let ia = va.as_int();
+                            match ia.checked_rem(vb.as_int()) {
+                                Some(rem) if rem != 0 || ia >= 0 => Value::int(rem),
+                                _ => Value::num(va.as_f64() % vb.as_f64()),
+                            }
+                        } else if va.is_number() && vb.is_number() {
                             Value::num(va.as_f64() % vb.as_f64())
                         } else {
                             self.numeric_binop(BigOp::Mod, va, vb)?

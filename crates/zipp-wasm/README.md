@@ -11,11 +11,61 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --locked
 cd crates/zipp-wasm
 cargo build --locked --release --target wasm32-unknown-unknown
-wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/zipp_wasm.wasm
-wasm-opt -Oz --strip-debug -o pkg/zipp_wasm_bg.wasm pkg/zipp_wasm_bg.wasm   # optional
+wasm-bindgen --target web --out-dir pkg \
+  --remove-name-section --remove-producers-section \
+  target/wasm32-unknown-unknown/release/zipp_wasm.wasm
 # Verify the final post-processed artifact's memory and host-import surface.
 node tests/node/check-wasm-memory.cjs pkg/zipp_wasm_bg.wasm
+# Pre-compress. Serve this body with `Content-Encoding: br`; see below.
+brotli -q 11 -f -o pkg/zipp_wasm_bg.wasm.br pkg/zipp_wasm_bg.wasm
 ```
+
+### Why there is no `wasm-opt` step
+
+There used to be a `wasm-opt -Oz --strip-debug` line here, marked optional. It is
+worse than nothing on both axes it was supposed to help, measured on this module:
+
+| post-processing | raw | brotli (the wire) |
+| --- | --- | --- |
+| none | 5,998,514 | 1,337,361 |
+| strip sections only | 5,669,892 | **1,261,091** |
+| `wasm-opt -O3` | 5,299,317 | 1,280,742 |
+| `wasm-opt -Oz` | 5,280,172 | 1,282,981 |
+
+`-Oz` is 390 KB smaller *raw* and **22 KB larger on the wire**. Binaryen's
+rewrites trade away the regularity brotli feeds on, and every byte of the real
+saving comes from dropping the 329 KB name section — which `wasm-bindgen` does
+by itself, without the 90-second pass. `-Oz` also measured **2.04% slower** and
+`-O3` **1.39% slower** on a paired counterbalanced benchmark against a
+strip-only control (~0.15% noise floor). Do not reintroduce it without
+re-measuring both numbers.
+
+Keep the release profile at `opt-level = 3`. `opt-level = "s"` and `"z"` were
+measured: `"z"` cuts the wire to 974,657 bytes and makes the interpreter
+**1.9x-2.5x slower**, which is not a trade this artifact should take.
+
+### Compression is where the bytes actually are
+
+The artifact is ~1.26 MB brotli and ~1.87 MB gzip. Serving it as gzip therefore
+costs ~600 KB per cold load — more than every build-level saving here put
+together. Confirm what your origin actually sends:
+
+```sh
+curl -sS -o /dev/null -w '%{size_download}\n' \
+  -H 'Accept-Encoding: gzip, deflate, br, zstd' https://<host>/wasm/zipp_wasm_bg.wasm
+```
+
+If that number is closer to the gzip figure than the brotli one, the origin is
+negotiating gzip. Cloudflare in front of an origin passes the origin's encoding
+through, and only emits brotli itself when `br` is the *sole* accepted encoding —
+which no real browser sends. Serve the pre-compressed `.br` body explicitly.
+`Content-Type: application/wasm` must survive that, or `instantiateStreaming`
+falls back to the slower buffering path (the generated glue warns when it does).
+
+Give it a `Cache-Control` too: without one the module is revalidated or refetched
+per visit. The filename is not content-hashed, so `immutable` needs a hash in the
+name first; until then a bounded `max-age` with revalidation is the honest
+ceiling.
 
 This crate is deliberately a separate Cargo workspace and lockfile. Cargo
 unifies features inside one workspace; isolation prevents the native CLI's JIT

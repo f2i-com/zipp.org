@@ -281,6 +281,21 @@ const HEAP_AUDIT_MASK: u64 = 0xFFFF;
 /// rather than to whatever the embedding happens to do.
 const POSTFLIGHT_AUDIT_STRIDE: u32 = 256;
 
+/// Preflight calls between forced full heap audits. The preflight sits on the
+/// per-part string paths — `JSON.stringify`, `join`, the string builders, regex
+/// results — so it runs orders of magnitude more often than either the tick
+/// stride or the boundary stride, and it is the one place where an unconditional
+/// walk turns linear work quadratic. Same bargain as `POSTFLIGHT_AUDIT_STRIDE`,
+/// same window.
+const PREFLIGHT_AUDIT_STRIDE: u32 = 256;
+
+/// `HEAP_AUDIT_MASK` polls between forced full heap walks in the dispatch loop.
+/// The poll itself stays on its old schedule and still answers from the O(1)
+/// figure every time; this is only how often the exact reconciliation runs, so
+/// in-place capacity growth is still incorporated regularly (every 64 * 65,536
+/// instructions) without the walk riding the instruction count.
+const HEAP_WALK_STRIDE: u32 = 64;
+
 /// Per-VM instrumentation state. Allocated only when a host asks for it.
 pub(crate) struct Recorder {
     /// Instructions the script may still execute, NOT counting any chunk
@@ -334,6 +349,15 @@ pub(crate) struct Recorder {
     /// the host boundary — which is what SoftN does between frames — would
     /// never reconcile at all.
     postflight_since_audit: u32,
+    /// Preflight calls since the last full audit. Starts at the stride so the
+    /// very first preflight audits: `Heap::audit_resident_bytes` is what turns
+    /// payload accounting on, and until it has run once the O(1) estimate omits
+    /// object payload entirely and would read far too low to be trusted.
+    preflight_since_audit: u32,
+    /// `HEAP_AUDIT_MASK` polls since the last full walk in the dispatch loop.
+    /// Starts at the stride so the first poll reconciles, which is also what
+    /// switches payload accounting on.
+    ticks_since_heap_walk: u32,
 }
 
 impl Recorder {
@@ -348,6 +372,8 @@ impl Recorder {
             output_exhausted: false,
             exhaustion: None,
             postflight_since_audit: 0,
+            preflight_since_audit: PREFLIGHT_AUDIT_STRIDE,
+            ticks_since_heap_walk: HEAP_WALK_STRIDE,
             dynamic_limits: DynamicCodeLimits::UNLIMITED,
             dynamic_calls: 0,
             dynamic_source_bytes: 0,
@@ -743,6 +769,52 @@ impl super::Vm<'_> {
             return Ok(());
         }
         let heap_limit = rec.heap_limit;
+
+        // The early returns above spare an UNinstrumented run the walk. They do
+        // nothing for the hardened profile, which always attaches a recorder and
+        // always sets a finite ceiling (`zipp-wasm` calls `set_heap_limit` on
+        // every `Engine`), so the artifact this crate exists for paid the full
+        // O(heap-slots) audit on every part append. That is the same shape as the
+        // 0.3s -> 258s+ regression described above, just reached down a different
+        // path: `JSON.stringify` over 16k small objects measured 165us per call
+        // against 0.2us to allocate the object being serialised, and the per-call
+        // figure doubled every time the loop count doubled.
+        //
+        // `Heap::resident_bytes` is the O(1) high-water estimate, and
+        // `audit_heap_bytes` can only ever RAISE it — the audit reconciles
+        // in-place capacity growth into the same monotonic peak and returns
+        // `resident_bytes()`. Two consequences, and the asymmetry between them is
+        // what makes this safe:
+        //
+        //   * If the cheap figure already convicts, the exact figure convicts too.
+        //     Rejecting on it is not an estimate-based kill; it is the same
+        //     verdict reached without paying for it.
+        //   * If the cheap figure acquits, the exact one might not, because it can
+        //     still discover capacity growth inside objects already counted. That
+        //     is the only direction needing the walk, so it rides a stride — the
+        //     bargain `instrument_resource_limit_error` already strikes at the
+        //     boundary and the interpreter already strikes on `HEAP_AUDIT_MASK`
+        //     ticks. The drift window is bounded by the stride, not by the
+        //     workload.
+        let estimate = self.heap.resident_bytes();
+        if bytes > heap_limit.saturating_sub(estimate) {
+            let rec = self
+                .instr_rec
+                .as_mut()
+                .expect("recorder checked present above");
+            return Err(rec.exhaust(ResourceExhaustion::Heap));
+        }
+
+        let rec = self
+            .instr_rec
+            .as_mut()
+            .expect("recorder checked present above");
+        rec.preflight_since_audit = rec.preflight_since_audit.saturating_add(1);
+        if rec.preflight_since_audit < PREFLIGHT_AUDIT_STRIDE {
+            return Ok(());
+        }
+        rec.preflight_since_audit = 0;
+
         let resident = self.heap_bytes();
         let rec = self
             .instr_rec
@@ -1092,9 +1164,42 @@ impl super::Vm<'_> {
         }
         let tracing = rec.tracing;
 
-        if ceiling != usize::MAX && self.audit_heap_bytes() > ceiling {
-            let rec = self.instr_rec.as_mut().expect("recorder checked above");
-            return Err(rec.exhaust(ResourceExhaustion::Heap));
+        // Escalate, then confirm — the same change commit 935f6dd made at the
+        // host boundary, which the interpreter's own poll was left out of.
+        //
+        // `audit_heap_bytes` is O(heap slots) and the slot table only grows, so
+        // running it on a fixed instruction stride costs an app a tax
+        // proportional to everything it is holding, for code that allocates
+        // nothing: measured at 3.3x on a non-allocating integer loop with 150,000
+        // live objects and 7.2x at 300,000. Only the wasm build ever felt it,
+        // because `heap_limit` defaults to `usize::MAX` and `zipp-wasm` is the
+        // one embedding that always calls `set_heap_limit` — which is also why
+        // no native benchmark could see it.
+        //
+        // `Heap::resident_bytes` is O(1) and the audit can only ever raise it
+        // (the walk reconciles in-place growth into the same monotonic peak and
+        // returns `resident_bytes()`). So headroom on the cheap figure is
+        // headroom the walk cannot take away, and the walk is only needed to
+        // reconcile capacity growth inside objects already counted — which rides
+        // a stride of its own rather than every poll.
+        if ceiling != usize::MAX {
+            let convicted = self.heap.resident_bytes() > ceiling;
+            let reconcile = match self.instr_rec.as_mut() {
+                Some(rec) => {
+                    rec.ticks_since_heap_walk = rec.ticks_since_heap_walk.saturating_add(1);
+                    if rec.ticks_since_heap_walk >= HEAP_WALK_STRIDE {
+                        rec.ticks_since_heap_walk = 0;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            };
+            if (convicted || reconcile) && self.audit_heap_bytes() > ceiling {
+                let rec = self.instr_rec.as_mut().expect("recorder checked above");
+                return Err(rec.exhaust(ResourceExhaustion::Heap));
+            }
         }
 
         let Some(rec) = self.instr_rec.as_mut() else {
