@@ -222,6 +222,35 @@ one. See [`SECURITY.md`](SECURITY.md) for the full deployment checklist.
 
 ## Performance, measured honestly
 
+### QuickJS-NG and Boa diagnostic — v0.0.5
+
+The v0.0.5 release was also measured against pinned interpreter builds of
+QuickJS-NG v0.16.2 and Boa v0.22.0. These are clean release-default builds on
+the same Windows x86-64 host, with identical generated source, exact-output
+validation, six counterbalanced repetitions, and 10,000 paired-bootstrap
+samples. Ratios are Zipp / competitor, so lower is faster.
+
+| Native diagnostic | Zipp interpreter / competitor | 95% CI | point wins |
+|---|---:|---:|---:|
+| frozen real13 vs QuickJS-NG | **0.6413×** | 0.6386–0.6452 | 12 / 13 |
+| micro5 vs QuickJS-NG | **0.8556×** | 0.8405–0.8761 | 5 / 5 |
+| micro5 vs Boa | **0.2539×** | 0.2501–0.2590 | 5 / 5 |
+| micro5 vs Boa `--optimize` | **0.2522×** | 0.2493–0.2593 | 5 / 5 |
+
+The native result is an aggregate win, not a universal claim: QuickJS-NG was
+1.0099× faster at the point median on the retained sparse-array row, while
+Zipp led the other twelve. The browser-WASM comparison has a different result:
+Zipp is **0.2274× Boa** but **2.1074× QuickJS-NG** on adjusted execution across
+the five diagnostic workloads. Zipp's stripped module is 5,595,833 bytes raw
+(1,254,075 Brotli-11), between QuickJS-NG's 1,528,293-byte reactor
+(417,087 Brotli-11) and Boa's 21,296,176-byte module (5,484,164 Brotli-11).
+
+The commands, exact revisions, per-row numbers, module hashes, host-interface
+differences, and limitations are in
+[`bench/comparison/README.md`](bench/comparison/README.md). These ecosystem
+comparisons are deliberately separate from the canonical Node/Bun/Deno series
+below.
+
 ### Canonical public capture
 
 The current public evidence is the clean PGO capture at engine commit

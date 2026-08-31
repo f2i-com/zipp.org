@@ -23,7 +23,7 @@ Cold wall time is the headline. Startup-adjusted time is diagnostic, especially
 on short cases. Ratios are new/old for binary A/Bs and Zipp/competitor for engine
 tables; below `1.0×` is faster.
 
-## Current status — 2026-08-30
+## Current status — 2026-08-31
 
 ### Public canonical capture
 
@@ -48,6 +48,28 @@ Across Node, Bun, and Deno, the normal suite has 29 / 39 point and exact-sign
 wins; hostile has 36 / 51. The literal all-row target remains false. See
 [`README.md`](README.md#performance-measured-honestly) for the tables and raw
 artifact links.
+
+### v0.0.5 QuickJS-NG and Boa diagnostic
+
+The release-default native executable at engine commit `7cb7210` reports
+v0.0.5, the exact source commit, `dirty:false`, `opt-level:3`, default features,
+and no PGO or ad-hoc Rust flags. Six counterbalanced repetitions with exact
+output and 10,000 bootstrap samples measured:
+
+| Suite | Comparator | Zipp / comparator | point wins |
+|---|---|---:|---:|
+| native interpreter real13 | QuickJS-NG v0.16.2 | **0.6413×** [0.6386, 0.6452] | 12 / 13 |
+| native interpreter micro5 | QuickJS-NG v0.16.2 | **0.8556×** [0.8405, 0.8761] | 5 / 5 |
+| native interpreter micro5 | Boa v0.22.0 | **0.2539×** [0.2501, 0.2590] | 5 / 5 |
+| WASM adjusted execution | QuickJS-NG reactor | **2.1074×** | 0 / 5 |
+| WASM adjusted execution | Boa package | **0.2274×** | 5 / 5 |
+
+The one native real13 QuickJS-NG point gap is sparse-array at 1.0099×. The
+larger open problem is WASM: Zipp is 5,595,833 bytes raw / 1,254,075 Brotli-11,
+versus 1,528,293 / 417,087 for the QuickJS-NG reactor and 21,296,176 / 5,484,164
+for Boa. The WASM interfaces and feature sets differ, so this is diagnostic
+attribution rather than a universal engine ranking. Exact commands and hashes
+are in [`bench/comparison/README.md`](bench/comparison/README.md).
 
 ### Correctness
 
@@ -230,7 +252,24 @@ Earlier entries, designs, hazards, and refutations remain searchable in the
 Priorities are ordered by current measured gap and by whether the next question
 can be answered with a bounded experiment.
 
-### 1. Allocation survival — 1.772× Node
+### 1. WASM execution and transfer size vs QuickJS-NG
+
+The five-row adjusted execution geomean is 2.107× QuickJS-NG and the Brotli
+module is 3.01× as large. Attribute parser/compiler setup, interpreter dispatch,
+host glue, and Rust/WASM code footprint separately. A candidate must improve
+execution without regressing the compressed wire artifact; raw size alone is
+not the shipping objective. Keep the persistent-module boundary and exact
+work/control sources fixed.
+
+### 2. Native sparse-array parity vs QuickJS-NG
+
+The v0.0.5 release wins 12 / 13 real13 point medians, with sparse-array at
+1.0099× and the next closest rows polymorphic-objects at 0.9892× and
+typedarray-math at 0.9782×. Repeat more than six rounds before treating the
+one-percent point gap as stable, then profile only if it survives. Do not spend
+correctness risk to optimize noise.
+
+### 3. Allocation survival — 1.772× Node
 
 This is the largest current Node gap and one of three hostile rows above the
 aspirational 1.50× individual cap, alongside warm-router and
@@ -238,20 +277,20 @@ reactish-reconcile. Profile nursery promotion, survivor tracing, and
 free-list/pool maintenance separately; do not infer the term from the much
 faster allocation-ephemeral row.
 
-### 2. Warm router and React reconcile — 1.674× / 1.646× Node
+### 4. Warm router and React reconcile — 1.674× / 1.646× Node
 
 Both application-shaped rows need fresh attribution on B255. For the router,
 separate closure dispatch from property and URL/string work. For React, measure
 recursive framed calls, handler-bearing loops, shape checks, and allocation
 before attempting another combined shortcut.
 
-### 3. Object shapes — 1.493× / 1.484× Node
+### 5. Object shapes — 1.493× / 1.484× Node
 
 Stable and megamorphic shapes are almost equally slow, which argues against
 assuming this is only an IC-polymorphism problem. Compare lookup, guard failure,
 transition, and allocation counters on the same binary.
 
-### 4. Calls, async, and retained normal gaps
+### 6. Calls, async, and retained normal gaps
 
 Closure calls are **1.307× Node** and async-promise-chain is **1.232×**.
 Long-lived hostile async is **1.082×**. JSON and sparse-array are about

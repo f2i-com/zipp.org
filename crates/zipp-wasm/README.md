@@ -61,8 +61,8 @@ section-stripped `wasm-bindgen --target web` module:
 | 1 CGU + ThinLTO | 5,284,887 | 1,789,214 | 1,223,108 | not timed | reject: only 649 raw bytes below CGU1, larger on the wire |
 | 1 CGU + fat LTO | 5,284,887 | 1,789,320 | 1,223,314 | not timed | reject: only 649 raw bytes below CGU1, larger on the wire |
 
-These are a reproducible artifact comparison, not a claim that every browser
-workload gets 0.95% faster. All candidates used commit
+These are a historical, reproducible build-policy comparison, not a claim that
+every browser workload gets 0.95% faster. All candidates used commit
 `d71168a9fba3c4b97a05aaacbf14cf046dc65d38`, rustc 1.92.0, locked dependencies,
 and `wasm-bindgen` 0.2.126 with the name and producers sections removed. gzip was
 level 9; Brotli was quality 11. The accepted CGU4 and rejected CGU8 builds were
@@ -75,13 +75,15 @@ largest observed slower rows were +3.76%, +2.84%, and +2.76%, and each per-row
 warm-round and measured-sample counts and counterbalanced order. LTO was already
 dominated on transfer size and was not given a throughput claim.
 
-The tracked landing-page module was then rebuilt from the selected profile in
-the primary worktree. Its exact current artifact is 5,566,206 bytes raw,
-1,845,822 bytes at gzip-9, and 1,244,186 bytes at Brotli-11, with SHA-256
-`71df836700a2431021ef6aa3793da77b86226b6b43ead76e70169ec0b9ed00fd`.
-The generated JavaScript and declarations were byte-identical to the checked-in
-files; only `zipp_wasm_bg.wasm` changed. The table retains the isolated CGU4
-candidate's sizes so every build-policy row remains a like-for-like comparison.
+The tracked v0.0.5 landing-page module was rebuilt from the selected profile at
+engine commit `7cb72106c9591613b170ba057d3c07e1cee01379`. Its exact artifact is
+5,595,833 bytes raw, 1,859,668 bytes at gzip-9, and 1,254,075 bytes at
+Brotli-11, with SHA-256
+`f3d67856f5853c235c12ee62a1cc86032492012e3942c032a08d8d22df85ff0b`.
+That is 72,700 raw bytes smaller than the v0.0.4 module it replaces. The table
+retains the isolated historical CGU4 candidate sizes so every build-policy row
+remains a like-for-like comparison. Current QuickJS-NG and Boa size and speed
+diagnostics are recorded in [`../../bench/comparison/README.md`](../../bench/comparison/README.md).
 
 ### Compression is where the bytes actually are
 

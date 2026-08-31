@@ -7,27 +7,58 @@ and the B001–B252 experiment ledger is preserved in
 
 ## Current engine baseline
 
-The reviewed engine source is commit
-`21288c1219b06f1c4c30128b5eb9beb02a996503` on `main`. It lands:
+The v0.0.5 performance source is commit
+`7cb72106c9591613b170ba057d3c07e1cee01379` on `main`. It lands the interpreter
+fast paths and focused parity tests from the v0.0.5 campaign, the bounded
+one-slot split-receiver bridge for the native integer tier, the persistent-WASM
+fingerprint API, and fail-closed heap accounting for private side tables.
 
-- stable paired-`typeof` fusion (`ZIPP_NO_TYPEOF_SAME=1`);
-- call-free Tier-C loose-null checks
-  (`ZIPP_NO_TIERC_LOOSE_NULL_INLINE=1`);
-- polymorphic-function-id Cross3 routing (`ZIPP_NO_CROSS3_POLY_FID=1`);
-- a deferred flat-ASCII append cursor (`ZIPP_NO_STR_APPEND_CURSOR=1`); and
-- correct protected returns through `finally`, with new parity coverage.
-
-The clean publication executable is:
+The clean, release-default comparison executable is:
 
 ```text
-target/canonical-21288c1/zipp-21288c1-pgo.exe
-commit  21288c1219b06f1c4c30128b5eb9beb02a996503
-sha256 c2ddb9e6562edd165310362c918670b4a1539385b0912924aef1fbf4fb6a3cb5
-profile fbe1699292bc6ff3c7fd5c4609dee59a648c3213e375dd339dd73dc5ffe91743
+target/comparison/build/zipp-native-v005-7cb72106c959/release/zipp.exe
+commit  7cb72106c9591613b170ba057d3c07e1cee01379
+sha256 b36850e162f7a9d2221ac33e888c8e5ea3d7ee85e3833e6f2e5ad9a73c0c23be
+profile release, opt-level 3, default features, no PGO or ad-hoc RUSTFLAGS
 dirty  false
 ```
 
+## v0.0.5 QuickJS-NG / Boa release diagnostic
+
+All source output matched before timing. Six complete counterbalanced rounds and
+10,000 bootstrap samples produced:
+
+| Diagnostic | Zipp / competitor | 95% interval | point wins |
+|---|---:|---:|---:|
+| native interpreter real13 / QuickJS-NG | **0.6413×** | [0.6386, 0.6452] | 12 / 13 |
+| native interpreter micro5 / QuickJS-NG | **0.8556×** | [0.8405, 0.8761] | 5 / 5 |
+| native interpreter micro5 / Boa | **0.2539×** | [0.2501, 0.2590] | 5 / 5 |
+| WASM adjusted execution / QuickJS-NG | **2.1074×** | descriptive | 0 / 5 |
+| WASM adjusted execution / Boa | **0.2274×** | descriptive | 5 / 5 |
+
+The native sparse-array point median is the only QuickJS-NG loss at 1.0099×;
+do not turn the aggregate win into an every-row claim. The larger open gap is
+browser WASM: Zipp's 5,595,833-byte raw module (1,254,075 Brotli-11) sits between
+QuickJS-NG's 1,528,293-byte reactor (417,087 Brotli-11) and Boa's 21,296,176-byte
+module (5,484,164 Brotli-11), while QuickJS-NG is about 2.1× faster on the
+five-row WASM execution diagnostic.
+
+Raw release evidence is intentionally ignored under
+`target/comparison/results/`: `native-real13-v005-qjsng-clean-6.json`,
+`native-micro5-v005-clean-6.json`, and `wasm-v005-clean-6.json`. Reproduction
+commands and artifact hashes are in
+[`bench/comparison/README.md`](bench/comparison/README.md).
+
+Focused release gates were green: safe-sandbox library 463 passed / 1 ignored,
+benchmark-tool tests 164 passed / 2 skipped, bool-home 11 passed / 1 worker
+ignored, split-receiver 7 / 7, isolated WASM Rust host 4 / 4, Node host contract
+137 / 137, and syntax corpus 23 / 23.
+
 ## Canonical public state
+
+The separate Node/Bun/Deno PGO publication series below remains the current
+canonical public capture; the v0.0.5 ecosystem comparison above does not
+silently replace it.
 
 The current raw captures are:
 

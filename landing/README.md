@@ -8,6 +8,13 @@ and
 The all-30 headline is the equal-row geomean of the normal 13 and hostile 17;
 development-only A/Bs do not silently change the public ratios.
 
+The checked-in v0.0.5 browser module is the section-stripped production build:
+5,595,833 bytes raw, 1,859,668 at gzip-9, and 1,254,075 at Brotli-11, with
+SHA-256 `f3d67856f5853c235c12ee62a1cc86032492012e3942c032a08d8d22df85ff0b`.
+The separate pinned QuickJS-NG and Boa comparison, including the remaining
+QuickJS-NG WASM gap, is documented in
+[`../bench/comparison/README.md`](../bench/comparison/README.md).
+
 ```sh
 npm install
 npm run dev
