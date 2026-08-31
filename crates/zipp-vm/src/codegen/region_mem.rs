@@ -455,23 +455,24 @@ pub(crate) fn compile_region_mem(
         ; call rax
         ; mov r14, rax                    // pinned inline-cache table base
     );
-    // A captured-limit cyclic field read cannot stay on the DOUBLE tier because
-    // its ordinary fallback header executes `UpvalGet`. Host that exact shape
-    // here, where the unchanged MEM region already implements the fallback op.
+    // A field-read prefix may reach the MEM tier either because its header needs
+    // a MEM-only op (for example `UpvalGet`) or because DOUBLE register planning
+    // declined later in the region. Host every recognized shape here as the
+    // sound fallback; DOUBLE still wins whenever it compiles successfully.
     // The helper repeats the complete recognition and receiver/effect preflight;
     // a miss has changed no JS state and falls through below.
-    let captured_field_read_prefix = meter.is_none()
-        && field_read_stream_enabled()
-        && matches!(proto.code[s], Instr::UpvalGet { .. })
-        && field_cyclic_read_stream_shape(proto, s, e);
-    if captured_field_read_prefix {
+    let field_read_prefix = meter
+        .is_none()
+        .then(|| pack_field_stream_region(heap.func_id, s, e))
+        .flatten()
+        .filter(|_| field_read_stream_enabled() && field_read_stream_shape(proto, s, e));
+    if let Some(packed) = field_read_prefix {
         if std::env::var_os("ZIPP_JITLOG").is_some() {
             eprintln!(
-                "[jit] MEM region fn{} [{start},{end}] upvalue-field-read-stream prefix",
+                "[jit] MEM region fn{} [{start},{end}] field-read-stream prefix",
                 heap.func_id
             );
         }
-        let packed = ((heap.func_id as u64) << 32) | ((s as u64) << 16) | e as u64;
         let fallback = ops.new_dynamic_label();
         dynasm!(ops
             ; mov rcx, rdi
@@ -493,17 +494,21 @@ pub(crate) fn compile_region_mem(
     // touched slot and publishes the loop-carried locals.  It runs before any
     // TA pin or region-local state is materialized, so a guard miss has changed
     // nothing and simply enters the byte-identical ordinary region below.
-    let field_write_prefix = (field_write_stream_enabled()
-        && field_write_stream_shape(proto, s, e))
-        || (field_mixed_stream_enabled() && field_mixed_stream_shape(proto, s, e));
-    if meter.is_none() && field_write_prefix {
+    let field_write_prefix = meter
+        .is_none()
+        .then(|| pack_field_stream_region(heap.func_id, s, e))
+        .flatten()
+        .filter(|_| {
+            (field_write_stream_enabled() && field_write_stream_shape(proto, s, e))
+                || (field_mixed_stream_enabled() && field_mixed_stream_shape(proto, s, e))
+        });
+    if let Some(packed) = field_write_prefix {
         if std::env::var_os("ZIPP_JITLOG").is_some() {
             eprintln!(
                 "[jit] MEM region fn{} [{start},{end}] field-write-stream prefix",
                 heap.func_id
             );
         }
-        let packed = ((heap.func_id as u64) << 32) | ((s as u64) << 16) | e as u64;
         let fallback = ops.new_dynamic_label();
         dynasm!(ops
             ; mov rcx, rdi
@@ -4073,12 +4078,7 @@ pub(crate) fn chain_next_leaf(code: &[Instr], ip: usize, acc: u16) -> Option<u16
                 b,
             }),
             Some(Instr::Move { src, .. }),
-        ) if *dst == acc
-            && *a == acc
-            && *next_dst == acc
-            && *next_a == acc
-            && *src == acc =>
-        {
+        ) if *dst == acc && *a == acc && *next_dst == acc && *next_a == acc && *src == acc => {
             Some(*b)
         }
         _ => None,

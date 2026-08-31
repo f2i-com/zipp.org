@@ -14,6 +14,59 @@ pub(crate) const MAX_ARRAY_BUFFER_LEN: i64 = 1 << 20;
 #[cfg(not(feature = "safe-sandbox"))]
 pub(crate) const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
 
+/// Immutable TypedArray internal slots copied by the interpreter's exact
+/// receiver match. Private fields make the match the only authority that can
+/// feed the direct numeric-index leaves without re-reading the receiver.
+#[derive(Clone, Copy)]
+pub(crate) struct TaInterpNumericView {
+    ta_idx: u32,
+    buffer: u32,
+    kind: u8,
+    byte_offset: usize,
+    stored_len: usize,
+}
+
+impl TaInterpNumericView {
+    /// The caller has just matched `ta_idx` as this exact non-BigInt
+    /// `HeapObj::TypedArray`; no operation between that match and this copy may
+    /// execute JavaScript or move heap slots.
+    #[inline(always)]
+    pub(crate) fn from_matched_non_bigint(
+        ta_idx: u32,
+        buffer: u32,
+        kind: u8,
+        byte_offset: usize,
+        stored_len: usize,
+    ) -> Self {
+        debug_assert!(!native::TA_KINDS[kind as usize].2);
+        Self {
+            ta_idx,
+            buffer,
+            kind,
+            byte_offset,
+            stored_len,
+        }
+    }
+}
+
+/// Runtime kind id for the allocation-free, non-BigInt DataView getters.
+/// Keeping this as a direct match avoids a linear scan of all 22 get/set names
+/// on every interpreted call.
+#[inline]
+fn dataview_get_kind(name: &str) -> Option<(usize, u8)> {
+    match name {
+        "getInt8" => Some((0, 0)),
+        "getUint8" => Some((1, 1)),
+        "getInt16" => Some((2, 3)),
+        "getUint16" => Some((3, 4)),
+        "getInt32" => Some((4, 5)),
+        "getUint32" => Some((5, 6)),
+        "getFloat32" => Some((6, 7)),
+        "getFloat64" => Some((7, 8)),
+        _ => None,
+    }
+}
+
 impl<'p> Vm<'p> {
     pub(crate) fn as_array_buffer(&self, v: Value) -> Option<u32> {
         (v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::ArrayBuffer { .. }))
@@ -29,6 +82,30 @@ impl<'p> Vm<'p> {
             _ => 0,
         }
     }
+
+    /// A DataView's effective byte length against one live buffer-length
+    /// witness. `None` is IsViewOutOfBounds: a fixed view no longer fits, or a
+    /// length-tracking view's byteOffset is past the current buffer end.
+    ///
+    /// The tracking set is empty in ordinary programs. Keep that common case
+    /// to one cheap length test before paying for a HashSet probe in the direct
+    /// interpreter/JIT getter lanes.
+    #[inline]
+    pub(crate) fn dv_effective_len_at(
+        &self,
+        view_idx: u32,
+        byte_offset: usize,
+        stored_len: usize,
+        buffer_len: usize,
+    ) -> Option<usize> {
+        if !self.dv_tracking.is_empty() && self.dv_tracking.contains(&view_idx) {
+            buffer_len.checked_sub(byte_offset)
+        } else {
+            let end = byte_offset.checked_add(stored_len)?;
+            (end <= buffer_len).then_some(stored_len)
+        }
+    }
+
     /// Effective element length of a TypedArray view, accounting for a resizable
     /// backing buffer. `None` means the view is out of bounds — detached, its
     /// offset is past the (shrunk) buffer, or a fixed-length view no longer fits;
@@ -224,6 +301,139 @@ impl<'p> Vm<'p> {
             // to one load.
             && (self.obj_realm.is_empty() || self.get_function_realm(value) == 0))
             .then_some(value)
+    }
+
+    /// Interpreter-only leaf for the common pristine DataView numeric getter.
+    /// `None` means no observable action was taken and the caller must use the
+    /// full method-dispatch path. A hit preserves the ordinary live guards:
+    /// receiver own shadows/custom prototypes and a replaced/deleted intrinsic
+    /// method all fail closed before any buffer access.
+    pub(crate) fn dataview_interp_get_fast(
+        &self,
+        view_idx: u32,
+        name: &str,
+        position: Value,
+        little_endian: Value,
+    ) -> Result<Option<Value>, Thrown> {
+        let Some((method, kind)) = dataview_get_kind(name) else {
+            return Ok(None);
+        };
+        let (buffer, byte_offset, byte_length, pristine_version) = match self.heap.get(view_idx) {
+            HeapObj::DataView {
+                buffer,
+                pristine_version,
+                byte_offset,
+                byte_length,
+            } => (*buffer, *byte_offset, *byte_length, *pristine_version),
+            _ => return Ok(None),
+        };
+        // Restrict this leaf to the main realm. Generic builtin dispatch installs
+        // the callee realm around child-realm natives; falling back retains that
+        // error-identity behaviour without burdening the main-only hot path.
+        if !self.realm_global_objs.is_empty() || self.dataview_proto == 0 {
+            return Ok(None);
+        }
+        // A fresh default-prototype DataView captures its heap version. Every
+        // own named-property creation/deletion/definition and every later
+        // [[Prototype]] change bumps it. Non-default construction is explicitly
+        // stamped then bumped, so equality replaces both hot receiver HashMap
+        // probes without losing any observable shadow.
+        let intrinsic_live = if self.heap.version_of(view_idx) != pristine_version
+            || self.dataview_proto_shape == crate::shape::DICT
+        {
+            false
+        } else {
+            match self.heap.get(self.dataview_proto) {
+                // The boot shape proves exact keys/order/descriptors. Value
+                // writes are shape-neutral, so compare the selected slot's
+                // exact pinned function bits as the independent live proof.
+                HeapObj::Object(map) => {
+                    map.shape() == self.dataview_proto_shape
+                        && method < map.len()
+                        && map.val_at(method).bits() == self.dataview_numeric_getter_bits[method]
+                }
+                _ => false,
+            }
+        };
+        if !intrinsic_live {
+            return Ok(None);
+        }
+
+        // The benchmark-hot offsets are already non-negative integral numbers.
+        // Every other ToIndex shape (fraction, string/object coercion, NaN,
+        // negative/huge value) falls back before doing observable work.
+        let Some(pos) = array_index(position) else {
+            return Ok(None);
+        };
+        let size = native::TA_KINDS[kind as usize].1;
+        let data = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => data,
+            HeapObj::ArrayBuffer { .. } => {
+                // The intrinsic has committed after its side-effect-free guards
+                // and ToIndex leaf. Match generic builtin dispatch even when
+                // the operation completes abruptly.
+                super::builtins::builtin_stats_count(self, Value::heap(view_idx), name);
+                return Err(Thrown(
+                    "TypeError: Cannot perform DataView read on a detached or out-of-bounds ArrayBuffer".into(),
+                ));
+            }
+            _ => return Ok(None),
+        };
+        // This is the final `Ok(None)` boundary. From here the direct intrinsic
+        // either returns a value or throws, so count it once here; every earlier
+        // decline remains counted only by its eventual generic dispatch.
+        super::builtins::builtin_stats_count(self, Value::heap(view_idx), name);
+        let Some(view_len) =
+            self.dv_effective_len_at(view_idx, byte_offset, byte_length, data.len())
+        else {
+            return Err(Thrown(
+                "TypeError: Cannot perform DataView read on a detached or out-of-bounds ArrayBuffer".into(),
+            ));
+        };
+        if size > view_len || pos > view_len - size {
+            return Err(Thrown(
+                "RangeError: Offset is outside the bounds of the DataView".into(),
+            ));
+        }
+        let abs = byte_offset + pos;
+        let bytes = &data[abs..abs + size];
+        let little = self.truthy(little_endian);
+        let result = match kind {
+            0 => Value::num(bytes[0] as i8 as f64),
+            1 => Value::num(bytes[0] as f64),
+            3 => Value::num(if little {
+                i16::from_le_bytes([bytes[0], bytes[1]]) as f64
+            } else {
+                i16::from_be_bytes([bytes[0], bytes[1]]) as f64
+            }),
+            4 => Value::num(if little {
+                u16::from_le_bytes([bytes[0], bytes[1]]) as f64
+            } else {
+                u16::from_be_bytes([bytes[0], bytes[1]]) as f64
+            }),
+            5 => Value::num(if little {
+                i32::from_le_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+            } else {
+                i32::from_be_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+            }),
+            6 => Value::num(if little {
+                u32::from_le_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+            } else {
+                u32::from_be_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+            }),
+            7 => Value::num(if little {
+                f32::from_le_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+            } else {
+                f32::from_be_bytes(bytes.try_into().expect("four-byte DataView read")) as f64
+            }),
+            8 => Value::num(if little {
+                f64::from_le_bytes(bytes.try_into().expect("eight-byte DataView read"))
+            } else {
+                f64::from_be_bytes(bytes.try_into().expect("eight-byte DataView read"))
+            }),
+            _ => unreachable!("dataview_get_kind returned a non-numeric getter"),
+        };
+        Ok(Some(result))
     }
 
     /// `IsTypedArrayFixedLength(O)`: is this view's length settled for good?
@@ -566,6 +776,124 @@ impl<'p> Vm<'p> {
             )),
             _ => self.make_bigint(u64::from_le_bytes(bytes) as i128),
         }
+    }
+
+    /// Allocation-free numeric-index load using internal slots already copied
+    /// by the dispatch receiver match. Backing-buffer identity, detachment and
+    /// resizable-view bounds remain live and fail closed here.
+    #[inline]
+    pub(crate) fn ta_interp_numeric_get_view(
+        &self,
+        view: TaInterpNumericView,
+        i: usize,
+    ) -> Option<Value> {
+        let TaInterpNumericView {
+            ta_idx,
+            buffer,
+            kind,
+            byte_offset,
+            stored_len,
+        } = view;
+        let size = native::TA_KINDS[kind as usize].1;
+        let data = match self.heap.get(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => data,
+            HeapObj::ArrayBuffer { .. } => return Some(Value::UNDEFINED),
+            _ => return None,
+        };
+        let len = if !self.ta_tracking.is_empty() && self.ta_tracking.contains(&ta_idx) {
+            if byte_offset > data.len() {
+                return Some(Value::UNDEFINED);
+            }
+            (data.len() - byte_offset) / size
+        } else {
+            if byte_offset
+                .checked_add(stored_len.checked_mul(size)?)
+                .is_none_or(|end| end > data.len())
+            {
+                return Some(Value::UNDEFINED);
+            }
+            stored_len
+        };
+        if i >= len {
+            return Some(Value::UNDEFINED);
+        }
+        let off = byte_offset + i * size;
+        let bytes = &data[off..off + size];
+        Some(match kind {
+            0 => Value::num(bytes[0] as i8 as f64),
+            1 | 2 => Value::num(bytes[0] as f64),
+            3 => Value::num(i16::from_le_bytes([bytes[0], bytes[1]]) as f64),
+            4 => Value::num(u16::from_le_bytes([bytes[0], bytes[1]]) as f64),
+            5 => Value::num(
+                i32::from_le_bytes(bytes.try_into().expect("four-byte TypedArray read")) as f64,
+            ),
+            6 => Value::num(
+                u32::from_le_bytes(bytes.try_into().expect("four-byte TypedArray read")) as f64,
+            ),
+            7 => Value::num(
+                f32::from_le_bytes(bytes.try_into().expect("four-byte TypedArray read")) as f64,
+            ),
+            8 => Value::num(f64::from_le_bytes(
+                bytes.try_into().expect("eight-byte TypedArray read"),
+            )),
+            11 => Value::num(crate::vm::helpers_num2::f16_bits_to_f64(
+                u16::from_le_bytes([bytes[0], bytes[1]]),
+            )),
+            _ => return None,
+        })
+    }
+
+    /// Primitive-number twin of [`Vm::ta_element_set`] using dispatch-validated
+    /// internal slots. The caller has also excluded immutable buffers. Numeric
+    /// conversion cannot execute JS, so encoding before the live bounds check
+    /// preserves TypedArraySetElement's coerce-before-valid-index order.
+    #[inline]
+    pub(crate) fn ta_interp_numeric_set_view(
+        &mut self,
+        view: TaInterpNumericView,
+        i: usize,
+        number: f64,
+    ) -> bool {
+        let TaInterpNumericView {
+            ta_idx,
+            buffer,
+            kind,
+            byte_offset,
+            stored_len,
+        } = view;
+        let size = native::TA_KINDS[kind as usize].1;
+        let bytes = ta_encode(kind, number);
+        let tracking = !self.ta_tracking.is_empty() && self.ta_tracking.contains(&ta_idx);
+        let data = match self.heap.get_mut(buffer) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => data,
+            // A detached view's numeric element write is the specified no-op
+            // after value coercion (already completed above).
+            HeapObj::ArrayBuffer { .. } => return true,
+            _ => return false,
+        };
+        let len = if tracking {
+            if byte_offset > data.len() {
+                return true;
+            }
+            (data.len() - byte_offset) / size
+        } else {
+            if byte_offset
+                .checked_add(match stored_len.checked_mul(size) {
+                    Some(bytes) => bytes,
+                    None => return true,
+                })
+                .is_none_or(|end| end > data.len())
+            {
+                return true;
+            }
+            stored_len
+        };
+        if i >= len {
+            return true;
+        }
+        let off = byte_offset + i * size;
+        data[off..off + size].copy_from_slice(&bytes[..size]);
+        true
     }
 
     /// A TypedArray element as its display string (read-only, no allocation) —
@@ -1497,11 +1825,19 @@ impl<'p> Vm<'p> {
         }
         let idx = self.heap.alloc(HeapObj::DataView {
             buffer: buf,
+            pristine_version: 0,
             byte_offset,
             byte_length,
         });
         if self.dataview_proto != 0 {
             self.proto_of.insert(idx, Value::heap(self.dataview_proto));
+        }
+        let born = self.heap.version_of(idx);
+        if let HeapObj::DataView {
+            pristine_version, ..
+        } = self.heap.get_mut(idx)
+        {
+            *pristine_version = born;
         }
         // An auto-length DataView (no explicit byteLength) over a resizable /
         // growable buffer tracks the buffer's current size (byteLength follows it,
@@ -1510,6 +1846,26 @@ impl<'p> Vm<'p> {
             self.dv_tracking.insert(idx);
         }
         Ok(Value::heap(idx))
+    }
+
+    /// Permanently invalidate a DataView's default-construction proof under the
+    /// heap version's existing practical no-wrap contract. Stamp first, then
+    /// bump: the live version differs immediately and cannot equal the token
+    /// again without 2^32 mutations of this one object.
+    pub(crate) fn invalidate_dataview_pristine(&mut self, view_idx: u32) {
+        let current = self.heap.version_of(view_idx);
+        let stamped = if let HeapObj::DataView {
+            pristine_version, ..
+        } = self.heap.get_mut(view_idx)
+        {
+            *pristine_version = current;
+            true
+        } else {
+            false
+        };
+        if stamped {
+            self.heap.bump_version(view_idx);
+        }
     }
 }
 

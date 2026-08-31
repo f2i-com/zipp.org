@@ -336,6 +336,13 @@ impl<'p> Vm<'p> {
     /// pointers). Called before entering the top-level run.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn reserve_jit_regs(&mut self) {
+        // The interpreter never holds raw pointers into the register Vec, so a
+        // runtime-disabled JIT (`ZIPP_NOJIT=1` or an embedder policy) needs no
+        // lifetime pin. Let its ordinary growth stay proportional to the
+        // frames it actually executes instead of reserving up to 256 MiB.
+        if !self.jit_enabled {
+            return;
+        }
         // Entry points may compose (`run()` followed by `run_module_entry()`).
         // Once native code has been enabled the recorded capacity is the
         // lifetime pin: never reserve again and move the allocation out from

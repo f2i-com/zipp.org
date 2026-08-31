@@ -600,7 +600,7 @@ for cargo_config in "$CARGO_HOME_CANONICAL/config" "$CARGO_HOME_CANONICAL/config
   fi
 done
 
-PGO_BUILD_CONTRACT='zipp-pgo-build-v2;cargo=build --locked --release --target=x86_64-pc-windows-msvc --package=zipp-cli --bin=zipp --no-default-features;profile=opt-level=3,lto=fat,codegen-units=1,panic=abort,incremental=false,debug=false,strip=none,debug-assertions=false,overflow-checks=false;rustflags=target-cpu=x86-64,linker-flavor=lld-link,profile-use=<verified-profile>;linker=selected-rustc-rust-lld;cc-rs=target-specific-selected-msvc-cl+lib;source=private-readonly-clean-head-snapshot-v1;cargo-config=controlled-cwd+no-home-config;target-dir=fresh;sdk=validated-environment-paths-not-byte-manifested;env=allowlist-v2'
+PGO_BUILD_CONTRACT='zipp-pgo-build-v2;cargo=build --locked --release --target=x86_64-pc-windows-msvc --package=zipp-cli --bin=zipp --no-default-features;profile=opt-level=3,lto=fat,codegen-units=1,panic=abort,incremental=false,debug=false,strip=none,debug-assertions=false,overflow-checks=false;pe-stack=reserve-268435456,commit-4096;rustflags=target-cpu=x86-64,linker-flavor=lld-link,profile-use=<verified-profile>;linker=selected-rustc-rust-lld;cc-rs=target-specific-selected-msvc-cl+lib;source=private-readonly-clean-head-snapshot-v1;cargo-config=controlled-cwd+no-home-config;target-dir=fresh;sdk=validated-environment-paths-not-byte-manifested;env=allowlist-v2'
 PGO_BUILD_ENV_POLICY='zipp-pgo-build-env-allowlist-v2'
 FORWARDED_ENV_NAMES=(
   PATH HOME USERPROFILE SystemRoot SYSTEMROOT WINDIR COMSPEC PATHEXT TEMP TMP TMPDIR

@@ -272,7 +272,6 @@ const ABORT_CHECK_MASK: u64 = 0xFFF;
 /// this audit catches capacity growth of already-existing collections.
 const HEAP_AUDIT_MASK: u64 = 0xFFFF;
 
-
 /// Host re-entries between forced full heap audits in the postflight. The
 /// interpreter reconciles on a tick stride; a host that re-enters without
 /// running bytecode ticks nothing, so it needs a stride of its own or in-place
@@ -358,6 +357,11 @@ pub(crate) struct Recorder {
     /// Starts at the stride so the first poll reconciles, which is also what
     /// switches payload accounting on.
     ticks_since_heap_walk: u32,
+    /// Retained growth in a VM-owned side table that is deliberately absent
+    /// from `Heap::resident_bytes` (private fields/brands are the motivating
+    /// case). The next interpreter poll or host-boundary postflight must run
+    /// one exact VM audit; non-allocating re-entry keeps the O(1) fast path.
+    external_heap_dirty: bool,
 }
 
 impl Recorder {
@@ -374,6 +378,7 @@ impl Recorder {
             postflight_since_audit: 0,
             preflight_since_audit: PREFLIGHT_AUDIT_STRIDE,
             ticks_since_heap_walk: HEAP_WALK_STRIDE,
+            external_heap_dirty: false,
             dynamic_limits: DynamicCodeLimits::UNLIMITED,
             dynamic_calls: 0,
             dynamic_source_bytes: 0,
@@ -826,6 +831,47 @@ impl super::Vm<'_> {
         Ok(())
     }
 
+    /// Mark retained growth outside `HeapObj` payloads. The cheap heap estimate
+    /// cannot observe these VM-owned tables, so the next scheduled interpreter
+    /// check or explicit host-boundary status read must reconcile exactly.
+    /// Repeated mutations coalesce into one walk.
+    #[inline]
+    pub(crate) fn instrument_mark_external_heap_growth(&mut self) {
+        if let Some(rec) = self.instr_rec.as_mut() {
+            rec.external_heap_dirty = true;
+        }
+    }
+
+    /// Exact counterpart for rare allocations whose retained bytes live
+    /// outside `HeapObj` payloads and therefore cannot feed the heap's O(1)
+    /// high-water estimate when admitted. Compiled RegExp programs are the
+    /// motivating case: construction is already substantially more expensive
+    /// than this walk, while auditing here makes a sequence of distinct large
+    /// programs respect the aggregate ceiling before the next one is retained.
+    pub(crate) fn instrument_preflight_external_heap_growth(&mut self, bytes: usize) -> Tick {
+        let Some(rec) = self.instr_rec.as_ref() else {
+            return Ok(());
+        };
+        if let Some(message) = rec.terminal_message() {
+            return Err(message);
+        }
+        if rec.heap_limit == usize::MAX {
+            return Ok(());
+        }
+        let heap_limit = rec.heap_limit;
+        let resident = self.audit_heap_bytes();
+        let rec = self
+            .instr_rec
+            .as_mut()
+            .expect("recorder checked present above");
+        rec.preflight_since_audit = 0;
+        rec.external_heap_dirty = false;
+        if bytes > heap_limit.saturating_sub(resident) {
+            return Err(rec.exhaust(ResourceExhaustion::Heap));
+        }
+        Ok(())
+    }
+
     /// Configure VM-wide dynamic-code ceilings. Every `do_eval` caller is
     /// covered: direct/indirect `eval`, Function constructors, ShadowRealm,
     /// and embedder eval helpers. Requires an attached recorder.
@@ -910,22 +956,23 @@ impl super::Vm<'_> {
         let heap_bytes = if ceiling == usize::MAX {
             None
         } else {
-            let stride = match self.instr_rec.as_mut() {
+            let reconcile = match self.instr_rec.as_mut() {
                 Some(rec) => {
                     rec.postflight_since_audit = rec.postflight_since_audit.saturating_add(1);
-                    if rec.postflight_since_audit >= POSTFLIGHT_AUDIT_STRIDE {
+                    let stride = rec.postflight_since_audit >= POSTFLIGHT_AUDIT_STRIDE;
+                    if stride {
                         rec.postflight_since_audit = 0;
-                        true
-                    } else {
-                        false
                     }
+                    let external = rec.external_heap_dirty;
+                    rec.external_heap_dirty = false;
+                    stride || external
                 }
                 None => false,
             };
             // Convict on the cheap figure, then confirm with the exact one: the
             // estimate holds a freed-memory overshoot the audit is what settles,
             // and killing a VM is not a thing to do on an estimate.
-            if stride || self.heap.resident_bytes() > ceiling {
+            if reconcile || self.heap.resident_bytes() > ceiling {
                 Some(self.audit_heap_bytes())
             } else {
                 None
@@ -1187,12 +1234,13 @@ impl super::Vm<'_> {
             let reconcile = match self.instr_rec.as_mut() {
                 Some(rec) => {
                     rec.ticks_since_heap_walk = rec.ticks_since_heap_walk.saturating_add(1);
-                    if rec.ticks_since_heap_walk >= HEAP_WALK_STRIDE {
+                    let stride = rec.ticks_since_heap_walk >= HEAP_WALK_STRIDE;
+                    if stride {
                         rec.ticks_since_heap_walk = 0;
-                        true
-                    } else {
-                        false
                     }
+                    let external = rec.external_heap_dirty;
+                    rec.external_heap_dirty = false;
+                    stride || external
                 }
                 None => false,
             };

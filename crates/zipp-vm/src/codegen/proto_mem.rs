@@ -34,8 +34,8 @@ fn tierc_protected_return_map(code: &[Instr]) -> Vec<bool> {
     for (ip, instr) in code.iter().enumerate() {
         depth += depth_delta[ip];
         debug_assert!(depth >= 0, "unbalanced structured finally intervals");
-        protected[ip] = depth != 0
-            && matches!(instr, Instr::Return { .. } | Instr::ReturnUndefined);
+        protected[ip] =
+            depth != 0 && matches!(instr, Instr::Return { .. } | Instr::ReturnUndefined);
     }
     protected
 }
@@ -182,9 +182,7 @@ fn tierc_str_append_cursor_plan(
         if instr_uses(instr).contains(&plan.acc)
             && !matches!(
                 instr,
-                Instr::StrAppendIndex { .. }
-                    | Instr::Move { .. }
-                    | Instr::Return { .. }
+                Instr::StrAppendIndex { .. } | Instr::Move { .. } | Instr::Return { .. }
             )
         {
             return None;
@@ -219,7 +217,6 @@ fn tierc_str_append_cursor_plan(
         if !pure {
             return None;
         }
-
     }
     Some(plan)
 }
@@ -2809,12 +2806,8 @@ pub(crate) fn compile_proto_mem(
             }
         }
     }
-    let str_append_cursor = tierc_str_append_cursor_plan(
-        proto,
-        random_fuse,
-        &random_fuse_covered,
-        meter,
-    );
+    let str_append_cursor =
+        tierc_str_append_cursor_plan(proto, random_fuse, &random_fuse_covered, meter);
     if let Some(plan) = str_append_cursor {
         if std::env::var_os("ZIPP_JITLOG").is_some() {
             eprintln!(
@@ -2863,23 +2856,21 @@ pub(crate) fn compile_proto_mem(
         } else {
             0
         };
-    let frame: i32 = 40
-        + if str_append_cursor.is_some() {
+    let frame: i32 =
+        40 + if str_append_cursor.is_some() {
             crate::vm::STR_APPEND_CURSOR_FRAME_BYTES
         } else {
             0
-        }
-        + if do_cross3 { 64 } else { 0 }
-        + if do_leaf || method_needs_headroom {
-            16
-        } else {
-            0
-        };
+        } + if do_cross3 { 64 } else { 0 }
+            + if do_leaf || method_needs_headroom {
+                16
+            } else {
+                0
+            };
     let cursor_active_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACTIVE_OFF;
     let cursor_acc_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_ACC_BITS_OFF;
     let cursor_source_bits_off = cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_BITS_OFF;
-    let cursor_source_version_off =
-        cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_VERSION_OFF;
+    let cursor_source_version_off = cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_VERSION_OFF;
     let cursor_source_ptr_off = cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_PTR_OFF;
     let cursor_source_len_off = cursor_off + crate::vm::STR_APPEND_CURSOR_SOURCE_LEN_OFF;
     let cursor_out_ptr_off = cursor_off + crate::vm::STR_APPEND_CURSOR_OUT_PTR_OFF;

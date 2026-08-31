@@ -4534,8 +4534,14 @@ pub enum HeapObj {
         length: usize,
     },
     /// A JS `DataView` over an ArrayBuffer (`buffer` heap index, byte window).
+    /// `pristine_version` is the heap-slot version captured after installing the
+    /// default `%DataView.prototype%`. Equality with the live slot version proves
+    /// that no own named property or custom prototype has ever been installed;
+    /// non-default construction stamps then bumps the live version so it fails
+    /// closed. Keep the two `u32`s together so this variant remains 24 bytes.
     DataView {
         buffer: u32,
+        pristine_version: u32,
         byte_offset: usize,
         byte_length: usize,
     },

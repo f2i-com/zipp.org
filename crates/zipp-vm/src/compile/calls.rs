@@ -635,9 +635,14 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
-        let cond = self.expr(test)?;
-        let jf = self.here();
-        self.emit(Instr::JumpIfFalse { cond, target: 0 });
+        // A conditional expression consumes its test exactly like `if` and
+        // the loop heads do: the comparison result is not observable.  Route
+        // it through the shared test emitter so a bare `<` / `<=` can use the
+        // existing compare-and-branch opcode instead of materialising a Bool
+        // and dispatching a second `JumpIfFalse` instruction.  Every other
+        // expression keeps the byte-for-byte generic lowering in
+        // `emit_test_jump`.
+        let jfs = self.emit_test_jumps(test)?;
         let t = self.expr_into(cons, dst)?;
         if t != dst {
             self.emit(Instr::Move { dst, src: t });
@@ -645,7 +650,9 @@ impl<'a> FnCompiler<'a> {
         let jmp = self.here();
         self.emit(Instr::Jump { target: 0 });
         let else_start = self.here();
-        self.patch_jump(jf, else_start);
+        for jf in jfs {
+            self.patch_jump(jf, else_start);
+        }
         let e = self.expr_into(alt, dst)?;
         if e != dst {
             self.emit(Instr::Move { dst, src: e });
@@ -755,7 +762,9 @@ impl<'a> FnCompiler<'a> {
             return None;
         }
         match self.resolve("Math") {
-            Binding::Global(idx) => Reg::try_from(idx).ok().filter(|&r| r != crate::bytecode::NO_REG),
+            Binding::Global(idx) => Reg::try_from(idx)
+                .ok()
+                .filter(|&r| r != crate::bytecode::NO_REG),
             _ => None,
         }
     }
@@ -773,7 +782,16 @@ impl<'a> FnCompiler<'a> {
         if !bound_here && self.inherited_with_shadows.contains_key(name) {
             return false;
         }
-        if !matches!(self.resolve(name), Binding::Local(_)) {
+        let Binding::Local(reg) = self.resolve(name) else {
+            return false;
+        };
+        // Fixed/rest parameter registers are not stable snapshots. In a
+        // sloppy function with simple parameters, an argument expression can
+        // write `arguments[i]` and thereby replace the mapped parameter without
+        // naming it directly. Excluding every parameter is the conservative
+        // rule and matches the direct named-method argument lane below.
+        let parameter_top = self.param_names.len() as Reg;
+        if reg != 0 && reg <= parameter_top {
             return false;
         }
         !args.iter().any(|a| match a {
@@ -847,7 +865,7 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
                 MemberProp::Private(_) => {
-                    return Err("a private name may not be accessed through `super`".into())
+                    return Err("a private name may not be accessed through `super`".into());
                 }
             }
             return Ok((callee, this_v));
@@ -1660,12 +1678,18 @@ impl<'a> FnCompiler<'a> {
                     // GetIndex + CallWithThis form only has the generic path.
                     let obj_reg = self.alloc_reg();
                     if obj != obj_reg {
-                        self.emit(Instr::Move { dst: obj_reg, src: obj });
+                        self.emit(Instr::Move {
+                            dst: obj_reg,
+                            src: obj,
+                        });
                     }
                     let key = self.expr(key_expr)?;
                     let key_reg = self.alloc_reg();
                     if key != key_reg {
-                        self.emit(Instr::Move { dst: key_reg, src: key });
+                        self.emit(Instr::Move {
+                            dst: key_reg,
+                            src: key,
+                        });
                     }
                     let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                     self.emit(Instr::CallMethodComputed {
@@ -1685,7 +1709,7 @@ impl<'a> FnCompiler<'a> {
                     }
                     MemberProp::Computed(_) => unreachable!("handled above"),
                 };
-                let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
+                let (arg_base, argc) = self.eval_named_method_args(&c.args, obj, dst)?;
                 // NOTE: no `next_reg` reset here, deliberately — the fused
                 // lowering has always left its receiver/argument temporaries
                 // allocated. Recycling them (as the captured path below does)
@@ -2115,6 +2139,42 @@ impl<'a> FnCompiler<'a> {
             .collect::<R<Vec<_>>>()?;
         let base = self.eval_contiguous(&exprs)?;
         Ok((base, exprs.len() as u16))
+    }
+
+    /// Evaluate the arguments for a fused, statically-named `CallMethod`.
+    ///
+    /// For exactly one bare identifier that resolves to an ordinary local, the
+    /// local itself is already a valid one-register argument window.  Reusing
+    /// it removes the otherwise unconditional `Move local -> arg_temp` from hot
+    /// calls such as `src.charCodeAt(i)` and `items.push(value)`.
+    ///
+    /// The exclusions are part of the correctness proof:
+    ///
+    /// * fixed and rest parameters are refused because sloppy mapped
+    ///   `arguments` can mutate their registers from a property getter/proxy;
+    /// * captured and direct-eval-visible bindings resolve as `LocalCell`, not
+    ///   `Local`, and therefore never enter this branch;
+    /// * receiver/result overlap is refused, keeping the argument window
+    ///   invariant across lookup, call setup, and the legacy active
+    ///   `Function#arguments` view.
+    ///
+    /// The caller has already required `arg_order_transparent`, so `with`, TDZ,
+    /// and dynamic-name cases cannot reach this helper's direct branch.
+    fn eval_named_method_args(&mut self, args: &[Arg], obj: Reg, dst: Reg) -> R<(Reg, u16)> {
+        if let [Arg::Expr(e @ Expr::Ident(name))] = args {
+            if let Binding::Local(reg) = self.resolve(name) {
+                let parameter_top = self.param_names.len() as Reg;
+                if reg > parameter_top && reg != obj && reg != dst {
+                    // Run the ordinary identifier compiler for its strict-name
+                    // and other validation, but target the value's existing
+                    // register so no scratch slot or bytecode Move is created.
+                    let actual = self.expr_into(e, reg)?;
+                    debug_assert_eq!(actual, reg);
+                    return Ok((reg, 1));
+                }
+            }
+        }
+        self.eval_args_contiguous(args)
     }
 
     /// Build a call-argument list containing `...spread` into a fresh array and

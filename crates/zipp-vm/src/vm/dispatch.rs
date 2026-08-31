@@ -191,6 +191,12 @@ impl<'p> Vm<'p> {
             let base = self.frames[frame_idx].base;
             let mut ip = self.frames[frame_idx].ip;
             let cur_closure = self.frames[frame_idx].closure;
+            // `func()` returns a reference with the immutable PROGRAM lifetime,
+            // so the hardened interpreter can cache the current function's
+            // bytecode once per frame transition without extending a borrow of
+            // the VM across any mutating instruction arm.
+            #[cfg(feature = "safe-sandbox")]
+            let code: &'p [Instr] = self.func(func_id as usize).code.as_slice();
             #[cfg(not(feature = "safe-sandbox"))]
             let code: *const Vec<Instr> = &self.func(func_id as usize).code;
             // SAFETY: `code` borrows immutable program data that outlives the
@@ -408,11 +414,12 @@ impl<'p> Vm<'p> {
             // Inner loop: execute within the current frame until a call pushes
             // a new frame or a return pops this one.
             loop {
-                // The hardened interpreter never extends a borrow of program
-                // data across an instruction that mutates the VM. Clone only
-                // the current instruction: cloning the whole function on every
-                // call/return made otherwise-cheap calls an unmetered O(code)
-                // operation that hostile source could amplify.
+                // The hardened interpreter never extends a borrow of VM-owned
+                // data across an instruction that mutates the VM. The cached
+                // slice above has the immutable PROGRAM lifetime; cloning the
+                // whole function on every call/return made otherwise-cheap
+                // calls an unmetered O(code) operation that hostile source
+                // could amplify.
                 // `Vm::func` returns `&'p FuncProto` — the PROGRAM lifetime, not
                 // a reborrow of `&self` (see its doc comment: callers may hold it
                 // across `&mut self` operations). Borrowing the instruction out of
@@ -428,7 +435,7 @@ impl<'p> Vm<'p> {
                 // one. Two of them are visible 19 KB apart in the shipped
                 // `dispatch_body`.
                 #[cfg(feature = "safe-sandbox")]
-                let instr: &crate::bytecode::Instr = &self.func(func_id as usize).code[ip];
+                let instr: &crate::bytecode::Instr = &code[ip];
                 #[cfg(not(feature = "safe-sandbox"))]
                 let instr = &code[ip];
                 // Step budget / abort poll / execution trace. Compiled out
@@ -939,11 +946,14 @@ impl<'p> Vm<'p> {
                                     "ReferenceError: {name} is not defined"
                                 )));
                             }
-                        } else if self.global_real_own_route(idx) {
+                        } else if self.global_route_epoch != 0 && self.global_real_own_route(idx) {
                             // A defineProperty'd REAL own property of the global
                             // object governs the write — a strict assignment to
                             // a non-writable one is a TypeError, never a slot
-                            // write (regress-bug1037770, strict analogue).
+                            // write (regress-bug1037770, strict analogue). As for
+                            // LoadGlobal, the route can only have changed after
+                            // `note_global_own_property_change` bumped the epoch;
+                            // keep the heap/name probe off ordinary global loops.
                             let name = self.global_slot_name(idx).unwrap_or_default();
                             if !self.global_name_is_lexical(&name) {
                                 let v = self.get(base, src);
@@ -5168,6 +5178,47 @@ impl<'p> Vm<'p> {
                     Instr::GetIndex { dst, obj, key } => {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
+                        // Numeric TypedArray indices are integer-indexed exotic
+                        // accesses, so an in/out-of-bounds result never consults
+                        // a user prototype. Serve non-BigInt kinds directly;
+                        // strings/coercive keys and every unsupported edge fall
+                        // through before observable work.
+                        if o.is_heap() {
+                            let ta_idx = o.heap_index();
+                            if let HeapObj::TypedArray {
+                                buffer,
+                                kind,
+                                byte_offset,
+                                length,
+                            } = self.heap.get(ta_idx)
+                            {
+                                if !native::TA_KINDS[*kind as usize].2 {
+                                    if let Some(i) = array_index(k) {
+                                        let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
+                                            ta_idx,
+                                            *buffer,
+                                            *kind,
+                                            *byte_offset,
+                                            *length,
+                                        );
+                                        if let Some(r) = self.ta_interp_numeric_get_view(view, i) {
+                                            self.set(base, dst, r);
+                                            ip += 1;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Exact present dense-Array + Int leaf. This sits after
+                        // the TypedArray lane so integer-indexed exotics retain
+                        // their existing shortest path; every uncertain Array
+                        // shape falls through to the authoritative dispatcher.
+                        if let Some(r) = self.interp_dense_int_get(o, k) {
+                            self.set(base, dst, r);
+                            ip += 1;
+                            continue;
+                        }
                         let r = self.get_index(o, k)?;
                         self.set(base, dst, r);
                         ip += 1;
@@ -5205,6 +5256,44 @@ impl<'p> Vm<'p> {
                         let o = self.get(base, obj);
                         let k = self.get(base, key);
                         let v = self.get(base, val);
+                        if o.is_heap() && v.is_number() {
+                            let ta_idx = o.heap_index();
+                            if let HeapObj::TypedArray {
+                                buffer,
+                                kind,
+                                byte_offset,
+                                length,
+                            } = self.heap.get(ta_idx)
+                            {
+                                if !native::TA_KINDS[*kind as usize].2
+                                    && (self.immutable_buffers.is_empty()
+                                        || !self.immutable_buffers.contains(buffer))
+                                {
+                                    if let Some(i) = array_index(k) {
+                                        // Preserve the SetIndex GC/oracle
+                                        // chokepoint before the live-buffer
+                                        // leaf. The token copy itself is pure
+                                        // and cannot change store ordering.
+                                        let view = crate::vm::typedarray::TaInterpNumericView::from_matched_non_bigint(
+                                            ta_idx,
+                                            *buffer,
+                                            *kind,
+                                            *byte_offset,
+                                            *length,
+                                        );
+                                        self.store_barrier_v(
+                                            crate::heap::gcoracle::SET_INDEX,
+                                            o,
+                                            v,
+                                        );
+                                        if self.ta_interp_numeric_set_view(view, i, v.as_f64()) {
+                                            ip += 1;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let strict = self.func(func_id as usize).is_strict;
                         self.set_index(o, k, v, strict)?;
                         ip += 1;
@@ -6781,6 +6870,49 @@ impl<'p> Vm<'p> {
                         // any `&mut self` below â€” and resolves eval functions too.
                         let key: &'p str =
                             &self.func(func_id as usize).string_constants[name as usize];
+                        // `charCodeAt` dominates the parser/tokenizer-shaped
+                        // interpreter workload. Its exact flat-string + Int
+                        // leaf bypasses the method IC, argument stack buffer,
+                        // generic receiver dispatcher, no-op flatten and
+                        // ToInteger conversion. Every guard is read-only and a
+                        // miss resumes this historical path unchanged.
+                        if argc == 1 && key == "charCodeAt" {
+                            let arg = self.get(base, arg_base);
+                            if let Some(result) = self.interp_char_code_at_fast(recv, arg) {
+                                self.set(base, dst, result);
+                                ip += 1;
+                                continue;
+                            }
+                        }
+                        // Pristine non-BigInt DataView getters are a sufficiently
+                        // hot interpreter primitive to bypass the generic
+                        // receiver-kind dispatcher and argument stack buffer.
+                        // The leaf repeats every live method/prototype/own-shadow
+                        // guard and declines before observable work on any miss.
+                        if recv.is_heap()
+                            && matches!(self.heap.get(recv.heap_index()), HeapObj::DataView { .. })
+                        {
+                            let position = if argc == 0 {
+                                Value::UNDEFINED
+                            } else {
+                                self.get(base, arg_base)
+                            };
+                            let little_endian = if argc < 2 {
+                                Value::UNDEFINED
+                            } else {
+                                self.get(base, arg_base + 1)
+                            };
+                            if let Some(result) = self.dataview_interp_get_fast(
+                                recv.heap_index(),
+                                key,
+                                position,
+                                little_endian,
+                            )? {
+                                self.set(base, dst, result);
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // An exact allocation-only loop of
                         // `sum += array.slice(...).length` or
                         // `sum += array.concat([literal...]).length` can be
@@ -7497,10 +7629,15 @@ impl<'p> Vm<'p> {
                     }
                     Instr::Return { src } => {
                         let v = self.regs[base + src as usize];
-                        // Run any pending `finally` in this frame first.
-                        if let Some(target) = self.route_through_finally(1, v) {
-                            ip = target as usize;
-                            continue;
+                        // A handler-free return cannot have a pending `finally`.
+                        // Avoid the out-of-line handler walk on this overwhelmingly
+                        // common path; a non-empty stack keeps the exact historical
+                        // route, including discarding catch-only handlers.
+                        if !self.frames[frame_idx].handlers.is_empty() {
+                            if let Some(target) = self.route_through_finally(1, v) {
+                                ip = target as usize;
+                                continue;
+                            }
                         }
                         if self.pop_frame_with(v, stop_depth) {
                             return Ok(v);
@@ -7508,9 +7645,11 @@ impl<'p> Vm<'p> {
                         break;
                     }
                     Instr::ReturnUndefined => {
-                        if let Some(target) = self.route_through_finally(1, Value::UNDEFINED) {
-                            ip = target as usize;
-                            continue;
+                        if !self.frames[frame_idx].handlers.is_empty() {
+                            if let Some(target) = self.route_through_finally(1, Value::UNDEFINED) {
+                                ip = target as usize;
+                                continue;
+                            }
                         }
                         if self.pop_frame_with(Value::UNDEFINED, stop_depth) {
                             return Ok(Value::UNDEFINED);
@@ -9755,7 +9894,8 @@ impl<'p> Vm<'p> {
     #[inline]
     pub(crate) fn load_global_value(&mut self, idx: u32, func_id: u32) -> Result<Value, Thrown> {
         let v = self.globals[idx as usize];
-        if v.is_uninitialized() || (self.global_route_epoch != 0 && self.global_real_own_route(idx)) {
+        if v.is_uninitialized() || (self.global_route_epoch != 0 && self.global_real_own_route(idx))
+        {
             return self.load_global_slow(idx, func_id);
         }
         Ok(v)
@@ -9784,7 +9924,11 @@ impl<'p> Vm<'p> {
     /// re-read every time). A real own-property route on the global (an
     /// accessor `Math` on globalThis) fails closed to the miss path, whose
     /// `load_global_value` honours it.
-    pub(crate) fn math_bare_is_intrinsic(&mut self, op: crate::bytecode::MathFn, gidx: u32) -> bool {
+    pub(crate) fn math_bare_is_intrinsic(
+        &mut self,
+        op: crate::bytecode::MathFn,
+        gidx: u32,
+    ) -> bool {
         let math_idx = self.builtin_ns_slots[0];
         if math_idx == u32::MAX {
             return false;

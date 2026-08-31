@@ -73,19 +73,23 @@ impl<'a> FnCompiler<'a> {
         // branch yields undefined, not the prior statement's value). No-op outside
         // eval mode.
         self.reset_loop_completion();
-        let jf = self.emit_test_jump(test)?; // patched
+        let jfs = self.emit_test_jumps(test)?; // patched
         self.branch_stmt(cons)?;
         if let Some(alt) = alt {
             let jmp = self.here();
             self.emit(Instr::Jump { target: 0 }); // patched
             let else_start = self.here();
-            self.patch_jump(jf, else_start);
+            for jf in jfs {
+                self.patch_jump(jf, else_start);
+            }
             self.branch_stmt(alt)?;
             let end = self.here();
             self.patch_jump(jmp, end);
         } else {
             let end = self.here();
-            self.patch_jump(jf, end);
+            for jf in jfs {
+                self.patch_jump(jf, end);
+            }
         }
         Ok(())
     }
@@ -103,7 +107,7 @@ impl<'a> FnCompiler<'a> {
 
     pub(crate) fn while_stmt(&mut self, test: &ast::Expr, body: &ast::Stmt) -> R<()> {
         let top = self.here();
-        let jf = self.emit_test_jump(test)?;
+        let jfs = self.emit_test_jumps(test)?;
         self.loop_ctx.push(LoopCtx::loop_frame(
             self.pending_label.take(),
             self.handler_depth,
@@ -115,7 +119,9 @@ impl<'a> FnCompiler<'a> {
         }
         self.emit(Instr::Jump { target: top });
         let end = self.here();
-        self.patch_jump(jf, end);
+        for jf in jfs {
+            self.patch_jump(jf, end);
+        }
         for b in ctx.break_jumps {
             self.patch_jump(b, end);
         }
@@ -248,8 +254,8 @@ impl<'a> FnCompiler<'a> {
         // mutate.
         self.emit_freshen_cells(&fresh_regs);
         let top = self.here();
-        let jf = match test {
-            Some(t) => Some(self.emit_test_jump(t)?),
+        let jfs = match test {
+            Some(t) => Some(self.emit_test_jumps(t)?),
             None => None,
         };
         self.loop_ctx.push(LoopCtx::loop_frame(
@@ -274,8 +280,10 @@ impl<'a> FnCompiler<'a> {
         }
         self.emit(Instr::Jump { target: top });
         let end = self.here();
-        if let Some(j) = jf {
-            self.patch_jump(j, end);
+        if let Some(jumps) = jfs {
+            for j in jumps {
+                self.patch_jump(j, end);
+            }
         }
         for b in ctx.break_jumps {
             self.patch_jump(b, end);

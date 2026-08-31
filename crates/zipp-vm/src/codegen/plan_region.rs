@@ -3466,12 +3466,13 @@ fn plan_region_cold_inner(
         }
     }
 
-    // ── B97 write-through set ── every read-after-region register that `shareable`
-    // now admits. This MUST be populated for BOTH allocation branches, not just the
-    // reuse one: making a register shareable also drops it from `live_in_regs` (see
-    // there), so even with a private home it starts as GARBAGE, and a `flush_exit`
-    // that wrote that home would corrupt its slot. That is not hypothetical — it is
-    // exactly what `hoisted_const_on_untaken_branch` catches:
+    // ── B97 write-through set ── every read-after-region NUMERIC register
+    // that `shareable` now admits. This MUST be populated for BOTH numeric
+    // allocation branches, not just the reuse one: making a numeric register
+    // shareable also drops it from `live_in_regs` (see there), so even with a
+    // private home it starts as GARBAGE, and a `flush_exit` that wrote that home
+    // would corrupt its slot. That is not hypothetical — it is exactly what
+    // `hoisted_const_on_untaken_branch` catches:
     //
     //   let c = 3; for (…) { if (i > 1e9) { c = 7; … } }  return c;
     //
@@ -3481,7 +3482,15 @@ fn plan_region_cold_inner(
         // A slot-materialized const is NOT written through in the B97 sense:
         // its defining op already stores the boxed const to the slot, it has
         // no home to write from, and the flush skips it by construction.
-        if admit_wt_share
+        // Bools have a separate, stricter allocator below. A read-outside Bool
+        // is never `bool_shareable`, always keeps a private GPR, and remains in
+        // `live_in_bools`; putting it in this NUMERIC write-through set buys no
+        // sharing and makes GPR admission depend on an irrelevant XMM-home
+        // mechanism. Type-split registers remain covered by the explicit set
+        // insertion above (their planner type is numeric and both halves make
+        // memory authoritative).
+        if ty.get(&r) == Some(&VTy::Num)
+            && admit_wt_share
             && read_outside.contains(&r)
             && shareable(r)
             && !slot_consts.contains_key(&r)
@@ -3895,7 +3904,11 @@ fn plan_region_cold_inner(
                                 format!(
                                     "r{r}{}{}{}",
                                     if read_outside.contains(r) { "o" } else { "" },
-                                    if first_seen.get(r) == Some(&false) { "i" } else { "" },
+                                    if first_seen.get(r) == Some(&false) {
+                                        "i"
+                                    } else {
+                                        ""
+                                    },
                                     if hoisted.contains(r) { "h" } else { "" }
                                 )
                             })
@@ -3966,7 +3979,11 @@ fn plan_region_cold_inner(
                                     format!(
                                         "r{r}{}{}{}",
                                         if read_outside.contains(r) { "o" } else { "" },
-                                        if first_seen.get(r) == Some(&false) { "i" } else { "" },
+                                        if first_seen.get(r) == Some(&false) {
+                                            "i"
+                                        } else {
+                                            ""
+                                        },
                                         if hoisted.contains(r) { "h" } else { "" }
                                     )
                                 })
@@ -6456,28 +6473,44 @@ pub(crate) fn plan_local_concat_len(
 
             // Reused temporaries must not interfere. `length_dst == number_reg`
             // is the useful exact shape: the final projection consumes then
-            // overwrites `n`. All other working registers stay distinct.
-            let distinct = [
-                prefix_reg,
-                number_reg,
-                mask_reg,
-                add_dst,
-                get_dst,
-                field.scratch,
-            ];
+            // overwrites `n`. All other working registers stay distinct. The
+            // compiler may reuse the dead mask register for the later field
+            // read; in that one exact shape an untouched dead prefix/concat
+            // register carries the shift count instead.
+            let distinct = [prefix_reg, number_reg, add_dst, get_dst, field.scratch];
             if distinct
                 .iter()
                 .enumerate()
                 .any(|(i, r)| distinct[..i].contains(r))
+                || (mask_reg != get_dst && distinct.contains(&mask_reg))
                 || length_dst != number_reg
             {
                 continue;
             }
+            let shift_reg = if mask_reg != get_dst {
+                mask_reg
+            } else {
+                let untouched = |reg| {
+                    !code[append_ip + 1..length_ip].iter().any(|instr| {
+                        local_sroa_dst(instr) == Some(reg) || instr_uses(instr).contains(&reg)
+                    })
+                };
+                let Some(reg) = [prefix_reg, add_dst]
+                    .into_iter()
+                    .find(|reg| untouched(*reg))
+                else {
+                    continue;
+                };
+                reg
+            };
 
             // The prefix and concat result have no observation beyond the Add
             // and field append respectively. The projected string is observed
-            // only by `.length`. The mask register is dead after the And, so
-            // its slot can safely carry shift-count 8 until the projection.
+            // only by `.length`. Usually the mask register is dead after the
+            // And and carries shift-count 8. If that slot becomes `get_dst`,
+            // either the prefix or the otherwise-virtual concat destination
+            // may carry the count when its slot is untouched through the
+            // projection. Deopt already restores both original values.
             if !local_uses_until_def_are(code, prefix_ip, prefix_reg, &[add_ip])
                 || !local_uses_until_def_are(code, add_ip, add_dst, &[append_ip])
                 || !local_uses_until_def_are(code, get_ip, get_dst, &[length_ip])
@@ -6485,9 +6518,10 @@ pub(crate) fn plan_local_concat_len(
                 || code[bit_ip + 1..length_ip]
                     .iter()
                     .any(|instr| local_sroa_dst(instr) == Some(number_reg))
-                || code[bit_ip + 1..length_ip]
-                    .iter()
-                    .any(|instr| local_sroa_dst(instr) == Some(mask_reg))
+                || (shift_reg == mask_reg
+                    && code[bit_ip + 1..length_ip]
+                        .iter()
+                        .any(|instr| local_sroa_dst(instr) == Some(mask_reg)))
             {
                 continue;
             }
@@ -6508,7 +6542,7 @@ pub(crate) fn plan_local_concat_len(
                 append_ip: append_ip as u32,
                 number_reg,
                 projection_src: number_reg,
-                shift_reg: mask_reg,
+                shift_reg,
                 length_ip: length_ip as u32,
                 length_dst,
                 length_bias: bias as i32,

@@ -321,8 +321,7 @@ fn cursor_declines_an_unfused_call_span_child() {
     if std::env::var_os("ZIPP_CURSOR_CALL_CHILD").is_none() {
         return;
     }
-    let outcome = run(
-        r#"
+    let outcome = run(r#"
         "use strict";
         const alphabet = "abcd";
         function pick(i) { return i & 3; }
@@ -334,10 +333,13 @@ fn cursor_declines_an_unfused_call_span_child() {
         let total = 0;
         for (let n = 0; n < 200; n++) total += makeId(40).length;
         console.log(total, makeId(7));
-        "#,
-    )
+        "#)
     .expect("call-span source compiles");
-    assert!(outcome.error.is_none(), "call-span error: {:?}", outcome.error);
+    assert!(
+        outcome.error.is_none(),
+        "call-span error: {:?}",
+        outcome.error
+    );
     assert_eq!(outcome.output, ["8000 abcdabc"]);
 }
 

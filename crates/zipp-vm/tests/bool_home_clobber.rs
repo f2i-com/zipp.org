@@ -314,6 +314,27 @@ fn int_case(op: &Op, k: usize) -> String {
     kernel(op, k, false, &format!("int-{}-{k}", op.tag))
 }
 
+/// A split-receiver loop whose shared-home retry still needs TWO spill slots.
+/// The default B94 bridge is deliberately capped at one; the general spill
+/// opt-in is used below to prove that the fixture really does need two.
+const TWO_SPILL_SPLIT: &str = r#"
+"use strict";
+var KI = [0, 3, 6, 2, 5, 1, 4, 7];
+function kernel(n) {
+  var h = 1, u = 3, i = 0, t = 0;
+  var b0 = false, b1 = false, b2 = false, b3 = false;
+  for (i = 0; i < n; i++) {
+    b0 = i >= 4; b1 = i < 4; b2 = t > 2; b3 = t < 2;
+    t = KI[i & 7] | 0;
+    h = (h + t) | 0;
+    u = (u + (i & 3)) | 0;
+  }
+  return "" + h + " " + u + " " + b0 + " " + b1 + " " + b2 + " " + b3;
+}
+for (var q = 0; q < 12; q++) kernel(20000);
+console.log(kernel(20000));
+"#;
+
 // ── the parity cases ────────────────────────────────────────────────────────
 
 /// The DOUBLE tier, one to four live bools, every body op. This is the matrix
@@ -351,6 +372,11 @@ fn boolhome_parity_int_matrix() {
             assert_matches_node(&int_case(op, k));
         }
     }
+}
+
+#[test]
+fn boolhome_parity_two_spill_split_cap() {
+    assert_matches_node(TWO_SPILL_SPLIT);
 }
 
 /// The soak's most common signature, and the one with a consequence beyond
@@ -422,13 +448,16 @@ console.log(kernel(120));
 /// bool per unfused guard shifts which `BOOL_GPRS` register each value gets, so
 /// it re-runs the whole sweep against a different assignment). `ZIPP_NO_GPR_HOMES=1`
 /// pins the INT cases onto the xmm emitter that carried W14's defect, and
-/// `ZIPP_JIT_THRESHOLD=1` compiles before the interpreter has warmed anything.
+/// `ZIPP_JIT_THRESHOLD=1` compiles before the interpreter has warmed anything,
+/// and `ZIPP_NO_GPR_SPILL_SLOTS=1` proves the bounded split-spill bridge is a
+/// pure optimization rather than a correctness dependency.
 #[test]
 fn boolhome_all_modes_answer_identically() {
     let exe = std::env::current_exe().expect("test exe path");
-    let modes: [&[(&str, &str)]; 4] = [
+    let modes: [&[(&str, &str)]; 5] = [
         &[("ZIPP_NO_FUSED_CMPJUMP", "1")],
         &[("ZIPP_NO_GPR_HOMES", "1")],
+        &[("ZIPP_NO_GPR_SPILL_SLOTS", "1")],
         &[("ZIPP_JIT_THRESHOLD", "1")],
         &[("ZIPP_NOJIT", "1")],
     ];
@@ -456,16 +485,24 @@ fn boolhome_all_modes_answer_identically() {
 /// child is this same test binary running [`boolhome_jitlog_child`], with the
 /// program passed through the environment.
 fn jitlog_of(src: &str) -> String {
+    jitlog_of_mode(src, &[])
+}
+
+fn jitlog_of_mode(src: &str, mode: &[(&str, &str)]) -> String {
     let exe = std::env::current_exe().expect("test exe path");
-    let out = Command::new(&exe)
-        .arg("boolhome_jitlog_child")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("boolhome_jitlog_child")
         .arg("--exact")
         .arg("--ignored")
         .arg("--nocapture") // libtest swallows a PASSING child's stderr otherwise
         .env("ZIPP_JITLOG", "1")
         .env("ZIPP_BOOLHOME_SRC", src)
-        .output()
-        .expect("spawn the test binary");
+        .env_remove("ZIPP_GPR_SPILL_SLOTS")
+        .env_remove("ZIPP_NO_GPR_SPILL_SLOTS");
+    for (key, val) in mode {
+        cmd.env(key, val);
+    }
+    let out = cmd.output().expect("spawn the test binary");
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
         out.status.success(),
@@ -532,4 +569,107 @@ fn boolhome_mechanism_int_matrix_reaches_the_int_tier() {
             );
         }
     }
+}
+
+/// The four-bool dense-Array row is just one home wider than the physical GPR
+/// pool after its shared-home B94 retry. Default settings must use the bounded
+/// one-slot bridge and install INT-GPR rather than silently falling to DOUBLE.
+#[test]
+fn boolhome_denseint_four_engages_one_bounded_split_spill() {
+    let op = INT_OPS
+        .iter()
+        .find(|op| op.tag == "denseint")
+        .expect("denseint row");
+    let log = jitlog_of(&int_case(op, 4));
+    let engaged = log
+        .lines()
+        .filter(|line| line.contains("GPR homes engaged"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        engaged.len(),
+        1,
+        "denseint-4 must engage exactly one INT-GPR region:\n{log}"
+    );
+    assert!(
+        engaged[0].contains(", 1 spilled)"),
+        "denseint-4 did not use exactly one spill slot: {}\n{log}",
+        engaged[0]
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("INT-GPR region [") && line.contains("B94 split receiver"))
+            .count(),
+        1,
+        "denseint-4 did not carry exactly one B94 split receiver:\n{log}"
+    );
+    assert!(
+        log.contains("INT region fn1 [") && !log.contains("DOUBLE region fn1 ["),
+        "denseint-4 did not install the INT-GPR plan:\n{log}"
+    );
+}
+
+/// The shared spill kill switch must restore the pre-bridge fallback exactly:
+/// the same correct (mode-swept above) denseint-4 kernel declines the one-slot
+/// retry and installs DOUBLE, with no GPR home plan emitted.
+#[test]
+fn boolhome_denseint_four_no_spill_switch_refuses_split_spill() {
+    let op = INT_OPS
+        .iter()
+        .find(|op| op.tag == "denseint")
+        .expect("denseint row");
+    let log = jitlog_of_mode(&int_case(op, 4), &[("ZIPP_NO_GPR_SPILL_SLOTS", "1")]);
+    assert!(
+        log.lines()
+            .any(|line| line.contains("INT-GPR decline [") && line.contains("7 homes > 4 gprs")),
+        "denseint-4 did not refuse its post-share overflow:\n{log}"
+    );
+    assert!(
+        !log.contains("GPR homes engaged") && !log.contains("INT region fn1 ["),
+        "the spill kill switch still installed an INT-GPR plan:\n{log}"
+    );
+    assert!(
+        log.contains("DOUBLE region fn1 ["),
+        "the spill kill switch did not restore the DOUBLE fallback:\n{log}"
+    );
+}
+
+/// A two-spill B94 retry must remain outside the default one-slot bridge. The
+/// explicit general-spill mode then proves non-vacuously that this exact source
+/// needs (and can consume) two slots.
+#[test]
+fn boolhome_split_spill_bridge_stays_capped_at_one() {
+    let capped = jitlog_of(TWO_SPILL_SPLIT);
+    assert!(
+        capped
+            .lines()
+            .any(|line| line.contains("INT-GPR decline [") && line.contains("8 homes > 4 gprs")),
+        "the cap fixture no longer needs two post-share spill slots:\n{capped}"
+    );
+    assert!(
+        !capped.contains("GPR homes engaged") && capped.contains("DOUBLE region fn1 ["),
+        "the default one-slot bridge admitted the two-spill fixture:\n{capped}"
+    );
+
+    let general = jitlog_of_mode(TWO_SPILL_SPLIT, &[("ZIPP_GPR_SPILL_SLOTS", "1")]);
+    let engaged = general
+        .lines()
+        .filter(|line| line.contains("GPR homes engaged"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        engaged.len(),
+        1,
+        "general spill mode must engage exactly one INT-GPR region:\n{general}"
+    );
+    assert!(
+        engaged[0].contains(", 2 spilled)"),
+        "the cap fixture did not require exactly two spill slots: {}\n{general}",
+        engaged[0]
+    );
+    assert!(
+        general.contains("INT-GPR region [")
+            && general.contains("B94 split receiver")
+            && general.contains("INT region fn1 [")
+            && !general.contains("DOUBLE region fn1 ["),
+        "general spill mode did not install the two-spill B94 plan:\n{general}"
+    );
 }

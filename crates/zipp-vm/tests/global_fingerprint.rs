@@ -46,12 +46,19 @@ fn stable_value_keeps_its_digest() {
     );
     let slot = slot_of(&st, "scenery");
     let first = st.fingerprint_slot(slot);
-    assert!(first.is_some(), "a 200-element array is well inside the walk budget");
+    assert!(
+        first.is_some(),
+        "a 200-element array is well inside the walk budget"
+    );
 
     // Running unrelated code must not disturb it: the digest is of the value,
     // not of when it was taken.
     st.call_global("untouched", &[]).expect("call runs");
-    assert_eq!(first, st.fingerprint_slot(slot), "digest moved with no mutation");
+    assert_eq!(
+        first,
+        st.fingerprint_slot(slot),
+        "digest moved with no mutation"
+    );
 }
 
 #[test]
@@ -79,7 +86,10 @@ fn in_place_mutation_changes_the_digest() {
             format!("{after_val:?}"),
             "{step} was supposed to change the value"
         );
-        assert_ne!(before_fp, after_fp, "{step} changed the value but not the digest");
+        assert_ne!(
+            before_fp, after_fp,
+            "{step} changed the value but not the digest"
+        );
     }
 }
 
@@ -96,13 +106,21 @@ fn reassignment_changes_the_digest() {
     let original = st.fingerprint_slot(slot);
 
     st.call_global("swap", &[]).expect("call runs");
-    assert_ne!(original, st.fingerprint_slot(slot), "a different value kept its digest");
+    assert_ne!(
+        original,
+        st.fingerprint_slot(slot),
+        "a different value kept its digest"
+    );
 
     // An equal value is an equal digest even though it is a different array:
     // the host compares what it would read, not object identity, so rebuilding
     // an identical value must not force a copy.
     st.call_global("restore", &[]).expect("call runs");
-    assert_eq!(original, st.fingerprint_slot(slot), "an equal value changed its digest");
+    assert_eq!(
+        original,
+        st.fingerprint_slot(slot),
+        "an equal value changed its digest"
+    );
 }
 
 #[test]
@@ -177,7 +195,10 @@ fn a_cycle_terminates() {
     let before = st.fingerprint_slot(slot);
     st.call_global("tie", &[]).expect("call runs");
     let after = st.fingerprint_slot(slot);
-    assert!(after.is_some(), "a cycle must produce a digest, not a hang or a None");
+    assert!(
+        after.is_some(),
+        "a cycle must produce a digest, not a hang or a None"
+    );
     assert_ne!(before, after, "adding a self-reference changed the value");
 }
 
@@ -185,7 +206,10 @@ fn a_cycle_terminates() {
 fn a_missing_slot_is_not_an_error() {
     let mut st = prepare("let only = 1");
     let fp = st.fingerprint_slot(9_999);
-    assert!(fp.is_some(), "an out-of-range slot should digest, not panic");
+    assert!(
+        fp.is_some(),
+        "an out-of-range slot should digest, not panic"
+    );
 }
 
 #[test]
@@ -196,5 +220,9 @@ fn host_writes_are_visible_to_the_digest() {
     let slot = slot_of(&st, "value");
     let before = st.fingerprint_slot(slot);
     assert!(st.set_slot(slot, &HostValue::Number(2.0)), "write accepted");
-    assert_ne!(before, st.fingerprint_slot(slot), "a host write left the digest alone");
+    assert_ne!(
+        before,
+        st.fingerprint_slot(slot),
+        "a host write left the digest alone"
+    );
 }

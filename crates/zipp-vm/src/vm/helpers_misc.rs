@@ -1774,24 +1774,36 @@ pub(crate) extern "win64" fn jit_ta_snapshot(
                     buffer,
                     byte_offset,
                     byte_length,
+                    ..
                 } => (*buffer, *byte_offset, *byte_length),
                 _ => return None,
             };
-            let (base, flags) = match vm.heap.get_mut(buffer) {
-                HeapObj::ArrayBuffer { data, detached }
-                    if !*detached && byte_offset + byte_length <= data.len() =>
-                {
-                    match data {
-                        crate::heap::AbData::Local(v) => (v.as_mut_ptr(), TA_SNAP_LOCAL),
-                        crate::heap::AbData::Shared(m) => (m.base_ptr(), 0),
-                    }
+            // A length-tracking GSAB can grow concurrently without any VM call
+            // that would refresh this region-entry snapshot. Decline that pin;
+            // the per-access helper below reads its live length instead.
+            if !vm.dv_tracking.is_empty()
+                && vm.dv_tracking.contains(&idx)
+                && vm.shared_buffers.contains(&buffer)
+            {
+                return None;
+            }
+            let live_len = match vm.heap.get(buffer) {
+                HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                    vm.dv_effective_len_at(idx, byte_offset, byte_length, data.len())?
                 }
+                _ => return None,
+            };
+            let (base, flags) = match vm.heap.get_mut(buffer) {
+                HeapObj::ArrayBuffer { data, detached } if !*detached => match data {
+                    crate::heap::AbData::Local(v) => (v.as_mut_ptr(), TA_SNAP_LOCAL),
+                    crate::heap::AbData::Shared(m) => (m.base_ptr(), 0),
+                },
                 _ => return None,
             };
             return Some(TaSnap {
                 obj_bits: ta_bits,
                 base: unsafe { base.add(byte_offset) } as u64,
-                len: byte_length as u64,
+                len: live_len as u64,
                 flags,
             });
         }
@@ -1899,6 +1911,7 @@ pub(crate) extern "win64" fn jit_dv_get(
             buffer,
             byte_offset,
             byte_length,
+            ..
         } => (*buffer, *byte_offset, *byte_length),
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
@@ -1913,14 +1926,15 @@ pub(crate) extern "win64" fn jit_dv_get(
     // IsViewOutOfBounds (detached or shrunk under the view) → TypeError in the
     // interpreter; failed bounds → RangeError. Both deopt.
     let data = match vm.heap.get(buffer) {
-        HeapObj::ArrayBuffer { data, detached }
-            if !*detached && byte_offset + byte_length <= data.len() =>
-        {
-            data
-        }
+        HeapObj::ArrayBuffer { data, detached } if !*detached => data,
         _ => return crate::codegen::SELF_CALL_DEOPT,
     };
-    if !(size <= byte_length && pos <= byte_length - size) {
+    let Some(view_len) =
+        vm.dv_effective_len_at(dv.heap_index(), byte_offset, byte_length, data.len())
+    else {
+        return crate::codegen::SELF_CALL_DEOPT;
+    };
+    if !(size <= view_len && pos <= view_len - size) {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let abs = byte_offset + pos;

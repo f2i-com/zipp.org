@@ -130,14 +130,10 @@ fn tierc_protected_return_child() {
 fn run_child(mode: &str, env: &[(&str, &str)]) -> (String, String) {
     let exe = std::env::current_exe().expect("test binary path");
     let mut cmd = Command::new(exe);
-    cmd.args([
-        "tierc_protected_return_child",
-        "--exact",
-        "--nocapture",
-    ])
-    .env(CHILD_ENV, mode)
-    .env("ZIPP_JIT_THRESHOLD", "8")
-    .env("ZIPP_JITLOG", "1");
+    cmd.args(["tierc_protected_return_child", "--exact", "--nocapture"])
+        .env(CHILD_ENV, mode)
+        .env("ZIPP_JIT_THRESHOLD", "8")
+        .env("ZIPP_JITLOG", "1");
     for key in [
         "ZIPP_NO_TIERC_ITER",
         "ZIPP_NOJIT",

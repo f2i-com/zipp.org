@@ -1861,6 +1861,30 @@ class ProvenanceTests(unittest.TestCase):
     HEAD = "a" * 40
     OTHER = "b" * 40
 
+    def test_pgo_build_contract_pins_the_windows_main_stack(self):
+        self.assertIn(
+            ";pe-stack=reserve-268435456,commit-4096;",
+            bench.PGO_BUILD_CONTRACT,
+        )
+        build_rs = (bench.ROOT / "crates/zipp-cli/build.rs").read_text(
+            encoding="utf-8"
+        )
+        pgo_sh = (bench.ROOT / "tools/pgo.sh").read_text(encoding="utf-8")
+        build_match = re.search(
+            r'^const PGO_BUILD_CONTRACT: &str = "([^"]+)";$',
+            build_rs,
+            re.MULTILINE,
+        )
+        pgo_match = re.search(
+            r"^PGO_BUILD_CONTRACT='([^']+)'$",
+            pgo_sh,
+            re.MULTILINE,
+        )
+        self.assertIsNotNone(build_match)
+        self.assertIsNotNone(pgo_match)
+        self.assertEqual(build_match.group(1), bench.PGO_BUILD_CONTRACT)
+        self.assertEqual(pgo_match.group(1), bench.PGO_BUILD_CONTRACT)
+
     def test_source_identity_distinguishes_dirty_from_its_parent(self):
         clean = {"commit": self.HEAD, "dirty": False}
         dirty = {"commit": self.HEAD, "dirty": True, "diff_digest": "beef"}

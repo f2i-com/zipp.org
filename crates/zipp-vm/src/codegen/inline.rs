@@ -137,7 +137,11 @@ pub(crate) fn captured_builtin_lane(
         Instr::GetProp { dst, name, .. } if dst == callee => Some(name),
         _ => None,
     })?;
-    match proto.string_constants.get(name as usize).map(|s| s.as_str()) {
+    match proto
+        .string_constants
+        .get(name as usize)
+        .map(|s| s.as_str())
+    {
         Some("push") if heap.push_intrinsic_bits != 0 => {
             Some((heap.push_intrinsic_bits, heap.array_push, true))
         }

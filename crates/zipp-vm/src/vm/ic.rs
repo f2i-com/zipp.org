@@ -144,6 +144,10 @@ pub(crate) enum IcEntry {
     /// `hops[last].slot`, or (`slot == u32::MAX` for `ProtoData`) a full-chain
     /// MISS — the read yields `undefined`.
     ProtoData {
+        /// Guardable hidden shape of the receiver at fill time. For an
+        /// inherited-data entry, a live match proves the static key remains
+        /// absent from the receiver without another key-table lookup.
+        recv_shape: u32,
         first: u8,
         hops: IcHops,
         slot: u32,
@@ -177,6 +181,14 @@ pub(crate) enum IcEntry {
         slot: u32,
     },
 }
+
+// `SuperData` already established this interpreter-cache entry budget. Keep
+// additional guards in the existing padding/variant envelope so every
+// eight-way `SiteIc` remains the same size on the supported targets.
+const _: () = assert!(
+    std::mem::size_of::<IcEntry>() <= 72,
+    "interpreter IcEntry exceeded its existing largest-variant size budget"
+);
 
 /// Read-only resolution of a `super.m()` op for Stage 3 method inlining
 /// (`ic_super_method_baked`): the resolved super-method `fid`, the hop
@@ -628,6 +640,21 @@ impl<'p> Vm<'p> {
 
     // ── GetProp sites ──
 
+    /// True when this VM cannot enter native code. Builds with a JIT-capable
+    /// field honor the live `ZIPP_NOJIT`/embedding toggle; no-JIT and
+    /// safe-sandbox builds are interpreter-only by construction.
+    #[inline]
+    fn interp_own_resolve_vm_is_interpreter(&self) -> bool {
+        #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            !self.jit_enabled
+        }
+        #[cfg(not(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        {
+            true
+        }
+    }
+
     /// IC lookup + fill for a `GetProp` site. `GetAct::None` ⇒ slow path.
     pub(crate) fn ic_get_prop(
         &mut self,
@@ -681,7 +708,62 @@ impl<'p> Vm<'p> {
                             _ => {}
                         }
                     }
+
+                    // An inherited-data fill has already proved this static
+                    // key absent from the receiver. In a pure interpreter,
+                    // matching the receiver's complete hidden shape proves it
+                    // is still absent, so validate the live proto chain and
+                    // holder directly instead of hashing the receiver key and
+                    // then re-discovering the same first way. DICT receivers,
+                    // class resolution, accessors, chain misses, and every
+                    // failed guard retain the ordinary path below. JIT-enabled
+                    // execution deliberately keeps the old feedback path.
+                    if sh != crate::shape::DICT {
+                        if let IcEntry::ProtoData {
+                            recv_shape,
+                            first,
+                            hops,
+                            slot,
+                        } = site.entries[0]
+                        {
+                            if slot != u32::MAX
+                                && recv_shape == sh
+                                && m.class.is_none()
+                                && self.interp_own_resolve_vm_is_interpreter()
+                            {
+                                if let Some(hm) = self.ic_chain_ok(idx, first, &hops) {
+                                    let s = slot as usize;
+                                    if s < hm.keys.len()
+                                        && hm.keys[s] == key
+                                        && !hm.attr_at(s).accessor
+                                    {
+                                        return GetAct::Value(hm.val_at(s));
+                                    }
+                                }
+                            }
+                        }
+                    }
                     let own = m.pos(key);
+                    // In a pure-interpreter VM, `own` has already answered the
+                    // static site's complete own-property question against the
+                    // LIVE map. Once the first-way shape shortcut misses, do
+                    // not re-prove that same key/slot mapping against up to eight
+                    // historical Own* ways: read the live data value directly,
+                    // or re-resolve the live accessor exactly as an OwnAcc hit
+                    // would. A native/non-plain getter returns None and resumes
+                    // the authoritative slow path; a missing getter returns
+                    // undefined. JIT-enabled execution deliberately retains the
+                    // old scan/walk/install path so every observed shape remains
+                    // training feedback for native property plans.
+                    if let Some(slot) = own {
+                        if self.interp_own_resolve_vm_is_interpreter() {
+                            return if m.attr_at(slot).accessor {
+                                self.ic_acc_get_from(m, slot)
+                            } else {
+                                GetAct::Value(m.val_at(slot))
+                            };
+                        }
+                    }
                     for e in &site.entries[..site.n as usize] {
                         match self.ic_validate_get(e, idx, m, own, key) {
                             GetAct::None => {}
@@ -786,7 +868,17 @@ impl<'p> Vm<'p> {
                 }
             }
             Walked::ChainData { first, hops, slot } => {
-                self.ic_install(func_id, ip, IcEntry::ProtoData { first, hops, slot });
+                let recv_shape = self.ic_recv_shape(recv);
+                self.ic_install(
+                    func_id,
+                    ip,
+                    IcEntry::ProtoData {
+                        recv_shape,
+                        first,
+                        hops,
+                        slot,
+                    },
+                );
                 let hm = match self.heap.get(hops.0[hops.1 as usize - 1].0) {
                     HeapObj::Object(hm) => hm,
                     _ => return GetAct::None,
@@ -798,10 +890,12 @@ impl<'p> Vm<'p> {
                 self.ic_chain_acc_get(hops, slot)
             }
             Walked::ChainMiss { first, hops } => {
+                let recv_shape = self.ic_recv_shape(recv);
                 self.ic_install(
                     func_id,
                     ip,
                     IcEntry::ProtoData {
+                        recv_shape,
                         first,
                         hops,
                         slot: u32::MAX,
@@ -866,7 +960,9 @@ impl<'p> Vm<'p> {
                     GetAct::None
                 }
             }
-            IcEntry::ProtoData { first, hops, slot } => {
+            IcEntry::ProtoData {
+                first, hops, slot, ..
+            } => {
                 if own.is_some() || m.class.is_some() {
                     return GetAct::None;
                 }
@@ -1383,7 +1479,17 @@ impl<'p> Vm<'p> {
                         // o.m()` — the receiver loaded indirectly — would get
                         // exactly ONE arm.
                         self.mi_record_recv(func_id, ip, recv);
-                        self.ic_install(func_id, ip, IcEntry::ProtoData { first, hops, slot });
+                        let recv_shape = self.ic_recv_shape(recv);
+                        self.ic_install(
+                            func_id,
+                            ip,
+                            IcEntry::ProtoData {
+                                recv_shape,
+                                first,
+                                hops,
+                                slot,
+                            },
+                        );
                         Some((fid, closure, v))
                     }
                     None => {
@@ -1488,7 +1594,9 @@ impl<'p> Vm<'p> {
                     None
                 }
             }
-            IcEntry::ProtoData { first, hops, slot } => {
+            IcEntry::ProtoData {
+                first, hops, slot, ..
+            } => {
                 if slot == u32::MAX || own.is_some() || m.class.is_some() {
                     return None;
                 }

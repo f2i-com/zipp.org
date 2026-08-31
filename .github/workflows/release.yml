@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag (for example, v0.0.1)
+        description: Existing release tag (for example, v0.0.5)
         required: true
-        default: v0.0.1
+        default: v0.0.5
         type: string
 
 # Build jobs can only read the repository. The release job raises this to
@@ -198,7 +198,61 @@ jobs:
           $bundle = "zipp-$env:RELEASE_VERSION-$env:RUST_TARGET"
           $bundlePath = Join-Path $PWD "dist/$bundle"
           New-Item -ItemType Directory -Path $bundlePath -Force | Out-Null
-          Copy-Item -LiteralPath $binary -Destination (Join-Path $bundlePath 'zipp.exe')
+          $packagedBinary = Join-Path $bundlePath 'zipp.exe'
+          Copy-Item -LiteralPath $binary -Destination $packagedBinary
+
+          # The Windows CLI runs the VM on its process main thread, so the PE
+          # stack fields are a runtime safety contract. Inspect the exact copy
+          # that will be archived rather than assuming the link argument took
+          # effect on the release-profile binary.
+          function Get-PeStackSizes([string] $Path) {
+            [byte[]] $bytes = [IO.File]::ReadAllBytes($Path)
+            if ($bytes.LongLength -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+              throw "packaged zipp.exe has no valid DOS header"
+            }
+
+            [uint64] $peOffset64 = [BitConverter]::ToUInt32($bytes, 0x3c)
+            if ($peOffset64 + 26 -gt [uint64] $bytes.LongLength) {
+              throw "packaged zipp.exe has a truncated PE header"
+            }
+            [int] $peOffset = $peOffset64
+            if ($bytes[$peOffset] -ne 0x50 -or
+                $bytes[$peOffset + 1] -ne 0x45 -or
+                $bytes[$peOffset + 2] -ne 0 -or
+                $bytes[$peOffset + 3] -ne 0) {
+              throw "packaged zipp.exe has no valid PE signature"
+            }
+
+            # The optional header follows the 4-byte signature and 20-byte
+            # COFF header. PE32+ stores the two stack fields as u64; PE32 uses
+            # u32 fields at the corresponding offsets.
+            [int] $optional = $peOffset + 24
+            [uint16] $magic = [BitConverter]::ToUInt16($bytes, $optional)
+            if ($magic -eq 0x20b) {
+              if ([uint64] $optional + 0x58 -gt [uint64] $bytes.LongLength) {
+                throw "packaged zipp.exe has a truncated PE32+ optional header"
+              }
+              [uint64] $reserve = [BitConverter]::ToUInt64($bytes, $optional + 0x48)
+              [uint64] $commit = [BitConverter]::ToUInt64($bytes, $optional + 0x50)
+            } elseif ($magic -eq 0x10b) {
+              if ([uint64] $optional + 0x50 -gt [uint64] $bytes.LongLength) {
+                throw "packaged zipp.exe has a truncated PE32 optional header"
+              }
+              [uint64] $reserve = [BitConverter]::ToUInt32($bytes, $optional + 0x48)
+              [uint64] $commit = [BitConverter]::ToUInt32($bytes, $optional + 0x4c)
+            } else {
+              throw ('packaged zipp.exe has unexpected optional-header magic 0x{0:x}' -f $magic)
+            }
+
+            return [pscustomobject]@{ Reserve = $reserve; Commit = $commit }
+          }
+
+          $stack = Get-PeStackSizes $packagedBinary
+          if ($stack.Reserve -ne 268435456 -or $stack.Commit -ne 4096) {
+            throw "packaged zipp.exe has stack reserve=$($stack.Reserve), commit=$($stack.Commit); expected reserve=268435456, commit=4096"
+          }
+          Write-Host "verified packaged PE stack: reserve=$($stack.Reserve), commit=$($stack.Commit)"
+
           Copy-Item -LiteralPath @('README.md', 'LICENSE-APACHE') -Destination $bundlePath
           $buildInfo = & $binary --version --json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -309,6 +363,15 @@ jobs:
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node --input-type=module --check < "dist/$bundle/zipp_wasm.js"
           node tests/node/check-wasm-memory.cjs "dist/$bundle/zipp_wasm_bg.wasm"
+          # Pin all generated type surfaces as well as the runtime smoke below:
+          # a mutually stale JS+WASM pair can execute successfully while
+          # silently omitting an API added by the tagged Rust source.
+          grep -Fq 'getGlobalsFingerprint(indices: any): any;' \
+            "dist/$bundle/zipp_wasm.d.ts"
+          grep -Fq 'readonly engine_getGlobalsFingerprint:' \
+            "dist/$bundle/zipp_wasm.d.ts"
+          grep -Fq 'export const engine_getGlobalsFingerprint:' \
+            "dist/$bundle/zipp_wasm_bg.wasm.d.ts"
           BUNDLE_PATH="$(pwd)/dist/$bundle" node --input-type=module <<'JS'
           import fs from "node:fs";
           import path from "node:path";
@@ -316,18 +379,54 @@ jobs:
 
           const bundle = process.env.BUNDLE_PATH;
           const zipp = await import(pathToFileURL(path.join(bundle, "zipp_wasm.js")));
+          const wasmBytes = fs.readFileSync(path.join(bundle, "zipp_wasm_bg.wasm"));
+          const wasmModule = new WebAssembly.Module(wasmBytes);
+          if (!WebAssembly.Module.exports(wasmModule).some(
+            entry => entry.kind === "function" && entry.name === "engine_getGlobalsFingerprint"
+          )) {
+            throw new Error("browser package lacks raw engine_getGlobalsFingerprint export");
+          }
+          if (typeof zipp.Engine?.prototype?.getGlobalsFingerprint !== "function") {
+            throw new Error("browser package lacks Engine.getGlobalsFingerprint glue");
+          }
           await zipp.default({
-            module_or_path: fs.readFileSync(path.join(bundle, "zipp_wasm_bg.wasm")),
+            module_or_path: wasmModule,
           });
           const engine = new zipp.Engine();
           try {
-            engine.initScript('console.log("zipp-web-release-smoke");');
+            const symbols = engine.initScript(`
+              let fingerprintProbe = { items: [1] };
+              function mutateFingerprintProbe() { fingerprintProbe.items.push(2); }
+              console.log("zipp-web-release-smoke");
+            `);
+            const indices = [symbols.fingerprintProbe.index];
+            const beforeValue = engine.getGlobalsBatch(indices);
+            const before = engine.getGlobalsFingerprint(indices);
+            const stable = engine.getGlobalsFingerprint(indices);
+            if (!Array.isArray(before)
+                || before.length !== 1
+                || !Number.isSafeInteger(before[0])
+                || before[0] < 0
+                || stable[0] !== before[0]) {
+              throw new Error(`invalid globals fingerprint binding: ${JSON.stringify({ before, stable })}`);
+            }
+            engine.callFunction("mutateFingerprintProbe", []);
+            const afterValue = engine.getGlobalsBatch(indices);
+            const after = engine.getGlobalsFingerprint(indices);
+            if (JSON.stringify(beforeValue) === JSON.stringify(afterValue)
+                || !Array.isArray(after)
+                || before[0] === after[0]) {
+              throw new Error(
+                `globals fingerprint did not follow an in-place mutation: ${JSON.stringify({ before, after })}`
+              );
+            }
             const output = engine.takeOutput();
             if (JSON.stringify(output) !== '["zipp-web-release-smoke"]') {
               throw new Error(`unexpected browser-package output: ${JSON.stringify(output)}`);
             }
           } finally {
             engine.dispose();
+            engine.free();
           }
           JS
           install -m 0644 README.md ../../LICENSE-APACHE "dist/$bundle/"

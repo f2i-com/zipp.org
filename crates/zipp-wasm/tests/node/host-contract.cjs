@@ -1,5 +1,30 @@
 // Exercises the full Engine surface the SoftN adapter depends on.
+const fs = require("node:fs");
+const path = require("node:path");
 const { Engine } = require("./pkg/zipp_wasm.js");
+
+// Fail before the behavioral suite if generated artifacts came from an older
+// source revision. Checking all four surfaces catches every mixed-package
+// combination: stale high-level glue, either stale declaration file, or a
+// module whose raw wasm-bindgen export is absent.
+const pkg = path.join(__dirname, "pkg");
+const engineTypes = fs.readFileSync(path.join(pkg, "zipp_wasm.d.ts"), "utf8");
+const wasmTypes = fs.readFileSync(path.join(pkg, "zipp_wasm_bg.wasm.d.ts"), "utf8");
+const wasmModule = new WebAssembly.Module(fs.readFileSync(path.join(pkg, "zipp_wasm_bg.wasm")));
+if (typeof Engine.prototype.getGlobalsFingerprint !== "function") {
+  throw new Error("stale generated Zipp glue: Engine.getGlobalsFingerprint is missing");
+}
+if (!/\bgetGlobalsFingerprint\s*\(indices:\s*any\)\s*:\s*any\s*;/.test(engineTypes)) {
+  throw new Error("stale generated Zipp declarations: getGlobalsFingerprint is missing");
+}
+if (!/\bengine_getGlobalsFingerprint\b/.test(wasmTypes)) {
+  throw new Error("stale generated raw-WASM declarations: engine_getGlobalsFingerprint is missing");
+}
+if (!WebAssembly.Module.exports(wasmModule).some(
+  entry => entry.kind === "function" && entry.name === "engine_getGlobalsFingerprint",
+)) {
+  throw new Error("stale generated Zipp module: engine_getGlobalsFingerprint is missing");
+}
 
 let pass = 0, fail = 0;
 function eq(label, got, want) {
@@ -11,6 +36,7 @@ function ok(label, cond, extra = "") {
   if (cond) { pass++; console.log(`  ok   ${label}`); }
   else { fail++; console.log(`  FAIL ${label} ${extra}`); }
 }
+ok("fingerprint bindings exist in glue, declarations, and raw WASM", true);
 
 // ---- a mock db + localStorage, same shape the SoftN adapter installs -------
 const rows = {};
@@ -231,9 +257,48 @@ eq("clipboard has a separately granted bridge", e.callFunction("clipboardRoundTr
 console.log("— batch —");
 const idx = [syms.score.index, syms.best.index, syms.bump.index];
 eq("getGlobalsBatch (function reads as null)", e.getGlobalsBatch(idx), [5, 42, null]);
+const firstFingerprints = e.getGlobalsFingerprint(idx);
+ok(
+  "fingerprints are one exact non-negative JS integer per slot",
+  Array.isArray(firstFingerprints)
+    && firstFingerprints.length === idx.length
+    && firstFingerprints.every(value => Number.isSafeInteger(value) && value >= 0),
+  JSON.stringify(firstFingerprints),
+);
+eq("unchanged globals keep their fingerprints", e.getGlobalsFingerprint(idx), firstFingerprints);
+const duplicateFingerprints = e.getGlobalsFingerprint([syms.score.index, syms.score.index]);
+eq("fingerprint order and duplicate slots are preserved", duplicateFingerprints, [firstFingerprints[0], firstFingerprints[0]]);
 e.setGlobalsBatch(idx, [100, 200, 12345]);
 eq("setGlobalsBatch wrote the variables", e.getGlobalsBatch([syms.score.index, syms.best.index]), [100, 200]);
 ok("function slot survived the batch write", e.callFunction("bump", [0]).score === 100);
+const writtenFingerprints = e.getGlobalsFingerprint(idx);
+ok(
+  "changed data slots change while the protected function slot stays stable",
+  writtenFingerprints[0] !== firstFingerprints[0]
+    && writtenFingerprints[1] !== firstFingerprints[1]
+    && writtenFingerprints[2] === firstFingerprints[2],
+  JSON.stringify({ firstFingerprints, writtenFingerprints }),
+);
+
+// A slot-generation counter would miss this: the global still points at the
+// same Array, but nested data changed in place. The fingerprint must track the
+// value getGlobalsBatch would actually marshal, and an equal replacement must
+// recover the original content digest even though it has a new identity.
+const originalGrid = e.getGlobalsBatch([syms.grid.index])[0];
+const originalGridFingerprint = e.getGlobalsFingerprint([syms.grid.index])[0];
+e.evalInContext("(grid[1].on = true, grid.push({ i: 3, on: false }))");
+const mutatedGridFingerprint = e.getGlobalsFingerprint([syms.grid.index])[0];
+ok(
+  "an in-place nested mutation changes the fingerprint",
+  mutatedGridFingerprint !== originalGridFingerprint,
+  JSON.stringify({ originalGridFingerprint, mutatedGridFingerprint }),
+);
+e.setGlobalByIndex(syms.grid.index, originalGrid);
+eq(
+  "a structurally equal replacement restores the content fingerprint",
+  e.getGlobalsFingerprint([syms.grid.index]),
+  [originalGridFingerprint],
+);
 
 console.log("— events —");
 eq("listener types", e.getEventListenerTypes(), ["keydown"]);
@@ -439,6 +504,15 @@ try { limits.getGlobalsBatch(throwingIndices); }
 catch (err) { throwingIndicesErr = String(err); }
 ok("throwing index arrays are controlled", throwingIndicesErr.includes("could not be inspected safely"), throwingIndicesErr);
 eq("index inspection does not poison the Engine borrow", limits.evalInContext("1 + 1"), 2);
+let throwingFingerprintIndicesErr = "";
+try { limits.getGlobalsFingerprint(throwingIndices); }
+catch (err) { throwingFingerprintIndicesErr = String(err); }
+ok(
+  "throwing fingerprint index arrays are controlled",
+  throwingFingerprintIndicesErr.includes("could not be inspected safely"),
+  throwingFingerprintIndicesErr,
+);
+eq("fingerprint index inspection does not poison the Engine borrow", limits.evalInContext("1 + 1"), 2);
 
 for (const [label, invalidIndex] of [
   ["negative", -1],
@@ -453,6 +527,20 @@ for (const [label, invalidIndex] of [
   catch (caught) { err = String(caught); }
   ok(`${label} slot indices fail closed`, err.includes("finite unsigned 32-bit integers"), err);
   eq(`${label} slot indices do not poison the Engine borrow`, limits.evalInContext("1 + 1"), 2);
+
+  let fingerprintErr = "";
+  try { limits.getGlobalsFingerprint([invalidIndex]); }
+  catch (caught) { fingerprintErr = String(caught); }
+  ok(
+    `${label} fingerprint slot indices fail closed`,
+    fingerprintErr.includes("finite unsigned 32-bit integers"),
+    fingerprintErr,
+  );
+  eq(
+    `${label} fingerprint indices do not poison the Engine borrow`,
+    limits.evalInContext("1 + 1"),
+    2,
+  );
 }
 
 const throwingValues = new Proxy([1], {
@@ -482,11 +570,19 @@ try { tenant.setDbBridge(db); } catch (err) { bridgeAfterDisposeErr = String(err
 ok("disposed engine cannot reacquire host capabilities", bridgeAfterDisposeErr.includes("disposed"), bridgeAfterDisposeErr);
 
 const disposed = new Engine();
-disposed.initScript("let value = 1;");
+const disposedSyms = disposed.initScript("let value = 1;");
 disposed.dispose();
 let terminalErr = "";
 try { disposed.initScript("let replacement = 2;"); } catch (err) { terminalErr = String(err); }
 ok("explicit dispose is terminal", terminalErr.includes("disposed"), terminalErr);
+let disposedFingerprintErr = "";
+try { disposed.getGlobalsFingerprint([disposedSyms.value.index]); }
+catch (err) { disposedFingerprintErr = String(err); }
+ok(
+  "disposed engine rejects fingerprint reads",
+  disposedFingerprintErr.includes("disposed"),
+  disposedFingerprintErr,
+);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

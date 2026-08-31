@@ -120,6 +120,21 @@ console.log("module-rec:" + sum);
             "both module entries must reach Tier A new-ground recursion:\n{stderr}"
         );
     }
+
+    #[test]
+    fn runtime_disabled_jit_does_not_pin_the_interpreter_register_file() {
+        let source = "function add(a, b) { return a + b; } console.log(add(20, 22));";
+        let ast = crate::front::parse_script(source).expect("script parses");
+        let program = crate::compile::compile_main_program(&ast, source).expect("script compiles");
+        let mut vm = Vm::new(&program);
+        vm.set_jit_enabled(false);
+        vm.run().expect("interpreter run succeeds");
+        assert_eq!(vm.output, ["42"]);
+        assert_eq!(
+            vm.reg_capacity, 0,
+            "runtime-disabled JIT must leave interpreter register growth unpinned"
+        );
+    }
 }
 
 impl<'p> Vm<'p> {

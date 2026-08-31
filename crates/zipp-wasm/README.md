@@ -7,10 +7,11 @@ once, then read and write the script's top-level bindings, call its functions, a
 deliver events — for as long as the page lives. That is what `Engine` is.
 
 ```sh
-rustup target add wasm32-unknown-unknown
-cargo install wasm-bindgen-cli --locked
+rustup +1.92.0 target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version '=0.2.126' --locked
 cd crates/zipp-wasm
-cargo build --locked --release --target wasm32-unknown-unknown
+RUSTFLAGS='-Dwarnings -C link-arg=--max-memory=268435456 -C link-arg=-zstack-size=1048576' \
+  cargo +1.92.0 build --locked --release --target wasm32-unknown-unknown
 wasm-bindgen --target web --out-dir pkg \
   --remove-name-section --remove-producers-section \
   target/wasm32-unknown-unknown/release/zipp_wasm.wasm
@@ -44,9 +45,47 @@ Keep the release profile at `opt-level = 3`. `opt-level = "s"` and `"z"` were
 measured: `"z"` cuts the wire to 974,657 bytes and makes the interpreter
 **1.9x-2.5x slower**, which is not a trade this artifact should take.
 
+### Why release uses four codegen units
+
+Codegen-unit count changes both duplicate code and the layout V8 sees, so the
+smallest module was not automatically the fastest one. The production setting
+was selected from this complete bounded screen; sizes are the final
+section-stripped `wasm-bindgen --target web` module:
+
+| release profile | raw | gzip-9 | brotli-11 | observed steady time vs previous default | decision |
+| --- | ---: | ---: | ---: | ---: | --- |
+| previous default: 16 CGUs, no LTO | 5,671,347 | 1,870,840 | 1,262,145 | baseline | control |
+| 8 CGUs, no LTO | 5,618,617 | 1,862,076 | 1,259,931 | +0.87% | reject: slower aggregate; array rows regressed |
+| **4 CGUs, no LTO** | **5,568,906** | **1,845,830** | **1,245,797** | **-0.95%** | **ship** |
+| 1 CGU, no LTO | 5,285,536 | 1,789,022 | 1,222,240 | +2.01% | reject: slower aggregate |
+| 1 CGU + ThinLTO | 5,284,887 | 1,789,214 | 1,223,108 | not timed | reject: only 649 raw bytes below CGU1, larger on the wire |
+| 1 CGU + fat LTO | 5,284,887 | 1,789,320 | 1,223,314 | not timed | reject: only 649 raw bytes below CGU1, larger on the wire |
+
+These are a reproducible artifact comparison, not a claim that every browser
+workload gets 0.95% faster. All candidates used commit
+`d71168a9fba3c4b97a05aaacbf14cf046dc65d38`, rustc 1.92.0, locked dependencies,
+and `wasm-bindgen` 0.2.126 with the name and producers sections removed. gzip was
+level 9; Brotli was quality 11. The accepted CGU4 and rejected CGU8 builds were
+timed together under Node 24.12 / V8 13.6 over 11 successful steady-state rows:
+one warm round, then six measured rounds of 13 samples, for 78 paired samples
+per row, with all six module execution orders balanced. The table reports the
+equal-row geomean; no aggregate confidence interval was computed. CGU4's three
+largest observed slower rows were +3.76%, +2.84%, and +2.76%, and each per-row
+95% interval crossed zero. CGU1 used a separate quiet two-way run with the same
+warm-round and measured-sample counts and counterbalanced order. LTO was already
+dominated on transfer size and was not given a throughput claim.
+
+The tracked landing-page module was then rebuilt from the selected profile in
+the primary worktree. Its exact current artifact is 5,566,206 bytes raw,
+1,845,822 bytes at gzip-9, and 1,244,186 bytes at Brotli-11, with SHA-256
+`71df836700a2431021ef6aa3793da77b86226b6b43ead76e70169ec0b9ed00fd`.
+The generated JavaScript and declarations were byte-identical to the checked-in
+files; only `zipp_wasm_bg.wasm` changed. The table retains the isolated CGU4
+candidate's sizes so every build-policy row remains a like-for-like comparison.
+
 ### Compression is where the bytes actually are
 
-The artifact is ~1.26 MB brotli and ~1.87 MB gzip. Serving it as gzip therefore
+The artifact is ~1.25 MB brotli and ~1.85 MB gzip. Serving it as gzip therefore
 costs ~600 KB per cold load — more than every build-level saving here put
 together. Confirm what your origin actually sends:
 

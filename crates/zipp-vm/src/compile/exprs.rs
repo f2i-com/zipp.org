@@ -1871,6 +1871,31 @@ impl<'a> FnCompiler<'a> {
         Ok(j)
     }
 
+    /// Compile a TEST whose value is consumed only for truthiness and return
+    /// every jump taken when it is falsy.  `a && b && c` is falsy as soon as
+    /// any operand is falsy, so the control-flow form can branch after each
+    /// operand instead of materialising the two intermediate values that
+    /// `logical()` must preserve when `&&` is used as an expression.
+    ///
+    /// Evaluation remains exactly left-to-right and short-circuiting: each
+    /// returned jump is patched to the caller's one false successor.  `||`
+    /// and `??` deliberately retain their ordinary lowering because their
+    /// left-success path needs a second patch list; this first step is both
+    /// narrow and sufficient for the parser/tokenizer-shaped hot loops.
+    pub(crate) fn emit_test_jumps(&mut self, test: &ast::Expr) -> R<Vec<u32>> {
+        if let ast::Expr::Logical {
+            op: ast::LogicalOp::And,
+            left,
+            right,
+        } = test
+        {
+            let mut jumps = self.emit_test_jumps(left)?;
+            jumps.extend(self.emit_test_jumps(right)?);
+            return Ok(jumps);
+        }
+        Ok(vec![self.emit_test_jump(test)?])
+    }
+
     /// W11 (B124) n-ary string-concat chain fusion: emit a flattened
     /// `L1+L2+…+Ln` (n≥3) as `acc = Add(L1,L2)` then, per remaining leaf,
     /// `StrConcatChain{dst:acc, a:acc, b:leaf}`, and a final `Move` into the
@@ -2089,7 +2114,14 @@ impl<'a> FnCompiler<'a> {
                 return self.concat_chain(&leaves, dst);
             }
         }
+        // A completed expression exposes only its returned value register. Any
+        // callee/argument/member/literal scratch allocated while producing it is
+        // dead before Evaluate(RHS) begins, so reclaim that suffix while keeping
+        // both the pre-existing outer register floor and a newly allocated LHS
+        // result. `saturating_add` preserves alloc_reg's clean overflow path.
+        let left_floor = self.next_reg;
         let a = self.expr(left)?;
+        self.next_reg = left_floor.max(a.saturating_add(1));
         let r = self.expr(right)?;
         let instr = match op {
             Op::Add => Instr::Add { dst, a, b: r },
@@ -2145,7 +2177,7 @@ impl<'a> FnCompiler<'a> {
             // Both are handled above; kept explicit so a new operator breaks the
             // build instead of falling into a catch-all.
             Op::In | Op::Instanceof => {
-                return Err("unsupported binary operator (zipp-vm v1)".into())
+                return Err("unsupported binary operator (zipp-vm v1)".into());
             }
         };
         self.emit(instr);
@@ -2838,6 +2870,87 @@ impl<'a> FnCompiler<'a> {
 }
 
 #[cfg(test)]
+mod binary_lhs_reclaim_tests {
+    use super::*;
+
+    fn compile(source: &str) -> crate::bytecode::Program {
+        let ast = crate::front::parse_script(source).expect("source parses");
+        crate::compile::compile_program(&ast, source).expect("source compiles")
+    }
+
+    fn compile_module(source: &str) -> crate::bytecode::Program {
+        let ast = crate::front::parse_module(source).expect("module parses");
+        crate::compile::compile_module(&ast, source).expect("module compiles")
+    }
+
+    fn named<'a>(program: &'a crate::bytecode::Program, name: &str) -> &'a FuncProto {
+        program
+            .functions
+            .iter()
+            .find(|func| func.name == name)
+            .unwrap_or_else(|| panic!("missing function {name:?}"))
+    }
+
+    #[test]
+    fn fib_reclaims_only_left_scratch_without_changing_opcode_shape() {
+        let program = compile("function fib(n){ return n < 2 ? n : fib(n-1) + fib(n-2); } fib(8);");
+        let fib = named(&program, "fib");
+        assert_eq!(fib.reg_count, 9, "unexpected fib register frame:\n{fib:#?}");
+        assert_eq!(fib.code.len(), 12, "scratch reuse changed opcode count");
+
+        let calls = fib
+            .code
+            .iter()
+            .filter_map(|instr| match *instr {
+                Instr::Call {
+                    dst,
+                    callee,
+                    arg_base,
+                    argc: 1,
+                } => Some((dst, callee, arg_base)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2, "recursive call shape changed: {fib:#?}");
+        let add_inputs = fib.code.iter().find_map(|instr| match *instr {
+            Instr::Add { a, b, .. } => Some((a, b)),
+            _ => None,
+        });
+        assert_eq!(add_inputs, Some((calls[0].0, calls[1].0)));
+        assert_eq!(
+            calls[1],
+            (calls[0].1, calls[0].2, calls[0].2.saturating_add(1)),
+            "RHS did not reuse only dead LHS call scratch"
+        );
+    }
+
+    #[test]
+    fn a_non_dst_left_result_is_kept_above_the_reclaimed_floor() {
+        // ImportMeta deliberately allocates and returns a register OTHER than
+        // the dst requested by expr(). Reclaiming to the entry floor alone
+        // would let the RHS overwrite the first module object before Eq reads it.
+        let program =
+            compile_module("export function same(){ return import.meta === import.meta; }");
+        let same = named(&program, "same");
+        let metas = same
+            .code
+            .iter()
+            .filter_map(|instr| match *instr {
+                Instr::ImportMeta { dst } => Some(dst),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(metas.len(), 2, "import.meta lowering changed: {same:#?}");
+        assert_ne!(metas[0], metas[1], "RHS overwrote the live LHS result");
+        let eq_inputs = same.code.iter().find_map(|instr| match *instr {
+            Instr::Eq { a, b, .. } => Some((a, b)),
+            _ => None,
+        });
+        assert_eq!(eq_inputs, Some((metas[0], metas[1])));
+    }
+}
+
+#[cfg(test)]
 mod static_key_plan_tests {
     use super::*;
 
@@ -2985,14 +3098,17 @@ mod static_key_plan_tests {
             .functions
             .iter()
             .all(|func| func.static_key_plans.is_empty()));
-        assert!(program.functions.iter().all(|func| !func
-            .code
-            .iter()
-            .any(|instr| matches!(instr, Instr::NewPlannedObject { .. }))));
-        assert!(program.functions.iter().any(|func| func
-            .code
-            .iter()
-            .any(|instr| matches!(instr, Instr::NewObject { hint: 2, .. }))));
+        assert!(program.functions.iter().all(|func| {
+            !func
+                .code
+                .iter()
+                .any(|instr| matches!(instr, Instr::NewPlannedObject { .. }))
+        }));
+        assert!(program.functions.iter().any(|func| {
+            func.code
+                .iter()
+                .any(|instr| matches!(instr, Instr::NewObject { hint: 2, .. }))
+        }));
     }
 
     #[test]

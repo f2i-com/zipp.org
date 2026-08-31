@@ -20,14 +20,17 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let stats = std::env::var_os("ZIPP_SHAPESTATS").is_some();
     let bstats = std::env::var_os("ZIPP_BUILTINSTATS").is_some();
-    // Run the engine on a dedicated thread with a large stack. The interpreter
-    // keeps JS recursion in an explicit frame stack, but every NATIVE re-entry
-    // (a builtin callback, a generator/async resume, a direct eval, a JIT
-    // bail-out) is a real Rust frame — and the main thread gets only 1 MiB on
-    // Windows, which runaway recursion through such re-entries exhausts long
-    // before the engine's own depth guards can raise a catchable RangeError.
-    // 256 MiB of RESERVE (committed lazily by the OS) puts the engine's guards
-    // firmly in charge.
+    // On Windows build.rs gives the PE main thread a 256 MiB reserve with only
+    // one 4 KiB page committed up front. Running here avoids the fixed
+    // CreateThread/join and second allocator-thread-heap cost while preserving
+    // the stack headroom guest-driven native re-entry needs to reach the VM's
+    // catchable depth guards.
+    #[cfg(windows)]
+    let (r, shape) = (run(&args), stats.then(zipp_vm::shape_stats));
+
+    // Other platforms have no equivalent binary-local, portable main-stack
+    // contract. Retain the proven dedicated-thread path there.
+    #[cfg(not(windows))]
     let (r, shape) = std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
         // The shape transition tree is a thread-local, so it has to be sampled

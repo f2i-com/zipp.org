@@ -1435,7 +1435,9 @@ fn gpr_home_map(
         || (!gpr_split_enabled()
             && (!plan.split_recvs.is_empty() || !plan.split_recv_lg.is_empty()))
     {
-        crate::codegen::region_int_gpr::gpr_decline_note("wt/dv-flag needs dv_gpr, or split needs gpr_split");
+        crate::codegen::region_int_gpr::gpr_decline_note(
+            "wt/dv-flag needs dv_gpr, or split needs gpr_split",
+        );
         return Err(false);
     }
     // Engage only where the mode pays: at least one op that would round-trip
@@ -1652,7 +1654,9 @@ fn gpr_home_map(
         match plan.reg_home.get(r) {
             Some(&Home::Xmm(x)) if matches!(map.get(&x), Some(Loc::R(_))) => {}
             _ => {
-                crate::codegen::region_int_gpr::gpr_decline_note("split receiver home not resident");
+                crate::codegen::region_int_gpr::gpr_decline_note(
+                    "split receiver home not resident",
+                );
                 return Err(false);
             }
         }
@@ -1707,7 +1711,9 @@ fn gpr_home_map(
                 if (spilled_path || !plan.narrow_globs.is_empty())
                     && plan.bool_regs.iter().any(|&(br, _)| br == *r) => {}
             _ => {
-                crate::codegen::region_int_gpr::gpr_decline_note("write-through register home unmapped");
+                crate::codegen::region_int_gpr::gpr_decline_note(
+                    "write-through register home unmapped",
+                );
                 return Err(false);
             }
         }
@@ -2532,8 +2538,18 @@ pub(crate) fn compile_region_int_gpr(
             .captured_calls
             .values()
             .any(|site| s <= site.call_ip && site.call_ip <= e);
+    // A recycled pinned receiver can add one numeric home to an otherwise
+    // register-sized bitwise loop. The split fallback reaches this function
+    // only on its post-share attempt (`allow_spill`), and split homes are
+    // force-resident above, so one canonical slot for the coldest OTHER home
+    // is the bounded bridge back to the faster integer lane. Keep this separate
+    // from the dark general spill policy: the measured four-slot DV swizzle
+    // regression still exceeds this cap and declines unchanged. The shared
+    // spill kill switch remains a byte-for-byte fallback for the mechanism.
+    let split_prefix_spill = spills_not_forced_off && !plan.split_recvs.is_empty();
     let general_spill = gpr_spill_slots_enabled() || computed_spill;
-    let spill_enabled = allow_spill && (general_spill || captured_prefix_spill);
+    let spill_enabled =
+        allow_spill && (general_spill || captured_prefix_spill || split_prefix_spill);
     let spill_cap = if general_spill { GPR_SPILL_CAP } else { 1 };
     let (map, hoist_c, inline_guards, n_spill) = match gpr_home_map(
         proto,
@@ -3571,7 +3587,9 @@ pub(crate) fn compile_region_int_gpr(
                             dynasm!(ops ; movsxd Rq(d), DWORD [rdx + rcx * 4])
                         }
                         None => {
-                            crate::codegen::region_int_gpr::gpr_decline_note("pinned element kind not an int TA load");
+                            crate::codegen::region_int_gpr::gpr_decline_note(
+                                "pinned element kind not an int TA load",
+                            );
                             return GprAttempt::OutOfScope;
                         }
                     }

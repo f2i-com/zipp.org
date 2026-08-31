@@ -136,3 +136,37 @@ fn aggregate_unique_programs_respect_the_embedder_heap_limit() {
         "two programs should remain while the third is declined; growth was {growth}"
     );
 }
+
+#[test]
+fn regexp_compile_reuses_the_program_that_passed_preflight() {
+    let mut state = embed::compile_script(
+        r#"
+        var target = /seed/;
+        function recompile() {
+            target.compile("A\\p{RGI_Emoji}", "v");
+            return target.source.length;
+        }
+        "#,
+    )
+    .expect("script compiles");
+    state.set_limits(20_000_000, None);
+    state.run_init().expect("script initializes");
+    let recompile = slot(&state, "recompile");
+    let baseline = state.heap_bytes();
+
+    // The UnicodeSets matcher is about 1 MiB. `compile` historically rebuilt
+    // an equivalent second program after the constructor path had preflighted
+    // the first, so one successful call retained roughly 2 MiB and silently
+    // crossed this ceiling. The receiver and constructor cache must share the
+    // one admitted Arc instead.
+    state.set_heap_limit(baseline + 1_500 * 1024);
+    state
+        .call_slot(recompile, &[])
+        .expect("one preflighted program fits the budget");
+    assert!(state.resource_limit_error().is_none());
+    let growth = state.heap_bytes().saturating_sub(baseline);
+    assert!(
+        growth > 900 * 1024 && growth < 1_500 * 1024,
+        "compile must retain one shared program, not a duplicate; growth was {growth}"
+    );
+}

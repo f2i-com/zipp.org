@@ -161,6 +161,8 @@ impl<'p> Vm<'p> {
             const_string_cache: rustc_hash::FxHashMap::default(),
             const_string_cache_funcs: rustc_hash::FxHashMap::default(),
             const_string_cache_enabled: std::env::var_os("ZIPP_NO_CONST_STRING_CACHE").is_none(),
+            #[cfg(not(target_arch = "wasm32"))]
+            builtin_stats_enabled: crate::vm::builtins::builtin_stats_enabled_for_vm(),
             heap,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             globals_raw: globals.as_mut_ptr().expose_provenance() as u64,
@@ -342,6 +344,8 @@ impl<'p> Vm<'p> {
             arraybuffer_proto: 0,
             dataview_ctor: 0,
             dataview_proto: 0,
+            dataview_proto_shape: crate::shape::DICT,
+            dataview_numeric_getter_bits: [Value::UNDEFINED.bits(); 8],
             sab_ctor: 0,
             sab_proto: 0,
             shared_buffers: std::collections::HashSet::new(),

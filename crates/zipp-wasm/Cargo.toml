@@ -1,6 +1,6 @@
 [package]
 name = "zipp-wasm"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 license = "Apache-2.0"
 description = "WebAssembly embedding of the zipp JavaScript engine: a persistent VM a browser host can keep alive across re-entries."
@@ -15,6 +15,11 @@ resolver = "2"
 # never silently become an index/limit bypass in the hardened artifact.
 overflow-checks = true
 panic = "abort"
+# Measured in the isolated, section-stripped A/B: four units cut raw/Brotli
+# size by 1.81%/1.30% with no aggregate throughput regression. Eight units
+# were larger and slower; one unit was smaller but slower on the steady-state
+# WebAssembly gate.
+codegen-units = 4
 
 [lib]
 crate-type = ["cdylib", "rlib"]

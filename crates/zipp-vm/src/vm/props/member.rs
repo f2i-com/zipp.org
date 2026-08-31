@@ -835,9 +835,9 @@ impl<'p> Vm<'p> {
                                      // Inside a ShadowRealm's evaluate, `globalThis.x` reads the REALM's
                                      // own binding for x when one exists (bare `x` and `globalThis.x`
                                      // alias the same realm slot).
-        // (A `$262.createRealm()` child has a global object of its OWN — a
-        // reference to the main global from child code is an OrdinaryGet
-        // (10.1.8) on that object, never the child's binding table.)
+                                     // (A `$262.createRealm()` child has a global object of its OWN — a
+                                     // reference to the main global from child code is an OrdinaryGet
+                                     // (10.1.8) on that object, never the child's binding table.)
         if let Some(rid) = self.active_realm {
             if obj.is_heap()
                 && self.global_this != 0
@@ -1373,6 +1373,7 @@ impl<'p> Vm<'p> {
             buffer,
             byte_offset,
             byte_length,
+            ..
         } = self.heap.get(obj.heap_index())
         {
             let (buffer, byte_offset, byte_length) = (*buffer, *byte_offset, *byte_length);
@@ -1421,7 +1422,11 @@ impl<'p> Vm<'p> {
                         .filter(|p| p.is_heap())
                         .map(|p| p.heap_index())
                         .unwrap_or(self.dataview_proto);
-                    self.proto_member(proto, key)
+                    // The pristine interpreter leaf deliberately declines on
+                    // accessor mutation. Preserve OrdinaryGet semantics here:
+                    // invoke the inherited getter with the original receiver,
+                    // then let CallMethod invoke the callable it returned.
+                    return self.proto_member_get(proto, key, receiver);
                 }
             });
         }

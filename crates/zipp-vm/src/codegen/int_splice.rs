@@ -1044,8 +1044,16 @@ fn map_body_instr(
         } => Instr::MathOp {
             dst: m(dst),
             op: crate::bytecode::MathFn::Imul,
-            callee: if callee == crate::bytecode::NO_REG { callee } else { m(callee) },
-            this_v: if callee == crate::bytecode::NO_REG { this_v } else { m(this_v) },
+            callee: if callee == crate::bytecode::NO_REG {
+                callee
+            } else {
+                m(callee)
+            },
+            this_v: if callee == crate::bytecode::NO_REG {
+                this_v
+            } else {
+                m(this_v)
+            },
             arg_base: m(arg_base),
             argc: 2,
         },

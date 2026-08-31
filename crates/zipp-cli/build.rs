@@ -17,10 +17,43 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-const PGO_BUILD_CONTRACT: &str = "zipp-pgo-build-v2;cargo=build --locked --release --target=x86_64-pc-windows-msvc --package=zipp-cli --bin=zipp --no-default-features;profile=opt-level=3,lto=fat,codegen-units=1,panic=abort,incremental=false,debug=false,strip=none,debug-assertions=false,overflow-checks=false;rustflags=target-cpu=x86-64,linker-flavor=lld-link,profile-use=<verified-profile>;linker=selected-rustc-rust-lld;cc-rs=target-specific-selected-msvc-cl+lib;source=private-readonly-clean-head-snapshot-v1;cargo-config=controlled-cwd+no-home-config;target-dir=fresh;sdk=validated-environment-paths-not-byte-manifested;env=allowlist-v2";
+const PGO_BUILD_CONTRACT: &str = "zipp-pgo-build-v2;cargo=build --locked --release --target=x86_64-pc-windows-msvc --package=zipp-cli --bin=zipp --no-default-features;profile=opt-level=3,lto=fat,codegen-units=1,panic=abort,incremental=false,debug=false,strip=none,debug-assertions=false,overflow-checks=false;pe-stack=reserve-268435456,commit-4096;rustflags=target-cpu=x86-64,linker-flavor=lld-link,profile-use=<verified-profile>;linker=selected-rustc-rust-lld;cc-rs=target-specific-selected-msvc-cl+lib;source=private-readonly-clean-head-snapshot-v1;cargo-config=controlled-cwd+no-home-config;target-dir=fresh;sdk=validated-environment-paths-not-byte-manifested;env=allowlist-v2";
 const PGO_BUILD_ENV_POLICY: &str = "zipp-pgo-build-env-allowlist-v2";
 
+// The CLI runs the engine on the Windows main thread. Reserve the same large,
+// lazily committed stack that the old worker thread requested so guest-driven
+// native re-entry reaches the VM's catchable depth guards instead of the OS
+// guard page. This is a PE-header policy, not a request to commit 256 MiB.
+pub(crate) const WINDOWS_STACK_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const WINDOWS_STACK_COMMIT_BYTES: u64 = 4 * 1024;
+
+pub(crate) fn windows_stack_link_arg(target: &str) -> Option<String> {
+    if target.ends_with("-windows-msvc") {
+        Some(format!(
+            "/STACK:{WINDOWS_STACK_RESERVE_BYTES},{WINDOWS_STACK_COMMIT_BYTES}"
+        ))
+    } else if target.ends_with("-windows-gnu") || target.ends_with("-windows-gnullvm") {
+        // The GNU and gnullvm targets both drive their linker through a
+        // GNU-style compiler frontend, so pass the PE reserve option through
+        // with `-Wl`. Their PE default commit is one 4 KiB page. The Windows
+        // integration test reads both fields back from the linked binary,
+        // independent of linker flavour.
+        Some(format!("-Wl,--stack,{WINDOWS_STACK_RESERVE_BYTES}"))
+    } else {
+        None
+    }
+}
+
 fn main() {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.contains("-windows-") {
+        let link_arg = windows_stack_link_arg(&target)
+            .unwrap_or_else(|| panic!("unsupported Windows linker target: {target}"));
+        // Scope the setting to the shipped CLI binary: build-script helpers,
+        // unit tests and unrelated workspace binaries keep their normal stack.
+        println!("cargo:rustc-link-arg-bin=zipp={link_arg}");
+    }
+
     let git = |args: &[&str]| -> Option<String> {
         let out = Command::new("git").args(args).output().ok()?;
         if !out.status.success() {

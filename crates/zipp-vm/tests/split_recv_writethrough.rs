@@ -30,10 +30,11 @@
 //!     current capture-first bytecode hosts this case on INT-GPR at default
 //!     settings; the switch matrix still pins its fallback semantics.
 //!
-//! `pre`, the constant-folding nest in the first two, is LOAD-BEARING: it is
-//! what makes the bytecode compiler recycle the receiver's register number
-//! earlier in the proto, which is what puts it in `read_outside` and therefore
-//! in `write_through`. Drop it and the same loop answers correctly — so the
+//! `pre`, the constant-folding nest in the first two, and the first case's
+//! explicit `+ 0.0` are LOAD-BEARING: they make the bytecode compiler recycle
+//! the receiver's register number earlier in the proto, which is what puts it
+//! in `read_outside` and therefore in `write_through`. Drop them and the same
+//! loop answers correctly — so the
 //! `splitwt_mechanism_*` pins read the plan back out of a child's ZIPP_JITLOG
 //! and fail if the shape stops engaging the DOUBLE tier, stops carrying a split
 //! receiver, stops being a B97 candidate, or stops taking a native exit inside
@@ -89,7 +90,7 @@ a[4000] = "7";
 var s = 0.0;
 var pre = (((1+2)*(3+4))+((5+6)*(7+8)))+((((9+10)*(11+12))+((13+14)*(15+16)))*(((17+18)*(19+20))+((21+22)*(23+24))));
 for (var j = 0; j < N; j++) {
-  var t = (j * 0.25) + 1.5;
+  var t = ((j * 0.25) + 1.5) + 0.0;
   s = s + a[j] * t;
 }
 console.log(s.toFixed(4), t.toFixed(4), j, pre);

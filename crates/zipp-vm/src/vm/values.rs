@@ -579,6 +579,8 @@ impl<'p> Vm<'p> {
             let e = self.instance_brand.entry(inst.heap_index()).or_default();
             if !e.contains(&own) {
                 e.push(own);
+                #[cfg(feature = "instrument")]
+                self.instrument_mark_external_heap_growth();
             }
         }
     }
@@ -806,7 +808,11 @@ impl<'p> Vm<'p> {
         if !add && !m.contains_key(&k) {
             return false;
         }
-        m.insert(k, v);
+        let _retained_new_key = m.insert(k, v).is_none();
+        #[cfg(feature = "instrument")]
+        if _retained_new_key {
+            self.instrument_mark_external_heap_growth();
+        }
         true
     }
 
@@ -1872,7 +1878,7 @@ impl<'p> Vm<'p> {
         #[cfg(feature = "instrument")]
         {
             return self
-                .instrument_preflight_heap_growth(bytes)
+                .instrument_preflight_external_heap_growth(bytes)
                 .map_err(|message| Thrown(message.into()));
         }
         #[cfg(not(feature = "instrument"))]

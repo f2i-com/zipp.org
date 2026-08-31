@@ -256,10 +256,39 @@ fn global_field_sum_stream_shape(proto: &FuncProto, start: usize, end: usize) ->
         && matches!(&c[cursor + 6], Instr::Jump { target } if *target as usize == start)
 }
 
-fn field_read_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
+pub(crate) fn field_read_stream_shape(proto: &FuncProto, start: usize, end: usize) -> bool {
     field_cyclic_read_stream_shape(proto, start, end)
         || field_mask_read_stream_shape(proto, start, end)
         || (field_sum_stream_enabled() && global_field_sum_stream_shape(proto, start, end))
+}
+
+/// Pack a field-stream region for the Win64 helper ABI. Both instruction
+/// offsets occupy exactly 16 bits; decline instead of truncating a large
+/// function's bytecode IP to an unrelated earlier region.
+pub(crate) const fn pack_field_stream_region(
+    func_id: u32,
+    start: usize,
+    end: usize,
+) -> Option<u64> {
+    if start > u16::MAX as usize || end > u16::MAX as usize {
+        return None;
+    }
+    Some(((func_id as u64) << 32) | ((start as u64) << 16) | end as u64)
+}
+
+#[cfg(test)]
+mod field_stream_pack_tests {
+    use super::pack_field_stream_region;
+
+    #[test]
+    fn instruction_offsets_fail_closed_at_the_packed_boundary() {
+        assert_eq!(
+            pack_field_stream_region(7, u16::MAX as usize, u16::MAX as usize),
+            Some((7u64 << 32) | (u16::MAX as u64) << 16 | u16::MAX as u64)
+        );
+        assert_eq!(pack_field_stream_region(7, u16::MAX as usize + 1, 9), None);
+        assert_eq!(pack_field_stream_region(7, 9, u16::MAX as usize + 1), None);
+    }
 }
 
 /// ── W20 ── the REGISTER tier's inline-cache probe for `GetProp`.
@@ -724,14 +753,15 @@ pub(crate) fn compile_region_regalloc(
         && field_read_stream_enabled()
         && field_read_stream_shape(proto, s, e)
     {
-        if let Some(h) = heap {
+        if let Some((h, packed)) =
+            heap.and_then(|h| pack_field_stream_region(h.func_id, s, e).map(|packed| (h, packed)))
+        {
             if std::env::var_os("ZIPP_JITLOG").is_some() {
                 eprintln!(
                     "[jit] DOUBLE region fn{} [{start},{end}] field-read-stream prefix",
                     h.func_id
                 );
             }
-            let packed = ((h.func_id as u64) << 32) | ((s as u64) << 16) | e as u64;
             let fallback = ops.new_dynamic_label();
             dynasm!(ops
                 ; mov rcx, rdi

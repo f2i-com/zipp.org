@@ -7,6 +7,43 @@ use super::*;
 
 use crate::parse::ast;
 
+/// Recognise only `return x <int-literal> ? x : alt` (and `<=`). Keeping this
+/// deliberately narrower than a general conditional return leaves specialised
+/// expression lowering such as `Pad2Conditional` untouched. The consequent is
+/// still compiled as an expression, so it re-reads `x` after relational
+/// coercion exactly as the ordinary conditional does.
+fn direct_cond_return_parts(expr: &ast::Expr) -> Option<(&ast::Expr, &ast::Expr, &ast::Expr)> {
+    let ast::Expr::Cond { test, cons, alt } = expr else {
+        return None;
+    };
+    let ast::Expr::Binary { op, left, right } = &**test else {
+        return None;
+    };
+    if !matches!(op, ast::BinaryOp::Lt | ast::BinaryOp::LtEq) {
+        return None;
+    }
+    let ast::Expr::Ident(test_name) = &**left else {
+        return None;
+    };
+    let ast::Expr::Ident(cons_name) = &**cons else {
+        return None;
+    };
+    if test_name != cons_name {
+        return None;
+    }
+    let ast::Expr::Num(limit) = &**right else {
+        return None;
+    };
+    if !limit.is_finite()
+        || limit.fract() != 0.0
+        || *limit < i32::MIN as f64
+        || *limit > i32::MAX as f64
+    {
+        return None;
+    }
+    Some((test, cons, alt))
+}
+
 // NOTE (port): cross-group call shapes this module now assumes. The oxc STRUCT
 // nodes these functions took (`ox::IfStatement`, `ox::WhileStatement`, …) have
 // no `zipp_ast` counterpart — the payload lives in the `Stmt` variant — so each
@@ -188,7 +225,7 @@ impl<'a> FnCompiler<'a> {
                     None => {
                         return Err(
                             "`break` target not found (outside a loop / unknown label)".into()
-                        )
+                        );
                     }
                 };
                 // Iterators of for-of frames BETWEEN here and the target close
@@ -218,7 +255,7 @@ impl<'a> FnCompiler<'a> {
                     None => {
                         return Err(
                             "`continue` target not found (outside a loop / unknown label)".into(),
-                        )
+                        );
                     }
                 };
                 let iters: Vec<Reg> = self.loop_ctx[idx + 1..]
@@ -286,6 +323,41 @@ impl<'a> FnCompiler<'a> {
                     if self.tail_call_position() && self.expr_has_tail_call(arg) {
                         self.emit_tail_return(arg)?;
                         return Ok(());
+                    }
+
+                    // A recursive numeric base case commonly has the exact form
+                    // `return n < 2 ? n : recurse(...)`. The ordinary conditional
+                    // must materialise a shared destination and jump over the
+                    // alternate before this statement can emit its one Return.
+                    // Here each selected arm returns directly, removing that
+                    // Move+Jump from every base-case execution without changing
+                    // call/frame semantics or adding an opcode.
+                    //
+                    // Async-generator returns must Await their operand first, and
+                    // a return enclosed by for-of/for-await-of must perform the
+                    // compiler's IteratorClose protocol. Leave both on the common
+                    // path. Active try/using finally handlers need no exclusion:
+                    // the runtime Return instruction already routes through them.
+                    if !(self.in_generator && self.in_async)
+                        && self.loop_ctx.iter().all(|ctx| ctx.iter_close.is_none())
+                    {
+                        if let Some((test, cons, alt)) = direct_cond_return_parts(arg) {
+                            let save = self.next_reg;
+                            let jf = self.emit_test_jump(test)?;
+                            self.next_reg = save;
+
+                            let cons_v = self.expr(cons)?;
+                            self.emit(Instr::Return { src: cons_v });
+
+                            let alt_at = self.here();
+                            self.patch_jump(jf, alt_at);
+                            self.next_reg = save;
+
+                            let alt_v = self.expr(alt)?;
+                            self.emit(Instr::Return { src: alt_v });
+                            self.next_reg = save;
+                            return Ok(());
+                        }
                     }
                 }
                 // Evaluate the return value FIRST (its side effects precede the

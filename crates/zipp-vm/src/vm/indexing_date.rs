@@ -47,6 +47,36 @@ impl<'p> Vm<'p> {
         Ok(key)
     }
 
+    /// Allocation-free interpreter leaf for the common `array[int]` read. A
+    /// miss is strictly read-only and returns to `get_index`, which retains the
+    /// full coercion, exotic-object and prototype semantics.
+    ///
+    /// Only a present ordinary dense slot is authoritative on its own. An
+    /// `arr_props` entry can carry a defineProperty'd data/accessor override (or
+    /// a sparse element), while an `arguments_objs` entry can make the slot
+    /// alias a live formal register; both receiver classes therefore decline as
+    /// a whole. Holes and out-of-range indices also decline because they must
+    /// consult the actual prototype chain.
+    #[inline]
+    pub(crate) fn interp_dense_int_get(&self, obj: Value, key: Value) -> Option<Value> {
+        if !obj.is_heap() || !key.is_int() {
+            return None;
+        }
+        let i = key.as_int();
+        if i < 0 {
+            return None;
+        }
+        let idx = obj.heap_index();
+        let HeapObj::Array(items) = self.heap.get(idx) else {
+            return None;
+        };
+        if self.arr_props.contains_key(&idx) || self.arguments_objs.contains_key(&idx) {
+            return None;
+        }
+        let value = *items.get(i as usize)?;
+        (!value.is_hole()).then_some(value)
+    }
+
     pub(crate) fn get_index(&mut self, obj: Value, key: Value) -> Result<Value, Thrown> {
         // RequireObjectCoercible(base) precedes ToPropertyKey(key): `null[k]` must
         // throw TypeError BEFORE evaluating k's toString (sec-evaluate-property-

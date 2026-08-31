@@ -13,9 +13,9 @@ use crate::value::Value;
 /// It exists because the B5.3 target list should come from the benchmarks, not
 /// from reading `string_ops.rs` and picking what looks expensive — §5's standing
 /// lesson is that every probe which started from reading the code and reasoning
-/// about what ought to be costly has been wrong. Measured with it OFF the
-/// counter is one relaxed atomic load, and the `Mutex` is only ever reached when
-/// it is on.
+/// about what ought to be costly has been wrong. Enablement is latched once per
+/// VM, so with it OFF the counter is one ordinary boolean load; the `Mutex` is
+/// only ever reached when it is on.
 ///
 /// What makes the list actionable: a builtin that HAS a region intrinsic runs at
 /// or near node (`charCodeAt` 0.5ns, `map.get` 6.5ns, `set.has` 7.0ns) and one
@@ -25,25 +25,11 @@ use crate::value::Value;
 /// (`str.startsWith` 44.5ns JIT against 39.0ns NOJIT).
 mod bstats {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::Mutex;
 
-    static ON: AtomicU8 = AtomicU8::new(2);
     static TABLE: Mutex<Option<HashMap<(&'static str, String), u64>>> = Mutex::new(None);
 
-    #[inline]
-    pub(super) fn enabled() -> bool {
-        match ON.load(Ordering::Relaxed) {
-            0 => false,
-            1 => true,
-            _ => {
-                let v = std::env::var_os("ZIPP_BUILTINSTATS").is_some() as u8;
-                ON.store(v, Ordering::Relaxed);
-                v == 1
-            }
-        }
-    }
-
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) fn bump(kind: &'static str, name: &str) {
         let mut g = match TABLE.lock() {
             Ok(g) => g,
@@ -74,6 +60,15 @@ mod bstats {
 }
 
 pub use bstats::dump as builtin_stats;
+
+/// Capture the diagnostic switch once when a native VM is created. WebAssembly
+/// embeddings have no process-environment diagnostic contract and compile the
+/// switch away entirely.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+pub(super) fn builtin_stats_enabled_for_vm() -> bool {
+    std::env::var_os("ZIPP_BUILTINSTATS").is_some()
+}
 
 /// B191 memo indices for the hot string names (see `STR_MEMO_NAMES`).
 fn str_memo_id(name: &str) -> Option<usize> {
@@ -116,9 +111,10 @@ fn arr_memo_id(name: &str) -> Option<usize> {
 /// Classify a receiver for the [`bstats`] histogram. Deliberately coarse — the
 /// question it answers is "which (kind, name) pairs deserve a region intrinsic",
 /// and that is decided per heap kind.
-#[inline]
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
 pub(super) fn builtin_stats_count(vm: &Vm<'_>, recv: Value, name: &str) {
-    if !bstats::enabled() {
+    if !vm.builtin_stats_enabled {
         return;
     }
     let kind = if recv.is_number() {
@@ -143,6 +139,12 @@ pub(super) fn builtin_stats_count(vm: &Vm<'_>, recv: Value, name: &str) {
     };
     bstats::bump(kind, name);
 }
+
+/// Browser wasm cannot enable process-environment diagnostics. Make the hot
+/// call sites disappear instead of loading the always-false VM field.
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+pub(super) fn builtin_stats_count(_vm: &Vm<'_>, _recv: Value, _name: &str) {}
 
 /// `ZIPP_NO_PROMISE_PRISTINE=1` makes `promise_method_is_intrinsic` always
 /// decline, which restores the original `get_prop`-walk proof EXACTLY — the
@@ -2156,6 +2158,7 @@ impl<'p> Vm<'p> {
                 buffer,
                 byte_offset,
                 byte_length,
+                ..
             } => (*buffer, *byte_offset, *byte_length),
             _ => return Ok(None),
         };
@@ -2206,31 +2209,27 @@ impl<'p> Vm<'p> {
         } else {
             self.truthy(args.get(2).copied().unwrap_or(Value::UNDEFINED))
         };
-        let bounds_ok = size <= byte_length && pos <= byte_length - size;
-        let abs = byte_offset + pos;
-        // GetViewValue/SetViewValue step "If IsViewOutOfBounds, throw TypeError":
-        // the view is out of bounds if its backing buffer is detached OR (on a
-        // resizable buffer that shrank) its byte range no longer fits. This
-        // precedes the RangeError bounds check (per spec order — for get, after
-        // ToIndex; for set, after the value conversion done above). A non-resizable
-        // buffer can never shrink, so this only fires for detached/shrunk-resizable.
-        let oob = match self.heap.get(buffer) {
-            HeapObj::ArrayBuffer { data, detached } => {
-                *detached || byte_offset + byte_length > data.len()
-            }
-            _ => true,
-        };
         if op == 0 {
-            if oob {
+            // GetViewValue snapshots the backing buffer only AFTER ToIndex.
+            // An auto-length DataView uses the live remaining byte length;
+            // `byte_length` is merely its construction-time size.
+            let view_len = match self.heap.get(buffer) {
+                HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                    self.dv_effective_len_at(idx, byte_offset, byte_length, data.len())
+                }
+                _ => None,
+            };
+            let Some(view_len) = view_len else {
                 return Err(Thrown(
                     "TypeError: Cannot perform DataView read on a detached or out-of-bounds ArrayBuffer".into(),
                 ));
-            }
-            if !bounds_ok {
+            };
+            if size > view_len || pos > view_len - size {
                 return Err(Thrown(
                     "RangeError: Offset is outside the bounds of the DataView".into(),
                 ));
             }
+            let abs = byte_offset + pos;
             // read
             let mut b = [0u8; 8];
             {
@@ -2283,22 +2282,23 @@ impl<'p> Vm<'p> {
             // throwing valueOf wins over an out-of-range offset. The out-of-bounds
             // check (TypeError) comes after the conversion (a valueOf may itself
             // detach/resize the buffer) and before the RangeError bounds check.
-            let oob = match self.heap.get(buffer) {
-                HeapObj::ArrayBuffer { data, detached } => {
-                    *detached || byte_offset + byte_length > data.len()
+            let view_len = match self.heap.get(buffer) {
+                HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                    self.dv_effective_len_at(idx, byte_offset, byte_length, data.len())
                 }
-                _ => true,
+                _ => None,
             };
-            if oob {
+            let Some(view_len) = view_len else {
                 return Err(Thrown(
                     "TypeError: Cannot perform DataView write on a detached or out-of-bounds ArrayBuffer".into(),
                 ));
-            }
-            if !bounds_ok {
+            };
+            if size > view_len || pos > view_len - size {
                 return Err(Thrown(
                     "RangeError: Offset is outside the bounds of the DataView".into(),
                 ));
             }
+            let abs = byte_offset + pos;
             if !little_endian {
                 bytes[..size].reverse();
             }

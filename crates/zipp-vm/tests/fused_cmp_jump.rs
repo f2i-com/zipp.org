@@ -3,11 +3,12 @@
 //!
 //! The fused ops existed (interpreter arm and every JIT tier) but were never
 //! emitted. `emit_test_jump` now fuses at the AST level — `if`/`while`/`for`
-//! tests and the for-in index guard — ONLY when the whole test is the bare
-//! binary, so the boolean is a freshly allocated temp nothing else can
-//! observe. The fused interpreter arm runs the same `cmp_lt`/`cmp_le` as the
-//! unfused pair, so operand evaluation, ToPrimitive order and NaN behaviour
-//! are identical by construction; these tests pin that down.
+//! tests, conditional-expression tests and the for-in index guard — ONLY when
+//! the whole test is the bare binary, so the boolean is a freshly allocated
+//! temp nothing else can observe. The fused interpreter arm runs the same
+//! `cmp_lt`/`cmp_le` as the unfused pair, so operand evaluation, ToPrimitive
+//! order and NaN behaviour are identical by construction; these tests pin
+//! that down.
 //!
 //! Every expectation below was executed in node (v24) as a script and diffs
 //! byte-identical. The whole file must also pass with `ZIPP_NO_FUSED_CMPJUMP=1`
@@ -283,6 +284,21 @@ fn bytecode_shape_branch_tests_fuse_value_uses_do_not() {
         fused_mode(),
         "for `<=` guard:\n{t}"
     );
+
+    // A conditional expression also consumes the test only as control flow.
+    // This is the recursive-fibonacci shape and must share the same fusion.
+    let t = text_of("function c(n) { return n < 2 ? n : c(n - 1) + c(n - 2); }");
+    assert_eq!(
+        t.contains("JumpIfNotLt"),
+        fused_mode(),
+        "conditional-expression `<` guard:\n{t}"
+    );
+    if fused_mode() {
+        assert!(
+            !t.contains("JumpIfFalse"),
+            "fused conditional test leaves no JumpIfFalse:\n{t}"
+        );
+    }
 
     // The for-in index guard.
     let t = text_of("function h(o) { var n = 0; for (var k in o) n++; return n; }");

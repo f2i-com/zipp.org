@@ -2378,50 +2378,24 @@ impl<'p> Vm<'p> {
                         "TypeError: RegExp.prototype.compile: flags must be undefined when pattern is a RegExp".into(),
                     ));
                 }
-                // Reuse the constructor path (validates flags, builds the matcher),
-                // then move the freshly built fields into the receiver.
+                // Reuse the constructor path (validates flags, builds and
+                // preflights the matcher), then move the freshly built fields
+                // into the receiver. Sharing this Arc also avoids compiling and
+                // retaining an un-preflighted duplicate program.
                 let built = self.build_regexp(a0, a1)?;
-                let (source, flags) = match self.heap.get(built.heap_index()) {
-                    HeapObj::RegExp { source, flags, .. } => (source.clone(), flags.clone()),
+                let (regex, source, flags) = match self.heap.get(built.heap_index()) {
+                    HeapObj::RegExp {
+                        regex,
+                        source,
+                        flags,
+                        ..
+                    } => (regex.clone(), source.clone(), flags.clone()),
                     _ => unreachable!(),
                 };
                 // EXACT pattern bytes (lone surrogates): `build_regexp` recorded
                 // them for the throwaway `built` — take the entry so it can move
                 // to the receiver below (the struct's `source` is lossy).
                 let exact = self.regexp_exact_source.remove(&built.heap_index());
-                // Rebuild the matcher from the validated source/flags. Pass `u`
-                // (Unicode) and `v` (UnicodeSets) through verbatim — `regress` reads
-                // them as distinct grammars (kept in sync with `build_regexp`).
-                let mut rflags = String::new();
-                for c in flags.chars() {
-                    match c {
-                        'i' | 'm' | 's' | 'u' | 'v' => rflags.push(c),
-                        _ => {}
-                    }
-                }
-                // Pattern characters: code points in `u`/`v` mode, UTF-16 code
-                // units otherwise (an astral literal is its two surrogate
-                // halves; group names recombine pairs) — kept in sync with
-                // `build_regexp`, including the exact-bytes (lone-surrogate)
-                // form, which feeds the surrogates verbatim.
-                let unicode_mode = flags.contains('u') || flags.contains('v');
-                let compile_cps: Vec<u32> = match (&exact, unicode_mode) {
-                    (Some(b), true) => crate::heap::wtf8_code_points(b).collect(),
-                    (Some(b), false) => super::proxy_regexp::nonunicode_pattern_chars(
-                        &crate::heap::wtf8_units_iter(b).collect::<Vec<u16>>(),
-                    ),
-                    (None, true) => source.chars().map(u32::from).collect(),
-                    (None, false) => super::proxy_regexp::nonunicode_pattern_chars(
-                        &source.encode_utf16().collect::<Vec<u16>>(),
-                    ),
-                };
-                let regex =
-                    regress::Regex::from_unicode(compile_cps.iter().copied(), rflags.as_str())
-                        .map_err(|e| {
-                            Thrown(format!(
-                                "SyntaxError: Invalid regular expression: /{source}/: {e}"
-                            ))
-                        })?;
                 if let HeapObj::RegExp {
                     regex: r,
                     source: s,
@@ -2430,7 +2404,7 @@ impl<'p> Vm<'p> {
                     ..
                 } = self.heap.get_mut(this.heap_index())
                 {
-                    *r = std::sync::Arc::new(regex);
+                    *r = regex;
                     *s = source;
                     *fl = flags;
                     // The byte-optimized ASCII twin compiled the OLD pattern —

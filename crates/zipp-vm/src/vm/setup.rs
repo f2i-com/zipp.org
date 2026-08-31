@@ -2306,6 +2306,41 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(m) = self.heap.get_mut(dataview_proto) {
                 m.define("constructor", Value::heap(dataview_ctor), method_attr);
             }
+            // Capture only after the prototype is complete. The first eight
+            // entries are the append-only non-BigInt numeric getters. Hidden
+            // shape equality later proves their keys and descriptors, while
+            // exact Value bits prove the live callable identity.
+            if let HeapObj::Object(m) = self.heap.get(dataview_proto) {
+                let shape = m.shape();
+                let mut bits = [Value::UNDEFINED.bits(); 8];
+                let mut valid = m.shape_guardable()
+                    && m.len() >= bits.len()
+                    && native::DV_PROTO_METHODS.len() >= bits.len();
+                if valid {
+                    for method in 0..bits.len() {
+                        let value = m.val_at(method);
+                        let intrinsic = value.is_heap()
+                            && matches!(
+                                self.heap.get(value.heap_index()),
+                                HeapObj::Native(id)
+                                    if *id == native::DV_METHOD_BASE + method as u16
+                            );
+                        if !intrinsic
+                            || m.key_at(method) != native::DV_PROTO_METHODS[method]
+                            || m.attr_at(method).accessor
+                        {
+                            valid = false;
+                            break;
+                        }
+                        bits[method] = value.bits();
+                    }
+                }
+                debug_assert!(valid, "DataView prototype boot layout drifted");
+                if valid {
+                    self.dataview_proto_shape = shape;
+                    self.dataview_numeric_getter_bits = bits;
+                }
+            }
         }
         // Wire each built-in prototype's `constructor` back to its constructor
         // (`Array.prototype.constructor === Array`, `p.constructor === Promise`,

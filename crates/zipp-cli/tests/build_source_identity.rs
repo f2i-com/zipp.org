@@ -6,6 +6,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[path = "../build.rs"]
 mod build_script;
 
+#[test]
+fn windows_stack_link_arguments_cover_supported_linker_flavours() {
+    assert_eq!(build_script::WINDOWS_STACK_RESERVE_BYTES, 256 * 1024 * 1024);
+    assert_eq!(build_script::WINDOWS_STACK_COMMIT_BYTES, 4 * 1024);
+    assert_eq!(
+        build_script::windows_stack_link_arg("x86_64-pc-windows-msvc").as_deref(),
+        Some("/STACK:268435456,4096")
+    );
+    assert_eq!(
+        build_script::windows_stack_link_arg("aarch64-pc-windows-gnullvm").as_deref(),
+        Some("-Wl,--stack,268435456")
+    );
+    assert_eq!(
+        build_script::windows_stack_link_arg("x86_64-pc-windows-gnu").as_deref(),
+        Some("-Wl,--stack,268435456")
+    );
+    assert_eq!(
+        build_script::windows_stack_link_arg("x86_64-unknown-linux-gnu"),
+        None
+    );
+}
+
 struct Scratch(PathBuf);
 
 impl Scratch {

@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 use super::*;
+
 use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
     AsyncGenState, AsyncStateData, ClassData, GenState, Handler, Heap, HeapObj, ObjMap,
@@ -27,6 +28,41 @@ fn matchall_pristine_enabled() -> bool {
 }
 
 impl<'p> Vm<'p> {
+    /// Narrow interpreter leaf for the overwhelmingly common
+    /// `flat_primitive_string.charCodeAt(int)` shape. A miss is read-only and
+    /// returns to the full named-method route, which performs property lookup,
+    /// argument coercion, rope flattening and cross-realm selection.
+    ///
+    /// The live intrinsic proof is deliberately shared with the generic string
+    /// builtin dispatcher: it rejects a replaced/deleted/accessorized prototype
+    /// slot and any active child realm. Boxed strings, proxies, ropes and
+    /// non-Int arguments are excluded before any observable work.
+    pub(crate) fn interp_char_code_at_fast(&mut self, recv: Value, arg: Value) -> Option<Value> {
+        if !recv.is_heap()
+            || !arg.is_int()
+            || !matches!(self.heap.get(recv.heap_index()), HeapObj::Str(_))
+            || !self.string_method_is_intrinsic("charCodeAt")
+        {
+            return None;
+        }
+
+        // Keep the optional diagnostics identical to dispatch_builtin_method:
+        // stats are counted outside the StringOps phase, then the actual string
+        // operation is attributed to that phase when the sampler is enabled.
+        super::builtins::builtin_stats_count(self, recv, "charCodeAt");
+        let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::StringOps);
+        let i = arg.as_int();
+        let unit = if i >= 0 {
+            self.heap_unit_at(recv.heap_index(), i as usize)
+        } else {
+            None
+        };
+        Some(match unit {
+            Some(unit) => Value::int(unit as i32),
+            None => Value::num(f64::NAN),
+        })
+    }
+
     /// IsRegExp(v) (ES 7.2.8): a `@@match` property overrides — when present it is
     /// ToBoolean'd; otherwise true iff `v` is a RegExp exotic. Non-objects are not
     /// regexps. Used by `String.prototype.{includes,startsWith,endsWith}`, which

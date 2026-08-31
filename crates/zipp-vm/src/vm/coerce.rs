@@ -178,9 +178,9 @@ fn str_append_cursor_logical_capacity(
     current_units: usize,
     allocation_capacity: usize,
 ) -> usize {
-    allocation_capacity.min(MAX_STRING_BYTES).min(
-        current_bytes.saturating_add(MAX_STRING_UNITS.saturating_sub(current_units)),
-    )
+    allocation_capacity
+        .min(MAX_STRING_BYTES)
+        .min(current_bytes.saturating_add(MAX_STRING_UNITS.saturating_sub(current_units)))
 }
 
 /// The cursor record is 72 bytes; native frames reserve the next 16-byte
@@ -1429,6 +1429,17 @@ impl<'p> Vm<'p> {
                 None => Value::num(va.as_int() as f64 + vb.as_int() as f64),
             });
         }
+        // Number + Number needs no coercion. In particular, once an integer
+        // accumulator widens past the tagged-i32 range, the common
+        // `double + int` loop shape must not fall through the complete
+        // ToPrimitive / BigInt classification / ToNumber pipeline below.
+        // Both operands are already primitive Numbers, so the direct f64 add
+        // preserves every observable result, including NaN, infinities and
+        // signed zero. Keep this after int+int so small exact sums retain the
+        // compact Int tag and its checked-overflow widening behaviour.
+        if va.is_number() && vb.is_number() {
+            return Ok(Value::num(va.as_f64() + vb.as_f64()));
+        }
         // Fast path: string + string (the hot concat shape, incl. jit_concat) —
         // strings pass ToPrimitive unchanged, so skipping it is unobservable.
         if va.is_heap()
@@ -2159,9 +2170,7 @@ impl<'p> Vm<'p> {
                     // and `out_len < out_capacity`; this epilogue is the only
                     // path back to JavaScript.
                     within_string_limits
-                        && unsafe {
-                            out.commit_ascii_append_cursor(state.out_ptr, state.out_len)
-                        }
+                        && unsafe { out.commit_ascii_append_cursor(state.out_ptr, state.out_len) }
                 }
                 _ => false,
             };
@@ -3780,6 +3789,83 @@ mod resolve_const_tests {
 #[cfg(test)]
 mod add_values_fresh_index_tests {
     use super::*;
+
+    fn vm() -> Vm<'static> {
+        let src = "var x = 0;";
+        let ast = crate::front::parse_script(src).expect("source parses");
+        let program = Box::leak(Box::new(
+            crate::compile::compile_program(&ast, src).expect("source compiles"),
+        ));
+        let mut vm = Vm::new(program);
+        vm.run().expect("program runs");
+        vm
+    }
+
+    #[test]
+    fn primitive_number_addition_preserves_ieee754_edges() {
+        let mut vm = vm();
+
+        // The existing exact-int arm remains first and widens only on overflow.
+        let widened = vm
+            .add_values(Value::int(i32::MAX), Value::int(1))
+            .expect("integer addition succeeds");
+        assert!(widened.is_double());
+        assert_eq!(widened.as_f64(), i32::MAX as f64 + 1.0);
+
+        // These mixed representations are the hot accumulator shapes that the
+        // primitive-Number arm is intended to serve.
+        let double_int = vm
+            .add_values(Value::num(0.5), Value::int(2))
+            .expect("double + int succeeds");
+        let int_double = vm
+            .add_values(Value::int(2), Value::num(0.5))
+            .expect("int + double succeeds");
+        assert_eq!(double_int.as_f64(), 2.5);
+        assert_eq!(int_double.as_f64(), 2.5);
+
+        let nan = vm
+            .add_values(Value::num(f64::NAN), Value::int(1))
+            .expect("NaN addition succeeds");
+        assert!(nan.as_f64().is_nan());
+
+        let infinity = vm
+            .add_values(Value::num(f64::INFINITY), Value::int(1))
+            .expect("infinity addition succeeds");
+        assert_eq!(infinity.as_f64(), f64::INFINITY);
+        let opposite_infinities = vm
+            .add_values(Value::num(f64::INFINITY), Value::num(f64::NEG_INFINITY))
+            .expect("opposite infinities add");
+        assert!(opposite_infinities.as_f64().is_nan());
+
+        let negative_zero = vm
+            .add_values(Value::num(-0.0), Value::num(-0.0))
+            .expect("negative zeros add");
+        assert!(negative_zero.as_f64().is_sign_negative());
+        let mixed_zero = vm
+            .add_values(Value::num(-0.0), Value::num(0.0))
+            .expect("mixed signed zeros add");
+        assert!(mixed_zero.as_f64().is_sign_positive());
+    }
+
+    #[test]
+    fn primitive_number_fast_path_keeps_observable_addition_fallbacks() {
+        let src = r#"
+            let order = "";
+            let left = {
+                valueOf() { order += "a"; return 1.5; },
+                toString() { order += "x"; return "wrong"; }
+            };
+            let right = {
+                valueOf() { order += "b"; return 2; },
+                toString() { order += "y"; return "wrong"; }
+            };
+            let sum = left + right;
+            console.log(sum === 3.5, order === "ab", "n=" + 2.5 === "n=2.5");
+        "#;
+        let out = crate::run(src).expect("source compiles");
+        assert_eq!(out.error, None);
+        assert_eq!(out.output, ["true true true"]);
+    }
 
     /// The JIT chain arms' same-bits refetch elision rests on this: a `+`
     /// through `add_values` with a heap (string) LHS NEVER returns the LHS's

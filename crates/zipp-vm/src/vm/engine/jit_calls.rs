@@ -1567,10 +1567,16 @@ mod own_method_preflight_tests {
                 .iter()
                 .enumerate()
                 .find_map(|(fid, proto)| {
-                    proto.code.iter().enumerate().find_map(|(ip, instr)| match instr {
-                        Instr::CallMethod { arg_base, .. } => Some((fid, ip, *arg_base as usize)),
-                        _ => None,
-                    })
+                    proto
+                        .code
+                        .iter()
+                        .enumerate()
+                        .find_map(|(ip, instr)| match instr {
+                            Instr::CallMethod { arg_base, .. } => {
+                                Some((fid, ip, *arg_base as usize))
+                            }
+                            _ => None,
+                        })
                 })
         {
             return (fid as u32, ip, arg_base);

@@ -429,6 +429,7 @@ impl<'p> Vm<'p> {
                 buffer,
                 byte_offset,
                 byte_length,
+                ..
             } = *self.heap.get(r.heap_index())
             {
                 if matches!(
@@ -448,7 +449,16 @@ impl<'p> Vm<'p> {
                     return Err(Thrown("RangeError: invalid DataView offset/length".into()));
                 }
             }
-            return Ok(self.set_ctor_proto(r, over));
+            let non_default = over.is_some();
+            let result = self.set_ctor_proto(r, over);
+            if non_default {
+                // `set_ctor_proto` is a cold constructor-only proto insertion
+                // and historically does not bump heap versions. The direct
+                // DataView leaf uses its birth version, so explicitly make a
+                // Reflect.construct/foreign-newTarget instance fail closed.
+                self.invalidate_dataview_pristine(result.heap_index());
+            }
+            return Ok(result);
         }
         if let Some(k) = self.ta_ctors.iter().position(|&c| c == ci && ci != 0) {
             // 23.2.5.1 steps 5 and 6.b.i: with NO arguments, or an OBJECT first
@@ -1260,6 +1270,10 @@ impl<'p> Vm<'p> {
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }
+            // Never inherit the temporary view's birth token: `oidx` is a
+            // different (possibly recycled) slot and its subclass prototype
+            // must remain observable even if numeric versions happen to match.
+            self.invalidate_dataview_pristine(oidx);
             return Ok(true);
         }
         // `class M extends Intl.<service>`: the service instance is an exotic

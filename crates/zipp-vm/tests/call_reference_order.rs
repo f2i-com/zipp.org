@@ -38,6 +38,28 @@ const SEMANTICS: &str = r#"
   eq(recv.m(rebindReceiver()), "old-O", "captured receiver");
   eq(events.splice(0).join("|"), "rebind|old:O:3", "receiver order");
 
+  // Sloppy simple parameters alias their mapped `arguments` entries. A call
+  // must retain the receiver/callee captured before argument evaluation even
+  // when an argument replaces that parameter without naming it directly.
+  function mappedReceiver(receiver) {
+    return receiver.m(arguments[0] = {id: "B", m: wrong});
+  }
+  eq(
+    mappedReceiver({id: "A", m: function () { return this.id; }}),
+    "A",
+    "mapped arguments preserves receiver"
+  );
+  function originalMappedCallee() { return "original"; }
+  function replacementMappedCallee() { return "replacement"; }
+  function mappedCallee(fn) {
+    return fn(arguments[0] = replacementMappedCallee);
+  }
+  eq(
+    mappedCallee(originalMappedCallee),
+    "original",
+    "mapped arguments preserves callee"
+  );
+
   // Proxy [[Get]] and computed ToPropertyKey both precede arguments.
   var proxied = new Proxy(o, {
     get: function (target, key, receiver) {

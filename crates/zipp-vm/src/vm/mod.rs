@@ -1223,6 +1223,12 @@ pub struct Vm<'p> {
     /// Latched at VM construction so `ZIPP_NO_CONST_STRING_CACHE=1` is a
     /// same-binary ablation with no environment lookup in the dispatch loop.
     const_string_cache_enabled: bool,
+    /// `ZIPP_BUILTINSTATS` sampled once per native VM. The global histogram is
+    /// still process-wide; this removes an atomic latch from every disabled
+    /// builtin dispatch. The field is absent from wasm32, where the diagnostic
+    /// call sites compile to a no-op.
+    #[cfg(not(target_arch = "wasm32"))]
+    builtin_stats_enabled: bool,
     heap: Heap,
     globals: Vec<Value>,
     /// Raw base of `globals`, loaded by Tier-C code through the live VM on
@@ -1872,6 +1878,12 @@ pub struct Vm<'p> {
     arraybuffer_proto: u32,
     dataview_ctor: u32,
     dataview_proto: u32,
+    /// Boot snapshot for the interpreter's main-realm DataView getter proof.
+    /// The shape proves the prototype's exact key/descriptor layout; exact
+    /// `Value` bits prove each numeric getter still names its pinned intrinsic
+    /// function object (a native id alone would not prove realm identity).
+    dataview_proto_shape: u32,
+    dataview_numeric_getter_bits: [u64; 8],
     /// `SharedArrayBuffer` ctor + prototype. A SharedArrayBuffer reuses the
     /// `HeapObj::ArrayBuffer` representation; its heap index is recorded in
     /// `shared_buffers` so property/prototype/`instanceof` resolution treats it as
@@ -2633,6 +2645,7 @@ pub(crate) use coerce::pad2_concat_stats;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use coerce::pad2_concat_stats_enabled;
 pub(crate) use coerce::pad2_conditional_stats;
+pub(crate) use coerce::SMALL_CONCAT_FLAT_UNITS;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use coerce::{
     jit_str_append_cursor_begin, jit_str_append_cursor_commit, STR_APPEND_CURSOR_ACC_BITS_OFF,
@@ -2642,7 +2655,6 @@ pub(crate) use coerce::{
     STR_APPEND_CURSOR_SOURCE_LEN_OFF, STR_APPEND_CURSOR_SOURCE_PTR_OFF,
     STR_APPEND_CURSOR_SOURCE_VERSION_OFF,
 };
-pub(crate) use coerce::SMALL_CONCAT_FLAT_UNITS;
 pub(crate) use gc::gc_gen_stats;
 pub(crate) use gc::gc_nursery_stats;
 pub(crate) use gc::gc_stats;
