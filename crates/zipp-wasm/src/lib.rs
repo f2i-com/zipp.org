@@ -438,19 +438,27 @@ impl Engine {
     /// Digests are 53-bit so they land exactly in a JS number. At that width a
     /// collision across a UI's worth of state is not a practical concern, and the
     /// cost of one would be a skipped update, not corruption.
+    ///
+    /// Built with the same Array and from_f64 that getGlobalsBatch uses, rather
+    /// than the Float64Array this obviously wants to be. A typed array pulls in
+    /// `__wbg_new_with_length` and `__wbg_set_index`, and the host import surface
+    /// is audited: check-wasm-memory.cjs pins the exact set of functions this
+    /// module may call out to. Widening that list to save an allocation on a
+    /// path that runs once per frame is a bad trade — the point of pinning it is
+    /// that it only moves deliberately.
     #[wasm_bindgen(js_name = getGlobalsFingerprint)]
     pub fn get_globals_fingerprint(&mut self, indices: JsValue) -> Result<JsValue, JsValue> {
         self.ensure_live()?;
         let mut budget = HostValueBudget::default();
         let indices = index_list(&indices, &mut budget).map_err(to_js_error)?;
-        let out = js_sys::Float64Array::new_with_length(indices.len() as u32);
+        let out = js_sys::Array::new();
         if let Some(st) = self.state.as_mut() {
-            for (n, i) in indices.into_iter().enumerate() {
+            for i in indices {
                 let cell = match st.fingerprint_slot(i) {
                     Some(h) => (h & ((1u64 << 53) - 1)) as f64,
                     None => f64::NAN,
                 };
-                out.set_index(n as u32, cell);
+                out.push(&JsValue::from_f64(cell));
             }
         }
         Ok(out.into())
