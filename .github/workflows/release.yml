@@ -294,7 +294,18 @@ jobs:
           bundle="zipp-wasm-$RELEASE_VERSION-web"
           archive="$bundle.zip"
           mkdir -p "dist/$bundle"
+          # Drop the name and producers sections from the SHIPPED bundle: 329 KB
+          # raw and ~75 KB brotli of symbol names no browser reads. The nodejs
+          # build above keeps them, so the harnesses and any profile of this
+          # release still resolve real function names.
+          #
+          # Deliberately no `wasm-opt` step. Measured on this module it is a wire
+          # REGRESSION — -Oz is 390 KB smaller uncompressed and 22 KB larger after
+          # brotli, because binaryen trades away the regularity the compressor
+          # feeds on — and it measured 2.04% slower to execute (-O3: 1.39%). See
+          # crates/zipp-wasm/README.md.
           wasm-bindgen --target web --out-dir "dist/$bundle" \
+            --remove-name-section --remove-producers-section \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node --input-type=module --check < "dist/$bundle/zipp_wasm.js"
           node tests/node/check-wasm-memory.cjs "dist/$bundle/zipp_wasm_bg.wasm"
