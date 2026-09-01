@@ -305,7 +305,13 @@ const MAX_DEPTH: usize = 64;
 
 /// Digest of a global that is absent or never initialised.
 const FP_ABSENT: u64 = 0x9e37_79b9_7f4a_7c15;
-/// FNV-1a's offset basis. The mixer only has to turn a change in the walked
+/// FNV-1a's offset basis, XORed with a per-engine key before the walk.
+///
+/// The mixer is a chain of bijections and therefore invertible: with a known
+/// starting value an attacker can solve for input that lands the digest on any
+/// chosen target, so equal digests would stop implying equal values for anyone
+/// willing to compute it. Keying the start removes the ability to solve rather
+/// than making it merely unlikely — see `ScriptState::set_fingerprint_seed`.
 /// graph into a change in the digest; it is not a cryptographic commitment.
 const FP_SEED: u64 = 0xcbf2_9ce4_8422_2325;
 /// Nodes one fingerprint will walk before giving up and reporting "unknown".
@@ -508,7 +514,22 @@ impl<'p> Vm<'p> {
     /// `None` means "assume it changed" — returned when the graph is larger
     /// than this walk will traverse, so a pathological value degrades to the old
     /// always-copy behaviour rather than to a wrong answer.
-    pub(crate) fn host_fingerprint_slot(&mut self, index: u32) -> Option<u64> {
+    /// Restore the instruction budget without touching any other limit.
+    ///
+    /// Only the step counter moves: `heap_limit`, `output_limit` and the
+    /// sticky `exhaustion` are left exactly as they are, so a renewal can
+    /// never resurrect an engine that has already spent a different budget.
+    pub(crate) fn renew_step_budget(&mut self, max_steps: u64) -> bool {
+        match self.instr_rec.as_mut() {
+            Some(rec) if rec.exhaustion.is_none() => {
+                rec.set_step_limit(max_steps);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn host_fingerprint_slot(&mut self, index: u32, seed: u64) -> Option<u64> {
         let v = match self.globals.get(index as usize) {
             Some(v) => *v,
             None => return Some(FP_ABSENT),
@@ -518,7 +539,7 @@ impl<'p> Vm<'p> {
         }
         let _g = self.gc_lock_guard();
         let mut seen: Vec<u32> = Vec::new();
-        let mut h: u64 = FP_SEED;
+        let mut h: u64 = FP_SEED ^ seed;
         let mut nodes: usize = 0;
         if self.host_fp(v, 0, &mut seen, &mut h, &mut nodes) {
             Some(h)

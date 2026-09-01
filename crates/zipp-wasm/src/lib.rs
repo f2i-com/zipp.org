@@ -428,6 +428,43 @@ impl Engine {
         Ok(out.into())
     }
 
+    /// Restore this engine's instruction budget.
+    ///
+    /// The budget is a lifetime total, which bounds a runaway script but also
+    /// puts a fuse on every long-running embedder: an interactive application
+    /// is tens of thousands of small calls, and 50M instructions is minutes of
+    /// ordinary use. Call this BEFORE a re-entry and the bound becomes
+    /// per-re-entry instead — no single call can run unbounded, which is the
+    /// property a browser host actually needs, while the application lives as
+    /// long as its host keeps calling it.
+    ///
+    /// Host-only, and that is the whole design: this is a method on the Engine
+    /// binding, unreachable from guest code, so a guest still cannot raise its
+    /// own ceiling. Returns false once a budget has actually been spent —
+    /// exhaustion stays sticky and a torn-down engine stays torn down.
+    #[wasm_bindgen(js_name = renewInstructionBudget)]
+    pub fn renew_instruction_budget(&mut self) -> bool {
+        match self.state.as_mut() {
+            Some(st) => st.renew_step_budget(MAX_LIFETIME_STEPS),
+            None => false,
+        }
+    }
+
+    /// Key this engine's global fingerprints with host randomness.
+    ///
+    /// Supply two halves of a 64-bit value from a real random source. The
+    /// digest mixer is invertible, so an unkeyed digest can be SOLVED for a
+    /// collision — a host skipping reads on matching digests would mirror
+    /// stale state while the guest moved on. The key is never exposed to guest
+    /// code and never needs to be stable, since digests are only compared with
+    /// earlier digests from the same engine.
+    #[wasm_bindgen(js_name = setFingerprintSeed)]
+    pub fn set_fingerprint_seed(&mut self, lo: u32, hi: u32) {
+        if let Some(st) = self.state.as_mut() {
+            st.set_fingerprint_seed(((hi as u64) << 32) | lo as u64);
+        }
+    }
+
     /// Fingerprint many globals in one boundary crossing.
     ///
     /// One number per index: equal numbers mean `getGlobalsBatch` would

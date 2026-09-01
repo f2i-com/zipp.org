@@ -110,6 +110,8 @@ pub struct ScriptState {
     /// Owning pointer to the leaked `Program`. Freed in `Drop`, after `vm`.
     #[cfg(not(feature = "safe-sandbox"))]
     program: *mut Program,
+    /// Key for [`Self::fingerprint_slot`]. See [`Self::set_fingerprint_seed`].
+    fp_seed: u64,
 }
 
 /// Parse and compile `src` as a classic script, returning a VM ready to run it.
@@ -145,6 +147,9 @@ pub fn compile_script(src: &str) -> Result<ScriptState, String> {
         vm: Some(vm),
         #[cfg(not(feature = "safe-sandbox"))]
         program,
+        // Unkeyed until a host supplies randomness. Documented on
+        // set_fingerprint_seed: a fixed start is solvable.
+        fp_seed: 0,
     })
 }
 
@@ -369,10 +374,58 @@ impl ScriptState {
         }
     }
 
+    /// Renew the instruction budget without disturbing any other limit.
+    ///
+    /// The budget exists so a runaway script cannot occupy the host forever.
+    /// As a LIFETIME total that also means every long-running embedder dies:
+    /// an interactive application is not one computation, it is a few tens of
+    /// thousands of small ones, and 50M instructions is minutes of ordinary
+    /// use. An emulator reaches it in seconds.
+    ///
+    /// Renewing per host re-entry keeps the property that matters — no single
+    /// re-entry can run unbounded, because this is called BEFORE a call and
+    /// never after exhaustion — while letting an application run as long as
+    /// its host keeps asking it to. The host decides the cadence; the guest
+    /// still cannot raise its own ceiling, which is the actual threat model.
+    ///
+    /// Deliberately NOT [`Self::set_limits`], which installs a fresh Recorder
+    /// and would silently reset `heap_limit` and `output_limit` to unlimited —
+    /// they are applied AFTER set_limits during setup, so renewing that way
+    /// would quietly drop two ceilings while restoring one.
+    ///
+    /// Returns false when the budget is already spent: exhaustion is sticky by
+    /// design, and a spent engine must stay spent.
+    pub fn renew_step_budget(&mut self, max_steps: u64) -> bool {
+        match self.vm.as_mut() {
+            Some(vm) => vm.renew_step_budget(max_steps),
+            None => false,
+        }
+    }
+
+    /// Key the global fingerprints for this engine.
+    ///
+    /// The digest mixer is a chain of bijections, so an attacker who knows the
+    /// starting value can INVERT it and solve for a value landing on any
+    /// chosen digest — a constructed collision, not an unlikely one. A host
+    /// that skips reads on matching digests would then mirror stale state
+    /// while the guest moved on, and a bundle could show one number and act on
+    /// another.
+    ///
+    /// A per-engine key the guest cannot observe removes the ability to solve:
+    /// digests are only ever compared against earlier digests from the same
+    /// engine, so the key never has to be stable or known to anyone.
+    ///
+    /// Supply real randomness. Without this the seed is a fixed constant and
+    /// the digests are collision-resistant only by accident.
+    pub fn set_fingerprint_seed(&mut self, seed: u64) {
+        self.fp_seed = seed;
+    }
+
     /// Fingerprint the global in `index` — see
     /// [`Vm::host_fingerprint_slot`]. `None` means "treat it as changed".
     pub fn fingerprint_slot(&mut self, index: u32) -> Option<u64> {
-        self.vm.as_mut()?.host_fingerprint_slot(index)
+        let seed = self.fp_seed;
+        self.vm.as_mut()?.host_fingerprint_slot(index, seed)
     }
 
     /// Write the global in `index`. `false` means the write was declined
