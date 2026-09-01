@@ -1458,9 +1458,44 @@ impl super::Vm<'_> {
     /// finite release-wasm meter calls it on the first dispatch after its next
     /// 65,536-step countdown threshold. The expensive work remains off the
     /// common instruction edge.
+    ///
+    /// `Vm::gc_from_poll` also calls it after a collection. That caller is
+    /// scheduled on BYTES rather than instructions, which is what bounds the
+    /// overshoot of a script whose single instructions allocate megabytes; see
+    /// the comment there for why the tick stride alone is the wrong unit.
     #[cold]
     #[inline(never)]
-    fn instrument_heap_poll(&mut self) -> Tick {
+    pub(crate) fn instrument_heap_poll(&mut self) -> Tick {
+        self.instrument_heap_poll_inner(true)
+    }
+
+    /// The same reconciliation, driven by a collection rather than by the
+    /// instruction stride.
+    ///
+    /// `advance_walk_stride: false` is the whole difference, and it is what
+    /// keeps this caller free. `ticks_since_heap_walk` schedules the O(heap
+    /// slots) walk once per `HEAP_WALK_STRIDE` polls; it counts POLLS, and its
+    /// budget was sized for polls that arrive every 65,536 instructions.
+    /// Letting a GC-driven poll advance it too would make the walk fire far
+    /// more often in exactly the allocation-heavy code that collects most —
+    /// the 3.3x-to-7.2x tax the comment above warns about.
+    ///
+    /// Not advancing it costs nothing here, because fresh allocations are
+    /// charged eagerly into the O(1) estimate: an over-ceiling script is
+    /// convicted by the cheap figure and only then pays one confirming walk.
+    /// The one case the cheap figure cannot see is a heap whose payload
+    /// accounting has never been switched on — it is enabled lazily, by the
+    /// first walk — so force a reconcile while that is still true.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn instrument_heap_poll_after_gc(&mut self) -> Tick {
+        let force = !self.heap.payload_accounting_enabled();
+        self.instrument_heap_poll_inner(force)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn instrument_heap_poll_inner(&mut self, advance_walk_stride: bool) -> Tick {
         let ceiling = match self.instr_rec.as_ref() {
             Some(rec) => rec.heap_limit,
             None => return Ok(()),
@@ -1490,11 +1525,16 @@ impl super::Vm<'_> {
         let convicted = self.instrument_heap_estimate() > ceiling;
         let reconcile = match self.instr_rec.as_mut() {
             Some(rec) => {
-                rec.ticks_since_heap_walk = rec.ticks_since_heap_walk.saturating_add(1);
-                let stride = rec.ticks_since_heap_walk >= HEAP_WALK_STRIDE;
-                if stride {
-                    rec.ticks_since_heap_walk = 0;
-                }
+                let stride = if advance_walk_stride {
+                    rec.ticks_since_heap_walk = rec.ticks_since_heap_walk.saturating_add(1);
+                    let due = rec.ticks_since_heap_walk >= HEAP_WALK_STRIDE;
+                    if due {
+                        rec.ticks_since_heap_walk = 0;
+                    }
+                    due
+                } else {
+                    false
+                };
                 let external = rec.external_heap_dirty;
                 rec.external_heap_dirty = false;
                 stride || external

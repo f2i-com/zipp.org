@@ -148,6 +148,34 @@ impl Vm<'_> {
     #[inline(never)]
     fn gc_from_poll(&mut self) {
         self.gc();
+        // Re-check the heap ceiling here, where the schedule is denominated in
+        // BYTES, not just on the dispatch loop's instruction stride.
+        //
+        // `instrument_heap_poll` alone is scheduled every 65,536 dispatches, so
+        // its drift is bounded in TICKS — the wrong unit for this failure. One
+        // instruction can commit megabytes (`new Array(1e6)` is a single step),
+        // so a loop of large allocations overshoots the ceiling by gigabytes
+        // before the next scheduled poll. A native host survives that and
+        // convicts late; a WebAssembly host does not — it reaches the linked
+        // memory maximum first, and that is an unrecoverable trap that also
+        // strands the Engine, instead of the catchable RangeError the ceiling
+        // exists to produce.
+        //
+        // This path is already byte-denominated: `alloc_settled` requests a
+        // major once `BIG_PAYLOAD_GC_AT` of large payload has accumulated. So
+        // hanging the re-check here converts the bound from ticks to bytes
+        // without adding anything to the dispatch loop — `maybe_gc` still
+        // early-outs on one flag load, and everything below it was already
+        // cold.
+        //
+        // Running it AFTER the collection is what keeps it honest: only memory
+        // that survived a major counts, so churn is not mistaken for growth.
+        // The poll latches sticky exhaustion via `Recorder::exhaust`, which the
+        // next `instrument_step` reports through the terminal-message check it
+        // already performs — hence discarding the result rather than plumbing a
+        // `Result` return through every `maybe_gc` caller.
+        #[cfg(feature = "instrument")]
+        let _ = self.instrument_heap_poll_after_gc();
     }
 
     /// Stage-3 write barrier + B6 oracle, one latched call per store

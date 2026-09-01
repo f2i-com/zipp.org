@@ -118,5 +118,80 @@ for (const size of [512, 2048, 4096, 8192, 23040, 32768]) {
   try { e.dispose(); } catch {}
 }
 
+
+// The ceiling must be reached by a CATCHABLE error for every allocation shape,
+// not just the ones with an explicit preflight.
+//
+// Enforcement has two schedules. `instrument_preflight_heap_growth` guards the
+// paths that know their size up front -- ArrayBuffer bytes, string builders,
+// the JSON serializer, the JIT register file -- and everything else waits for
+// the dispatch loop's periodic heap poll. That poll is scheduled on
+// INSTRUCTIONS, and instructions are the wrong unit: `new Array(1e6)` is a
+// single step that commits 8 MB, so a loop of them overshot the ceiling by
+// gigabytes before the next poll came due.
+//
+// A native host survives the overshoot and convicts late. This one does not --
+// it reaches the module's linked memory maximum first, and that is an
+// unrecoverable `RuntimeError: unreachable` which also strands the Engine
+// (`dispose()` then throws "recursive use of an object detected"). So the
+// symptom was shape-dependent: typed arrays and strings raised the intended
+// RangeError, while plain arrays and object properties trapped.
+//
+// `Vm::gc_from_poll` now re-checks the ceiling after a collection, a schedule
+// already denominated in bytes. Each row below retains until the ceiling stops
+// it; the assertion is that the engine SAYS so rather than trapping, and that
+// the Engine is still disposable afterwards.
+{
+  const SHAPES = [
+    ["new Array(n)", "held.push(new Array(200000))"],
+    ["array push", "let a = []; let k = 0; while (k < 60000) { a.push(k); k = k + 1 } held.push(a)"],
+    ["array index-assign", "let a = []; let k = 0; while (k < 60000) { a[k] = k; k = k + 1 } held.push(a)"],
+    ["object properties", "let o = {}; let k = 0; while (k < 20000) { o['k' + k] = k; k = k + 1 } held.push(o)"],
+    ["Map growth", "let m = new Map(); let k = 0; while (k < 20000) { m.set('k' + k, k); k = k + 1 } held.push(m)"],
+    ["typed array", "held.push(new Uint8Array(1048576))"],
+  ];
+
+  for (const [label, body] of SHAPES) {
+    const e = new Engine();
+    const r = e.initScript(
+      "let held = []\n" +
+      "function hoard(n) {\n" +
+      "  let i = 0\n" +
+      "  while (i < n) { " + body + "; i = i + 1 }\n" +
+      "  return 'survived:' + held.length\n" +
+      "}\n"
+    );
+    if (r && r.error) throw new Error("initScript: " + r.error);
+
+    let verdict = "";
+    try {
+      // Renewed per re-entry so the instruction budget cannot be what stops
+      // this; the question is only how the MEMORY ceiling gets reported.
+      for (let round = 0; round < 400 && !verdict; round++) {
+        e.renewInstructionBudget();
+        e.callFunction("hoard", [40]);
+        if (round === 399) verdict = "never convicted";
+      }
+    } catch (err) {
+      verdict = String((err && err.message) || err);
+    }
+
+    check(
+      label + ": ceiling reported, not trapped",
+      /memory budget/i.test(verdict),
+      verdict || "no verdict"
+    );
+
+    let disposed = "clean";
+    try { e.dispose(); } catch (err) { disposed = String((err && err.message) || err); }
+    check(label + ": Engine still disposable", disposed === "clean", disposed);
+  }
+
+  // A trapped module would poison everything after it; prove it did not.
+  const after = new Engine();
+  after.initScript("let ok = 41 + 1");
+  check("module still usable after every shape", after.evalInContext("ok") === 42);
+  after.dispose();
+}
 console.log(`\n${pass} passed, ${fail} failed`);
 if (fail > 0) process.exit(1);
