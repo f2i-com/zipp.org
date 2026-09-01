@@ -1,18 +1,19 @@
 # Zipp landing page
 
 The standalone React + TypeScript landing page for Zipp, built with Vite. Its
-performance copy mirrors the clean four-engine canonical captures in
+Node/Bun/Deno performance copy is specifically the native PGO CLI evidence in
+the clean four-engine canonical captures:
 [`../bench/real13_21288c1_pgo_2026-08-30.json`](../bench/real13_21288c1_pgo_2026-08-30.json)
 and
 [`../bench/hostile/head_clean_21288c1_pgo_2026-08-30.json`](../bench/hostile/head_clean_21288c1_pgo_2026-08-30.json).
 The all-30 headline is the equal-row geomean of the normal 13 and hostile 17;
 development-only A/Bs do not silently change the public ratios.
 
-The checked-in v0.0.5 browser module is the section-stripped production build:
-5,595,833 bytes raw, 1,859,668 at gzip-9, and 1,254,075 at Brotli-11, with
-SHA-256 `f3d67856f5853c235c12ee62a1cc86032492012e3942c032a08d8d22df85ff0b`.
-The separate pinned QuickJS-NG and Boa comparison, including the remaining
-QuickJS-NG WASM gap, is documented in
+The checked-in v0.0.6 browser module is the section-stripped production build:
+5,480,311 bytes raw, 1,825,812 at gzip-9, and 1,233,575 at Brotli-11, with
+SHA-256 `318fc5cf7ee5d55751d829419d4de5af1ab2643b8f7fd30df2e3779c16ad1691`.
+The separate pinned QuickJS-NG and Boa comparison documents both the incomplete
+exact-suite WASM attempt and the specialization-sensitive micro diagnostic in
 [`../bench/comparison/README.md`](../bench/comparison/README.md).
 
 ```sh

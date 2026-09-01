@@ -222,7 +222,9 @@ one. See [`SECURITY.md`](SECURITY.md) for the full deployment checklist.
 
 ## Performance, measured honestly
 
-### QuickJS-NG and Boa diagnostic — v0.0.5
+### QuickJS-NG and Boa diagnostics
+
+#### Historical v0.0.5 release
 
 The v0.0.5 release was also measured against pinned interpreter builds of
 QuickJS-NG v0.16.2 and Boa v0.22.0. These are clean release-default builds on
@@ -246,31 +248,46 @@ is 5,595,833 bytes raw (1,254,075 Brotli-11), between QuickJS-NG's
 1,528,293-byte reactor (417,087 Brotli-11) and Boa's 21,296,176-byte module
 (5,484,164 Brotli-11).
 
-#### Current browser-WASM development snapshot
+#### Current v0.0.6 browser-WASM status
 
-A separately validated, uncommitted post-v0.0.5 development snapshot is
-5,480,576 bytes raw, 1,826,113 at gzip-9, and 1,233,843 at Brotli-11 (SHA-256
-`caf26214ffca1407fba46f3bb304e4bb78ebb01b12898bf4132fc4e7a21f05f3`). In the
-48-repetition adapter-inclusive diagnostic, Zipp won all five persistent
-workload point medians: its Zipp / QuickJS-NG geomean was `0.0954663913×` and
-its Zipp / Boa geomean was `0.0105336875×`. Array HOF and comparator sort also
-had stable positive work-minus-control samples, at `0.4681596596×` and
-`0.2316111384×` QuickJS-NG respectively.
+The committed v0.0.6 production module is 5,480,311 bytes raw, 1,825,812 at
+gzip-9, and 1,233,575 at Brotli-11 (SHA-256
+`318fc5cf7ee5d55751d829419d4de5af1ab2643b8f7fd30df2e3779c16ad1691`). The
+official QuickJS-NG v0.16.2 reactor is 1,528,293 bytes raw and 417,087 at
+Brotli-11, so Zipp is `3.586×` as large raw and `2.958×` as large on the wire.
 
-This is a bounded five-workload result, including each project's public adapter
-and context lifecycle; it is not a universal interpreter-core or all-JavaScript
-ranking. Fib, loop, and object-property execution reached the subtraction noise
-floor, so the much smaller computed adjusted aggregate is not a robust headline.
-QuickJS-NG also remains substantially smaller: Zipp is `3.586×` its raw module
-and `2.958×` its Brotli payload. The prior development baseline is retained for
-comparison: 5,462,006 raw / 1,818,299 gzip-9 / 1,230,296 Brotli-11, SHA-256
-`8cf6e8207d1852cfa31c6e38d3b8a60bdec6e4894a65c1d08f39b244c849903b`, and
-`1.7725499353×` QuickJS-NG on adjusted execution. The current speed kernels add
-only 18,570 raw, 7,814 gzip, and 3,547 Brotli bytes to that prior baseline. The
-checked-in landing module and v0.0.5 release figures above remain unchanged.
+We also attempted a direct, unscaled WASM run over the same current v0.0.6
+normal 13 and hostile 17 sources used by the v0.0.6 Node/Bun/Deno reruns in
+`target/bench-results/real13-v006-6650647a718c-pgo-15.json` and
+`target/bench-results/hostile17-v006-6650647a718c-pgo-15.json`. Those sources
+are newer than the retained canonical public capture below. The WASM capture
+preserves their exact bytes and Node output oracle, but it is explicitly
+`publishable:false`: the production Zipp WASM API cannot load the two module
+rows, QuickJS-NG's official reactor cannot drain pending jobs for three async
+rows, and Zipp validated only 7 of the 28 script rows. Seventeen Zipp rows hit
+the fixed production instruction or heap ceilings and four ended in other
+engine errors. There were consequently no comparable normal-suite rows and
+only five comparable hostile rows.
 
-The commands, exact revisions, per-row numbers, module hashes, host-interface
-differences, and limitations are in
+On those five available rows, Zipp / QuickJS-NG was `0.9604×` for persistent
+time and `0.9567×` after paired-control subtraction, with Zipp ahead only on
+`warm-router` (1 / 5 point wins). Those are incomplete row-level diagnostics,
+not full-suite geomeans: this run does **not** establish that Zipp WASM is faster
+than QuickJS-NG WASM. Zipp's separately sampled compile median was slower
+(5.080 ms versus 1.795 ms), while its instantiation/start median was faster
+(0.397 ms versus 1.676 ms). Their sums are not a measured end-to-end median.
+
+The separate five-workload speed-kernel experiment remains useful attribution
+evidence: it measured `0.0954663913×` QuickJS-NG on persistent time. It is highly
+specialization-sensitive, however; disabling the exact workload lanes measured
+`1.815×` QuickJS-NG but `0.199×` Boa, with Zipp ahead of Boa on all five rows.
+That control used a dirty-tree diagnostic candidate, not the release artifact.
+No current same-source normal-13-plus-hostile-17 Boa WASM run exists, so neither
+micro result is a general interpreter ranking or a substitute for the
+incomplete exact-suite result above.
+
+The commands, exact revisions, all validation failures, per-row numbers, module
+hashes, host-interface differences, and limitations are in
 [`bench/comparison/README.md`](bench/comparison/README.md). These ecosystem
 comparisons are deliberately separate from the canonical Node/Bun/Deno series
 below.

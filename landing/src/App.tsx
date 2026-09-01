@@ -461,8 +461,8 @@ function App() {
         <section className="hero section-wrap" id="top">
           <div className="hero-copy">
             <a className="result-pill" href="#benchmarks">
-              <span>Canonical PGO · 30/30 exact outputs</span>
-              <strong>0.768× Node across all 30 measured rows</strong>
+              <span>Native CLI · canonical PGO · 30/30 exact outputs</span>
+              <strong>0.768× Node across all 30 measured native rows</strong>
               <span aria-hidden="true">↓</span>
             </a>
 
@@ -548,22 +548,22 @@ function App() {
           </aside>
         </section>
 
-        <section className="proof-band" aria-label="Measured Zipp results">
+        <section className="proof-band" aria-label="Measured native Zipp results">
           <div className="section-wrap proof-grid">
             <div className="proof-lead">
               <span className="metric-index">01</span>
               <strong>17 / 30</strong>
-              <p>point-estimate wins vs Node</p>
+              <p>native point-estimate wins vs Node</p>
             </div>
             <div>
               <span className="metric-index">02</span>
               <strong>0.768×</strong>
-              <p>Node time · equal-row all 30</p>
+              <p>native Zipp / Node · equal-row all 30</p>
             </div>
             <div>
               <span className="metric-index">03</span>
               <strong>7.9 ms</strong>
-              <p>median process launch</p>
+              <p>median native process launch</p>
             </div>
             <div>
               <span className="metric-index">04</span>
@@ -651,7 +651,7 @@ function App() {
         <section className="benchmark-section section-wrap" id="benchmarks">
           <div className="benchmark-heading">
             <div>
-              <p className="section-kicker">Measured performance</p>
+              <p className="section-kicker">Measured native performance</p>
               <h2>Fast where it counts. Honest where work remains.</h2>
             </div>
             <div className="benchmark-statement">
@@ -663,15 +663,15 @@ function App() {
           <div className="benchmark-summary">
             <article className="headline-result">
               <div>
-                <span>Equal-row all-30 headline</span>
+                <span>Native equal-row all-30 headline</span>
                 <strong>0.7679×</strong>
-                <p>Zipp / Node paired geomean · lower is better</p>
+                <p>Native Zipp / Node paired geomean · lower is better</p>
               </div>
               <div className="confidence-pill">95% CI&nbsp; 0.7642–0.7712</div>
             </article>
 
             <article className="ratio-card">
-              <span>All-30 paired geomeans</span>
+              <span>Native all-30 paired geomeans</span>
               <div className="ratio-row"><b>vs Node</b><span><i className="bar-geomean-node" /></span><strong>0.7679×</strong></div>
               <div className="ratio-row"><b>vs Bun</b><span><i className="bar-geomean-bun" /></span><strong>0.6154×</strong></div>
               <div className="ratio-row"><b>vs Deno</b><span><i className="bar-geomean-deno" /></span><strong>0.4918×</strong></div>
@@ -689,7 +689,7 @@ function App() {
           <div className="scoreboard">
             <div className="scoreboard-toolbar">
               <div>
-                <p>Canonical normal 13 · cold wall time <span>milliseconds · lower is better</span></p>
+                <p>Canonical native normal 13 · cold wall time <span>milliseconds · lower is better</span></p>
               </div>
               <div className="filter-tabs" role="group" aria-label="Filter benchmark rows">
                 {([
@@ -712,7 +712,7 @@ function App() {
 
             <div className="benchmark-table-wrap">
               <table className="benchmark-table">
-                <caption>Canonical cold wall-time medians for Zipp, Node, Bun, and Deno</caption>
+                <caption>Canonical native cold wall-time medians for Zipp, Node, Bun, and Deno</caption>
                 <thead>
                   <tr>
                     <th scope="col">Workload</th>
@@ -750,7 +750,7 @@ function App() {
           <div className="methodology-note">
             <span className="methodology-mark">i</span>
             <p>
-              Windows x86-64, high-performance power mode. Cold wall time includes process launch;
+              Native Windows x86-64 CLI, high-performance power mode. Cold wall time includes process launch;
               15 paired repetitions with deterministically shuffled engine and benchmark order;
               10,000 paired-bootstrap samples; exact-byte outputs. Node 24.12.0, Bun 1.3.14,
               Deno 2.6.10, Zipp 0.0.1 at clean PGO source <code>21288c1</code>; binary SHA-256
@@ -762,7 +762,8 @@ function App() {
               sparse-array 1.050×. Hostile gaps: calls-closures 1.307×, shapes-stable 1.493×,
               shapes-megamorphic 1.484×, allocation-survival 1.772×, async-lived 1.082×,
               reactish-reconcile 1.646×, warm-router 1.674×, bytecode-vm 1.014×, and npm-nanoid
-              1.0004×. These workloads are evidence, not a claim of universal runtime superiority.
+              1.0004×. These native workloads are evidence, not a claim of universal runtime superiority;
+              they are not browser-WASM results.
             </p>
             <div className="methodology-links">
               <ExternalLink className="text-link" href={BENCHMARK_URL}>Normal capture</ExternalLink>

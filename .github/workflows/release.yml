@@ -304,6 +304,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Test the exact-suite WASM comparison harness
+        run: node --no-warnings --test ../../bench/comparison/test_run_wasm_suites.mjs
+
       - name: Test the isolated host workspace
         env:
           RUSTFLAGS: -Dwarnings

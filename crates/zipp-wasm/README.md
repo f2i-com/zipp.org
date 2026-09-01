@@ -78,58 +78,62 @@ largest observed slower rows were +3.76%, +2.84%, and +2.76%, and each per-row
 warm-round and measured-sample counts and counterbalanced order. LTO was already
 dominated on transfer size and was not given a throughput claim.
 
-The tracked v0.0.5 landing-page module was rebuilt from the selected profile at
-engine commit `7cb72106c9591613b170ba057d3c07e1cee01379`. Its exact artifact is
-5,595,833 bytes raw, 1,859,668 bytes at gzip-9, and 1,254,075 bytes at
-Brotli-11, with SHA-256
+The historical v0.0.5 landing-page module was rebuilt from the selected profile
+at engine commit `7cb72106c9591613b170ba057d3c07e1cee01379`. It was 5,595,833
+bytes raw, 1,859,668 at gzip-9, and 1,254,075 at Brotli-11, with SHA-256
 `f3d67856f5853c235c12ee62a1cc86032492012e3942c032a08d8d22df85ff0b`.
-That is 72,700 raw bytes smaller than the v0.0.4 module it replaces. The table
-retains the isolated historical CGU4 candidate sizes so every build-policy row
-remains a like-for-like comparison. Current QuickJS-NG and Boa size and speed
-diagnostics are recorded in [`../../bench/comparison/README.md`](../../bench/comparison/README.md).
 
-The validated current development snapshot is separate from that release and
-from the checked-in landing-page module. Its section-stripped production Web
-artifact is 5,480,576 bytes raw, 1,826,113 bytes at gzip-9, and 1,233,843 bytes
-at Brotli-11, with SHA-256
-`caf26214ffca1407fba46f3bb304e4bb78ebb01b12898bf4132fc4e7a21f05f3`.
-It was built from the uncommitted post-v0.0.5 working tree, so the artifact hash,
-not a source revision, identifies this snapshot. The locked build used Rust
-1.92.0, wasm-bindgen 0.2.126, `opt-level=3`, four codegen units, overflow checks,
-aborting panics, a 256 MiB linked memory maximum, a 1 MiB linked stack, and the
+The current v0.0.6 production artifact uses the same pinned Rust 1.92.0,
+wasm-bindgen 0.2.126, `opt-level=3`, and four-codegen-unit policy. It also keeps
+the 256 MiB linked memory maximum, 1 MiB linked stack, and isolated
 `safe-sandbox`, `meter-only`, `wasm-no-fs-loader`, and `wasm-single-agent`
-zipp-vm features. Name and producers sections were removed by wasm-bindgen and
-the optional `target_features` custom section by the validated local stripper;
-no `wasm-opt` pass was used.
+features. Name, producers, and optional `target_features` sections are removed;
+no `wasm-opt` pass is used. The exact tracked module is:
 
-On the 48-repetition adapter-inclusive diagnostic this snapshot's persistent
-work geomean measured `0.0954663913×` QuickJS-NG and `0.0105336875×` Boa, with
-Zipp ahead on all five persistent point medians against both. Only array HOF
-and comparator sort remain cleanly above the work-minus-control subtraction
-floor, at `0.4681596596×` and `0.2316111384×` QuickJS-NG. Fib, loop, and object
-properties have only 25/48, 24/48, and 24/48 positive Zipp adjusted samples,
-with a negative object adjusted median, so the computed adjusted aggregate is
-not a robust headline. This is a bounded five-workload result including each
-project's adapter and context lifecycle, not a universal interpreter-core or
-all-JavaScript ranking.
+```text
+raw         5,480,311 bytes
+gzip-9      1,825,812 bytes
+Brotli-11   1,233,575 bytes
+SHA-256     318fc5cf7ee5d55751d829419d4de5af1ab2643b8f7fd30df2e3779c16ad1691
+```
 
-The immediately preceding development baseline is preserved: 5,462,006 bytes
-raw, 1,818,299 gzip-9, and 1,230,296 Brotli-11, SHA-256
-`8cf6e8207d1852cfa31c6e38d3b8a60bdec6e4894a65c1d08f39b244c849903b`.
-Its 48-repetition adjusted results were `1.7725499353×` QuickJS-NG and
-`0.1834251840×` Boa. The current speed kernels add only 18,570 raw, 7,814 gzip,
-and 3,547 Brotli bytes to that baseline. The current Zipp artifact remains
-`3.586×` as large raw and `2.958×` as large at Brotli-11 as QuickJS-NG's
-reactor; Boa remains larger. Exact commands and all per-row results are in the
-comparison document linked above. These are development evidence, not revised
-v0.0.5 release claims.
+QuickJS-NG v0.16.2's official reactor is 1,528,293 bytes raw and 417,087 at
+Brotli-11. Zipp is therefore `3.586×` as large raw and `2.958×` as large on the
+wire. Boa's official module remains larger than Zipp's.
+
+The direct v0.0.6 WASM attempt uses the exact, unscaled current v0.0.6 normal 13
+and hostile 17 sources from the v0.0.6 Node/Bun/Deno reruns. It does **not**
+establish a full speed ranking. Production Zipp WASM cannot load the two module
+rows and validated only 7 / 28 scripts:
+seventeen rows reached fixed production instruction or heap ceilings and four
+ended in other engine errors. QuickJS-NG's official reactor cannot drain
+pending jobs for three async rows. There were no comparable normal-suite rows
+and only five comparable hostile rows.
+
+On those five available rows, Zipp / QuickJS-NG was `0.9604×` persistent and
+`0.9567×` adjusted, but Zipp led only `warm-router` (1 / 5 point wins). The
+capture records `publishable:false` and `evidence_usable:false`; these are
+available-row geomeans, not complete-suite aggregates. The separately sampled
+compile medians were 5.080 ms for Zipp and 1.795 ms for QuickJS-NG;
+instantiation/start medians were 0.397 ms and 1.676 ms. Their sums are not
+measured end-to-end module-ready medians.
+
+An older five-workload speed-kernel experiment measured `0.0954663913×`
+QuickJS-NG persistent, but disabling its exact workload lanes measured
+`1.8150248200×` QuickJS-NG and `0.1992205735×` Boa. The latter was a five-of-five
+Zipp point win, but the control used a dirty-tree diagnostic candidate and no
+Boa run exists for the current full source inventory. That contrast makes the
+boundary explicit: it measures exact artifact specialization and adapter
+lifecycle, not general interpreter speed. Native interpreter results likewise
+do not predict wasm32 performance. Exact commands, validation failures, and
+per-row results are in
+[`../../bench/comparison/README.md`](../../bench/comparison/README.md).
 
 ### Compression is where the bytes actually are
 
-The tracked v0.0.5 artifact is ~1.25 MB brotli and ~1.85 MB gzip; both
-development snapshots are ~1.23 MB and ~1.82 MB respectively. Serving them as
-gzip therefore costs roughly 590–600 KB per cold load — more than every
-build-level saving here put together. Confirm what your origin actually sends:
+The tracked v0.0.6 artifact is ~1.23 MB Brotli and ~1.83 MB gzip. Serving it as
+gzip therefore costs about 592 KB per cold load — more than every build-level
+saving here put together. Confirm what your origin actually sends:
 
 ```sh
 curl -sS -o /dev/null -w '%{size_download}\n' \
