@@ -1396,12 +1396,21 @@ impl Default for ValStore {
 
 /// Capacity classes for the literal slab: FinalizeObject admits 1..=16 keys.
 #[cfg(not(feature = "safe-sandbox"))]
+const VAL_SLAB_CLASS_COUNT: usize = 5;
+
+/// Keep the small literal classes close to their actual length. In particular,
+/// five- and six-field literals used to share an eight-slot cell, retaining 16
+/// to 24 unused bytes per object. Dedicated five- and six-slot classes remove
+/// that boundary penalty without changing the allocation/copy path.
+#[cfg(not(feature = "safe-sandbox"))]
 #[inline]
 fn val_slab_class(count: usize) -> Option<u8> {
     match count {
         1..=4 => Some(0),
-        5..=8 => Some(1),
-        9..=16 => Some(2),
+        5 => Some(1),
+        6 => Some(2),
+        7..=8 => Some(3),
+        9..=16 => Some(4),
         _ => None,
     }
 }
@@ -1411,8 +1420,11 @@ fn val_slab_class(count: usize) -> Option<u8> {
 fn val_slab_class_cap(class: u8) -> usize {
     match class {
         0 => 4,
-        1 => 8,
-        _ => 16,
+        1 => 5,
+        2 => 6,
+        3 => 8,
+        4 => 16,
+        _ => unreachable!("invalid value-slab class {class}"),
     }
 }
 
@@ -4960,7 +4972,7 @@ pub struct Heap {
     courier_bulk: bool,
     /// The literal value slab (B187 stage 2), one class per capacity bucket.
     #[cfg(not(feature = "safe-sandbox"))]
-    val_slab: Box<[ValSlabClass; 3]>,
+    val_slab: Box<[ValSlabClass; VAL_SLAB_CLASS_COUNT]>,
     /// B187 stage 3: recycled `Box<ObjMap>` shells. The sweep pushes a dying
     /// object's box here (instead of shipping it to the courier) when its
     /// remaining contents are drop-cheap — Planned keys, all-default attrs,
@@ -5384,6 +5396,8 @@ impl Heap {
             courier_bulk: false,
             #[cfg(not(feature = "safe-sandbox"))]
             val_slab: Box::new([
+                ValSlabClass::new(),
+                ValSlabClass::new(),
                 ValSlabClass::new(),
                 ValSlabClass::new(),
                 ValSlabClass::new(),
@@ -8257,6 +8271,93 @@ mod tests {
         assert_eq!(object_slab_identity(&heaps[0], right_reuse).0, right_base);
         heaps[0].replace(right_reuse, HeapObj::Date(0.0));
         assert_eq!(heaps[0].val_slab[0].free, vec![right_base]);
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[test]
+    fn slab_capacity_classes_keep_five_and_six_field_cells_exact() {
+        let expected = [
+            (0, None),
+            (1, Some((0, 4))),
+            (4, Some((0, 4))),
+            (5, Some((1, 5))),
+            (6, Some((2, 6))),
+            (7, Some((3, 8))),
+            (8, Some((3, 8))),
+            (9, Some((4, 16))),
+            (16, Some((4, 16))),
+            (17, None),
+        ];
+        for (count, want) in expected {
+            let got = val_slab_class(count).map(|class| (class, val_slab_class_cap(class)));
+            assert_eq!(got, want, "wrong value-slab class for {count} fields");
+        }
+        assert_eq!(Heap::new().val_slab.len(), VAL_SLAB_CLASS_COUNT);
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[test]
+    fn exact_five_slot_slab_class_avoids_an_extra_chunk_at_the_boundary() {
+        // 700 retained five-field cells fit in one five-slot chunk (3,500
+        // Values), while even the six-slot class needs two chunks. This pins
+        // the incremental resident-byte saving without involving allocator
+        // metadata or the process working-set sampler.
+        const CELLS: usize = 700;
+        let class = val_slab_class(5).expect("five fields use the slab");
+        let cap = val_slab_class_cap(class);
+        assert_eq!(cap, 5);
+
+        let mut compact = ValSlabClass::new();
+        for _ in 0..CELLS {
+            compact.alloc_cell(cap);
+        }
+        let mut former = ValSlabClass::new();
+        for _ in 0..CELLS {
+            former.alloc_cell(6);
+        }
+
+        assert_eq!(compact.chunks.len(), 1);
+        assert_eq!(compact.cursor, CELLS * 5);
+        assert_eq!(former.chunks.len(), 2);
+        assert!(
+            former.resident_bytes() - compact.resident_bytes()
+                >= VAL_SLAB_CHUNK * std::mem::size_of::<Value>(),
+            "the five-slot class must save at least one complete slab chunk"
+        );
+    }
+
+    #[cfg(not(feature = "safe-sandbox"))]
+    #[test]
+    fn exact_five_slot_slab_class_bounds_sparse_mixed_arity_overhead() {
+        // Separating five- and six-field cells can cost one extra chunk when
+        // both classes are sparsely occupied. It cannot cost two: a five-slot
+        // chunk holds at least as many cells as a six-slot chunk, and splitting
+        // one ceiling into two adds at most one. Pin the concrete worst case,
+        // including Vec capacity and the one extra fixed class record.
+        let mut shared = ValSlabClass::new();
+        shared.alloc_cell(6); // one five-field object in the former class
+        shared.alloc_cell(6); // one six-field object in the former class
+
+        let mut exact_five = ValSlabClass::new();
+        exact_five.alloc_cell(5);
+        let mut exact_six = ValSlabClass::new();
+        exact_six.alloc_cell(6);
+
+        assert_eq!(shared.chunks.len(), 1);
+        assert_eq!(exact_five.chunks.len() + exact_six.chunks.len(), 2);
+        let chunk_bytes = VAL_SLAB_CHUNK * std::mem::size_of::<Value>();
+        let extra_resident = exact_five
+            .resident_bytes()
+            .saturating_add(exact_six.resident_bytes())
+            .saturating_sub(shared.resident_bytes());
+        let fixed_class_bytes = std::mem::size_of::<ValSlabClass>();
+        assert!(extra_resident >= chunk_bytes);
+        assert!(extra_resident <= chunk_bytes + fixed_class_bytes);
+        assert!(fixed_class_bytes <= 64);
+        eprintln!(
+            "mixed 5/6 sparse overhead: {extra_resident} resident bytes + \
+             {fixed_class_bytes} fixed bytes"
+        );
     }
 
     #[cfg(not(feature = "safe-sandbox"))]
