@@ -76,10 +76,10 @@ const QUICKJS_REACTOR_NO_JOB_DRAIN = new Set([
 ]);
 
 const ZIPP_FIXED_LIMITS = {
-  initial_source_bytes: 2 * 1024 * 1024,
+  initial_source_bytes: 16 * 1024 * 1024,
   lifetime_instructions: 50_000_000,
-  approximate_heap_bytes: 128 * 1024 * 1024,
-  lifetime_output_bytes: 96 * 1024,
+  approximate_heap_bytes: 512 * 1024 * 1024,
+  lifetime_output_bytes: 8 * 1024 * 1024,
   source: "crates/zipp-wasm/src/lib.rs compile-time production constants",
   host_can_raise_limits: false,
 };
@@ -236,10 +236,10 @@ export function controlledEnvironment(source = process.env) {
 
 export function verifyZippFixedLimits(source = fs.readFileSync(ZIPP_WASM_LIB, "utf8")) {
   const declarations = [
-    ["initial_source_bytes", /const MAX_INITIAL_SOURCE_BYTES: usize = 2 \* 1024 \* 1024;/],
+    ["initial_source_bytes", /const MAX_INITIAL_SOURCE_BYTES: usize = 16 \* 1024 \* 1024;/],
     ["lifetime_instructions", /const MAX_LIFETIME_STEPS: u64 = 50_000_000;/],
-    ["approximate_heap_bytes", /const MAX_APPROX_HEAP_BYTES: usize = 128 \* 1024 \* 1024;/],
-    ["lifetime_output_bytes", /const MAX_LIFETIME_OUTPUT_BYTES: usize = 96 \* 1024;/],
+    ["approximate_heap_bytes", /const MAX_APPROX_HEAP_BYTES: usize = 512 \* 1024 \* 1024;/],
+    ["lifetime_output_bytes", /const MAX_LIFETIME_OUTPUT_BYTES: usize = 8 \* 1024 \* 1024;/],
   ];
   const missing = declarations.filter(([, pattern]) => !pattern.test(source)).map(([name]) => name);
   if (missing.length) {

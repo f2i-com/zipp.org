@@ -828,20 +828,20 @@ test("recorded Zipp limits stay pinned to production wasm constants", () => {
 
   const expected = [
     {
-      rust: /const MAX_INITIAL_SOURCE_BYTES: usize = 2 \* 1024 \* 1024;/,
-      harness: /initial_source_bytes: 2 \* 1024 \* 1024,/,
+      rust: /const MAX_INITIAL_SOURCE_BYTES: usize = 16 \* 1024 \* 1024;/,
+      harness: /initial_source_bytes: 16 \* 1024 \* 1024,/,
     },
     {
       rust: /const MAX_LIFETIME_STEPS: u64 = 50_000_000;/,
       harness: /lifetime_instructions: 50_000_000,/,
     },
     {
-      rust: /const MAX_APPROX_HEAP_BYTES: usize = 128 \* 1024 \* 1024;/,
-      harness: /approximate_heap_bytes: 128 \* 1024 \* 1024,/,
+      rust: /const MAX_APPROX_HEAP_BYTES: usize = 512 \* 1024 \* 1024;/,
+      harness: /approximate_heap_bytes: 512 \* 1024 \* 1024,/,
     },
     {
-      rust: /const MAX_LIFETIME_OUTPUT_BYTES: usize = 96 \* 1024;/,
-      harness: /lifetime_output_bytes: 96 \* 1024,/,
+      rust: /const MAX_LIFETIME_OUTPUT_BYTES: usize = 8 \* 1024 \* 1024;/,
+      harness: /lifetime_output_bytes: 8 \* 1024 \* 1024,/,
     },
   ];
   for (const item of expected) {
