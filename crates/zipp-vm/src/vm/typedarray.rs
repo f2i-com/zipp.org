@@ -26,9 +26,9 @@ use crate::value::Value;
 /// cap alone prevents is one absurd request, and 32 MB is still absurd-request
 /// territory for anything that is not deliberately handling media.
 #[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_ARRAY_BUFFER_LEN: i64 = 1 << 27;
+pub const MAX_ARRAY_BUFFER_LEN: i64 = 1 << 27;
 #[cfg(not(feature = "safe-sandbox"))]
-pub(crate) const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
+pub const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
 
 /// Immutable TypedArray internal slots copied by the interpreter's exact
 /// receiver match. Private fields make the match the only authority that can

@@ -122,6 +122,19 @@ pub mod safe_syntax_limits {
     pub use crate::parse::limits::MAX_SAFE_AST_NESTING;
     pub use crate::parse::parser::{MAX_SAFE_SYNTAX_CHAIN, MAX_SAFE_SYNTAX_RECURSION};
 }
+
+/// The hardened profile's native-work and size ceilings, for the same reason
+/// as [`safe_syntax_limits`]: v0.0.10 raised every one of these and the tests
+/// that had copied the old numbers kept passing while exercising nothing.
+#[cfg(feature = "safe-sandbox")]
+pub mod safe_native_limits {
+    pub use crate::vm::temporal::MAX_TEMPORAL_CALENDAR_ITERATIONS;
+    pub use crate::vm::typedarray::MAX_ARRAY_BUFFER_LEN;
+    pub use crate::vm::{
+        MAX_DENSE_ARRAY_LEN, MAX_EAGER_ITER_RESULT, MAX_NATIVE_ITERATION_WORK, MAX_STRING_BYTES,
+        MAX_STRING_UNITS,
+    };
+}
 mod shape;
 mod slot_table;
 

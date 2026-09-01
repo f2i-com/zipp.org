@@ -1,4 +1,11 @@
 #![allow(unused_imports)]
+/// Longest walk `Duration.prototype.total` will take while bracketing a
+/// calendar unit; exhausting it is the catchable "Temporal calendar iteration
+/// limit exceeded" RangeError. Public through `safe_native_limits` so the
+/// hardened-profile test can exceed it by construction instead of by a copied
+/// number.
+pub const MAX_TEMPORAL_CALENDAR_ITERATIONS: u64 = 2_000_000;
+
 use super::*;
 use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
@@ -1324,7 +1331,7 @@ fn duration_total_relative(
             let mut whole = 0i64;
             let mut bracketed = false;
             let mut work = 0u64;
-            for _ in 0..2_000_000 {
+            for _ in 0..MAX_TEMPORAL_CALENDAR_ITERATIONS {
                 work = work.saturating_add(1);
                 if work > MAX_NATIVE_ITERATION_WORK {
                     return Err(Thrown(

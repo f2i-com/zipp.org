@@ -221,9 +221,9 @@ impl TiercActivationState {
 /// any realistic program needs, while keeping a 12-way-parallel test262 run (each
 /// process possibly building several arrays) comfortably bounded.
 #[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 22;
+pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 22;
 #[cfg(not(feature = "safe-sandbox"))]
-pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
+pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
 
 /// Maximum materialized string size. The hardened profile keeps a single
 /// allocation small enough that the periodic heap poll cannot overshoot a
@@ -245,13 +245,13 @@ pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
 /// The concern the old value names, a single allocation overshooting the
 /// host's budget by hundreds of megabytes, is untouched at this size.
 #[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_STRING_BYTES: usize = 1 << 27;
+pub const MAX_STRING_BYTES: usize = 1 << 27;
 #[cfg(not(feature = "safe-sandbox"))]
-pub(crate) const MAX_STRING_BYTES: usize = 1 << 28;
+pub const MAX_STRING_BYTES: usize = 1 << 28;
 #[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_STRING_UNITS: usize = 1 << 26;
+pub const MAX_STRING_UNITS: usize = 1 << 26;
 #[cfg(not(feature = "safe-sandbox"))]
-pub(crate) const MAX_STRING_UNITS: usize = 1 << 28;
+pub const MAX_STRING_UNITS: usize = 1 << 28;
 
 /// Maximum amount of host-side iteration one JavaScript builtin may perform
 /// without returning to the bytecode dispatch loop. The instruction meter can
@@ -265,9 +265,9 @@ pub(crate) const MAX_STRING_UNITS: usize = 1 << 28;
 // 2^26 covers the payloads a real application moves while still bounding a
 // native loop over an attacker-controlled length, which is the point.
 #[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_NATIVE_ITERATION_WORK: u64 = 1 << 26;
+pub const MAX_NATIVE_ITERATION_WORK: u64 = 1 << 26;
 #[cfg(not(feature = "safe-sandbox"))]
-pub(crate) const MAX_NATIVE_ITERATION_WORK: u64 = u64::MAX;
+pub const MAX_NATIVE_ITERATION_WORK: u64 = u64::MAX;
 
 /// Maximum owned memory retained by one compiled RegExp program in the
 /// hostile-code profile. Source length alone is not a sufficient bound:
@@ -288,9 +288,9 @@ pub(crate) const MAX_REGEX_PROGRAM_BYTES: usize = usize::MAX;
 /// already builds eagerly — beyond which `map` reports a RangeError instead of
 /// attempting a multi-gigabyte allocation the host cannot satisfy.
 #[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_EAGER_ITER_RESULT: usize = 1 << 17;
+pub const MAX_EAGER_ITER_RESULT: usize = 1 << 17;
 #[cfg(not(feature = "safe-sandbox"))]
-pub(crate) const MAX_EAGER_ITER_RESULT: usize = 1 << 24;
+pub const MAX_EAGER_ITER_RESULT: usize = 1 << 24;
 
 /// An active `try` handler within a frame.
 /// One activation record.
@@ -2670,8 +2670,8 @@ mod proxy_regexp;
 mod segmenter;
 mod special_casing;
 mod string_ops;
-mod temporal;
-mod typedarray;
+pub(crate) mod temporal;
+pub(crate) mod typedarray;
 mod values;
 
 pub(crate) use access::htmldda_membership_stats;
