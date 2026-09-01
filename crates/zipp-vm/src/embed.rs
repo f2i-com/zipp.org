@@ -395,6 +395,7 @@ impl ScriptState {
     ///
     /// Returns false when the budget is already spent: exhaustion is sticky by
     /// design, and a spent engine must stay spent.
+    #[cfg(feature = "instrument")]
     pub fn renew_step_budget(&mut self, max_steps: u64) -> bool {
         match self.vm.as_mut() {
             Some(vm) => vm.renew_step_budget(max_steps),

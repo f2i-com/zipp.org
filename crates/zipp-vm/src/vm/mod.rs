@@ -921,7 +921,9 @@ impl RegisterFile {
     }
 
     #[inline(always)]
-    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+    // Read by the JIT plan builders and the full instrument tracer only (the
+    // meter-only profile compiles no trace consumer).
+    #[cfg(any(feature = "jit", all(feature = "instrument", not(feature = "meter-only"))))]
     pub(crate) fn get(&self, index: usize) -> Option<&Value> {
         self.storage[..self.logical_len].get(index)
     }
@@ -948,8 +950,8 @@ impl RegisterFile {
     /// a semantically valid `Value`. The hard bound check keeps this operation
     /// memory-safe in release builds as well as debug builds.
     #[inline(always)]
-    #[cfg(not(feature = "safe-sandbox"))]
-    #[cfg_attr(feature = "meter-only", allow(dead_code))]
+    // Only the x86-64 JIT call protocol resizes the file without initialising.
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit"))]
     pub(crate) unsafe fn set_len(&mut self, new_len: usize) {
         assert!(
             new_len <= self.storage.len(),

@@ -499,6 +499,25 @@ impl<'p> Vm<'p> {
         self.host_out(v, 0, &mut seen, &mut budget)
     }
 
+    /// Restore the instruction budget without touching any other limit.
+    ///
+    /// Only the step counter moves: `heap_limit`, `output_limit` and the
+    /// sticky `exhaustion` are left exactly as they are, so a renewal can
+    /// never resurrect an engine that has already spent a different budget.
+    ///
+    /// Instrument-only like the recorder it renews: a build without the
+    /// `instrument` feature has no step budget to restore.
+    #[cfg(feature = "instrument")]
+    pub(crate) fn renew_step_budget(&mut self, max_steps: u64) -> bool {
+        match self.instr_rec.as_mut() {
+            Some(rec) if rec.exhaustion.is_none() => {
+                rec.set_step_limit(max_steps);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A digest of what global `index` would marshal to, without marshalling it.
     ///
     /// A host that mirrors globals pays for what they HOLD, not for how many
@@ -518,21 +537,6 @@ impl<'p> Vm<'p> {
     /// `None` means "assume it changed" — returned when the graph is larger
     /// than this walk will traverse, so a pathological value degrades to the old
     /// always-copy behaviour rather than to a wrong answer.
-    /// Restore the instruction budget without touching any other limit.
-    ///
-    /// Only the step counter moves: `heap_limit`, `output_limit` and the
-    /// sticky `exhaustion` are left exactly as they are, so a renewal can
-    /// never resurrect an engine that has already spent a different budget.
-    pub(crate) fn renew_step_budget(&mut self, max_steps: u64) -> bool {
-        match self.instr_rec.as_mut() {
-            Some(rec) if rec.exhaustion.is_none() => {
-                rec.set_step_limit(max_steps);
-                true
-            }
-            _ => false,
-        }
-    }
-
     pub(crate) fn host_fingerprint_slot(&mut self, index: u32, seed: u64) -> Option<u64> {
         let v = match self.globals.get(index as usize) {
             Some(v) => *v,

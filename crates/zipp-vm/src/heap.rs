@@ -6671,6 +6671,7 @@ impl Heap {
     /// first `audit_resident_bytes`, so until that has happened the O(1)
     /// resident estimate reports no payload at all — a caller that relies on
     /// the cheap figure to convict has to force one walk while this is false.
+    #[cfg(feature = "instrument")]
     #[inline]
     pub(crate) fn payload_accounting_enabled(&self) -> bool {
         self.payload_accounting.get()
