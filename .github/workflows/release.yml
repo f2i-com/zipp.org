@@ -333,7 +333,7 @@ jobs:
         env:
           RUSTFLAGS: >-
             -Dwarnings
-            -C link-arg=--max-memory=268435456
+            -C link-arg=--max-memory=1073741824
             -C link-arg=-zstack-size=1048576
         run: cargo build --locked --release --target wasm32-unknown-unknown
 

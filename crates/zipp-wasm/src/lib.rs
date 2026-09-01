@@ -45,10 +45,20 @@ const PREAMBLE: &str = include_str!("preamble.js");
 const EVAL_PREFIX: &str = "JSON.stringify((function () { return (";
 const EVAL_SUFFIX: &str = "); })())";
 
+// Sized for applications, not for snippets. Every one of these was small
+// enough that ordinary media work hit it as a wall rather than as a guard:
+// a Game Boy cartridge would not fit in a buffer, an 8-second audio frame
+// would not fit in a string, base64 of either would not run in one call.
+//
+// The bound that matters is MAX_APPROX_HEAP_BYTES, which is charged against
+// everything and stops a runaway bundle no matter which shape it allocates.
+// The individual ceilings only ever refused ONE absurd request; they are now
+// set where an absurd request actually begins.
+//
 // These are lifetime limits for one Engine. They are deliberately fixed at
 // the embedding boundary: a guest must not be able to raise its own ceiling,
 // and every browser host gets the same fail-closed defaults.
-const MAX_INITIAL_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_INITIAL_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DYNAMIC_CODE_SOURCE_BYTES: usize = 64 * 1024;
 // `evalInContext` adds a fixed host-controlled wrapper before it enters the
 // same VM-wide dynamic compiler gate as guest `eval`/`Function`/ShadowRealm.
@@ -61,14 +71,14 @@ const MAX_DYNAMIC_CODE_CALLS: usize = 256;
 const MAX_DYNAMIC_CODE_FUNCTIONS: usize = 4096;
 const MAX_DYNAMIC_CODE_CLASSES: usize = 1024;
 const MAX_LIFETIME_STEPS: u64 = 50_000_000;
-const MAX_APPROX_HEAP_BYTES: usize = 128 * 1024 * 1024;
+const MAX_APPROX_HEAP_BYTES: usize = 512 * 1024 * 1024;
 // Keep the byte ceiling below the 100,000-node host conversion cap: even an
 // adversarial stream of empty lines then fits in one bounded `takeOutput()`
 // result (array root + one node per line) without destructive marshal failure.
-const MAX_LIFETIME_OUTPUT_BYTES: usize = 96 * 1024;
+const MAX_LIFETIME_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SYNC_BRIDGE_KIND_BYTES: usize = 64;
 const MAX_SYNC_BRIDGE_ARGS: usize = 16;
-const MAX_SYNC_BRIDGE_BYTES: usize = 1024 * 1024;
+const MAX_SYNC_BRIDGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SYNC_CAPABILITY_ENTRIES: u32 = 32;
 
 /// Preamble bindings the host may address by slot even though it did not

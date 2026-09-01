@@ -5,6 +5,6 @@
 # linear memory without bound. Run each tenant in a dedicated Worker so a trap
 # or deadline can discard the complete instance.
 rustflags = [
-    "-C", "link-arg=--max-memory=268435456",
+    "-C", "link-arg=--max-memory=1073741824",
     "-C", "link-arg=-zstack-size=1048576",
 ]

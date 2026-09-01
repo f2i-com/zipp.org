@@ -38,7 +38,7 @@ implementation can be read end to end.
 
 ## Quick start
 
-The [`v0.0.9` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.9)
+The [`v0.0.10` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.10)
 contains ready-to-run x86-64 binaries and a browser WebAssembly package.
 
 ### Windows
@@ -46,7 +46,7 @@ contains ready-to-run x86-64 binaries and a browser WebAssembly package.
 Download, extract, and run the native Windows executable from PowerShell:
 
 ```powershell
-$version = '0.0.9'
+$version = '0.0.10'
 $archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
 Expand-Archive -LiteralPath $archive -DestinationPath .
@@ -61,7 +61,7 @@ Use `mjs` instead of `js` for an ES module entry, including top-level `await`.
 Download, extract, and run the native Linux binary:
 
 ```sh
-version=0.0.9
+version=0.0.10
 archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 tar -xzf "$archive"
@@ -70,7 +70,7 @@ tar -xzf "$archive"
 ```
 
 The archive preserves the executable bit. If another tool removes it, restore it
-with `chmod +x zipp-0.0.9-x86_64-unknown-linux-gnu/zipp`.
+with `chmod +x zipp-0.0.10-x86_64-unknown-linux-gnu/zipp`.
 
 ### Build from source
 
@@ -106,7 +106,7 @@ Download the browser bundle, then serve its JavaScript and WebAssembly files
 from the same origin as your app:
 
 ```sh
-version=0.0.9
+version=0.0.10
 archive="zipp-wasm-$version-web.zip"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 unzip "$archive"
@@ -248,9 +248,9 @@ is 5,595,833 bytes raw (1,254,075 Brotli-11), between QuickJS-NG's
 1,528,293-byte reactor (417,087 Brotli-11) and Boa's 21,296,176-byte module
 (5,484,164 Brotli-11).
 
-#### Current v0.0.9 native confirmation
+#### Current v0.0.10 native confirmation
 
-The clean default-feature v0.0.9 release binary at engine-source commit
+The clean default-feature v0.0.10 release binary at engine-source commit
 `e3acee352074` reran all 13 current real13 inputs against QuickJS-NG v0.16.2,
 with the runner selecting Zipp's interpreter through `ZIPP_NOJIT=1`. All 39
 canonicalized validation outputs matched after the documented QuickJS CRLF-to-LF
@@ -261,16 +261,16 @@ fresh-process time and `0.6058409×` (0.6041440–0.6090422) after paired
 empty-launch subtraction. This confirms the native interpreter result on the
 final engine code; it does not predict WASM performance.
 
-#### Current v0.0.9 browser-WASM status
+#### Current v0.0.10 browser-WASM status
 
-The committed v0.0.9 production module is 5,480,311 bytes raw, 1,825,812 at
+The committed v0.0.10 production module is 5,480,311 bytes raw, 1,825,812 at
 gzip-9, and 1,233,575 at Brotli-11 (SHA-256
 `318fc5cf7ee5d55751d829419d4de5af1ab2643b8f7fd30df2e3779c16ad1691`). The
 official QuickJS-NG v0.16.2 reactor is 1,528,293 bytes raw and 417,087 at
 Brotli-11, so Zipp is `3.586×` as large raw and `2.958×` as large on the wire.
 
-We also attempted a direct, unscaled WASM run over the same current v0.0.9
-normal 13 and hostile 17 sources used by the v0.0.9 Node/Bun/Deno reruns in
+We also attempted a direct, unscaled WASM run over the same current v0.0.10
+normal 13 and hostile 17 sources used by the v0.0.10 Node/Bun/Deno reruns in
 `target/bench-results/real13-v006-6650647a718c-pgo-15.json` and
 `target/bench-results/hostile17-v006-6650647a718c-pgo-15.json`. Those sources
 are newer than the retained canonical public capture below. The WASM capture

@@ -221,7 +221,7 @@ impl TiercActivationState {
 /// any realistic program needs, while keeping a 12-way-parallel test262 run (each
 /// process possibly building several arrays) comfortably bounded.
 #[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 17;
+pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 22;
 #[cfg(not(feature = "safe-sandbox"))]
 pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
 
@@ -229,12 +229,27 @@ pub(crate) const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
 /// allocation small enough that the periodic heap poll cannot overshoot a
 /// host's budget by hundreds of megabytes. Rope length is capped separately in
 /// UTF-16 units; three WTF-8 bytes per unit is its worst-case representation.
+///
+/// The units ceiling was 2^18 — 262,144 characters. Anything a program hands
+/// to a host as text has to fit there, and a data: URL is text: 262,144
+/// characters of base64 is about 196 KB, which is two seconds of 48 kHz 16-bit
+/// audio. An encoder generating an 8.5-second frame produced 1,093,691
+/// characters and could not hold the result at all — not by building it, not
+/// by concatenating it. Chunking the encode does not help when the answer is
+/// the thing that will not fit.
+///
+/// 2^24 units is 16.7M characters, and 2^25 bytes covers the worst-case WTF-8
+/// expansion of that. Both remain a fraction of the 128 MiB heap budget, which
+/// is what actually bounds total use — a program that builds these steadily
+/// still meets the budget, and one absurd request is still refused outright.
+/// The concern the old value names, a single allocation overshooting the
+/// host's budget by hundreds of megabytes, is untouched at this size.
 #[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_STRING_BYTES: usize = 1 << 20;
+pub(crate) const MAX_STRING_BYTES: usize = 1 << 27;
 #[cfg(not(feature = "safe-sandbox"))]
 pub(crate) const MAX_STRING_BYTES: usize = 1 << 28;
 #[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_STRING_UNITS: usize = 1 << 18;
+pub(crate) const MAX_STRING_UNITS: usize = 1 << 26;
 #[cfg(not(feature = "safe-sandbox"))]
 pub(crate) const MAX_STRING_UNITS: usize = 1 << 28;
 
@@ -243,8 +258,14 @@ pub(crate) const MAX_STRING_UNITS: usize = 1 << 28;
 /// interrupt JavaScript callbacks, but it cannot see a native loop over holes
 /// or an attacker-controlled array-like `length`; keep those operations
 /// independently bounded in the hostile-code profile.
+// 2^18 units of work meant toBase64 stopped at 262,144 bytes and fromBase64
+// at 98,304 — below one Game Boy cartridge, one audio frame, or one image.
+// A bundle encoding a file hit "native builtin iteration limit exceeded",
+// which names the guard rather than the size and reads like corruption.
+// 2^26 covers the payloads a real application moves while still bounding a
+// native loop over an attacker-controlled length, which is the point.
 #[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_NATIVE_ITERATION_WORK: u64 = 1 << 18;
+pub(crate) const MAX_NATIVE_ITERATION_WORK: u64 = 1 << 26;
 #[cfg(not(feature = "safe-sandbox"))]
 pub(crate) const MAX_NATIVE_ITERATION_WORK: u64 = u64::MAX;
 

@@ -24,7 +24,7 @@ function check(label, ok, detail) {
   }
 }
 
-const CEILING = 32 * 1024 * 1024;
+const CEILING = 128 * 1024 * 1024;
 
 function engine() {
   const e = new Engine();
@@ -56,7 +56,7 @@ function engine() {
 // 1. The ceiling is where it says it is.
 {
   const e = engine();
-  check("a buffer exactly at the 32 MiB ceiling allocates", e.callFunction("alloc", [CEILING]) === "ok:" + CEILING);
+  check("a buffer exactly at the 128 MiB ceiling allocates", e.callFunction("alloc", [CEILING]) === "ok:" + CEILING);
   const over = e.callFunction("alloc", [CEILING + 1]);
   check("one byte over the ceiling is a RangeError", String(over).includes("exceeds the maximum"), String(over));
   e.dispose();
@@ -85,12 +85,12 @@ function engine() {
   const e = engine();
   let verdict;
   try {
-    verdict = "returned:" + String(e.callFunction("hoard", [8 * 1024 * 1024, 64]));
+    verdict = "returned:" + String(e.callFunction("hoard", [8 * 1024 * 1024, 256]));
   } catch (err) {
     verdict = "host-threw:" + String(err && err.message ? err.message : err);
   }
   check(
-    "64 x 8 MB (512 MB) is stopped by the memory budget",
+    "256 x 8 MB (2 GB) is stopped by the memory budget",
     /memory budget/i.test(verdict) || verdict.startsWith("returned:stopped:"),
     verdict
   );
@@ -105,7 +105,7 @@ function engine() {
 // 4. An absurd request is still refused outright, not attempted.
 {
   const e = engine();
-  for (const n of [64 * 1024 * 1024, 512 * 1024 * 1024, 2 * 1024 * 1024 * 1024]) {
+  for (const n of [256 * 1024 * 1024, 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024]) {
     const out = String(e.callFunction("alloc", [n]));
     check(`${(n / 1048576).toFixed(0)} MB is refused by the ceiling`, out.includes("exceeds the maximum"), out);
   }

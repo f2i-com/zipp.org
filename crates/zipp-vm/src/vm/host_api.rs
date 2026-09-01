@@ -332,7 +332,11 @@ fn fp_mix(h: &mut u64, x: u64) {
 /// (`x = [x, x]` repeatedly) whose tree-shaped host representation expands
 /// exponentially. These limits bound the representation itself, including
 /// object keys and string payloads, before it is handed to an embedder.
-pub const DEFAULT_HOST_VALUE_MAX_NODES: usize = 100_000;
+// Matched to the fingerprint walk budget. At 100,000 the digest would walk
+// and answer for a value twenty times larger than the read could marshal, so
+// a host could be told "unchanged" about something it was then unable to
+// fetch. Equal budgets make the two agree by construction.
+pub const DEFAULT_HOST_VALUE_MAX_NODES: usize = 2_000_000;
 pub const DEFAULT_HOST_VALUE_MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]

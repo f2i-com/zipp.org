@@ -6,7 +6,7 @@ const fs = require("node:fs");
 const path = process.argv[2];
 if (!path) throw new Error("usage: node check-wasm-memory.cjs <module.wasm>");
 const bytes = fs.readFileSync(path);
-const expectedMaxPages = 268435456 / 65536;
+const expectedMaxPages = 1073741824 / 65536;
 
 function uleb(state) {
   let value = 0;

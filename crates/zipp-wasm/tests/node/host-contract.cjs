@@ -197,9 +197,15 @@ try { e.callFunction("probeHostFailure", []); } catch (err) { opaqueHostError = 
 ok("host bridge exceptions are opaque to the guest", opaqueHostError.includes("host bridge call failed") && !opaqueHostError.includes("secret-token"), opaqueHostError);
 let bridgeLimitErr = "";
 const getItemCallsBeforeLimit = getItemCalls;
-try { e.callFunction("probeBridgeLimit", ["x".repeat(1024 * 1024 + 1)]); }
+// Two ceilings stand between a host string and the VM, and the boundary one is
+// the lower: a value is converted before it is stored, so the conversion string
+// limit answers first. It used to be the other way round only because the VM
+// ceiling was 1 MiB — below the boundary's 16 MiB — and raising the VM side to
+// 128 MiB put them back in their natural order. Either way an oversized
+// argument never reaches the bridge, which is what this is here to prove.
+try { e.callFunction("probeBridgeLimit", ["x".repeat(16 * 1024 * 1024 + 1)]); }
 catch (err) { bridgeLimitErr = String(err); }
-ok("the VM string ceiling rejects an oversized bridge argument", bridgeLimitErr.includes("Invalid string length"), bridgeLimitErr);
+ok("an oversized bridge argument is rejected at the conversion boundary", bridgeLimitErr.includes("conversion string limit"), bridgeLimitErr);
 eq("an oversized bridge argument is rejected before the bridge runs", getItemCalls, getItemCallsBeforeLimit);
 eq("known kind still works after rejection", e.callFunction("syncInfo", []), { connected: true, peers: 2, room: "r", peerId: "p" });
 
@@ -355,7 +361,7 @@ ok("top-level init failure also disposes", runtimeInitTerminalErr.includes("disp
 console.log("— engine resource controls —");
 const sourceBound = new Engine();
 let sourceLimitErr = "";
-try { sourceBound.initScript(" ".repeat(2 * 1024 * 1024 + 1)); }
+try { sourceBound.initScript(" ".repeat(16 * 1024 * 1024 + 1)); }
 catch (err) { sourceLimitErr = String(err); }
 ok("initial source is capped before compilation", sourceLimitErr.includes("initial script source exceeds"), sourceLimitErr);
 let sourceTerminalErr = "";
@@ -401,13 +407,13 @@ catch (err) { instructionTerminalErr = String(err); }
 ok("instruction exhaustion disposes", instructionTerminalErr.includes("disposed"), instructionTerminalErr);
 
 const outputEdge = new Engine();
-outputEdge.initScript("for (let i = 0; i < 96 * 1024; i++) console.log('');");
-eq("exact output limit remains drainable", outputEdge.takeOutput().length, 96 * 1024);
+outputEdge.initScript("for (let i = 0; i < 8 * 1024; i++) console.log('x'.repeat(1023));");
+eq("exact output limit remains drainable", outputEdge.takeOutput().length, 8 * 1024);
 eq("successful output drain clears the buffer", outputEdge.takeOutput().length, 0);
 
 const outputOver = new Engine();
 let outputLimitErr = "";
-try { outputOver.initScript("for (let i = 0; i <= 96 * 1024; i++) console.log('');"); }
+try { outputOver.initScript("for (let i = 0; i <= 8 * 1024; i++) console.log('x'.repeat(1023));"); }
 catch (err) { outputLimitErr = String(err); }
 ok("one byte beyond the lifetime output cap fails closed", outputLimitErr.includes("output budget"), outputLimitErr);
 let outputTerminalErr = "";
@@ -433,7 +439,7 @@ limits.setGlobalByIndex(limitSyms.incoming.index, cyclic);
 eq("inbound cycles retain the null back-edge behavior", limits.evalInContext("incoming.self === null && incoming.again === null"), true);
 
 let nodeLimitErr = "";
-try { limits.setGlobalByIndex(limitSyms.incoming.index, new Array(100000).fill(0)); }
+try { limits.setGlobalByIndex(limitSyms.incoming.index, new Array(2000000).fill(0)); }
 catch (err) { nodeLimitErr = String(err); }
 ok("wide inbound arrays hit a controlled node limit", nodeLimitErr.includes("conversion node limit"), nodeLimitErr);
 
