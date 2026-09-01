@@ -6298,10 +6298,23 @@ impl Heap {
     /// poll adds this to the resident estimate, so a heap whose tables could
     /// not be grown within the ceiling is convicted before it asks -- the
     /// WebAssembly build has no memory past its ceiling to grow into, and a
-    /// refused request there is a trap, not an error. Zero without a ceiling.
+    /// refused request there is a trap, not an error.
+    ///
+    /// Charged only when it can matter: the tables are at least an eighth
+    /// of the ceiling (and 16 MiB) AND within one gentle step of their
+    /// capacity. Charging
+    /// it always spent a small embedding's entire headroom on a copy that was
+    /// neither large nor imminent -- a 220 KiB regex-attack budget was
+    /// convicted by the reserve alone. Zero without a ceiling.
     #[cfg(feature = "instrument")]
     pub(crate) fn slot_table_growth_reserve(&self) -> usize {
-        if self.resident_ceiling == usize::MAX {
+        let ceiling = self.resident_ceiling;
+        if ceiling == usize::MAX {
+            return 0;
+        }
+        let cap = self.objs.capacity();
+        let step = (cap / 16).max(4096);
+        if cap.saturating_sub(self.objs.len()) > step {
             return 0;
         }
         let mut n = vec_capacity_bytes(&self.objs)
@@ -6318,6 +6331,12 @@ impl Heap {
         n = n
             .saturating_add(vec_capacity_bytes(&self.gen))
             .saturating_add(vec_capacity_bytes(&self.born));
+        // Below 16 MiB of tables a doubling is a few pages of any linked
+        // memory that could hold the ceiling; what the reserve guards against
+        // starts in the hundreds of megabytes.
+        if n < (ceiling / 8).max(16 << 20) {
+            return 0;
+        }
         n
     }
 
