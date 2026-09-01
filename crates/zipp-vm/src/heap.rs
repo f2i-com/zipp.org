@@ -6250,6 +6250,13 @@ impl Heap {
     #[cfg(feature = "instrument")]
     pub(crate) fn set_resident_ceiling(&mut self, bytes: usize) {
         self.resident_ceiling = bytes;
+        // Under a ceiling the payload figure has a consumer from the first
+        // allocation on. Left lazy, the estimate ignored every payload until
+        // the first reconciliation walk -- a handful of 48 MiB spread results
+        // filled the WebAssembly build's linked memory before any walk ran.
+        if bytes != usize::MAX {
+            self.payload_accounting.set(true);
+        }
     }
 
     /// Give every per-slot table the slot table's capacity, so they reach

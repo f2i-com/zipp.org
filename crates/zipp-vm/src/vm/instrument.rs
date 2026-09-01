@@ -309,6 +309,20 @@ const PREFLIGHT_AUDIT_STRIDE: u32 = 256;
 /// without the walk riding every instruction.
 const HEAP_WALK_STRIDE: u32 = 64;
 
+/// Polls between reconciliation walks, by heap size in slots. The walk is
+/// O(slots); below a few thousand it is cheaper than the poll's own
+/// bookkeeping, so small heaps -- where in-place payload growth is the whole
+/// story -- reconcile every time.
+fn heap_walk_stride_for(slots: usize) -> u32 {
+    if slots < 4_096 {
+        1
+    } else if slots < 65_536 {
+        8
+    } else {
+        HEAP_WALK_STRIDE
+    }
+}
+
 /// Per-VM instrumentation state. Allocated only when a host asks for it.
 pub(crate) struct Recorder {
     /// Instructions the script may still execute, NOT counting any chunk
@@ -1528,11 +1542,18 @@ impl super::Vm<'_> {
         // request is still affordable rather than trapped when it is not.
         let growth = self.heap.slot_table_growth_reserve();
         let convicted = self.instrument_heap_estimate().saturating_add(growth) > ceiling;
+        // The walk costs O(slots), which is what the stride protects; a heap
+        // of few slots can afford to reconcile every poll. That is exactly
+        // the heap the cheap figure cannot see: one object growing its
+        // property tables in place to a gigabyte is one slot, charged once
+        // at birth, and before this it reached the WebAssembly build's
+        // linked memory between two walks.
+        let walk_stride = heap_walk_stride_for(self.heap.len());
         let reconcile = match self.instr_rec.as_mut() {
             Some(rec) => {
                 let stride = if advance_walk_stride {
                     rec.ticks_since_heap_walk = rec.ticks_since_heap_walk.saturating_add(1);
-                    let due = rec.ticks_since_heap_walk >= HEAP_WALK_STRIDE;
+                    let due = rec.ticks_since_heap_walk >= walk_stride;
                     if due {
                         rec.ticks_since_heap_walk = 0;
                     }
