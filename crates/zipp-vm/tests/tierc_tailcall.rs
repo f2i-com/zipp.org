@@ -9,6 +9,9 @@
 //! runaway (>1M streak) still throws catchable. `ZIPP_NO_TIERC_TAILCALL=1`
 //! restores the blacklist (re-run in a child, the latch is per-process).
 
+//! Pins x86-64 JIT mechanisms from the engine's logs and counters, which the interpreter-only profiles never emit; compiled only where that tier exists, like the other tier-pinning suites.
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
+
 use std::sync::mpsc;
 use std::time::Duration;
 

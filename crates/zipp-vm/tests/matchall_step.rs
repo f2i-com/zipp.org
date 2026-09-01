@@ -15,6 +15,9 @@
 //! processes with `ZIPP_NO_MATCHALL_STEP=1`, `ZIPP_NOJIT=1`,
 //! `ZIPP_JIT_THRESHOLD=1` and `ZIPP_GC_STRESS=1`.
 
+//! Pins x86-64 JIT mechanisms from the engine's logs and counters, which the interpreter-only profiles never emit; compiled only where that tier exists, like the other tier-pinning suites.
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
+
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
     assert!(

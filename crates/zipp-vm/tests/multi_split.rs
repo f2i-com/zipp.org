@@ -32,6 +32,9 @@
 //! recycled string receiver splits while its clean element receiver remains an
 //! ordinary pin.
 
+//! Pins x86-64 JIT mechanisms from the engine's logs and counters, which the interpreter-only profiles never emit; compiled only where that tier exists, like the other tier-pinning suites.
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
+
 const PRELUDE: &str = r#""use strict";
 var N = 20000;
 "#;

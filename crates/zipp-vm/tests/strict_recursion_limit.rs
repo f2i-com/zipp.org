@@ -12,6 +12,9 @@
 //! (compile everything immediately), each in its own child process (the env
 //! latches are read once per process).
 
+//! The deep-but-terminating recursion cases exceed the hardened profile's MAX_FRAMES (4,096), which is that profile's intended answer; the B117 tail-call semantics are pinned by the ordinary profile.
+#![cfg(not(feature = "safe-sandbox"))]
+
 use std::sync::mpsc;
 use std::time::Duration;
 

@@ -1,6 +1,9 @@
 //! Exact outer-region `matchAll` scalarization: mechanism, publication order,
 //! protocol fallback, exclusion, GC/JIT-mode, and kill-switch pins.
 
+//! Pins x86-64 JIT mechanisms from the engine's logs and counters, which the interpreter-only profiles never emit; compiled only where that tier exists, like the other tier-pinning suites.
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
+
 use std::process::Command;
 
 const HOT: usize = 64;

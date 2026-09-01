@@ -22,6 +22,9 @@
 //! under node. Each expectation was executed in node (v24) and diffed exactly.
 //! The whole file must also pass with `ZIPP_NO_ICGATE=1` set for the process.
 
+//! Pins x86-64 JIT mechanisms from the engine's logs and counters, which the interpreter-only profiles never emit; compiled only where that tier exists, like the other tier-pinning suites.
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
+
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
     assert!(

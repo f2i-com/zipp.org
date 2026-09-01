@@ -3,6 +3,9 @@
 //! receiver, in-range tagged-int key); every miss must execute the original
 //! indexed read and append once, including user coercion and GC safe points.
 
+//! Pins x86-64 JIT mechanisms from the engine's logs and counters, which the interpreter-only profiles never emit; compiled only where that tier exists, like the other tier-pinning suites.
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
+
 use std::process::Command;
 
 use zipp_vm::{compile_to_text, run};

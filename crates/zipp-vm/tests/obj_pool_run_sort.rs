@@ -4,6 +4,9 @@
 //! run proof and the kill-switch fallback must leave the pools in the same
 //! ascending-address order and therefore produce identical JS behavior.
 
+//! Pins x86-64 JIT mechanisms from the engine's logs and counters, which the interpreter-only profiles never emit; compiled only where that tier exists, like the other tier-pinning suites.
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
+
 use std::process::{Command, Output};
 
 const CHILD_ENV: &str = "ZIPP_OBJ_POOL_RUN_SORT_CHILD";

@@ -43,6 +43,9 @@
 //! of a child's ZIPP_JITLOG, so an admission change that quietly drops these
 //! kernels to the MEM tier fails the suite instead of making it vacuous.
 
+//! Pins x86-64 JIT mechanisms from the engine's logs and counters, which the interpreter-only profiles never emit; compiled only where that tier exists, like the other tier-pinning suites.
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
+
 /// Dense all-Int Array `K` (the pin family the defect lived in) and the
 /// Int32Array `T` twin (the same loop through the other `GetIndex` branch —
 /// the control that must NOT move).
