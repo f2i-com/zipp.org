@@ -10,7 +10,7 @@ deliver events — for as long as the page lives. That is what `Engine` is.
 rustup +1.92.0 target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version '=0.2.126' --locked
 cd crates/zipp-wasm
-RUSTFLAGS='-Dwarnings -C link-arg=--max-memory=268435456 -C link-arg=-zstack-size=1048576' \
+RUSTFLAGS='-Dwarnings -C link-arg=--max-memory=1073741824 -C link-arg=-zstack-size=1048576' \
   cargo +1.92.0 build --locked --release --target wasm32-unknown-unknown
 wasm-bindgen --target web --out-dir pkg \
   --remove-name-section --remove-producers-section \
@@ -85,7 +85,7 @@ bytes raw, 1,859,668 at gzip-9, and 1,254,075 at Brotli-11, with SHA-256
 
 The current v0.0.6 production artifact uses the same pinned Rust 1.92.0,
 wasm-bindgen 0.2.126, `opt-level=3`, and four-codegen-unit policy. It also keeps
-the 256 MiB linked memory maximum, 1 MiB linked stack, and isolated
+the 1 GiB linked memory maximum, 1 MiB linked stack, and isolated
 `safe-sandbox`, `meter-only`, `wasm-no-fs-loader`, and `wasm-single-agent`
 features. Name, producers, and optional `target_features` sections are removed;
 no `wasm-opt` pass is used. The exact tracked module is:
@@ -336,7 +336,8 @@ remain recoverable.
   time. The x86-64 and ARM64 JIT tiers emit native machine code and are excluded;
   js-sys's optional `unsafe-eval` constructors are disabled as well.
 - Build from this directory (or the repository root) so the checked-in Cargo
-  configuration links a 256 MiB maximum on the exported WebAssembly memory.
+  configuration links a 1 GiB maximum on the exported WebAssembly memory, above
+  the VM's own 512 MiB accounting limit so exhaustion throws instead of trapping.
   Verify that maximum in any post-processed production artifact. This is a
   per-instance limit: the host must separately cap concurrent Workers and
   aggregate origin/process memory.

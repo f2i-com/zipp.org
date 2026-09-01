@@ -24,3 +24,6 @@ zipp_profiling.map
 target-hard1/
 target-hard2/
 target-soft/
+
+# Browser package built by `wasm-bindgen --target web` (see crates/zipp-wasm/README.md).
+crates/zipp-wasm/pkg/

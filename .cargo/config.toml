@@ -1,8 +1,13 @@
 [target.wasm32-unknown-unknown]
 # Mirror the standalone zipp-wasm workspace's allocator backstop for builds
 # launched from the repository root (Cargo discovers config from the current
-# directory, not from --manifest-path).
+# directory, not from --manifest-path). Keep this byte-identical to
+# crates/zipp-wasm/.cargo/config.toml: `check-wasm-memory.cjs` fails a module
+# whose linked maximum is anything other than 16384 pages, and a root-launched
+# build that linked a SMALLER maximum than the VM's own accounting limit would
+# turn a catchable `RangeError: script exceeded its memory budget` into an
+# unrecoverable trap.
 rustflags = [
-    "-C", "link-arg=--max-memory=268435456",
+    "-C", "link-arg=--max-memory=1073741824",
     "-C", "link-arg=-zstack-size=1048576",
 ]
