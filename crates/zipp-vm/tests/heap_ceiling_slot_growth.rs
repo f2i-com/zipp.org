@@ -12,8 +12,8 @@
 //! gracefully and the guest gets its RangeError with the engine intact.
 //!
 //! Native memory cannot reproduce the trap, so this pins the mechanism the
-//! trap depended on: at conviction the resident estimate must sit close to
-//! the ceiling, not a doubling above it.
+//! trap depended on: the resident estimate must never pass the ceiling
+//! before conviction, because the poll charges the next growth ahead of it.
 
 #![cfg(feature = "safe-sandbox")]
 
@@ -76,18 +76,12 @@ fn slot_table_growth_stops_at_the_ceiling_instead_of_doubling_past_it() {
     }
     assert!(convicted, "the hoard never reached the {CEILING}-byte ceiling");
 
-    // Conviction must come from the estimate crossing the ceiling by one
-    // round of allocation plus a gentle step, not from a doubling that
-    // overshot it. The round that convicts adds 65,536 slots (about 9 MiB
-    // here) and at most one gentle step of the same size; a doubling of the
-    // slot tables at this size adds over 90 MiB in one jump.
+    // The ceiling charges the copy the next table growth would need, so the
+    // resident estimate never passes the ceiling before the guest is
+    // convicted. Before the fix the same hoard peaked at 203 MB against this
+    // 160 MiB ceiling: the tables doubled on the push that crossed it.
     assert!(
-        peak > CEILING,
-        "convicted below the ceiling: peak {peak} <= {CEILING}"
-    );
-    let jump = peak - before_last_round;
-    assert!(
-        jump <= CEILING / 4,
-        "the slot tables doubled past the ceiling: the convicting round jumped {jump} bytes          (from {before_last_round} to {peak}); a gentle step is a fraction of that"
+        peak <= CEILING,
+        "the resident estimate passed the ceiling before conviction: peak {peak} > {CEILING}          (last settled round {before_last_round})"
     );
 }

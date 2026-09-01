@@ -1522,7 +1522,12 @@ impl super::Vm<'_> {
         if ceiling == usize::MAX {
             return Ok(());
         }
-        let convicted = self.instrument_heap_estimate() > ceiling;
+        // Growing the per-slot tables needs them twice over for the copy, and
+        // a WebAssembly host cannot supply memory past the ceiling for that:
+        // charge the next growth now, so the guest is convicted while the
+        // request is still affordable rather than trapped when it is not.
+        let growth = self.heap.slot_table_growth_reserve();
+        let convicted = self.instrument_heap_estimate().saturating_add(growth) > ceiling;
         let reconcile = match self.instr_rec.as_mut() {
             Some(rec) => {
                 let stride = if advance_walk_stride {
@@ -1541,7 +1546,7 @@ impl super::Vm<'_> {
             }
             None => false,
         };
-        if (convicted || reconcile) && self.audit_heap_bytes() > ceiling {
+        if (convicted || reconcile) && self.audit_heap_bytes().saturating_add(growth) > ceiling {
             let rec = self.instr_rec.as_mut().expect("recorder checked above");
             return Err(rec.exhaust(ResourceExhaustion::Heap));
         }

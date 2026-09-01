@@ -6285,6 +6285,35 @@ impl Heap {
         }
     }
 
+    /// What the next growth of the per-slot tables needs IN FLIGHT: a `Vec`
+    /// grows by allocating the new block and copying, so for the moment of
+    /// the copy the old tables and the new ones coexist. Under a ceiling the
+    /// poll adds this to the resident estimate, so a heap whose tables could
+    /// not be grown within the ceiling is convicted before it asks -- the
+    /// WebAssembly build has no memory past its ceiling to grow into, and a
+    /// refused request there is a trap, not an error. Zero without a ceiling.
+    #[cfg(feature = "instrument")]
+    pub(crate) fn slot_table_growth_reserve(&self) -> usize {
+        if self.resident_ceiling == usize::MAX {
+            return 0;
+        }
+        let mut n = vec_capacity_bytes(&self.objs)
+            .saturating_add(vec_capacity_bytes(&self.resident_payload_charged))
+            .saturating_add(vec_capacity_bytes(&self.versions))
+            .saturating_add(vec_capacity_bytes(&self.cell_vals_mirror));
+        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        {
+            n = n
+                .saturating_add(vec_capacity_bytes(&self.hot_mirror))
+                .saturating_add(vec_capacity_bytes(&self.this_mirror))
+                .saturating_add(vec_capacity_bytes(&self.upvals_mirror));
+        }
+        n = n
+            .saturating_add(vec_capacity_bytes(&self.gen))
+            .saturating_add(vec_capacity_bytes(&self.born));
+        n
+    }
+
     /// Bytes every slot costs across the parallel per-slot tables that grow
     /// in lock-step with `objs`.
     fn slot_table_bytes_per_entry(&self) -> usize {
