@@ -7328,14 +7328,34 @@ impl<'p> Vm<'p> {
                     } => {
                         let recv = self.get(base, obj);
                         let k = self.get(base, key);
+                        // A NUMERIC key cannot name a builtin method, and finding
+                        // that out the long way is not cheap: `display` formats the
+                        // number into a fresh String, `try_builtin_method` copies the
+                        // arguments into a buffer, and the name is then matched
+                        // against every builtin there is so it can fail.
+                        //
+                        // `table[i]()` pays all of it on every call — an opcode table,
+                        // a jump table, any array of functions. Measured at 118.8ns
+                        // against 44.4ns for the identical call written out as
+                        // `let h = table[i]; h()`. Pocket's CPU core carries a comment
+                        // telling the next reader to hand-write the slow form in the
+                        // hot path, which is the engine asking a bundle to work around
+                        // it.
+                        let numeric_key = k.is_int() || k.is_double();
                         // `obj["push"](x)` etc: a builtin array/string method first.
-                        let kstr = self.display(k);
-                        if let Some(result) =
-                            self.try_builtin_method(recv, &kstr, base, arg_base, argc)?
-                        {
-                            self.set(base, dst, result);
-                            ip += 1;
-                            continue;
+                        let kstr = if numeric_key {
+                            String::new()
+                        } else {
+                            self.display(k)
+                        };
+                        if !numeric_key {
+                            if let Some(result) =
+                                self.try_builtin_method(recv, &kstr, base, arg_base, argc)?
+                            {
+                                self.set(base, dst, result);
+                                ip += 1;
+                                continue;
+                            }
                         }
                         // Else resolve the method off the receiver (own/inherited)
                         // and call it with `this = recv`.
@@ -7359,7 +7379,19 @@ impl<'p> Vm<'p> {
                             ip += 1;
                             continue;
                         }
-                        let (fid, closure) = self.resolve_callable_named(method, &kstr)?;
+                        // Only the failure path needs the key rendered, so a hot
+                        // numeric dispatch never formats one.
+                        let (fid, closure) = if numeric_key {
+                            match self.resolve_callable(method) {
+                                Ok(x) => x,
+                                Err(Thrown(msg)) => {
+                                    let name = self.display(k);
+                                    return Err(Thrown(format!("{msg} (property \"{name}\")")));
+                                }
+                            }
+                        } else {
+                            self.resolve_callable_named(method, &kstr)?
+                        };
                         if self.func(fid as usize).is_generator && self.func(fid as usize).is_async
                         {
                             let argv: Vec<Value> =
