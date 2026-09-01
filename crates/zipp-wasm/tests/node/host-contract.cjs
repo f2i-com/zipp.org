@@ -406,14 +406,24 @@ try { runaway.initScript("let unreachable = 1;"); }
 catch (err) { instructionTerminalErr = String(err); }
 ok("instruction exhaustion disposes", instructionTerminalErr.includes("disposed"), instructionTerminalErr);
 
+// A line is charged its text plus the cost of its own entry — a String in a Vec
+// that later becomes one node of the takeOutput() array. The overhead is what
+// bounds the LINE count: without it an empty line cost a single byte and a
+// stream of them grew until the instance trapped. Spelled out here so this pair
+// of tests keeps landing exactly on the limit rather than near it.
+const OUTPUT_LIMIT = 8 * 1024 * 1024;
+const LINE_OVERHEAD = 8;
+const EDGE_WIDTH = 1024 - LINE_OVERHEAD;          // 1016 chars + 8 = 1024 a line
+const EDGE_LINES = OUTPUT_LIMIT / (EDGE_WIDTH + LINE_OVERHEAD);   // 8192
+
 const outputEdge = new Engine();
-outputEdge.initScript("for (let i = 0; i < 8 * 1024; i++) console.log('x'.repeat(1023));");
-eq("exact output limit remains drainable", outputEdge.takeOutput().length, 8 * 1024);
+outputEdge.initScript(`for (let i = 0; i < ${EDGE_LINES}; i++) console.log('x'.repeat(${EDGE_WIDTH}));`);
+eq("exact output limit remains drainable", outputEdge.takeOutput().length, EDGE_LINES);
 eq("successful output drain clears the buffer", outputEdge.takeOutput().length, 0);
 
 const outputOver = new Engine();
 let outputLimitErr = "";
-try { outputOver.initScript("for (let i = 0; i <= 8 * 1024; i++) console.log('x'.repeat(1023));"); }
+try { outputOver.initScript(`for (let i = 0; i <= ${EDGE_LINES}; i++) console.log('x'.repeat(${EDGE_WIDTH}));`); }
 catch (err) { outputLimitErr = String(err); }
 ok("one byte beyond the lifetime output cap fails closed", outputLimitErr.includes("output budget"), outputLimitErr);
 let outputTerminalErr = "";
