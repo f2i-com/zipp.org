@@ -344,6 +344,7 @@ jobs:
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/check-wasm-memory.cjs tests/node/pkg/zipp_wasm_bg.wasm
           node tests/node/host-contract.cjs
+          node tests/node/buffer-ceiling.cjs
           node tests/node/worker-deadline.cjs
           # The parse-shape limits are calibrated against the artifact built by
           # the step above, with its 1 MiB linker stack. v0.0.1 shipped limits

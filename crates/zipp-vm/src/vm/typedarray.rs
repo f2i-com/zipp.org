@@ -9,8 +9,24 @@ use crate::value::Value;
 
 /// Practical upper bound on an ArrayBuffer/TypedArray byte length. A larger
 /// request is a RangeError rather than an attempted (process-aborting) alloc.
+///
+/// The hardened ceiling was 1 MB, which is below one buffer of almost any real
+/// media work and made two shipped applications impossible rather than slow. A
+/// Game Boy cartridge runs to 8 MB and has to be decoded into one Uint8Array;
+/// 8.5 seconds of 48 kHz mono f32 audio is 1.64 MB, so an audio encoder could
+/// not assemble a single frame. Both failed with a RangeError that named the
+/// typed array rather than the ceiling, which is a hard thing to diagnose from
+/// inside a bundle.
+///
+/// 32 MB keeps every reason the cap exists. It is an eighth of the 256 MB wasm
+/// linear-memory maximum this profile links with, so no single request can
+/// abort the process; and it is a quarter of the 128 MiB heap budget, so the
+/// heap accounting still bounds TOTAL use — four of these and the budget stops
+/// you, which is the guard that was always doing the real work here. What this
+/// cap alone prevents is one absurd request, and 32 MB is still absurd-request
+/// territory for anything that is not deliberately handling media.
 #[cfg(feature = "safe-sandbox")]
-pub(crate) const MAX_ARRAY_BUFFER_LEN: i64 = 1 << 20;
+pub(crate) const MAX_ARRAY_BUFFER_LEN: i64 = 1 << 25;
 #[cfg(not(feature = "safe-sandbox"))]
 pub(crate) const MAX_ARRAY_BUFFER_LEN: i64 = 0x7FFF_FFFF;
 
