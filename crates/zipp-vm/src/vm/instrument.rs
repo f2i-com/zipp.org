@@ -153,8 +153,10 @@ pub(crate) const OUTPUT_MSG: &str = "RangeError: script exceeded its output budg
 /// until the WebAssembly instance trapped on `unreachable`, which the host
 /// cannot catch, cannot report, and cannot tell apart from a bug in the engine:
 ///
-///     3,800,000 empty lines -> ok
-///     3,900,000 empty lines -> RuntimeError: unreachable
+/// ```text
+/// 3,800,000 empty lines -> ok
+/// 3,900,000 empty lines -> RuntimeError: unreachable
+/// ```
 ///
 /// Eight bytes holds the entry count to `output_limit / 8`, which stays under
 /// the host's node cap so `takeOutput` can always return what was buffered,
