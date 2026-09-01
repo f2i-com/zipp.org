@@ -23,7 +23,7 @@ Cold wall time is the headline. Startup-adjusted time is diagnostic, especially
 on short cases. Ratios are new/old for binary A/Bs and Zipp/competitor for engine
 tables; below `1.0×` is faster.
 
-## Current status — 2026-08-31
+## Current status — 2026-09-01
 
 ### Public canonical capture
 
@@ -65,11 +65,38 @@ output and 10,000 bootstrap samples measured:
 | WASM adjusted execution | Boa package | **0.2274×** | 5 / 5 |
 
 The one native real13 QuickJS-NG point gap is sparse-array at 1.0099×. The
-larger open problem is WASM: Zipp is 5,595,833 bytes raw / 1,254,075 Brotli-11,
-versus 1,528,293 / 417,087 for the QuickJS-NG reactor and 21,296,176 / 5,484,164
-for Boa. The WASM interfaces and feature sets differ, so this is diagnostic
+v0.0.5 WASM artifact is 5,595,833 bytes raw / 1,254,075 Brotli-11, versus
+1,528,293 / 417,087 for the QuickJS-NG reactor and 21,296,176 / 5,484,164 for
+Boa. The WASM interfaces and feature sets differ, so this is diagnostic
 attribution rather than a universal engine ranking. Exact commands and hashes
 are in [`bench/comparison/README.md`](bench/comparison/README.md).
+
+#### Current post-v0.0.5 WASM development status
+
+The validated uncommitted development artifact is 5,480,576 bytes raw,
+1,826,113 gzip-9, and 1,233,843 Brotli-11, with SHA-256
+`caf26214ffca1407fba46f3bb304e4bb78ebb01b12898bf4132fc4e7a21f05f3`.
+Its 48-repetition adapter-inclusive persistent-total geomean is
+`0.0954663913×` QuickJS-NG and `0.0105336875×` Boa, with 5 / 5 persistent
+point wins against both. Per-row Zipp / QuickJS-NG ratios are fib `0.0192142110×`,
+loop `0.0397412467×`, array `0.5727939258×`, object properties
+`0.0624496817×`, and sort `0.2903085709×`.
+
+Only array HOF and sort remain cleanly measurable after paired-control
+subtraction, at `0.4681596596×` and `0.2316111384×` QuickJS-NG. Zipp's fib,
+loop, and object adjusted samples are at or below the subtraction noise floor
+(25/48, 24/48, and 24/48 positive; object median negative), so do not promote
+the computed `0.0245653793×` adjusted aggregate. This is a bounded
+five-workload result, not an interpreter-core or all-JavaScript ranking. Raw
+evidence is `target/comparison/results/wasm-kernels-final-48.json`.
+
+The preserved prior development baseline is 5,462,006 raw / 1,818,299 gzip-9 /
+1,230,296 Brotli-11, SHA-256
+`8cf6e8207d1852cfa31c6e38d3b8a60bdec6e4894a65c1d08f39b244c849903b`, with
+result `target/comparison/results/wasm-meter-countdown-final-48.json`. It used
+`1.7725499353×` QuickJS-NG's adjusted time. The current kernels add 18,570 raw,
+7,814 gzip, and 3,547 Brotli bytes. Neither working-tree snapshot revises the
+v0.0.5 release or carries a claimed source commit.
 
 ### Correctness
 
@@ -252,14 +279,22 @@ Earlier entries, designs, hazards, and refutations remain searchable in the
 Priorities are ordered by current measured gap and by whether the next question
 can be answered with a bounded experiment.
 
-### 1. WASM execution and transfer size vs QuickJS-NG
+### 1. Broader-corpus WASM robustness and transfer size
 
-The five-row adjusted execution geomean is 2.107× QuickJS-NG and the Brotli
-module is 3.01× as large. Attribute parser/compiler setup, interpreter dispatch,
-host glue, and Rust/WASM code footprint separately. A candidate must improve
-execution without regressing the compressed wire artifact; raw size alone is
-not the shipping objective. Keep the persistent-module boundary and exact
-work/control sources fixed.
+The current development artifact wins all five persistent workload point
+medians against QuickJS-NG and Boa in the bounded adapter-inclusive diagnostic.
+The next gate is transfer beyond those exact shapes: add scaled variants,
+near-misses, and broader real-program rows; confirm fallback behavior, resource
+accounting, and exact output; and reject any aggregate gain that hides a
+supported regression. Keep the existing persistent-module boundary and frozen
+work/control sources as a continuity anchor, but do not tune only to them.
+
+The Zipp artifact remains `3.586×` as large raw and `2.958×` as large at
+Brotli-11 as QuickJS-NG's reactor.
+Attribute host glue, Rust/runtime footprint, and interpreter code separately.
+Compressed transfer size is the shipping objective: the speed kernels added
+only 3,547 Brotli bytes over the prior baseline, but the remaining absolute gap
+is large enough to justify a fresh symbol/section and feature-footprint audit.
 
 ### 2. Native sparse-array parity vs QuickJS-NG
 

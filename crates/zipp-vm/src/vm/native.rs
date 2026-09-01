@@ -288,6 +288,7 @@ pub const CAP_REACTION: u16 = 915;
 /// import() promise as `this` and [specifier, type?] as args — performs a
 /// dynamic import that was DEFERRED to a microtask because a static module
 /// link DFS was in flight (the DFS evaluation order must not be preempted).
+#[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
 pub const MODULE_DYN_IMPORT: u16 = 916;
 /// Annex B "Runtime Errors for Function Call Assignment Targets" helper: the
 /// parse-retry rewrite in lib.rs turns a sloppy-mode call target (`f() = 1`,

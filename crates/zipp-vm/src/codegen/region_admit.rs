@@ -1823,6 +1823,7 @@ pub(crate) fn compile_region(
         Some(method_plan),
         ic_emit,
         boxref_ok,
+        None,
         meter,
     ) {
         return Some((f, false, bx));
@@ -1854,6 +1855,7 @@ pub(crate) fn compile_region_numeric(
     start: u32,
     end: u32,
     gh: usize,
+    sroa_obj_global: u32,
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<(JitFn, bool)> {
     // SROA-rewritten code has no index ops, so an empty TA plan (no snapshot) is correct.
@@ -1866,6 +1868,7 @@ pub(crate) fn compile_region_numeric(
         0,
         None,
         &IntEntry::default(),
+        Some(sroa_obj_global),
         meter,
     ) {
         return Some((f, true));
@@ -1884,6 +1887,7 @@ pub(crate) fn compile_region_numeric(
         None,
         &[],
         false,
+        Some(sroa_obj_global),
         meter,
     )
     .map(|(f, _)| (f, false))

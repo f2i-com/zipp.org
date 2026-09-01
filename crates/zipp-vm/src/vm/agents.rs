@@ -17,17 +17,22 @@
 //! timers/microtasks/heaps are strictly per-Vm.
 
 use super::*;
-use crate::heap::{AbData, HeapObj, SharedMem};
+#[cfg(not(feature = "wasm-single-agent"))]
+use crate::heap::SharedMem;
+use crate::heap::{AbData, HeapObj};
 use crate::value::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+#[cfg(not(feature = "wasm-single-agent"))]
+use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 /// Which side of the agent API this Vm is: the CLI entry Vm (`Main`) or an
 /// `agent.start` worker thread's Vm (`Worker`). The event loop's stay-alive
 /// rule branches on this: a Worker also parks for INFINITE-deadline
 /// waitAsync waiters (the main agent's notify is what ends them).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg(not(feature = "wasm-single-agent"))]
 pub(crate) enum AgentRole {
     Main,
     Worker,
@@ -37,6 +42,7 @@ pub(crate) enum AgentRole {
 /// one `Arc` cloned into each worker thread. Lazily created on the first
 /// `agent.start`, so a run that never starts an agent pays nothing.
 #[derive(Default)]
+#[cfg(not(feature = "wasm-single-agent"))]
 pub(crate) struct AgentShared {
     /// The `$262.agent.report` FIFO: workers push ToString'd values, the main
     /// agent's `getReport()` pops (null when empty).
@@ -47,6 +53,7 @@ pub(crate) struct AgentShared {
 }
 
 /// The main agent's channel to one started worker.
+#[cfg(not(feature = "wasm-single-agent"))]
 pub(crate) struct AgentHandle {
     tx: mpsc::Sender<BroadcastMsg>,
 }
@@ -54,6 +61,7 @@ pub(crate) struct AgentHandle {
 /// One `$262.agent.broadcast` delivery: the truly-shared SAB bytes (the
 /// worker re-wraps the SAME `Arc<SharedMem>` in its own heap), the numeric
 /// id, and a fresh ack channel the worker signals ON RECEIPT.
+#[cfg(not(feature = "wasm-single-agent"))]
 pub(crate) struct BroadcastMsg {
     mem: Arc<SharedMem>,
     id: f64,
@@ -61,6 +69,7 @@ pub(crate) struct BroadcastMsg {
 }
 
 /// Flip a `started` latch and wake the main agent blocked in `agent_start`.
+#[cfg(not(feature = "wasm-single-agent"))]
 fn signal_started(started: &Arc<(Mutex<bool>, Condvar)>) {
     let (lock, cv) = &**started;
     *lock.lock().unwrap() = true;
@@ -71,6 +80,7 @@ fn signal_started(started: &Arc<(Mutex<bool>, Condvar)>) {
 /// is per-thread and the thread owns its `Program`, so the Vm's `'p` borrow is
 /// this scope), run it with a fresh realm sharing only `shared`, then serve
 /// broadcasts until the channel disconnects (= the main Vm dropped).
+#[cfg(not(feature = "wasm-single-agent"))]
 fn agent_worker(
     src: String,
     shared: Arc<AgentShared>,
@@ -120,6 +130,7 @@ fn agent_worker(
     }
 }
 
+#[cfg(not(feature = "wasm-single-agent"))]
 impl<'p> Vm<'p> {
     /// The lazily-created cross-agent state (first use allocates it).
     fn agent_shared(&mut self) -> Arc<AgentShared> {
@@ -227,6 +238,46 @@ impl<'p> Vm<'p> {
             self.proto_of.insert(idx, Value::heap(self.sab_proto));
         }
         idx
+    }
+}
+
+/// The browser artifact runs one VM inside one externally-supervised Web
+/// Worker. Keep the test262 host methods well-defined if a general zipp-vm
+/// entry point is accidentally linked into that artifact profile, but never
+/// create an unmetered Rust thread or retain its channel graph.
+#[cfg(feature = "wasm-single-agent")]
+impl<'p> Vm<'p> {
+    /// `$262.agent.start` is secondary-source execution outside the artifact's
+    /// single-agent contract. Use the existing host-policy error so callers get
+    /// a catchable JS exception instead of wasm's unsupported-thread trap.
+    pub(crate) fn agent_start(&mut self, _src: String) -> Result<(), Thrown> {
+        Err(Thrown(
+            "EvalError: external code is disabled by the host".into(),
+        ))
+    }
+
+    /// With no child agents, broadcast has no recipients. Preserve the
+    /// ordinary API's SharedArrayBuffer brand check before succeeding.
+    pub(crate) fn agent_broadcast(&mut self, sab: Value, _id: f64) -> Result<(), Thrown> {
+        match sab.is_heap().then(|| self.heap.get(sab.heap_index())) {
+            Some(HeapObj::ArrayBuffer {
+                data: AbData::Shared(_),
+                ..
+            }) => Ok(()),
+            _ => Err(Thrown(
+                "TypeError: $262.agent.broadcast requires a SharedArrayBuffer".into(),
+            )),
+        }
+    }
+
+    /// Main-agent report/getReport calls remain a local FIFO even though there
+    /// are no worker reports or synchronization primitives in this profile.
+    pub(crate) fn agent_push_report(&mut self, s: String) {
+        self.agent_reports.push_back(s);
+    }
+
+    pub(crate) fn agent_pop_report(&mut self) -> Option<String> {
+        self.agent_reports.pop_front()
     }
 }
 

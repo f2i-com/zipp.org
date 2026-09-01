@@ -39,6 +39,23 @@ regex-linear = ["regress/linear-ascii"]
 # adds a branch to the inner dispatch loop, and enabling it on a VM turns the
 # JIT off for that VM (native code does not iterate the loop the hook lives in).
 instrument = []
+# Artifact-internal profile for the browser resource meter without algebraic
+# execution traces. Cooperative abort polling is intentionally omitted: the
+# zipp-wasm host enforces its wall-clock deadline by terminating the Worker.
+# Cargo features are additive, so do not unify this into a graph whose other
+# consumers call the trace API; the standalone zipp-wasm workspace is its
+# intended feature-resolution domain.
+meter-only = ["instrument"]
+# Artifact-internal specialization for the standalone zipp-wasm build. Its
+# ScriptState has no filesystem-module-loader host surface, so retaining that
+# unreachable loader only enlarges the artifact and its interpreter dispatch.
+# Like `meter-only`, keep this out of feature-unified general zipp-vm graphs.
+wasm-no-fs-loader = ["meter-only"]
+# Artifact-internal specialization for the standalone zipp-wasm build. Browser
+# Workers provide the process/isolation boundary, so the embedded VM never
+# creates test262 `$262.agent.start` threads. The Atomics waiter machinery is
+# deliberately retained: this feature removes only the worker harness.
+wasm-single-agent = ["meter-only"]
 # Memory-safe interpreter profile for the dedicated untrusted-code runner.
 # This deliberately conflicts with `jit`: native code generation and every
 # performance-only unchecked path are excluded, while the regex engine selects

@@ -288,9 +288,14 @@ impl<'p> Vm<'p> {
             async_waiters: Vec::new(),
             timer_queue: Vec::new(),
             vm_start_mono_ms: crate::vm::clock::now_mono_ms(),
+            #[cfg(not(feature = "wasm-single-agent"))]
             agent_shared: None,
+            #[cfg(not(feature = "wasm-single-agent"))]
             agent_role: agents::AgentRole::Main,
+            #[cfg(not(feature = "wasm-single-agent"))]
             broadcast_cb: Value::UNDEFINED,
+            #[cfg(feature = "wasm-single-agent")]
+            agent_reports: std::collections::VecDeque::new(),
             mailbox: std::sync::Arc::new(agents::Mailbox::default()),
             deferred_mods: std::collections::HashMap::new(),
             module_pending_reexports: std::collections::HashMap::new(),
@@ -751,10 +756,20 @@ impl<'p> Vm<'p> {
             n.saturating_add(Self::hash_map_resident_bytes(&self.symbol_registry)),
             |n, key| n.saturating_add(key.capacity()),
         );
-        self.symbol_keys.keys().fold(
+        let n = self.symbol_keys.keys().fold(
             n.saturating_add(Self::hash_map_resident_bytes(&self.symbol_keys)),
             |n, key| n.saturating_add(key.capacity()),
-        )
+        );
+        #[cfg(feature = "instrument")]
+        if let Some(rec) = self.instr_rec.as_ref() {
+            // Preserve the non-Heap part of this exact total for O(1)
+            // enforcement between audits. In particular, a JIT-enabled VM's
+            // pinned register allocation is real resident memory but is not
+            // part of `Heap::resident_bytes()`.
+            rec.heap_audit_non_heap
+                .set(n.saturating_sub(self.heap.resident_bytes()));
+        }
+        n
     }
 
     /// Payload-aware resident VM estimate — see `embed::ScriptState::heap_bytes`.
@@ -826,7 +841,7 @@ impl<'p> Vm<'p> {
     /// program still returned the right answer — a proof over that trace would
     /// attest to an execution that never happened. Metering can be made to work
     /// natively (it is a counter); a trace cannot.
-    #[cfg(feature = "instrument")]
+    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
     pub(crate) fn enter_trace_mode(&mut self) {
         #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
         {

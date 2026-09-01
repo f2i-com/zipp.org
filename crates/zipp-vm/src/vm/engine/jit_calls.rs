@@ -1060,6 +1060,7 @@ impl<'p> Vm<'p> {
                 self.ic_plain_fn(cv)
             } else {
                 self.ic_call(func_id, ip, cv)
+                    .map(|call| (call.fid, call.closure))
             };
             match resolved {
                 Some((fid, closure)) => (fid, closure, explicit_this, cv),

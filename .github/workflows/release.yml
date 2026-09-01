@@ -10,9 +10,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag (for example, v0.0.5)
+        description: Existing release tag (for example, v0.0.6)
         required: true
-        default: v0.0.5
+        default: v0.0.6
         type: string
 
 # Build jobs can only read the repository. The release job raises this to
@@ -309,6 +309,15 @@ jobs:
           RUSTFLAGS: -Dwarnings
         run: cargo test --locked
 
+      - name: Test artifact-only VM specializations
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: >-
+          cargo test --locked --manifest-path ../zipp-vm/Cargo.toml
+          --no-default-features
+          --features safe-sandbox,meter-only,wasm-no-fs-loader,wasm-single-agent
+          --test no_fs_loader --test wasm_single_agent
+
       - name: Install the exact matching wasm-bindgen CLI
         run: |
           set -euo pipefail
@@ -361,6 +370,11 @@ jobs:
           wasm-bindgen --target web --out-dir "dist/$bundle" \
             --remove-name-section --remove-producers-section \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          node tests/node/strip-target-features.cjs \
+            "dist/$bundle/zipp_wasm_bg.wasm" \
+            "dist/$bundle/zipp_wasm_bg.stripped.wasm"
+          mv "dist/$bundle/zipp_wasm_bg.stripped.wasm" \
+            "dist/$bundle/zipp_wasm_bg.wasm"
           node --input-type=module --check < "dist/$bundle/zipp_wasm.js"
           node tests/node/check-wasm-memory.cjs "dist/$bundle/zipp_wasm_bg.wasm"
           # Pin all generated type surfaces as well as the runtime smoke below:

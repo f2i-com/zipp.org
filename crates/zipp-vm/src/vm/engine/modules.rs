@@ -1503,6 +1503,7 @@ impl<'p> Vm<'p> {
 
     /// Trigger hook for KEYED operations on a possibly-deferred namespace.
     /// Zero-cost when no unevaluated deferred namespace exists.
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     #[inline]
     pub(crate) fn defer_check(&mut self, obj: Value, key: &str) -> Result<(), Thrown> {
         if !self.deferred_ns_state.is_empty()
@@ -1515,7 +1516,15 @@ impl<'p> Vm<'p> {
         Ok(())
     }
 
+    /// The WebAssembly embedder cannot create a deferred module namespace.
+    #[cfg(feature = "wasm-no-fs-loader")]
+    #[inline(always)]
+    pub(crate) fn defer_check(&mut self, _obj: Value, _key: &str) -> Result<(), Thrown> {
+        Ok(())
+    }
+
     /// Trigger hook for [[OwnPropertyKeys]]-class operations (always trigger).
+    #[cfg(not(feature = "wasm-no-fs-loader"))]
     #[inline]
     pub(crate) fn defer_check_all(&mut self, obj: Value) -> Result<(), Thrown> {
         if !self.deferred_ns_state.is_empty()
@@ -1524,6 +1533,13 @@ impl<'p> Vm<'p> {
         {
             self.defer_ns_trigger(obj.heap_index())?;
         }
+        Ok(())
+    }
+
+    /// The WebAssembly embedder cannot create a deferred module namespace.
+    #[cfg(feature = "wasm-no-fs-loader")]
+    #[inline(always)]
+    pub(crate) fn defer_check_all(&mut self, _obj: Value) -> Result<(), Thrown> {
         Ok(())
     }
 

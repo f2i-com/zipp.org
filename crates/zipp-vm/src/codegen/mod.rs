@@ -4409,8 +4409,14 @@ impl Jit {
                         .collect();
                     let rewritten =
                         rewrite_for_field_promotion(proto, start, end, &fp, field_pool_base);
-                    let compiled =
-                        compile_region_numeric(&rewritten, start, end, globals_base_helper, meter);
+                    let compiled = compile_region_numeric(
+                        &rewritten,
+                        start,
+                        end,
+                        globals_base_helper,
+                        fp.obj_global,
+                        meter,
+                    );
                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                         eprintln!(
                             "[jit] SROA region fn{func_id} [{start},{end}] fields={} -> {}",
@@ -4495,6 +4501,7 @@ impl Jit {
                 heap_helpers.ta_snapshot,
                 heap_helpers.math_imul_guard,
                 &entry,
+                None,
                 meter,
             ) {
                 if std::env::var_os("ZIPP_JITLOG").is_some() {

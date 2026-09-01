@@ -12,9 +12,13 @@
 
 #![cfg(feature = "instrument")]
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(not(feature = "meter-only"))]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use zipp_vm::embed::{self, op, ScriptState, TraceStep};
+use zipp_vm::embed::{self, ScriptState};
+#[cfg(not(feature = "meter-only"))]
+use zipp_vm::embed::{op, TraceStep};
 
 /// A bootstrap that mentions the globals the eval'd script reaches through.
 /// A name the compiled program never mentions has no global slot, so `eval`
@@ -45,6 +49,7 @@ fn instrumented(max_steps: u64, abort: Option<Arc<AtomicBool>>) -> ScriptState {
 }
 
 /// Trace `script` and return `(rows, result JSON)`.
+#[cfg(not(feature = "meter-only"))]
 fn trace(script: &str) -> (Option<Vec<TraceStep>>, String) {
     let mut st = instrumented(u64::MAX, None);
     st.start_trace(1 << 20);
@@ -64,6 +69,7 @@ fn trace(script: &str) -> (Option<Vec<TraceStep>>, String) {
 /// Every condition the prover's AIR imposes on a trace, checked here so a
 /// producer bug shows up as a named assertion instead of an opaque
 /// `InconsistentOodConstraintEvaluations` at verification time.
+#[cfg(not(feature = "meter-only"))]
 fn assert_provable(rows: &[TraceStep]) {
     assert!(rows.len() >= 2, "row 0 is asserted not to be the halt row");
     assert_eq!(rows[0].clk, 0, "clk[0] == 0");
@@ -108,6 +114,7 @@ fn assert_provable(rows: &[TraceStep]) {
     }
 }
 
+#[cfg(not(feature = "meter-only"))]
 #[test]
 fn a_trace_of_real_javascript_is_provable() {
     for script in [
@@ -132,6 +139,7 @@ fn a_trace_of_real_javascript_is_provable() {
     }
 }
 
+#[cfg(not(feature = "meter-only"))]
 #[test]
 fn results_are_unchanged_by_tracing() {
     for (script, want) in [
@@ -157,6 +165,7 @@ fn results_are_unchanged_by_tracing() {
 /// integers. Negative results, fractions and strings must fall back to OTHER —
 /// this is the difference between a proof that means something and one that is
 /// false.
+#[cfg(not(feature = "meter-only"))]
 #[test]
 fn unprovable_arithmetic_is_demoted_rather_than_faked() {
     for script in ["(-5) + 3", "0.1 + 0.2", "'a' + 'b'", "1 / 3", "7 % 2.5"] {
@@ -224,6 +233,19 @@ fn steps_used_reports_what_the_script_consumed() {
     assert_eq!(st.steps_used() + st.steps_remaining(), BUDGET);
 }
 
+#[test]
+fn an_unlimited_meter_retains_a_real_usage_counter() {
+    let mut st = instrumented(u64::MAX, None);
+    let before = st.steps_used();
+    st.eval_in_context("(0,eval)('let s=0; for(let i=0;i<1000;i++) s+=i; s')")
+        .expect("an unlimited metered loop runs");
+    assert!(
+        st.steps_used() > before,
+        "unlimited work must still be billed"
+    );
+    assert_eq!(st.steps_remaining(), u64::MAX);
+}
+
 /// Exhaustion reports exactly the budget — the number a gas meter charges for
 /// a rejected transaction.
 #[test]
@@ -238,6 +260,43 @@ fn an_exhausted_budget_reports_the_full_cap() {
     assert_eq!(st.steps_remaining(), 0);
 }
 
+/// Static object finalization charges one dispatch plus its field count: the
+/// latter is completed work outside the dispatch loop. A finite meter must
+/// include both in billing without letting that off-loop charge shift the
+/// interpreter's periodic-poll clock.
+#[test]
+fn finite_budget_exactly_replays_weighted_off_loop_work() {
+    const BUDGET: u64 = 10_000_000;
+    const SCRIPT: &str = "(0,eval)('let sink; for (let i=0;i<256;i++) { sink={a:i,b:i,c:i,d:i,e:i,f:i,g:i,h:i}; } sink.h')";
+
+    let mut measured = instrumented(BUDGET, None);
+    measured
+        .eval_in_context(SCRIPT)
+        .expect("weighted object finalization runs");
+    let exact = measured.steps_used();
+    assert!(exact > 256 * 8, "off-loop field charges were not reflected");
+    assert_eq!(exact + measured.steps_remaining(), BUDGET);
+
+    let mut replay = embed::compile_script(BOOT).expect("bootstrap compiles");
+    replay.set_limits(exact, None);
+    replay.run_init().expect("bootstrap replays");
+    replay
+        .eval_in_context(SCRIPT)
+        .expect("the exact final allowance succeeds");
+    assert_eq!(replay.steps_used(), exact);
+    assert_eq!(replay.steps_remaining(), 0);
+
+    let mut short = embed::compile_script(BOOT).expect("bootstrap compiles");
+    short.set_limits(exact - 1, None);
+    short.run_init().expect("bootstrap fits the short budget");
+    let err = short
+        .eval_in_context(SCRIPT)
+        .expect_err("one fewer weighted step is rejected");
+    assert!(err.contains("instruction budget"), "got {err:?}");
+    assert_eq!(short.steps_used(), exact - 1);
+    assert_eq!(short.steps_remaining(), 0);
+}
+
 /// The budget is a hard stop, not a catchable error: a script must not be able
 /// to `try`/`catch` its way past its own limit and keep running.
 #[test]
@@ -250,6 +309,7 @@ fn the_budget_cannot_be_caught_and_ignored() {
 }
 
 #[test]
+#[cfg(not(feature = "meter-only"))]
 fn the_abort_flag_stops_a_running_script() {
     let flag = Arc::new(AtomicBool::new(false));
     let setter = flag.clone();
@@ -268,6 +328,7 @@ fn the_abort_flag_stops_a_running_script() {
 /// A truncated recording is discarded, not returned. A trace missing its tail
 /// would attest to an execution that did not happen, and the caller has no way
 /// to tell the difference from the rows alone.
+#[cfg(not(feature = "meter-only"))]
 #[test]
 fn hitting_the_row_cap_yields_no_trace_at_all() {
     let mut st = instrumented(u64::MAX, None);
@@ -291,8 +352,9 @@ fn hitting_the_row_cap_yields_no_trace_at_all() {
 /// Compiled code charges one basic block at a time, by that block's exact
 /// instruction count. A basic block is straight-line, so entering it means
 /// executing all of it: the charge is what the interpreter would have counted.
-/// `start_trace` is the lever used here to force interpreter-only execution,
-/// since a trace has to be a complete record and native code produces no rows.
+/// The explicit JIT switch gives the test an interpreter-only oracle without
+/// allocating a trace, so the same test also covers the WASM `meter-only`
+/// profile.
 #[test]
 fn the_jit_charges_exactly_what_the_interpreter_would() {
     const BIG: u64 = 1_000_000_000;
@@ -301,7 +363,7 @@ fn the_jit_charges_exactly_what_the_interpreter_would() {
         let mut st = embed::compile_script(BOOT).expect("compiles");
         st.set_limits(BIG, None);
         if interpreter_only {
-            st.start_trace(usize::MAX);
+            st.disable_vm_jit();
         }
         st.run_init().expect("runs");
         let before = st.steps_remaining();
@@ -388,6 +450,7 @@ fn a_jit_hot_loop_still_hits_its_budget() {
 /// native entry, and the lent chunk is what forces those entries to keep
 /// happening inside an otherwise unbounded loop.
 #[test]
+#[cfg(not(feature = "meter-only"))]
 fn the_abort_flag_stops_a_jit_hot_loop() {
     let flag = Arc::new(AtomicBool::new(false));
     let setter = flag.clone();
@@ -482,6 +545,7 @@ fn an_uninstrumented_vm_is_unbounded() {
     let mut st = embed::compile_script("var x = 0;").expect("compiles");
     st.run_init().expect("runs");
     assert_eq!(st.steps_remaining(), u64::MAX);
+    #[cfg(not(feature = "meter-only"))]
     assert!(st.finish_trace(0).is_none());
     assert_eq!(
         st.eval_in_context("(function(){var s=0;for(var i=0;i<300000;i++)s+=i;return s})()")

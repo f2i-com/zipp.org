@@ -25,7 +25,7 @@
 //! polled.
 //!
 //! For the TRACE there is no such fix, and the JIT genuinely does go off
-//! ([`super::Vm::enter_trace_mode`]). A trace has to be a row-per-instruction
+//! (`Vm::enter_trace_mode` in full instrumentation builds). A trace has to be a row-per-instruction
 //! record; native code produces no rows, so a JIT'd hot loop would simply be
 //! missing from it while the program still returned the right answer — and a
 //! proof over that trace would attest to an execution that never happened.
@@ -76,6 +76,7 @@
 use crate::bytecode::Instr;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 use crate::codegen::meter::NATIVE_CHUNK;
+#[cfg(not(feature = "meter-only"))]
 use crate::value::Value;
 
 /// Without a JIT tier there is no native code to lend budget to; the constant
@@ -133,6 +134,7 @@ pub struct TraceStep {
 /// Why an instrumented run stopped. Surfaced as an uncaught throw so a script
 /// cannot `catch` its way past its own budget.
 pub(crate) const BUDGET_MSG: &str = "RangeError: script exceeded its instruction budget";
+#[cfg(not(feature = "meter-only"))]
 pub(crate) const ABORT_MSG: &str = "RangeError: script execution was aborted by the host";
 /// Raised when a script exceeds the heap ceiling its host set.
 pub(crate) const MEMORY_MSG: &str = "RangeError: script exceeded its memory budget";
@@ -165,6 +167,7 @@ pub(crate) const REGEX_MEMORY_MSG: &str =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResourceExhaustion {
     Steps,
+    #[cfg(not(feature = "meter-only"))]
     Abort,
     Heap,
     Output,
@@ -183,6 +186,7 @@ impl ResourceExhaustion {
     pub(crate) const fn message(self) -> &'static str {
         match self {
             Self::Steps => BUDGET_MSG,
+            #[cfg(not(feature = "meter-only"))]
             Self::Abort => ABORT_MSG,
             Self::Heap => MEMORY_MSG,
             Self::Output => OUTPUT_MSG,
@@ -221,6 +225,7 @@ impl DynamicCodeLimits {
 /// A row whose operands have been sampled but whose result has not: the
 /// destination register is not written until the instruction runs, so the row is
 /// completed at the top of the next dispatch iteration.
+#[cfg(not(feature = "meter-only"))]
 struct Pending {
     row: usize,
     /// ABSOLUTE index into the register file (`base + dst`), or `None` for an
@@ -237,6 +242,7 @@ struct Pending {
 /// What the pre-hook proposed. The post-hook either confirms it against the
 /// observed result or rewrites the row to [`op::OTHER`].
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg(not(feature = "meter-only"))]
 enum Claim {
     /// `val_dst == const_val` — both sides are the same encoding, so it holds.
     Const,
@@ -266,11 +272,17 @@ enum Claim {
 /// `ticks & MASK == 0`). An atomic load per instruction would be a real cost for
 /// a flag that is almost never set; 4096 instructions is well under a
 /// millisecond, so the host still sees a prompt stop.
+#[cfg(not(feature = "meter-only"))]
 const ABORT_CHECK_MASK: u64 = 0xFFF;
 /// A full payload reconciliation walks the heap, so do it less often than the
 /// cheap abort poll. New objects and known large buffers are charged eagerly;
 /// this audit catches capacity growth of already-existing collections.
 const HEAP_AUDIT_MASK: u64 = 0xFFFF;
+#[cfg(any(
+    all(feature = "meter-only", not(feature = "jit"), not(test)),
+    all(feature = "meter-only", test)
+))]
+const HEAP_AUDIT_INTERVAL: u64 = HEAP_AUDIT_MASK + 1;
 
 /// Host re-entries between forced full heap audits in the postflight. The
 /// interpreter reconciles on a tick stride; a host that re-enters without
@@ -288,11 +300,13 @@ const POSTFLIGHT_AUDIT_STRIDE: u32 = 256;
 /// same window.
 const PREFLIGHT_AUDIT_STRIDE: u32 = 256;
 
-/// `HEAP_AUDIT_MASK` polls between forced full heap walks in the dispatch loop.
-/// The poll itself stays on its old schedule and still answers from the O(1)
-/// figure every time; this is only how often the exact reconciliation runs, so
-/// in-place capacity growth is still incorporated regularly (every 64 * 65,536
-/// instructions) without the walk riding the instruction count.
+/// Periodic polls between forced full heap walks in the dispatch loop. Ordinary
+/// and unlimited meters poll every 65,536 dispatches; the finite release-wasm
+/// countdown polls on the first dispatch after each 65,536 metered-step
+/// threshold (off-loop charges can make that earlier in dispatch terms). The
+/// poll still answers from the O(1) figure every time; this is only how often
+/// exact reconciliation runs, so in-place capacity growth remains bounded
+/// without the walk riding every instruction.
 const HEAP_WALK_STRIDE: u32 = 64;
 
 /// Per-VM instrumentation state. Allocated only when a host asks for it.
@@ -302,12 +316,16 @@ pub(crate) struct Recorder {
     /// native tier charges a whole basic block at a time and can overshoot zero
     /// by up to one block; `i64::MAX` means unlimited.
     pub(crate) remaining: i64,
-    /// Instructions actually executed since the recorder was attached: the
-    /// interpreter's per-instruction charge, the native tier's net lending
-    /// (lent at `meter_lend`, unspent refunded at `meter_return`), and off-loop
-    /// work charged through `charge_steps`. The consumed half of `remaining` —
-    /// the number a host billing for execution (gas metering) needs, rather
-    /// than the cap it enforces.
+    /// Instructions executed outside the interpreter dispatch loop: the native
+    /// tier's net lending (lent at `meter_lend`, unspent refunded at
+    /// `meter_return`) and off-loop work charged through `charge_steps`.
+    /// Interpreter work is already counted by `ticks`; [`Self::steps_used`]
+    /// combines both counters at the observation boundary.
+    ///
+    /// The finite, no-JIT release wasm profile instead stores the next
+    /// `remaining` balance at which a heap poll is due. Its initial balance in
+    /// `ticks` makes a separate off-loop counter unnecessary, and reusing this
+    /// field avoids adding another hot-path load or another recorder field.
     pub(crate) used: u64,
     /// Set by another thread to stop a running script.
     pub(crate) abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -329,17 +347,27 @@ pub(crate) struct Recorder {
     dynamic_limits: DynamicCodeLimits,
     dynamic_calls: usize,
     dynamic_source_bytes: usize,
+    #[cfg(not(feature = "meter-only"))]
     steps: Vec<TraceStep>,
     /// Whether to record rows at all — metering works without tracing.
+    #[cfg(not(feature = "meter-only"))]
     tracing: bool,
     /// Stop recording (but keep executing) past this many rows. A truncated
     /// trace is unprovable, which [`Recorder::finish`] reports as `None`.
+    #[cfg(not(feature = "meter-only"))]
     max_steps: usize,
+    #[cfg(not(feature = "meter-only"))]
     truncated: bool,
+    #[cfg(not(feature = "meter-only"))]
     pending: Option<Pending>,
     /// The call depth the emitted rows imply. The prover recomputes this from
     /// the opcodes, so the two must agree — never emit a RETURN at depth 0.
+    #[cfg(not(feature = "meter-only"))]
     depth: u64,
+    /// Interpreter-dispatch clock in ordinary instrumentation builds and for
+    /// unlimited meters. In the finite, no-JIT release wasm profile this holds
+    /// the immutable initial step ceiling, so total work is derived as
+    /// `ticks - remaining` without writing a second counter per instruction.
     ticks: u64,
     /// Host re-entries since the last full heap audit. The postflight check is
     /// O(1) and reads a figure that lags in-place capacity growth, so it is
@@ -362,6 +390,11 @@ pub(crate) struct Recorder {
     /// case). The next interpreter poll or host-boundary postflight must run
     /// one exact VM audit; non-allocating re-entry keeps the O(1) fast path.
     external_heap_dirty: bool,
+    /// Non-`Heap` resident bytes observed by the latest exact audit. Cheap
+    /// ceiling checks add the live `Heap` high-water figure, retaining the
+    /// VM-core/side-table baseline without another heap-slot walk. Zero before
+    /// the first audit safely falls back to the historical Heap-only estimate.
+    pub(crate) heap_audit_non_heap: std::cell::Cell<usize>,
 }
 
 impl Recorder {
@@ -379,14 +412,21 @@ impl Recorder {
             preflight_since_audit: PREFLIGHT_AUDIT_STRIDE,
             ticks_since_heap_walk: HEAP_WALK_STRIDE,
             external_heap_dirty: false,
+            heap_audit_non_heap: std::cell::Cell::new(0),
             dynamic_limits: DynamicCodeLimits::UNLIMITED,
             dynamic_calls: 0,
             dynamic_source_bytes: 0,
+            #[cfg(not(feature = "meter-only"))]
             steps: Vec::new(),
+            #[cfg(not(feature = "meter-only"))]
             tracing: false,
+            #[cfg(not(feature = "meter-only"))]
             max_steps: usize::MAX,
+            #[cfg(not(feature = "meter-only"))]
             truncated: false,
+            #[cfg(not(feature = "meter-only"))]
             pending: None,
+            #[cfg(not(feature = "meter-only"))]
             depth: 0,
             ticks: 0,
         }
@@ -394,6 +434,7 @@ impl Recorder {
 
     /// Begin recording. `max_steps` bounds memory: at ~64 bytes a row, a hot
     /// loop would otherwise exhaust the host long before it finished.
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn start_trace(&mut self, max_steps: usize) {
         self.steps.clear();
         self.steps.reserve(max_steps.min(1 << 16));
@@ -404,8 +445,38 @@ impl Recorder {
         self.depth = 0;
     }
 
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// Install a fresh step ceiling. The release wasm meter reuses `ticks` as
+    /// the immutable finite starting balance; all other profiles keep its
+    /// historical role as the interpreter-dispatch counter.
+    pub(crate) fn set_step_limit(&mut self, max_steps: u64) {
+        // Saturating, so `u64::MAX` keeps meaning "unlimited".
+        self.remaining = max_steps.min(i64::MAX as u64) as i64;
+        #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
+        {
+            self.ticks = if self.remaining == i64::MAX {
+                0
+            } else {
+                self.remaining as u64
+            };
+            self.used = finite_next_heap_poll_balance(self.ticks);
+        }
+    }
+
+    /// Total metered work. Ordinary and unlimited profiles combine disjoint
+    /// dispatch/off-loop counters. A finite release-wasm meter instead derives
+    /// the total from its immutable initial balance and current countdown.
+    #[inline]
+    pub(crate) fn steps_used(&self) -> u64 {
+        #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
+        if self.remaining != i64::MAX {
+            return finite_meter_total_used(self.ticks, self.remaining);
+        }
+        self.used.wrapping_add(self.ticks)
     }
 
     #[inline]
@@ -496,6 +567,7 @@ impl Recorder {
     /// `None` means the trace is unusable and the caller must fall back to an
     /// unproven receipt: it was truncated, or it is too short to satisfy the
     /// AIR's boundary assertions (row 0 is asserted NOT to be the halt row).
+    #[cfg(not(feature = "meter-only"))]
     pub(crate) fn finish(&mut self, result: u64) -> Option<Vec<TraceStep>> {
         self.tracing = false;
         // A pending row's instruction ran but its result was never observed
@@ -537,7 +609,31 @@ impl Recorder {
     }
 }
 
+/// Recover total work from the finite release-wasm countdown. A negative
+/// balance means completed off-loop work crossed the ceiling; public
+/// accounting remains capped at that ceiling, and subtraction cannot wrap even
+/// if the sticky exhaustion is observed after the charge.
+#[cfg(any(
+    all(feature = "meter-only", not(feature = "jit"), not(test)),
+    all(feature = "meter-only", test)
+))]
+#[inline(always)]
+fn finite_meter_total_used(initial: u64, remaining: i64) -> u64 {
+    let remaining = (remaining.max(0) as u64).min(initial);
+    initial.saturating_sub(remaining)
+}
+
+#[cfg(any(
+    all(feature = "meter-only", not(feature = "jit"), not(test)),
+    all(feature = "meter-only", test)
+))]
+#[inline(always)]
+fn finite_next_heap_poll_balance(balance: u64) -> u64 {
+    balance.saturating_sub(HEAP_AUDIT_INTERVAL)
+}
+
 /// Strip a row back to a bare "a step happened here" claim.
+#[cfg(not(feature = "meter-only"))]
 fn blank(row: &mut TraceStep) {
     row.opcode = op::OTHER;
     row.val_a = 0;
@@ -573,6 +669,18 @@ impl Drop for RegexTransientReservation {
 }
 
 impl super::Vm<'_> {
+    /// O(1) total-resident estimate between exact audits. `Heap` maintains a
+    /// monotonic resident high-water figure, while allocations in VM-owned
+    /// side tables request an exact audit through `external_heap_dirty`.
+    #[inline]
+    fn instrument_heap_estimate(&self) -> usize {
+        let heap_now = self.heap.resident_bytes();
+        let Some(rec) = self.instr_rec.as_ref() else {
+            return heap_now;
+        };
+        heap_now.saturating_add(rec.heap_audit_non_heap.get())
+    }
+
     /// Derive one regex search's hard ceilings. The fixed ceilings stop
     /// catastrophic backtracking even when the host left its VM budgets
     /// unlimited; finite VM budgets tighten them so transient backtrack
@@ -801,7 +909,7 @@ impl super::Vm<'_> {
         //     boundary and the interpreter already strikes on `HEAP_AUDIT_MASK`
         //     ticks. The drift window is bounded by the stride, not by the
         //     workload.
-        let estimate = self.heap.resident_bytes();
+        let estimate = self.instrument_heap_estimate();
         if bytes > heap_limit.saturating_sub(estimate) {
             let rec = self
                 .instr_rec
@@ -972,7 +1080,7 @@ impl super::Vm<'_> {
             // Convict on the cheap figure, then confirm with the exact one: the
             // estimate holds a freed-memory overshoot the audit is what settles,
             // and killing a VM is not a thing to do on an estimate.
-            if reconcile || self.heap.resident_bytes() > ceiling {
+            if reconcile || self.instrument_heap_estimate() > ceiling {
                 Some(self.audit_heap_bytes())
             } else {
                 None
@@ -1020,11 +1128,14 @@ impl super::Vm<'_> {
         // Once per native entry is the right cadence for the abort poll: the
         // interpreter's own every-4096-instructions check barely advances while
         // a hot loop is running natively.
-        if let Some(flag) = rec.abort.as_ref() {
-            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                rec.exhaust(ResourceExhaustion::Abort);
-                self.jit_steps = 0;
-                return 0;
+        #[cfg(not(feature = "meter-only"))]
+        {
+            if let Some(flag) = rec.abort.as_ref() {
+                if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    rec.exhaust(ResourceExhaustion::Abort);
+                    self.jit_steps = 0;
+                    return 0;
+                }
             }
         }
         // The heap ceiling needs checking here for the same reason: compiled
@@ -1115,14 +1226,21 @@ impl super::Vm<'_> {
             let n = n.max(0);
             if rec.remaining != i64::MAX {
                 let before = rec.remaining;
-                rec.remaining -= n;
+                rec.remaining = rec.remaining.saturating_sub(n);
                 // The work has already completed. Exactly consuming the final
                 // allowance is valid; only a strict overshoot is exhaustion.
                 if n > before {
                     rec.exhaust(ResourceExhaustion::Steps);
                 }
             }
-            rec.used = rec.used.wrapping_add(n as u64);
+            #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
+            if rec.remaining == i64::MAX {
+                rec.used = rec.used.wrapping_add(n as u64);
+            }
+            #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
+            {
+                rec.used = rec.used.wrapping_add(n as u64);
+            }
         }
     }
 
@@ -1169,7 +1287,119 @@ impl super::Vm<'_> {
     /// The dispatch loop's hook, run once per instruction *before* it executes:
     /// completes the previous row, charges one step against the budget, polls
     /// the abort flag, and opens a row for `instr`.
+    #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
+    #[inline(always)]
+    pub(crate) fn instrument_step(&mut self, _base: usize, _ip: usize, _instr: &Instr) -> Tick {
+        let rec = match self.instr_rec.as_mut() {
+            Some(rec) => rec,
+            None => return Ok(()),
+        };
+        if let Some(message) = rec.terminal_message() {
+            return Err(message);
+        }
+        // `meter-only` is the zipp-wasm artifact profile. Its deadline is an
+        // external Worker termination and it never installs the cooperative
+        // abort flag. Output exhaustion is already sticky in `exhaustion` at
+        // the write that crosses the limit, so neither state needs a second
+        // per-instruction probe here.
+        let heap_poll = if rec.remaining != i64::MAX {
+            if rec.remaining <= 0 {
+                return Err(rec.exhaust(ResourceExhaustion::Steps));
+            }
+            rec.remaining -= 1;
+            let balance = rec.remaining as u64;
+            if balance <= rec.used {
+                // Off-loop work can cross a threshold between dispatches. Poll
+                // on the next dispatch and schedule from the current balance,
+                // bounding the next interval by 65,536 additional metered
+                // steps without maintaining a per-dispatch counter.
+                rec.used = finite_next_heap_poll_balance(balance);
+                true
+            } else {
+                false
+            }
+        } else {
+            // With no finite starting balance there is no countdown from which
+            // to recover the dispatch clock, so retain the real counter.
+            rec.ticks = rec.ticks.wrapping_add(1);
+            rec.ticks & HEAP_AUDIT_MASK == 0
+        };
+
+        if heap_poll {
+            self.instrument_heap_poll()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "meter-only", any(feature = "jit", test)))]
+    #[inline(always)]
+    pub(crate) fn instrument_step(&mut self, _base: usize, _ip: usize, _instr: &Instr) -> Tick {
+        let rec = match self.instr_rec.as_mut() {
+            Some(rec) => rec,
+            None => return Ok(()),
+        };
+        if let Some(message) = rec.terminal_message() {
+            return Err(message);
+        }
+        if rec.remaining != i64::MAX {
+            if rec.remaining <= 0 {
+                return Err(rec.exhaust(ResourceExhaustion::Steps));
+            }
+            rec.remaining -= 1;
+        }
+        rec.ticks = rec.ticks.wrapping_add(1);
+        let heap_poll = rec.ticks & HEAP_AUDIT_MASK == 0;
+
+        if heap_poll {
+            self.instrument_heap_poll()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "meter-only"))]
+    #[inline]
     pub(crate) fn instrument_step(&mut self, base: usize, ip: usize, instr: &Instr) -> Tick {
+        let rec = match self.instr_rec.as_mut() {
+            Some(rec) => rec,
+            None => return Ok(()),
+        };
+
+        // The production wasm engine meters without tracing or an abort flag.
+        // Keep that overwhelmingly common path small enough to live beside the
+        // opcode dispatch; trace completion, atomics, and row construction stay
+        // in the out-of-line path below. `pending` is checked independently so
+        // ending a trace can never strand its final row.
+        if rec.tracing || rec.pending.is_some() || rec.abort.is_some() {
+            return self.instrument_step_slow(base, ip, instr);
+        }
+        if let Some(message) = rec.terminal_message() {
+            return Err(message);
+        }
+        if rec.output_exhausted {
+            return Err(rec.exhaust(ResourceExhaustion::Output));
+        }
+        if rec.remaining != i64::MAX {
+            if rec.remaining <= 0 {
+                return Err(rec.exhaust(ResourceExhaustion::Steps));
+            }
+            rec.remaining -= 1;
+        }
+        rec.ticks = rec.ticks.wrapping_add(1);
+        let heap_poll = rec.ticks & HEAP_AUDIT_MASK == 0;
+
+        if heap_poll {
+            self.instrument_heap_poll()?;
+        }
+        Ok(())
+    }
+
+    /// Trace/abort-enabled metering. Kept out of the production wasm dispatch
+    /// loop so V8 sees a compact common case instead of the complete prover and
+    /// heap-audit machinery at every opcode.
+    #[cfg(not(feature = "meter-only"))]
+    #[cold]
+    #[inline(never)]
+    fn instrument_step_slow(&mut self, base: usize, ip: usize, instr: &Instr) -> Tick {
         // Completing the previous row needs `&self.regs`, so it cannot happen
         // inside the `&mut self.instr_rec` borrow below.
         self.instrument_complete();
@@ -1184,21 +1414,16 @@ impl super::Vm<'_> {
         if rec.output_exhausted {
             return Err(rec.exhaust(ResourceExhaustion::Output));
         }
-        rec.ticks = rec.ticks.wrapping_add(1);
         if rec.remaining != i64::MAX {
             if rec.remaining <= 0 {
                 return Err(rec.exhaust(ResourceExhaustion::Steps));
             }
             rec.remaining -= 1;
         }
-        // Counted unconditionally — `used` is the host's consumption figure,
-        // meaningful with or without a budget. The budget-exhausted return
-        // above precedes this, so a stopped script reports exactly its cap.
-        rec.used = rec.used.wrapping_add(1);
-        // Heap ceiling rides the abort poll's schedule. Measuring it needs
-        // `&self.heap`, which cannot be borrowed while `rec` is, so the limit
-        // comes out here and the comparison happens once the borrow ends.
-        let mut ceiling = usize::MAX;
+        // `ticks` is both the polling clock and the interpreter-work counter.
+        // Advance it only after the budget check: an instruction rejected at
+        // zero remaining steps did not execute and must not be billed.
+        rec.ticks = rec.ticks.wrapping_add(1);
         if rec.ticks & ABORT_CHECK_MASK == 0 {
             if let Some(flag) = rec.abort.as_ref() {
                 if flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1206,10 +1431,40 @@ impl super::Vm<'_> {
                 }
             }
         }
-        if rec.ticks & HEAP_AUDIT_MASK == 0 {
-            ceiling = rec.heap_limit;
-        }
+        let heap_poll = rec.ticks & HEAP_AUDIT_MASK == 0;
         let tracing = rec.tracing;
+
+        if heap_poll {
+            self.instrument_heap_poll()?;
+        }
+
+        let Some(rec) = self.instr_rec.as_mut() else {
+            return Ok(());
+        };
+        if !tracing {
+            return Ok(());
+        }
+        if rec.steps.len() >= rec.max_steps {
+            rec.truncated = true;
+            rec.tracing = false;
+            return Ok(());
+        }
+        self.instrument_open(base, ip, instr);
+        Ok(())
+    }
+
+    /// Periodic heap-limit reconciliation shared by ordinary metering and the
+    /// trace/abort path. Ordinary meters call it every 65,536 dispatches; a
+    /// finite release-wasm meter calls it on the first dispatch after its next
+    /// 65,536-step countdown threshold. The expensive work remains off the
+    /// common instruction edge.
+    #[cold]
+    #[inline(never)]
+    fn instrument_heap_poll(&mut self) -> Tick {
+        let ceiling = match self.instr_rec.as_ref() {
+            Some(rec) => rec.heap_limit,
+            None => return Ok(()),
+        };
 
         // Escalate, then confirm — the same change commit 935f6dd made at the
         // host boundary, which the interpreter's own poll was left out of.
@@ -1229,43 +1484,32 @@ impl super::Vm<'_> {
         // headroom the walk cannot take away, and the walk is only needed to
         // reconcile capacity growth inside objects already counted — which rides
         // a stride of its own rather than every poll.
-        if ceiling != usize::MAX {
-            let convicted = self.heap.resident_bytes() > ceiling;
-            let reconcile = match self.instr_rec.as_mut() {
-                Some(rec) => {
-                    rec.ticks_since_heap_walk = rec.ticks_since_heap_walk.saturating_add(1);
-                    let stride = rec.ticks_since_heap_walk >= HEAP_WALK_STRIDE;
-                    if stride {
-                        rec.ticks_since_heap_walk = 0;
-                    }
-                    let external = rec.external_heap_dirty;
-                    rec.external_heap_dirty = false;
-                    stride || external
+        if ceiling == usize::MAX {
+            return Ok(());
+        }
+        let convicted = self.instrument_heap_estimate() > ceiling;
+        let reconcile = match self.instr_rec.as_mut() {
+            Some(rec) => {
+                rec.ticks_since_heap_walk = rec.ticks_since_heap_walk.saturating_add(1);
+                let stride = rec.ticks_since_heap_walk >= HEAP_WALK_STRIDE;
+                if stride {
+                    rec.ticks_since_heap_walk = 0;
                 }
-                None => false,
-            };
-            if (convicted || reconcile) && self.audit_heap_bytes() > ceiling {
-                let rec = self.instr_rec.as_mut().expect("recorder checked above");
-                return Err(rec.exhaust(ResourceExhaustion::Heap));
+                let external = rec.external_heap_dirty;
+                rec.external_heap_dirty = false;
+                stride || external
             }
-        }
-
-        let Some(rec) = self.instr_rec.as_mut() else {
-            return Ok(());
+            None => false,
         };
-        if !tracing {
-            return Ok(());
+        if (convicted || reconcile) && self.audit_heap_bytes() > ceiling {
+            let rec = self.instr_rec.as_mut().expect("recorder checked above");
+            return Err(rec.exhaust(ResourceExhaustion::Heap));
         }
-        if rec.steps.len() >= rec.max_steps {
-            rec.truncated = true;
-            rec.tracing = false;
-            return Ok(());
-        }
-        self.instrument_open(base, ip, instr);
         Ok(())
     }
 
     /// Fill in the previous row's `val_dst` and confirm — or drop — its claim.
+    #[cfg(not(feature = "meter-only"))]
     fn instrument_complete(&mut self) {
         let Some(rec) = self.instr_rec.as_ref() else {
             return;
@@ -1396,6 +1640,7 @@ impl super::Vm<'_> {
     }
 
     /// Open a row for `instr`: classify it and sample its operand registers.
+    #[cfg(not(feature = "meter-only"))]
     fn instrument_open(&mut self, base: usize, ip: usize, instr: &Instr) {
         let (opcode, claim, a, b, cst, dst) = classify(instr);
         let val_a = a.map(|r| enc(self.reg_at(base, r))).unwrap_or(0);
@@ -1425,6 +1670,7 @@ impl super::Vm<'_> {
         });
     }
 
+    #[cfg(not(feature = "meter-only"))]
     fn reg_at(&self, base: usize, r: u16) -> Value {
         self.regs
             .get(base + r as usize)
@@ -1438,6 +1684,7 @@ impl super::Vm<'_> {
 /// The bound is what keeps the arithmetic claims exact: the prover's field is
 /// 128-bit, so a product of two values under 2^32 never wraps and a sum never
 /// aliases a different pair.
+#[cfg(not(feature = "meter-only"))]
 fn exact_uint(v: Value) -> Option<u64> {
     if v.is_int() {
         let i = v.as_int();
@@ -1457,6 +1704,7 @@ fn exact_uint(v: Value) -> Option<u64> {
 /// [`exact_uint`] over an already-encoded operand column. Encoded small integers
 /// are stored as themselves, and the hashed fallback is always ≥ 2^62, so the
 /// round trip is exact and a heap value can never be mistaken for an integer.
+#[cfg(not(feature = "meter-only"))]
 fn exact_uint_col(encoded: u64) -> Option<u64> {
     (encoded < 4_294_967_296).then_some(encoded)
 }
@@ -1473,6 +1721,7 @@ fn exact_uint_col(encoded: u64) -> Option<u64> {
 /// so two rows with equal heap-tagged encodings at different clocks need not be
 /// the same object. No constraint in the AIR reads across rows, so this is a
 /// limit on what the trace means, not a soundness hole.
+#[cfg(not(feature = "meter-only"))]
 fn enc(v: Value) -> u64 {
     if let Some(n) = exact_uint(v) {
         return n;
@@ -1496,6 +1745,7 @@ fn enc(v: Value) -> u64 {
 /// program hash) but silent about values. Adding a case here is how the proof
 /// gets stronger; guessing one is how it becomes false.
 #[allow(clippy::type_complexity)]
+#[cfg(not(feature = "meter-only"))]
 fn classify(instr: &Instr) -> (u8, Claim, Option<u16>, Option<u16>, u64, Option<u16>) {
     use Instr::*;
     match *instr {
@@ -1683,6 +1933,8 @@ fn classify(instr: &Instr) -> (u8, Claim, Option<u16>, Option<u16>, u64, Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(feature = "meter-only", feature = "jit", target_arch = "x86_64"))]
+    use crate::value::Value;
 
     fn program(src: &str) -> &'static crate::bytecode::Program {
         let ast = crate::front::parse_script(src).expect("source parses");
@@ -1780,6 +2032,7 @@ mod tests {
 
     /// The hashed fallback must never be mistaken for a small integer, or a row
     /// carrying a string would be admitted to an arithmetic constraint.
+    #[cfg(not(feature = "meter-only"))]
     #[test]
     fn hashed_encoding_never_looks_like_an_integer() {
         for v in [
@@ -1805,6 +2058,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "meter-only"))]
     #[test]
     fn integers_in_range_encode_to_themselves() {
         for i in [0i32, 1, 2, 1000, i32::MAX] {
@@ -1817,6 +2071,47 @@ mod tests {
         assert!(exact_uint(Value::num(4_294_967_296.0)).is_none());
     }
 
+    #[cfg(feature = "meter-only")]
+    #[test]
+    fn finite_countdown_accounts_for_weighted_threshold_crossings() {
+        let initial = 200_000_u64;
+        let first_threshold = finite_next_heap_poll_balance(initial);
+        let balance_before_weighted_charge = first_threshold + 1;
+        assert!(balance_before_weighted_charge > first_threshold);
+
+        // A weighted operation may jump across the exact threshold between
+        // dispatch hooks. The following dispatch still observes `<=`, polls,
+        // and schedules a full interval from the balance it actually saw.
+        let balance_at_next_dispatch = balance_before_weighted_charge - 37 - 1;
+        assert!(balance_at_next_dispatch <= first_threshold);
+        let second_threshold = finite_next_heap_poll_balance(balance_at_next_dispatch);
+        assert_eq!(
+            balance_at_next_dispatch - second_threshold,
+            HEAP_AUDIT_INTERVAL
+        );
+
+        assert_eq!(
+            finite_meter_total_used(initial, balance_at_next_dispatch as i64),
+            initial - balance_at_next_dispatch,
+            "the public total includes both dispatch and off-loop countdown charges"
+        );
+
+        // A final partial interval polls at zero and never wraps its threshold.
+        let partial_balance = HEAP_AUDIT_INTERVAL - 9;
+        let final_threshold = finite_next_heap_poll_balance(partial_balance);
+        assert_eq!(final_threshold, 0);
+        let poll_due = |balance| balance <= final_threshold;
+        assert!(!poll_due(1), "a positive final balance is not due yet");
+        assert!(poll_due(0), "the final permitted step is due");
+
+        assert_eq!(
+            finite_meter_total_used(initial, -9),
+            initial,
+            "an overshoot must saturate rather than wrapping the billed total"
+        );
+        assert_eq!(finite_meter_total_used(initial, initial as i64 + 1), 0);
+    }
+
     #[test]
     fn exact_final_step_is_success_not_exhaustion() {
         let src = "var answer = 42;";
@@ -1824,7 +2119,11 @@ mod tests {
         let mut measured = crate::vm::Vm::new(program(src));
         measured.set_instrumentation(Recorder::new());
         measured.run().expect("measurement run succeeds");
-        let used = measured.instr_rec.as_ref().expect("recorder attached").used;
+        let used = measured
+            .instr_rec
+            .as_ref()
+            .expect("recorder attached")
+            .steps_used();
         assert!(used > 0);
 
         let mut exact = crate::vm::Vm::new(program(src));
@@ -1847,6 +2146,229 @@ mod tests {
             Some(ResourceExhaustion::Steps)
         );
         assert_eq!(short.instrument_resource_limit_error(), Some(BUDGET_MSG));
+    }
+
+    /// The meter-only dispatch may forward a successful plain own-data store
+    /// into an immediately adjacent read. It is still two bytecodes: exhausting
+    /// the budget between them must leave the store committed while rejecting
+    /// the read before its destination changes.
+    #[cfg(feature = "meter-only")]
+    #[test]
+    fn adjacent_set_get_forwarding_keeps_the_exact_budget_boundary() {
+        const SRC: &str = "var o={x:0}; function pair(v){ let q=o; q.x=v; return q.x; }";
+        let program = program(SRC);
+        let fid = program
+            .functions
+            .iter()
+            .position(|f| f.name == "pair")
+            .expect("pair function exists");
+        let pair = &program.functions[fid];
+        let set_ip = pair
+            .code
+            .windows(2)
+            .position(|ops| match (&ops[0], &ops[1]) {
+                (
+                    Instr::SetProp {
+                        obj,
+                        name,
+                        val: _,
+                        strict: _,
+                    },
+                    Instr::GetProp {
+                        obj: get_obj,
+                        name: get_name,
+                        dst: _,
+                    },
+                ) => {
+                    obj == get_obj
+                        && pair.string_constants[*name as usize]
+                            == pair.string_constants[*get_name as usize]
+                }
+                _ => false,
+            })
+            .expect("compiler emits the adjacent same-property pair");
+        let executed_len = pair
+            .code
+            .iter()
+            .position(|op| matches!(op, Instr::Return { .. }))
+            .map(|ip| ip + 1)
+            .expect("pair has an explicit return");
+        let pair_slot = pair.name_global.expect("pair has a global slot") as usize;
+        let o_slot = program
+            .global_names
+            .iter()
+            .position(|name| name == "o")
+            .expect("o has a global slot");
+
+        let mut exact = crate::vm::Vm::new(program);
+        exact.run().expect("top level initializes");
+        exact.set_instrumentation(Recorder::new());
+        let callee = exact.globals[pair_slot];
+        assert_eq!(
+            exact
+                .call_value(
+                    callee,
+                    crate::value::Value::UNDEFINED,
+                    &[crate::value::Value::int(7)],
+                )
+                .expect("the full pair succeeds"),
+            crate::value::Value::int(7)
+        );
+        assert_eq!(
+            exact.instr_rec.as_ref().unwrap().steps_used(),
+            executed_len as u64,
+            "forwarding must charge every logical bytecode"
+        );
+
+        let mut boundary = crate::vm::Vm::new(program);
+        boundary.run().expect("top level initializes");
+        let mut rec = Recorder::new();
+        rec.remaining = (set_ip + 1) as i64;
+        boundary.set_instrumentation(rec);
+        let callee = boundary.globals[pair_slot];
+        let err = boundary
+            .call_value(
+                callee,
+                crate::value::Value::UNDEFINED,
+                &[crate::value::Value::int(7)],
+            )
+            .expect_err("the adjacent GetProp must cross the boundary");
+        assert!(err.0.contains("instruction budget"), "got {err:?}");
+        let object = boundary.globals[o_slot];
+        assert_eq!(
+            boundary.get_prop(object, "x").expect("plain own property"),
+            crate::value::Value::int(7),
+            "the SetProp before the boundary remains committed"
+        );
+    }
+
+    #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+    #[test]
+    fn numeric_fib_kernel_preserves_results_binding_guards_and_exact_steps() {
+        const SRC: &str = "function fib(n){ return n < 2 ? n : fib(n-1) + fib(n-2); }";
+        const N: i32 = 30;
+
+        fn fib_steps(n: i32) -> u64 {
+            let (mut a, mut b) = (3u64, 3u64);
+            if n < 2 {
+                return 3;
+            }
+            for _ in 2..=n {
+                (a, b) = (b, 10 + a + b);
+            }
+            b
+        }
+
+        fn ready(src: &str, remaining: i64) -> crate::vm::Vm<'static> {
+            let mut vm = crate::vm::Vm::new(program(src));
+            vm.run().expect("top level initializes");
+            let mut rec = Recorder::new();
+            rec.remaining = remaining;
+            vm.set_instrumentation(rec);
+            vm
+        }
+
+        let expected_steps = fib_steps(N);
+        let mut measured = ready(SRC, i64::MAX);
+        let slot = measured.func(1).name_global.expect("fib has a global slot");
+        let callee = measured.globals[slot as usize];
+        assert_eq!(
+            measured
+                .call_value(
+                    callee,
+                    crate::value::Value::UNDEFINED,
+                    &[crate::value::Value::int(N)],
+                )
+                .expect("collapsed recursion succeeds"),
+            crate::value::Value::int(832_040)
+        );
+        assert_eq!(
+            measured.instr_rec.as_ref().unwrap().steps_used(),
+            expected_steps,
+            "off-dispatch recursion must retain the historical bytecode bill"
+        );
+
+        let mut exact = ready(SRC, expected_steps as i64);
+        let callee = exact.globals[slot as usize];
+        assert_eq!(
+            exact
+                .call_value(
+                    callee,
+                    crate::value::Value::UNDEFINED,
+                    &[crate::value::Value::int(N)],
+                )
+                .expect("the exact final allowance succeeds"),
+            crate::value::Value::int(832_040)
+        );
+        assert_eq!(exact.instr_rec.as_ref().unwrap().remaining, 0);
+        assert_eq!(exact.instrument_resource_limit_error(), None);
+
+        let mut short = ready(SRC, expected_steps as i64 - 1);
+        let callee = short.globals[slot as usize];
+        let err = short
+            .call_value(
+                callee,
+                crate::value::Value::UNDEFINED,
+                &[crate::value::Value::int(N)],
+            )
+            .expect_err("one missing logical bytecode is rejected");
+        assert!(err.0.contains("instruction budget"), "got {err:?}");
+        assert_eq!(
+            short.instr_rec.as_ref().unwrap().exhaustion,
+            Some(ResourceExhaustion::Steps)
+        );
+
+        const NEAR_MISS: &str = r#"
+            function almostFib(n) {
+                if (n < 0) return 0;
+                return n < 2 ? n : almostFib(n-1) + almostFib(n-2);
+            }
+        "#;
+        const NEAR_N: i32 = 8;
+        let mut near = ready(NEAR_MISS, i64::MAX);
+        let near_slot = near
+            .func(1)
+            .name_global
+            .expect("near miss has a global slot");
+        let near_callee = near.globals[near_slot as usize];
+        assert_eq!(
+            near.call_value(
+                near_callee,
+                crate::value::Value::UNDEFINED,
+                &[crate::value::Value::int(NEAR_N)],
+            )
+            .expect("near-match recursion succeeds"),
+            crate::value::Value::int(21)
+        );
+        assert!(
+            near.instr_rec.as_ref().unwrap().steps_used() > fib_steps(NEAR_N),
+            "a FuncProto with extra observable control flow must fail the exact cached classifier"
+        );
+
+        const REBOUND: &str = r#"
+            function fib(n){ return n < 2 ? n : fib(n-1) + fib(n-2); }
+            var saved = fib;
+            fib = function (_) { return 7; };
+        "#;
+        let mut rebound = ready(REBOUND, i64::MAX);
+        let saved_slot = rebound
+            .program
+            .global_names
+            .iter()
+            .position(|name| name == "saved")
+            .expect("saved has a global slot");
+        let saved = rebound.globals[saved_slot];
+        assert_eq!(
+            rebound
+                .call_value(
+                    saved,
+                    crate::value::Value::UNDEFINED,
+                    &[crate::value::Value::int(5)],
+                )
+                .expect("rebound recursion follows the live global"),
+            crate::value::Value::int(14),
+            "a changed recursive binding must decline the collapsed kernel"
+        );
     }
 
     #[test]
@@ -1890,7 +2412,7 @@ mod tests {
         // ninth call is the first one to enter the whole-function native body.
         let (measured, result) = exercise(i64::MAX, false);
         assert_eq!(result.expect("measurement call succeeds"), Value::int(9));
-        let exact_steps = measured.instr_rec.as_ref().unwrap().used;
+        let exact_steps = measured.instr_rec.as_ref().unwrap().steps_used();
         assert!(exact_steps > 0);
         assert!(
             exact_steps < NATIVE_CHUNK as u64,
@@ -1901,7 +2423,7 @@ mod tests {
         assert_eq!(result.expect("interpreter oracle succeeds"), Value::int(9));
         assert_eq!(
             exact_steps,
-            interpreted.instr_rec.as_ref().unwrap().used,
+            interpreted.instr_rec.as_ref().unwrap().steps_used(),
             "native and interpreter execution must charge the same bytecodes"
         );
 
@@ -1927,25 +2449,33 @@ mod tests {
         assert_eq!(short.instrument_resource_limit_error(), Some(BUDGET_MSG));
     }
 
+    #[cfg(not(feature = "meter-only"))]
     #[test]
-    fn abort_and_postflight_heap_have_typed_sticky_status() {
-        let mut aborted = crate::vm::Vm::new(program("var answer = 42;"));
+    fn abort_has_typed_sticky_status_and_exact_accounting() {
+        const ABORT_BUDGET: i64 = 10_000;
+        const ABORT_POLL: u64 = ABORT_CHECK_MASK + 1;
+        let mut aborted = crate::vm::Vm::new(program("while (true) {}"));
         let mut abort_rec = Recorder::new();
-        abort_rec.remaining = 1_000;
+        abort_rec.remaining = ABORT_BUDGET;
         abort_rec.abort = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
             true,
         )));
-        // The next tick wraps to a polling tick, avoiding a 4096-instruction
-        // fixture just to exercise the abort branch.
-        abort_rec.ticks = u64::MAX;
         aborted.set_instrumentation(abort_rec);
         aborted.run().expect_err("host abort stops execution");
-        assert_eq!(
-            aborted.instr_rec.as_ref().unwrap().exhaustion,
-            Some(ResourceExhaustion::Abort)
+        let abort_rec = aborted.instr_rec.as_ref().unwrap();
+        assert_eq!(abort_rec.exhaustion, Some(ResourceExhaustion::Abort));
+        let used = abort_rec.steps_used();
+        assert!(
+            (1..=ABORT_POLL).contains(&used),
+            "the interpreter poll or an earlier native-entry poll must stop execution; used {used}"
         );
+        assert_eq!(abort_rec.remaining, ABORT_BUDGET - used as i64);
+        assert_eq!(used + abort_rec.remaining as u64, ABORT_BUDGET as u64);
         assert_eq!(aborted.instrument_resource_limit_error(), Some(ABORT_MSG));
+    }
 
+    #[test]
+    fn postflight_heap_has_typed_sticky_status() {
         let mut heap = instrumented_vm("var answer = 42;");
         heap.run()
             .expect("short run need not hit the periodic heap poll");

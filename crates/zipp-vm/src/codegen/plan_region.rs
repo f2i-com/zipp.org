@@ -584,6 +584,9 @@ pub(crate) fn plan_region(
     // `plan_region_cold`, which pins this to `BoxRefAdmit::NONE`, so their
     // plans are byte-identical to the pre-wave ones.
     boxref: BoxRefAdmit,
+    // Exact selected-SROA receiver global. Generic region callers pass None;
+    // only loads of this already-proven global may use dead-load B94 recovery.
+    sroa_obj_global: Option<u32>,
 ) -> Option<RegionPlan> {
     plan_region_cold_ex(
         proto,
@@ -597,6 +600,7 @@ pub(crate) fn plan_region(
         &FxHashSet::default(),
         false,
         boxref,
+        sroa_obj_global,
     )
 }
 
@@ -654,6 +658,7 @@ pub(crate) fn plan_region_cold(
     // retry. `false` keeps every existing caller's plan byte-identical (the
     // predicate below is unchanged when `!admit_bitwise`).
     admit_dv: bool,
+    sroa_obj_global: Option<u32>,
 ) -> Option<RegionPlan> {
     // Every `[decline-reason]` line below — and every one an emitter prints
     // after this plan is handed to it — belongs to THIS region. See
@@ -670,6 +675,7 @@ pub(crate) fn plan_region_cold(
         cold,
         admit_dv,
         BoxRefAdmit::NONE,
+        sroa_obj_global,
     )
 }
 
@@ -689,6 +695,7 @@ pub(crate) fn plan_region_cold_ex(
     cold: &FxHashSet<usize>,
     admit_dv: bool,
     boxref: BoxRefAdmit,
+    sroa_obj_global: Option<u32>,
 ) -> Option<RegionPlan> {
     plan_region_cold_ex_with_home_last(
         proto,
@@ -702,6 +709,7 @@ pub(crate) fn plan_region_cold_ex(
         cold,
         admit_dv,
         boxref,
+        sroa_obj_global,
         HOME_XMM_LAST,
     )
 }
@@ -750,6 +758,7 @@ pub(crate) fn plan_region_cold_gpr_virtual(
     share_homes: bool,
     cold: &FxHashSet<usize>,
     admit_dv: bool,
+    sroa_obj_global: Option<u32>,
     home_count: usize,
 ) -> Option<RegionPlan> {
     if !share_homes {
@@ -769,6 +778,7 @@ pub(crate) fn plan_region_cold_gpr_virtual(
         cold,
         admit_dv,
         BoxRefAdmit::NONE,
+        sroa_obj_global,
         last,
     )
 }
@@ -786,6 +796,7 @@ fn plan_region_cold_ex_with_home_last(
     cold: &FxHashSet<usize>,
     admit_dv: bool,
     boxref: BoxRefAdmit,
+    sroa_obj_global: Option<u32>,
     home_last: u8,
 ) -> Option<RegionPlan> {
     debug_assert!(home_last >= HOME_XMM_LAST);
@@ -803,6 +814,7 @@ fn plan_region_cold_ex_with_home_last(
         true,
         admit_dv,
         boxref,
+        sroa_obj_global,
         home_last,
     ) {
         PlanOutcome::Plan(p) => Some(*p),
@@ -820,6 +832,7 @@ fn plan_region_cold_ex_with_home_last(
                 false,
                 admit_dv,
                 boxref,
+                sroa_obj_global,
                 home_last,
             ) {
                 PlanOutcome::Plan(p) => Some(*p),
@@ -874,6 +887,9 @@ fn plan_region_cold_inner(
     // W20 — see `BoxRefAdmit`. `BoxRefAdmit::NONE` for every caller but the
     // regalloc tier, and the passes below are no-ops under it.
     boxref: BoxRefAdmit,
+    // `Some(g)` only for a selected field-promotion plan. Its preflight proved
+    // that every in-region load of `g` is a promoted receiver load.
+    sroa_obj_global: Option<u32>,
     // Inclusive numeric-home colour ceiling. `HOME_XMM_LAST` for every normal
     // plan; a small virtual value only for the computed-splice GPR retry.
     home_last: u8,
@@ -1723,6 +1739,56 @@ fn plan_region_cold_inner(
                 if def_n.get(&dst) == Some(&1) && !used.contains(&dst) {
                     ta_recv_regs.insert(dst);
                 }
+            }
+        }
+
+        // Capture-first lowering may recycle an otherwise-dead SROA object-load
+        // register after the promoted property access. The selected field plan
+        // proved that EVERY in-region load of `sroa_obj_global` is one of its
+        // receivers; generic regions pass None and cannot enter this recovery.
+        // In the rewritten body the access no longer reads the receiver, so the
+        // LoadGlobal's value is dead until the next definition, but the later
+        // numeric range still needs a real home. This is exactly B94's
+        // split-receiver contract: the dead LoadGlobal writes the authoritative
+        // boxed frame slot, later numeric defs write through, and entry/exit
+        // never treats the object as a number.
+        let mut dead_global_loads: FxHashMap<u16, FxHashSet<usize>> = FxHashMap::default();
+        for ip in s..=e {
+            if cold.contains(&ip) {
+                continue;
+            }
+            let Instr::LoadGlobal { dst, idx } = code[ip] else {
+                continue;
+            };
+            if sroa_obj_global != Some(idx)
+                || ta_recv_regs.contains(&dst)
+                || split_recvs.contains(&dst)
+                || def_n.get(&dst).copied().unwrap_or(0) <= 1
+                || !used.contains(&dst)
+            {
+                continue;
+            }
+            let next_def = (ip + 1..=e)
+                .find(|&next| !cold.contains(&next) && writes_reg(&code[next]) == Some(dst));
+            let stop = next_def.unwrap_or(e + 1);
+            let dead_to_next_def = (ip + 1..stop)
+                .all(|next| cold.contains(&next) || !instr_uses(&code[next]).contains(&dst));
+            if dead_to_next_def {
+                dead_global_loads.entry(dst).or_default().insert(ip);
+            }
+        }
+        for (r, loads) in dead_global_loads {
+            if split_home_provably_safe(code, s, e, r, cold, &loads, &|_| None) {
+                if !admit_split {
+                    decline!("dead LoadGlobal range requires receiver splitting");
+                }
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    let mut ips: Vec<usize> = loads.iter().copied().collect();
+                    ips.sort_unstable();
+                    eprintln!("[jit] region [{s},{e}] dead-global split receiver r{r} lg={ips:?}");
+                }
+                split_recvs.insert(r);
+                split_recv_lg.extend(loads);
             }
         }
     }
@@ -6817,29 +6883,34 @@ pub(crate) fn plan_field_promotion(
         return None;
     }
 
-    // Single-def map (for tracing an obj-ref reg to its LoadGlobal).
-    let mut reg_def: FxHashMap<u16, usize> = FxHashMap::default();
-    let mut reg_def_count: FxHashMap<u16, u32> = FxHashMap::default();
-    for (off, instr) in code[s..=e].iter().enumerate() {
-        if let Some(d) = writes_reg(instr) {
-            reg_def.insert(d, s + off);
-            *reg_def_count.entry(d).or_insert(0) += 1;
-        }
-    }
-
-    // Every heap-op receiver must be the SAME global object, loaded once.
+    // Every heap-op receiver must be the SAME global object. Trace each access
+    // to its nearest dominating definition rather than requiring the receiver
+    // register to have one definition across the whole region: capture-first
+    // lowering deliberately recycles an object-ref temporary after its final
+    // property access. The object-valued range remains non-escaping; only the
+    // unrelated later numeric range shares the register number.
+    let jump_targets = region_jump_targets(code, s, e);
     let mut obj_global: Option<u32> = None;
-    let mut obj_ref_regs: FxHashSet<u16> = FxHashSet::default();
+    let mut obj_load_ips: FxHashSet<usize> = FxHashSet::default();
     let mut fields: Vec<u32> = Vec::new();
-    for instr in &code[s..=e] {
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        let ip = s + off;
         let (obj_reg, name) = match *instr {
             Instr::GetProp { obj, name, .. } => (obj, name),
             Instr::SetProp { obj, name, .. } => (obj, name),
             _ => continue,
         };
-        let def_ip = *reg_def.get(&obj_reg)?; // must be defined in the region
-        if reg_def_count.get(&obj_reg) != Some(&1) {
-            return None; // multiple defs → can't trace
+        let def_ip = (s..ip)
+            .rev()
+            .find(|&candidate| writes_reg(&code[candidate]) == Some(obj_reg))?;
+        // A branch entering after the load could execute the access with a
+        // different value in the recycled frame slot, so textual reachability
+        // alone is not enough: the matching load must dominate the access.
+        if jump_targets
+            .iter()
+            .any(|&target| target > def_ip && target <= ip)
+        {
+            return None;
         }
         let g = match code[def_ip] {
             Instr::LoadGlobal { idx, .. } => idx,
@@ -6850,7 +6921,7 @@ pub(crate) fn plan_field_promotion(
             Some(prev) if prev == g => {}
             Some(_) => return None, // two different objects at the site set
         }
-        obj_ref_regs.insert(obj_reg);
+        obj_load_ips.insert(def_ip);
         // Dedup by the field STRING, not the name-constant INDEX: the compiler
         // emits a distinct string-constant per occurrence, so `o.a` read and
         // `o.a` write have DIFFERENT name indices for the SAME field. Keying by
@@ -6874,9 +6945,12 @@ pub(crate) fn plan_field_promotion(
     }
     let g = obj_global?;
 
-    // The object ref must be stable (G not re-stored) and its ref reg must not
-    // escape (used only as the GetProp/SetProp receiver, nowhere else).
-    for instr in &code[s..=e] {
+    // The object ref must be stable (G not re-stored). Every load of G must be
+    // one of the proven receiver loads, and while that loaded value is live its
+    // register may be used only as the property receiver. A later definition
+    // ends the object-valued range and may freely recycle the register.
+    for (off, instr) in code[s..=e].iter().enumerate() {
+        let ip = s + off;
         if let Instr::StoreGlobal { idx, .. }
         | Instr::StoreGlobalStrict { idx, .. }
         | Instr::StoreGlobalResolved { idx, .. } = *instr
@@ -6889,17 +6963,25 @@ pub(crate) fn plan_field_promotion(
         // also loaded into a register that is NOT a heap-op receiver, that ref
         // could escape (be stored, or used numerically), so the object isn't
         // provably confined to the rewritten accesses. Decline (→ inline cache).
-        if let Instr::LoadGlobal { dst, idx } = *instr {
-            if idx == g && !obj_ref_regs.contains(&dst) {
+        if let Instr::LoadGlobal { idx, .. } = *instr {
+            if idx == g && !obj_load_ips.contains(&ip) {
                 return None;
             }
         }
-        if matches!(instr, Instr::GetProp { .. } | Instr::SetProp { .. }) {
-            continue;
-        }
         for u in instr_uses(instr) {
-            if obj_ref_regs.contains(&u) {
-                return None; // ref reg used outside a heap op → object escapes
+            let reaching_obj_load = (s..ip)
+                .rev()
+                .find(|&candidate| writes_reg(&code[candidate]) == Some(u))
+                .is_some_and(|def_ip| obj_load_ips.contains(&def_ip));
+            if reaching_obj_load {
+                let receiver_only = match *instr {
+                    Instr::GetProp { obj, .. } => obj == u,
+                    Instr::SetProp { obj, val, .. } => obj == u && val != u,
+                    _ => false,
+                };
+                if !receiver_only {
+                    return None; // live object ref escaped its receiver-only range
+                }
             }
         }
     }

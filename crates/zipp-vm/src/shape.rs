@@ -184,6 +184,13 @@ thread_local! {
 /// disables. Exists so the standing gate can A/B the whole mechanism without a
 /// rebuild, and so a regression can be bisected between "maintaining shapes" and
 /// "the struct got bigger".
+#[cfg(feature = "meter-only")]
+#[inline(always)]
+const fn disabled() -> bool {
+    false
+}
+
+#[cfg(not(feature = "meter-only"))]
 #[inline]
 fn disabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};

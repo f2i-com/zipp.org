@@ -120,11 +120,17 @@ impl Vm<'_> {
     /// Run a collection if one is due (or always, under stress) and it is safe.
     #[inline]
     pub(crate) fn maybe_gc(&mut self) {
+        // The overwhelmingly common poll has no pending collection.  Reject it
+        // before touching the lock/floor fields so allocation-free call paths
+        // pay one heap flag load instead of all three VM-state loads.
+        if !self.heap.gc_requested() && !self.gc_stress {
+            return;
+        }
         #[cfg(feature = "safe-sandbox")]
         let unlocked = self.gc_lock.get() == 0;
         #[cfg(not(feature = "safe-sandbox"))]
         let unlocked = self.gc_lock == 0;
-        if unlocked && self.gc_floor != 0 && (self.heap.gc_requested() || self.gc_stress) {
+        if unlocked && self.gc_floor != 0 {
             self.gc_from_poll();
         }
     }
@@ -345,6 +351,7 @@ impl Vm<'_> {
             root_val!(*cb);
         }
         // Worker-side $262.agent.receiveBroadcast callback (invoked per broadcast).
+        #[cfg(not(feature = "wasm-single-agent"))]
         root_val!(self.broadcast_cb);
         for v in self.gen_callee.values() {
             root_val!(*v);

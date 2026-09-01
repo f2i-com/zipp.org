@@ -414,7 +414,7 @@ fn ta_len_meter_is_exact() {
             zipp_vm::embed::compile_script("var ready=true;").expect("bootstrap compiles");
         state.set_limits(20_000_000, None);
         if interpreter_only {
-            state.start_trace(usize::MAX);
+            state.disable_vm_jit();
         }
         state.run_init().expect("bootstrap runs");
         let before = state.steps_remaining();

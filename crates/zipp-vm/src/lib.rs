@@ -637,6 +637,7 @@ pub fn run_with_harness(
 /// Run the module FILE at `path`: an entry with STATIC imports routes through
 /// the module loader (dependencies link before evaluation); one without keeps
 /// the async-capable direct path (top-level await works there).
+#[cfg(not(feature = "wasm-no-fs-loader"))]
 pub fn run_module_file(
     path: &std::path::Path,
     harness_path: Option<&str>,
@@ -721,12 +722,29 @@ pub fn run_module_file(
     }
 }
 
+/// The artifact-only WebAssembly profile cannot grant filesystem module-loader
+/// authority. Fail before reading either the entry or harness path.
+#[cfg(feature = "wasm-no-fs-loader")]
+pub fn run_module_file(
+    _path: &std::path::Path,
+    _harness_path: Option<&str>,
+) -> Result<Outcome, String> {
+    Err("filesystem module loader is disabled in this build".into())
+}
+
 pub fn run_module_with_base(
     src: &str,
     base_dir: Option<std::path::PathBuf>,
 ) -> Result<Outcome, String> {
     let ast = front::parse_module(src)?;
     let program = compile::compile_main_module(&ast, src)?;
+    #[cfg(feature = "wasm-no-fs-loader")]
+    if !program.module_imports.is_empty() {
+        // The direct-module runner executes func 0 without the loader's link
+        // phase. In the artifact profile, never let that turn a static import
+        // or re-export into a silently skipped dependency before the body runs.
+        return Err("filesystem module loader is disabled in this build".into());
+    }
     if std::env::var_os("ZIPP_VM_DUMP").is_some() {
         for (fid, f) in program.functions.iter().enumerate() {
             eprintln!(

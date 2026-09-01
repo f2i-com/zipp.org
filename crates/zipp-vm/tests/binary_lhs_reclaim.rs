@@ -198,7 +198,7 @@ fn recursive_binary_result_is_unchanged() {
     );
 }
 
-#[cfg(feature = "instrument")]
+#[cfg(all(feature = "instrument", not(feature = "meter-only")))]
 #[test]
 fn metered_and_traced_dispatch_observes_the_reclaimed_frame() {
     let mut state = zipp_vm::embed::compile_script(

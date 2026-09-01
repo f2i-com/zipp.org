@@ -255,6 +255,18 @@ impl<'p> Vm<'p> {
                 // TypeError. EVERY failure after argument validation REJECTS
                 // the returned promise (never throws synchronously).
                 let export_name = self.display(a1);
+                #[cfg(feature = "wasm-no-fs-loader")]
+                let settle: Result<Value, Value> = {
+                    // Keep both conversions above: specifier ToString and the
+                    // export-name string materialisation precede the loader
+                    // lookup in the general path. Only the impossible
+                    // filesystem-resolution tail is specialized away.
+                    let _ = (&spec, &export_name);
+                    Err(self.alloc_error_from_message(
+                        "TypeError: ShadowRealm.prototype.importValue: no module base",
+                    ))
+                };
+                #[cfg(not(feature = "wasm-no-fs-loader"))]
                 let settle: Result<Value, Value> = match self
                     .module_base_dir
                     .as_ref()

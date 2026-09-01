@@ -136,6 +136,12 @@ jobs:
           rustup +stable target add wasm32-unknown-unknown
       - name: Test the isolated host build
         run: cargo +stable test --locked
+      - name: Test artifact-only VM specializations
+        run: >-
+          cargo +stable test --locked --manifest-path ../zipp-vm/Cargo.toml
+          --no-default-features
+          --features safe-sandbox,meter-only,wasm-no-fs-loader,wasm-single-agent
+          --test no_fs_loader --test wasm_single_agent
       - name: Install matching wasm-bindgen CLI
         run: cargo +stable install wasm-bindgen-cli --locked --version 0.2.126
       - name: Build the production wasm32 artifact

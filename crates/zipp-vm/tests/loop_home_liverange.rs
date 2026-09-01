@@ -31,7 +31,7 @@
 //!     -14100479, and the deficit tracked the compile threshold because it is
 //!     one lost addend per outer iteration AFTER the region compiles;
 //!   * on the DOUBLE tier the clobbering value was `h + (7|3)`, which reaches
-//!     109, so `d1 > 100` — false on all 36 real evaluations — came out TRUE
+//!     109, so `100 < d1` — false on all 36 real evaluations — came out TRUE
 //!     twice. `ZIPP_NO_FUSED_CMPJUMP=1` answered correctly, which framed the
 //!     fused compare emitter; unfusing merely re-planned the allocation.
 //!
@@ -152,7 +152,13 @@ fn kernel(inv: &str, depth: usize, pressure: usize, dbl: bool) -> String {
     let (decl, body_head) = if dbl {
         (
             "var h = 1, i = 0, j = 0, q = 0, u = 0;\n  var d = 2.5, a = 1.5;",
-            format!("{ind}a = a * 0.5 + j;\n{ind}h = (h + (d > 100 ? 7 : 3)) | 0;\n"),
+            // `100 < d` is numerically equivalent to `d > 100` here (both
+            // operands are effect-free Numbers), while letting the shared test
+            // emitter use JumpIfNotLt directly. The `>` spelling materialises
+            // a Bool in a scratch register later recycled as numeric; the
+            // DOUBLE tier deliberately refuses that type split and would make
+            // this live-range regression fixture run on MEM instead.
+            format!("{ind}a = a * 0.5 + j;\n{ind}h = (h + (100 < d ? 7 : 3)) | 0;\n"),
         )
     } else {
         (
@@ -248,10 +254,12 @@ console.log(kernel(20));
     assert_matches_node(SRC);
 }
 
-/// The DOUBLE face as the fuzzer minimized it. `d1` is `h * 0.5` and `h` never
-/// exceeds 109, so `d1 > 100` is false on all 36 evaluations; pre-fix the answer
-/// was 117, i.e. the `7` arm twice. The clobbering value was `h + (7|3)`, which
-/// is exactly the quantity the compare was supposed to be independent of.
+/// The DOUBLE face as the fuzzer minimized it, with its effect-free comparison
+/// respelled so the current compiler keeps the fused branch on the DOUBLE tier.
+/// `d1` is `h * 0.5` and `h` never exceeds 109, so `100 < d1` is false on all 36
+/// evaluations; pre-fix the answer was 117, i.e. the `7` arm twice. The
+/// clobbering value was `h + (7|3)`, exactly the quantity the compare was
+/// supposed to be independent of.
 #[test]
 fn liverange_parity_double_compare_reads_its_own_operand() {
     const SRC: &str = r#"
@@ -263,7 +271,7 @@ function kernel(n) {
     for (j = 0; j < 2; j++) {
       for (q = 0; q < 2; q++) {
         d0 = d0 * 0.5 + j;
-        h = (h + (d1 > 100 ? 7 : 3)) | 0;
+        h = (h + (100 < d1 ? 7 : 3)) | 0;
       }
     }
   }

@@ -300,15 +300,16 @@ fn int_push3_enabled() -> bool {
 
 /// Find fail-closed three-push batches in an ordinary, unmetered INT region.
 ///
-/// The exact twelve-op shape is three repetitions of `LoadGlobal receiver;
-/// GetProp saved-callee; LoadInt|Move argument; CallWithThis`. Every call
-/// result must be bytecode-dead across the whole function, because the batched
-/// helper intentionally does not materialise the three otherwise discarded
-/// length results. No interior op may be a jump target, all receiver pins must
-/// be distinct stable globals, and every argument must already have an xmm
-/// home. These restrictions make moving the three pure argument reads ahead
-/// of the appends unobservable: the push gate proved the appends cannot invoke
-/// user code, and a helper decline mutates nothing and replays the first setup.
+/// The accepted legs are the captured four-op spelling, the fused three-op
+/// spelling with an explicit argument setup, and the current fused two-op
+/// spelling whose argument already lives in a local home. Every call result
+/// must be bytecode-dead across the whole function, because the batched helper
+/// intentionally does not materialise the three otherwise discarded length
+/// results. No interior op may be a jump target, all receiver pins must be
+/// distinct stable globals, and every argument must already have an xmm home.
+/// These restrictions make delaying the first two appends unobservable: the
+/// push gate proved the appends cannot invoke user code, and a helper decline
+/// mutates nothing and replays the first receiver setup.
 fn arr_push3_steps(
     proto: &FuncProto,
     s: usize,
@@ -319,7 +320,10 @@ fn arr_push3_steps(
     enabled: bool,
 ) -> FxHashMap<usize, ArrPush3Step> {
     let mut out = FxHashMap::default();
-    if !enabled || e.saturating_sub(s) < 11 {
+    // The shortest admitted spelling is three adjacent
+    // `LoadGlobal; CallMethod` legs: six bytecodes inclusive. Longer fused and
+    // captured spellings retain their own exact `span` bound below.
+    if !enabled || e.saturating_sub(s) < 5 {
         return out;
     }
 
@@ -344,9 +348,23 @@ fn arr_push3_steps(
     // fused shape the compiler emits for a transparent argument is
     // `[LoadGlobal recv; arg; CallMethod]` (stride 3). Both bind the SAME
     // helper protocol — the fused leg simply has no callee register to prove.
-    while base + 8 <= e {
+    while base + 5 <= e {
         let split = matches!(proto.code[base + 1], Instr::GetProp { .. });
-        let stride = if split { 4 } else { 3 };
+        let (stride, has_arg_setup) = if split {
+            (4, true)
+        } else if matches!(
+            proto.code[base + 1],
+            Instr::LoadInt { .. } | Instr::Move { .. }
+        ) {
+            (3, true)
+        } else if matches!(proto.code[base + 1], Instr::CallMethod { .. }) {
+            // Transparent local arguments no longer need a synthetic Move:
+            // their existing numeric home is the CallMethod argument directly.
+            (2, false)
+        } else {
+            base += 1;
+            continue;
+        };
         let span = 3 * stride;
         if base + span - 1 > e {
             break;
@@ -365,15 +383,7 @@ fn arr_push3_steps(
                     break;
                 }
             };
-            let arg_ip = if split { b + 2 } else { b + 1 };
             let call_ip = b + stride - 1;
-            let arg = match proto.code[arg_ip] {
-                Instr::LoadInt { dst, .. } | Instr::Move { dst, .. } => dst,
-                _ => {
-                    ok = false;
-                    break;
-                }
-            };
             let (dst, obj, arg_base) = if split {
                 let (saved_callee, get_obj) = match proto.code[b + 1] {
                     Instr::GetProp { dst, obj, .. } => (dst, obj),
@@ -431,10 +441,31 @@ fn arr_push3_steps(
                     }
                 }
             };
+            let arg_def_ip = has_arg_setup.then_some(if split { b + 2 } else { b + 1 });
+            let arg = if let Some(arg_ip) = arg_def_ip {
+                match proto.code[arg_ip] {
+                    Instr::LoadInt { dst, .. } | Instr::Move { dst, .. } => dst,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            } else {
+                arg_base
+            };
             let Some(j) = arr_push_pin(proto, call_ip, ta_plan) else {
                 ok = false;
                 break;
             };
+            let setup_is_replay_safe = arg_def_ip.is_none_or(|arg_ip| {
+                !reg_value_is_observable_after_def(&proto.code, arg, arg_ip, &[call_ip])
+                    // A future setup is speculative until the helper commits.
+                    // On decline replay begins at `base`, so its destination
+                    // must not be consumed before that exact definition.
+                    && !proto.code[base..arg_ip]
+                        .iter()
+                        .any(|ins| instr_uses(ins).contains(&arg))
+            });
             if obj != recv
                 || arg_base != arg
                 || ta_plan.pins[j].src != TaPinSrc::Global(global)
@@ -443,15 +474,7 @@ fn arr_push3_steps(
                 // rejecting a compiler register merely because a later,
                 // dominating overwrite recycles it for a boxed temporary.
                 || reg_value_is_observable_after_def(&proto.code, dst, call_ip, &[])
-                || reg_value_is_observable_after_def(&proto.code, arg, arg_ip, &[call_ip])
-                // A future setup is speculative until the helper commits. On
-                // decline, replay begins at `base`; no split/write-through
-                // frame value may be read before its exact argument def
-                // reconstructs it. Handler/finally paths already fail closed
-                // in the CFG proof above.
-                || proto.code[base..arg_ip]
-                    .iter()
-                    .any(|ins| instr_uses(ins).contains(&arg))
+                || !setup_is_replay_safe
                 || plan.slot_consts.contains_key(&arg)
                 || !matches!(plan.reg_home.get(&arg), Some(Home::Xmm(_)))
             {
@@ -761,6 +784,7 @@ pub(crate) fn compile_region_int(
     ta_snapshot: usize,
     math_imul_guard: Option<MathIntrinsicGuard>,
     entry: &IntEntry<'_>,
+    sroa_obj_global: Option<u32>,
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     compile_region_int_maybe_cold(
@@ -773,6 +797,7 @@ pub(crate) fn compile_region_int(
         math_imul_guard,
         false,
         entry,
+        sroa_obj_global,
         meter,
     )
 }
@@ -820,6 +845,7 @@ pub(crate) fn compile_region_int_maybe_cold(
     // Deopt resume map + hoisted entry guards when `proto` is a SPLICE-FLATTENED
     // body (`IntEntry::default()` for an ordinary region — byte-identical).
     entry: &IntEntry<'_>,
+    sroa_obj_global: Option<u32>,
     meter: Option<crate::codegen::meter::Meter>,
 ) -> Option<JitFn> {
     let (s, e) = (start as usize, end as usize);
@@ -852,7 +878,17 @@ pub(crate) fn compile_region_int_maybe_cold(
             // exhaustion before any emitter runs. The GPR emitter's
             // write-through is def-complete since W9 (see `gpr_home_map`).
             if let Some(p) = plan_region_cold(
-                proto, start, end, ta_plan, true, true, true, false, &empty, true,
+                proto,
+                start,
+                end,
+                ta_plan,
+                true,
+                true,
+                true,
+                false,
+                &empty,
+                true,
+                sroa_obj_global,
             ) {
                 match compile_region_int_gpr(
                     proto,
@@ -873,7 +909,17 @@ pub(crate) fn compile_region_int_maybe_cold(
                     // 8-10 GPR pool is exactly the case it exists for).
                     GprAttempt::PoolOverflow if gpr_nest_enabled() => {
                         if let Some(shared) = plan_region_cold(
-                            proto, start, end, ta_plan, true, true, true, true, &empty, true,
+                            proto,
+                            start,
+                            end,
+                            ta_plan,
+                            true,
+                            true,
+                            true,
+                            true,
+                            &empty,
+                            true,
+                            sroa_obj_global,
                         ) {
                             if std::env::var_os("ZIPP_JITLOG").is_some() {
                                 eprintln!(
@@ -988,6 +1034,7 @@ pub(crate) fn compile_region_int_maybe_cold(
         false,
         &cold,
         false,
+        sroa_obj_global,
     ) {
         Some(p) => p,
         None => {
@@ -1014,7 +1061,18 @@ pub(crate) fn compile_region_int_maybe_cold(
                 && gpr_wt_share_enabled()
             {
                 if let Some(shared) = plan_region_cold_gpr_virtual(
-                    proto, start, end, ta_plan, true, false, true, true, &cold, false, 18,
+                    proto,
+                    start,
+                    end,
+                    ta_plan,
+                    true,
+                    false,
+                    true,
+                    true,
+                    &cold,
+                    false,
+                    sroa_obj_global,
+                    18,
                 ) {
                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                         eprintln!(
@@ -1053,7 +1111,17 @@ pub(crate) fn compile_region_int_maybe_cold(
             if !int_split_enabled() && gpr_split_enabled() && gpr_homes_enabled() && cold.is_empty()
             {
                 if let Some(p2) = plan_region_cold(
-                    proto, start, end, ta_plan, true, true, false, false, &cold, false,
+                    proto,
+                    start,
+                    end,
+                    ta_plan,
+                    true,
+                    true,
+                    false,
+                    false,
+                    &cold,
+                    false,
+                    sroa_obj_global,
                 ) {
                     if !p2.split_recvs.is_empty() {
                         match compile_region_int_gpr(
@@ -1092,6 +1160,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                                     true,
                                     &cold,
                                     false,
+                                    sroa_obj_global,
                                 ) {
                                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                                         eprintln!(
@@ -1199,6 +1268,7 @@ pub(crate) fn compile_region_int_maybe_cold(
                     true,
                     &cold,
                     false,
+                    sroa_obj_global,
                 ) {
                     if std::env::var_os("ZIPP_JITLOG").is_some() {
                         eprintln!("[jit] INT-GPR nest retry [{start},{end}]: shared-home re-plan");

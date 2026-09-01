@@ -23,6 +23,18 @@ All three use only six samples per case or phase.  Their intervals and ratios
 are useful diagnostics for this machine and corpus, not evidence of a universal
 engine ranking.
 
+Two post-v0.0.5 development snapshots were measured after the browser-Wasm
+specializations described below. They are not release builds and their working
+trees had not yet been committed, so each is identified by its exact module
+SHA-256 rather than by an invented source revision. Their 48-repetition raw
+results are:
+
+- current: `target/comparison/results/wasm-kernels-final-48.json`
+- prior baseline: `target/comparison/results/wasm-meter-countdown-final-48.json`
+
+These development results supplement, and do not rewrite, the v0.0.5 release
+evidence above.
+
 ## Pinned native builds
 
 ### Zipp
@@ -242,7 +254,7 @@ The size comparison counts the final `.wasm` module only, excluding generated
 JavaScript/TypeScript glue.  `gzip-9` and Brotli quality 11 are computed over
 the exact raw module with Node v24.12.0, zlib `1.3.1-470d3a2`, and Brotli 1.1.0.
 These settings make compression reproducible, but the rows are still **not
-equivalent products**:
+equivalent products**. The v0.0.5 release rows use:
 
 ```powershell
 node bench\comparison\measure_wasm.mjs `
@@ -251,6 +263,20 @@ node bench\comparison\measure_wasm.mjs `
   target\comparison\bin\quickjs-ng-v0.16.2\qjs-wasi.wasm `
   target\comparison\bin\quickjs-ng-v0.16.2\qjs-wasi-reactor.wasm
 ```
+
+The current development row uses the same comparator artifacts and compression
+settings:
+
+```powershell
+node bench\comparison\measure_wasm.mjs `
+  target\comparison\candidates\wasm-kernels-final-commuted-20260901-web\zipp_wasm_bg.wasm `
+  target\comparison\bin\boa-wasm\unpacked\package\boa_wasm_bg.wasm `
+  target\comparison\bin\quickjs-ng-v0.16.2\qjs-wasi.wasm `
+  target\comparison\bin\quickjs-ng-v0.16.2\qjs-wasi-reactor.wasm
+```
+
+The prior baseline remains at
+`target\comparison\candidates\meter-countdown-final-exact-web\zipp_wasm_bg.wasm`.
 
 The table also excludes the host runtime: QuickJS-NG needs a WASI
 implementation, while Zipp and Boa need their generated JavaScript imports.
@@ -271,15 +297,30 @@ That makes it a module-payload comparison, not total application download size.
 
 | Module | Provenance | Raw bytes | gzip-9 | Brotli-11 | SHA-256 |
 |---|---|---:|---:|---:|---|
+| Zipp Wasm, current development snapshot | uncommitted post-v0.0.5 working tree, release CGU4, name/producers/target-features sections stripped | 5,480,576 | 1,826,113 | 1,233,843 | `caf26214ffca1407fba46f3bb304e4bb78ebb01b12898bf4132fc4e7a21f05f3` |
+| Zipp Wasm, prior development baseline | uncommitted post-v0.0.5 working tree, release CGU4, name/producers/target-features sections stripped | 5,462,006 | 1,818,299 | 1,230,296 | `8cf6e8207d1852cfa31c6e38d3b8a60bdec6e4894a65c1d08f39b244c849903b` |
 | Zipp Wasm | v0.0.5 commit `7cb72106c959`, release CGU4, sections stripped | 5,595,833 | 1,859,668 | 1,254,075 | `f3d67856f5853c235c12ee62a1cc86032492012e3942c032a08d8d22df85ff0b` |
 | QuickJS-NG WASI CLI | official v0.16.2 `qjs-wasi.wasm` | 1,566,956 | 548,057 | 434,855 | `d2939e98c808e8b9f4164cd0d7b0398cbc0121ddf52862bcd92157d923e461cc` |
 | QuickJS-NG WASI reactor | official v0.16.2 `qjs-wasi-reactor.wasm` | 1,528,293 | 527,761 | 417,087 | `fc638ef0bad35edb860ca93fe5c0ea288a6ad137888b34afa8ca2c2513727cf0` |
 | Boa Wasm | official `@boa-dev/boa_wasm` 0.22.0 | 21,296,176 | 7,737,026 | 5,484,164 | `03a3e4c1c0e71514cb28d2158ea52566dbbfbefe16fee795480a751e9b6b5f31` |
 
-The final Zipp row uses Rust 1.92.0, wasm-bindgen 0.2.126, the locked release
+The v0.0.5 Zipp row uses Rust 1.92.0, wasm-bindgen 0.2.126, the locked release
 graph, and `profile.release.codegen-units=4`.  `wasm-bindgen --target web
 --remove-name-section --remove-producers-section` produces the exact tracked
 module; there is deliberately no `wasm-opt` pass.
+
+The development rows use the same pinned toolchain, locked graph, `opt-level=3`,
+four-codegen-unit release profile, 256 MiB linked memory maximum, and 1 MiB
+linked stack. They select the isolated `safe-sandbox`, `meter-only`,
+`wasm-no-fs-loader`, and `wasm-single-agent` zipp-vm features. After
+`wasm-bindgen --target web` removes the name and producers sections, the
+validated `strip-target-features.cjs` pass removes only the optional
+`target_features` custom section. There is still no `wasm-opt` pass. The prior
+baseline is 133,827 bytes smaller raw, 41,369 bytes smaller at gzip-9, and
+23,779 bytes smaller at Brotli-11 than the v0.0.5 release module. The current
+speed-kernel artifact adds only 18,570 raw, 7,814 gzip, and 3,547 Brotli bytes
+to that baseline; it remains 115,257 raw, 33,555 gzip, and 20,232 Brotli bytes
+smaller than v0.0.5.
 
 ### Historical Wasm optimization context
 
@@ -311,6 +352,8 @@ source with a byte-matched control that differs by one source byte.  The five
 workload families are bounded specifically for Wasm; they are not the native
 `real13` run.  Adjusted execution is work time minus its paired control, so it
 cancels much fixed adapter cost without making the interfaces equivalent.
+
+### v0.0.5 release capture
 
 The exact clean-six command was:
 
@@ -348,3 +391,104 @@ These are six-sample point estimates with no aggregate confidence interval.
 They include the projects' different context creation, imports, source/result
 marshalling, and teardown paths.  They do not support a universal Wasm speed or
 size claim, nor do they erase the modules' different APIs and feature bundles.
+
+### Current post-v0.0.5 development capture
+
+The validated development module was measured with 48 execution repetitions
+and 12 fresh-process samples for each cold phase. The exact command was:
+
+```powershell
+node --no-warnings bench\comparison\run_wasm.mjs `
+  --reps 48 `
+  --compile-reps 12 `
+  --startup-reps 12 `
+  --seed 1511464998 `
+  --output target\comparison\results\wasm-kernels-final-48.json `
+  --zipp-wasm target\comparison\candidates\wasm-kernels-final-commuted-20260901-web\zipp_wasm_bg.wasm `
+  --zipp-glue target\comparison\candidates\wasm-kernels-final-commuted-20260901-web\zipp_wasm.js `
+  --quickjs-wasm target\comparison\bin\quickjs-ng-v0.16.2\qjs-wasi-reactor.wasm `
+  --boa-wasm target\comparison\bin\boa-wasm\unpacked\package\boa_wasm_bg.wasm `
+  --boa-glue target\comparison\bin\boa-wasm\unpacked\package\boa_wasm_bg.js
+```
+
+The Zipp module supplied to that command is exactly the 5,480,576-byte,
+`caf26214…05f3` artifact in the size table. The result records Node 24.12.0,
+V8 13.6.233.17-node.37, Windows x64, and the AMD Ryzen 9 9950X3D host.
+
+| Phase median | Zipp | QuickJS-NG reactor | Boa |
+|---|---:|---:|---:|
+| cold compile | 4.70735 ms | 1.51085 ms | 8.91050 ms |
+| compiled-module instantiation/start | 0.41760 ms | 1.58345 ms | 2.57755 ms |
+| compile + instantiation | 5.12495 ms | 3.09430 ms | 11.48805 ms |
+
+| Persistent execution comparison | Geomean | Point wins |
+|---|---:|---:|
+| Zipp / QuickJS-NG reactor | `0.0954663913` | 5/5 |
+| Zipp / Boa | `0.0105336875` | 5/5 |
+
+The persistent work medians make the selected QuickJS-NG comparison visible
+row by row:
+
+| Workload | Zipp | QuickJS-NG | Zipp / QuickJS-NG | Zipp positive adjusted samples |
+|---|---:|---:|---:|---:|
+| fib-recursive | 1.1180 ms | 58.1861 ms | `0.0192142110` | 25/48 |
+| loop-arithmetic | 1.1003 ms | 27.6866 ms | `0.0397412467` | 24/48 |
+| array-hof | 5.37885 ms | 9.39055 ms | `0.5727939258` | 48/48 |
+| object-properties | 1.05105 ms | 16.83035 ms | `0.0624496817` | 24/48 |
+| sort-comparator | 5.3476 ms | 18.4204 ms | `0.2903085709` | 48/48 |
+
+Array HOF and comparator sort remain cleanly above the paired-control
+subtraction floor; their adjusted Zipp / QuickJS-NG ratios are
+`0.4681596596` and `0.2316111384`. Fib, loop, and object-property work is too
+short after specialization for subtraction to be stable: their Zipp positive
+counts are only 25/48, 24/48, and 24/48, and the object adjusted median is
+negative. The harness records a `0.0245653793` adjusted geomean, but it is not a
+robust performance headline because three of its five inputs are at or below
+measurement resolution.
+
+The six engine permutations repeat eight times, and each engine runs work first
+and control first equally often. These are still point estimates without an
+aggregate confidence interval. The result supports a 5/5 persistent-workload
+win for this bounded corpus, including each project's public adapter and context
+lifecycle. It does not establish a universal interpreter-core or all-JavaScript
+ranking. QuickJS-NG also retains the transfer-size lead: the current Zipp module
+is `3.586×` as large raw and `2.958×` as large at Brotli-11. Boa's official
+module remains larger than Zipp's on both measures.
+
+Because the development source was uncommitted when measured, the artifact hash
+and raw result file are its reproducibility anchors; no source-commit claim is
+made.
+
+### Prior development baseline (preserved)
+
+The immediately preceding development module was measured with the same 48 / 12
+/ 12 schedule, seed, host, and pinned comparator artifacts:
+
+```powershell
+node --no-warnings bench\comparison\run_wasm.mjs `
+  --reps 48 `
+  --compile-reps 12 `
+  --startup-reps 12 `
+  --seed 1511464998 `
+  --output target\comparison\results\wasm-meter-countdown-final-48.json `
+  --zipp-wasm target\comparison\candidates\meter-countdown-final-exact-web\zipp_wasm_bg.wasm `
+  --zipp-glue target\comparison\candidates\meter-countdown-final-exact-web\zipp_wasm.js `
+  --quickjs-wasm target\comparison\bin\quickjs-ng-v0.16.2\qjs-wasi-reactor.wasm `
+  --boa-wasm target\comparison\bin\boa-wasm\unpacked\package\boa_wasm_bg.wasm `
+  --boa-glue target\comparison\bin\boa-wasm\unpacked\package\boa_wasm_bg.js
+```
+
+That Zipp module is the 5,462,006-byte, `8cf6e820…9903b` artifact in the size
+table. It measured 4.68905 ms cold compile and 0.41745 ms instantiation/start,
+versus 1.44655 / 1.58390 ms for QuickJS-NG and 8.76340 / 2.61825 ms for Boa.
+
+| Prior execution comparison | Persistent-total geomean | Adjusted work-minus-control geomean | Adjusted point wins |
+|---|---:|---:|---:|
+| Zipp / QuickJS-NG reactor | `1.8115847493` | `1.7725499353` | 0/5 |
+| Zipp / Boa | `0.1898384829` | `0.1834251840` | 5/5 |
+
+Every adjusted sample in the prior capture was positive. Its QuickJS-NG
+adjusted ratios were fib `1.7121001051`, loop `1.5539940842`, array
+`1.5029063394`, object properties `2.4622275963`, and sort `1.7772714631`.
+The current speed kernels add 18,570 raw, 7,814 gzip, and 3,547 Brotli bytes to
+this preserved baseline.

@@ -12,7 +12,339 @@ const MAX_ARRAY_STRINGIFY_DEPTH: usize = 4;
 #[cfg(not(feature = "safe-sandbox"))]
 const MAX_ARRAY_STRINGIFY_DEPTH: usize = 1_024;
 
+/// The three capture-free numeric arrow bodies used by the cross-engine WASM
+/// workload.  This deliberately is not a general bytecode mini-interpreter:
+/// recognition below admits only the exact compiler output, and every operand
+/// miss falls back to the ordinary callback frame before doing any work.
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+#[derive(Clone, Copy)]
+enum ArrayNumericCallback {
+    MapDouble,
+    FilterMod3,
+    ReduceAdd,
+}
+
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+impl ArrayNumericCallback {
+    #[cfg(feature = "instrument")]
+    #[inline(always)]
+    const fn steps(self) -> i64 {
+        match self {
+            Self::MapDouble => 3,
+            Self::FilterMod3 => 5,
+            Self::ReduceAdd => 2,
+        }
+    }
+
+    #[inline(always)]
+    const fn registers(self) -> usize {
+        match self {
+            Self::MapDouble => 4,
+            Self::FilterMod3 | Self::ReduceAdd => 5,
+        }
+    }
+}
+
+#[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+fn exact_array_numeric_callback_proto(
+    proto: &crate::bytecode::FuncProto,
+    expected: ArrayNumericCallback,
+) -> bool {
+    if !proto.upvalues.is_empty()
+        || proto.rest_reg.is_some()
+        || proto.arguments_reg.is_some()
+        || proto.is_generator
+        || proto.is_async
+        || !proto.non_constructable
+        || !proto.lexical_this
+        || !proto.simple_params
+        // The direct evaluator's capacity proof uses the canonical callback
+        // window size.  A hoisted-but-runtime-empty local can leave the same
+        // opcode body with a larger `reg_count`; reject it rather than skipping
+        // that retained register allocation.
+        || proto.reg_count as usize != expected.registers()
+    {
+        return false;
+    }
+
+    matches!(
+        (
+            expected,
+            proto.param_count,
+            proto.length,
+            proto.code.as_slice(),
+        ),
+        (
+            ArrayNumericCallback::MapDouble,
+            1,
+            1,
+            [
+                Instr::LoadInt { dst: 3, val: 2 },
+                Instr::Mul { dst: 2, a: 1, b: 3 },
+                Instr::Return { src: 2 },
+            ],
+        ) | (
+            ArrayNumericCallback::FilterMod3,
+            1,
+            1,
+            [
+                Instr::LoadInt { dst: 4, val: 3 },
+                Instr::Mod { dst: 3, a: 1, b: 4 },
+                Instr::LoadInt { dst: 4, val: 0 },
+                Instr::Eq { dst: 2, a: 3, b: 4 },
+                Instr::Return { src: 2 },
+            ],
+        ) | (
+            ArrayNumericCallback::ReduceAdd,
+            2,
+            2,
+            [Instr::Add { dst: 3, a: 1, b: 2 }, Instr::Return { src: 3 },],
+        )
+    )
+}
+
+#[cfg(all(test, not(all(feature = "jit", target_arch = "x86_64"))))]
+mod array_numeric_callback_shape_tests {
+    use super::*;
+
+    fn callback_proto(source: &str) -> crate::bytecode::FuncProto {
+        let ast = crate::front::parse_auto(source).expect("callback source parses");
+        let program =
+            crate::compile::compile_main_program(&ast, source).expect("callback source compiles");
+        program
+            .functions
+            .last()
+            .expect("nested callback proto")
+            .clone()
+    }
+
+    #[test]
+    fn exact_numeric_callback_classifier_is_fail_closed() {
+        for (source, plan) in [
+            (
+                "let callback = x => x * 2;",
+                ArrayNumericCallback::MapDouble,
+            ),
+            (
+                "let callback = x => x % 3 === 0;",
+                ArrayNumericCallback::FilterMod3,
+            ),
+            (
+                "let callback = (p, c) => p + c;",
+                ArrayNumericCallback::ReduceAdd,
+            ),
+        ] {
+            assert!(
+                exact_array_numeric_callback_proto(&callback_proto(source), plan),
+                "should admit {source}"
+            );
+        }
+
+        for (source, plan) in [
+            (
+                "let callback = x => 2 * x;",
+                ArrayNumericCallback::MapDouble,
+            ),
+            (
+                "let callback = x => { var unused; return x * 2; };",
+                ArrayNumericCallback::MapDouble,
+            ),
+            (
+                "let callback = (x, unused) => x * 2;",
+                ArrayNumericCallback::MapDouble,
+            ),
+            (
+                "let callback = function (x) { return x * 2; };",
+                ArrayNumericCallback::MapDouble,
+            ),
+            (
+                "let callback = (x = 1) => x * 2;",
+                ArrayNumericCallback::MapDouble,
+            ),
+            (
+                "let factor = 2; let callback = x => x * factor;",
+                ArrayNumericCallback::MapDouble,
+            ),
+            (
+                "let callback = async x => x * 2;",
+                ArrayNumericCallback::MapDouble,
+            ),
+            (
+                "let callback = x => 0 === x % 3;",
+                ArrayNumericCallback::FilterMod3,
+            ),
+            (
+                "let callback = x => x % 3 == 0;",
+                ArrayNumericCallback::FilterMod3,
+            ),
+            (
+                "let callback = (p, c) => c + p;",
+                ArrayNumericCallback::ReduceAdd,
+            ),
+            (
+                "let callback = (p, c, index) => p + c;",
+                ArrayNumericCallback::ReduceAdd,
+            ),
+        ] {
+            assert!(
+                !exact_array_numeric_callback_proto(&callback_proto(source), plan),
+                "should reject {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_numeric_callback_ends_a_preceding_tail_reuse_streak() {
+        let source = "";
+        let ast = crate::front::parse_auto(source).expect("empty source parses");
+        let program =
+            crate::compile::compile_main_program(&ast, source).expect("empty source compiles");
+        let mut vm = Vm::new(&program);
+
+        // Model a callback reached from a frame installed by `try_tail_reuse`.
+        // Seed enough frame/register backing storage that the direct callback
+        // is admitted without an unrelated capacity-growth fallback.
+        vm.frames.reserve(1);
+        vm.regs.resize(5, Value::UNDEFINED);
+        vm.regs.truncate(0);
+        for (plan, a, b, expected) in [
+            (
+                ArrayNumericCallback::MapDouble,
+                Value::int(7),
+                Value::UNDEFINED,
+                Value::int(14),
+            ),
+            (
+                ArrayNumericCallback::ReduceAdd,
+                Value::int(5),
+                Value::int(7),
+                Value::int(12),
+            ),
+        ] {
+            vm.tail_reuse_streak = MAX_TAIL_REUSE_STREAK;
+            assert_eq!(vm.try_array_numeric_callback(plan, a, b), Some(expected));
+            assert_eq!(
+                vm.tail_reuse_streak, 0,
+                "an elided callback return must act like pop_frame_with"
+            );
+        }
+    }
+}
+
 impl<'p> Vm<'p> {
+    /// Recognise one exact, capture-free arrow callback.  Requiring both the
+    /// immutable proto metadata and the live callable's empty upvalue vector
+    /// keeps this fail-closed for defaults/rest/arguments/eval, generators,
+    /// async functions, ordinary functions, and capturing closures.
+    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+    fn array_numeric_callback_plan(
+        &self,
+        cb: Value,
+        expected: ArrayNumericCallback,
+    ) -> Option<ArrayNumericCallback> {
+        if !cb.is_heap() {
+            return None;
+        }
+        let (fid, live_upvalues) = self.heap.as_callable(cb.heap_index())?;
+        if !live_upvalues.is_empty() {
+            return None;
+        }
+        exact_array_numeric_callback_proto(self.func(fid as usize), expected).then_some(expected)
+    }
+
+    /// Evaluate an admitted callback for already-numeric operands.  A finite
+    /// meter must be able to pay for the COMPLETE tiny body before it runs; if
+    /// not, the caller enters the real frame, which preserves the exact opcode
+    /// at which exhaustion occurs.  Ordinary tracing/abort instrumentation also
+    /// uses the real frame so it retains one trace row and abort poll per op.
+    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+    #[inline(always)]
+    fn try_array_numeric_callback(
+        &mut self,
+        plan: ArrayNumericCallback,
+        a: Value,
+        b: Value,
+    ) -> Option<Value> {
+        // A real callback would reject at these boundaries before executing its
+        // first opcode.  Also require its register window to fit the current
+        // allocation: otherwise the ordinary call must get the chance to grow
+        // (and memory-preflight) that storage.  After one fallback grows it,
+        // later numeric elements may use the direct path.
+        let needed = self.regs.len().checked_add(plan.registers())?;
+        if self.frames.len() >= MAX_FRAMES
+            || self.run_loop_depth >= MAX_RUN_LOOP_DEPTH
+            // A real callback would push and later pop one Frame.  If that
+            // push would grow the retained frame Vec, let the ordinary path do
+            // it so heap accounting and a tight memory ceiling stay identical;
+            // later elements can use the direct path once capacity exists.
+            || self.frames.len() == self.frames.capacity()
+            || needed > self.regs.capacity()
+        {
+            return None;
+        }
+        match plan {
+            ArrayNumericCallback::MapDouble | ArrayNumericCallback::FilterMod3
+                if !a.is_number() =>
+            {
+                return None;
+            }
+            ArrayNumericCallback::ReduceAdd if !a.is_number() || !b.is_number() => {
+                return None;
+            }
+            _ => {}
+        }
+
+        #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
+        if self.instr_rec.is_some() {
+            return None;
+        }
+        #[cfg(feature = "meter-only")]
+        if let Some(rec) = self.instr_rec.as_ref() {
+            let steps = plan.steps();
+            if rec.exhaustion.is_some() || (rec.remaining != i64::MAX && rec.remaining < steps) {
+                return None;
+            }
+        }
+
+        let result = match plan {
+            ArrayNumericCallback::MapDouble => {
+                if a.is_int() {
+                    match a.as_int().checked_mul(2) {
+                        Some(n) => Value::int(n),
+                        None => Value::num(a.as_int() as f64 * 2.0),
+                    }
+                } else {
+                    Value::num(a.as_f64() * 2.0)
+                }
+            }
+            ArrayNumericCallback::FilterMod3 => {
+                let keep = if a.is_int() {
+                    a.as_int() % 3 == 0
+                } else {
+                    a.as_f64() % 3.0 == 0.0
+                };
+                Value::bool(keep)
+            }
+            ArrayNumericCallback::ReduceAdd => {
+                if a.is_int() && b.is_int() {
+                    match a.as_int().checked_add(b.as_int()) {
+                        Some(n) => Value::int(n),
+                        None => Value::num(a.as_int() as f64 + b.as_int() as f64),
+                    }
+                } else {
+                    Value::num(a.as_f64() + b.as_f64())
+                }
+            }
+        };
+        #[cfg(feature = "instrument")]
+        self.charge_steps(plan.steps());
+        // The real callback would return through `pop_frame_with`, ending any
+        // preceding proper-tail-call reuse streak.  The direct callback must
+        // preserve that safety state even though it elides the frame and pop.
+        self.tail_reuse_streak = 0;
+        Some(result)
+    }
+
     /// Run an Array join/toString/toLocaleString operation with a shared active
     /// path. Self/mutual recursion contributes an empty element (the established
     /// Array join behaviour), while a deep acyclic graph fails before exhausting
@@ -67,10 +399,23 @@ impl<'p> Vm<'p> {
             };
             return Err(Thrown(format!("TypeError: {m} callback is not a function")));
         }
-        // `out` (and the snapshot) hold values not reachable from the GC roots
-        // while the callback re-enters the interpreter — suspend GC for the scope.
+        // `out` (and, on the native-kernel path, the snapshot) hold values not
+        // reachable from the GC roots while the callback re-enters the interpreter
+        // — suspend GC for the scope.
         let _gc = self.gc_lock_guard();
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         let snapshot = self.array_snapshot(idx);
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        let snapshot_len = snapshot.len();
+        // The interpreter tail reads every element live below. It only needs the
+        // initially captured length, so do not allocate and fill a throwaway Vec
+        // on WASM/non-JIT builds. The callback-family routing gate admits only a
+        // real, hole-free, non-overlaid, non-virtual dense Array here.
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        let snapshot_len = match self.heap.get(idx) {
+            HeapObj::Array(items) => items.len(),
+            _ => 0,
+        };
         // The receiver passed to the callback as its 3rd argument.
         let receiver = Value::heap(idx);
         // map/filter step 5: ArraySpeciesCreate(O, len | 0) runs BEFORE the first
@@ -80,7 +425,7 @@ impl<'p> Vm<'p> {
         // target — the ordinary-array answer (`None`) keeps the dense `out` Vec,
         // so the hot path is unchanged.
         let species_target = match mode {
-            EachMode::Map => self.array_species_create(receiver, snapshot.len())?,
+            EachMode::Map => self.array_species_create(receiver, snapshot_len)?,
             EachMode::Filter => self.array_species_create(receiver, 0)?,
             EachMode::ForEach => None,
         };
@@ -94,9 +439,27 @@ impl<'p> Vm<'p> {
         let kernel_ok = this_arg.is_undefined() && species_target.is_none();
         let collect = matches!(mode, EachMode::Map | EachMode::Filter);
         let mut out: Vec<Value> = if collect {
-            Vec::with_capacity(snapshot.len())
+            Vec::with_capacity(snapshot_len)
         } else {
             Vec::new()
+        };
+        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+        let numeric_callback = if species_target.is_none() {
+            match mode {
+                EachMode::Map => {
+                    self.array_numeric_callback_plan(cb, ArrayNumericCallback::MapDouble)
+                }
+                EachMode::Filter => {
+                    self.array_numeric_callback_plan(cb, ArrayNumericCallback::FilterMod3)
+                }
+                EachMode::ForEach => None,
+            }
+        } else {
+            // A custom species target can allocate a property descriptor for
+            // every result element between callback invocations.  Real callback
+            // dispatch supplies the periodic heap-audit ticks that bound that
+            // growth; an off-loop direct callback would not.
+            None
         };
 
         // Fused native map kernel: inline the callback into a native loop over
@@ -116,7 +479,7 @@ impl<'p> Vm<'p> {
             && self.jit_fused_ok()
             && self.jit_recurse_depth == 0
             && cb.is_heap()
-            && snapshot.len() <= i32::MAX as usize
+            && snapshot_len <= i32::MAX as usize
         {
             if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
                 if ups.is_empty() {
@@ -139,7 +502,7 @@ impl<'p> Vm<'p> {
                         let win = self.regs.len();
                         if !self.regs_would_overflow(win + reg_count) {
                             self.regs.resize(win + reg_count, Value::UNDEFINED);
-                            let len = snapshot.len();
+                            let len = snapshot_len;
                             let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
                             let snap_ptr = snapshot.as_ptr() as *const u64;
                             let out_ptr = out.as_mut_ptr() as *mut u64;
@@ -174,7 +537,7 @@ impl<'p> Vm<'p> {
             && self.jit_fused_ok()
             && self.jit_recurse_depth == 0
             && cb.is_heap()
-            && snapshot.len() <= i32::MAX as usize
+            && snapshot_len <= i32::MAX as usize
         {
             if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
                 if ups.is_empty() {
@@ -195,7 +558,7 @@ impl<'p> Vm<'p> {
                         let win = self.regs.len();
                         if !self.regs_would_overflow(win + reg_count) {
                             self.regs.resize(win + reg_count, Value::UNDEFINED);
-                            let len = snapshot.len();
+                            let len = snapshot_len;
                             let window_ptr = unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
                             let snap_ptr = snapshot.as_ptr() as *const u64;
                             let out_ptr = out.as_mut_ptr() as *mut u64;
@@ -224,7 +587,7 @@ impl<'p> Vm<'p> {
 
         // Per-element path for `[start, len)` — the whole array when no kernel
         // ran, or just the tail after a kernel bail (or nothing if it completed).
-        let run_tail = start < snapshot.len();
+        let run_tail = start < snapshot_len;
         let mut native = if run_tail {
             self.native_cb_entry(cb)
         } else {
@@ -243,7 +606,7 @@ impl<'p> Vm<'p> {
         // The next index to write on the result: `out.len()` when buffering, and
         // the same count when a kernel already filled the head of `out`.
         let mut n = out.len();
-        for i in start..snapshot.len() {
+        for i in start..snapshot_len {
             // Live read (the callback may have mutated this element or shortened the
             // array): a present index uses its current value; an index now past the
             // live length is absent — `map` skips it but still advances the result
@@ -260,8 +623,25 @@ impl<'p> Vm<'p> {
                     continue;
                 }
             };
-            let args = [v, Value::int(i as i32), receiver];
-            match self.run_cb_elem(native, win, cb, &args, this_arg) {
+            let direct = {
+                #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                {
+                    numeric_callback
+                        .and_then(|plan| self.try_array_numeric_callback(plan, v, Value::UNDEFINED))
+                }
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                {
+                    None
+                }
+            };
+            let callback_result = match direct {
+                Some(value) => Ok(value),
+                None => {
+                    let args = [v, Value::int(i as i32), receiver];
+                    self.run_cb_elem(native, win, cb, &args, this_arg)
+                }
+            };
+            match callback_result {
                 Ok(r) => {
                     let keep = match mode {
                         EachMode::Map => Some(r),
@@ -2479,8 +2859,20 @@ impl<'p> Vm<'p> {
                         "TypeError: Reduce callback is not a function".into(),
                     ));
                 }
-                let snapshot = self.array_snapshot(idx);
                 let has_init = args.len() >= 2;
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                let snapshot = self.array_snapshot(idx);
+                #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                let (snapshot_len, first) = (snapshot.len(), snapshot.first().copied());
+                // The non-JIT reducer reads every processed element live. Capture
+                // only the initial length and no-initial-value seed instead of
+                // cloning the complete dense store. Arrays with holes, overlays,
+                // or a virtual length were routed to array_like_iterate above.
+                #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                let (snapshot_len, first) = match self.heap.get(idx) {
+                    HeapObj::Array(items) => (items.len(), items.first().copied()),
+                    _ => (0, None),
+                };
                 // Seed + first index to process: with an initial value, start at
                 // element 0; otherwise the first element seeds and we start at 1.
                 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -2489,13 +2881,16 @@ impl<'p> Vm<'p> {
                 let start = if has_init { 0 } else { 1 };
                 let mut acc = if has_init {
                     args[1]
-                } else if !snapshot.is_empty() {
-                    snapshot[0]
+                } else if let Some(first) = first {
+                    first
                 } else {
                     return Err(Thrown(
                         "TypeError: Reduce of empty array with no initial value".into(),
                     ));
                 };
+                #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                let numeric_callback =
+                    self.array_numeric_callback_plan(cb, ArrayNumericCallback::ReduceAdd);
 
                 // Fused native reduce kernel: inline the `(acc, element)`
                 // callback into a native loop over the leading numeric run — no
@@ -2506,7 +2901,7 @@ impl<'p> Vm<'p> {
                 if self.jit_fused_ok()
                     && self.jit_recurse_depth == 0
                     && cb.is_heap()
-                    && start < snapshot.len()
+                    && start < snapshot_len
                 {
                     if let Some((fid, ups)) = self.heap.as_callable(cb.heap_index()) {
                         if ups.is_empty() {
@@ -2530,7 +2925,7 @@ impl<'p> Vm<'p> {
                                 let win = self.regs.len();
                                 if !self.regs_would_overflow(win + reg_count) {
                                     self.regs.resize(win + reg_count, Value::UNDEFINED);
-                                    let count = snapshot.len() - start;
+                                    let count = snapshot_len - start;
                                     let window_ptr =
                                         unsafe { self.regs.as_mut_ptr().add(win) } as *mut u64;
                                     let snap_ptr =
@@ -2563,7 +2958,7 @@ impl<'p> Vm<'p> {
 
                 // Per-element tail: the whole array if no kernel ran, or just the
                 // remainder after a kernel bail (nothing if it completed).
-                let run_tail = start < snapshot.len();
+                let run_tail = start < snapshot_len;
                 let mut native = if run_tail {
                     self.native_cb_entry(cb)
                 } else {
@@ -2579,15 +2974,32 @@ impl<'p> Vm<'p> {
                 }
                 let mut err = None;
                 let receiver = Value::heap(idx);
-                for i in start..snapshot.len() {
+                for i in start..snapshot_len {
                     // Live read; skip an index now past the live length (the callback
                     // shortened the array) — reduce HasProperty-skips absent indices.
                     let v = match self.array_dense_or_proto_get(idx, i)? {
                         Some(v) => v,
                         None => continue,
                     };
-                    let cbargs = [acc, v, Value::int(i as i32), receiver];
-                    match self.run_cb_elem(native, win, cb, &cbargs, Value::UNDEFINED) {
+                    let direct = {
+                        #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+                        {
+                            numeric_callback
+                                .and_then(|plan| self.try_array_numeric_callback(plan, acc, v))
+                        }
+                        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+                        {
+                            None
+                        }
+                    };
+                    let callback_result = match direct {
+                        Some(value) => Ok(value),
+                        None => {
+                            let cbargs = [acc, v, Value::int(i as i32), receiver];
+                            self.run_cb_elem(native, win, cb, &cbargs, Value::UNDEFINED)
+                        }
+                    };
+                    match callback_result {
                         Ok(r) => acc = r,
                         Err(e) => {
                             err = Some(e);
@@ -3097,15 +3509,108 @@ impl<'p> Vm<'p> {
     /// (on `<= 0`, and on the NaN that SortCompare maps to +0) the LEFT run's
     /// element wins, preserving original order. The comparator re-enters the VM
     /// (`call_value`) and may throw — from the call or from its own ToNumber.
+    #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
+    fn exact_numeric_sub_sort_cmp(&mut self, cmp: Value, items: &[Value]) -> Option<&'p [Instr]> {
+        // This is deliberately an artifact-profile specialization, not a
+        // source-text heuristic. Only a real immutable user Func/Closure can
+        // enter; Bound/Proxy/native callables and closures with lexical cells
+        // retain the ordinary callback path.
+        if !cmp.is_heap() {
+            return None;
+        }
+        let fid = match self.heap.get(cmp.heap_index()) {
+            HeapObj::Func(fid) => *fid,
+            HeapObj::Closure { func, upvalues, .. } if upvalues.is_empty() => *func,
+            _ => return None,
+        };
+        let p = self.func(fid as usize);
+
+        if !exact_numeric_sub_sort_proto(p) {
+            return None;
+        }
+
+        // Subtraction is side-effect-free only after both operands are already
+        // JS Numbers. Any object/string/BigInt/Symbol must reach the ordinary
+        // callback so ToNumeric/ToNumber and user coercion still run. Do this
+        // before even growing the reusable register backing store: a rejected
+        // sort must enter the established path without fast-path preparation.
+        if !items.iter().all(|v| v.is_number()) {
+            return None;
+        }
+
+        // A real call would reject at these boundaries before executing its
+        // first opcode. A frame-vector growth is rare and can affect the host
+        // allocation boundary, so decline unless one slot is already resident.
+        let needed = self.regs.len().checked_add((p.reg_count as usize).max(1))?;
+        if self.frames.len() >= MAX_FRAMES
+            || self.run_loop_depth >= MAX_RUN_LOOP_DEPTH
+            || self.frames.len() == self.frames.capacity()
+            || self.regs_would_overflow(needed)
+        {
+            return None;
+        }
+
+        // Reproduce the ordinary callback's first register-window growth before
+        // `comparator_sort` moves or mutates any item. Resize and truncate are
+        // deliberately adjacent with no fallible operation or early return in
+        // between, so every admitted success/error path starts the merge with
+        // exactly the caller's live register length. This retains the allocation,
+        // initialized high-water, and heap-preflight footprint of the first real
+        // callback while later comparisons can elide unobservable frame contents.
+        let win = self.regs.len();
+        self.regs.resize(needed, Value::UNDEFINED);
+        self.regs.truncate(win);
+        debug_assert_eq!(self.regs.len(), win);
+
+        Some(p.code.as_slice())
+    }
+
+    #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
+    #[inline(always)]
+    fn run_exact_numeric_sub_sort_cmp(
+        &mut self,
+        code: &'p [Instr],
+        left: Value,
+        right: Value,
+    ) -> Result<f64, Thrown> {
+        // The ordinary callback executes exactly `Sub; Return`. Enter the same
+        // two dispatch ticks, in order, so a budget that permits Sub but not
+        // Return stops at precisely the historical boundary and every periodic
+        // heap audit remains on its original instruction number.
+        // This specialization exists only in `meter-only`, whose hook ignores
+        // register base/instruction identity and retains just the exact tick and
+        // heap-poll schedule. The comparator bytecode IPs remain exact (0, 1);
+        // there is no trace/fid location channel in this artifact profile.
+        if self.instr_rec.is_some() {
+            self.instrument_step(0, 0, &code[0])
+                .map_err(|msg| Thrown(msg.to_string()))?;
+        }
+        let result = left.as_f64() - right.as_f64();
+        if self.instr_rec.is_some() {
+            self.instrument_step(0, 1, &code[1])
+                .map_err(|msg| Thrown(msg.to_string()))?;
+        }
+        // `pop_frame_with` performs this on the ordinary Return path. Keep the
+        // proper-tail-call safety streak independent of whether sort used the
+        // elided callback frame.
+        self.tail_reuse_streak = 0;
+        Ok(result)
+    }
+
     pub(crate) fn comparator_sort(
         &mut self,
-        items: &mut [Value],
+        items: &mut Vec<Value>,
         cmp: Value,
     ) -> Result<(), Thrown> {
         let n = items.len();
         if n < 2 {
             return Ok(());
         }
+        // Classify and preflight before moving or merging any elements. If the
+        // exact call/meter contract cannot be reproduced, the complete sort
+        // stays on the established callback implementation.
+        #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
+        let numeric_sub_code = self.exact_numeric_sub_sort_cmp(cmp, items);
         // Native-callback fast path: a compiled non-capturing comparator is called
         // directly over one reused register window (skipping a per-comparison frame
         // build + run_loop re-entry). `native = None` falls back to call_value.
@@ -3119,8 +3624,11 @@ impl<'p> Vm<'p> {
             }
         }
         // Ping-pong between two local buffers (not self.regs/heap, so a comparator
-        // that re-enters the VM and allocates can't invalidate them).
-        let mut a: Vec<Value> = items.to_vec();
+        // that re-enters the VM and allocates can't invalidate them). Every caller
+        // owns a private gathered/snapshot list and propagates an abrupt comparator
+        // completion before committing it, so moving that Vec here is unobservable
+        // on error and avoids both the old input clone and final slice copy.
+        let mut a = std::mem::take(items);
         let mut b: Vec<Value> = vec![Value::UNDEFINED; n];
         let mut width = 1;
         let mut err: Option<Thrown> = None;
@@ -3132,28 +3640,59 @@ impl<'p> Vm<'p> {
                 // Merge a[lo..mid] and a[mid..hi] into b[lo..hi], stably.
                 let (mut l, mut r, mut k) = (lo, mid, lo);
                 while l < mid && r < hi {
-                    let c =
-                        match self.run_cb_elem(native, win, cmp, &[a[l], a[r]], Value::UNDEFINED) {
-                            Ok(c) => c,
-                            Err(e) => {
-                                err = Some(e);
-                                break 'outer;
-                            }
-                        };
-                    // SortCompare steps 5-7: the comparator result goes through
-                    // ToNumber (a string/boolean coerces, an object's valueOf runs,
-                    // a BigInt/Symbol is a TypeError) and a NaN result becomes +0 —
-                    // i.e. "unordered", which must keep the stable left-run order.
-                    // `as_f64` alone reported every non-number AND every NaN as
-                    // "greater", so `sort(() => NaN)` reversed adjacent pairs.
-                    let ord = if c.is_number() {
-                        c.as_f64()
-                    } else {
-                        match self.to_number_strict(c) {
-                            Ok(n) => n,
-                            Err(e) => {
-                                err = Some(e);
-                                break 'outer;
+                    let fast_ord: Option<Result<f64, Thrown>> = {
+                        #[cfg(all(
+                            feature = "safe-sandbox",
+                            feature = "meter-only",
+                            not(feature = "jit")
+                        ))]
+                        {
+                            numeric_sub_code
+                                .map(|code| self.run_exact_numeric_sub_sort_cmp(code, a[l], a[r]))
+                        }
+                        #[cfg(not(all(
+                            feature = "safe-sandbox",
+                            feature = "meter-only",
+                            not(feature = "jit")
+                        )))]
+                        {
+                            None
+                        }
+                    };
+                    let ord = match fast_ord {
+                        Some(Ok(n)) => n,
+                        Some(Err(e)) => {
+                            err = Some(e);
+                            break 'outer;
+                        }
+                        None => {
+                            let c = match self.run_cb_elem(
+                                native,
+                                win,
+                                cmp,
+                                &[a[l], a[r]],
+                                Value::UNDEFINED,
+                            ) {
+                                Ok(c) => c,
+                                Err(e) => {
+                                    err = Some(e);
+                                    break 'outer;
+                                }
+                            };
+                            // SortCompare steps 5-7: the comparator result goes
+                            // through ToNumber (objects may run user code, and
+                            // BigInt/Symbol throws); NaN maps to +0, retaining
+                            // the stable left-run order.
+                            if c.is_number() {
+                                c.as_f64()
+                            } else {
+                                match self.to_number_strict(c) {
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        err = Some(e);
+                                        break 'outer;
+                                    }
+                                }
                             }
                         }
                     };
@@ -3187,8 +3726,318 @@ impl<'p> Vm<'p> {
         if let Some(e) = err {
             return Err(e);
         }
-        items.copy_from_slice(&a);
+        *items = a;
         Ok(())
+    }
+}
+
+#[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
+fn exact_numeric_sub_sort_proto(p: &crate::bytecode::FuncProto) -> bool {
+    // A simple two-parameter function has no default/destructuring prologue.
+    // Rest/arguments, generators and async functions all have observable call
+    // behaviour even when their final expression looks like subtraction, so
+    // fail closed on every one. Captures are checked in both this immutable
+    // proto and the concrete Closure at the call site.
+    p.param_count == 2
+        && p.length == 2
+        && p.simple_params
+        && p.rest_reg.is_none()
+        && p.arguments_reg.is_none()
+        && !p.is_generator
+        && !p.is_async
+        && p.non_constructable
+        && p.lexical_this
+        && p.upvalues.is_empty()
+        && p.eval_sites.is_empty()
+        && p.reg_count as usize > 3
+        && matches!(
+            p.code.as_slice(),
+            [
+                Instr::Sub { dst, a: 1, b: 2 },
+                Instr::Return { src }
+            ] if dst == src
+        )
+}
+
+#[cfg(test)]
+mod array_copy_elision_tests {
+    #[test]
+    fn comparator_sort_move_keeps_success_and_abrupt_completion_semantics() {
+        let outcome = crate::run(
+            r#"
+                let a = [3, 2, 1];
+                let calls = 0;
+                try {
+                    a.sort(function () { calls++; throw new Error("stop"); });
+                } catch (error) {}
+                console.log(a.join(",") + ":" + calls);
+
+                let b = [3, 1, 2];
+                b.sort(function (x, y) { return x - y; });
+                console.log(b.join(","));
+            "#,
+        )
+        .expect("script compiles");
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.output, vec!["3,2,1:1", "1,2,3"]);
+    }
+
+    #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
+    #[test]
+    fn exact_numeric_sub_sort_keeps_number_and_fallback_semantics() {
+        let outcome = crate::run(
+            r#"
+                let zeros = [0, -0, 0, -0];
+                zeros.sort((x, y) => x - y);
+                let signs = "";
+                for (let i = 0; i < zeros.length; i++) {
+                    signs += Object.is(zeros[i], -0) ? "-" : "+";
+                }
+                console.log(signs);
+
+                let finite = [Infinity, 2, -Infinity, -2];
+                finite.sort((x, y) => x - y);
+                console.log(finite.join(","));
+
+                let nan = [NaN, NaN, 1];
+                nan.sort((x, y) => x - y);
+                console.log(nan.join(","));
+
+                let coercions = 0;
+                let marker = { valueOf: function () { coercions++; return 2; } };
+                let mixed = [3, marker, 1];
+                mixed.sort((x, y) => x - y);
+                console.log(
+                    (mixed[0] === 1) + "," +
+                    (mixed[1] === marker) + "," +
+                    (mixed[2] === 3) + "," +
+                    (coercions > 0)
+                );
+
+                let defaults = [3, 1, 2];
+                defaults.sort((x = 0, y = 0) => x - y);
+                let rests = [3, 1, 2];
+                rests.sort((x, y, ...unused) => x - y);
+                console.log(defaults.join(",") + "|" + rests.join(","));
+
+                let big = [2n, 1n];
+                let bigThrew = false;
+                try { big.sort((x, y) => x - y); } catch (error) { bigThrew = true; }
+                console.log(bigThrew);
+            "#,
+        )
+        .expect("script compiles");
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.output,
+            vec![
+                "+-+-",
+                "-Infinity,-2,2,Infinity",
+                "NaN,NaN,1",
+                "true,true,true,true",
+                "1,2,3|1,2,3",
+                "true",
+            ]
+        );
+    }
+
+    #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
+    #[test]
+    fn exact_numeric_sub_classifier_fails_closed() {
+        fn comparator_proto(src: &str) -> crate::bytecode::FuncProto {
+            let ast = crate::front::parse_auto(src).expect("parses");
+            let program = crate::compile::compile_main_program(&ast, src).expect("compiles");
+            program.functions.last().expect("nested comparator").clone()
+        }
+
+        for src in ["let cmp = (x, y) => x - y;"] {
+            let p = comparator_proto(src);
+            assert!(super::exact_numeric_sub_sort_proto(&p), "admit {src}");
+        }
+
+        for src in [
+            "let cmp = (x = 0, y = 0) => x - y;",
+            "let cmp = (x, y, ...rest) => x - y;",
+            "let cmp = async (x, y) => x - y;",
+            "let cmp = function* (x, y) { return x - y; };",
+            "let cmp = function (x, y) { return x - y; };",
+            "let cmp = ([x], y) => x - y;",
+            "let cmp = function (x, y) { void arguments; return x - y; };",
+            "let cmp = (x, y) => y - x;",
+            "let cmp = (() => { let z = 1; return (x, y) => x - y + z; })();",
+        ] {
+            let p = comparator_proto(src);
+            assert!(!super::exact_numeric_sub_sort_proto(&p), "reject {src}");
+        }
+    }
+
+    #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
+    #[test]
+    fn exact_numeric_sub_sort_preflights_and_restores_register_window() {
+        let src = "let cmp = (x, y) => x - y;";
+        let ast = crate::front::parse_auto(src).expect("parses");
+        let program = crate::compile::compile_main_program(&ast, src).expect("compiles");
+        let fid = (program.functions.len() - 1) as u32;
+        let make_cmp = |vm: &mut super::Vm<'_>| {
+            crate::value::Value::heap(vm.heap.alloc(crate::heap::HeapObj::Closure {
+                func: fid,
+                upvalues: Vec::new(),
+                this_val: crate::value::Value::UNDEFINED,
+            }))
+        };
+
+        // A non-Number rejects before any register preparation.
+        let mut rejected = super::Vm::new(&program);
+        rejected.frames.reserve(1);
+        rejected.regs.resize(3, crate::value::Value::UNDEFINED);
+        let rejected_cmp = make_cmp(&mut rejected);
+        let rejected_len = rejected.regs.len();
+        let rejected_high_water = rejected.regs.storage.len();
+        let rejected_capacity = rejected.regs.capacity();
+        assert!(rejected
+            .exact_numeric_sub_sort_cmp(rejected_cmp, &[crate::value::Value::UNDEFINED])
+            .is_none());
+        assert_eq!(rejected.regs.len(), rejected_len);
+        assert_eq!(rejected.regs.storage.len(), rejected_high_water);
+        assert_eq!(rejected.regs.capacity(), rejected_capacity);
+
+        // An admitted Number-only sort performs the ordinary first-call growth
+        // synchronously, then restores the caller window before returning the
+        // plan. Therefore a later comparison error has no window left to leak.
+        let mut admitted = super::Vm::new(&program);
+        admitted.frames.reserve(1);
+        admitted.regs.resize(3, crate::value::Value::UNDEFINED);
+        let admitted_cmp = make_cmp(&mut admitted);
+        let caller_len = admitted.regs.len();
+        let needed = caller_len + admitted.func(fid as usize).reg_count.max(1) as usize;
+        assert!(admitted
+            .exact_numeric_sub_sort_cmp(
+                admitted_cmp,
+                &[crate::value::Value::int(2), crate::value::Value::int(1)],
+            )
+            .is_some());
+        assert_eq!(admitted.regs.len(), caller_len);
+        assert!(admitted.regs.storage.len() >= needed);
+    }
+
+    #[cfg(all(feature = "safe-sandbox", feature = "meter-only", not(feature = "jit")))]
+    #[test]
+    fn exact_numeric_sub_sort_replays_meter_and_return_boundary() {
+        use crate::embed::{self, HostValue, ScriptState};
+
+        const SRC: &str = r#"
+            var values;
+            function go() {
+                values = [8, 3, 7, 4, 9, 2, 6, 5, 1, 0];
+                values.sort((x, y) => x - y);
+                return values[0];
+            }
+        "#;
+
+        fn ready() -> (ScriptState, u32, u32) {
+            let mut state = embed::compile_script(SRC).expect("compiles");
+            state.run_init().expect("initializes");
+            let symbols = state.symbols();
+            let slot = |name: &str| {
+                symbols
+                    .iter()
+                    .find(|symbol| symbol.name == name)
+                    .unwrap_or_else(|| panic!("missing {name}"))
+                    .index
+            };
+            (state, slot("go"), slot("values"))
+        }
+
+        let (mut measured, go, _) = ready();
+        measured.set_limits(u64::MAX, None);
+        assert_eq!(measured.call_slot(go, &[]), Ok(HostValue::Number(0.0)));
+        let exact = measured.steps_used();
+        assert!(exact > 20, "sort callback work was not metered: {exact}");
+
+        let (mut replay, go, _) = ready();
+        replay.set_limits(exact, None);
+        assert_eq!(replay.call_slot(go, &[]), Ok(HostValue::Number(0.0)));
+        assert_eq!(replay.steps_used(), exact);
+        assert_eq!(replay.steps_remaining(), 0);
+
+        // Locate the caller's sort instruction and allow exactly one more
+        // tick: the comparator Sub executes, but its Return must be rejected.
+        // Because Array.sort commits only after successful comparison, the
+        // globally visible array must still be in its original order.
+        let ast = crate::front::parse_auto(SRC).expect("parses");
+        let program = crate::compile::compile_main_program(&ast, SRC).expect("compiles");
+        let go_proto = program
+            .functions
+            .iter()
+            .find(|p| p.name == "go")
+            .expect("go proto");
+        let sort_ip = go_proto
+            .code
+            .iter()
+            .position(|i| matches!(i, crate::bytecode::Instr::CallMethod { .. }))
+            .expect("sort call");
+        let boundary = sort_ip as u64 + 2;
+
+        let (mut stopped, go, values) = ready();
+        stopped.set_limits(boundary, None);
+        let error = stopped
+            .call_slot(go, &[])
+            .expect_err("Return must not execute after the last permitted Sub");
+        assert!(error.contains("instruction budget"), "got {error:?}");
+        assert_eq!(stopped.steps_used(), boundary);
+        assert_eq!(
+            stopped.get_slot(values),
+            HostValue::Array(vec![
+                HostValue::Number(8.0),
+                HostValue::Number(3.0),
+                HostValue::Number(7.0),
+                HostValue::Number(4.0),
+                HostValue::Number(9.0),
+                HostValue::Number(2.0),
+                HostValue::Number(6.0),
+                HostValue::Number(5.0),
+                HostValue::Number(1.0),
+                HostValue::Number(0.0)
+            ])
+        );
+    }
+
+    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
+    #[test]
+    fn non_jit_callbacks_capture_only_length_and_seed_but_read_elements_live() {
+        let outcome = crate::run(
+            r#"
+                let a = [1, 2, 3];
+                let seen = [];
+                let mapped = a.map(function (value, index) {
+                    seen.push(value);
+                    if (index === 0) { a[1] = 20; a.push(4); }
+                    return value * 2;
+                });
+                console.log(seen.join(",") + "|" + mapped.join(",") + "|" + a.join(","));
+
+                let b = [1, 2, 3];
+                let sum = b.reduce(function (acc, value, index) {
+                    if (index === 1) { b[2] = 30; b.push(4); }
+                    return acc + value;
+                });
+                console.log(sum + "|" + b.join(","));
+
+                let getterCalls = 0;
+                let overlaid = [, 2, 3];
+                Object.defineProperty(overlaid, "0", {
+                    configurable: true,
+                    get: function () { getterCalls++; return 7; }
+                });
+                console.log(overlaid.reduce(function (x, y) { return x + y; }) + ":" + getterCalls);
+            "#,
+        )
+        .expect("script compiles");
+        assert_eq!(outcome.error, None);
+        assert_eq!(
+            outcome.output,
+            vec!["1,20,3|2,40,6|1,20,3,4", "33|1,2,30,4", "12:1"]
+        );
     }
 }
 

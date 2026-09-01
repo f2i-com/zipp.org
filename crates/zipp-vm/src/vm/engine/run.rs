@@ -237,6 +237,7 @@ impl<'p> Vm<'p> {
     /// loader: dependencies link before the body evaluates. The loader path
     /// is synchronous, so a top-level await in such an entry surfaces the
     /// explicit not-yet-supported TypeError (B15 lifts that).
+    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
     pub fn run_module_entry(&mut self, path: &std::path::Path) -> Result<Value, Thrown> {
         // The host (harness) script may have already run on this Vm — do NOT
         // re-setup (re-hoisting would re-materialize host functions, losing
@@ -300,6 +301,7 @@ impl<'p> Vm<'p> {
     /// its capability promise: a fulfilled body refreshes the namespace
     /// snapshot and resolves; a rejected/thrown body rejects; a body that
     /// itself suspends at top-level await is ADOPTED (pass-through reactions).
+    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
     pub(crate) fn run_deferred_module(&mut self, cap: u32, st: DeferredModuleExec) {
         let exec = self.execute_eval_program(
             st.base_func,

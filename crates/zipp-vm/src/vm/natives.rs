@@ -3323,6 +3323,7 @@ impl<'p> Vm<'p> {
             // Async-module plumbing: `this` carries the deferred module's
             // capability-promise index. OK decrements the pending-dependency
             // count and runs the body on zero; FAIL rejects the capability.
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             MODULE_DEP_OK => {
                 let cap = this.as_f64() as u32;
                 if let Some(st) = self.deferred_mods.get_mut(&cap) {
@@ -3392,12 +3393,15 @@ impl<'p> Vm<'p> {
                 self.agent_broadcast(sab, id)?;
                 Value::UNDEFINED
             }
+            #[cfg(not(feature = "wasm-single-agent"))]
             AGENT_RECEIVE_BROADCAST => {
                 // Worker-side: register cb(sab, id) for the next broadcast.
                 // GC ROOT (gc.rs traces broadcast_cb).
                 self.broadcast_cb = args.first().copied().unwrap_or(Value::UNDEFINED);
                 Value::UNDEFINED
             }
+            #[cfg(feature = "wasm-single-agent")]
+            AGENT_RECEIVE_BROADCAST => Value::UNDEFINED,
             AGENT_REPORT => {
                 // ToString(x) onto the shared FIFO the main agent's
                 // getReport() pops. Workers report; main pushing is harmless.
@@ -3449,6 +3453,7 @@ impl<'p> Vm<'p> {
                 std::thread::sleep(host_timeout_duration(ms)?);
                 Value::UNDEFINED
             }
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             MODULE_DEP_FAIL => {
                 let cap = this.as_f64() as u32;
                 if self.deferred_mods.remove(&cap).is_some() {
@@ -3462,6 +3467,7 @@ impl<'p> Vm<'p> {
             // promise, args = [specifier, type?]. Performs the load now and
             // settles the promise exactly like the inline path (including
             // chaining on a still-pending TLA body promise).
+            #[cfg(not(feature = "wasm-no-fs-loader"))]
             MODULE_DYN_IMPORT => {
                 let p = this.heap_index();
                 let spec = self.display(args.first().copied().unwrap_or(Value::UNDEFINED));

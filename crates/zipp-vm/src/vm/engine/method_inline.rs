@@ -1005,7 +1005,11 @@ mod replay_safety_tests {
             .position(|proto| proto.source.contains("return this.n + 1"))
             .expect("Subject.value function") as u32;
         vm.set_instrumentation(crate::vm::instrument::Recorder::new());
-        let before = vm.instr_rec.as_ref().expect("recorder attached").used;
+        let before = vm
+            .instr_rec
+            .as_ref()
+            .expect("recorder attached")
+            .steps_used();
 
         assert_eq!(
             vm.try_method_inline(fid, subject, 0, 0, 0),
@@ -1013,7 +1017,7 @@ mod replay_safety_tests {
             "nested work must fall back to the exactly metered frame path"
         );
         assert_eq!(
-            vm.instr_rec.as_ref().unwrap().used,
+            vm.instr_rec.as_ref().unwrap().steps_used(),
             before,
             "a declined speculative path must not consume metered work"
         );
@@ -1046,7 +1050,11 @@ mod replay_safety_tests {
             .position(|proto| proto.source.contains("this.n = x | 0"))
             .expect("value setter") as u32;
         vm.set_instrumentation(crate::vm::instrument::Recorder::new());
-        let before_steps = vm.instr_rec.as_ref().expect("recorder attached").used;
+        let before_steps = vm
+            .instr_rec
+            .as_ref()
+            .expect("recorder attached")
+            .steps_used();
         let before_value = vm.get_prop(subject, "n").expect("read n");
 
         assert_eq!(vm.accessor_fast_get(getter, subject), None);
@@ -1057,7 +1065,7 @@ mod replay_safety_tests {
             "the metered setter shortcut must decline before its store"
         );
         assert_eq!(
-            vm.instr_rec.as_ref().unwrap().used,
+            vm.instr_rec.as_ref().unwrap().steps_used(),
             before_steps,
             "declined accessor shortcuts must not consume untracked work"
         );

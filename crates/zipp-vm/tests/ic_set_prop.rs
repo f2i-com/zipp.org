@@ -171,3 +171,59 @@ fn set_prop_ic_falls_back_for_proxy_and_exotic_receivers() {
 
     assert_eq!(output, ["proxy 1 8", "array 13 0"]);
 }
+
+#[test]
+fn adjacent_set_then_get_forwards_only_the_same_plain_own_data_property() {
+    let output = run_ok(
+        r#"
+        function same(o, v) { o.x = v; return o.x; }
+        let plain = { x: 0 };
+        console.log("plain", same(plain, 3), same(plain, 4), plain.x);
+
+        let readonly = {};
+        Object.defineProperty(readonly, "x", {
+            value: 5, writable: false, configurable: true
+        });
+        console.log("readonly", same(readonly, 9), readonly.x);
+
+        let backing = 0;
+        let accessor = {};
+        Object.defineProperty(accessor, "x", {
+            get: function() { return backing + 1; },
+            set: function(v) { backing = v * 2; },
+            configurable: true
+        });
+        console.log("accessor", same(accessor, 6), backing);
+
+        let setCalls = 0;
+        let getCalls = 0;
+        let target = { x: 0 };
+        let proxy = new Proxy(target, {
+            set: function(t, k, v) { setCalls++; t[k] = v + 2; return true; },
+            get: function(t, k) { getCalls++; return t[k] + 3; }
+        });
+        console.log("proxy", same(proxy, 7), setCalls, getCalls, target.x);
+
+        function differentKey(o, v) { o.x = v; return o.y; }
+        let keys = { x: 0, y: 12 };
+        console.log("key", differentKey(keys, 8), keys.x);
+
+        function differentReceiver(a, b, v) { a.x = v; return b.x; }
+        let left = { x: 0 };
+        let right = { x: 14 };
+        console.log("receiver", differentReceiver(left, right, 10), left.x);
+        "#,
+    );
+
+    assert_eq!(
+        output,
+        [
+            "plain 3 4 4",
+            "readonly 5 5",
+            "accessor 13 12",
+            "proxy 12 1 1 9",
+            "key 12 8",
+            "receiver 14 10",
+        ]
+    );
+}

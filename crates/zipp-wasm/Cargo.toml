@@ -1,6 +1,6 @@
 [package]
 name = "zipp-wasm"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 license = "Apache-2.0"
 description = "WebAssembly embedding of the zipp JavaScript engine: a persistent VM a browser host can keep alive across re-entries."
@@ -27,7 +27,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # The engine, interpreter-only: the JIT tiers emit x86-64/ARM64 native code and
 # have no meaning on wasm (see zipp-vm's `jit` feature).
-zipp-vm = { path = "../zipp-vm", default-features = false, features = ["safe-sandbox"] }
+zipp-vm = { path = "../zipp-vm", default-features = false, features = ["safe-sandbox", "meter-only", "wasm-no-fs-loader", "wasm-single-agent"] }
 wasm-bindgen = "=0.2.126"
 # Keep the Function type/call bindings, but do not compile js-sys's
 # `unsafe-eval` constructors into the trusted host surface.

@@ -6085,10 +6085,12 @@ pub(crate) extern "win64" fn jit_regexp_scalar_flush(
 }
 
 /// Exact non-global exec scalar helper. The third Win64 argument packs the
-/// captured callee/receiver/input register indices and the fourth packs the
-/// four future ToNum destination registers (one u16 each); all Values are read
-/// from the traced frame after the GC safe point, and all outputs are committed
-/// only after the full protocol/shape/capture scan succeeds.
+/// captured callee/receiver/input register indices and the fourth points at
+/// four native-frame scratch Values. All operands are read from the traced
+/// frame after the GC safe point, and all outputs are staged only after the
+/// full protocol/shape/capture scan succeeds. Codegen publishes each scratch
+/// Value at its original ToNum position so recycled bytecode registers cannot
+/// clobber a future capture.
 /// `TRUE` denotes a successful match, `NULL` a semantic miss, and
 /// `SELF_CALL_DEOPT` a pure guard decline.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -6096,9 +6098,9 @@ pub(crate) extern "win64" fn jit_regexp_scalar_exec(
     vm: *mut core::ffi::c_void,
     regs: *mut u64,
     packed_inputs: u64,
-    packed_dsts: u64,
+    capture_nums: *mut u64,
 ) -> u64 {
-    if regs.is_null() {
+    if regs.is_null() || capture_nums.is_null() {
         return crate::codegen::SELF_CALL_DEOPT;
     }
     let vm = unsafe { &mut *(vm as *mut Vm) };
@@ -6118,8 +6120,7 @@ pub(crate) extern "win64" fn jit_regexp_scalar_exec(
     match vm.regexp_scalar_exec_step(callee, recv, input) {
         super::proxy_regexp::RegexpScalarExecStep::Success(values) => {
             for (g, value) in values.into_iter().enumerate() {
-                let dst = ((packed_dsts >> (16 * g)) & 0xFFFF) as usize;
-                unsafe { *regs.add(dst) = value.bits() };
+                unsafe { *capture_nums.add(g) = value.bits() };
             }
             Value::TRUE.bits()
         }

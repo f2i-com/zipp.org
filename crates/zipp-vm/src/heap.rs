@@ -56,6 +56,7 @@ pub const PROP_INDEX_THRESHOLD: usize = 12;
 /// [`Heap`]'s fid-mirror sentinel for "not a plain callable": no real
 /// FuncProto id reaches `u32::MAX` (function tables are bounds-checked far
 /// below it), so the emitted guard can compare against a baked id blindly.
+#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
 pub(crate) const FID_MIRROR_NONE: u32 = u32::MAX;
 
 /// Slot sentinel for an empty [`PropIndex`] bucket (a real slot is a `keys`
@@ -820,6 +821,13 @@ const OBJ_POOL_FLOOR: usize = 4096;
 /// `ZIPP_NO_ATTRS_ELIDE=1` makes every map carry the explicit attribute
 /// vector from birth (`PropAttrs::Mixed`), the pre-elision representation —
 /// the single-binary A/B for the all-default elision. Latched on first use.
+#[cfg(feature = "meter-only")]
+#[inline(always)]
+const fn attrs_elide_enabled() -> bool {
+    true
+}
+
+#[cfg(not(feature = "meter-only"))]
 #[inline]
 fn attrs_elide_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -1558,6 +1566,7 @@ impl PropAttrs {
         }
     }
 
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     fn get(&self, i: usize) -> Option<PropAttr> {
         match self {
@@ -1704,6 +1713,7 @@ impl ObjMap {
         self.attrs.at(i)
     }
 
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub fn attr_get(&self, i: usize) -> Option<PropAttr> {
         self.attrs.get(i)
@@ -3982,6 +3992,13 @@ mod gc_courier {
         SetV(Vec<super::Value>),
     }
 
+    #[cfg(feature = "meter-only")]
+    #[inline(always)]
+    const fn enabled() -> bool {
+        false
+    }
+
+    #[cfg(not(feature = "meter-only"))]
     fn enabled() -> bool {
         use std::sync::atomic::{AtomicU8, Ordering};
         static STATE: AtomicU8 = AtomicU8::new(0);
@@ -4053,6 +4070,13 @@ mod gc_courier {
     /// merely-registered idle thread costing ~3.7% on async-promise-chain
     /// (mimalloc-secure's cross-thread bookkeeping scales with registered
     /// threads), so a run that never ships must never spawn it.
+    #[cfg(feature = "meter-only")]
+    #[inline(always)]
+    pub(super) const fn active() -> bool {
+        false
+    }
+
+    #[cfg(not(feature = "meter-only"))]
     pub(super) fn active() -> bool {
         enabled()
     }
@@ -4289,6 +4313,7 @@ const COURIER_BULK_SWEEP_BYTES: usize = 1 << 20;
 /// fid, and the `vals` base — sized and laid out for the JIT's
 /// `base + idx*16` addressing. `#[repr(C)]` pins the field offsets the
 /// `host_api` asserts check.
+#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HotMirror {
@@ -4297,6 +4322,7 @@ pub(crate) struct HotMirror {
     pub(crate) vals: u64,
 }
 
+#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
 impl HotMirror {
     /// The cleared record: unmatchable shape (`DICT`), no callee, null vals.
     pub(crate) const CLEAR: HotMirror = HotMirror {
@@ -4305,6 +4331,35 @@ impl HotMirror {
         vals: 0,
     };
 }
+
+#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+type HotMirrorHint = Option<HotMirror>;
+#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+type HotMirrorHint = ();
+
+#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+#[inline(always)]
+fn no_hot_mirror() -> HotMirrorHint {
+    None
+}
+
+#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+#[inline(always)]
+fn no_hot_mirror() -> HotMirrorHint {}
+
+#[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+#[inline(always)]
+fn object_hot_mirror(map: &ObjMap, shape: u32) -> HotMirrorHint {
+    Some(HotMirror {
+        shape,
+        fid: FID_MIRROR_NONE,
+        vals: map.vals.as_ptr() as u64,
+    })
+}
+
+#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+#[inline(always)]
+fn object_hot_mirror(_map: &ObjMap, _shape: u32) -> HotMirrorHint {}
 
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
@@ -4825,16 +4880,19 @@ pub struct Heap {
     /// no invalidation discipline — a callable's proto id is immutable for
     /// the occupant's lifetime — so `bump_version` leaves it alone and only
     /// the settling refresh and `free_slot` maintain it.
+    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
     hot_mirror: Vec<HotMirror>,
     /// ARROW-`this` MIRROR (B189b), parallel to `objs`: a Closure occupant's
     /// captured `this_val` bits (UNDEFINED bits otherwise). Immutable per
     /// occupant like the fid — settling refresh + `free_slot` clear only.
+    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
     this_mirror: Vec<u64>,
     /// UPVALUE-BASE MIRROR (B189b), parallel to `objs`: a Closure occupant's
     /// `upvalues` base pointer (0 when none). The pointer is fixed at closure
     /// creation and the box never moves while live, so the same settling
     /// discipline as `fid_mirror` keeps it exact; the emitted call lane
     /// installs it as the activation's `upvals_raw`.
+    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
     upvals_mirror: Vec<u64>,
     /// CELL-VALUE MIRROR (B189), parallel to `objs`: a live copy of
     /// `HeapObj::Cell` payloads (UNDEFINED bits everywhere else), so the
@@ -4851,6 +4909,7 @@ pub struct Heap {
     /// (`[rdi + offset]`) on every access. Tier-C loads `versions_raw` only on
     /// entry; an allocation or user-code call still re-derives its pinned r13
     /// through the existing helper before any later version read.
+    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
     pub(crate) hot_mirror_raw: u64,
     /// Number of entries addressable through `hot_mirror_raw`.  Emitted
     /// guards check this before dereferencing a heap-tagged value so a
@@ -4859,7 +4918,9 @@ pub struct Heap {
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) hot_mirror_len: u32,
     pub(crate) cell_vals_mirror_raw: u64,
+    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
     pub(crate) this_mirror_raw: u64,
+    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
     pub(crate) upvals_mirror_raw: u64,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) versions_raw: u64,
@@ -5355,15 +5416,21 @@ impl Heap {
             obj_pool_sort_stats: [0; 4],
             thin_alloc: thin_alloc_default(),
             thin_stats: [0; 6],
+            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
             hot_mirror: vec![HotMirror::CLEAR; versions.len()],
             cell_vals_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
+            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
             this_mirror: vec![Value::UNDEFINED.bits(); versions.len()],
+            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
             upvals_mirror: vec![0; versions.len()],
+            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
             hot_mirror_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             hot_mirror_len: 0,
             cell_vals_mirror_raw: 0,
+            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
             this_mirror_raw: 0,
+            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
             upvals_mirror_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             versions_raw: 0,
@@ -5412,14 +5479,17 @@ impl Heap {
     /// the VM. Called after any growth of the parallel vectors (and at boot).
     #[inline]
     fn recache_mirror_raws(&mut self) {
-        self.hot_mirror_raw = self.hot_mirror.as_ptr() as u64;
+        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        {
+            self.hot_mirror_raw = self.hot_mirror.as_ptr() as u64;
+            self.this_mirror_raw = self.this_mirror.as_ptr() as u64;
+            self.upvals_mirror_raw = self.upvals_mirror.as_ptr() as u64;
+        }
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             self.hot_mirror_len = self.hot_mirror.len() as u32;
         }
         self.cell_vals_mirror_raw = self.cell_vals_mirror.as_ptr() as u64;
-        self.this_mirror_raw = self.this_mirror.as_ptr() as u64;
-        self.upvals_mirror_raw = self.upvals_mirror.as_ptr() as u64;
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             self.versions_raw = self.versions.as_ptr() as u64;
@@ -5444,10 +5514,13 @@ impl Heap {
     /// here instead of an accident of shape non-collision (B178 review).
     #[inline]
     pub fn pin_mirror_dict(&mut self, idx: u32) {
-        self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        {
+            self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+            self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
+            self.upvals_mirror[idx as usize] = 0;
+        }
         self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
-        self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
-        self.upvals_mirror[idx as usize] = 0;
     }
 
     /// B201: allocate a captured-variable cell holding `initial` — the only
@@ -5675,20 +5748,19 @@ impl Heap {
             shape,
             "settled mirror must carry the map's own shape"
         );
-        let hot = HotMirror {
-            shape,
-            fid: FID_MIRROR_NONE,
-            vals: boxed.vals.as_ptr() as u64,
-        };
+        let hot = object_hot_mirror(&boxed, shape);
         if self.payload_accounting.get() {
-            return self.alloc_settled(HeapObj::Object(boxed), Some(hot));
+            return self.alloc_settled(HeapObj::Object(boxed), hot);
         }
         let Some(idx) = self.free.pop() else {
-            return self.alloc_settled(HeapObj::Object(boxed), Some(hot));
+            return self.alloc_settled(HeapObj::Object(boxed), hot);
         };
         self.reuse_slot_begin();
         self.reuse_slot_write(idx, HeapObj::Object(boxed));
-        self.hot_mirror[idx as usize] = hot;
+        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        if let Some(hot) = hot {
+            self.hot_mirror[idx as usize] = hot;
+        }
         self.reuse_slot_stamp(idx);
         if self.oracle {
             self.thin_stats[1] += 1;
@@ -5763,6 +5835,7 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         if self.thin_alloc && !self.payload_accounting.get() {
             if let Some(idx) = self.free.pop() {
+                #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
                 debug_assert_eq!(
                     self.hot_mirror[idx as usize],
                     HotMirror::CLEAR,
@@ -5790,11 +5863,14 @@ impl Heap {
             if let Some(idx) = self.free.pop() {
                 self.reuse_slot_begin();
                 self.reuse_slot_write(idx, HeapObj::Func(fid));
-                self.hot_mirror[idx as usize] = HotMirror {
-                    shape: crate::shape::DICT,
-                    fid,
-                    vals: 0,
-                };
+                #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+                {
+                    self.hot_mirror[idx as usize] = HotMirror {
+                        shape: crate::shape::DICT,
+                        fid,
+                        vals: 0,
+                    };
+                }
                 self.reuse_slot_stamp(idx);
                 if self.oracle {
                     self.thin_stats[3] += 1;
@@ -5819,6 +5895,7 @@ impl Heap {
         if self.thin_alloc && !self.payload_accounting.get() {
             if let Some(idx) = self.free.pop() {
                 // A Vec's buffer address survives the move into the slot.
+                #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
                 let upvals_raw = if upvalues.is_empty() {
                     0
                 } else {
@@ -5833,13 +5910,16 @@ impl Heap {
                         this_val,
                     },
                 );
-                self.this_mirror[idx as usize] = this_val.bits();
-                self.upvals_mirror[idx as usize] = upvals_raw;
-                self.hot_mirror[idx as usize] = HotMirror {
-                    shape: crate::shape::DICT,
-                    fid: func,
-                    vals: 0,
-                };
+                #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+                {
+                    self.this_mirror[idx as usize] = this_val.bits();
+                    self.upvals_mirror[idx as usize] = upvals_raw;
+                    self.hot_mirror[idx as usize] = HotMirror {
+                        shape: crate::shape::DICT,
+                        fid: func,
+                        vals: 0,
+                    };
+                }
                 self.reuse_slot_stamp(idx);
                 if self.oracle {
                     self.thin_stats[4] += 1;
@@ -5892,21 +5972,15 @@ impl Heap {
             shape,
             "settled mirror must carry the map's own shape"
         );
-        let vals = boxed.vals.as_ptr() as u64;
-        self.alloc_settled(
-            HeapObj::Object(boxed),
-            Some(HotMirror {
-                shape,
-                fid: FID_MIRROR_NONE,
-                vals,
-            }),
-        )
+        let hot = object_hot_mirror(&boxed, shape);
+        self.alloc_settled(HeapObj::Object(boxed), hot)
     }
 
     /// Refresh slot `idx`'s shape/vals mirrors from the live object — the
     /// settling events: allocation, wholesale replace, and the JIT miss
     /// helper's repair after resolving own data (see the field docs for why
     /// `bump_version` must NOT use this).
+    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
     #[inline]
     pub fn refresh_mirror(&mut self, idx: u32) {
         // One pass over the occupant, and — B198 — the cold mirrors
@@ -5953,6 +6027,12 @@ impl Heap {
         self.hot_mirror[idx as usize] = hot;
     }
 
+    /// Meter-only interpreter builds have no native probes that consume the
+    /// hot/closure mirrors, so their settling hook compiles away entirely.
+    #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+    #[inline(always)]
+    pub fn refresh_mirror(&mut self, _idx: u32) {}
+
     /// W9: enter a static-pretenure scope (NURSERY_DESIGN.md §4) — until the
     /// matching [`Heap::pretenure_end`], every allocation is stamped OLD-clean
     /// and skipped from the young log. Callers must pair begin/end on every
@@ -5979,7 +6059,7 @@ impl Heap {
 
     #[inline]
     pub fn alloc(&mut self, obj: HeapObj) -> u32 {
-        self.alloc_settled(obj, None)
+        self.alloc_settled(obj, no_hot_mirror())
     }
 
     /// B238/B240: the one allocation body, which settles the occupant's hot
@@ -5993,7 +6073,9 @@ impl Heap {
     /// +0.73%) — and forcing it grew the binary by 664KB, which is I-cache
     /// pressure charged to every row. Passing the mirror instead keeps one
     /// body and one copy: `alloc` is a wrapper LLVM folds away.
-    fn alloc_settled(&mut self, obj: HeapObj, hot: Option<HotMirror>) -> u32 {
+    fn alloc_settled(&mut self, obj: HeapObj, hot: HotMirrorHint) -> u32 {
+        #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+        let _ = hot;
         // Sizing every allocation is only worth paying once something reads
         // the figure; `audit_resident_bytes` turns accounting on and backfills
         // (see `payload_accounting`), so lazily-enabled totals stay exact.
@@ -6022,6 +6104,7 @@ impl Heap {
                 self.resident_payload_charged[idx as usize].set(payload);
             }
             self.versions[idx as usize] = self.versions[idx as usize].wrapping_add(1);
+            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
             match hot {
                 Some(h) => self.hot_mirror[idx as usize] = h,
                 None => self.refresh_mirror(idx),
@@ -6056,11 +6139,15 @@ impl Heap {
         self.objs.push(obj);
         self.resident_payload_charged.push(Cell::new(payload));
         self.versions.push(0);
-        self.hot_mirror.push(HotMirror::CLEAR);
         self.cell_vals_mirror.push(Value::UNDEFINED.bits());
-        self.this_mirror.push(Value::UNDEFINED.bits());
-        self.upvals_mirror.push(0);
+        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        {
+            self.hot_mirror.push(HotMirror::CLEAR);
+            self.this_mirror.push(Value::UNDEFINED.bits());
+            self.upvals_mirror.push(0);
+        }
         self.recache_mirror_raws();
+        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
         match hot {
             Some(h) => self.hot_mirror[idx as usize] = h,
             None => self.refresh_mirror(idx),
@@ -6543,9 +6630,23 @@ impl Heap {
         // from the mirror instead of the dying map's own fields is what
         // keeps the sweep from touching a second cold line per object
         // (survival's minors measured +5.8ms from those field reads).
-        #[cfg(not(feature = "safe-sandbox"))]
+        #[cfg(all(
+            not(feature = "safe-sandbox"),
+            any(not(feature = "meter-only"), feature = "jit")
+        ))]
         let was_settled = self.hot_mirror[idx as usize].shape != crate::shape::DICT;
-        self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+        // Mirrorless meter-only builds conservatively skip the optional object
+        // shell pool; collection, reclamation, and accounting are unchanged.
+        #[cfg(all(
+            not(feature = "safe-sandbox"),
+            feature = "meter-only",
+            not(feature = "jit")
+        ))]
+        let was_settled = false;
+        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        {
+            self.hot_mirror[idx as usize] = HotMirror::CLEAR;
+        }
         // B197: the charge cell is touched only under accounting — with it
         // off (the default) every charge is 0 and the replace was a pure
         // extra cache line on the sweep's per-dead path.
@@ -6574,6 +6675,7 @@ impl Heap {
             HeapObj::Cell => {
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
             }
+            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
             HeapObj::Closure { .. } => {
                 self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
                 self.upvals_mirror[idx as usize] = 0;
@@ -7022,6 +7124,7 @@ impl Heap {
             HeapObj::Cell => {
                 self.cell_vals_mirror[idx as usize] = Value::UNDEFINED.bits();
             }
+            #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
             HeapObj::Closure { .. } => {
                 self.this_mirror[idx as usize] = Value::UNDEFINED.bits();
                 self.upvals_mirror[idx as usize] = 0;
@@ -7059,8 +7162,11 @@ impl Heap {
         // The next miss on the object repairs the mirror from the settled map.
         // (`fid_mirror` deliberately survives the bump: a callable's proto id
         // is immutable for the occupant's lifetime, so no bump can stale it.)
-        self.hot_mirror[idx as usize].shape = crate::shape::DICT;
-        self.hot_mirror[idx as usize].vals = 0;
+        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        {
+            self.hot_mirror[idx as usize].shape = crate::shape::DICT;
+            self.hot_mirror[idx as usize].vals = 0;
+        }
     }
 
     /// Base pointer of the parallel version array (for the JIT inline cache). The
@@ -7982,7 +8088,10 @@ mod tests {
     /// B257: the thin paths reuse a swept slot in place — tombstone
     /// overwritten without drop glue, mirrors settled from the values in
     /// hand — and agree with `refresh_mirror` on every mirror line.
-    #[cfg(not(feature = "safe-sandbox"))]
+    #[cfg(all(
+        not(feature = "safe-sandbox"),
+        any(not(feature = "meter-only"), feature = "jit")
+    ))]
     #[test]
     fn thin_paths_reuse_swept_slots_with_settled_mirrors() {
         let (plan, vals, shape) = slab_fixture();
@@ -9181,6 +9290,41 @@ mod tests {
         assert_eq!(h.resident_payload_current.get(), baseline + charge);
     }
 
+    #[test]
+    fn cell_payload_survives_free_closure_reuse_and_reallocation() {
+        let mut h = Heap::new();
+        let cell = h.alloc_cell(Value::int(41));
+        assert_eq!(h.cell_get(cell), Value::int(41));
+
+        h.cell_set(cell, Value::int(42));
+        assert_eq!(h.cell_get(cell), Value::int(42));
+        h.free_slot(cell);
+        assert_eq!(
+            h.cell_mirror_bits(cell),
+            Value::UNDEFINED.bits(),
+            "reclaiming a Cell must clear its authoritative payload"
+        );
+
+        let closure = h.alloc(HeapObj::Closure {
+            func: 0,
+            upvalues: Vec::new(),
+            this_val: Value::int(7),
+        });
+        assert_eq!(closure, cell, "the free-list slot should be reused");
+        assert!(matches!(h.get(closure), HeapObj::Closure { .. }));
+        assert_eq!(
+            h.cell_mirror_bits(closure),
+            Value::UNDEFINED.bits(),
+            "a Closure occupant must not inherit a dead Cell payload"
+        );
+
+        h.free_slot(closure);
+        let cell_again = h.alloc_cell(Value::int(99));
+        assert_eq!(cell_again, cell);
+        assert_eq!(h.cell_get(cell_again), Value::int(99));
+    }
+
+    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
     #[test]
     fn shape_mirror_settles_at_alloc_invalidates_at_bump_repairs_on_demand() {
         let mut h = Heap::new();

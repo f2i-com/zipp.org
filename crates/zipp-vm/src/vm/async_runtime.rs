@@ -3495,6 +3495,7 @@ impl<'p> Vm<'p> {
                 (a, b) => a.or(b),
             };
             let Some(due) = due else {
+                #[cfg(not(feature = "wasm-single-agent"))]
                 if self.agent_role == agents::AgentRole::Worker && !self.async_waiters.is_empty() {
                     // Worker with only infinite-deadline waiters: park until a
                     // notify lands in the mailbox (re-check under the lock —

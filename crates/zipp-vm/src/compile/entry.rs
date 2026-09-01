@@ -29,6 +29,7 @@ pub fn compile_main_program(prog: &ast::Program, source: &str) -> R<Program> {
 
 /// Compile a MODULE as the program entry: the top level is an async context
 /// (top-level `await`), and the VM runs func 0 as an async activation.
+#[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
 pub fn compile_module(prog: &ast::Program, source: &str) -> R<Program> {
     compile_program_inner(prog, source, true, false)
 }

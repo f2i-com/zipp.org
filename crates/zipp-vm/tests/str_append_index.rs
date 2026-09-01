@@ -370,21 +370,26 @@ fn cursor_plan_rejects_unfused_calls() {
     );
 }
 
-/// The reserve changes only a Rust backing buffer's spare capacity. Native and
-/// forced-interpreter execution must still charge exactly the same bytecodes,
-/// return the same value, and report the same slot-based heap high-water mark.
+/// Native and forced-interpreter execution must charge exactly the same
+/// bytecodes, return the same value, and retain the same incremental guest
+/// payload. Compare growth rather than the absolute VM total: a JIT-enabled VM
+/// intentionally pins a larger register allocation before guest execution.
 #[test]
 #[cfg(feature = "instrument")]
 fn reserved_first_builder_meter_and_heap_accounting_are_exact() {
-    const SCRIPT: &str = r#"
-      function copy(s) {
+    const SETUP: &str = r#"
+      function __appendIndexCopy(s) {
         let out = "";
         for (let i = 0; i < s.length; i++) out += s[i];
         return out;
       }
-      let sum = 0;
-      for (let n = 0; n < 1200; n++) sum += copy("0123456789abcdefghijklmnopqrstu").length;
-      sum;
+      function __appendIndexRun(rounds) {
+        let sum = 0;
+        for (let n = 0; n < rounds; n++) {
+          sum += __appendIndexCopy("0123456789abcdefghijklmnopqrstu").length;
+        }
+        return sum;
+      }
     "#;
 
     fn metered(interpreter_only: bool) -> (u64, usize, String) {
@@ -393,14 +398,22 @@ fn reserved_first_builder_meter_and_heap_accounting_are_exact() {
         state.set_limits(20_000_000, None);
         state.set_heap_limit(64 * 1024 * 1024);
         if interpreter_only {
-            state.start_trace(usize::MAX);
+            state.disable_vm_jit();
         }
         state.run_init().expect("bootstrap runs");
+        state
+            .eval_in_context(SETUP)
+            .expect("builder kernel installs");
+        state
+            .eval_in_context("__appendIndexRun(1)")
+            .expect("kernel call window warms");
+        let heap_before = state.heap_bytes();
         let before = state.steps_remaining();
-        let expr = format!("globalThis.__appendIndexResult=(0,eval)({SCRIPT:?});");
-        state.eval_in_context(&expr).expect("kernel runs");
+        state
+            .eval_in_context("globalThis.__appendIndexResult=__appendIndexRun(1200)")
+            .expect("kernel runs");
         let used = before - state.steps_remaining();
-        let heap = state.heap_bytes();
+        let heap = state.heap_bytes().saturating_sub(heap_before);
         let value = state
             .eval_in_context("String(globalThis.__appendIndexResult)")
             .expect("result reads")
@@ -423,28 +436,35 @@ fn reserve_tiny_heap_limit_child() {
         return;
     }
 
-    const SCRIPT: &str = r#"
-      function copy(s) {
+    const SETUP: &str = r#"
+      function __appendIndexBoundaryCopy(s) {
         let out = "";
         for (let i = 0; i < s.length; i++) out += s[i];
         return out;
       }
-      const keep = [];
-      for (let n = 0; n < 100000; n++) {
-        keep.push(copy("0123456789abcdefghijklmnopqrstu"));
+      function __appendIndexBoundaryRun(rounds) {
+        const keep = [];
+        for (let n = 0; n < rounds; n++) {
+          keep.push(__appendIndexBoundaryCopy("0123456789abcdefghijklmnopqrstu"));
+        }
+        return keep.length;
       }
-      keep.length;
     "#;
 
     let mut state = zipp_vm::embed::compile_script("var ready=true;").expect("bootstrap compiles");
     state.set_limits(20_000_000, None);
     state.run_init().expect("bootstrap runs");
+    state
+        .eval_in_context(SETUP)
+        .expect("boundary kernel installs");
+    state
+        .eval_in_context("__appendIndexBoundaryRun(1)")
+        .expect("boundary call window warms");
     let baseline = state.heap_bytes();
     state.set_heap_limit(baseline + 16 * 1024);
 
-    let expr = format!("(0,eval)({SCRIPT:?})");
     let err = state
-        .eval_in_context(&expr)
+        .eval_in_context("__appendIndexBoundaryRun(100000)")
         .expect_err("builder retention must cross the tiny heap ceiling");
     let status = state
         .resource_limit_error()
@@ -463,11 +483,11 @@ fn reserve_tiny_heap_limit_child() {
     );
 }
 
-/// The first-builder reserve has up to 31 bytes of payload capacity that the
-/// slot-based heap meter cannot see. `set_limits` attaches the recorder and the
-/// runtime gate therefore declines that reserve. Pin the consequence at an
-/// actual sandbox boundary: default, explicit reserve-off, and forced-
-/// interpreter children must stop at the exact same step/heap/status tuple.
+/// `set_limits` makes the first-builder path decline its optional reserve. Pin
+/// that decision at an actual sandbox boundary: default, explicit reserve-off,
+/// and forced-interpreter children must stop at the exact same
+/// step/incremental-heap/status tuple, even though their fixed VM baselines
+/// differ.
 #[test]
 #[cfg(feature = "instrument")]
 fn reserved_first_builder_tiny_heap_boundary_matches_all_modes() {

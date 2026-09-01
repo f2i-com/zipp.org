@@ -165,14 +165,13 @@ fn wide_leaf_route_change_falls_back_before_raw_global_read() {
         "guarded wide lane did not engage:\n{stderr}"
     );
 
-    let no_wide = assert_route_child_ok(
-        &run_route_fresh(Some("ZIPP_NO_WIDE_LEAF")),
-        "wide-leaf ablation",
+    let no_typed_globals = assert_route_child_ok(
+        &run_route_fresh(Some("ZIPP_NO_TYPED_GLOBAL_LOAD")),
+        "typed-global ablation",
     );
     assert!(
-        no_wide.contains("DECLINE (not leaf-eligible)")
-            && !has_guarded_typed_lane(&no_wide)
-            && !no_wide.contains("INT splice"),
-        "wide-leaf ablation still scheduled the guarded lane:\n{no_wide}"
+        no_typed_globals.contains("typed-lane=DECLINED(callee-value-escapes)")
+            && !has_guarded_typed_lane(&no_typed_globals),
+        "typed-global ablation still scheduled the guarded lane:\n{no_typed_globals}"
     );
 }

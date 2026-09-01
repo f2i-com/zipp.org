@@ -374,9 +374,16 @@ pub(crate) fn compile_region_mem(
         .values()
         .any(|site| !site.cross3.is_empty() || site.cross3m.is_some());
     let c3_off = 40 + 32 * n_ta as i32;
+    // The exec scalar helper computes four capture numbers at the call site,
+    // but their bytecode destinations can be recycled as live accumulator
+    // registers before each corresponding ToNum executes.  Keep those values
+    // in native-frame scratch and publish them to the register file only at
+    // their original ToNum positions.
+    let scalar_exec_scratch_off = c3_off + if do_cross3 { 64 } else { 0 };
     let frame = 40
         + 32 * n_ta as i32
         + if do_cross3 { 64 } else { 0 }
+        + if scalar_exec.is_some() { 32 } else { 0 }
         + if do_leaf || do_method { 16 } else { 0 };
     // Byte offset (from post-prologue rsp) of the headroom flag slot (1 = the
     // scratch window fits → inline; 0 = fall back to the per-call helper).
@@ -620,10 +627,22 @@ pub(crate) fn compile_region_mem(
             );
             continue;
         }
-        if scalar_exec.is_some_and(|p| p.elides_capture_ip(ip)) {
-            // The helper wrote the four future ToNum destinations; these exact
-            // publication/capture-only bytecodes have no remaining source effect.
-            continue;
+        if let Some(plan) = scalar_exec {
+            if let Some(g) = plan.capture_tonum_ips.iter().position(|&p| p == ip) {
+                let dst = plan.tonum_dsts[g];
+                let off = scalar_exec_scratch_off + 8 * g as i32;
+                dynasm!(ops
+                    ; mov rax, [rsp + off]
+                    ; mov [rbx + dreg(dst)], rax
+                );
+                continue;
+            }
+            if plan.elides_capture_ip(ip) {
+                // The helper staged the four numeric captures in native-frame
+                // scratch; the publication/capture-only bytecodes have no
+                // remaining source effect.
+                continue;
+            }
         }
         let bail = ops.new_dynamic_label();
         match proto.code[ip] {
@@ -3201,16 +3220,11 @@ pub(crate) fn compile_region_mem(
                     debug_assert_eq!(dst, plan.call_result_reg);
                     let packed_inputs =
                         ((callee as u64) << 32) | ((this_v as u64) << 16) | arg_base as u64;
-                    let packed_dsts = plan
-                        .tonum_dsts
-                        .iter()
-                        .enumerate()
-                        .fold(0u64, |bits, (g, &reg)| bits | ((reg as u64) << (16 * g)));
                     dynasm!(ops
                         ; mov rcx, rdi
                         ; mov rdx, rbx
                         ; mov r8, QWORD packed_inputs as i64
-                        ; mov r9, QWORD packed_dsts as i64
+                        ; lea r9, [rsp + scalar_exec_scratch_off]
                         ; mov rax, QWORD heap.regexp_scalar_exec as i64
                         ; call rax
                         ; mov r10, QWORD SELF_CALL_DEOPT as i64

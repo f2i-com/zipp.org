@@ -593,6 +593,9 @@ pub(crate) fn compile_region_regalloc(
     // Cleared by `Jit::compile_region` for a region whose BOXREF compile has
     // already evicted once — see `region_boxref_blacklist`.
     boxref_ok: bool,
+    // Exact object global for a selected SROA rewrite; None for ordinary
+    // regions, whose LoadGlobal ranges must retain the generic plan.
+    sroa_obj_global: Option<u32>,
     meter: Option<crate::codegen::meter::Meter>,
     // `(code, engaged_boxref)`. The flag rides back so `Jit::compile_region` can
     // tag the installed region: a BOXREF region that evicts must retry WITHOUT
@@ -619,7 +622,17 @@ pub(crate) fn compile_region_regalloc(
     };
     // The regalloc path uses boxed-double semantics and cannot host Bitwise
     // (int32-lane) ops — they decline to the memory path here.
-    let plan = plan_region(proto, start, end, ta_plan, false, true, true, boxref)?;
+    let plan = plan_region(
+        proto,
+        start,
+        end,
+        ta_plan,
+        false,
+        true,
+        true,
+        boxref,
+        sroa_obj_global,
+    )?;
     // W28: type splits are planned ONLY for `admit_dv`/`share_homes` plans,
     // which route exclusively into the GPR emitter — this call passes neither,
     // so the map is empty by construction. Refuse rather than assume: this

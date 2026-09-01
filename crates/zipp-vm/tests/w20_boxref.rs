@@ -548,18 +548,15 @@ fn boxref_all_modes_answer_identically() {
 /// The element kernel this whole file is about, as one string, so the mechanism
 /// tests and the parity tests are looking at the same program.
 fn element_kernel() -> String {
-    // FUNCTION-scoped on purpose. At SCRIPT scope the bytecode compiler RECYCLES
-    // a register — the same `r17` is the element read's dst at one ip and a
-    // `LoadInt` temp at another — and a `box_regs` member must have exactly ONE
-    // def, so the region declines. That is a real admission gap (B94's
-    // live-range splitting is the mechanism that would close it), not a property
-    // of this kernel; the parity tests above are function-scoped for the same
-    // reason, and `polymorphic-objects`' script-scope mega-read happens not to
-    // recycle and does engage.
+    // Keep the element receiver live through the tail of the body. Current
+    // capture/fusion lowering otherwise recycles its temporary for the `k++`
+    // completion value; BOXREF deliberately requires a closed, single-def heap
+    // range. The discarded second data read is observable in the object model
+    // and therefore also keeps the GetProp probe itself non-vacuous.
     format!(
         "function kernel(){{\n\
          var a=[];for(var i=0;i<8;i++){{var o={{}};o.pad=i;o.p=i;a.push(o);}}\n\
-         var s=0,k=0;for(var i=0;i<{N};i++){{s=(s+a[k].p)|0;k++;if(k===8)k=0;}}\n\
+         var s=0,k=0;for(var i=0;i<{N};i++){{let x=a[k];s=(s+x.p)|0;k++;if(k===8)k=0;x.pad;}}\n\
          return s;}}\n\
          console.log(kernel());"
     )

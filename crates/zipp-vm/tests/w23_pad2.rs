@@ -364,21 +364,30 @@ fn pad2_bytecode_child() {
         return;
     }
     let bc = zipp_vm::compile_to_text(BYTECODE_SRC, false).expect("compile bytecode");
+    let op_count = |opcode: &str| {
+        bc.lines()
+            .filter(|line| line.trim_start().starts_with(opcode))
+            .count()
+    };
     if std::env::var_os("ZIPP_NO_PAD2_CACHE").is_some() {
         assert!(
             !bc.contains("Pad2Concat") && !bc.contains("Pad2Conditional"),
             "off switch left fused bytecode:\n{bc}"
         );
         assert_eq!(
-            bc.matches("Add {").count(),
+            op_count("Add {"),
             2,
             "off switch did not restore two Adds:\n{bc}"
         );
-        assert_eq!(bc.matches("Lt {").count(), 1, "missing original Lt:\n{bc}");
         assert_eq!(
-            bc.matches("JumpIfFalse {").count(),
+            op_count("JumpIfNotLt {"),
             1,
-            "missing original conditional branch:\n{bc}"
+            "missing direct conditional branch:\n{bc}"
+        );
+        assert_eq!(
+            op_count("Lt {") + op_count("JumpIfFalse {"),
+            0,
+            "cache switch unexpectedly disabled the independent branch fusion:\n{bc}"
         );
     } else if std::env::var_os("ZIPP_NO_PAD2_COND_FUSE").is_some() {
         assert!(
@@ -386,24 +395,24 @@ fn pad2_bytecode_child() {
             "conditional switch left whole fusion:\n{bc}"
         );
         assert_eq!(
-            bc.matches("Pad2Concat {").count(),
+            op_count("Pad2Concat {"),
             2,
             "conditional switch did not restore both literal arms:\n{bc}"
         );
-        assert_eq!(bc.matches("Lt {").count(), 1, "missing original Lt:\n{bc}");
         assert_eq!(
-            bc.matches("JumpIfFalse {").count(),
+            op_count("JumpIfNotLt {"),
             1,
-            "missing original conditional branch:\n{bc}"
+            "missing direct conditional branch:\n{bc}"
         );
+        assert_eq!(op_count("Lt {") + op_count("JumpIfFalse {"), 0);
         assert_eq!(
-            bc.matches("Add {").count(),
+            op_count("Add {"),
             0,
             "conditional switch lost Pad2Concat leaf lowering:\n{bc}"
         );
     } else {
         assert_eq!(
-            bc.matches("Pad2Conditional {").count(),
+            op_count("Pad2Conditional {"),
             1,
             "whole Pad2Conditional absent/duplicated:\n{bc}"
         );

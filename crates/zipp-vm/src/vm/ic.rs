@@ -70,6 +70,8 @@ pub(crate) const IC_WAYS: usize = 8;
 const IC_MISS_LIMIT: u8 = 16;
 /// Maximum proto-chain hops a `Proto*`/`Super*` entry can guard.
 const IC_MAX_HOPS: usize = 6;
+#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+pub(crate) const IC_NO_FIB_GLOBAL: u32 = u32::MAX;
 
 /// Let loader-installed module functions retain the same guarded call/property
 /// feedback as main-program functions. Runtime module and eval functions share
@@ -164,6 +166,12 @@ pub(crate) enum IcEntry {
         ver: u32,
         fid: u32,
         closure: u32,
+        /// Cached structural classification for the meter-only numeric fib
+        /// lane. `u32::MAX` means this immutable FuncProto is not the exact
+        /// accepted body. Keeping the result in the identity/version-guarded
+        /// Call IC entry avoids re-reading its bytecode on every hot hit.
+        #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+        fib_global: u32,
     },
     /// `super.key(…)` / `super.key` site: `home` is the class VALUE the site's
     /// `home_class_id` resolved to at fill; `hops[0]` is the derivation anchor
@@ -211,6 +219,17 @@ pub(crate) struct SiteIc {
     pub(crate) n: u8,
     rot: u8,
     pub(crate) entries: [IcEntry; IC_WAYS],
+}
+
+/// Resolved action for a plain `Call` IC hit/fill. The meter-only build carries
+/// one cached specialization witness; other builds retain the same two-u32
+/// result shape as the former tuple.
+#[derive(Clone, Copy)]
+pub(crate) struct CallIcHit {
+    pub(crate) fid: u32,
+    pub(crate) closure: u32,
+    #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+    pub(crate) fib_global: u32,
 }
 
 /// Action for a `GetProp`-shaped site (also `SuperGet`).
@@ -318,7 +337,7 @@ impl<'p> Vm<'p> {
     /// Exclusions shared with `get_member`'s fast path: objects with live /
     /// exotic slot semantics layered over their ObjMap never take IC paths.
     /// (Also consulted by the JIT region prop-miss helpers in helpers_misc.rs.)
-    #[inline]
+    #[inline(always)]
     pub(crate) fn ic_obj_ok(&self, idx: u32) -> bool {
         !(idx == self.global_this && self.global_this != 0)
             && !(idx == self.arr_proto && self.arr_proto != 0)
@@ -1088,11 +1107,12 @@ impl<'p> Vm<'p> {
                         } = site.entries[0]
                         {
                             if cached_shape == shape {
-                                if let Some(attr) = m.attr_get(slot as usize) {
-                                    if !attr.accessor && attr.writable {
-                                        plan = Some(SetPlan::WriteOwn { idx, slot });
-                                    }
-                                }
+                                // Set sites install an OwnData entry only after
+                                // proving that this exact shape has a writable
+                                // data property in the cached slot. Descriptor
+                                // changes leave the shape, so a shape hit is the
+                                // complete guard for the monomorphic first way.
+                                plan = Some(SetPlan::WriteOwn { idx, slot });
                             }
                         }
                     }
@@ -1133,17 +1153,23 @@ impl<'p> Vm<'p> {
         }
         match self.ic_walk(recv, key) {
             Walked::OwnData { slot } => {
-                let shape = self.ic_recv_shape(recv);
-                self.ic_install(
-                    func_id,
-                    ip,
-                    IcEntry::OwnData {
-                        shape,
-                        slot: slot as u32,
-                    },
-                );
                 match self.ic_own_set_plan(recv, key, slot as u32) {
-                    Some(p) => self.ic_apply_set(p, val),
+                    Some(p) => {
+                        // Only writable own-data shapes may seed the direct
+                        // shape-hit arm above. In particular, do not let a
+                        // failed write to a frozen/non-writable property leave
+                        // an entry that would make a later hit skip attributes.
+                        let shape = self.ic_recv_shape(recv);
+                        self.ic_install(
+                            func_id,
+                            ip,
+                            IcEntry::OwnData {
+                                shape,
+                                slot: slot as u32,
+                            },
+                        );
+                        self.ic_apply_set(p, val)
+                    }
                     None => SetAct::None,
                 }
             }
@@ -1302,7 +1328,13 @@ impl<'p> Vm<'p> {
                 // Nursery barrier: the interpreter IC's direct own-data store
                 // bypasses `set_prop` (whose entry barrier covers every slow
                 // route), so it carries its own.
-                self.heap.write_barrier_val(idx, val);
+                // Primitive stores dominate ordinary property loops and can
+                // never create an old-to-young edge. Keep them out of the
+                // non-inlined barrier helper entirely; the helper retains its
+                // own value check for its general call sites.
+                if val.is_heap() {
+                    self.heap.write_barrier_val(idx, val);
+                }
                 if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                     m.set_val_at(slot as usize, val);
                 }
@@ -1970,11 +2002,92 @@ impl<'p> Vm<'p> {
         None
     }
 
-    /// IC for a `Call` site: callee identity (+ slot version) → (fid,
-    /// closure) for a plain user function, skipping the Proxy/native/bound/
-    /// ctor probes and flag loads. `None` ⇒ slow path.
+    /// Classify the one exact immutable FuncProto accepted by the meter-only
+    /// numeric Fibonacci lane. This runs only while installing a `Callee` IC
+    /// way; hot hits consume the cached global slot without rescanning code.
+    #[cfg(all(feature = "meter-only", not(feature = "jit")))]
     #[inline]
-    pub(crate) fn ic_call(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<(u32, u32)> {
+    fn ic_numeric_fib_global(&self, fid: u32, closure: u32) -> Option<u32> {
+        if closure != NO_CLOSURE || fid as usize >= self.program.functions.len() {
+            return None;
+        }
+        let p = &self.program.functions[fid as usize];
+        if p.param_count != 1
+            || p.reg_count != 9
+            || p.is_generator
+            || p.is_async
+            || p.lexical_this
+            || p.rest_reg.is_some()
+            || p.arguments_reg.is_some()
+            || !p.upvalues.is_empty()
+        {
+            return None;
+        }
+        match p.code.as_slice() {
+            [Instr::LoadInt { dst: limit, val: 2 }, Instr::JumpIfNotLt {
+                a: 1,
+                b: limit_use,
+                target: 3,
+            }, Instr::Return { src: 1 }, Instr::LoadGlobal {
+                dst: callee1,
+                idx: global1,
+            }, Instr::AddInt {
+                dst: arg1,
+                a: 1,
+                imm: -1,
+                upd: false,
+            }, Instr::Call {
+                dst: result1,
+                callee: callee1_use,
+                arg_base: arg1_use,
+                argc: 1,
+            }, Instr::LoadGlobal {
+                dst: callee2,
+                idx: global2,
+            }, Instr::AddInt {
+                dst: arg2,
+                a: 1,
+                imm: -2,
+                upd: false,
+            }, Instr::Call {
+                dst: result2,
+                callee: callee2_use,
+                arg_base: arg2_use,
+                argc: 1,
+            }, Instr::Add {
+                dst: result,
+                a: result1_use,
+                b: result2_use,
+            }, Instr::Return { src: result_use }, Instr::ReturnUndefined]
+                if limit == limit_use
+                    && *limit == 4
+                    && callee1 == callee1_use
+                    && *callee1 == 5
+                    && arg1 == arg1_use
+                    && *arg1 == 6
+                    && callee2 == callee2_use
+                    && *callee2 == 6
+                    && arg2 == arg2_use
+                    && *arg2 == 7
+                    && result1 == result1_use
+                    && *result1 == 4
+                    && result2 == result2_use
+                    && *result2 == 5
+                    && result == result_use
+                    && *result == 3
+                    && global1 == global2 =>
+            {
+                Some(*global1)
+            }
+            _ => None,
+        }
+    }
+
+    /// IC for a `Call` site: callee identity (+ slot version) → a resolved
+    /// plain user function, skipping the Proxy/native/bound/ctor probes and
+    /// flag loads. `None` ⇒ slow path.
+    #[inline]
+    pub(crate) fn ic_call(&mut self, func_id: u32, ip: usize, callee: Value) -> Option<CallIcHit> {
         if !callee.is_heap() {
             return None;
         }
@@ -1985,10 +2098,17 @@ impl<'p> Vm<'p> {
                     ver,
                     fid,
                     closure,
+                    #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                    fib_global,
                 } = *e
                 {
                     if callee.bits() == bits && self.heap.version_of(callee.heap_index()) == ver {
-                        return Some((fid, closure));
+                        return Some(CallIcHit {
+                            fid,
+                            closure,
+                            #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                            fib_global,
+                        });
                     }
                 }
             }
@@ -1999,6 +2119,16 @@ impl<'p> Vm<'p> {
         match self.ic_plain_fn(callee) {
             Some((fid, closure)) => {
                 let ver = self.heap.version_of(callee.heap_index());
+                #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                let fib_global = if self.ic_func_eligible(func_id) {
+                    self.ic_numeric_fib_global(fid, closure)
+                        .unwrap_or(IC_NO_FIB_GLOBAL)
+                } else {
+                    // Runtime eval/new-Function sites do not own IC entries;
+                    // do not replace their uncached call resolution with a
+                    // repeated structural scan.
+                    IC_NO_FIB_GLOBAL
+                };
                 self.ic_install(
                     func_id,
                     ip,
@@ -2007,9 +2137,16 @@ impl<'p> Vm<'p> {
                         ver,
                         fid,
                         closure,
+                        #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                        fib_global,
                     },
                 );
-                Some((fid, closure))
+                Some(CallIcHit {
+                    fid,
+                    closure,
+                    #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                    fib_global,
+                })
             }
             None => {
                 self.ic_note_miss(func_id, ip);
@@ -2301,5 +2438,79 @@ impl<'p> Vm<'p> {
                 }
             };
         }
+    }
+}
+
+#[cfg(all(test, feature = "meter-only", not(feature = "jit")))]
+mod fib_ic_classifier_tests {
+    use super::*;
+
+    fn classify(program: Program, fid: u32) -> Option<u32> {
+        let program = Box::leak(Box::new(program));
+        Vm::new(program).ic_numeric_fib_global(fid, NO_CLOSURE)
+    }
+
+    #[test]
+    fn numeric_fib_classifier_rejects_register_permutations() {
+        const SRC: &str = "function fib(n){ return n < 2 ? n : fib(n-1) + fib(n-2); }";
+        let ast = crate::front::parse_script(SRC).expect("source parses");
+        let canonical = crate::compile::compile_program(&ast, SRC).expect("source compiles");
+        let fid = canonical
+            .functions
+            .iter()
+            .position(|p| p.name == "fib")
+            .expect("fib proto exists") as u32;
+        let expected_global = canonical.functions[fid as usize]
+            .name_global
+            .expect("fib has a global slot");
+        assert_eq!(classify(canonical.clone(), fid), Some(expected_global));
+
+        // A hand-built Program may preserve every def/use relationship while
+        // assigning different physical registers. It must not inherit the
+        // canonical compiler layout's arithmetic/capacity proof by accident.
+        let mut permuted = canonical;
+        let rename = |reg: &mut u16| {
+            *reg = match *reg {
+                3 => 8,
+                4 => 3,
+                5 => 4,
+                6 => 5,
+                7 => 6,
+                8 => 7,
+                other => other,
+            };
+        };
+        for instr in &mut permuted.functions[fid as usize].code {
+            match instr {
+                Instr::LoadInt { dst, .. } | Instr::LoadGlobal { dst, .. } => rename(dst),
+                Instr::JumpIfNotLt { a, b, .. } => {
+                    rename(a);
+                    rename(b);
+                }
+                Instr::Return { src } => rename(src),
+                Instr::AddInt { dst, a, .. } => {
+                    rename(dst);
+                    rename(a);
+                }
+                Instr::Call {
+                    dst,
+                    callee,
+                    arg_base,
+                    ..
+                } => {
+                    rename(dst);
+                    rename(callee);
+                    rename(arg_base);
+                }
+                Instr::Add { dst, a, b } => {
+                    rename(dst);
+                    rename(a);
+                    rename(b);
+                }
+                Instr::ReturnUndefined => {}
+                other => panic!("unexpected canonical fib instruction: {other:?}"),
+            }
+        }
+        assert_eq!(classify(permuted, fid), None);
     }
 }

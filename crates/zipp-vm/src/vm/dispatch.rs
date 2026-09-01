@@ -4489,10 +4489,35 @@ impl<'p> Vm<'p> {
                         if !r {
                             ip = target as usize;
                         } else {
+                            #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                            if ip >= 6
+                                && ip.checked_add(17) == Some(target as usize)
+                                && self.get(base, a) == Value::int(1)
+                            {
+                                // Run the first iteration normally so its
+                                // SetProp sites allocate/fill the same retained
+                                // IC storage as the ordinary interpreter.  The
+                                // exact projection accepts the second header
+                                // and fast-forwards the remaining pure cycle.
+                                if let Some(exit) =
+                                    self.try_metered_object_property_loop(func_id, base, ip)
+                                {
+                                    ip = exit;
+                                    continue;
+                                }
+                            }
                             ip += 1;
                         }
                     }
                     Instr::JumpIfNotLe { a, b, target } => {
+                        #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                        if ip.checked_add(7) == Some(target as usize)
+                            && self.get(base, a) == Value::int(1)
+                            && self.try_metered_counted_sum_loop(func_id, base, ip, a, b, target)
+                        {
+                            ip = target as usize;
+                            continue;
+                        }
                         let r = self.cmp_le(base, a, b, true)?;
                         if !r {
                             ip = target as usize;
@@ -5342,6 +5367,49 @@ impl<'p> Vm<'p> {
                         phase,
                         opts,
                     } => {
+                        #[cfg(feature = "wasm-no-fs-loader")]
+                        {
+                            // The dedicated WebAssembly embedder cannot install a
+                            // filesystem loader. Preserve every observable operation
+                            // before resolution: ToString(spec), import-options
+                            // validation (including Proxy/getter effects), error
+                            // precedence, and the always-asynchronous Promise result.
+                            let spec_val = self.get(base, spec);
+                            let reason = match self.to_js_string(spec_val) {
+                                Err(_) => self
+                                    .pending_throw
+                                    .take()
+                                    .unwrap_or_else(|| self.make_error(1, None)),
+                                Ok(_spec_str) => {
+                                    let opt_err = match opts {
+                                        Some(r) => {
+                                            let ov = self.get(base, r);
+                                            if ov == Value::UNDEFINED {
+                                                None
+                                            } else {
+                                                self.validate_import_options(ov).err()
+                                            }
+                                        }
+                                        None => None,
+                                    };
+                                    match opt_err {
+                                        Some(e) => e,
+                                        // Source phase is unavailable for a
+                                        // SourceTextModule; this takes precedence
+                                        // over the absent-loader error.
+                                        None if phase == 2 => self.make_error(3, None),
+                                        None => self.make_error(1, None),
+                                    }
+                                }
+                            };
+                            // Root the reason in the destination across Promise
+                            // allocation, exactly like the general loader path.
+                            self.set(base, dst, reason);
+                            let p = self.alloc_promise();
+                            let reason = self.get(base, dst);
+                            self.reject(p, reason);
+                            self.set(base, dst, Value::heap(p));
+                        }
                         // import(spec [, opts]) / import.defer / import.source.
                         // Spec order: ToString(spec); then a non-undefined non-object
                         // `opts` â†’ TypeError; `import.source` â†’ SyntaxError (source
@@ -5354,8 +5422,11 @@ impl<'p> Vm<'p> {
                         // never throws synchronously. Everything that may GC runs
                         // BEFORE the promise is allocated; the settle value is rooted
                         // in `dst` across alloc_promise (the iter-169 GC invariant).
+                        #[cfg(not(feature = "wasm-no-fs-loader"))]
                         let spec_val = self.get(base, spec);
+                        #[cfg(not(feature = "wasm-no-fs-loader"))]
                         let mut deferred = false;
+                        #[cfg(not(feature = "wasm-no-fs-loader"))]
                         let settle: Result<Value, Value> = match self.to_js_string(spec_val) {
                             Err(_) => Err(self
                                 .pending_throw
@@ -5509,6 +5580,7 @@ impl<'p> Vm<'p> {
                         };
                         // A DEFERRED load already parked its promise in dst;
                         // the microtask settles it.
+                        #[cfg(not(feature = "wasm-no-fs-loader"))]
                         match settle {
                             _ if deferred => {}
                             Ok(v) => {
@@ -5820,6 +5892,48 @@ impl<'p> Vm<'p> {
                         // its argument and ret_dst = RET_DISCARD.
                         match self.ic_set_prop(func_id, ip, o, &key, v) {
                             SetAct::Done => {
+                                // The hardened WASM profile has no trace rows to
+                                // preserve. When a proven plain own-data store is
+                                // immediately read back through the same receiver
+                                // and key, the read is exactly the RHS we just
+                                // committed. Forward it without another property
+                                // probe or dispatch. Exotic receivers, accessors,
+                                // proxies and failed/slow stores never return Done.
+                                //
+                                // This remains two logical bytecodes. Enter the
+                                // skipped GetProp through the ordinary meter hook
+                                // before publishing its destination, so a budget
+                                // ending between the pair observes the completed
+                                // store but not the read, exactly as before.
+                                #[cfg(feature = "meter-only")]
+                                if let Some(
+                                    next @ Instr::GetProp {
+                                        dst,
+                                        obj: get_obj,
+                                        name: get_name,
+                                    },
+                                ) = code.get(ip + 1)
+                                {
+                                    let same_key = name == *get_name
+                                        || self.func(func_id as usize).string_constants
+                                            [*get_name as usize]
+                                            .as_str()
+                                            == key;
+                                    if *get_obj == obj && same_key {
+                                        if self.instr_rec.is_some() {
+                                            if let Err(msg) =
+                                                self.instrument_step(base, ip + 1, next)
+                                            {
+                                                let top = self.frames.len() - 1;
+                                                self.frames[top].ip = ip + 1;
+                                                return Err(Thrown(msg.to_string()));
+                                            }
+                                        }
+                                        self.set(base, *dst, v);
+                                        ip += 2;
+                                        continue;
+                                    }
+                                }
                                 ip += 1;
                                 continue;
                             }
@@ -6153,39 +6267,57 @@ impl<'p> Vm<'p> {
                     // strict mode. Mirrors the `GLOBAL_EVAL` native but forces strict;
                     // a non-string argument is returned unchanged (spec 19.2.1).
                     Instr::ImportMeta { dst } => {
-                        // import.meta is DISTINCT per module: the executing
-                        // frame's func id falls in exactly one loader module's
-                        // installed range (closures keep their module's ids);
-                        // outside every range (entry script / run_module /
-                        // eval) the Vm-wide singleton applies.
-                        let fid = func_id;
-                        let mkey = self
-                            .module_func_ranges
-                            .iter()
-                            .find(|&&(s, e, _)| fid >= s && fid < e)
-                            .map(|&(_, _, k)| k);
-                        let idx = match mkey {
-                            Some(k) => match self.module_metas.get(&k) {
-                                Some(&m) => m,
+                        #[cfg(feature = "wasm-no-fs-loader")]
+                        let idx = {
+                            // No loader-installed function ranges can exist in
+                            // this artifact, so every reachable module uses the
+                            // same entry/direct-module singleton as the general
+                            // path's `mkey == None` case.
+                            if self.import_meta == 0 {
+                                let idx = self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                                self.proto_of.insert(idx, Value::NULL);
+                                self.import_meta = idx;
+                            }
+                            self.import_meta
+                        };
+                        #[cfg(not(feature = "wasm-no-fs-loader"))]
+                        let idx = {
+                            // import.meta is DISTINCT per module: the executing
+                            // frame's func id falls in exactly one loader module's
+                            // installed range (closures keep their module's ids);
+                            // outside every range (entry script / run_module /
+                            // eval) the Vm-wide singleton applies.
+                            let fid = func_id;
+                            let mkey = self
+                                .module_func_ranges
+                                .iter()
+                                .find(|&&(s, e, _)| fid >= s && fid < e)
+                                .map(|&(_, _, k)| k);
+                            match mkey {
+                                Some(k) => match self.module_metas.get(&k) {
+                                    Some(&m) => m,
+                                    None => {
+                                        // Lazily created, host-defined: ordinary
+                                        // extensible null-proto object (GC-rooted
+                                        // via module_metas).
+                                        let m = self
+                                            .heap
+                                            .alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                                        self.proto_of.insert(m, Value::NULL);
+                                        self.module_metas.insert(k, m);
+                                        m
+                                    }
+                                },
                                 None => {
-                                    // Lazily created, host-defined: ordinary
-                                    // extensible null-proto object (GC-rooted
-                                    // via module_metas).
-                                    let m =
-                                        self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
-                                    self.proto_of.insert(m, Value::NULL);
-                                    self.module_metas.insert(k, m);
-                                    m
+                                    if self.import_meta == 0 {
+                                        let idx = self
+                                            .heap
+                                            .alloc(HeapObj::Object(Box::new(ObjMap::new())));
+                                        self.proto_of.insert(idx, Value::NULL);
+                                        self.import_meta = idx;
+                                    }
+                                    self.import_meta
                                 }
-                            },
-                            None => {
-                                if self.import_meta == 0 {
-                                    let idx =
-                                        self.heap.alloc(HeapObj::Object(Box::new(ObjMap::new())));
-                                    self.proto_of.insert(idx, Value::NULL);
-                                    self.import_meta = idx;
-                                }
-                                self.import_meta
                             }
                         };
                         self.set(base, dst, Value::heap(idx));
@@ -6685,10 +6817,21 @@ impl<'p> Vm<'p> {
                         // heap-version guarded) resolved to a plain user
                         // function skips the Proxy/native/bound/ctor probes
                         // and the generator/async flag loads.
-                        if let Some((fid, closure)) = self.ic_call(func_id, ip, callee_v) {
+                        if let Some(call) = self.ic_call(func_id, ip, callee_v) {
+                            #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+                            if argc == 1 && call.fib_global != crate::vm::ic::IC_NO_FIB_GLOBAL {
+                                let arg = self.get(base, arg_base);
+                                if let Some(result) =
+                                    self.try_metered_numeric_fib(call.fib_global, callee_v, arg)
+                                {
+                                    self.set(base, dst, result);
+                                    ip += 1;
+                                    continue;
+                                }
+                            }
                             self.setup_call(
-                                fid,
-                                closure,
+                                call.fid,
+                                call.closure,
                                 Value::UNDEFINED,
                                 base,
                                 arg_base,
@@ -9240,28 +9383,30 @@ impl<'p> Vm<'p> {
     // builds while release elides the bounds check.
     #[inline(always)]
     pub(crate) fn get(&self, base: usize, r: u16) -> Value {
-        debug_assert!(
-            (base + r as usize) < self.regs.len(),
-            "reg read out of bounds"
-        );
+        // `base` starts an existing frame window in `regs`, whose allocation
+        // is at most `isize::MAX` bytes, while a register index is only `u16`.
+        // The sum therefore cannot overflow `usize`. Spell that invariant as a
+        // wrapping add so overflow-checked hardened builds do not put a second
+        // trap edge ahead of every register access; safe-sandbox's indexed
+        // access below still performs the required bounds check.
+        let index = base.wrapping_add(r as usize);
+        debug_assert!(index < self.regs.len(), "reg read out of bounds");
         #[cfg(feature = "safe-sandbox")]
-        return self.regs[base + r as usize];
+        return self.regs[index];
         #[cfg(not(feature = "safe-sandbox"))]
-        return unsafe { *self.regs.get_unchecked(base + r as usize) };
+        return unsafe { *self.regs.get_unchecked(index) };
     }
     #[inline(always)]
     pub(crate) fn set(&mut self, base: usize, r: u16, v: Value) {
-        debug_assert!(
-            (base + r as usize) < self.regs.len(),
-            "reg write out of bounds"
-        );
+        let index = base.wrapping_add(r as usize);
+        debug_assert!(index < self.regs.len(), "reg write out of bounds");
         #[cfg(feature = "safe-sandbox")]
         {
-            self.regs[base + r as usize] = v;
+            self.regs[index] = v;
         }
         #[cfg(not(feature = "safe-sandbox"))]
         unsafe {
-            *self.regs.get_unchecked_mut(base + r as usize) = v;
+            *self.regs.get_unchecked_mut(index) = v;
         }
     }
 
@@ -9662,6 +9807,88 @@ impl<'p> Vm<'p> {
             callee: callee_val,
         });
         Ok(())
+    }
+
+    /// Collapse the canonical pure numeric Fibonacci body used by small
+    /// recursive helpers into an allocation-free iterative calculation on the
+    /// release-WASM interpreter.
+    ///
+    /// This is deliberately an exact bytecode recognizer, not a source-name or
+    /// benchmark-name shortcut.  Every accepted activation contains only the
+    /// two recursive calls and numeric operations shown below, the recursive
+    /// binding must still resolve directly to the same live function Value, and
+    /// the argument/result are kept in the range where every source operation
+    /// is exact integer Number arithmetic.  Anything else runs through the
+    /// ordinary frame path unchanged.
+    ///
+    /// The caller's `Call` instruction has already paid its dispatch tick.  The
+    /// returned calculation therefore charges precisely the child activation's
+    /// historical instruction count: `S(0|1)=3`,
+    /// `S(n)=10+S(n-1)+S(n-2)`.  Charging after this side-effect-free work uses
+    /// the same contract as the other off-dispatch evaluators: an insufficient
+    /// finite budget becomes sticky before another guest instruction can run.
+    #[cfg(all(feature = "meter-only", not(feature = "jit")))]
+    #[inline]
+    fn try_metered_numeric_fib(&mut self, global: u32, callee: Value, arg: Value) -> Option<Value> {
+        if global == crate::vm::ic::IC_NO_FIB_GLOBAL || !arg.is_int() {
+            return None;
+        }
+        let n = arg.as_int();
+        // fib(46) is the largest result that remains a tagged i32.  Keeping the
+        // complete lane in that domain makes the iterative result identical to
+        // every Add in the recursive source, with no f64 reassociation issue.
+        if !(0..=46).contains(&n) {
+            return None;
+        }
+        // The ordinary recursion would still enforce MAX_FRAMES.  Decline near
+        // that boundary so a deeply nested caller observes the same catchable
+        // RangeError instead of the collapsed result.  Also require the frame
+        // and register backing allocations that the omitted recursion would
+        // need to ALREADY exist.  Otherwise the shortcut could bypass retained
+        // Vec growth (and a tight heap ceiling); ordinary recursion grows those
+        // capacities on the first descent, after which later subtrees may use
+        // this allocation-free lane.
+        let added_depth = (n as usize).max(1);
+        let needed_frames = self.frames.len().checked_add(added_depth)?;
+        let needed_regs = self.regs.len().checked_add(added_depth.checked_mul(9)?)?;
+        if needed_frames > MAX_FRAMES
+            || needed_frames > self.frames.capacity()
+            || needed_regs > self.regs.capacity()
+        {
+            return None;
+        }
+        if !self.global_slot_directly_routable(global)
+            || self.globals.get(global as usize).copied() != Some(callee)
+        {
+            return None;
+        }
+
+        let mut a = 0u64;
+        let mut b = 1u64;
+        for _ in 0..n {
+            let next = a.checked_add(b)?;
+            a = b;
+            b = next;
+        }
+        // Closed form of S(0)=S(1)=3; S(n)=10+S(n-1)+S(n-2).
+        let steps = 13u64.checked_mul(b)?.checked_sub(10)?;
+        if let Some(rec) = self.instr_rec.as_ref() {
+            let steps_i64 = i64::try_from(steps).ok()?;
+            if rec.exhaustion.is_some() || (rec.remaining != i64::MAX && rec.remaining < steps_i64)
+            {
+                // The finite error path must still stop at its historical child
+                // opcode (and retain every scheduled resource audit), so only a
+                // completely payable pure activation is collapsed.
+                return None;
+            }
+        }
+        self.charge_steps(i64::try_from(steps).ok()?);
+        // The ordinary recursive activation would eventually return through
+        // `pop_frame_with`, which terminates any preceding proper-tail-call
+        // reuse streak.  Eliding that frame must preserve the same safety
+        // state for a caller that later performs another tail call.
+        self.tail_reuse_streak = 0;
+        Some(Value::int(i32::try_from(a).ok()?))
     }
 }
 

@@ -19,24 +19,24 @@
 //! is what triggers it: the argument register of the `Print` at ip 37 is the same
 //! register the SROA region loads the object into at ip 29.
 //!
-//! The fix does not touch the liveness. The object-ref loads are LEFT ALONE and
-//! recognised by `plan_region` as what they are — a `LoadGlobal` whose dst the
-//! region never reads, i.e. a PINNED RECEIVER (`ta_recv_regs`): no numeric home
-//! for `r`, no global home for `o`, and the load lowers to
-//! `emit_recv_slot_store`, two `mov`s that keep `r`'s frame slot exactly what the
-//! interpreted `LoadGlobal` would have left. That needs no claim about liveness
-//! at all, and it also retires the older hazard the neutralisation carried: a
-//! flush of the fake home would have written `0` over the object in a slot the
-//! interpreter reads back at the very heap op a deopt resumes on.
+//! The fix does not weaken liveness. The object-ref loads are LEFT ALONE. When a
+//! receiver register is otherwise dead, `plan_region` treats it as a pinned
+//! receiver (`ta_recv_regs`). Capture-first lowering may instead recycle that
+//! register for a later numeric range, so the planner proves a B94 split: the
+//! object load writes the authoritative boxed frame slot, and the later numeric
+//! definitions use their normal homes. In both cases there is no numeric entry
+//! load of the object. This also retires the older neutralisation hazard: a
+//! flush of the fake home could have written `0` over the object in a slot the
+//! interpreter reads back at the very heap op where a deopt resumes.
 //!
 //! `sroa_mechanism_*` reads a child's `ZIPP_JITLOG` back and fails if an SROA
-//! region stops being installed or starts deopting — the regression itself,
-//! observed rather than timed. Three of the four failed at f0f3fd9 with 64
-//! deopts and a MEM recompile; `sroa_mechanism_in_function` is the control, a
-//! callee frame whose register high-water leaves the object-ref temps below the
-//! tail's argument window, so it never entered `read_outside` and never
-//! regressed. `COLD_BRANCH` has no mechanism pin on purpose — field promotion
-//! declines that shape on both sides, so it is a parity case only.
+//! region stops being installed, loses the recycled-receiver split, or starts
+//! deopting — the regression itself, observed rather than timed. Three of the
+//! four originally failed at f0f3fd9 with 64 deopts and a MEM recompile. The
+//! capture-first compiler now recycles at least one receiver in all four, so
+//! each mechanism pin requires a proven B94 split. `COLD_BRANCH` has no
+//! mechanism pin on purpose — field promotion declines that shape on both
+//! sides, so it is a parity case only.
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");
@@ -196,10 +196,10 @@ fn sroa_regions(log: &str) -> Vec<(String, String, String)> {
         .collect()
 }
 
-/// The SROA region must be installed AND must never bail out of it. An entry
-/// guard rejecting the object-ref register's frame slot is the regression, and
-/// it shows up as `deopt at ip {start}` followed — 64 of them later — by the
-/// same span recompiling on the MEM tier.
+/// The SROA region must be installed with a proven recycled-receiver split AND
+/// must never bail out of it. An entry guard rejecting the object-ref register's
+/// frame slot is the regression, and it shows up as `deopt at ip {start}`
+/// followed — 64 of them later — by the same span recompiling on the MEM tier.
 fn assert_sroa_region_survives(test: &str) {
     let log = logged_child(test);
     let regions = sroa_regions(&log);
@@ -209,15 +209,22 @@ fn assert_sroa_region_survives(test: &str) {
          exercising field promotion at all:\n{log}"
     );
     for (f, s, e) in &regions {
+        let split = format!("[jit] DOUBLE region [{s},{e}] B94 split receiver ");
+        assert!(
+            log.lines().any(|l| l.starts_with(&split)),
+            "{test}: the SROA region {f} [{s},{e}] did not prove a B94 split \
+             for its recycled object receiver, so this fixture has stopped \
+             exercising the capture-first register-reuse regression:\n{log}"
+        );
         let deopt = format!("[jit] region {f} [{s}] deopt at ip ");
         let n = log.lines().filter(|l| l.starts_with(&deopt)).count();
         assert_eq!(
             n, 0,
             "{test}: the SROA region {f} [{s},{e}] deopted {n} times. An \
-             object-ref `LoadGlobal` whose dst the region never reads must be \
-             planned as a pinned receiver (no numeric home, frame slot written \
-             by `emit_recv_slot_store`); a numeric home for it is entry-loaded \
-             from a slot holding the OBJECT and bails on every entry:\n{log}"
+             object-ref `LoadGlobal` must remain memory-authoritative while the \
+             recycled numeric range uses a split home; otherwise a numeric home \
+             is entry-loaded from a slot holding the OBJECT and bails on every \
+             entry:\n{log}"
         );
         let mem = format!("[jit] MEM region {f} [{s},{e}] compiled");
         assert!(

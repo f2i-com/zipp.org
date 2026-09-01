@@ -37,17 +37,70 @@ All source output matched before timing. Six complete counterbalanced rounds and
 | WASM adjusted execution / Boa | **0.2274×** | descriptive | 5 / 5 |
 
 The native sparse-array point median is the only QuickJS-NG loss at 1.0099×;
-do not turn the aggregate win into an every-row claim. The larger open gap is
-browser WASM: Zipp's 5,595,833-byte raw module (1,254,075 Brotli-11) sits between
-QuickJS-NG's 1,528,293-byte reactor (417,087 Brotli-11) and Boa's 21,296,176-byte
-module (5,484,164 Brotli-11), while QuickJS-NG is about 2.1× faster on the
-five-row WASM execution diagnostic.
+do not turn the aggregate win into an every-row claim. In the historical v0.0.5
+browser-WASM release capture, Zipp's 5,595,833-byte raw module (1,254,075
+Brotli-11) sat between QuickJS-NG's 1,528,293-byte reactor (417,087 Brotli-11)
+and Boa's 21,296,176-byte module (5,484,164 Brotli-11), while QuickJS-NG
+measured about 2.1× faster on the five-row execution diagnostic. The current
+development status is recorded separately below.
 
 Raw release evidence is intentionally ignored under
 `target/comparison/results/`: `native-real13-v005-qjsng-clean-6.json`,
 `native-micro5-v005-clean-6.json`, and `wasm-v005-clean-6.json`. Reproduction
 commands and artifact hashes are in
 [`bench/comparison/README.md`](bench/comparison/README.md).
+
+### Current post-v0.0.5 WASM development snapshot
+
+The current uncommitted development artifact is
+`target/comparison/candidates/wasm-kernels-final-commuted-20260901-web/zipp_wasm_bg.wasm`.
+It is identified by SHA-256
+`caf26214ffca1407fba46f3bb304e4bb78ebb01b12898bf4132fc4e7a21f05f3`:
+5,480,576 bytes raw, 1,826,113 gzip-9, and 1,233,843 Brotli-11. It does not
+replace the v0.0.5 release or checked-in landing module.
+
+The 48-repetition result is
+`target/comparison/results/wasm-kernels-final-48.json`, with 12 cold-compile and
+12 startup samples and seed `1511464998`. Persistent work medians were:
+
+| Workload | Zipp | QuickJS-NG | Zipp / QuickJS-NG |
+|---|---:|---:|---:|
+| fib-recursive | 1.1180 ms | 58.1861 ms | `0.0192142110×` |
+| loop-arithmetic | 1.1003 ms | 27.6866 ms | `0.0397412467×` |
+| array-hof | 5.37885 ms | 9.39055 ms | `0.5727939258×` |
+| object-properties | 1.05105 ms | 16.83035 ms | `0.0624496817×` |
+| sort-comparator | 5.3476 ms | 18.4204 ms | `0.2903085709×` |
+
+The persistent-total geomean is `0.0954663913×` QuickJS-NG and
+`0.0105336875×` Boa, with Zipp ahead on all five persistent point medians
+against both. Cold compile / instantiation / module-ready medians were
+4.70735 / 0.41760 / 5.12495 ms for Zipp, 1.51085 / 1.58345 / 3.09430 ms for
+QuickJS-NG, and 8.91050 / 2.57755 / 11.48805 ms for Boa.
+
+Do not headline the computed `0.0245653793×` adjusted geomean. Array HOF and
+sort have 48/48 positive work-minus-control samples and adjusted ratios of
+`0.4681596596×` and `0.2316111384×`; fib, loop, and object properties are at
+or below subtraction resolution, with only 25/48, 24/48, and 24/48 positive
+Zipp samples and a negative object adjusted median. This is an adapter-inclusive
+five-workload diagnostic, not a universal interpreter-core or all-JavaScript
+ranking. QuickJS-NG remains smaller: Zipp is `3.586×` its raw reactor and
+`2.958×` its Brotli payload; Boa remains larger.
+
+#### Prior development baseline (preserved)
+
+The immediately preceding snapshot was 5,462,006 bytes raw, 1,818,299 gzip-9,
+and 1,230,296 Brotli-11, SHA-256
+`8cf6e8207d1852cfa31c6e38d3b8a60bdec6e4894a65c1d08f39b244c849903b`.
+Its 48-repetition result,
+`target/comparison/results/wasm-meter-countdown-final-48.json`, measured
+`1.8115847493×` QuickJS-NG persistent and `1.7725499353×` adjusted, and
+`0.1898384829×` Boa persistent and `0.1834251840×` adjusted. QuickJS-NG led
+all five adjusted point medians in that prior capture. The current kernels cost
+18,570 raw, 7,814 gzip, and 3,547 Brotli bytes relative to this baseline. Exact
+commands, pinned artifacts, and interface caveats are in the comparison README;
+no source commit is claimed for either working-tree snapshot.
+
+### v0.0.5 release validation
 
 Focused release gates were green: safe-sandbox library 463 passed / 1 ignored,
 benchmark-tool tests 164 passed / 2 skipped, bool-home 11 passed / 1 worker

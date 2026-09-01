@@ -21,15 +21,16 @@
 //! Every `msplit_parity_*` case asserts byte-identical output against
 //! `node -e`. `msplit_all_modes_answer_identically` re-runs them under
 //! `ZIPP_NO_MULTI_SPLIT=1` (the off-switch — a pure fallback),
-//! `ZIPP_INT_SPLIT=1` (routes the multi-split plan into the XMM integer
-//! emitter instead of the GPR one, so the other write-through/flush
-//! implementation carries N split registers too), `ZIPP_NO_GPR_SPLIT=1`,
-//! `ZIPP_JIT_THRESHOLD=1`, `ZIPP_GC_STRESS=1` and `ZIPP_NOJIT=1`.
+//! `ZIPP_INT_SPLIT=1` (admits the multi-split plan to the XMM integer emitter),
+//! `ZIPP_NO_GPR_SPLIT=1`, `ZIPP_JIT_THRESHOLD=1`, `ZIPP_GC_STRESS=1` and
+//! `ZIPP_NOJIT=1`. The XMM mechanism pin additionally sets
+//! `ZIPP_NO_GPR_HOMES=1`, ensuring the preferred GPR emitter cannot win first.
 //!
-//! `msplit_mechanism_*` reads the plan back out of a child's ZIPP_JITLOG:
-//! more than one `B94 split receiver` in a single region is the thing that was
-//! impossible before, so a parity case that stopped producing one would be
-//! testing nothing.
+//! `msplit_mechanism_*` reads the plan back out of a child's ZIPP_JITLOG. The
+//! two-element case pins the budget extension with two B94 splits in one
+//! region. The string case separately pins the `pin_obj` extension: its
+//! recycled string receiver splits while its clean element receiver remains an
+//! ordinary pin.
 
 const PRELUDE: &str = r#""use strict";
 var N = 20000;
@@ -94,9 +95,10 @@ console.log("two h=" + h);
     ));
 }
 
-/// A recycled pinned-STRING receiver next to a recycled element receiver — the
-/// `pin_obj` half. `src` is a global read only through `charCodeAt`, and the
-/// bytecode allocator recycles its register as an arithmetic temp.
+/// A recycled pinned-STRING receiver next to a cleanly excludable element
+/// receiver — the `pin_obj` half. `src` is a global read only through
+/// `charCodeAt`, and the bytecode allocator recycles its register as an
+/// arithmetic temp. `starts` remains an ordinary pinned receiver.
 #[test]
 fn msplit_parity_string_and_element_receivers() {
     assert_matches_node(&prog(
@@ -136,8 +138,8 @@ console.log("three h=" + h);
     ));
 }
 
-/// FOUR recycled receivers, three element and one string — the parse-large-js
-/// mix loop's exact receiver set, and `MULTI_SPLIT_BUDGET` exactly.
+/// FOUR pinned receivers, three recycled and one clean, across three element
+/// sources and one string — the parse-large-js mix loop's receiver set.
 #[test]
 fn msplit_parity_four_receivers_with_a_string() {
     assert_matches_node(&prog(
@@ -351,41 +353,36 @@ fn has_pinned_receiver_decline(log: &str) -> bool {
 /// off-switch and not a no-op.
 #[test]
 fn msplit_mechanism_two_receivers_split_and_reach_the_int_tier() {
-    for name in [
-        "msplit_parity_two_element_receivers",
-        "msplit_parity_string_and_element_receivers",
-    ] {
-        let on = jitlog_of(name, &[]);
-        assert!(
-            splits(&on) >= 2,
-            "{name}: fewer than two B94 split receivers — the multi-split did \
-             not engage:\n{on}"
-        );
-        assert!(
-            on.contains("INT region fn1 ["),
-            "{name}: the kernel is not on the integer tier:\n{on}"
-        );
+    let name = "msplit_parity_two_element_receivers";
+    let on = jitlog_of(name, &[]);
+    assert!(
+        splits(&on) >= 2,
+        "{name}: fewer than two B94 split receivers — the multi-split did \
+         not engage:\n{on}"
+    );
+    assert!(
+        on.contains("INT region fn1 ["),
+        "{name}: the kernel is not on the integer tier:\n{on}"
+    );
 
-        let off = jitlog_of(name, &[("ZIPP_NO_MULTI_SPLIT", "1")]);
-        assert!(
-            splits(&off) <= 1,
-            "{name}: ZIPP_NO_MULTI_SPLIT=1 still split more than one \
-             receiver:\n{off}"
-        );
-        assert!(
-            off.contains("plan_region=None"),
-            "{name}: with the switch off the region should decline the plan; \
-             if it no longer does, this pin has stopped measuring the \
-             switch:\n{off}"
-        );
-    }
+    let off = jitlog_of(name, &[("ZIPP_NO_MULTI_SPLIT", "1")]);
+    assert!(
+        splits(&off) <= 1,
+        "{name}: ZIPP_NO_MULTI_SPLIT=1 still split more than one \
+         receiver:\n{off}"
+    );
+    assert!(
+        off.contains("plan_region=None"),
+        "{name}: with the switch off the region should decline the plan; \
+         if it no longer does, this pin has stopped measuring the \
+         switch:\n{off}"
+    );
 }
 
 /// The pinned-STRING receiver specifically. Both pins (the string and the
-/// index array) are hoisted in the compiled region, which is what proves the
-/// STRING receiver — not two array receivers — is one of the two splits: the
-/// program has exactly one array and one string, so `pins=2/2` on a region
-/// that also reports two `B94 split receiver`s can only be that pair.
+/// index array) are hoisted in the compiled region. The fixture's bytecode
+/// deliberately recycles `src` in r10, which must split, while `starts` in r12
+/// has one `LoadGlobal` and remains an ordinary pinned receiver.
 ///
 /// The `pinned receiver reg not cleanly excludable` line is still expected in
 /// the ON log: the FIRST plan attempt runs with `admit_split=false` (the B94
@@ -410,10 +407,18 @@ fn msplit_mechanism_string_receiver_gate() {
         "the compiled region should carry both the STRING and the ARRAY pin — \
          without the string pin this is not the arm being tested:\n{on}"
     );
+    assert_eq!(
+        splits(&on),
+        1,
+        "the recycled string receiver should be the fixture's sole split:\n{on}"
+    );
     assert!(
-        splits(&on) >= 2 && on.contains("INT region fn1 ["),
-        "with the switch on the string-receiver region must split both \
-         receivers and reach the integer tier:\n{on}"
+        on.contains("B94 split receiver r10") && on.contains("pinned receiver r12"),
+        "the string receiver must split while the element receiver remains a clean pin:\n{on}"
+    );
+    assert!(
+        on.contains("INT region fn1 ["),
+        "with the switch on the string-receiver region must reach the integer tier:\n{on}"
     );
 }
 
@@ -432,22 +437,36 @@ fn msplit_mechanism_budget_declines_past_four() {
     );
 }
 
-/// The XMM integer emitter must carry N split registers too (it is the one the
-/// `ZIPP_INT_SPLIT=1` arm routes a multi-split plan into, and its
-/// write-through / flush_exit implementation is separate from the GPR one).
+/// The XMM integer emitter must carry every recycled receiver too; its
+/// write-through / `flush_exit` implementation is separate from the GPR one.
+/// `ZIPP_NO_GPR_HOMES=1` is load-bearing: otherwise the preferred GPR retry
+/// wins before the XMM body is emitted. The current fn1 bytecode has three
+/// recycled receivers and one clean pin.
 #[test]
-fn msplit_mechanism_xmm_emitter_carries_four_splits() {
+fn msplit_mechanism_xmm_emitter_carries_three_splits_and_a_clean_pin() {
     let log = jitlog_of(
         "msplit_parity_four_receivers_with_a_string",
-        &[("ZIPP_INT_SPLIT", "1")],
+        &[("ZIPP_INT_SPLIT", "1"), ("ZIPP_NO_GPR_HOMES", "1")],
+    );
+    let fn1_xmm_splits = log
+        .lines()
+        .filter(|line| line.contains("INT region [1,48] B94 split receiver"))
+        .count();
+    assert_eq!(
+        fn1_xmm_splits, 3,
+        "expected exactly three fn1 B94 splits on the XMM emitter:\n{log}"
     );
     assert!(
-        splits(&log) >= 4,
-        "expected four B94 split receivers on the xmm emitter:\n{log}"
+        log.contains("INT region [1,48] pinned receiver r16")
+            && log.contains("INT region [1,48] guard-hoist pins=4/4"),
+        "the fourth fn1 receiver must remain a clean, hoisted pin:\n{log}"
     );
     assert!(
-        log.contains("INT region fn1 ["),
-        "the four-receiver kernel is not on the integer tier under \
-         ZIPP_INT_SPLIT=1:\n{log}"
+        !log.contains("INT-GPR region [1,48]"),
+        "the mechanism pin must execute the XMM emitter, not a GPR retry:\n{log}"
+    );
+    assert!(
+        log.contains("INT region fn1 [1,48] compiled"),
+        "the four-receiver fn1 kernel is not on the XMM integer tier:\n{log}"
     );
 }

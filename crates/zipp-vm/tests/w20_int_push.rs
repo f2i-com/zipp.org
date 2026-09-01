@@ -158,6 +158,37 @@ console.log("pushbools-{k} " + s);
     )
 }
 
+/// Mechanism-only sibling of `push_bools_case`: the same disjoint Bool pool
+/// and pinned append, with comparisons that do not make a later Bool reuse an
+/// earlier arithmetic temporary's bytecode register. The larger fixture stays
+/// in the parity matrix as fail-closed coverage for that independent type-split
+/// admission gap.
+fn push_disjoint_bools_case(k: usize, n: usize) -> String {
+    let body: String = (0..k)
+        .map(|j| {
+            format!(
+                "    if (c === {j}) {{ h = (h + {w}) | 0; }}\n",
+                w = j * 3 + 1
+            )
+        })
+        .collect();
+    format!(
+        r#"var out = [];
+function kernel(n) {{
+  var h = 0, c = 0;
+  for (var i = 0; i < n; i++) {{
+    c = i % {m};
+{body}    out.push(h & 255);
+    h = (h + 1) | 0;
+  }}
+  return h;
+}}
+console.log(kernel({n}) + ":" + out.length);
+"#,
+        m = k + 3
+    )
+}
+
 /// `k` private bool homes and four numeric locals genuinely LIVE across the
 /// append call. The first two invocations keep `shift == 0`, warming and then
 /// running the INT region normally. The last uses `shift == 1`: iteration zero
@@ -428,6 +459,24 @@ for (var r = 0; r < 4; r++) {{ aa = []; bb = []; cc = []; s += "|" + kernel({n})
 console.log("push3 " + s);
 "#
     )
+}
+
+/// The shortest compiler spelling accepted by the batch recogniser: three
+/// adjacent `LoadGlobal; CallMethod` legs whose arguments are stable locals.
+/// Keep the loop body otherwise minimal so its complete INT region remains
+/// below the captured form's historical twelve-bytecode minimum.
+fn push3_compact_six_op_case() -> &'static str {
+    r#"var aa = [], bb = [], cc = [];
+function kernel(n) {
+  var i = 0;
+  while (i < n) {
+    aa.push(i); bb.push(i); cc.push(i);
+    i = i + 1;
+  }
+  return i + aa.length + bb.length + cc.length;
+}
+kernel(400); kernel(400); kernel(400); kernel(400);
+"#
 }
 
 /// Runtime shapes which invalidate the batching assumptions only after the
@@ -928,7 +977,7 @@ fn jitlog_of(src: &str, env: &[(&str, &str)]) -> String {
 /// remains a semantic and fail-closed oracle for register-type conflicts.
 #[test]
 fn intpush_mechanism_reaches_the_int_tier() {
-    let src = push_bools_case(8, 400);
+    let src = push_disjoint_bools_case(8, 400);
     let on = jitlog_of(&src, &[]);
     assert!(
         on.contains("[jit] INT region fn") && on.contains("compiled"),
@@ -1022,6 +1071,57 @@ fn intpush3_mechanism_engages_declines_atomically_and_switches_off() {
     );
 }
 
+#[test]
+fn intpush3_compact_six_op_region_engages() {
+    let src = push3_compact_six_op_case();
+    let log = jitlog_of(src, &[("ZIPP_JIT_THRESHOLD", "1"), ("ZIPP_VM_DUMP", "1")]);
+
+    // The bytecode dump is one instruction per line. Prove the recogniser is
+    // exercised by the new direct-local spelling, not either older staged
+    // spelling, before accepting its mechanism log as evidence.
+    let opcodes: Vec<&str> = log
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_start();
+            let (ip, instr) = line.split_once("  ")?;
+            ip.parse::<usize>().ok()?;
+            instr.split_whitespace().next()
+        })
+        .collect();
+    let compact = [
+        "LoadGlobal",
+        "CallMethod",
+        "LoadGlobal",
+        "CallMethod",
+        "LoadGlobal",
+        "CallMethod",
+    ];
+    assert!(
+        opcodes
+            .windows(compact.len())
+            .any(|window| window == compact),
+        "probe stopped compiling the compact six-op push trio:\n{log}"
+    );
+
+    let batch = log
+        .lines()
+        .find(|line| line.contains("array-push3 groups="))
+        .unwrap_or_else(|| panic!("compact push trio did not batch:\n{log}"));
+    let range = batch
+        .split_once("INT region [")
+        .and_then(|(_, tail)| tail.split_once(']'))
+        .map(|(range, _)| range)
+        .unwrap_or_else(|| panic!("malformed batch log line: {batch}"));
+    let (start, end) = range
+        .split_once(',')
+        .and_then(|(start, end)| Some((start.parse::<usize>().ok()?, end.parse::<usize>().ok()?)))
+        .unwrap_or_else(|| panic!("malformed batch range: {range}"));
+    assert!(
+        end.saturating_sub(start) < 11,
+        "probe no longer exercises the compact-region minimum: {batch}"
+    );
+}
+
 /// The push-inclusive snapshot plan belongs to the INTEGER attempt, not
 /// automatically to the fallback emitters. Three facts make this gate
 /// non-vacuous:
@@ -1036,7 +1136,7 @@ fn intpush3_mechanism_engages_declines_atomically_and_switches_off() {
 /// The off switch must reproduce the unfiltered fallback on the same binary.
 #[test]
 fn push_pin_filter_is_tier_specific_and_non_vacuous() {
-    let push_bools = push_bools_case(8, 400);
+    let push_bools = push_disjoint_bools_case(8, 400);
     let on = jitlog_of(&push_bools, &[]);
     assert!(
         on.contains("[jit] INT region fn") && on.contains("compiled"),

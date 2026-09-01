@@ -387,7 +387,18 @@ impl<'p> Vm<'p> {
     /// Set the directory used to resolve a dynamic `import(specifier)` against the
     /// filesystem (the running script's directory). Without it, `import()` rejects.
     pub fn set_module_base_dir(&mut self, dir: Option<std::path::PathBuf>) {
-        self.module_base_dir = dir;
+        #[cfg(not(feature = "wasm-no-fs-loader"))]
+        {
+            self.module_base_dir = dir;
+        }
+        #[cfg(feature = "wasm-no-fs-loader")]
+        {
+            // All public runners share this setter. Ignoring their base keeps
+            // the artifact's no-filesystem invariant centralized even if one
+            // of those general zipp-vm entry points is linked accidentally.
+            let _ = dir;
+            self.module_base_dir = None;
+        }
     }
 
     /// Permit only the already-compiled main program to execute. No recorder is
@@ -417,6 +428,7 @@ impl<'p> Vm<'p> {
     /// directory before any module loader is enabled. A confined VM accepts at
     /// most 256 canonical module files, 64 MiB of aggregate observed source,
     /// and 64 levels of loader recursion. Repeated reads share one path ledger.
+    #[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
     #[cfg(any(feature = "instrument", test))]
     pub(crate) fn set_module_root(
         &mut self,

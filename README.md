@@ -38,7 +38,7 @@ implementation can be read end to end.
 
 ## Quick start
 
-The [`v0.0.5` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.5)
+The [`v0.0.6` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.6)
 contains ready-to-run x86-64 binaries and a browser WebAssembly package.
 
 ### Windows
@@ -46,7 +46,7 @@ contains ready-to-run x86-64 binaries and a browser WebAssembly package.
 Download, extract, and run the native Windows executable from PowerShell:
 
 ```powershell
-$version = '0.0.5'
+$version = '0.0.6'
 $archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
 Expand-Archive -LiteralPath $archive -DestinationPath .
@@ -61,7 +61,7 @@ Use `mjs` instead of `js` for an ES module entry, including top-level `await`.
 Download, extract, and run the native Linux binary:
 
 ```sh
-version=0.0.5
+version=0.0.6
 archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 tar -xzf "$archive"
@@ -70,7 +70,7 @@ tar -xzf "$archive"
 ```
 
 The archive preserves the executable bit. If another tool removes it, restore it
-with `chmod +x zipp-0.0.5-x86_64-unknown-linux-gnu/zipp`.
+with `chmod +x zipp-0.0.6-x86_64-unknown-linux-gnu/zipp`.
 
 ### Build from source
 
@@ -106,7 +106,7 @@ Download the browser bundle, then serve its JavaScript and WebAssembly files
 from the same origin as your app:
 
 ```sh
-version=0.0.5
+version=0.0.6
 archive="zipp-wasm-$version-web.zip"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 unzip "$archive"
@@ -239,11 +239,35 @@ samples. Ratios are Zipp / competitor, so lower is faster.
 
 The native result is an aggregate win, not a universal claim: QuickJS-NG was
 1.0099× faster at the point median on the retained sparse-array row, while
-Zipp led the other twelve. The browser-WASM comparison has a different result:
-Zipp is **0.2274× Boa** but **2.1074× QuickJS-NG** on adjusted execution across
-the five diagnostic workloads. Zipp's stripped module is 5,595,833 bytes raw
-(1,254,075 Brotli-11), between QuickJS-NG's 1,528,293-byte reactor
-(417,087 Brotli-11) and Boa's 21,296,176-byte module (5,484,164 Brotli-11).
+Zipp led the other twelve. In the historical v0.0.5 browser-WASM release
+capture, Zipp measured **0.2274× Boa** but **2.1074× QuickJS-NG** on adjusted
+execution across the five diagnostic workloads. That release's stripped module
+is 5,595,833 bytes raw (1,254,075 Brotli-11), between QuickJS-NG's
+1,528,293-byte reactor (417,087 Brotli-11) and Boa's 21,296,176-byte module
+(5,484,164 Brotli-11).
+
+#### Current browser-WASM development snapshot
+
+A separately validated, uncommitted post-v0.0.5 development snapshot is
+5,480,576 bytes raw, 1,826,113 at gzip-9, and 1,233,843 at Brotli-11 (SHA-256
+`caf26214ffca1407fba46f3bb304e4bb78ebb01b12898bf4132fc4e7a21f05f3`). In the
+48-repetition adapter-inclusive diagnostic, Zipp won all five persistent
+workload point medians: its Zipp / QuickJS-NG geomean was `0.0954663913×` and
+its Zipp / Boa geomean was `0.0105336875×`. Array HOF and comparator sort also
+had stable positive work-minus-control samples, at `0.4681596596×` and
+`0.2316111384×` QuickJS-NG respectively.
+
+This is a bounded five-workload result, including each project's public adapter
+and context lifecycle; it is not a universal interpreter-core or all-JavaScript
+ranking. Fib, loop, and object-property execution reached the subtraction noise
+floor, so the much smaller computed adjusted aggregate is not a robust headline.
+QuickJS-NG also remains substantially smaller: Zipp is `3.586×` its raw module
+and `2.958×` its Brotli payload. The prior development baseline is retained for
+comparison: 5,462,006 raw / 1,818,299 gzip-9 / 1,230,296 Brotli-11, SHA-256
+`8cf6e8207d1852cfa31c6e38d3b8a60bdec6e4894a65c1d08f39b244c849903b`, and
+`1.7725499353×` QuickJS-NG on adjusted execution. The current speed kernels add
+only 18,570 raw, 7,814 gzip, and 3,547 Brotli bytes to that prior baseline. The
+checked-in landing module and v0.0.5 release figures above remain unchanged.
 
 The commands, exact revisions, per-row numbers, module hashes, host-interface
 differences, and limitations are in

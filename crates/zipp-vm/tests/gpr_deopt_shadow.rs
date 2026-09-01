@@ -206,26 +206,20 @@ fn logged_child(test: &str, extra: &[(&str, &str)]) -> String {
     String::from_utf8_lossy(&out.stderr).into_owned()
 }
 
-/// Non-vacuity and kill-switch gate. The current compiler's captured-call
-/// lowering leaves three fixtures inside V1's closed proof; their structural
-/// shadow census is fixed without pinning bytecode spans, which legitimately
-/// move as the compiler's temporary layout changes. The throw fixture now
-/// needs a type split and the constant-Mul fixture no longer has an elided Mul
-/// guard, so both must retain the incumbent GPR path without weakening either
-/// of those shadow gates.
+/// Non-vacuity and kill-switch gate. Four fixtures remain inside V1's closed
+/// proof; their structural shadow census is fixed without pinning bytecode
+/// spans, which legitimately move as the compiler's temporary layout changes.
+/// The throw fixture needs a Bool/Num type split, which the raw-Int shadow
+/// deliberately refuses, so it must retain the incumbent GPR path and execute
+/// its dynamic deopt without weakening that shadow gate.
 #[test]
 fn shadow_mechanism_engages_and_switch_falls_back() {
     let cases = [
         // Census values follow the compiler's temporary layout (region spans
         // are deliberately not pinned — they move with it). These are the
         // pre-hardening values: the fused method-call lowering leaves no
-        // receiver snapshot and no post-call register reset behind, so every
-        // fixture sits inside V1's closed proof again.
-        (
-            "shadow_parity_throw_deopt_receiver_reload_and_wide_globals",
-            "regs=1 globs=2 reg-writes=1 glob-writes=2 recv-resets=1",
-            Some("deopt at ip"),
-        ),
+        // receiver snapshot and no post-call register reset behind for these
+        // four fixtures.
         (
             "shadow_parity_loop_boundary_side_exit",
             "regs=3 globs=5 reg-writes=6 glob-writes=5 recv-resets=1",
@@ -270,6 +264,27 @@ fn shadow_mechanism_engages_and_switch_falls_back() {
             );
         }
     }
+
+    let throw = logged_child(
+        "shadow_parity_throw_deopt_receiver_reload_and_wide_globals",
+        &[],
+    );
+    assert!(
+        !throw.contains("GPR deopt-shadow engaged"),
+        "the type-split throw fixture bypassed a closed V1 shadow guard:\n{throw}"
+    );
+    assert!(
+        throw.contains("type-split r"),
+        "the throw fixture no longer demonstrates the type-split shadow guard:\n{throw}"
+    );
+    assert!(
+        throw.contains("GPR homes engaged"),
+        "the guarded throw fixture should retain the incumbent GPR tier:\n{throw}"
+    );
+    assert!(
+        throw.contains("deopt at ip"),
+        "the guarded throw fixture did not execute its intended dynamic exit:\n{throw}"
+    );
 
     let test = "shadow_parity_loop_boundary_side_exit";
     let off = logged_child(test, &[("ZIPP_NO_GPR_DEOPT_SHADOW", "1")]);

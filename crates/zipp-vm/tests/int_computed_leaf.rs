@@ -408,7 +408,7 @@ fn computed_meter_matches_interpreter_exactly() {
         let mut st = embed::compile_script(BOOT).expect("bootstrap compiles");
         st.set_limits(BIG, None);
         if interpreter_only {
-            st.start_trace(usize::MAX);
+            st.disable_vm_jit();
         }
         st.run_init().expect("bootstrap runs");
         let before = st.steps_remaining();

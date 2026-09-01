@@ -349,7 +349,7 @@ fn wide_mask_meter_matches_interpreter_exactly() {
             embed::compile_script("void globalThis; void eval;").expect("meter bootstrap compiles");
         state.set_limits(BIG, None);
         if interpreter_only {
-            state.start_trace(usize::MAX);
+            state.disable_vm_jit();
         }
         state.run_init().expect("meter bootstrap runs");
         let before = state.steps_remaining();

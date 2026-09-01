@@ -36,8 +36,9 @@ pub use crate::vm::host_api::{
     HostValue, HostValueBudget, Symbol, SymbolScope, DEFAULT_HOST_VALUE_MAX_NODES,
     DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
 };
-/// The execution-trace row and its opcode contract. See
-/// [`ScriptState::start_trace`].
+/// The execution-trace row and its opcode contract. Full `instrument` builds
+/// expose the `ScriptState::start_trace` control API; the artifact-internal
+/// `meter-only` profile deliberately does not.
 #[cfg(feature = "instrument")]
 pub use crate::vm::instrument::{op, TraceStep};
 
@@ -178,7 +179,7 @@ impl ScriptState {
     /// source-phase, and re-export load is canonicalized and must remain under
     /// `root`, so `..` components and symlink escapes are rejected. Each file
     /// is also rejected before parsing when it exceeds `max_module_bytes`.
-    #[cfg(feature = "instrument")]
+    #[cfg(all(feature = "instrument", not(feature = "wasm-no-fs-loader")))]
     pub fn set_confined_module_loader(
         &mut self,
         base_dir: &std::path::Path,
@@ -196,6 +197,19 @@ impl ScriptState {
         }
         vm.set_module_base_dir(Some(base));
         Ok(())
+    }
+
+    /// The dedicated WebAssembly artifact has no filesystem module-loader
+    /// authority. Keep the embedding method as a fail-closed stub so feature
+    /// unification cannot silently turn a caller's loader request into access.
+    #[cfg(all(feature = "instrument", feature = "wasm-no-fs-loader"))]
+    pub fn set_confined_module_loader(
+        &mut self,
+        _base_dir: &std::path::Path,
+        _root: &std::path::Path,
+        _max_module_bytes: u64,
+    ) -> Result<(), String> {
+        Err("filesystem module loader is disabled in this build".into())
     }
 
     /// Disable the VM's native code generators for this script state.
@@ -462,6 +476,10 @@ impl ScriptState {
     /// an atomic load per instruction is a real cost for a flag that is almost
     /// never set.
     ///
+    /// The artifact-internal `meter-only` profile is the exception: it requires
+    /// `abort` to be `None` and omits cooperative polling. Its zipp-wasm host
+    /// enforces the wall-clock deadline by terminating the surrounding Worker.
+    ///
     /// Note what this does NOT generally bound: a single native builtin. A
     /// pathological `JSON.parse` is ONE instruction, so wall-clock safety still
     /// needs the abort flag driven by a timer on another thread. The
@@ -474,10 +492,14 @@ impl ScriptState {
         max_steps: u64,
         abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) {
+        #[cfg(feature = "meter-only")]
+        debug_assert!(
+            abort.is_none(),
+            "meter-only relies on Worker termination and does not poll an abort flag"
+        );
         if let Some(vm) = self.vm.as_mut() {
             let mut rec = crate::vm::instrument::Recorder::new();
-            // Saturating, so `u64::MAX` keeps meaning "unlimited".
-            rec.remaining = max_steps.min(i64::MAX as u64) as i64;
+            rec.set_step_limit(max_steps);
             rec.abort = abort;
             vm.set_instrumentation(rec);
         }
@@ -534,7 +556,7 @@ impl ScriptState {
     /// Recording costs roughly 64 bytes and a few register reads per
     /// instruction, so switch it on immediately before the code you want to
     /// prove and take it back with [`Self::finish_trace`] straight after.
-    #[cfg(feature = "instrument")]
+    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
     pub fn start_trace(&mut self, max_steps: usize) {
         let Some(vm) = self.vm.as_mut() else { return };
         if vm.instr_rec.is_none() {
@@ -555,7 +577,7 @@ impl ScriptState {
     /// receipt it offers. It is never a PARTIAL trace: a truncated recording is
     /// discarded rather than returned, because a trace missing its tail attests
     /// to an execution that did not happen.
-    #[cfg(feature = "instrument")]
+    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
     pub fn finish_trace(&mut self, result: u64) -> Option<Vec<TraceStep>> {
         self.vm
             .as_mut()
@@ -564,7 +586,7 @@ impl ScriptState {
     }
 
     /// Whether the last recording stopped early at the row cap.
-    #[cfg(feature = "instrument")]
+    #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
     pub fn trace_truncated(&self) -> bool {
         self.vm
             .as_ref()
@@ -607,7 +629,7 @@ impl ScriptState {
         let Some(rec) = vm.instr_rec.as_ref() else {
             return 0;
         };
-        rec.used
+        rec.steps_used()
     }
 
     /// Return the recorder's typed resource-exhaustion state, if any.

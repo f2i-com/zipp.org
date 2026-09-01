@@ -15,6 +15,9 @@ RUSTFLAGS='-Dwarnings -C link-arg=--max-memory=268435456 -C link-arg=-zstack-siz
 wasm-bindgen --target web --out-dir pkg \
   --remove-name-section --remove-producers-section \
   target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+node tests/node/strip-target-features.cjs \
+  pkg/zipp_wasm_bg.wasm pkg/zipp_wasm_bg.stripped.wasm
+mv pkg/zipp_wasm_bg.stripped.wasm pkg/zipp_wasm_bg.wasm
 # Verify the final post-processed artifact's memory and host-import surface.
 node tests/node/check-wasm-memory.cjs pkg/zipp_wasm_bg.wasm
 # Pre-compress. Serve this body with `Content-Encoding: br`; see below.
@@ -85,11 +88,48 @@ retains the isolated historical CGU4 candidate sizes so every build-policy row
 remains a like-for-like comparison. Current QuickJS-NG and Boa size and speed
 diagnostics are recorded in [`../../bench/comparison/README.md`](../../bench/comparison/README.md).
 
+The validated current development snapshot is separate from that release and
+from the checked-in landing-page module. Its section-stripped production Web
+artifact is 5,480,576 bytes raw, 1,826,113 bytes at gzip-9, and 1,233,843 bytes
+at Brotli-11, with SHA-256
+`caf26214ffca1407fba46f3bb304e4bb78ebb01b12898bf4132fc4e7a21f05f3`.
+It was built from the uncommitted post-v0.0.5 working tree, so the artifact hash,
+not a source revision, identifies this snapshot. The locked build used Rust
+1.92.0, wasm-bindgen 0.2.126, `opt-level=3`, four codegen units, overflow checks,
+aborting panics, a 256 MiB linked memory maximum, a 1 MiB linked stack, and the
+`safe-sandbox`, `meter-only`, `wasm-no-fs-loader`, and `wasm-single-agent`
+zipp-vm features. Name and producers sections were removed by wasm-bindgen and
+the optional `target_features` custom section by the validated local stripper;
+no `wasm-opt` pass was used.
+
+On the 48-repetition adapter-inclusive diagnostic this snapshot's persistent
+work geomean measured `0.0954663913×` QuickJS-NG and `0.0105336875×` Boa, with
+Zipp ahead on all five persistent point medians against both. Only array HOF
+and comparator sort remain cleanly above the work-minus-control subtraction
+floor, at `0.4681596596×` and `0.2316111384×` QuickJS-NG. Fib, loop, and object
+properties have only 25/48, 24/48, and 24/48 positive Zipp adjusted samples,
+with a negative object adjusted median, so the computed adjusted aggregate is
+not a robust headline. This is a bounded five-workload result including each
+project's adapter and context lifecycle, not a universal interpreter-core or
+all-JavaScript ranking.
+
+The immediately preceding development baseline is preserved: 5,462,006 bytes
+raw, 1,818,299 gzip-9, and 1,230,296 Brotli-11, SHA-256
+`8cf6e8207d1852cfa31c6e38d3b8a60bdec6e4894a65c1d08f39b244c849903b`.
+Its 48-repetition adjusted results were `1.7725499353×` QuickJS-NG and
+`0.1834251840×` Boa. The current speed kernels add only 18,570 raw, 7,814 gzip,
+and 3,547 Brotli bytes to that baseline. The current Zipp artifact remains
+`3.586×` as large raw and `2.958×` as large at Brotli-11 as QuickJS-NG's
+reactor; Boa remains larger. Exact commands and all per-row results are in the
+comparison document linked above. These are development evidence, not revised
+v0.0.5 release claims.
+
 ### Compression is where the bytes actually are
 
-The artifact is ~1.25 MB brotli and ~1.85 MB gzip. Serving it as gzip therefore
-costs ~600 KB per cold load — more than every build-level saving here put
-together. Confirm what your origin actually sends:
+The tracked v0.0.5 artifact is ~1.25 MB brotli and ~1.85 MB gzip; both
+development snapshots are ~1.23 MB and ~1.82 MB respectively. Serving them as
+gzip therefore costs roughly 590–600 KB per cold load — more than every
+build-level saving here put together. Confirm what your origin actually sends:
 
 ```sh
 curl -sS -o /dev/null -w '%{size_download}\n' \
@@ -112,6 +152,24 @@ This crate is deliberately a separate Cargo workspace and lockfile. Cargo
 unifies features inside one workspace; isolation prevents the native CLI's JIT
 feature from being combined with `safe-sandbox`. It builds for any target (so
 `cargo test --locked` here works), but only does anything on wasm32.
+
+The browser artifact additionally selects zipp-vm's internal `meter-only`
+profile. It retains step, heap, output, dynamic-code and regex limits but does
+not compile the execution-proof trace recorder or cooperative abort polling into
+WASM. The browser host enforces the wall-clock deadline by terminating the
+Worker instead. This is an artifact profile rather than a generally composable
+Cargo capability: `meter-only` deliberately removes trace-control methods even
+though it implies `instrument`, so do not combine it into a native embedding
+that consumes execution traces or expects an abort flag to be polled.
+
+Two further artifact-internal profiles match this host surface.
+`wasm-no-fs-loader` removes filesystem module-resolution machinery that the
+browser API cannot configure; explicit loader APIs continue to fail closed.
+`wasm-single-agent` removes the embedded test262 worker harness because browser
+Workers are the isolation boundary. The implementation retains
+SharedArrayBuffer, Atomics, and waiter behavior, but that retention does not
+broaden the `safe-sandbox` guest-visible surface. Like `meter-only`, neither
+feature belongs in a feature-unified general embedding.
 
 ## The two host channels
 

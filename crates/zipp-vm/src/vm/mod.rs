@@ -492,6 +492,7 @@ pub(crate) enum EnumWhat {
 /// A module whose dependencies are still evaluating (top-level await):
 /// everything needed to execute its body once they settle. Holds NO heap
 /// Values (slots/ids only) — the namespace itself is rooted via module_cache.
+#[cfg_attr(feature = "wasm-no-fs-loader", allow(dead_code))]
 pub(crate) struct DeferredModuleExec {
     pub remaining: usize,
     pub base_func: u32,
@@ -899,6 +900,7 @@ impl RegisterFile {
     }
 
     #[inline(always)]
+    #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
     pub(crate) fn get(&self, index: usize) -> Option<&Value> {
         self.storage[..self.logical_len].get(index)
     }
@@ -926,6 +928,7 @@ impl RegisterFile {
     /// memory-safe in release builds as well as debug builds.
     #[inline(always)]
     #[cfg(not(feature = "safe-sandbox"))]
+    #[cfg_attr(feature = "meter-only", allow(dead_code))]
     pub(crate) unsafe fn set_len(&mut self, new_len: usize) {
         assert!(
             new_len <= self.storage.len(),
@@ -2099,13 +2102,20 @@ pub struct Vm<'p> {
     /// one handle per started agent). `None` until the first `agent.start` —
     /// a run that never starts an agent pays nothing; each worker Vm holds a
     /// clone of the same Arc.
+    #[cfg(not(feature = "wasm-single-agent"))]
     agent_shared: Option<std::sync::Arc<agents::AgentShared>>,
     /// Whether this Vm is the CLI entry agent (`Main`) or an `agent.start`
     /// worker thread's Vm (`Worker`).
+    #[cfg(not(feature = "wasm-single-agent"))]
     agent_role: agents::AgentRole,
     /// Worker-side `$262.agent.receiveBroadcast` callback, invoked as
     /// `cb(sab, id)` for each broadcast retrieved. GC ROOT (gc.rs).
+    #[cfg(not(feature = "wasm-single-agent"))]
     broadcast_cb: Value,
+    /// In the single-agent artifact profile, preserve main-side report/FIFO
+    /// semantics without retaining Arc/Mutex/channel worker state.
+    #[cfg(feature = "wasm-single-agent")]
+    agent_reports: std::collections::VecDeque<String>,
     /// This Vm's cross-thread `Atomics.waitAsync` wake channel: a `notify`
     /// in ANY agent pushes a woken waiter's id here and signals the condvar;
     /// the event loop sleeps on that condvar and drains the ids first each
@@ -2608,6 +2618,8 @@ mod coerce;
 mod collections;
 mod const_cache;
 mod construct;
+#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+mod counted_loop;
 mod dtf_pattern;
 mod enum_stream;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -2629,6 +2641,8 @@ mod misc_methods;
 pub(crate) mod native;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod object_literal_jit;
+#[cfg(all(feature = "meter-only", not(feature = "jit")))]
+mod object_loop;
 mod proxy_regexp;
 mod segmenter;
 mod special_casing;
