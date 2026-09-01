@@ -1,4 +1,11 @@
 #![cfg_attr(feature = "safe-sandbox", forbid(unsafe_code))]
+// Outside the hardened profile every resource ceiling is the type's maximum
+// (`MAX_NATIVE_ITERATION_WORK` is `u64::MAX`, the string and regex caps are
+// `usize::MAX`), so the guards compare against a bound that can never be
+// exceeded and clippy's deny-by-default lint fires on each of them. The
+// comparisons are the hardened profile's guards compiled with the limit off,
+// not mistakes; silencing the lint here keeps `cargo clippy` runnable.
+#![allow(clippy::absurd_extreme_comparisons)]
 
 //! # zipp-vm — dynamic JavaScript engine v2
 //!
