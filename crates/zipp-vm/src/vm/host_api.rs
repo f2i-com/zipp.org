@@ -499,6 +499,14 @@ impl<'p> Vm<'p> {
         self.host_out(v, 0, &mut seen, &mut budget)
     }
 
+    /// Mirror the recorder's heap ceiling into the heap, so the slot table
+    /// grows gently instead of doubling past it (see
+    /// `Heap::reserve_slot_growth`).
+    #[cfg(feature = "instrument")]
+    pub(crate) fn set_resident_ceiling(&mut self, bytes: usize) {
+        self.heap.set_resident_ceiling(bytes);
+    }
+
     /// Restore the instruction budget without touching any other limit.
     ///
     /// Only the step counter moves: `heap_limit`, `output_limit` and the

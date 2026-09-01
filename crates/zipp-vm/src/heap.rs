@@ -5072,6 +5072,11 @@ pub struct Heap {
     /// `alloc` sets this once the live count passes `gc_threshold`; the interpreter
     /// dispatch loop polls it at a safe point and runs a collection.
     pub(crate) gc_requested: bool,
+    /// The embedder's resident-byte ceiling, mirrored from the recorder's
+    /// `heap_limit` by [`Heap::set_resident_ceiling`] so the slot table can
+    /// refuse to DOUBLE past it. `usize::MAX` (the native default) leaves
+    /// `Vec` growth alone. See [`Heap::reserve_slot_growth`].
+    resident_ceiling: usize,
     /// Live-count at which the next collection is requested (grown adaptively after
     /// each GC to amortise; never below `GC_MIN_THRESHOLD`).
     gc_threshold: usize,
@@ -5481,6 +5486,7 @@ impl Heap {
             free: Vec::new(),
             live,
             gc_requested: false,
+            resident_ceiling: usize::MAX,
             // Keep the historical number of collectable allocations before
             // the first GC: the 100 new pad2 prefix slots are permanent OLD
             // objects, not young allocation pressure.
@@ -5513,6 +5519,7 @@ impl Heap {
             vremset: Vec::new(),
             valgrain,
         };
+        h.align_slot_table_capacities();
         h.recache_mirror_raws();
         h
     }
@@ -6200,6 +6207,9 @@ impl Heap {
             return idx;
         }
         let idx = self.objs.len() as u32;
+        if self.objs.len() == self.objs.capacity() {
+            self.reserve_slot_growth();
+        }
         self.objs.push(obj);
         self.resident_payload_charged.push(Cell::new(payload));
         self.versions.push(0);
@@ -6233,6 +6243,111 @@ impl Heap {
             self.allocs_epoch += 1;
         }
         idx
+    }
+
+    /// Record the embedder's resident-byte ceiling (`usize::MAX` = none).
+    /// Only the instrumented profile has a ceiling to mirror.
+    #[cfg(feature = "instrument")]
+    pub(crate) fn set_resident_ceiling(&mut self, bytes: usize) {
+        self.resident_ceiling = bytes;
+    }
+
+    /// Give every per-slot table the slot table's capacity, so they reach
+    /// their power-of-two boundaries on the SAME push and
+    /// [`Heap::reserve_slot_growth`] sees all of them at once. The mirrors are
+    /// built with `vec![x; n]` (capacity exactly `n`) while `objs` may start
+    /// with headroom, and a table whose boundary comes early doubles on its
+    /// own, unguarded -- measured as a 44 MiB jump one round before the slot
+    /// table's own boundary.
+    fn align_slot_table_capacities(&mut self) {
+        let cap = self.objs.capacity();
+        fn align<T>(v: &mut Vec<T>, cap: usize) {
+            if let Some(more) = cap.checked_sub(v.len()) {
+                if v.capacity() < cap {
+                    v.reserve_exact(more);
+                }
+            }
+        }
+        align(&mut self.resident_payload_charged, cap);
+        align(&mut self.versions, cap);
+        align(&mut self.cell_vals_mirror, cap);
+        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        {
+            align(&mut self.hot_mirror, cap);
+            align(&mut self.this_mirror, cap);
+            align(&mut self.upvals_mirror, cap);
+        }
+        if self.nursery {
+            align(&mut self.gen, cap);
+        }
+        if self.oracle {
+            align(&mut self.born, cap);
+        }
+    }
+
+    /// Bytes every slot costs across the parallel per-slot tables that grow
+    /// in lock-step with `objs`.
+    fn slot_table_bytes_per_entry(&self) -> usize {
+        let mut per = std::mem::size_of::<HeapObj>()
+            + std::mem::size_of::<Cell<usize>>()
+            + std::mem::size_of::<u32>()
+            + std::mem::size_of::<u64>();
+        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        {
+            per += std::mem::size_of::<HotMirror>() + 2 * std::mem::size_of::<u64>();
+        }
+        if self.nursery {
+            per += std::mem::size_of::<u8>();
+        }
+        if self.oracle {
+            per += std::mem::size_of::<u32>();
+        }
+        per
+    }
+
+    /// Called when the slot table is full and about to grow. `Vec::push`
+    /// doubles, and every parallel per-slot table doubles at the same
+    /// moment, so a heap sitting just under a resident ceiling asks the
+    /// allocator for a second copy of everything it holds: at four million
+    /// slots that is more than a gigabyte in flight, which is the linked
+    /// maximum of the WebAssembly build. The ceiling check runs AFTER an
+    /// allocation, so it never saw the request -- the module trapped with
+    /// `unreachable` instead of the catchable RangeError the ceiling exists
+    /// to produce, and the stranded Engine could not even be disposed.
+    ///
+    /// When doubling would carry the resident estimate past the ceiling,
+    /// reserve a small exact step instead. The tables still grow, the estimate
+    /// crosses the ceiling on the next poll, and the guest gets its RangeError
+    /// with the module intact. A heap with no ceiling never enters this path.
+    #[cold]
+    #[inline(never)]
+    fn reserve_slot_growth(&mut self) {
+        let ceiling = self.resident_ceiling;
+        if ceiling == usize::MAX {
+            return;
+        }
+        let cap = self.objs.capacity();
+        let doubled = cap.max(4).saturating_mul(self.slot_table_bytes_per_entry());
+        if self.resident_bytes().saturating_add(doubled) <= ceiling {
+            return;
+        }
+        let step = (cap / 16).max(1024);
+        self.objs.reserve_exact(step);
+        self.resident_payload_charged.reserve_exact(step);
+        self.versions.reserve_exact(step);
+        self.cell_vals_mirror.reserve_exact(step);
+        #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+        {
+            self.hot_mirror.reserve_exact(step);
+            self.this_mirror.reserve_exact(step);
+            self.upvals_mirror.reserve_exact(step);
+        }
+        if self.nursery {
+            self.gen.reserve_exact(step);
+        }
+        if self.oracle {
+            self.born.reserve_exact(step);
+        }
     }
 
     /// Whether the B6 generational oracle is latched on (`ZIPP_GCSTATS=1`).
@@ -6636,6 +6751,19 @@ impl Heap {
                 }
             })
             .saturating_add(vec_capacity_bytes(&self.versions))
+            .saturating_add(vec_capacity_bytes(&self.cell_vals_mirror))
+            .saturating_add({
+                #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+                {
+                    vec_capacity_bytes(&self.hot_mirror)
+                        + vec_capacity_bytes(&self.this_mirror)
+                        + vec_capacity_bytes(&self.upvals_mirror)
+                }
+                #[cfg(not(any(not(feature = "meter-only"), feature = "jit")))]
+                {
+                    0
+                }
+            })
             .saturating_add(vec_capacity_bytes(&self.free))
             .saturating_add(vec_capacity_bytes(&self.born))
             .saturating_add(vec_capacity_bytes(&self.young))

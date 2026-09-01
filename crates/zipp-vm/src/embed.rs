@@ -470,6 +470,8 @@ impl ScriptState {
             if let Some(rec) = vm.instr_rec.as_mut() {
                 rec.heap_limit = bytes;
             }
+            // Let the slot table refuse to double past the ceiling too.
+            vm.set_resident_ceiling(bytes);
         }
     }
 
