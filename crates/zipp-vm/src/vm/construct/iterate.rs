@@ -1025,6 +1025,7 @@ impl<'p> Vm<'p> {
                 break;
             }
             out.push(self.get_prop(res, "value")?);
+            self.instrument_drain_heap_check(out.len())?;
         }
         // IteratorClose (normal completion): destructuring took the fixed number of
         // elements it needed; if the iterator isn't exhausted, close it. With a
@@ -1302,6 +1303,7 @@ impl<'p> Vm<'p> {
                         "RangeError: iterator produced more values than the engine's limit".into(),
                     ));
                 }
+                self.instrument_drain_heap_check(out.len())?;
             }
             return Ok(out);
         }
@@ -1343,6 +1345,7 @@ impl<'p> Vm<'p> {
                                 .into(),
                         ));
                     }
+                    self.instrument_drain_heap_check(out.len())?;
                 }
                 return Ok(out);
             }
@@ -1509,6 +1512,9 @@ impl<'p> Vm<'p> {
                             ));
                         }
                         out.push(mapped);
+                        if let Err(e) = self.instrument_drain_heap_check(out.len()) {
+                            close_and_throw!(e);
+                        }
                     }
                 }
                 k += 1;

@@ -1456,6 +1456,9 @@ pub struct Vm<'p> {
     /// (14 slots). Refreshed by every successful RegExpBuiltinExec; empty until
     /// the first match (the accessors then yield their empty-string defaults).
     regexp_last: Vec<Value>,
+    /// Native iterator steps taken so far, for the heap-ceiling re-check
+    /// inside long drains (`iterhelpers::note_iterator_drain_step`). Wraps.
+    pub(crate) iterator_drain_steps: u32,
     /// The eight `typeof` result strings, interned once in `setup_globals` (so
     /// below `gc_floor` and pinned for the VM's lifetime). Indexed by position in
     /// [`crate::bytecode::TYPEOF_NAMES`]. `UNDEFINED` before setup runs, which
@@ -2587,6 +2590,17 @@ pub(crate) const COLL_MEMO_NAMES: usize = 6;
 /// A thrown JS value rendered to a message (v1 throws are strings/RangeError).
 #[derive(Debug)]
 pub struct Thrown(pub String);
+
+impl<'p> Vm<'p> {
+    /// Heap-ceiling re-check inside a native iterator drain; see the
+    /// instrumented twin in `instrument.rs`. Nothing to check without a
+    /// recorder.
+    #[cfg(not(feature = "instrument"))]
+    #[inline(always)]
+    pub(crate) fn instrument_drain_heap_check(&mut self, _steps: usize) -> Result<(), Thrown> {
+        Ok(())
+    }
+}
 
 impl<'p> Vm<'p> {
     /// Execute one guest-controlled native recursion edge under the shared

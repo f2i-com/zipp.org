@@ -1553,6 +1553,26 @@ impl super::Vm<'_> {
         Ok(())
     }
 
+    /// Re-check the heap ceiling from inside a native drain.
+    ///
+    /// `Array.from`, spread, the collection constructors and the destructuring
+    /// helpers pull an iterator to exhaustion inside ONE instruction, with the
+    /// collector suspended for the scope, so every `{value, done}` result they
+    /// allocate stays live until the drain returns. The dispatch-stride poll
+    /// never runs meanwhile, and the eager-result cap alone permits four
+    /// million results -- more than a gigabyte of them -- before it fires. A
+    /// WebAssembly host reaches its linked memory first and traps. Polling
+    /// every 1,024 steps turns that into the ceiling's catchable RangeError
+    /// while the request is still affordable; the check is the O(1) estimate
+    /// with the growth reserve, and it never advances the walk stride.
+    pub(crate) fn instrument_drain_heap_check(&mut self, steps: usize) -> Result<(), super::Thrown> {
+        if steps & 1023 != 0 {
+            return Ok(());
+        }
+        self.instrument_heap_poll_inner(false)
+            .map_err(|message| super::Thrown(message.into()))
+    }
+
     /// Fill in the previous row's `val_dst` and confirm — or drop — its claim.
     #[cfg(not(feature = "meter-only"))]
     fn instrument_complete(&mut self) {

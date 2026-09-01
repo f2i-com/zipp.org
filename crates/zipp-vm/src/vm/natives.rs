@@ -68,6 +68,10 @@ impl<'p> Vm<'p> {
                 ));
             }
             out.push(value);
+            if let Err(error) = self.instrument_drain_heap_check(out.len()) {
+                self.iterator_close_quiet(iter);
+                return Err(error);
+            }
         }
         Ok(out)
     }

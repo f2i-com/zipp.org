@@ -125,10 +125,23 @@ impl<'p> Vm<'p> {
                 return Ok(None);
             }
             let val = self.get_prop(res, "value")?;
+            self.note_iterator_drain_step()?;
             return Ok(Some(val));
         }
         let next = self.get_prop(iter, "next")?;
         self.iterator_step_with(iter, next)
+    }
+
+    /// Every native step through an iterator counts toward a heap-ceiling
+    /// re-check (see `instrument_drain_heap_check`): the collection
+    /// constructors, `Promise.all` and friends step an iterator to exhaustion
+    /// inside one instruction with the collector suspended, so the
+    /// `{value, done}` results pile up unseen by the dispatch-stride poll.
+    #[inline]
+    fn note_iterator_drain_step(&mut self) -> Result<(), Thrown> {
+        self.iterator_drain_steps = self.iterator_drain_steps.wrapping_add(1);
+        let steps = self.iterator_drain_steps as usize;
+        self.instrument_drain_heap_check(steps)
     }
 
     /// IteratorStep using a PRE-FETCHED `next` method (GetIteratorDirect cached it), so
@@ -149,6 +162,7 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let val = self.get_prop(res, "value")?;
+        self.note_iterator_drain_step()?;
         Ok(Some(val))
     }
 

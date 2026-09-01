@@ -214,6 +214,7 @@ impl<'p> Vm<'p> {
             regexp_last: vec![Value::heap(crate::heap::INTERN_EMPTY); 14],
             #[cfg(not(feature = "safe-sandbox"))]
             regexp_last: Vec::new(),
+            iterator_drain_steps: 0,
             typeof_strs: [Value::UNDEFINED; 8],
             regexp_last_lazy: None,
             run_loop_depth: 0,
