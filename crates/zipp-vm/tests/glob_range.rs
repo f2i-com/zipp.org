@@ -26,6 +26,10 @@
 //! with a `globrange_mechanism_*` pin that reads the plan back out of the
 //! log: narrowing planned, GPR tier engaged, and — for the B9 pin — a native
 //! exit ip that lands strictly inside a narrowed global's touch window.
+//!
+//! Every mechanism pin reads the x86-64 JIT's log, so like the other
+//! tier-pinning suites this file compiles only where that tier exists.
+#![cfg(all(feature = "jit", target_arch = "x86_64"))]
 
 fn run_ok(src: &str) -> Vec<String> {
     let out = zipp_vm::run(src).expect("source compiles");

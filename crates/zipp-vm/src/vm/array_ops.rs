@@ -4090,9 +4090,11 @@ mod array_stringify_safety_tests {
 
     #[test]
     fn array_like_native_loops_fail_before_hostile_length_work() {
-        let outcome = crate::run(
-            r#"
-                const huge = { length: 262146 };
+        // One past the live cap, so raising MAX_NATIVE_ITERATION_WORK (v0.0.10
+        // took it from 262,144 to 67,108,864) keeps this a hostile length.
+        let hostile_len = crate::vm::MAX_NATIVE_ITERATION_WORK + 2;
+        let source = r#"
+                const huge = { length: __HOSTILE_LEN__ };
                 const results = [];
                 for (const run of [
                     () => Array.prototype.forEach.call(huge, () => {}),
@@ -4107,9 +4109,9 @@ mod array_stringify_safety_tests {
                 }
                 console.log(results.join(","));
                 console.log(Array.prototype.indexOf.call({ length: 1000000000 }, 1, 999999999));
-            "#,
-        )
-        .expect("script compiles");
+            "#
+        .replace("__HOSTILE_LEN__", &hostile_len.to_string());
+        let outcome = crate::run(&source).expect("script compiles");
         assert_eq!(outcome.error, None);
         assert_eq!(
             outcome.output,

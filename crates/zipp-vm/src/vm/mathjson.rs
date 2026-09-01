@@ -2556,20 +2556,34 @@ impl JsonSrc {
 mod stringify_limit_tests {
     use crate::embed;
 
-    // A tiny retained graph whose serialized expansion is about 10 MiB:
-    // every level aliases the preceding value ten times, so constructing it
-    // costs only four short arrays and one 1 KiB string.
-    const ALIAS_TREE: &str = r#"
-        let v = "x".repeat(1024);
-        for (let depth = 0; depth < 4; depth++) {
-            v = [v, v, v, v, v, v, v, v, v, v];
+    // A tiny retained graph whose serialized expansion exceeds the string
+    // ceiling: every level aliases the preceding value ten times, so
+    // constructing it costs only a handful of short arrays and one 1 KiB
+    // string. The depth is derived from the live limit so that raising
+    // MAX_STRING_BYTES (v0.0.10 took it from 1 MiB to 128 MiB) cannot
+    // silently turn this into a test of a graph that fits.
+    fn alias_tree() -> String {
+        let mut depth = 0u32;
+        let mut expansion = 1024u128;
+        while expansion <= super::MAX_STRING_BYTES as u128 {
+            expansion *= 10;
+            depth += 1;
         }
-    "#;
+        format!(
+            r#"
+        let v = "x".repeat(1024);
+        for (let depth = 0; depth < {depth}; depth++) {{
+            v = [v, v, v, v, v, v, v, v, v, v];
+        }}
+    "#
+        )
+    }
 
     fn assert_catchable_range_error(call: &str) {
+        let alias_tree = alias_tree();
         let source = format!(
             r#"
-                {ALIAS_TREE}
+                {alias_tree}
                 let caught = "none";
                 try {{ {call}; }} catch (error) {{
                     caught = (error instanceof RangeError) + ":" + error.name + ":" + error.message;
@@ -2597,9 +2611,10 @@ mod stringify_limit_tests {
 
     #[test]
     fn metered_stringify_exhaustion_is_sticky() {
+        let alias_tree = alias_tree();
         let source = format!(
             r#"
-                {ALIAS_TREE}
+                {alias_tree}
                 try {{
                     JSON.stringify(v, function (_key, value) {{ return value; }});
                 }} catch (error) {{}}
