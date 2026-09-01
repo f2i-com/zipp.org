@@ -5152,6 +5152,22 @@ pub struct Heap {
     /// Latched by [`Heap::note_minor_done`] when the post-minor occupied
     /// count crossed `major_at`: the next collection runs as a major.
     major_due: bool,
+    /// Bytes of large payload allocated since the last collection.
+    ///
+    /// The rest of the schedule counts ALLOCATIONS: a minor is due every
+    /// NURSERY_YOUNG_BUDGET of them, a major every `nursery_max_minors`
+    /// minors. The memory ceiling an embedder sets is in BYTES, and those two
+    /// units come apart as objects get bigger. At 2 KiB an object, 16,384
+    /// allocations between minors is 33 MB and the collector keeps pace; at
+    /// 4 KiB it is 67 MB, and a 128 MiB budget is spent before a minor is even
+    /// due. A Game Boy emulator encoding a 23 KB framebuffer per frame reached
+    /// the ceiling in about 1,400 allocations — two orders of magnitude before
+    /// the schedule would have looked.
+    ///
+    /// Only allocations at or above BIG_PAYLOAD_BYTES are counted here, so the
+    /// small-object path that the count-based schedule already handles well
+    /// pays one size read and nothing else.
+    big_bytes_since_gc: usize,
     /// Minor collections since the last major (the scheduling backstop).
     minors_since_major: u32,
     /// Maximum consecutive minor collections before the scheduling backstop
@@ -5285,6 +5301,17 @@ const NURSERY_YOUNG_BUDGET: usize = 1 << 14;
 /// at the adaptive cap (`NURSERY_BUDGET_MAX`) the default defers the hygiene
 /// major to at most 64×128k allocations; `major_at` still bounds floats within
 /// one (now larger) budget of the pre-nursery schedule.
+/// Payload size at which an allocation is counted against the byte-based
+/// collection trigger. Below this the count-based schedule demonstrably keeps
+/// up: 2 KiB objects churn through 512 MB without the ceiling being reached.
+const BIG_PAYLOAD_BYTES: usize = 4096;
+
+/// Large-payload bytes allowed between collections. Small enough that a
+/// 128 MiB budget cannot be spent inside one interval — the failure this
+/// exists to prevent — and large enough that a program allocating big buffers
+/// steadily is not collecting on every frame.
+const BIG_PAYLOAD_GC_AT: usize = 8 * 1024 * 1024;
+
 const NURSERY_MAX_MINORS_DEFAULT: u32 = 64;
 const NURSERY_MAX_MINORS_LIMIT: u32 = 4096;
 
@@ -5472,6 +5499,7 @@ impl Heap {
             // includes these permanent slots, so preserve the old boundary in
             // terms of collectable survivors rather than total prefix size.
             major_at: GC_MIN_THRESHOLD + INTERN_PAD2_COUNT as usize,
+            big_bytes_since_gc: 0,
             major_due: false,
             minors_since_major: 0,
             nursery_max_minors,
@@ -6090,6 +6118,28 @@ impl Heap {
     fn alloc_settled(&mut self, obj: HeapObj, hot: HotMirrorHint) -> u32 {
         #[cfg(all(feature = "meter-only", not(feature = "jit")))]
         let _ = hot;
+        // Ask for a collection on BYTES as well as on count. Only large
+        // payloads are weighed: `resident_payload_bytes` is a capacity read
+        // for the variants that can be big, and the threshold test rejects
+        // everything else before the counter is touched, so the small-object
+        // path the count-based schedule already serves well is unaffected.
+        //
+        // A major is requested, not a minor. Large buffers are what the
+        // nursery pretenures and what survives a minor, so a young-only sweep
+        // is precisely the collection that cannot reclaim them — that is why
+        // the existing schedule, which reaches a major only after 64 minors,
+        // never arrived in time.
+        {
+            let big = obj.resident_payload_bytes();
+            if big >= BIG_PAYLOAD_BYTES {
+                self.big_bytes_since_gc = self.big_bytes_since_gc.saturating_add(big);
+                if self.big_bytes_since_gc >= BIG_PAYLOAD_GC_AT {
+                    self.big_bytes_since_gc = 0;
+                    self.gc_requested = true;
+                    self.major_due = true;
+                }
+            }
+        }
         // Sizing every allocation is only worth paying once something reads
         // the figure; `audit_resident_bytes` turns accounting on and backfills
         // (see `payload_accounting`), so lazily-enabled totals stay exact.
@@ -7045,6 +7095,7 @@ impl Heap {
         self.live_at_major = live;
         self.minors_since_major = 0;
         self.major_due = false;
+        self.big_bytes_since_gc = 0;
         if self.nursery {
             // Every survivor of a major is OLD (and the remembered set is
             // stale — its young referents were just promoted or swept).

@@ -346,6 +346,7 @@ jobs:
           node tests/node/host-contract.cjs
           node tests/node/buffer-ceiling.cjs
           node tests/node/budget-and-seed.cjs
+          node tests/node/large-alloc-gc.cjs
           node tests/node/worker-deadline.cjs
           # The parse-shape limits are calibrated against the artifact built by
           # the step above, with its 1 MiB linker stack. v0.0.1 shipped limits
