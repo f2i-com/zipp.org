@@ -374,10 +374,15 @@ cheap, isolated explanation.
 cargo test --workspace --release
 cargo check -p zipp-vm --no-default-features
 cargo check -p zipp-vm --no-default-features --features safe-sandbox
+cargo test -p zipp-vm --no-default-features --features safe-sandbox --no-fail-fast
 ```
 
-For changes that touch sandbox-only code, also run the standalone sandbox
-workspace. For interpreter/JIT semantics, compare the test262 expected-failure
+The last line is the whole hardened-profile suite and is expected clean
+(209 binaries, 0 failures as of 2026-09-02): the JIT-pinning suites carry the
+x86-64 JIT cfg, the limit tests size themselves from `zipp_vm::safe_native_limits`,
+and the drains that need sixty-seven million iterator steps run only under
+`--release`. For changes that touch sandbox-only code, also run the standalone
+sandbox workspace. For interpreter/JIT semantics, compare the test262 expected-failure
 identity in default, `ZIPP_NOJIT=1`, `ZIPP_JIT_THRESHOLD=1`, and
 `ZIPP_NO_NURSERY=1` modes. Run the tier-differential fuzz slice for codegen,
 register-planning, deopt, or heap-layout changes.
