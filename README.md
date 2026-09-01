@@ -248,6 +248,19 @@ is 5,595,833 bytes raw (1,254,075 Brotli-11), between QuickJS-NG's
 1,528,293-byte reactor (417,087 Brotli-11) and Boa's 21,296,176-byte module
 (5,484,164 Brotli-11).
 
+#### Current v0.0.6 native confirmation
+
+The clean default-feature v0.0.6 release binary at engine-source commit
+`e3acee352074` reran all 13 current real13 inputs against QuickJS-NG v0.16.2,
+with the runner selecting Zipp's interpreter through `ZIPP_NOJIT=1`. All 39
+canonicalized validation outputs matched after the documented QuickJS CRLF-to-LF
+normalization; raw output bytes and hashes remain recorded. Across six
+counterbalanced rounds, Zipp won all 13 point medians: Zipp / QuickJS-NG was
+`0.6089665×` (descriptive 95% interval 0.6072021–0.6122180) for cold
+fresh-process time and `0.6058409×` (0.6041440–0.6090422) after paired
+empty-launch subtraction. This confirms the native interpreter result on the
+final engine code; it does not predict WASM performance.
+
 #### Current v0.0.6 browser-WASM status
 
 The committed v0.0.6 production module is 5,480,311 bytes raw, 1,825,812 at

@@ -13,6 +13,18 @@ same-suite harness repair at `c778292`. The production browser module is
 5,480,311 bytes raw, 1,825,812 gzip-9, and 1,233,575 Brotli-11, with SHA-256
 `318fc5cf7ee5d55751d829419d4de5af1ab2643b8f7fd30df2e3779c16ad1691`.
 
+## v0.0.6 native interpreter / QuickJS-NG confirmation
+
+The clean default-feature release binary at `e3acee352074` reran the current
+real13 suite for six counterbalanced rounds with `ZIPP_NOJIT=1`. All 39
+canonicalized validation outputs matched after QuickJS CRLF-to-LF normalization
+and all 234 measured launch pairs completed. Zipp / QuickJS-NG v0.16.2 was
+`0.6089665×` cold [0.6072021, 0.6122180] and `0.6058409×` startup-adjusted
+[0.6041440, 0.6090422], with 13 / 13 point wins; intervals are descriptive 95%.
+Raw evidence is
+`target/comparison/results/native-real13-v006-e3acee352074-clean-6.json`
+(SHA-256 `38915c58…2fe5`). This is native CLI evidence, not WASM evidence.
+
 ## v0.0.6 same-source WASM / QuickJS-NG diagnostic
 
 The clean six-round capture is

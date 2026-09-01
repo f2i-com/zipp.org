@@ -71,6 +71,18 @@ Boa. The WASM interfaces and feature sets differ, so this is diagnostic
 attribution rather than a universal engine ranking. Exact commands and hashes
 are in [`bench/comparison/README.md`](bench/comparison/README.md).
 
+### Current v0.0.6 native QuickJS-NG confirmation
+
+The clean default-feature release binary at engine-source commit `e3acee352074`
+reran the current real13 protocol for six counterbalanced rounds with
+`ZIPP_NOJIT=1`. All canonicalized output matched after documented QuickJS
+CRLF-to-LF normalization, and Zipp led QuickJS-NG v0.16.2 on all 13 point
+medians. Cold Zipp / QuickJS-NG was `0.6089665×` [0.6072021, 0.6122180];
+startup-adjusted was `0.6058409×` [0.6041440, 0.6090422], with descriptive 95%
+intervals. This closes the historical sparse-array point gap for the current
+native engine source. It remains diagnostic native CLI evidence and does not
+imply a WASM win.
+
 ### v0.0.6 exact-suite WASM status
 
 The committed production WebAssembly module is 5,480,311 bytes raw, 1,825,812
@@ -314,14 +326,13 @@ Attribute host glue, Rust/runtime footprint, and interpreter code separately.
 Compressed transfer size is the shipping objective. The remaining absolute gap
 is large enough to justify a fresh symbol/section and feature-footprint audit.
 
-### 2. Reconfirm native real13 vs QuickJS-NG on the final release source
+### 2. Guard the native real13 win over QuickJS-NG
 
-The clean v0.0.6 diagnostic at engine commit `6650647` closed the historical
-v0.0.5 sparse-array point gap: Zipp led all 13 adjusted point medians, with a
-`0.6067463×` adjusted geomean and sparse-array at `0.9335625×`. It predates the
-later heap-slab change at `52645a0`, so rerun the six-round protocol on the
-final release source before promoting this from diagnostic evidence. Profile a
-native QuickJS gap only if that clean rerun reveals one.
+The clean final-engine-source diagnostic now leads all 13 QuickJS-NG point
+medians, at `0.6058409×` adjusted overall; the closest row is sparse-array at
+`0.9312122×`. Keep exact output and this full 13-row protocol as the regression
+gate. Do not profile a native QuickJS gap unless a future clean rerun reveals
+one; the present priority is WASM coverage and its four measured point gaps.
 
 ### 3. Allocation survival — 1.772× Node
 

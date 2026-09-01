@@ -23,14 +23,16 @@ All three use only six samples per case or phase. Their intervals and ratios
 are useful diagnostics for this machine and corpus, not evidence of a universal
 engine ranking.
 
-The v0.0.6 work adds a direct attempt over the exact frozen normal 13 and hostile
-17 inventory:
+The v0.0.6 work adds a clean native real13 confirmation and a separate direct
+WASM attempt over the current normal 13 and hostile 17 sources:
 
-- `target/comparison/results/wasm-suites-v006-c77829269703-final-6.json`
+- native real13: `target/comparison/results/native-real13-v006-e3acee352074-clean-6.json`
+- WASM normal 13 + hostile 17: `target/comparison/results/wasm-suites-v006-c77829269703-final-6.json`
 
-It is a complete capture attempt, but explicitly not a publishable comparison:
-the production interfaces and limits leave only five common timed rows. The
-older specialization experiments remain available for mechanism attribution:
+The WASM result is a complete capture attempt, but explicitly not a publishable
+comparison: the production interfaces and limits leave only five common timed
+rows. The older specialization experiments remain available for mechanism
+attribution:
 
 - speed kernels: `target/comparison/results/wasm-kernels-final-48.json`
 - pre-kernel baseline: `target/comparison/results/wasm-meter-countdown-final-48.json`
@@ -121,6 +123,7 @@ The exact native payloads supplied to the runner are:
 | Engine binary | Bytes | SHA-256 |
 |---|---:|---|
 | Zipp v0.0.5 release-default | 7,932,416 | `b36850e162f7a9d2221ac33e888c8e5ea3d7ee85e3833e6f2e5ad9a73c0c23be` |
+| Zipp v0.0.6 release-default | 7,940,096 | `ea559d296f3b7a9121b6f7a2bd4d9afad9960dc8b21432d46317d002b6fe4811` |
 | QuickJS-NG v0.16.2 official x86-64 | 2,149,746 | `7b27412de844403545bd151fbe49191b4d5b91a9e15b5db7c863fea54639a82b` |
 | Boa v0.22.0 local official-profile build | 35,422,720 | `1b41611e2c0bafcb5c73736f04896e3d82bf1903a455755b2e1f6876e1629d24` |
 
@@ -251,6 +254,47 @@ of the measured claim.
 Boa.  Its five wins do not establish the result on the larger `real13` corpus.
 Likewise, six repetitions make the bootstrap intervals descriptive rather than
 an assurance about other machines, engine versions, programs, or feature sets.
+
+### Current v0.0.6 native interpreter confirmation
+
+After the v0.0.6 engine changes, the default-feature release binary was rebuilt
+from clean commit `e3acee352074b0617627c04034742627cb08c9b8` and the real13 protocol
+was rerun unchanged. The `zipp-interp` engine entry sets `ZIPP_NOJIT=1`; this is
+the normal release binary executing its interpreter tier, not a separately
+compiled interpreter-only executable:
+
+```powershell
+python bench\comparison\run_native.py `
+  --zipp target\release\zipp.exe `
+  --quickjs-ng target\comparison\bin\quickjs-ng-v0.16.2\qjs-windows-x86_64.exe `
+  --boa target\comparison\build\boa-native\release\boa.exe `
+  --suite real13 `
+  --engines node,zipp-interp,quickjs-ng `
+  --reps 6 `
+  --bootstrap-samples 10000 `
+  --zipp-revision e3acee352074b0617627c04034742627cb08c9b8 `
+  --quickjs-ng-revision 1ab8676f4b6d6d669baeb5f21790fb9734636a20 `
+  --boa-revision 337a3668a0dc86dd401ea20906e782249a64a228 `
+  --json target\comparison\results\native-real13-v006-e3acee352074-clean-6.json
+```
+
+The result records `dirty:false`, `diagnostic_only:true`, `all_correct:true`,
+39 / 39 matching canonical validation outputs after the documented QuickJS
+CRLF-to-LF normalization, 234 measured launch pairs, and 10,000 retained
+paired-bootstrap draws. Raw output bytes and hashes remain in the result.
+The Zipp executable SHA-256 is
+`ea559d296f3b7a9121b6f7a2bd4d9afad9960dc8b21432d46317d002b6fe4811`;
+the result JSON SHA-256 is
+`38915c586a7b80d165f1e131097ac041a50b32baa0abba6460c7678a93db2fe5`.
+
+| Measure | Zipp / QuickJS-NG geomean (descriptive 95% interval) | point wins |
+|---|---:|---:|
+| cold fresh process | `0.6089664721×` (`0.6072020947`–`0.6122179737`) | 13 / 13 |
+| startup-adjusted | `0.6058408972×` (`0.6041439792`–`0.6090421670`) | 13 / 13 |
+
+The closest adjusted rows were sparse-array at `0.9312122×`,
+polymorphic-objects at `0.9302724×`, and typedarray-math at `0.9090106×`.
+This is a native interpreter/CLI result, not browser-WASM evidence.
 
 ## WebAssembly artifact scope
 
