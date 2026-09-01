@@ -2,7 +2,13 @@
 # Mirror the standalone zipp-wasm workspace's allocator backstop for builds
 # launched from the repository root (Cargo discovers config from the current
 # directory, not from --manifest-path).
+#
+# Keep this EQUAL to crates/zipp-wasm/.cargo/config.toml. It drifted once, when
+# the ceiling there went to 1 GiB and this was left at 256 MiB, which put the
+# instance maximum BELOW the VM's own 512 MiB heap budget: a root-launched build
+# could never reach its accounting limit, because linear memory ran out first
+# and the instance trapped instead of reporting.
 rustflags = [
-    "-C", "link-arg=--max-memory=268435456",
+    "-C", "link-arg=--max-memory=1073741824",
     "-C", "link-arg=-zstack-size=1048576",
 ]
