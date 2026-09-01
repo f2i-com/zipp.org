@@ -28,7 +28,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Select the Node.js harness-test runtime
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
       - name: Run benchmark harness adversarial tests
@@ -180,7 +180,7 @@ jobs:
       - name: Audit isolated native-sandbox dependencies
         run: cargo +stable audit --deny warnings --file crates/zipp-sandbox/Cargo.lock
       - name: Select Node.js for the landing-page lockfile audit
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
