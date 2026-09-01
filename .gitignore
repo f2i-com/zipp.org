@@ -8,6 +8,10 @@ crates/zipp-sandbox/target/
 
 # Generated wasm-bindgen glue for the node harnesses (see crates/zipp-wasm/tests/node/README.md)
 crates/zipp-wasm/tests/node/pkg/
+# ...and for the browser target, which the README recipe and SoftN's vendoring
+# script both write here. Untracked build output blocks the clean-checkout rule
+# that vendoring depends on, exactly as dist/ did.
+crates/zipp-wasm/pkg/
 
 # Release packaging output. The release job writes the CLI archive to ./dist and
 # the browser bundle to crates/zipp-wasm/dist, so anyone reproducing those steps
