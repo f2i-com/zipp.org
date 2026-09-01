@@ -321,6 +321,21 @@ jobs:
           --features safe-sandbox,meter-only,wasm-no-fs-loader,wasm-single-agent
           --test no_fs_loader --test wasm_single_agent
 
+      - name: Build zipp-vm in the configurations its manifest advertises
+        # Every other job builds this crate with `meter-only`, which pulls in
+        # `instrument`. That hid a `renew_step_budget` reaching straight for
+        # `instr_rec` — a field that only exists under that feature — so the
+        # crate did not compile on its own, nor as the `--no-default-features`
+        # pure interpreter its Cargo.toml offers. Feature unification in the
+        # workspace build meant nothing ever noticed.
+        env:
+          RUSTFLAGS: -Dwarnings
+        run: |
+          set -euo pipefail
+          cargo check --locked --manifest-path ../zipp-vm/Cargo.toml
+          cargo check --locked --manifest-path ../zipp-vm/Cargo.toml --no-default-features
+          cargo check --locked --manifest-path ../zipp-vm/Cargo.toml             --no-default-features --features safe-sandbox
+
       - name: Install the exact matching wasm-bindgen CLI
         run: |
           set -euo pipefail

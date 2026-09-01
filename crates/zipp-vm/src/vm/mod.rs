@@ -922,6 +922,10 @@ impl RegisterFile {
 
     #[inline(always)]
     #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
+    // Every caller is in `codegen`, which is gated on `jit`. Without that
+    // feature this compiles with nobody to use it, so a JIT-less build — the
+    // pure interpreter the manifest offers — failed under `-Dwarnings`.
+    #[cfg_attr(not(feature = "jit"), allow(dead_code))]
     pub(crate) fn get(&self, index: usize) -> Option<&Value> {
         self.storage[..self.logical_len].get(index)
     }
@@ -949,7 +953,8 @@ impl RegisterFile {
     /// memory-safe in release builds as well as debug builds.
     #[inline(always)]
     #[cfg(not(feature = "safe-sandbox"))]
-    #[cfg_attr(feature = "meter-only", allow(dead_code))]
+    // As `get` above: the callers live behind `jit`.
+    #[cfg_attr(any(feature = "meter-only", not(feature = "jit")), allow(dead_code))]
     pub(crate) unsafe fn set_len(&mut self, new_len: usize) {
         assert!(
             new_len <= self.storage.len(),
