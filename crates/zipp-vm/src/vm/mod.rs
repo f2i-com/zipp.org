@@ -554,6 +554,11 @@ pub(crate) struct RegexpLastLazy {
     /// returns a boolean and so paid a malloc + memcpy + `is_ascii` rescan of the
     /// matched text per successful call for nothing.
     pub ranges: [Option<(u32, u32)>; 13],
+    /// Whether `subj` is ASCII, so a range is a byte slice of the heap string.
+    /// Otherwise materialisation decodes the subject to UTF-16 once and slices
+    /// the units -- the same text `exec` matched against, recomputed on the
+    /// rare read instead of copied for every match.
+    pub ascii: bool,
 }
 
 /// The standard named properties of a pristine RegExp match-result Array.

@@ -3197,13 +3197,18 @@ impl<'p> Vm<'p> {
                 vm.units_value(&u16s[r])
             }
         };
-        // Annex B legacy RegExp statics — see `regexp_record_statics`. Only an
-        // ASCII subject can defer: a non-ASCII slice reads the locally-decoded
-        // `u16s` buffer, which does not outlive this call. The length bound
-        // keeps the deferred record's `as u32` range casts from truncating
-        // silently — unreachable in practice (a 4GB flat string), and a wrong
-        // slice is exactly what it would produce.
-        let defer = is_ascii && subj_units <= u32::MAX as usize;
+        // Annex B legacy RegExp statics — see `regexp_record_statics`. Every
+        // subject defers: the record keeps unit ranges and the subject, and a
+        // read re-decodes a non-ASCII subject to UTF-16 (the ASCII case slices
+        // bytes). Materialising eagerly copied the whole subject into
+        // leftContext + rightContext on EVERY match, and a global `match`,
+        // `split` or `replace` over a 24 KB non-ASCII string held a thousand
+        // such copies live inside one native call (72 MB), which convicted the
+        // hardened profile's heap headroom. The length bound keeps the
+        // deferred record's `as u32` range casts from truncating silently —
+        // unreachable in practice (a 4GB flat string), and a wrong slice is
+        // exactly what it would produce.
+        let defer = subj_units <= u32::MAX as usize;
         #[cfg(feature = "safe-sandbox")]
         let statics_bytes = if is_ascii {
             regexp_statics_materialization_bytes(
@@ -3223,7 +3228,9 @@ impl<'p> Vm<'p> {
         let statics_reservation = self
             .instrument_reserve_regex_transient(statics_bytes)
             .map_err(|message| Thrown(message.into()))?;
-        self.regexp_record_statics(&m, input_val, s_idx, mstart, mend, subj_units, defer, &mk);
+        self.regexp_record_statics(
+            &m, input_val, s_idx, mstart, mend, subj_units, defer, is_ascii, &mk,
+        );
         // The materialized strings now belong to the audited VM heap. Release
         // their provisional native charge before reserving result storage so
         // the same bytes cannot consume heap headroom twice.
@@ -3302,6 +3309,7 @@ impl<'p> Vm<'p> {
         mend: usize,
         subj_units: usize,
         defer: bool,
+        ascii: bool,
         mk: &F,
     ) where
         F: Fn(&mut Self, std::ops::Range<usize>) -> Value,
@@ -3345,6 +3353,7 @@ impl<'p> Vm<'p> {
                 subj: input_val,
                 subj_idx: s_idx,
                 ranges,
+                ascii,
             });
         } else {
             // Cannot defer: slice all thirteen eagerly through `mk`.
@@ -3711,6 +3720,7 @@ impl<'p> Vm<'p> {
             mend,
             subj_units,
             subj_units <= u32::MAX as usize,
+            true,
             &mka,
         );
         let arr = self.regexp_build_result(&m, input_val, mstart, mend, has_indices, &mka);
@@ -3766,6 +3776,7 @@ impl<'p> Vm<'p> {
             mend,
             subj_units,
             subj_units <= u32::MAX as usize,
+            true,
             &mka,
         );
         let out = self.regexp_build_result(&m, input_val, mstart, mend, has_indices, &mka);
@@ -3801,14 +3812,45 @@ impl<'p> Vm<'p> {
             return Ok(());
         };
         let subj_idx = lazy.subj_idx;
+        let subj = lazy.subj;
         let ranges = lazy.ranges;
+        let ascii = lazy.ascii;
+        // A non-ASCII subject is decoded to UTF-16 once for all thirteen
+        // slices — the text `exec` matched against, whose unit offsets the
+        // ranges index. The hardened profile charges the decode buffer as
+        // regex-transient storage exactly as `exec` did.
+        #[cfg(feature = "safe-sandbox")]
+        let (units, _units_reservation): (
+            Vec<u16>,
+            Option<super::instrument::RegexTransientReservation>,
+        ) = if ascii {
+            (Vec::new(), None)
+        } else {
+            let (units, reservation) = regex_subject_units(self, subj)?;
+            (units, Some(reservation))
+        };
+        #[cfg(not(feature = "safe-sandbox"))]
+        let units: Vec<u16> = if ascii {
+            Vec::new()
+        } else {
+            self.value_units(subj)
+        };
         #[cfg(feature = "safe-sandbox")]
         let record_requested = 14usize
             .saturating_sub(self.regexp_last.capacity())
             .saturating_mul(std::mem::size_of::<Value>());
         #[cfg(feature = "safe-sandbox")]
         let slice_bytes = ranges.iter().flatten().fold(0usize, |total, (start, end)| {
-            total.saturating_add((*end as usize).saturating_sub(*start as usize))
+            // Exactly what each slicer prepays: raw bytes for an ASCII slice
+            // (`regex_ascii_slice_precharged`), three bytes per unit for a
+            // UTF-16 slice (`regex_units_value_precharged`), so the shrink
+            // after each slice never underflows the reservation.
+            let range = *start as usize..*end as usize;
+            total.saturating_add(if ascii {
+                range.end.saturating_sub(range.start)
+            } else {
+                utf16_slice_heap_bytes(&units, range)
+            })
         });
         #[cfg(feature = "safe-sandbox")]
         let mut reservation = self
@@ -3842,17 +3884,25 @@ impl<'p> Vm<'p> {
         for (i, r) in ranges.iter().enumerate() {
             #[cfg(feature = "safe-sandbox")]
             let value = match *r {
-                Some((s, e)) => regex_ascii_slice_precharged(
+                Some((s, e)) if ascii => regex_ascii_slice_precharged(
                     self,
                     &mut reservation,
                     subj_idx,
                     s as usize..e as usize,
                 )?,
+                Some((s, e)) => regex_units_value_precharged(
+                    self,
+                    &mut reservation,
+                    &units[s as usize..e as usize],
+                )?,
                 None => self.alloc_str(String::new()),
             };
             #[cfg(not(feature = "safe-sandbox"))]
             let value = match *r {
-                Some((s, e)) => self.ascii_slice_value(subj_idx, s as usize..e as usize),
+                Some((s, e)) if ascii => {
+                    self.ascii_slice_value(subj_idx, s as usize..e as usize)
+                }
+                Some((s, e)) => self.units_value(&units[s as usize..e as usize]),
                 None => self.alloc_str(String::new()),
             };
             self.regexp_last[1 + i] = value;
@@ -4441,6 +4491,7 @@ impl<'p> Vm<'p> {
                     p.mend as usize,
                     subj_units,
                     true,
+                    true,
                     &mka,
                 );
                 let mut caps = m.captures;
@@ -4808,6 +4859,7 @@ impl<'p> Vm<'p> {
                 packed.mend as usize,
                 subject_units,
                 true,
+                true,
                 &mk,
             );
             let mut caps = matched.captures;
@@ -5039,6 +5091,7 @@ impl<'p> Vm<'p> {
             p.mstart as usize,
             p.mend as usize,
             subj_units,
+            true,
             true,
             &mka,
         );
@@ -5694,6 +5747,7 @@ impl<'p> Vm<'p> {
                 mend,
                 u16s.len(),
                 false,
+                true,
                 &mk,
             );
             #[cfg(feature = "safe-sandbox")]
@@ -6087,6 +6141,7 @@ impl<'p> Vm<'p> {
                 mend,
                 subject.len(),
                 subject.len() <= u32::MAX as usize,
+                true,
                 &mk,
             );
         }
