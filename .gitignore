@@ -9,6 +9,13 @@ crates/zipp-sandbox/target/
 # Generated wasm-bindgen glue for the node harnesses (see crates/zipp-wasm/tests/node/README.md)
 crates/zipp-wasm/tests/node/pkg/
 
+# Release packaging output. The release job writes the CLI archive to ./dist and
+# the browser bundle to crates/zipp-wasm/dist, so anyone reproducing those steps
+# locally ends up with an untracked tree. That is not cosmetic: SoftN's vendoring
+# script refuses to stamp a WASM binary with a revision when `git status` is not
+# clean, so build output left here blocks the documented way to pick up an engine.
+dist/
+
 # Python bytecode cache from tools/ (bench.py is imported by test_bench.py)
 __pycache__/
 *.pyc
