@@ -10,11 +10,13 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  auditValidationRuntimeRecovery,
   caseOrderForRep,
   canonicalStdout,
   captureStatus,
   classifyZippFailure,
   controlledEnvironment,
+  createZippEvaluator,
   engineOrderForRep,
   loadSuiteInventory,
   pairOrderFor,
@@ -227,6 +229,160 @@ test("QuickJS adapter exclusion requires the exact healthy no-job-drain shape", 
   assert.equal(dirtyTeardown.failure, teardown);
   assert.equal(dirtyTeardown.raw_engine_failure, teardown);
   assert.notEqual(dirtyTeardown.failure.kind, "adapter-unsupported");
+});
+
+test("captureStatus exposes a poisoned QuickJS runtime to validation recovery", () => {
+  const poisoned = captureStatus({
+    ok: false,
+    milliseconds: 0,
+    stdout: Buffer.alloc(0),
+    stderr: Buffer.alloc(0),
+    stderr_observable: true,
+    status: null,
+    teardown_clean: false,
+    runtime_poisoned: true,
+    teardown_failures: [{ action: "qjs_destroy", message: "destroy failed" }],
+    failure: {
+      kind: "teardown-error",
+      message: "QuickJS-NG context teardown failed",
+    },
+  }, Buffer.alloc(0));
+
+  assert.equal(poisoned.valid, false);
+  assert.equal(poisoned.runtime_poisoned, true);
+  assert.equal(poisoned.teardown_clean, false);
+  assert.deepEqual(
+    poisoned.teardown_failures.map(item => item.action),
+    ["qjs_destroy"],
+  );
+});
+
+test("Zipp dispose failure poisons the instance even when Engine.free succeeds", () => {
+  let constructed = 0;
+  let freed = 0;
+  class RecoverableEngine {
+    constructor() {
+      this.sequence = constructed++;
+    }
+
+    initScript() {
+      if (this.sequence === 0) throw new Error("guest evaluation trapped");
+    }
+
+    takeOutput() {
+      return ["second evaluation ran"];
+    }
+
+    dispose() {
+      if (this.sequence === 0) throw new Error("dispose retained a trapped borrow");
+    }
+
+    free() {
+      freed++;
+    }
+  }
+
+  const evaluate = createZippEvaluator(RecoverableEngine);
+  const first = evaluate("trapping source");
+  assert.equal(first.ok, false);
+  assert.equal(captureStatus(first, Buffer.alloc(0)).valid, false);
+  assert.equal(first.failure.kind, "engine-error");
+  assert.equal(first.teardown_clean, false);
+  assert.equal(first.wrapper_destroyed, true);
+  assert.equal(first.runtime_poisoned, true);
+  assert.deepEqual(first.teardown_failures.map(item => item.action), ["Engine.dispose"]);
+
+  const second = evaluate("healthy source");
+  assert.equal(second.ok, false);
+  assert.equal(second.failure.kind, "runtime-poisoned");
+  assert.equal(second.runtime_poisoned, true);
+  assert.deepEqual(second.stdout, Buffer.alloc(0));
+  assert.equal(constructed, 1, "poisoned runtime must not construct another Engine");
+  assert.equal(freed, 1, "the failed observation's wrapper must still be freed");
+});
+
+test("Zipp Engine.free failure poisons the persistent runtime", () => {
+  let constructed = 0;
+  class UnfreedEngine {
+    constructor() {
+      constructed++;
+    }
+
+    initScript() {}
+
+    takeOutput() {
+      return ["first evaluation completed"];
+    }
+
+    dispose() {}
+
+    free() {
+      throw new Error("wrapper free failed");
+    }
+  }
+
+  const evaluate = createZippEvaluator(UnfreedEngine);
+  const first = evaluate("healthy source");
+  assert.equal(first.ok, false);
+  assert.equal(
+    captureStatus(first, Buffer.from("first evaluation completed\n")).valid,
+    false,
+  );
+  assert.equal(first.failure.kind, "teardown-error");
+  assert.equal(first.teardown_clean, false);
+  assert.equal(first.wrapper_destroyed, false);
+  assert.equal(first.runtime_poisoned, true);
+  assert.deepEqual(first.teardown_failures.map(item => item.action), ["Engine.free"]);
+
+  const second = evaluate("must not execute");
+  assert.equal(second.ok, false);
+  assert.equal(second.failure.kind, "runtime-poisoned");
+  assert.equal(second.runtime_poisoned, true);
+  assert.equal(second.wrapper_destroyed, false);
+  assert.deepEqual(second.stdout, Buffer.alloc(0));
+  assert.equal(constructed, 1, "poisoned runtime must not construct another Engine");
+});
+
+test("validation recovery audit rejects a missing poison reset", () => {
+  const failure = { kind: "teardown-error", message: "dispose failed" };
+  const teardownFailures = [{ action: "Engine.dispose", message: "dispose failed" }];
+  const poisoned = {
+    engine: "zipp",
+    case: "real13:example",
+    runtime_generation: 0,
+    runtime_poisoned: true,
+    failure,
+    teardown_failures: teardownFailures,
+  };
+  const controls = {
+    zipp: { engine: "zipp", runtime_generation: 0, runtime_poisoned: false },
+    "quickjs-ng": { engine: "quickjs-ng", runtime_generation: 0, runtime_poisoned: false },
+  };
+
+  const missing = auditValidationRuntimeRecovery(controls, [poisoned], []);
+  assert.equal(missing.valid, false);
+  assert.equal(missing.poison_events.length, 1);
+
+  const matching = auditValidationRuntimeRecovery(controls, [poisoned], [{
+    sequence: 0,
+    engine: "zipp",
+    after_case: "real13:example",
+    old_generation: 0,
+    new_generation: 1,
+    reason: "runtime-poisoned-after-evaluation",
+    trigger_failure: failure,
+    trigger_teardown_failures: teardownFailures,
+    replacement_instantiated: true,
+    control_validation: {
+      engine: "zipp",
+      runtime_generation: 1,
+      valid: true,
+      runtime_poisoned: false,
+    },
+    success: true,
+    failure: null,
+  }]);
+  assert.equal(matching.valid, true);
 });
 
 test("inventory is exactly frozen real13 plus all hostile manifest entries", () => {

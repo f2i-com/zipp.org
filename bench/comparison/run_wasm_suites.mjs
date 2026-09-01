@@ -5,8 +5,8 @@
  * real13 and hostile suites.
  *
  * The compared modules remain live for the complete run. Every observation
- * creates and tears down a fresh guest JavaScript context, using production
- * Zipp's Engine embedding and QuickJS-NG's official WASI reactor entry point.
+ * creates a fresh guest JavaScript context and attempts teardown, using
+ * production Zipp's Engine embedding and QuickJS-NG's official WASI reactor.
  * Workload source is never scaled or rewritten. A separate empty source is
  * paired with each workload to expose fixed adapter/context cost.
  */
@@ -639,76 +639,103 @@ async function importSourceModule(source, label) {
 async function makeZippRuntime(wasmPath, gluePath) {
   const module = await WebAssembly.compile(fs.readFileSync(wasmPath));
   const glue = await importSourceModule(fs.readFileSync(gluePath, "utf8"), "zipp-suite-glue");
-  for (const method of ["initScript", "takeOutput", "dispose"]) {
+  for (const method of ["initScript", "takeOutput", "dispose", "free"]) {
     if (typeof glue.Engine?.prototype?.[method] !== "function") {
       throw new Error(`Zipp glue lacks Engine.${method}`);
     }
   }
   glue.initSync({ module });
+  return { module, evaluate: createZippEvaluator(glue.Engine) };
+}
+
+export function createZippEvaluator(EngineClass) {
   let poisonedBy = null;
-  return {
-    module,
-    evaluate(source) {
-      if (poisonedBy) {
-        return {
-          ok: false,
-          milliseconds: 0,
-          stdout: Buffer.alloc(0),
-          stderr: Buffer.alloc(0),
-          stderr_observable: false,
-          status: null,
-          teardown_clean: false,
-          teardown_failures: poisonedBy,
-          failure: {
-            kind: "runtime-poisoned",
-            message: "Zipp runtime was not reused after an earlier teardown failure",
-            teardown_failures: poisonedBy,
-          },
-        };
-      }
-      let engine;
-      let stdout = Buffer.alloc(0);
-      let failure = null;
-      const teardownFailures = [];
-      const started = nowNs();
-      try {
-        engine = new glue.Engine();
-        engine.initScript(source);
-        stdout = zippLinesToStdout(engine.takeOutput());
-      } catch (error) {
-        failure = classifyZippFailure(error);
-      } finally {
-        if (engine) {
-          try { engine.dispose(); } catch (error) {
-            teardownFailures.push({ action: "Engine.dispose", message: errorText(error) });
-          }
-          try { engine.free(); } catch (error) {
-            teardownFailures.push({ action: "Engine.free", message: errorText(error) });
-          }
-        }
-      }
-      if (teardownFailures.length) {
-        poisonedBy = teardownFailures;
-        failure = failure
-          ? { ...failure, teardown_failures: teardownFailures }
-          : {
-              kind: "teardown-error",
-              message: "Zipp context teardown failed",
-              teardown_failures: teardownFailures,
-            };
-      }
+  return source => {
+    if (poisonedBy) {
       return {
-        ok: failure === null,
-        milliseconds: elapsedMs(started),
-        stdout,
+        ok: false,
+        milliseconds: 0,
+        stdout: Buffer.alloc(0),
         stderr: Buffer.alloc(0),
         stderr_observable: false,
-        status: failure === null ? 0 : null,
-        teardown_clean: teardownFailures.length === 0,
-        teardown_failures: teardownFailures,
-        failure,
+        status: null,
+        teardown_clean: false,
+        wrapper_destroyed: false,
+        runtime_poisoned: true,
+        teardown_failures: poisonedBy,
+        failure: {
+          kind: "runtime-poisoned",
+          message: "Zipp runtime was not reused after an earlier teardown failure",
+          teardown_failures: poisonedBy,
+        },
       };
-    },
+    }
+    let engine;
+    let stdout = Buffer.alloc(0);
+    let failure = null;
+    let wrapperDestroyed = null;
+    const teardownFailures = [];
+    const started = nowNs();
+    try {
+      engine = new EngineClass();
+      engine.initScript(source);
+      stdout = zippLinesToStdout(engine.takeOutput());
+    } catch (error) {
+      failure = classifyZippFailure(error);
+    } finally {
+      if (engine) {
+        try { engine.dispose(); } catch (error) {
+          teardownFailures.push({ action: "Engine.dispose", message: errorText(error) });
+        }
+        try {
+          engine.free();
+          // wasm-bindgen's generated free() first moves __wbg_ptr to zero and
+          // unregisters the finalizer, then calls __wbg_engine_free. A normal
+          // return therefore proves this JS wrapper was destroyed even when
+          // dispose() failed after an earlier trapped Rust borrow.
+          wrapperDestroyed = true;
+        } catch (error) {
+          wrapperDestroyed = false;
+          teardownFailures.push({ action: "Engine.free", message: errorText(error) });
+        }
+      }
+    }
+    // Any teardown failure makes the whole instance unsafe to reuse. A
+    // successful generated free() proves only that this JS wrapper was
+    // destroyed; it cannot prove that a failed dispose() left shared WASM
+    // state pristine.
+    const poisonsRuntime = teardownFailures.length > 0
+      || (engine !== undefined && wrapperDestroyed !== true);
+    if (poisonsRuntime) poisonedBy = teardownFailures.length
+      ? teardownFailures
+      : [{ action: "Engine.free", message: "wrapper destruction was not proven" }];
+    if (teardownFailures.length) {
+      failure = failure
+        ? {
+            ...failure,
+            teardown_failures: teardownFailures,
+            wrapper_destroyed: wrapperDestroyed,
+          }
+        : {
+            kind: "teardown-error",
+            message: "Zipp context teardown failed",
+            teardown_failures: teardownFailures,
+            wrapper_destroyed: wrapperDestroyed,
+          };
+    }
+    return {
+      ok: failure === null,
+      milliseconds: elapsedMs(started),
+      stdout,
+      stderr: Buffer.alloc(0),
+      stderr_observable: false,
+      status: failure === null ? 0 : null,
+      teardown_clean: teardownFailures.length === 0,
+      wrapper_destroyed: wrapperDestroyed,
+      runtime_poisoned: Boolean(poisonedBy),
+      teardown_failures: teardownFailures,
+      failure,
+    };
   };
 }
 
@@ -793,6 +820,7 @@ async function makeQuickJsRuntime(wasmPath) {
           stderr_observable: true,
           status: null,
           teardown_clean: false,
+          runtime_poisoned: true,
           teardown_failures: poisonedBy,
           failure: {
             kind: "runtime-poisoned",
@@ -858,6 +886,7 @@ async function makeQuickJsRuntime(wasmPath) {
         stderr_observable: true,
         status,
         teardown_clean: teardownFailures.length === 0,
+        runtime_poisoned: Boolean(poisonedBy),
         teardown_failures: teardownFailures,
         failure,
       };
@@ -870,6 +899,8 @@ export function captureStatus(result, expectedStdout) {
   const stderr = outputRecord(result.stderr || Buffer.alloc(0));
   const stderrObservable = result.stderr_observable !== false;
   const teardownClean = result.teardown_clean !== false;
+  const wrapperDestroyed = result.wrapper_destroyed ?? null;
+  const runtimePoisoned = result.runtime_poisoned === true;
   let expectedCanonical;
   try {
     expectedCanonical = canonicalStdout(expectedStdout);
@@ -880,6 +911,8 @@ export function captureStatus(result, expectedStdout) {
       stderr_observable: stderrObservable,
       stderr_empty: stderrObservable ? stderr.bytes === 0 : null,
       teardown_clean: teardownClean,
+      wrapper_destroyed: wrapperDestroyed,
+      runtime_poisoned: runtimePoisoned,
       teardown_failures: result.teardown_failures || [],
       stdout,
       stderr,
@@ -900,6 +933,8 @@ export function captureStatus(result, expectedStdout) {
     stderr_observable: stderrObservable,
     stderr_empty: stderrEmpty,
     teardown_clean: teardownClean,
+    wrapper_destroyed: wrapperDestroyed,
+    runtime_poisoned: runtimePoisoned,
     teardown_failures: result.teardown_failures || [],
     stdout,
     stderr,
@@ -1345,6 +1380,46 @@ function knownEngineExclusion(item, engine, record) {
   return null;
 }
 
+export function auditValidationRuntimeRecovery(controlValidation, validation, resets) {
+  const poisonEvents = [];
+  const addEvent = (record, afterCase) => {
+    if (record?.runtime_poisoned !== true
+      || record?.failure?.kind === "validation-runtime-unavailable") return;
+    poisonEvents.push({
+      engine: record.engine,
+      after_case: afterCase,
+      runtime_generation: record.runtime_generation,
+      failure: record.failure,
+      teardown_failures: record.teardown_failures || [],
+    });
+  };
+  for (const engine of ENGINE_NAMES) addEvent(controlValidation[engine], null);
+  for (const record of validation) addEvent(record, record.case);
+
+  const resetMatches = poisonEvents.length === resets.length
+    && poisonEvents.every((event, index) => {
+      const reset = resets[index];
+      const control = reset?.control_validation;
+      return reset?.sequence === index
+        && reset.engine === event.engine
+        && reset.after_case === event.after_case
+        && reset.old_generation === event.runtime_generation
+        && reset.new_generation === event.runtime_generation + 1
+        && reset.reason === "runtime-poisoned-after-evaluation"
+        && JSON.stringify(reset.trigger_failure) === JSON.stringify(event.failure)
+        && JSON.stringify(reset.trigger_teardown_failures) === JSON.stringify(event.teardown_failures)
+        && reset.replacement_instantiated === true
+        && reset.success === true
+        && reset.failure === null
+        && control?.engine === event.engine
+        && control?.runtime_generation === reset.new_generation
+        && control?.valid === true
+        && control?.runtime_poisoned !== true;
+    });
+
+  return { valid: resetMatches, poison_events: poisonEvents };
+}
+
 function printInventory(inventory) {
   for (const item of inventory.allCases) {
     const selected = inventory.selectedCases.includes(item) ? "selected" : "not-selected";
@@ -1464,6 +1539,9 @@ async function runMain(args) {
     zipp: [args.zippWasm, args.zippGlue],
     "quickjs-ng": [args.quickjsWasm, "-"],
   };
+  const instantiateRuntime = async engine => engine === "zipp"
+    ? makeZippRuntime(args.zippWasm, args.zippGlue)
+    : makeQuickJsRuntime(args.quickjsWasm);
   const compile = [];
   const startup = [];
   if (!args.validationOnly) {
@@ -1497,8 +1575,8 @@ async function runMain(args) {
 
   console.log("Instantiating validation modules...");
   let runtimes = {
-    zipp: await makeZippRuntime(args.zippWasm, args.zippGlue),
-    "quickjs-ng": await makeQuickJsRuntime(args.quickjsWasm),
+    zipp: await instantiateRuntime("zipp"),
+    "quickjs-ng": await instantiateRuntime("quickjs-ng"),
   };
   const stage = stageSources(inventory.runnableCases);
   const validation = [];
@@ -1510,15 +1588,77 @@ async function runMain(args) {
   const execution = [];
   const schedules = [];
   const executionFailures = [];
+  const validationRuntimeResets = [];
+  const validationRuntimeGeneration = { zipp: 0, "quickjs-ng": 0 };
+  const validationRuntimeAvailable = { zipp: true, "quickjs-ng": true };
   const empty = "";
+
+  const resetValidationRuntime = async (engine, afterCase, trigger) => {
+    const oldGeneration = validationRuntimeGeneration[engine];
+    const newGeneration = oldGeneration + 1;
+    const reset = {
+      sequence: validationRuntimeResets.length,
+      engine,
+      after_case: afterCase,
+      old_generation: oldGeneration,
+      new_generation: newGeneration,
+      reason: "runtime-poisoned-after-evaluation",
+      trigger_failure: trigger.failure,
+      trigger_teardown_failures: trigger.teardown_failures || [],
+      replacement_instantiated: false,
+      control_validation: null,
+      success: false,
+      failure: null,
+    };
+    try {
+      const replacement = await instantiateRuntime(engine);
+      reset.replacement_instantiated = true;
+      const control = replacement.evaluate(empty);
+      const controlStatus = captureStatus(control, Buffer.alloc(0));
+      reset.control_validation = {
+        engine,
+        runtime_generation: newGeneration,
+        milliseconds: control.milliseconds,
+        ...controlStatus,
+      };
+      reset.success = controlStatus.valid && !controlStatus.runtime_poisoned;
+      if (reset.success) {
+        runtimes[engine] = replacement;
+        validationRuntimeGeneration[engine] = newGeneration;
+        validationRuntimeAvailable[engine] = true;
+      } else {
+        validationRuntimeAvailable[engine] = false;
+        reset.failure = {
+          kind: "replacement-control-failed",
+          message: "replacement validation runtime failed its empty control",
+        };
+      }
+    } catch (error) {
+      validationRuntimeAvailable[engine] = false;
+      reset.failure = { kind: "replacement-instantiation-failed", message: errorText(error) };
+    }
+    validationRuntimeResets.push(reset);
+    if (!reset.success) {
+      validationFailures.push(`${engine}: validation runtime replacement failed after ${afterCase ?? "control"}`);
+    }
+    return reset;
+  };
 
   try {
     console.log("Validating empty controls...");
     for (const engine of ENGINE_NAMES) {
       const result = runtimes[engine].evaluate(empty);
       const status = captureStatus(result, Buffer.alloc(0));
-      controlValidation[engine] = { engine, milliseconds: result.milliseconds, ...status };
+      controlValidation[engine] = {
+        engine,
+        runtime_generation: validationRuntimeGeneration[engine],
+        milliseconds: result.milliseconds,
+        ...status,
+      };
       if (!status.valid) validationFailures.push(`${engine}: empty control validation failed`);
+      if (status.runtime_poisoned) {
+        await resetValidationRuntime(engine, null, status);
+      }
     }
 
     console.log("Validating exact suite output against Node...");
@@ -1567,8 +1707,25 @@ async function runMain(args) {
       expectedByCase.set(item.key, node.stdout);
       const statuses = { node: nodeStatus };
       for (const engine of ENGINE_NAMES) {
-        const result = runtimes[engine].evaluate(item.sourceText);
+        const result = validationRuntimeAvailable[engine]
+          ? runtimes[engine].evaluate(item.sourceText)
+          : {
+              ok: false,
+              milliseconds: 0,
+              stdout: Buffer.alloc(0),
+              stderr: Buffer.alloc(0),
+              stderr_observable: engine !== "zipp",
+              status: null,
+              teardown_clean: false,
+              runtime_poisoned: true,
+              teardown_failures: [],
+              failure: {
+                kind: "validation-runtime-unavailable",
+                message: "validation runtime replacement previously failed",
+              },
+            };
         const record = validationRecord(engine, item, result, node.stdout);
+        record.runtime_generation = validationRuntimeGeneration[engine];
         validation.push(record);
         statuses[engine] = record;
         if (!record.valid) {
@@ -1577,6 +1734,9 @@ async function runMain(args) {
             ? `untyped-limit-message:${record.failure.fixed_limit_message_match}`
             : record.failure?.kind || (record.output_exact ? "engine-error" : "stdout-mismatch"));
           validationFailures.push(`${item.key}/${engine}: ${detail}`);
+        }
+        if (record.runtime_poisoned && validationRuntimeAvailable[engine]) {
+          await resetValidationRuntime(engine, item.key, record);
         }
       }
       validationByCase.set(item.key, statuses);
@@ -1707,10 +1867,18 @@ async function runMain(args) {
     const nodeOraclesValid = inventory.runnableCases.every(item =>
       validationByCase.get(item.key)?.node?.valid);
     const validationControlsValid = ENGINE_NAMES.every(engine => controlValidation[engine]?.valid);
+    const validationRuntimeRecoveryAudit = auditValidationRuntimeRecovery(
+      controlValidation,
+      validation,
+      validationRuntimeResets,
+    );
+    const validationRuntimeResetsValid = validationRuntimeRecoveryAudit.valid;
     const timedRuntimeControlsValid = args.validationOnly
       ? null
       : ENGINE_NAMES.every(engine => timedRuntimeControlValidation[engine]?.valid);
-    const controlsValid = validationControlsValid && (timedRuntimeControlsValid ?? true);
+    const controlsValid = validationControlsValid
+      && validationRuntimeResetsValid
+      && (timedRuntimeControlsValid ?? true);
     const validationCaptureComplete = inventory.runnableCases.every(item => {
       const statuses = validationByCase.get(item.key);
       return statuses?.node && ENGINE_NAMES.every(engine => statuses?.[engine]);
@@ -1788,10 +1956,18 @@ async function runMain(args) {
           "Engine.takeOutput() merges VM stdout and errput into one ordered line array; it is compared to "
           + "Node stdout, but Zipp stderr emptiness cannot be asserted independently (the frozen tests emit no stderr)"
         ),
-        persistent: "one live WASM module instance per engine; each work/control evaluation creates and tears down a fresh guest context",
+        persistent: (
+          "one live WASM module instance per engine; each work/control evaluation creates a fresh guest context "
+          + "and attempts teardown. Any teardown failure invalidates the observation and poisons that instance"
+        ),
         timed_runtime_freshness: (
           "validation uses separate module instances; timed execution creates fresh persistent instances, "
           + "preconditions each only with one validated empty control, then retains it for the full schedule"
+        ),
+        validation_runtime_recovery: (
+          "validation abandons and replaces an engine's WASM instance after an observation proves it poisoned; "
+          + "each replacement and its required empty-control validation are recorded with a generation number. "
+          + "Timed runtimes are never reset: an unexpected timed poison fails all later rows closed"
         ),
         control: "separate empty source paired with every exact workload; work/control order alternates by engine and repetition",
         order: (
@@ -1812,6 +1988,11 @@ async function runMain(args) {
         zipp_limit_failures: (
           "raw embedding errors are retained; exact known limit-message matches are advisory only "
           + "because this wasm-bindgen API does not export the VM's typed limit status"
+        ),
+        zipp_teardown_safety: (
+          "generated wasm-bindgen Engine.free() returning proves wrapper destruction, but cannot prove shared "
+          + "WASM state remained clean after an earlier dispose() failure; every teardown failure therefore "
+          + "poisons the instance and requires recorded validation-runtime replacement"
         ),
         quickjs_reactor_job_drain: (
           "the pinned official reactor evaluates and returns without js_std_loop/JS_ExecutePendingJob and "
@@ -1886,6 +2067,8 @@ async function runMain(args) {
         .map(serializableCase),
       control_validation: controlValidation,
       timed_runtime_control_validation: timedRuntimeControlValidation,
+      validation_runtime_resets: validationRuntimeResets,
+      validation_runtime_poison_events: validationRuntimeRecoveryAudit.poison_events,
       validation,
       observations: { compile, startup, execution },
       schedules,
@@ -1912,6 +2095,10 @@ async function runMain(args) {
         node_oracles_valid: nodeOraclesValid,
         controls_valid: controlsValid,
         validation_controls_valid: validationControlsValid,
+        validation_runtime_resets_valid: validationRuntimeResetsValid,
+        validation_runtime_reset_count: validationRuntimeResets.length,
+        validation_runtime_poison_event_count:
+          validationRuntimeRecoveryAudit.poison_events.length,
         timed_runtime_controls_valid: timedRuntimeControlsValid,
         validation_capture_complete: validationCaptureComplete,
         cold_capture_complete: coldCaptureComplete,
