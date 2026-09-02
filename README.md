@@ -38,7 +38,7 @@ implementation can be read end to end.
 
 ## Quick start
 
-The [`v0.0.12` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.12)
+The [`v0.0.13` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.13)
 contains ready-to-run x86-64 binaries and a browser WebAssembly package.
 
 ### Windows
@@ -46,7 +46,7 @@ contains ready-to-run x86-64 binaries and a browser WebAssembly package.
 Download, extract, and run the native Windows executable from PowerShell:
 
 ```powershell
-$version = '0.0.12'
+$version = '0.0.13'
 $archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
 Expand-Archive -LiteralPath $archive -DestinationPath .
@@ -61,7 +61,7 @@ Use `mjs` instead of `js` for an ES module entry, including top-level `await`.
 Download, extract, and run the native Linux binary:
 
 ```sh
-version=0.0.12
+version=0.0.13
 archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 tar -xzf "$archive"
@@ -70,7 +70,7 @@ tar -xzf "$archive"
 ```
 
 The archive preserves the executable bit. If another tool removes it, restore it
-with `chmod +x zipp-0.0.12-x86_64-unknown-linux-gnu/zipp`.
+with `chmod +x zipp-0.0.13-x86_64-unknown-linux-gnu/zipp`.
 
 ### Build from source
 
@@ -106,7 +106,7 @@ Download the browser bundle, then serve its JavaScript and WebAssembly files
 from the same origin as your app:
 
 ```sh
-version=0.0.12
+version=0.0.13
 archive="zipp-wasm-$version-web.zip"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 unzip "$archive"
@@ -263,7 +263,7 @@ final engine code; it does not predict WASM performance.
 
 #### v0.0.6 browser-WASM status
 
-The committed production module, built from the v0.0.12 source, is 5,558,860 bytes raw, 1,812,458 at
+The committed production module, built from the v0.0.13 source, is 5,558,860 bytes raw, 1,812,458 at
 gzip-9, and 1,248,649 at Brotli-11 (SHA-256
 `bd8614fe5f3a3b8ef67f4b917cdefebb3fe69afa39a9804a0d3f6b0b6b267126`). The
 official QuickJS-NG v0.16.2 reactor is 1,528,293 bytes raw and 417,087 at
@@ -314,7 +314,7 @@ Both artifacts record `publishable:true`, `ALL_CORRECT=1`, 15 complete
 counterbalanced repetitions, 10,000 bootstrap samples, exact output, and no
 source, engine, input, environment, process-health, or harness drift.
 
-Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · Zipp 0.0.12 canonical PGO SHA-256
+Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · Zipp 0.0.13 canonical PGO SHA-256
 `bf9fddab…dc9986`.
 
 Cold medians include process launch; bold marks the lowest displayed median.
