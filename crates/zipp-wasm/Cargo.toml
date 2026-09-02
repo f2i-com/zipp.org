@@ -1,6 +1,6 @@
 [package]
 name = "zipp-wasm"
-version = "0.0.10"
+version = "0.0.11"
 edition = "2021"
 license = "Apache-2.0"
 description = "WebAssembly embedding of the zipp JavaScript engine: a persistent VM a browser host can keep alive across re-entries."

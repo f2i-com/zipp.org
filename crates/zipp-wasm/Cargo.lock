@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-vm"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "num-bigint",
  "num-traits",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-wasm"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",
