@@ -142,6 +142,32 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B259 LANDED — the warm pristine-Promise re-check answers from bit compares
+
+`ZIPP_NO_PRISTINE_LEAN=1` restores the per-call re-proof. The pristine
+`Promise.prototype` slot cache guarded layout with version compares but still
+re-read three key strings, three out-of-line `PropAttrs::at` results and three
+unpacked heap identities on every `.then`, `await` and `Promise.all` element,
+because in-place data writes bump nothing. `promise_pristine_bit_identical` now
+answers the warm case from the two owner versions, the value bits at the
+`then`/`constructor`/`@@species` slots against the fill-time bits, the accessor
+bits (a new inlineable `ObjMap::is_accessor_at`) and the species getter's
+version; it only ever answers `true` and defers every mismatch to the unchanged
+re-check, so an in-place patch is caught by the bits and an accessor
+redefinition by its version bump.
+
+Gate (2026-09-02, one binary at `85a299f3`, 21 interleaved pairs, exact
+output): async-promise-chain **−5.1%** [−5.8, −4.5], async-lived **−3.9%**
+[−4.5, −2.7]. Two-binary against the `52961c42` base: async-promise-chain
+−6.3% [−7.0, −5.2], json-large +0.3% [−1.6, +1.6], shapes-stable +0.5%
+[+0.3, +2.5] — a row the change cannot reach, read as the fat-LTO layout
+confound two-binary comparisons carry (B240). `tests/promise_pristine_lean.rs`
+holds 17 node-oracled parity cases and the latch/mode children; microtask
+order matched node byte-for-byte on the async rows across five modes. Found
+alongside: zipp shares one `@@species` getter object across constructors
+(node: one per constructor), and the per-await SipHash is `gen_callee` /
+`gen_args_obj` in `std::collections::HashMap` — both left for a follow-up.
+
 ### B258 LANDED — pooled literal shells keep their slab value cell
 
 `ZIPP_NO_SHELL_CELL=1` restores the old path. Every finalize-born literal paid
