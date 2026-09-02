@@ -2,8 +2,10 @@ import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'rea
 
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
 const DOCS_URL = `${GITHUB_URL}/blob/main/DOC.md#embedding`
-const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_21288c1_pgo_2026-08-30.json`
-const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_21288c1_pgo_2026-08-30.json`
+const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_c28781cf_pgo_2026-09-02.json`
+const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_c28781cf_pgo_2026-09-02.json`
+const ROADMAP_URL = `${GITHUB_URL}/blob/main/PERF_ROADMAP.md`
+const RELEASE_URL = `${GITHUB_URL}/releases/tag/v0.0.12`
 
 const playgroundExample = `const orders = [
   { id: "A-104", total: 48 },
@@ -40,29 +42,82 @@ script.call_slot(on_event, &[event])?;`
 type Engine = 'node' | 'bun' | 'deno' | 'zipp'
 type BenchmarkGroup = 'headline' | 'diagnostic'
 type BenchmarkFilter = 'all' | BenchmarkGroup
+type Suite = 'normal' | 'hostile'
 
 type BenchmarkRow = {
   id: string
   name: string
-  group: BenchmarkGroup
+  /** Normal rows: headline or diagnostic. Hostile rows: the corpus category. */
+  group: string
   times: Record<Engine, number>
   nodeRatio: number
 }
 
+// Canonical clean PGO capture at engine commit c28781cf (2026-09-02): cold wall
+// time medians in milliseconds over 15 counterbalanced repetitions, exact
+// output on every row. Zipp / Node is the paired median ratio; below 1 is a win.
 const benchmarkRows: BenchmarkRow[] = [
-  { id: 'async-promise-chain', name: 'Async / promises', group: 'headline', times: { node: 328.786, bun: 363.605, deno: 354.774, zipp: 403.520 }, nodeRatio: 1.231865623 },
-  { id: 'class-prototype-hot', name: 'Class / prototype', group: 'headline', times: { node: 295.190, bun: 332.877, deno: 326.413, zipp: 224.388 }, nodeRatio: 0.763521730 },
-  { id: 'json-large', name: 'JSON', group: 'headline', times: { node: 258.640, bun: 189.975, deno: 308.320, zipp: 268.906 }, nodeRatio: 1.050831813 },
-  { id: 'map-set-heavy', name: 'Map / Set', group: 'headline', times: { node: 687.650, bun: 784.031, deno: 1155.782, zipp: 578.761 }, nodeRatio: 0.851300473 },
-  { id: 'markdown-render', name: 'Markdown render', group: 'headline', times: { node: 269.243, bun: 207.020, deno: 310.900, zipp: 232.357 }, nodeRatio: 0.869559492 },
-  { id: 'parse-large-js', name: 'Parse JavaScript', group: 'headline', times: { node: 270.157, bun: 227.320, deno: 286.377, zipp: 239.810 }, nodeRatio: 0.890355724 },
-  { id: 'polymorphic-objects', name: 'Polymorphic objects', group: 'headline', times: { node: 325.768, bun: 329.732, deno: 334.570, zipp: 306.949 }, nodeRatio: 0.939821866 },
-  { id: 'regex-log-scan', name: 'RegExp log scan', group: 'headline', times: { node: 464.885, bun: 555.160, deno: 458.206, zipp: 476.285 }, nodeRatio: 1.017445258 },
-  { id: 'sparse-array', name: 'Sparse array', group: 'headline', times: { node: 79.779, bun: 101.962, deno: 125.291, zipp: 81.723 }, nodeRatio: 1.050387229 },
-  { id: 'typedarray-math', name: 'TypedArray math', group: 'headline', times: { node: 198.452, bun: 909.489, deno: 167.531, zipp: 133.305 }, nodeRatio: 0.673612550 },
-  { id: 'polymorphic-objects-v2', name: 'Polymorphic objects v2', group: 'diagnostic', times: { node: 80.647, bun: 87.478, deno: 128.792, zipp: 23.823 }, nodeRatio: 0.294970167 },
-  { id: 'property-ic-shapes', name: 'Property IC shapes', group: 'diagnostic', times: { node: 259.169, bun: 158.105, deno: 311.346, zipp: 10.526 }, nodeRatio: 0.040193527 },
-  { id: 'sparse-array-v2', name: 'Sparse array v2', group: 'diagnostic', times: { node: 168.055, bun: 365.806, deno: 182.312, zipp: 100.959 }, nodeRatio: 0.601139082 },
+  { id: 'async-promise-chain', name: 'Async / promises', group: 'headline', times: { node: 344.321, bun: 372.640, deno: 365.741, zipp: 369.366 }, nodeRatio: 1.074364005 },
+  { id: 'class-prototype-hot', name: 'Class / prototype', group: 'headline', times: { node: 302.386, bun: 339.084, deno: 331.811, zipp: 230.240 }, nodeRatio: 0.761261483 },
+  { id: 'json-large', name: 'JSON', group: 'headline', times: { node: 270.749, bun: 199.802, deno: 327.023, zipp: 277.751 }, nodeRatio: 1.022337801 },
+  { id: 'map-set-heavy', name: 'Map / Set', group: 'headline', times: { node: 695.556, bun: 821.199, deno: 1246.528, zipp: 624.996 }, nodeRatio: 0.890409164 },
+  { id: 'markdown-render', name: 'Markdown render', group: 'headline', times: { node: 271.002, bun: 213.136, deno: 317.642, zipp: 214.108 }, nodeRatio: 0.785775701 },
+  { id: 'parse-large-js', name: 'Parse JavaScript', group: 'headline', times: { node: 275.531, bun: 231.822, deno: 294.052, zipp: 239.741 }, nodeRatio: 0.874717990 },
+  { id: 'polymorphic-objects', name: 'Polymorphic objects', group: 'headline', times: { node: 335.470, bun: 337.432, deno: 343.557, zipp: 309.192 }, nodeRatio: 0.920789325 },
+  { id: 'regex-log-scan', name: 'RegExp log scan', group: 'headline', times: { node: 477.108, bun: 573.414, deno: 461.284, zipp: 456.106 }, nodeRatio: 0.953465853 },
+  { id: 'sparse-array', name: 'Sparse array', group: 'headline', times: { node: 81.134, bun: 101.361, deno: 129.746, zipp: 75.030 }, nodeRatio: 0.924017154 },
+  { id: 'typedarray-math', name: 'TypedArray math', group: 'headline', times: { node: 204.063, bun: 935.527, deno: 171.668, zipp: 147.258 }, nodeRatio: 0.718713786 },
+  { id: 'polymorphic-objects-v2', name: 'Polymorphic objects v2', group: 'diagnostic', times: { node: 85.234, bun: 88.551, deno: 135.266, zipp: 24.991 }, nodeRatio: 0.295598405 },
+  { id: 'property-ic-shapes', name: 'Property IC shapes', group: 'diagnostic', times: { node: 265.963, bun: 159.224, deno: 316.274, zipp: 10.278 }, nodeRatio: 0.038544299 },
+  { id: 'sparse-array-v2', name: 'Sparse array v2', group: 'diagnostic', times: { node: 172.310, bun: 375.362, deno: 188.775, zipp: 102.126 }, nodeRatio: 0.591381962 },
+]
+
+// The 17-case hostile corpus from the same capture: closures, mixed locals,
+// shape churn, GC survival, async lifetimes, modules, a React-shaped kernel, a
+// warm router, a bytecode VM and vendored NanoID.
+const hostileRows: BenchmarkRow[] = [
+  { id: 'calls-baseline', name: 'Calls baseline', group: 'scope', times: { node: 35.438, bun: 48.138, deno: 88.908, zipp: 16.832 }, nodeRatio: 0.479671118 },
+  { id: 'calls-closures', name: 'Closure calls', group: 'scope', times: { node: 43.014, bun: 54.772, deno: 93.447, zipp: 45.877 }, nodeRatio: 1.099988047 },
+  { id: 'shapes-stable', name: 'Stable shapes', group: 'objects', times: { node: 40.083, bun: 60.690, deno: 92.940, zipp: 48.101 }, nodeRatio: 1.199181037 },
+  { id: 'shapes-megamorphic', name: 'Megamorphic shapes', group: 'objects', times: { node: 47.882, bun: 68.022, deno: 96.022, zipp: 58.374 }, nodeRatio: 1.226424684 },
+  { id: 'types-stable', name: 'Stable types', group: 'types', times: { node: 36.829, bun: 49.687, deno: 90.369, zipp: 18.509 }, nodeRatio: 0.516750981 },
+  { id: 'types-churn', name: 'Type churn', group: 'types', times: { node: 45.011, bun: 61.786, deno: 99.637, zipp: 33.581 }, nodeRatio: 0.747415271 },
+  { id: 'branch-control', name: 'Branch control', group: 'errors', times: { node: 39.286, bun: 51.767, deno: 90.098, zipp: 31.900 }, nodeRatio: 0.797849099 },
+  { id: 'throw-catch', name: 'Throw / catch', group: 'errors', times: { node: 314.566, bun: 93.826, deno: 106.533, zipp: 155.147 }, nodeRatio: 0.496536981 },
+  { id: 'allocation-ephemeral', name: 'Ephemeral allocation', group: 'allocation', times: { node: 37.099, bun: 70.767, deno: 91.069, zipp: 12.882 }, nodeRatio: 0.345696654 },
+  { id: 'allocation-survival', name: 'Allocation survival', group: 'allocation', times: { node: 59.055, bun: 75.793, deno: 113.320, zipp: 88.570 }, nodeRatio: 1.483715204 },
+  { id: 'async-burst', name: 'Async burst', group: 'async', times: { node: 54.811, bun: 54.611, deno: 107.089, zipp: 33.274 }, nodeRatio: 0.607391801 },
+  { id: 'async-lived', name: 'Long-lived async', group: 'async', times: { node: 41.538, bun: 67.951, deno: 93.018, zipp: 42.489 }, nodeRatio: 1.065282414 },
+  { id: 'reactish-reconcile', name: 'React-shaped reconcile', group: 'applications', times: { node: 45.225, bun: 67.760, deno: 99.424, zipp: 69.868 }, nodeRatio: 1.573522475 },
+  { id: 'warm-router', name: 'Warm router', group: 'server', times: { node: 46.045, bun: 70.003, deno: 101.505, zipp: 70.674 }, nodeRatio: 1.563177836 },
+  { id: 'bytecode-vm', name: 'Bytecode VM', group: 'endurance', times: { node: 44.249, bun: 56.427, deno: 95.007, zipp: 43.612 }, nodeRatio: 0.994103840 },
+  { id: 'module-hot-graph', name: 'Hot module graph', group: 'modules', times: { node: 41.952, bun: 51.150, deno: 94.788, zipp: 16.286 }, nodeRatio: 0.403273005 },
+  { id: 'npm-nanoid', name: 'npm nanoid', group: 'npm', times: { node: 86.019, bun: 98.589, deno: 127.279, zipp: 82.525 }, nodeRatio: 0.966236392 },
+]
+
+const nodeWins = (rows: BenchmarkRow[]) => rows.filter((row) => row.nodeRatio < 1).length
+const nodeGaps = (rows: BenchmarkRow[]) =>
+  rows.filter((row) => row.nodeRatio >= 1).sort((a, b) => b.nodeRatio - a.nodeRatio)
+
+const readingGuide = [
+  {
+    title: 'The ratio is Zipp divided by Node',
+    copy: 'Each row runs Node, Bun, Deno and Zipp in a shuffled order, 15 times each, and pairs the medians. 0.72× means Zipp finished in 72% of Node’s time; anything above 1× is a gap we still owe.',
+  },
+  {
+    title: 'Cold time, exact output',
+    copy: 'Every number includes process launch, and a row only counts when all four engines print byte-identical output. Zipp’s 7.7 ms launch is real, but the ratios are about the work, not the start.',
+  },
+  {
+    title: 'One number for the whole picture',
+    copy: 'The all-30 figure gives every normal and hostile row equal weight and reports a descriptive bootstrap interval. It is a summary, not a proof of universal speed — the table is the evidence.',
+  },
+]
+
+const releaseNotes = [
+  ['v0.0.12', 'Array element stores run inline in compiled loops; the `x | 0` idiom fuses into its add. sparse-array 1.01× → 0.92×, closure calls 1.18× → 1.10×.'],
+  ['v0.0.11', 'Booleans and receivers get their own registers, so tokenizer-shaped loops stay on the integer tier. parse-large-js 1.24× → 0.88×.'],
+  ['v0.0.10', 'Hardened limits sized for applications: megabyte-scale strings and buffers, a 512 MB heap budget.'],
 ]
 
 const useCases = [
@@ -393,12 +448,17 @@ function App() {
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
   const [menuOpen, setMenuOpen] = useState(false)
   const [benchmarkFilter, setBenchmarkFilter] = useState<BenchmarkFilter>('all')
+  const [suite, setSuite] = useState<Suite>('normal')
   const resetTimer = useRef<number | undefined>(undefined)
 
   const visibleBenchmarks = useMemo(
-    () => benchmarkRows.filter((row) => benchmarkFilter === 'all' || row.group === benchmarkFilter),
-    [benchmarkFilter],
+    () =>
+      suite === 'hostile'
+        ? hostileRows
+        : benchmarkRows.filter((row) => benchmarkFilter === 'all' || row.group === benchmarkFilter),
+    [benchmarkFilter, suite],
   )
+  const gaps = useMemo(() => [...nodeGaps(benchmarkRows), ...nodeGaps(hostileRows)], [])
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -462,7 +522,7 @@ function App() {
           <div className="hero-copy">
             <a className="result-pill" href="#benchmarks">
               <span>Native CLI · canonical PGO · 30/30 exact outputs</span>
-              <strong>0.768× Node across all 30 measured native rows</strong>
+              <strong>0.729× Node across all 30 measured rows · faster on 21</strong>
               <span aria-hidden="true">↓</span>
             </a>
 
@@ -552,17 +612,17 @@ function App() {
           <div className="section-wrap proof-grid">
             <div className="proof-lead">
               <span className="metric-index">01</span>
-              <strong>17 / 30</strong>
-              <p>native point-estimate wins vs Node</p>
+              <strong>21 / 30</strong>
+              <p>native rows faster than Node</p>
             </div>
             <div>
               <span className="metric-index">02</span>
-              <strong>0.768×</strong>
+              <strong>0.729×</strong>
               <p>native Zipp / Node · equal-row all 30</p>
             </div>
             <div>
               <span className="metric-index">03</span>
-              <strong>7.9 ms</strong>
+              <strong>7.7 ms</strong>
               <p>median native process launch</p>
             </div>
             <div>
@@ -655,8 +715,8 @@ function App() {
               <h2>Fast where it counts. Honest where work remains.</h2>
             </div>
             <div className="benchmark-statement">
-              <strong>17<span>/30</span></strong>
-              <p>Node point wins · every gap visible</p>
+              <strong>{nodeWins(benchmarkRows) + nodeWins(hostileRows)}<span>/30</span></strong>
+              <p>rows faster than Node · every gap visible</p>
             </div>
           </div>
 
@@ -664,49 +724,82 @@ function App() {
             <article className="headline-result">
               <div>
                 <span>Native equal-row all-30 headline</span>
-                <strong>0.7679×</strong>
+                <strong>0.7288×</strong>
                 <p>Native Zipp / Node paired geomean · lower is better</p>
               </div>
-              <div className="confidence-pill">95% CI&nbsp; 0.7642–0.7712</div>
+              <div className="confidence-pill">95% CI&nbsp; 0.7163–0.7359</div>
             </article>
 
             <article className="ratio-card">
               <span>Native all-30 paired geomeans</span>
-              <div className="ratio-row"><b>vs Node</b><span><i className="bar-geomean-node" /></span><strong>0.7679×</strong></div>
-              <div className="ratio-row"><b>vs Bun</b><span><i className="bar-geomean-bun" /></span><strong>0.6154×</strong></div>
-              <div className="ratio-row"><b>vs Deno</b><span><i className="bar-geomean-deno" /></span><strong>0.4918×</strong></div>
-              <small>95% CIs: Node 0.7642–0.7712 · Bun 0.6125–0.6199 · Deno 0.4885–0.4958. Normal 13 + hostile 17; equal weight per row.</small>
+              <div className="ratio-row"><b>vs Node</b><span><i className="bar-geomean-node" /></span><strong>0.7288×</strong></div>
+              <div className="ratio-row"><b>vs Bun</b><span><i className="bar-geomean-bun" /></span><strong>0.6022×</strong></div>
+              <div className="ratio-row"><b>vs Deno</b><span><i className="bar-geomean-deno" /></span><strong>0.4692×</strong></div>
+              <small>95% CIs: Node 0.7163–0.7359 · Bun 0.5972–0.6073 · Deno 0.4639–0.4739. Normal 13 + hostile 17; equal weight per row.</small>
             </article>
 
             <article className="ratio-card suite-card">
               <span>Suite geomeans vs Node</span>
-              <div className="ratio-row"><b>Normal 13</b><span><i className="bar-suite-normal" /></span><strong>0.6419×</strong></div>
-              <div className="ratio-row"><b>Hostile 17</b><span><i className="bar-suite-hostile" /></span><strong>0.8807×</strong></div>
-              <small>95% CIs: normal 0.6378–0.6457 · hostile 0.8745–0.8863. Node point wins: 9/13 + 8/17.</small>
+              <div className="ratio-row"><b>Normal 13</b><span><i className="bar-suite-normal" /></span><strong>0.6202×</strong></div>
+              <div className="ratio-row"><b>Hostile 17</b><span><i className="bar-suite-hostile" /></span><strong>0.8244×</strong></div>
+              <small>95% CIs: normal 0.6156–0.6240 · hostile 0.7995–0.8378. Rows faster than Node: {nodeWins(benchmarkRows)}/13 + {nodeWins(hostileRows)}/17.</small>
             </article>
+          </div>
+
+          <div className="reading-guide" aria-label="How to read the benchmark numbers">
+            {readingGuide.map((item, index) => (
+              <article key={item.title}>
+                <span>0{index + 1}</span>
+                <h3>{item.title}</h3>
+                <p>{item.copy}</p>
+              </article>
+            ))}
           </div>
 
           <div className="scoreboard">
             <div className="scoreboard-toolbar">
               <div>
-                <p>Canonical native normal 13 · cold wall time <span>milliseconds · lower is better</span></p>
+                <p>
+                  {suite === 'normal' ? 'Canonical native normal 13' : 'Canonical native hostile 17'} · cold wall time
+                  <span>milliseconds · lower is better</span>
+                </p>
               </div>
-              <div className="filter-tabs" role="group" aria-label="Filter benchmark rows">
-                {([
-                  ['all', 'All 13'],
-                  ['headline', 'Headline 10'],
-                  ['diagnostic', 'Diagnostics 3'],
-                ] as const).map(([value, label]) => (
-                  <button
-                    key={value}
-                    type="button"
-                    className={benchmarkFilter === value ? 'active' : ''}
-                    aria-pressed={benchmarkFilter === value}
-                    onClick={() => setBenchmarkFilter(value)}
-                  >
-                    {label}
-                  </button>
-                ))}
+              <div className="scoreboard-controls">
+                <div className="filter-tabs suite-tabs" role="group" aria-label="Choose a benchmark suite">
+                  {([
+                    ['normal', 'Normal suite'],
+                    ['hostile', 'Hostile suite'],
+                  ] as const).map(([value, label]) => (
+                    <button
+                      key={value}
+                      type="button"
+                      className={suite === value ? 'active' : ''}
+                      aria-pressed={suite === value}
+                      onClick={() => setSuite(value)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {suite === 'normal' && (
+                  <div className="filter-tabs" role="group" aria-label="Filter benchmark rows">
+                    {([
+                      ['all', 'All 13'],
+                      ['headline', 'Headline 10'],
+                      ['diagnostic', 'Diagnostics 3'],
+                    ] as const).map(([value, label]) => (
+                      <button
+                        key={value}
+                        type="button"
+                        className={benchmarkFilter === value ? 'active' : ''}
+                        aria-pressed={benchmarkFilter === value}
+                        onClick={() => setBenchmarkFilter(value)}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
 
@@ -729,7 +822,7 @@ function App() {
                       <tr key={row.id}>
                         <th scope="row">
                           <span>{row.name}</span>
-                          <small>{row.group === 'headline' ? 'Headline' : 'Diagnostic'}</small>
+                          <small>{suite === 'normal' ? (row.group === 'headline' ? 'Headline' : 'Diagnostic') : row.group}</small>
                         </th>
                         <td className="zipp-time" data-label="Zipp"><strong>{row.times.zipp.toFixed(3)}</strong><span className="sr-only"> milliseconds</span></td>
                         <td data-label="Node">{row.times.node.toFixed(3)}</td>
@@ -749,26 +842,47 @@ function App() {
 
           <div className="methodology-note">
             <span className="methodology-mark">i</span>
-            <p>
-              Native Windows x86-64 CLI, high-performance power mode. Cold wall time includes process launch;
-              15 paired repetitions with deterministically shuffled engine and benchmark order;
-              10,000 paired-bootstrap samples; exact-byte outputs. Node 24.12.0, Bun 1.3.14,
-              Deno 2.6.10, Zipp 0.0.1 at clean PGO source <code>21288c1</code>; binary SHA-256
-              <code>c2ddb9e6…6a3cb5</code>. Median startup: Zipp 7.9 ms, Node 29.6 ms, Bun 44.9 ms,
-              Deno 82.1 ms. The all-30 result gives equal weight to all normal and hostile rows;
-              its bootstrap intervals are descriptive. Zipp has 17/30 Node point wins and 30/30
-              exact outputs. Ratios above one remain point gaps even when an interval crosses one.
-              Normal gaps: async-promise-chain 1.232×, json-large 1.051×, regex-log-scan 1.017×,
-              sparse-array 1.050×. Hostile gaps: calls-closures 1.307×, shapes-stable 1.493×,
-              shapes-megamorphic 1.484×, allocation-survival 1.772×, async-lived 1.082×,
-              reactish-reconcile 1.646×, warm-router 1.674×, bytecode-vm 1.014×, and npm-nanoid
-              1.0004×. These native workloads are evidence, not a claim of universal runtime superiority;
-              they are not browser-WASM results.
-            </p>
+            <div>
+              <p>
+                Native Windows x86-64 CLI, high-performance power mode. Cold wall time includes process launch;
+                15 paired repetitions with deterministically shuffled engine and benchmark order;
+                10,000 paired-bootstrap samples; exact-byte outputs. Node 24.12.0, Bun 1.3.14,
+                Deno 2.6.10, Zipp 0.0.11 at clean PGO source <code>c28781cf</code>; binary SHA-256
+                <code>0b3cfcd0…b7fab6</code>. Median startup: Zipp 7.7 ms, Node 30.6 ms, Bun 44.0 ms,
+                Deno 84.4 ms. The all-30 result gives equal weight to all normal and hostile rows;
+                its bootstrap intervals are descriptive. Ratios above one remain point gaps even when an
+                interval crosses one. These native workloads are evidence, not a claim of universal
+                runtime superiority; they are not browser-WASM results.
+              </p>
+              <p className="gap-list">
+                <strong>Rows still behind Node ({gaps.length}):</strong>{' '}
+                {gaps.map((row, index) => (
+                  <span key={row.id}>
+                    {row.id} {row.nodeRatio.toFixed(3)}×{index < gaps.length - 1 ? ', ' : '.'}
+                  </span>
+                ))}
+              </p>
+            </div>
             <div className="methodology-links">
               <ExternalLink className="text-link" href={BENCHMARK_URL}>Normal capture</ExternalLink>
               <ExternalLink className="text-link" href={HOSTILE_BENCHMARK_URL}>Hostile capture</ExternalLink>
+              <ExternalLink className="text-link" href={ROADMAP_URL}>What is next</ExternalLink>
             </div>
+          </div>
+
+          <div className="release-strip" aria-label="Recent releases">
+            <div className="release-strip-heading">
+              <p className="section-kicker">Recent releases</p>
+              <ExternalLink className="text-link" href={RELEASE_URL}>Latest release</ExternalLink>
+            </div>
+            <ol>
+              {releaseNotes.map(([version, note]) => (
+                <li key={version}>
+                  <strong>{version}</strong>
+                  <p>{note}</p>
+                </li>
+              ))}
+            </ol>
           </div>
         </section>
 
