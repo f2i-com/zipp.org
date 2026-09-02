@@ -407,6 +407,23 @@ pub fn builtin_stats() -> Vec<(&'static str, String, u64)> {
     vm::builtin_stats()
 }
 
+/// `ZIPP_INTERPSTATS=1` histogram of interpreter frame activity:
+/// `(function id, name, entries the JIT did not take, resumes)`, busiest
+/// first. Empty unless the variable was set. See `vm::dispatch::interp_stats`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn interp_stats() -> Vec<(u32, String, u64, u64)> {
+    vm::interp_stats::dump()
+}
+
+/// `ZIPP_INTERPSTATS=1` companion: compiled loop-region runs as
+/// `(function id, entry ip, resume ip, runs)`, most runs first. A resume ip
+/// inside the region is a guard bail that left the iteration's tail to the
+/// interpreter.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn interp_region_stats() -> Vec<(u32, u32, u32, u64)> {
+    vm::interp_stats::dump_regions()
+}
+
 /// `ZIPP_RXSTATS=1` regex classical-backtrack counters:
 /// `(attempts, greedy 1-char backtrack pushes, retry iterations,
 ///   possessive pushes elided, failed-run skips)` — the mechanism evidence

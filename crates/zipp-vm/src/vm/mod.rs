@@ -2656,6 +2656,8 @@ mod natives;
 mod props;
 mod setup;
 pub(crate) use builtins::builtin_stats;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use dispatch::interp_stats;
 mod agents;
 mod array_ops;
 pub(crate) mod bigint;

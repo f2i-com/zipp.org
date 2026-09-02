@@ -7,6 +7,87 @@ use crate::heap::{
 };
 use crate::value::Value;
 
+/// `ZIPP_INTERPSTATS=1`: which functions the INTERPRETER executes, counted as
+/// frame entries (a fresh activation the JIT did not take at ip 0) and resumes
+/// (a return into a frame, or a JIT bail landing mid-function). One latched
+/// flag check per frame transition and nothing per instruction, so the knob
+/// is free when unset. It answers "what is still interpreted" on a row whose
+/// profile shows dispatch time while every hot function reports compiled.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod interp_stats {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::Mutex;
+
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    static TABLE: Mutex<Option<HashMap<u32, (String, u64, u64)>>> = Mutex::new(None);
+    /// `(func, region entry ip, resume ip) -> runs`: how often each compiled
+    /// loop region was entered and where it handed control back. A resume ip
+    /// inside the region's bounds is a guard bail; the interpreter then runs
+    /// the rest of that iteration itself.
+    static REGIONS: Mutex<Option<HashMap<(u32, u32, u32), u64>>> = Mutex::new(None);
+
+    #[inline]
+    pub(crate) fn enabled() -> bool {
+        match STATE.load(Ordering::Relaxed) {
+            1 => true,
+            2 => false,
+            _ => {
+                let on = std::env::var_os("ZIPP_INTERPSTATS").is_some();
+                STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+                on
+            }
+        }
+    }
+
+    pub(crate) fn bump(func_id: u32, name: &str, resume: bool) {
+        let mut guard = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        let table = guard.get_or_insert_with(HashMap::new);
+        let entry = table
+            .entry(func_id)
+            .or_insert_with(|| (name.to_string(), 0, 0));
+        if resume {
+            entry.2 += 1;
+        } else {
+            entry.1 += 1;
+        }
+    }
+
+    // The only region runner is the x86-64 JIT's.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn bump_region(func_id: u32, entry_ip: u32, resume_ip: u32) {
+        let mut guard = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        *guard
+            .get_or_insert_with(HashMap::new)
+            .entry((func_id, entry_ip, resume_ip))
+            .or_insert(0) += 1;
+    }
+
+    /// `(func_id, entry ip, resume ip, runs)`, most runs first.
+    pub fn dump_regions() -> Vec<(u32, u32, u32, u64)> {
+        let guard = REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<(u32, u32, u32, u64)> = guard
+            .iter()
+            .flat_map(|table| table.iter())
+            .map(|(&(f, e, r), &n)| (f, e, r, n))
+            .collect();
+        rows.sort_by(|a, b| b.3.cmp(&a.3));
+        rows
+    }
+
+    /// `(func_id, name, entries, resumes)`, busiest first.
+    pub fn dump() -> Vec<(u32, String, u64, u64)> {
+        let guard = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<(u32, String, u64, u64)> = guard
+            .iter()
+            .flat_map(|table| table.iter())
+            .map(|(&id, (name, entries, resumes))| (id, name.clone(), *entries, *resumes))
+            .collect();
+        rows.sort_by(|a, b| (b.2 + b.3).cmp(&(a.2 + a.3)));
+        rows
+    }
+}
+
 impl<'p> Vm<'p> {
     /// Drives execution from the current frame until the frame that was current
     /// on entry returns (frames drops to `stop_depth`), catching thrown values
@@ -409,6 +490,14 @@ impl<'p> Vm<'p> {
                     // SAFETY: program bytecode is immutable for the VM's life.
                     self.jit.compile(func_id, unsafe { &*proto });
                 }
+            }
+
+            // `ZIPP_INTERPSTATS=1`: this frame is about to be INTERPRETED from
+            // `ip` (the native tiers above either bailed here or did not take
+            // it). Free when unset: one latched load per frame transition.
+            #[cfg(not(target_arch = "wasm32"))]
+            if interp_stats::enabled() {
+                interp_stats::bump(func_id, &self.func(func_id as usize).name, ip != 0);
             }
 
             // Inner loop: execute within the current frame until a call pushes
@@ -9169,6 +9258,10 @@ impl<'p> Vm<'p> {
         }
         #[cfg(not(feature = "instrument"))]
         let meter_exit = false;
+        #[cfg(not(target_arch = "wasm32"))]
+        if interp_stats::enabled() {
+            interp_stats::bump_region(func_id, entry_ip, resume);
+        }
 
         // A LOCAL-SROA native body ran over an index-preserving clone in which
         // fresh aggregates were scalar homes. A clean exit proved those refs

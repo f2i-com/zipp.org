@@ -20,6 +20,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let stats = std::env::var_os("ZIPP_SHAPESTATS").is_some();
     let bstats = std::env::var_os("ZIPP_BUILTINSTATS").is_some();
+    let istats = std::env::var_os("ZIPP_INTERPSTATS").is_some();
     // On Windows build.rs gives the PE main thread a 256 MiB reserve with only
     // one 4 KiB page committed up front. Running here avoids the fixed
     // CreateThread/join and second allocator-thread-heap cost while preserving
@@ -236,6 +237,24 @@ fn main() -> ExitCode {
                 *calls as f64 * 100.0 / total as f64
             };
             eprintln!("[builtin] {calls:>10}  {pct:>5.1}%  {kind}.{name}");
+        }
+    }
+    if istats {
+        let rows = zipp_vm::interp_stats();
+        let (entries, resumes) = rows
+            .iter()
+            .fold((0u64, 0u64), |(e, r), row| (e + row.2, r + row.3));
+        eprintln!(
+            "[interp] {} functions ran interpreted: {entries} entries (not taken by the JIT at ip 0), {resumes} resumes (returns into a frame, JIT bails)",
+            rows.len()
+        );
+        for (id, name, e, r) in rows.iter().take(30) {
+            let shown = if name.is_empty() { "<anonymous>" } else { name.as_str() };
+            eprintln!("[interp] {e:>10} entries {r:>10} resumes  fn{id} {shown}");
+        }
+        let regions = zipp_vm::interp_region_stats();
+        for (f, entry, resume, runs) in regions.iter().take(30) {
+            eprintln!("[interp-region] {runs:>10} runs  fn{f} region@{entry} -> resume ip {resume}");
         }
     }
     match r {
