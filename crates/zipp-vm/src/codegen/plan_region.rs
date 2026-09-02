@@ -1905,6 +1905,40 @@ fn plan_region_cold_inner(
                         }
                     }
                 }
+                // B263: a flag register with NO other in-region definition and
+                // NO in-region use but the fused call itself is dead past the
+                // call by construction: nothing in the region observes the
+                // elided Bool, so no kill is needed. Outside the region every
+                // read of the register must follow (in code order, on its own
+                // side of the region) a definition of its own -- the compiler
+                // never reads a temporary before writing it, and this proves
+                // no outside read can see the stale slot. (The compiler now
+                // keeps boolean argument slots out of numeric reuse, so the
+                // recycled-window shape below no longer arises for these.)
+                let outside_reads_covered = {
+                    let covered = |range: std::ops::Range<usize>| -> bool {
+                        let mut defined = false;
+                        for ip2 in range {
+                            if !defined && instr_uses(&code[ip2]).contains(&f) {
+                                return false;
+                            }
+                            if writes_reg(&code[ip2]) == Some(f) {
+                                defined = true;
+                            }
+                        }
+                        true
+                    };
+                    covered(0..s) && covered(e + 1..code.len())
+                };
+                let dead_flag = !other_def
+                    && outside_reads_covered
+                    && !jump_targets.contains(&cip)
+                    && !(s..=e).any(|ip2| {
+                        ip2 != cip && !cold.contains(&ip2) && instr_uses(&code[ip2]).contains(&f)
+                    });
+                if dead_flag {
+                    continue;
+                }
                 let m = match (other_def, def_is_cmp, m) {
                     (true, false, Some(m)) => m,
                     _ => {
@@ -1965,6 +1999,19 @@ fn plan_region_cold_inner(
             dv_flag_fuse.insert(cip, (a, b));
         }
     }
+    // B263: the flag operand of a fused DV call is neither typed nor a live-in
+    // -- the call computes ToBoolean(a === b) from the Eq's operand homes, and
+    // a flag register with no other definition never materialises at all.
+    let fused_flag_reg = |ip: usize| -> Option<u16> {
+        if !dv_flag_fuse.contains_key(&ip) {
+            return None;
+        }
+        match code[ip] {
+            Instr::CallMethod { arg_base, .. } => Some(arg_base + 1),
+            Instr::CallWithThis { .. } => captured_pin_call(ip).map(|site| site.arg_base + 1),
+            _ => None,
+        }
+    };
 
     // ── W28 type-aware live-range splitting ── see `RegionPlan::ty_splits` for
     // the mechanism and `plan_type_splits` for the legality predicate. GATE:
@@ -2219,7 +2266,7 @@ fn plan_region_cold_inner(
         };
         // Record operand first-occurrences (uses) BEFORE the def, so a reg used
         // and defined by the same op counts the use first (live-in).
-        for u in numeric_uses(s + off, instr) {
+        for u in numeric_uses(s + off, instr).into_iter().filter(|&u| fused_flag_reg(s + off) != Some(u)) {
             first_seen.entry(u).or_insert(false); // first occurrence is a use ⇒ live-in
             if !ty.contains_key(&u) {
                 // Type not yet known; tentatively untyped — refined when defined.
@@ -2279,7 +2326,10 @@ fn plan_region_cold_inner(
                         && ty.get(&d) == Some(&if t == VTy::Bool { VTy::Num } else { VTy::Bool })
                 });
                 if !ok {
-                    decline!("type conflict on a reused register");
+                    decline!(format!(
+                        "type conflict on a reused register r{d} ({:?} vs {t:?})",
+                        ty.get(&d)
+                    ));
                 }
                 // A split register is typed Num for the whole region: its
                 // numeric half is the one `reg_home` names.
@@ -2361,7 +2411,7 @@ fn plan_region_cold_inner(
         if cold.contains(&(s + off)) {
             continue;
         }
-        for u in numeric_uses(s + off, instr) {
+        for u in numeric_uses(s + off, instr).into_iter().filter(|&u| fused_flag_reg(s + off) != Some(u)) {
             if !ta_recv_regs.contains(&u)
                 && !box_regs.contains(&u)
                 && !ty.contains_key(&u)
@@ -2409,7 +2459,7 @@ fn plan_region_cold_inner(
                     numeric.push(b);
                 }
             }
-            for u in numeric_uses(s + off, instr) {
+            for u in numeric_uses(s + off, instr).into_iter().filter(|&u| fused_flag_reg(s + off) != Some(u)) {
                 if ro_live_in.contains(&u) && !numeric.contains(&u) {
                     decline!("read-only live-in used where a number isn't required");
                     //
@@ -6537,19 +6587,24 @@ pub(crate) fn plan_local_concat_len(
                 continue;
             }
 
-            // Reused temporaries must not interfere. `length_dst == number_reg`
-            // is the useful exact shape: the final projection consumes then
-            // overwrites `n`. All other working registers stay distinct. The
-            // compiler may reuse the dead mask register for the later field
-            // read; in that one exact shape an untouched dead prefix/concat
-            // register carries the shift count instead.
+            // Reused temporaries must not interfere. The projection's
+            // destination is either `n`'s own register (the reuse shape: the
+            // final projection consumes then overwrites `n`) or a register of
+            // its own, clear of every working register including the mask,
+            // which may carry the shift count -- the compiler's monotone
+            // in-loop allocation never recycles `n`'s register for a later
+            // statement's temporary. All other working registers stay
+            // distinct. The compiler may reuse the dead mask register for the
+            // later field read; in that one exact shape an untouched dead
+            // prefix/concat register carries the shift count instead.
             let distinct = [prefix_reg, number_reg, add_dst, get_dst, field.scratch];
             if distinct
                 .iter()
                 .enumerate()
                 .any(|(i, r)| distinct[..i].contains(r))
                 || (mask_reg != get_dst && distinct.contains(&mask_reg))
-                || length_dst != number_reg
+                || (length_dst != number_reg
+                    && (distinct.contains(&length_dst) || length_dst == mask_reg))
             {
                 continue;
             }

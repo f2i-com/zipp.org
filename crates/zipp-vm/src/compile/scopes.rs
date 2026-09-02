@@ -33,6 +33,9 @@ impl<'a> FnCompiler<'a> {
             scope_lex_names: vec![HashSet::new()],
             next_reg: 0,
             max_reg: 0,
+            bool_regs: 0,
+            recv_regs: 0,
+            reg_kinds: Vec::new(),
             reg_overflow: false,
             rest_reg: None,
             arguments_reg: None,
@@ -212,16 +215,42 @@ impl<'a> FnCompiler<'a> {
         self.alloc_reg()
     }
 
-    /// Refuse to emit a `FuncProto` whose frame overflowed the `u16` register
-    /// space. Called at every finalisation site; without it `alloc_reg`'s
-    /// saturation would hand the same register to several live values.
-    pub(crate) fn check_regs(&self) -> R<()> {
-        if self.reg_overflow {
+    /// Finalise the frame: renumber the class registers (`alloc_bool_reg`,
+    /// `alloc_recv_reg`) to `[max_reg, max_reg + bools + receivers)` and
+    /// refuse to emit a `FuncProto` whose frame overflowed the register space.
+    /// Called at every finalisation site; without the overflow check
+    /// `alloc_reg`'s saturation would hand the same register to several live
+    /// values.
+    pub(crate) fn check_regs(&mut self) -> R<()> {
+        let total = self.max_reg as usize + self.bool_regs as usize + self.recv_regs as usize;
+        if self.reg_overflow || total > BOOL_BASE as usize {
             return Err(format!(
                 "function needs more than {} registers (too many locals, \
                  temporaries or literal elements in one function body)",
-                Reg::MAX
+                BOOL_BASE
             ));
+        }
+        if self.bool_regs > 0 || self.recv_regs > 0 {
+            let base = self.max_reg;
+            let bools = self.bool_regs;
+            // `NO_REG` / `BARE_MATH_BY_NAME` ride in `Reg` fields as sentinels
+            // (`MathOp`'s bare form also carries a global index in `this_v`,
+            // which is below `BOOL_BASE` and so untouched).
+            let m = move |r: Reg| -> Reg {
+                if r >= crate::bytecode::BARE_MATH_BY_NAME {
+                    r
+                } else if r >= RECV_BASE {
+                    base + bools + (r - RECV_BASE)
+                } else if r >= BOOL_BASE {
+                    base + (r - BOOL_BASE)
+                } else {
+                    r
+                }
+            };
+            for i in &mut self.code {
+                super::remap::remap_regs(i, &m);
+            }
+            self.max_reg = total as Reg;
         }
         Ok(())
     }
@@ -230,7 +259,159 @@ impl<'a> FnCompiler<'a> {
         if !self.typeof_alias.is_empty() {
             self.typeof_alias_note_emit(&i);
         }
+        self.note_reg_kind(&i);
         self.code.push(i);
+    }
+
+    /// Record the kind of value `i` writes (see `reg_kinds`): the comparison
+    /// opcodes the region planner types `Bool`, a `Move` of a boolean, and
+    /// everything else as a number/other. Class registers are not tracked --
+    /// they are never handed out again.
+    #[cfg(not(feature = "jit"))]
+    fn note_reg_kind(&mut self, _i: &Instr) {
+        // The history only serves the register tiers' one-type-per-register
+        // model; a build without the JIT has no consumer (and no def table).
+    }
+
+    #[cfg(feature = "jit")]
+    fn note_reg_kind(&mut self, i: &Instr) {
+        let Some(dst) = crate::codegen::writes_reg(i) else {
+            return;
+        };
+        if dst >= BOOL_BASE {
+            return;
+        }
+        let kind = match *i {
+            Instr::Lt { .. }
+            | Instr::Le { .. }
+            | Instr::Gt { .. }
+            | Instr::Ge { .. }
+            | Instr::Eq { .. }
+            | Instr::Ne { .. } => KIND_BOOL,
+            Instr::Move { src, .. } => {
+                if src >= BOOL_BASE && src < RECV_BASE {
+                    KIND_BOOL
+                } else {
+                    self.reg_kind(src)
+                }
+            }
+            _ => KIND_NUM,
+        };
+        if kind == 0 {
+            return;
+        }
+        let d = dst as usize;
+        if self.reg_kinds.len() <= d {
+            self.reg_kinds.resize(d + 1, 0);
+        }
+        self.reg_kinds[d] |= kind;
+    }
+
+    fn reg_kind(&self, r: Reg) -> u8 {
+        self.reg_kinds.get(r as usize).copied().unwrap_or(0)
+    }
+
+    /// A single scratch register for a non-boolean expression value: the
+    /// first register at or above `next_reg` with no boolean history (see
+    /// `reg_kinds`). Skipped registers are simply left unused this time.
+    pub(crate) fn alloc_num_reg(&mut self) -> Reg {
+        if reg_classes_enabled() {
+            let mut r = self.next_reg;
+            while r < self.max_reg && self.reg_kind(r) & KIND_BOOL != 0 {
+                r = r.saturating_add(1);
+            }
+            self.next_reg = r;
+        }
+        self.alloc_reg()
+    }
+
+    /// Reserve `kinds.len()` contiguous registers for an argument window,
+    /// starting at the first base at or above `next_reg` where no slot would
+    /// take a boolean argument (`kinds[i]`) over a numeric history or a
+    /// non-boolean one over a boolean history. Registers at or above
+    /// `max_reg` have no history, so the search always terminates.
+    pub(crate) fn alloc_block(&mut self, kinds: &[bool]) -> Reg {
+        let n = kinds.len() as Reg;
+        let mut base = self.next_reg;
+        if reg_classes_enabled() {
+            'search: while base < self.max_reg {
+                for (i, &is_bool) in kinds.iter().enumerate() {
+                    let r = base.saturating_add(i as Reg);
+                    let k = self.reg_kind(r);
+                    if (is_bool && k & KIND_NUM != 0) || (!is_bool && k & KIND_BOOL != 0) {
+                        base = base.saturating_add(1);
+                        continue 'search;
+                    }
+                }
+                break;
+            }
+        }
+        self.next_reg = base;
+        for _ in 0..n {
+            self.alloc_reg();
+        }
+        base
+    }
+
+    /// Every scratch reclaim goes through here. A class register (a
+    /// provisional number at or above `BOOL_BASE`) is never a reclaim
+    /// boundary: a reset computed from one (`save.max(dst + 1)` with a
+    /// boolean `dst`) leaves the ordinary stack where it is.
+    pub(crate) fn set_next_reg(&mut self, r: Reg) {
+        if r < BOOL_BASE {
+            self.next_reg = r;
+        }
+    }
+
+    /// `next_reg -= k` through the same funnel.
+    pub(crate) fn dec_next_reg(&mut self, k: Reg) {
+        let r = self.next_reg.saturating_sub(k);
+        self.set_next_reg(r);
+    }
+
+    /// The destination of a boolean-valued expression (`bool_valued`): a
+    /// provisional register in `BOOL_BASE..` that is never reclaimed, so no
+    /// later numeric temporary shares it and the region planner never sees a
+    /// register defined as both a number and a boolean. Renumbered to the top
+    /// of the frame by `check_regs`. Booleans share GPR homes by live range in
+    /// the planner, so distinct registers cost frame slots, not homes.
+    pub(crate) fn alloc_bool_reg(&mut self) -> Reg {
+        if !reg_classes_enabled() {
+            return self.temp();
+        }
+        if self.bool_regs >= RECV_BASE - BOOL_BASE - 1 {
+            self.reg_overflow = true;
+        }
+        let r = BOOL_BASE.saturating_add(self.bool_regs);
+        self.bool_regs = self.bool_regs.saturating_add(1);
+        r
+    }
+
+    /// The register of a receiver read from a global (`src.charCodeAt(i)`):
+    /// a provisional register in `RECV_BASE..`, never reclaimed, so it has
+    /// exactly one definition and the INT region tier can pin it (the
+    /// "cleanly excludable" rule). Renumbered by `check_regs`.
+    pub(crate) fn alloc_recv_reg(&mut self) -> Reg {
+        if self.recv_regs >= crate::bytecode::BARE_MATH_BY_NAME - RECV_BASE - 1 {
+            self.reg_overflow = true;
+        }
+        let r = RECV_BASE.saturating_add(self.recv_regs);
+        self.recv_regs = self.recv_regs.saturating_add(1);
+        r
+    }
+
+    /// Evaluate the receiver of a member access or method call; a plain
+    /// global identifier loads into a receiver class register.
+    pub(crate) fn recv_expr(&mut self, e: &Expr) -> R<Reg> {
+        if let Expr::Ident(name) = e {
+            if reg_classes_enabled() && !self.box_all_locals && !self.cx.dyn_global_zone {
+                if let Binding::Global(_) = self.resolve(name) {
+                    let r = self.alloc_recv_reg();
+                    return self.expr_into(e, r);
+                }
+            }
+        }
+        self.expr(e)
     }
     pub(crate) fn here(&self) -> u32 {
         self.code.len() as u32
@@ -264,7 +445,7 @@ impl<'a> FnCompiler<'a> {
         // Saturating: after a `reg_overflow` the counter no longer tracks the
         // real allocation depth, and a plain `-=` would underflow-panic (the
         // release profile is `panic = "abort"`, so that would be a hard crash).
-        self.next_reg = self.next_reg.saturating_sub(scope.len() as Reg);
+        self.set_next_reg(self.next_reg.saturating_sub(scope.len() as Reg));
         for (_, r) in &scope {
             self.const_regs.remove(r);
             self.cell_regs.remove(r);
@@ -606,5 +787,210 @@ impl<'a> FnCompiler<'a> {
         let si = self.string_constants.len() as u32;
         self.string_constants.push(s.to_string());
         si
+    }
+}
+
+/// `reg_kinds` bits (see `FnCompiler::note_reg_kind`).
+pub(crate) const KIND_BOOL: u8 = 1;
+pub(crate) const KIND_NUM: u8 = 2;
+
+/// Default ON; `ZIPP_NO_REG_CLASSES=1` restores the v0.0.5 allocation in which
+/// booleans and global receivers share the ordinary scratch stack (and
+/// tokenizer loops decline the INT tier). Read once per process.
+pub(crate) fn reg_classes_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_REG_CLASSES").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Is `e` boolean-valued by its syntax? Comparisons, `in`/`instanceof`,
+/// logical not, boolean literals, and `&&`/`||`/`?:` whose every value arm is.
+/// Syntactic only: `a < b` may run a `valueOf`, but the value it leaves in its
+/// register is still a boolean, which is all the register class asserts.
+pub(crate) fn bool_valued(e: &Expr) -> bool {
+    match e {
+        Expr::Bool(_) => true,
+        Expr::Unary { op: ast::UnaryOp::Not, .. } => true,
+        Expr::Binary { op, .. } => matches!(
+            op,
+            ast::BinaryOp::Eq
+                | ast::BinaryOp::NotEq
+                | ast::BinaryOp::StrictEq
+                | ast::BinaryOp::StrictNotEq
+                | ast::BinaryOp::Lt
+                | ast::BinaryOp::LtEq
+                | ast::BinaryOp::Gt
+                | ast::BinaryOp::GtEq
+                | ast::BinaryOp::In
+                | ast::BinaryOp::Instanceof
+        ),
+        Expr::Logical { op: ast::LogicalOp::And | ast::LogicalOp::Or, left, right } => {
+            bool_valued(left) && bool_valued(right)
+        }
+        Expr::Cond { cons, alt, .. } => bool_valued(cons) && bool_valued(alt),
+        Expr::Seq(items) => items.last().is_some_and(bool_valued),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod reg_classes_tests {
+    use super::*;
+
+    const TOKENIZE: &str = r#"
+        var src = "let a = 1; // c\n/* b */ if (a) { a += 2; }";
+        var kinds = [], starts = [];
+        function tokenize() {
+            var i = 0, n = src.length;
+            while (i < n) {
+                var c = src.charCodeAt(i);
+                if (c === 32 || c === 10) { i++; continue; }
+                var st = i;
+                if (c === 47) {
+                    var cc = src.charCodeAt(i + 1);
+                    if (cc === 47) {
+                        while (i < n && src.charCodeAt(i) !== 10) i++;
+                        kinds.push(5); starts.push(st); continue;
+                    }
+                    if (cc === 42) {
+                        i += 2;
+                        while (i < n && !(src.charCodeAt(i) === 42 && src.charCodeAt(i + 1) === 47)) i++;
+                        i += 2;
+                        kinds.push(5); starts.push(st); continue;
+                    }
+                }
+                kinds.push(c); starts.push(st); i++;
+            }
+            return kinds.length;
+        }
+        tokenize();
+    "#;
+
+    fn compile(source: &str) -> crate::bytecode::Program {
+        let ast = crate::front::parse_script(source).expect("source parses");
+        crate::compile::compile_program(&ast, source).expect("source compiles")
+    }
+
+    fn named<'a>(program: &'a crate::bytecode::Program, name: &str) -> &'a FuncProto {
+        program
+            .functions
+            .iter()
+            .find(|func| func.name == name)
+            .unwrap_or_else(|| panic!("missing function {name:?}"))
+    }
+
+    /// The destination of the opcodes this test reasons about; `None` for
+    /// everything else (their registers are irrelevant to the two rules).
+    fn def_of(i: &Instr) -> Option<(Reg, &'static str)> {
+        Some(match *i {
+            Instr::LoadGlobal { dst, .. } => (dst, "global"),
+            Instr::CallMethod { dst, .. } => (dst, "call"),
+            Instr::LoadInt { dst, .. }
+            | Instr::Add { dst, .. }
+            | Instr::AddInt { dst, .. }
+            | Instr::Sub { dst, .. }
+            | Instr::Mul { dst, .. }
+            | Instr::Bitwise { dst, .. } => (dst, "num"),
+            Instr::Eq { dst, .. }
+            | Instr::Ne { dst, .. }
+            | Instr::Lt { dst, .. }
+            | Instr::Le { dst, .. }
+            | Instr::Gt { dst, .. }
+            | Instr::Ge { dst, .. }
+            | Instr::Not { dst, .. } => (dst, "bool"),
+            Instr::Move { dst, .. } => (dst, "move"),
+            _ => return None,
+        })
+    }
+
+    #[test]
+    fn global_receivers_have_exactly_one_definition() {
+        let program = compile(TOKENIZE);
+        let f = named(&program, "tokenize");
+        let receivers: Vec<Reg> = f
+            .code
+            .iter()
+            .filter_map(|i| match *i {
+                Instr::CallMethod { obj, .. } => Some(obj),
+                _ => None,
+            })
+            .collect();
+        assert!(receivers.len() >= 10, "tokenize lost its method calls:\n{f:#?}");
+        for r in receivers {
+            let defs: Vec<&Instr> = f
+                .code
+                .iter()
+                .filter(|i| def_of(i).is_some_and(|(d, _)| d == r))
+                .collect();
+            assert_eq!(defs.len(), 1, "receiver r{r} has {} definitions: {defs:?}", defs.len());
+            assert!(matches!(defs[0], Instr::LoadGlobal { .. }), "receiver r{r}: {:?}", defs[0]);
+        }
+    }
+
+    #[test]
+    fn no_register_in_the_loop_is_both_a_number_and_a_boolean() {
+        let program = compile(TOKENIZE);
+        let f = named(&program, "tokenize");
+        let mut kinds: std::collections::BTreeMap<Reg, std::collections::BTreeSet<&str>> =
+            Default::default();
+        for i in &f.code {
+            if let Some((d, k)) = def_of(i) {
+                if k == "num" || k == "bool" {
+                    kinds.entry(d).or_default().insert(k);
+                }
+            }
+        }
+        let mixed: Vec<Reg> = kinds
+            .iter()
+            .filter(|(_, ks)| ks.len() > 1)
+            .map(|(r, _)| *r)
+            .collect();
+        assert!(mixed.is_empty(), "registers defined as both number and boolean: {mixed:?}\n{f:#?}");
+    }
+
+    #[test]
+    fn loop_free_functions_still_reclaim_scratch() {
+        // The v0.0.5 fib frame: nine registers, two recursive calls whose
+        // argument scratch is reused (see `binary_lhs_reclaim_tests`).
+        let program = compile("function fib(n){ return n < 2 ? n : fib(n-1) + fib(n-2); } fib(8);");
+        assert_eq!(named(&program, "fib").reg_count, 9);
+    }
+
+    #[test]
+    fn class_registers_are_renumbered_into_the_frame() {
+        let program = compile(TOKENIZE);
+        let f = named(&program, "tokenize");
+        for i in &f.code {
+            if let Some((d, _)) = def_of(i) {
+                assert!(d < f.reg_count, "r{d} outside the {}-register frame: {i:?}", f.reg_count);
+            }
+        }
+        // Booleans and receivers sit above every ordinary register.
+        let recv: Vec<Reg> = f
+            .code
+            .iter()
+            .filter_map(|i| match *i {
+                Instr::CallMethod { obj, .. } => Some(obj),
+                _ => None,
+            })
+            .collect();
+        let ordinary_top = f
+            .code
+            .iter()
+            .filter_map(|i| match def_of(i) {
+                Some((d, "num")) => Some(d),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(recv.iter().all(|&r| r > ordinary_top), "receivers {recv:?} below ordinary top {ordinary_top}");
     }
 }

@@ -343,39 +343,46 @@ fn arr_push3_steps(
         })
     };
     let mut base = s;
-    // A batch is three legs of one shape. The captured (spec-order) shape is
-    // `[LoadGlobal recv; GetProp callee; arg; CallWithThis]` (stride 4); the
-    // fused shape the compiler emits for a transparent argument is
-    // `[LoadGlobal recv; arg; CallMethod]` (stride 3). Both bind the SAME
-    // helper protocol — the fused leg simply has no callee register to prove.
+    // A batch is three legs, each in one of three shapes. The captured
+    // (spec-order) shape is `[LoadGlobal recv; GetProp callee; arg;
+    // CallWithThis]` (stride 4); the fused shape the compiler emits for a
+    // transparent argument is `[LoadGlobal recv; arg; CallMethod]` (stride
+    // 3); a transparent LOCAL argument needs no setup at all: `[LoadGlobal
+    // recv; CallMethod]` (stride 2). All bind the SAME helper protocol — the
+    // fused legs simply have no callee register to prove — and one batch may
+    // mix them: `kinds.push(5); starts.push(st); ends.push(i)` is a
+    // literal-argument leg followed by two local-argument legs.
     while base + 5 <= e {
-        let split = matches!(proto.code[base + 1], Instr::GetProp { .. });
-        let (stride, has_arg_setup) = if split {
-            (4, true)
-        } else if matches!(
-            proto.code[base + 1],
-            Instr::LoadInt { .. } | Instr::Move { .. }
-        ) {
-            (3, true)
-        } else if matches!(proto.code[base + 1], Instr::CallMethod { .. }) {
-            // Transparent local arguments no longer need a synthetic Move:
-            // their existing numeric home is the CallMethod argument directly.
-            (2, false)
-        } else {
-            base += 1;
-            continue;
-        };
-        let span = 3 * stride;
-        if base + span - 1 > e {
-            break;
-        }
         let mut pins = [0usize; 3];
         let mut calls = [0usize; 3];
         let mut args = [0u16; 3];
         let mut globals = [0u32; 3];
         let mut ok = true;
+        // First ip past the legs matched so far; the batch's `span` when all
+        // three legs match.
+        let mut next = base;
         for leg in 0..3usize {
-            let b = base + stride * leg;
+            let b = next;
+            if b + 1 > e {
+                ok = false;
+                break;
+            }
+            let split = matches!(proto.code[b + 1], Instr::GetProp { .. });
+            let (stride, has_arg_setup) = if split {
+                (4, true)
+            } else if matches!(proto.code[b + 1], Instr::LoadInt { .. } | Instr::Move { .. }) {
+                (3, true)
+            } else if matches!(proto.code[b + 1], Instr::CallMethod { .. }) {
+                (2, false)
+            } else {
+                ok = false;
+                break;
+            };
+            if b + stride - 1 > e {
+                ok = false;
+                break;
+            }
+            next = b + stride;
             let (recv, global) = match proto.code[b] {
                 Instr::LoadGlobal { dst, idx } => (dst, idx),
                 _ => {
@@ -486,6 +493,7 @@ fn arr_push3_steps(
             args[leg] = arg;
             globals[leg] = global;
         }
+        let span = next - base;
         if ok
             && pins[0] != pins[1]
             && pins[0] != pins[2]

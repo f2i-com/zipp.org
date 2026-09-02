@@ -119,7 +119,7 @@ impl<'a> FnCompiler<'a> {
                 cond: flag,
                 target: 0,
             });
-            self.next_reg -= 1; // reclaim the flag temp (dead after the branch)
+            self.dec_next_reg(1); // reclaim the flag temp (dead after the branch)
                                 // GetBindingValue re-checks HasProperty (the WithHas @@unscopables
                                 // getter may delete the binding); strictness is the REFERENCE
                                 // site's, not the with statement's.
@@ -162,7 +162,7 @@ impl<'a> FnCompiler<'a> {
                 cond: flag,
                 target: 0,
             });
-            self.next_reg -= 1; // reclaim the flag temp
+            self.dec_next_reg(1); // reclaim the flag temp
             self.emit(Instr::WithGet {
                 dst: callee_reg,
                 obj,
@@ -233,7 +233,7 @@ impl<'a> FnCompiler<'a> {
                 cond: flag,
                 target: 0,
             });
-            self.next_reg -= 1;
+            self.dec_next_reg(1);
             self.emit(Instr::WithSet {
                 obj,
                 name: nidx,
@@ -280,7 +280,7 @@ impl<'a> FnCompiler<'a> {
                 cond: flag,
                 target: 0,
             });
-            self.next_reg -= 1;
+            self.dec_next_reg(1);
             self.emit(Instr::Move {
                 dst: target,
                 src: obj,
@@ -391,7 +391,7 @@ impl<'a> FnCompiler<'a> {
                 cond: flag,
                 target: 0,
             });
-            self.next_reg -= 1;
+            self.dec_next_reg(1);
             self.emit(Instr::DeleteProp {
                 dst,
                 obj,

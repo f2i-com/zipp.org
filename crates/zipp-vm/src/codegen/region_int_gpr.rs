@@ -1534,6 +1534,29 @@ fn gpr_home_map(
     // When that alone doesn't fit but two more would, take r13/r14 anyway and
     // pay for each remaining guard with inline (movabs) constants — a few
     // bytes per guard against keeping the whole loop in registers.
+    if needs_guard && std::env::var_os("ZIPP_JITLOG").is_some() {
+        // Which op keeps r13/r14 out of the pool: the first guarded
+        // add/sub/neg/addint/mul. Two homes ride on this proof, so a region
+        // that misses the pool by one or two is usually one missed elision.
+        if let Some((ip, i)) = proto.code[s..=e].iter().enumerate().find_map(|(off, i)| {
+            let ip = s + off;
+            let guarded = match *i {
+                Instr::Add { .. } | Instr::Sub { .. } | Instr::Neg { .. } => {
+                    !plan.elide_guard.contains(&ip)
+                }
+                Instr::AddInt { imm, a, .. } => {
+                    imm != 0 && !hoist_c.contains_key(&a) && !plan.elide_guard.contains(&ip)
+                }
+                Instr::Mul { .. } => {
+                    !plan.mul_shift.contains_key(&ip) && !plan.elide_guard.contains(&ip)
+                }
+                _ => false,
+            };
+            guarded.then_some((ip, i))
+        }) {
+            eprintln!("[jit] INT-GPR region [{s},{e}] guard kept: first guarded op @{ip} {i:?}");
+        }
+    }
     let mut inline_guards = false;
     if !needs_guard {
         pool.push(13);

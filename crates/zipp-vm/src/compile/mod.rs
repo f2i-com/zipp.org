@@ -469,6 +469,27 @@ struct FnCompiler<'a> {
     /// Next free register / high-water mark.
     next_reg: Reg,
     max_reg: Reg,
+    /// Class registers handed out so far (B263). A boolean-valued expression
+    /// (`alloc_bool_reg`) and a global-loaded receiver (`alloc_recv_reg`) get
+    /// provisional numbers in `BOOL_BASE..` / `RECV_BASE..` that no scratch
+    /// reclaim ever hands out again; `check_regs` renumbers them to the top of
+    /// the frame. The INT region tier types every register once for a whole
+    /// loop and pins a receiver only when its register has exactly one
+    /// definition, so a recycled temporary that held a number in one
+    /// statement and a boolean in the next ("type conflict on a reused
+    /// register"), or a receiver slot recycled for a literal, declined whole
+    /// tokenizer loops to the boxed tier (parse-large-js 251 -> 396 ms).
+    /// Everything else keeps the v0.0.5 scratch reclaim, whose frame sizes the
+    /// register tiers' xmm pools were sized for.
+    bool_regs: Reg,
+    recv_regs: Reg,
+    /// Per ordinary register, the kinds of value written so far (`KIND_BOOL`
+    /// / `KIND_NUM` bits, recorded in `emit`). A contiguous argument window
+    /// (`alloc_block`) is placed where no slot would receive a boolean
+    /// argument over a numeric history or vice versa: `dv.getUint32(o, le ===
+    /// 1)` writes its boolean straight into an argument slot, and a slot the
+    /// loop also used for a number declined the region.
+    reg_kinds: Vec<u8>,
     /// Set when `alloc_reg` ran out of the u16 register space. `Reg` is a `u16`
     /// and `FuncProto::reg_count` is a `u16`, so a frame simply cannot address
     /// more than `u16::MAX` registers; before this flag existed the counter
@@ -793,6 +814,14 @@ pub struct EvalClassCtx {
     pub name: Option<String>,
 }
 
+/// Provisional number of the first boolean class register (see
+/// `FnCompiler::alloc_bool_reg`). Ordinary registers stay below it; every
+/// class register is renumbered below it again by `check_regs`.
+pub(crate) const BOOL_BASE: Reg = 0x8000;
+/// Provisional number of the first receiver class register
+/// (`FnCompiler::alloc_recv_reg`).
+pub(crate) const RECV_BASE: Reg = 0xC000;
+
 enum Binding {
     /// Plain register-resident local (the fast path; no capture).
     Local(Reg),
@@ -820,6 +849,7 @@ mod entry;
 mod exprs;
 mod funcs;
 mod helpers;
+mod remap;
 mod scopes;
 mod string_accum;
 mod typeof_alias;

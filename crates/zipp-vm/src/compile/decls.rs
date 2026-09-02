@@ -354,18 +354,18 @@ impl<'a> FnCompiler<'a> {
                         if let Some((test, cons, alt)) = direct_cond_return_parts(arg) {
                             let save = self.next_reg;
                             let jf = self.emit_test_jump(test)?;
-                            self.next_reg = save;
+                            self.set_next_reg(save);
 
                             let cons_v = self.expr(cons)?;
                             self.emit(Instr::Return { src: cons_v });
 
                             let alt_at = self.here();
                             self.patch_jump(jf, alt_at);
-                            self.next_reg = save;
+                            self.set_next_reg(save);
 
                             let alt_v = self.expr(alt)?;
                             self.emit(Instr::Return { src: alt_v });
-                            self.next_reg = save;
+                            self.set_next_reg(save);
                             return Ok(());
                         }
                     }
@@ -554,7 +554,7 @@ impl<'a> FnCompiler<'a> {
                                 let nslot = self.cx.global_slot(&n) as u32;
                                 self.cx.decl_globals.insert(nslot);
                                 self.cx.module_exports.push(("default".to_string(), n));
-                                self.next_reg -= 1;
+                                self.dec_next_reg(1);
                                 return Ok(());
                             }
                             // An ANONYMOUS default-exported function/generator is named
@@ -566,7 +566,7 @@ impl<'a> FnCompiler<'a> {
                             if self.is_script && self.cx.script_binds_globals && !has_up {
                                 self.cx.functions[id as usize].name_global = Some(slot);
                                 self.cx.decl_globals.insert(slot);
-                                self.next_reg -= 1;
+                                self.dec_next_reg(1);
                                 self.cx
                                     .module_exports
                                     .push(("default".to_string(), "*default*".to_string()));
@@ -613,7 +613,7 @@ impl<'a> FnCompiler<'a> {
                             src: tmp,
                         });
                     }
-                    self.next_reg -= 1;
+                    self.dec_next_reg(1);
                     self.cx
                         .module_exports
                         .push(("default".to_string(), "*default*".to_string()));
@@ -768,7 +768,7 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
                 self.pattern_block_local = false;
-                self.next_reg = save; // reclaim the source + extraction temps
+                self.set_next_reg(save); // reclaim the source + extraction temps
                 continue;
             }
             let name: &str = match &decl.id {
@@ -812,7 +812,7 @@ impl<'a> FnCompiler<'a> {
                         .resolve_upvalue(name)
                         .ok_or("eval caller binding upvalue")?;
                     self.emit(Instr::UpvalSet { idx, src: v });
-                    self.next_reg -= 1;
+                    self.dec_next_reg(1);
                 }
                 continue;
             }
@@ -835,7 +835,7 @@ impl<'a> FnCompiler<'a> {
                         .resolve_upvalue(name)
                         .ok_or("eval catch-param upvalue")?;
                     self.emit(Instr::UpvalSet { idx, src: v });
-                    self.next_reg -= 1;
+                    self.dec_next_reg(1);
                 }
                 continue;
             }
@@ -865,7 +865,7 @@ impl<'a> FnCompiler<'a> {
                     let v = self.compile_named_init(tmp, init, name)?;
                     self.with_store_resolved(name, target, v);
                 }
-                self.next_reg = save;
+                self.set_next_reg(save);
                 continue;
             }
             if self.is_script && self.cx.script_binds_globals && !block_scoped_lexical {
@@ -944,7 +944,7 @@ impl<'a> FnCompiler<'a> {
                     let v = self.compile_named_init(tmp, decl.init.as_ref().unwrap(), name)?;
                     self.with_store_resolved(name, target, v);
                 }
-                self.next_reg = save;
+                self.set_next_reg(save);
                 continue;
             }
 
@@ -986,12 +986,12 @@ impl<'a> FnCompiler<'a> {
                         let tmp = self.temp();
                         let v = self.compile_named_init(tmp, init, name)?;
                         self.with_store_resolved(name, target, v);
-                        self.next_reg = save;
+                        self.set_next_reg(save);
                     } else if self.cell_regs.contains(&reg) {
                         let tmp = self.temp();
                         let v = self.compile_named_init(tmp, init, name)?;
                         self.emit(Instr::CellSet { cell: reg, src: v });
-                        self.next_reg -= 1;
+                        self.dec_next_reg(1);
                     } else {
                         let v = self.compile_named_init(reg, init, name)?;
                         if v != reg {
@@ -1050,7 +1050,7 @@ impl<'a> FnCompiler<'a> {
                     let tmp = self.temp();
                     let v = self.compile_named_init(tmp, init, name)?;
                     self.emit(Instr::CellSet { cell: reg, src: v });
-                    self.next_reg -= 1; // reclaim tmp
+                    self.dec_next_reg(1); // reclaim tmp
                 } else {
                     let v = self.compile_named_init(reg, init, name)?;
                     if v != reg {
@@ -1071,7 +1071,7 @@ impl<'a> FnCompiler<'a> {
                     let t = self.temp();
                     self.emit(Instr::LoadUndefined { dst: t });
                     self.emit(Instr::CellSet { cell: reg, src: t });
-                    self.next_reg -= 1;
+                    self.dec_next_reg(1);
                 } else {
                     self.emit(Instr::LoadUndefined { dst: reg });
                 }
@@ -1120,7 +1120,7 @@ impl<'a> FnCompiler<'a> {
                     });
                 }
                 if is_cell {
-                    self.next_reg -= 1;
+                    self.dec_next_reg(1);
                 }
             }
         }
@@ -1325,7 +1325,7 @@ impl<'a> FnCompiler<'a> {
                             key: kreg,
                         });
                         self.extract_pattern(&prop.value, val)?;
-                        self.next_reg = save;
+                        self.set_next_reg(save);
                     }
                     let rest = rest.as_ref().unwrap();
                     let save = self.next_reg;
@@ -1337,8 +1337,8 @@ impl<'a> FnCompiler<'a> {
                         n,
                     });
                     self.extract_pattern(rest, val)?;
-                    self.next_reg = save;
-                    self.next_reg = block_save;
+                    self.set_next_reg(save);
+                    self.set_next_reg(block_save);
                     return Ok(());
                 }
                 for prop in props {
@@ -1396,15 +1396,15 @@ impl<'a> FnCompiler<'a> {
                                 }
                                 self.with_store_resolved(&name, target, val);
                             }
-                            self.next_reg = save;
+                            self.set_next_reg(save);
                             continue;
                         }
-                        self.next_reg = save;
+                        self.set_next_reg(save);
                     }
                     let val = self.alloc_reg();
                     self.extract_member(src, &prop.key, val)?;
                     self.extract_pattern(&prop.value, val)?;
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                 }
                 // `...rest` — a new object of `src`'s own keys minus the siblings.
                 if let Some(rest) = rest {
@@ -1428,7 +1428,7 @@ impl<'a> FnCompiler<'a> {
                         exclude_count,
                     });
                     self.extract_pattern(rest, val)?;
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                 }
                 Ok(())
             }
@@ -1481,7 +1481,7 @@ impl<'a> FnCompiler<'a> {
                             key: idx,
                         });
                         self.extract_pattern(&p.pat, val)?;
-                        self.next_reg = save;
+                        self.set_next_reg(save);
                     }
                     // a hole (`[, x]`) binds nothing
                 }
@@ -1494,7 +1494,7 @@ impl<'a> FnCompiler<'a> {
                         start: fixed.len() as u32,
                     });
                     self.extract_pattern(rest, val)?;
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                 }
                 Ok(())
             }
@@ -1519,7 +1519,7 @@ impl<'a> FnCompiler<'a> {
             let save = self.next_reg; // `dst` was allocated below this
             let k = self.expr(e)?;
             self.emit(Instr::GetIndex { dst, obj, key: k });
-            self.next_reg = save; // reclaim the key-expression temps
+            self.set_next_reg(save); // reclaim the key-expression temps
             return Ok(());
         }
         let name = match key {
@@ -1577,7 +1577,7 @@ impl<'a> FnCompiler<'a> {
         }
         let end = self.here();
         self.patch_jump(jf, end);
-        self.next_reg = save;
+        self.set_next_reg(save);
         Ok(())
     }
 }

@@ -176,7 +176,7 @@ impl<'a> FnCompiler<'a> {
             Target::Member(m) => match &m.prop {
                 MemberProp::Ident(prop) => {
                     let save = self.next_reg;
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     let name = self.string_name(prop);
                     self.emit(Instr::SetProp {
                         obj,
@@ -184,12 +184,12 @@ impl<'a> FnCompiler<'a> {
                         val: src,
                         strict: self.cx.strict_expr_region > 0,
                     });
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                     Ok(())
                 }
                 MemberProp::Computed(key_expr) => {
                     let save = self.next_reg;
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     // Fuse `obj[<plain string literal> + e] = v` → SetIndexConcat
                     // (no throwaway concat-key allocation; see GetIndexConcat).
                     if let Some((name, rhs)) = concat_key_literal_prefix(key_expr) {
@@ -201,12 +201,12 @@ impl<'a> FnCompiler<'a> {
                             key,
                             val: src,
                         });
-                        self.next_reg = save;
+                        self.set_next_reg(save);
                         return Ok(());
                     }
                     let key = self.expr(key_expr)?;
                     self.emit(Instr::SetIndex { obj, key, val: src });
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                     Ok(())
                 }
                 MemberProp::Private(field) => {
@@ -215,14 +215,14 @@ impl<'a> FnCompiler<'a> {
                     // reference is taken before the value per the destructuring driver).
                     self.check_private_declared(field)?;
                     let save = self.next_reg;
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     let name = self.string_name(&private_key(field));
                     self.emit(Instr::SetPrivate {
                         obj,
                         name,
                         val: src,
                     });
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                     Ok(())
                 }
             },
@@ -261,7 +261,7 @@ impl<'a> FnCompiler<'a> {
             errors: None,
         });
         self.emit(Instr::Throw { src: e });
-        self.next_reg = save;
+        self.set_next_reg(save);
         Ok(())
     }
 
@@ -421,7 +421,7 @@ impl<'a> FnCompiler<'a> {
             .pre_member_ref(target)?
             .ok_or("`super` assignment target lost its reference")?;
         self.store_pre_ref(default, obj, &key, src)?;
-        self.next_reg = save;
+        self.set_next_reg(save);
         Ok(())
     }
 
@@ -460,7 +460,7 @@ impl<'a> FnCompiler<'a> {
             Target::Member(m) => match &m.prop {
                 MemberProp::Ident(prop) => {
                     let save = self.next_reg;
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     let name = self.string_name(prop);
                     self.emit(Instr::SetProp {
                         obj,
@@ -468,24 +468,24 @@ impl<'a> FnCompiler<'a> {
                         val,
                         strict: self.cx.strict_expr_region > 0,
                     });
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                     Ok(())
                 }
                 MemberProp::Computed(key_expr) => {
                     let save = self.next_reg;
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     let key = self.expr(key_expr)?;
                     self.emit(Instr::SetIndex { obj, key, val });
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                     Ok(())
                 }
                 MemberProp::Private(field) => {
                     self.check_private_declared(field)?;
                     let save = self.next_reg;
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     let name = self.string_name(&private_key(field));
                     self.emit(Instr::SetPrivate { obj, name, val });
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                     Ok(())
                 }
             },
@@ -615,7 +615,7 @@ impl<'a> FnCompiler<'a> {
                     None => self.assign_maybe_default(&te.target, te.default.as_ref(), val)?,
                 }
             }
-            self.next_reg = save;
+            self.set_next_reg(save);
         }
         if let Some(rest) = rest {
             let save = self.next_reg;
@@ -672,7 +672,7 @@ impl<'a> FnCompiler<'a> {
                 Some((obj, key)) => self.store_pre_ref(None, obj, &key, out)?,
                 None => self.assign_target(&rest.target, out)?,
             }
-            self.next_reg = save;
+            self.set_next_reg(save);
         }
         self.emit(Instr::PopFinally);
         self.handler_depth -= 1;
@@ -726,7 +726,7 @@ impl<'a> FnCompiler<'a> {
         let end = self.here();
         self.patch_jump(jskip, end);
         self.patch_jump(jend, end);
-        self.next_reg = save_top;
+        self.set_next_reg(save_top);
         Ok(())
     }
 
@@ -808,7 +808,7 @@ impl<'a> FnCompiler<'a> {
                         self.assign_maybe_default(&prop.target, prop.default.as_ref(), val)?;
                     }
                 }
-                self.next_reg = save;
+                self.set_next_reg(save);
             }
             // `has_computed` is only set when there IS a rest target; no unwrap.
             let rest_target = rest.ok_or("object-rest destructuring lost its rest target")?;
@@ -821,8 +821,8 @@ impl<'a> FnCompiler<'a> {
                 n,
             });
             self.assign_target(rest_target, val)?;
-            self.next_reg = save;
-            self.next_reg = block_save;
+            self.set_next_reg(save);
+            self.set_next_reg(block_save);
             return Ok(());
         }
         for prop in props {
@@ -894,7 +894,7 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
             }
-            self.next_reg = save;
+            self.set_next_reg(save);
         }
         // `({a, ...rest} = o)` — a new object of `src`'s own keys minus the
         // siblings, assigned to the rest target (mirrors the declaration form).
@@ -920,7 +920,7 @@ impl<'a> FnCompiler<'a> {
                 exclude_count,
             });
             self.assign_target(rest_target, val)?;
-            self.next_reg = save;
+            self.set_next_reg(save);
         }
         Ok(())
     }
@@ -957,7 +957,7 @@ impl<'a> FnCompiler<'a> {
                     cond: isnull,
                     target: 0,
                 });
-                self.next_reg = save;
+                self.set_next_reg(save);
                 j
             }
         }
@@ -1042,7 +1042,7 @@ impl<'a> FnCompiler<'a> {
                     return Ok(dst);
                 }
                 MemberProp::Ident(prop) => {
-                    let obj = self.expr(&m.object)?; // evaluate the receiver once
+                    let obj = self.recv_expr(&m.object)?; // evaluate the receiver once
                     let name = self.string_name(prop);
                     if is_logical {
                         // `obj.x ??= v` etc: read current; skip the store on short-circuit.
@@ -1095,7 +1095,7 @@ impl<'a> FnCompiler<'a> {
                 // `obj.#x = v` / `obj.#x op= v` — same as a static member, keyed "#x".
                 MemberProp::Private(field) => {
                     self.check_private_declared(field)?;
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     let name = self.string_name(&private_key(field));
                     if is_logical {
                         self.emit(Instr::GetProp { dst, obj, name });
@@ -1217,7 +1217,7 @@ impl<'a> FnCompiler<'a> {
                     return Ok(dst);
                 }
                 MemberProp::Computed(key_expr) => {
-                    let obj = self.expr(&m.object)?; // evaluate receiver + key once
+                    let obj = self.recv_expr(&m.object)?; // evaluate receiver + key once
                                                      // Fuse `obj[<plain string literal> + e] = v` → SetIndexConcat,
                                                      // like the READ (`exprs.rs`), the delete and `assign_target`
                                                      // already do. Those three are sound as-is because nothing
@@ -1445,7 +1445,7 @@ impl<'a> FnCompiler<'a> {
                     self.emit(Instr::Move { dst, src: v });
                 }
                 self.store_binding_snapped_ex(&binding, dst, snap, resolved_first);
-                self.next_reg = save_p;
+                self.set_next_reg(save_p);
                 Ok(dst)
             }
             // Logical assignment: `x ||= y` / `x &&= y` / `x ??= y` only assign
@@ -1478,7 +1478,7 @@ impl<'a> FnCompiler<'a> {
                 self.store_binding_snapped_ex(&binding, dst, snap, true);
                 let end = self.here();
                 self.patch_jump(j, end);
-                self.next_reg = save_p;
+                self.set_next_reg(save_p);
                 Ok(dst)
             }
             // Arithmetic / bitwise compound assignment (`+= -= *= /= %= **= <<=
@@ -1536,7 +1536,7 @@ impl<'a> FnCompiler<'a> {
                 // read-first: the `load_binding` above already resolved the
                 // reference, so the store may not raise "is not defined".
                 self.store_binding_snapped_ex(&binding, dst, snap, true);
-                self.next_reg = save_p;
+                self.set_next_reg(save_p);
                 Ok(dst)
             }
         }
@@ -1627,7 +1627,7 @@ impl<'a> FnCompiler<'a> {
                 cond: flag,
                 target: 0,
             });
-            self.next_reg -= 1; // reclaim the flag temp
+            self.dec_next_reg(1); // reclaim the flag temp
             self.emit(Instr::LoadBool {
                 dst: found,
                 val: true,

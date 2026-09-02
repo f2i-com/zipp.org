@@ -160,7 +160,7 @@ impl<'a> FnCompiler<'a> {
                         errors: None,
                     });
                     self.emit(Instr::Throw { src: e });
-                    self.next_reg -= 1;
+                    self.dec_next_reg(1);
                 }
                 return;
             }
@@ -185,7 +185,7 @@ impl<'a> FnCompiler<'a> {
                 errors: None,
             });
             self.emit(Instr::Throw { src: e });
-            self.next_reg -= 1;
+            self.dec_next_reg(1);
             return;
         }
         match b {
@@ -355,7 +355,7 @@ impl<'a> FnCompiler<'a> {
                 let cond = self.expr(test)?;
                 let jf = self.here();
                 self.emit(Instr::JumpIfFalse { cond, target: 0 });
-                self.next_reg = save;
+                self.set_next_reg(save);
                 self.emit_tail_return(cons)?; // every path returns
                 let alt_at = self.here();
                 self.patch_jump(jf, alt_at);
@@ -392,13 +392,13 @@ impl<'a> FnCompiler<'a> {
                             cond: isnull,
                             target: 0,
                         });
-                        self.next_reg = tsave;
+                        self.set_next_reg(tsave);
                         // nullish: the right operand is the tail position
                         self.emit_tail_return(right)?;
                         let keep = self.here();
                         self.patch_jump(j, keep);
                         self.emit(Instr::Return { src: v });
-                        self.next_reg = save;
+                        self.set_next_reg(save);
                         return Ok(());
                     }
                 };
@@ -406,7 +406,7 @@ impl<'a> FnCompiler<'a> {
                 let short = self.here();
                 self.patch_jump(jshort, short);
                 self.emit(Instr::Return { src: v });
-                self.next_reg = save;
+                self.set_next_reg(save);
                 Ok(())
             }
             Expr::Seq(exprs) if !exprs.is_empty() => {
@@ -414,7 +414,7 @@ impl<'a> FnCompiler<'a> {
                 for ex in &exprs[..n - 1] {
                     let save = self.next_reg;
                     self.expr(ex)?;
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                 }
                 self.emit_tail_return(&exprs[n - 1])
             }
@@ -447,7 +447,7 @@ impl<'a> FnCompiler<'a> {
                         let dst = self.alloc_reg();
                         self.emit_direct_eval(callee, this_v, arg_base, argc, false, dst, true);
                         self.emit(Instr::Return { src: dst });
-                        self.next_reg = save;
+                        self.set_next_reg(save);
                         return Ok(());
                     }
                 }
@@ -475,7 +475,7 @@ impl<'a> FnCompiler<'a> {
                             argc,
                         });
                         self.emit(Instr::Return { src: dst });
-                        self.next_reg = save;
+                        self.set_next_reg(save);
                         return Ok(());
                     }
                 }
@@ -501,7 +501,7 @@ impl<'a> FnCompiler<'a> {
                     argc,
                 });
                 self.emit(Instr::Return { src: dst });
-                self.next_reg = save;
+                self.set_next_reg(save);
                 Ok(())
             }
             // NOTE: signature. `tagged_template_tail` took an
@@ -514,7 +514,7 @@ impl<'a> FnCompiler<'a> {
                 let dst = self.alloc_reg();
                 self.tagged_template_tail(tag, quasi, dst)?;
                 self.emit(Instr::Return { src: dst });
-                self.next_reg = save;
+                self.set_next_reg(save);
                 Ok(())
             }
             // A tail position that bottomed out in a non-tail-callable
@@ -523,7 +523,7 @@ impl<'a> FnCompiler<'a> {
                 let save = self.next_reg;
                 let v = self.expr(other)?;
                 self.emit(Instr::Return { src: v });
-                self.next_reg = save;
+                self.set_next_reg(save);
                 Ok(())
             }
         }
@@ -647,7 +647,7 @@ impl<'a> FnCompiler<'a> {
                     self.declare_pattern(pat, false)?;
                     let save = self.next_reg;
                     self.extract_pattern(pat, (i + 1) as Reg)?;
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                 }
                 _ => {}
             }
@@ -661,7 +661,7 @@ impl<'a> FnCompiler<'a> {
                     self.declare_pattern(rest, false)?;
                     let save = self.next_reg;
                     self.extract_pattern(rest, rr)?;
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                 }
             }
         }
@@ -695,7 +695,7 @@ impl<'a> FnCompiler<'a> {
         self.patch_jump(jf, end);
         // The init temps are dead before the body; reclaim them (max_reg has
         // already captured the high-water) so body locals reuse the registers.
-        self.next_reg = save;
+        self.set_next_reg(save);
         Ok(())
     }
 }

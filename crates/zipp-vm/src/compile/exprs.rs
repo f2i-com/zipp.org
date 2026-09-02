@@ -198,7 +198,14 @@ impl<'a> FnCompiler<'a> {
     // ── expressions ──
     /// Compile `e`, returning the register holding its value.
     pub(crate) fn expr(&mut self, e: &ast::Expr) -> R<Reg> {
-        let dst = self.temp();
+        // A boolean-valued expression gets a boolean class register so the
+        // ordinary scratch stack never carries both a number and a boolean in
+        // one register (see `alloc_bool_reg`).
+        let dst = if super::scopes::bool_valued(e) {
+            self.alloc_bool_reg()
+        } else {
+            self.alloc_num_reg()
+        };
         self.expr_into(e, dst)
     }
 
@@ -324,7 +331,7 @@ impl<'a> FnCompiler<'a> {
                     flags: ft,
                     is_construct: true,
                 });
-                self.next_reg -= 2;
+                self.dec_next_reg(2);
                 Ok(dst)
             }
             E::Str(s) => {
@@ -395,7 +402,7 @@ impl<'a> FnCompiler<'a> {
                             });
                             started = true;
                         }
-                        self.next_reg = save;
+                        self.set_next_reg(save);
                         if let Some(qe) = t.quasis.get(i + 1) {
                             if let Some(q) = qe.cooked.as_ref().filter(|s| !s.is_empty()) {
                                 let qidx = self.str_const(q);
@@ -406,12 +413,12 @@ impl<'a> FnCompiler<'a> {
                                     a: acc,
                                     b: qr,
                                 });
-                                self.next_reg = save;
+                                self.set_next_reg(save);
                             }
                         }
                     }
                     self.emit(Instr::Move { dst, src: acc });
-                    self.next_reg = acc.max(dst + 1);
+                    self.set_next_reg(acc.max(dst + 1));
                     return Ok(dst);
                 }
                 self.emit(Instr::LoadConst { dst, idx });
@@ -577,7 +584,7 @@ impl<'a> FnCompiler<'a> {
                         argc,
                         is_construct: true,
                     });
-                    self.next_reg = save.max(dst + 1);
+                    self.set_next_reg(save.max(dst + 1));
                     return Ok(dst);
                 }
                 // General `new C(args)`: evaluate the constructor value, then the
@@ -596,7 +603,7 @@ impl<'a> FnCompiler<'a> {
                         callee: callee_reg,
                         args: args_arr,
                     });
-                    self.next_reg = save.max(dst + 1); // reclaim callee + arg scratch
+                    self.set_next_reg(save.max(dst + 1)); // reclaim callee + arg scratch
                     return Ok(dst);
                 }
                 let (arg_base, argc) = self.eval_args_contiguous(args)?;
@@ -606,7 +613,7 @@ impl<'a> FnCompiler<'a> {
                     arg_base,
                     argc,
                 });
-                self.next_reg = save.max(dst + 1); // reclaim callee + args
+                self.set_next_reg(save.max(dst + 1)); // reclaim callee + args
                 Ok(dst)
             }
             E::Function(f) => {
@@ -747,7 +754,7 @@ impl<'a> FnCompiler<'a> {
             }
             return Ok(dst);
         }
-        let obj = self.expr(&m.object)?;
+        let obj = self.recv_expr(&m.object)?;
         if m.optional {
             self.emit_optional_check(obj);
         }
@@ -781,7 +788,7 @@ impl<'a> FnCompiler<'a> {
             }
             return Ok(dst);
         }
-        let obj = self.expr(&m.object)?;
+        let obj = self.recv_expr(&m.object)?;
         if m.optional {
             self.emit_optional_check(obj);
         }
@@ -808,7 +815,7 @@ impl<'a> FnCompiler<'a> {
     /// `obj.#field` → read the reserved "#field" property.
     pub(crate) fn private_member(&mut self, m: &ast::Member, prop: &str, dst: Reg) -> R<Reg> {
         self.check_private_declared(prop)?;
-        let obj = self.expr(&m.object)?;
+        let obj = self.recv_expr(&m.object)?;
         if m.optional {
             self.emit_optional_check(obj);
         }
@@ -853,7 +860,7 @@ impl<'a> FnCompiler<'a> {
         let jt = self.here();
         self.emit(Instr::JumpIfTrue { cond, target: 0 });
         self.chain_bails.last_mut().unwrap().push(jt);
-        self.next_reg = save; // scratch temps dead after the check
+        self.set_next_reg(save); // scratch temps dead after the check
     }
 
     /// Lower a PARENTHESIZED-chain member callee — `(a?.b)(…)` / `(a?.[k])(…)`
@@ -1037,7 +1044,7 @@ impl<'a> FnCompiler<'a> {
             if v != slot {
                 self.emit(Instr::Move { dst: slot, src: v });
             }
-            self.next_reg = block_top;
+            self.set_next_reg(block_top);
         }
         let argc = (n + 1) as u16;
         match tag {
@@ -1107,7 +1114,7 @@ impl<'a> FnCompiler<'a> {
             arg_base: cooked_base,
             argc: nq,
         });
-        self.next_reg = save;
+        self.set_next_reg(save);
         // Raw array → a temp, then dst.raw = it.
         let raw_reg = self.alloc_reg();
         let raw_base = self.next_reg;
@@ -1125,7 +1132,7 @@ impl<'a> FnCompiler<'a> {
             arr: dst,
             raw: raw_reg,
         });
-        self.next_reg = save;
+        self.set_next_reg(save);
         Ok(())
     }
 
@@ -1188,7 +1195,7 @@ impl<'a> FnCompiler<'a> {
                         });
                     }
                 }
-                self.next_reg = save;
+                self.set_next_reg(save);
             }
             return Ok(dst);
         }
@@ -1217,7 +1224,7 @@ impl<'a> FnCompiler<'a> {
                     }
                 }
             }
-            self.next_reg = block_top;
+            self.set_next_reg(block_top);
         }
         self.emit(Instr::NewArray {
             dst,
@@ -1347,7 +1354,7 @@ impl<'a> FnCompiler<'a> {
                     collect_static_key_plan_name(&mut plan_names, name);
                 }
             }
-            self.next_reg = save; // reclaim this property's scratch temps
+            self.set_next_reg(save); // reclaim this property's scratch temps
         }
         if plan_enabled && all_appendable && plan_names.len() == static_keys {
             self.install_static_key_plan(alloc_ip, dst, &plan_names);
@@ -1446,7 +1453,7 @@ impl<'a> FnCompiler<'a> {
             };
             names.push(name);
             slot += 1;
-            self.next_reg = block_top; // reclaim this value's scratch temps
+            self.set_next_reg(block_top); // reclaim this value's scratch temps
         }
         if let Some(plan) = self.try_install_static_key_plan(&names) {
             self.emit(Instr::FinalizeObject {
@@ -1921,7 +1928,7 @@ impl<'a> FnCompiler<'a> {
         let a = self.expr(leaves[0])?;
         let b = self.expr(leaves[1])?;
         self.emit(Instr::Add { dst: acc, a, b });
-        self.next_reg = save;
+        self.set_next_reg(save);
         for leaf in &leaves[2..] {
             let r = self.expr(leaf)?;
             self.emit(Instr::StrConcatChain {
@@ -1933,12 +1940,12 @@ impl<'a> FnCompiler<'a> {
             // `acc`) however long the chain — never below `acc` while the
             // chain is live (the in-place licence depends on `acc`'s slot
             // staying untouched between links).
-            self.next_reg = save;
+            self.set_next_reg(save);
         }
         self.emit(Instr::Move { dst, src: acc });
         // `acc` is dead after the Move; reclaim it (guarding a high `dst`,
         // following the `calls.rs` `save.max(dst + 1)` precedent).
-        self.next_reg = acc.max(dst + 1);
+        self.set_next_reg(acc.max(dst + 1));
         Ok(dst)
     }
 
@@ -2138,9 +2145,11 @@ impl<'a> FnCompiler<'a> {
         // dead before Evaluate(RHS) begins, so reclaim that suffix while keeping
         // both the pre-existing outer register floor and a newly allocated LHS
         // result. `saturating_add` preserves alloc_reg's clean overflow path.
+        // A boolean LHS lives in a class register (`alloc_bool_reg`), which
+        // `set_next_reg` ignores as a boundary: the scratch below stays put.
         let left_floor = self.next_reg;
         let a = self.expr(left)?;
-        self.next_reg = left_floor.max(a.saturating_add(1));
+        self.set_next_reg(left_floor.max(a.saturating_add(1)));
         let r = self.expr(right)?;
         let instr = match op {
             Op::Add => Instr::Add { dst, a, b: r },
@@ -2254,7 +2263,7 @@ impl<'a> FnCompiler<'a> {
                     cond: isnull,
                     target: 0,
                 }); // non-nullish → keep dst
-                self.next_reg = save; // the nullish-test temps are dead now
+                self.set_next_reg(save); // the nullish-test temps are dead now
                 let b = self.expr_into(right, dst)?;
                 if b != dst {
                     self.emit(Instr::Move { dst, src: b });
@@ -2325,7 +2334,7 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::Throw { src: e });
                         return Ok(dst);
                     }
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     let name = self.string_name(prop);
                     let strict = self.cx.in_strict;
                     self.emit(Instr::DeleteProp {
@@ -2357,7 +2366,7 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::Throw { src: e });
                         return Ok(dst);
                     }
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     let strict = self.cx.in_strict;
                     // Fuse `delete obj[<plain string literal> + e]` → DeleteIndexConcat
                     // (no throwaway concat-key allocation; see GetIndexConcat).
@@ -2404,7 +2413,7 @@ impl<'a> FnCompiler<'a> {
                 {
                     self.chain_bails.push(Vec::new());
                     let res: R<Reg> = (|| {
-                        let o = self.expr(&m.object)?;
+                        let o = self.recv_expr(&m.object)?;
                         let obj = self.alloc_reg();
                         if o != obj {
                             self.emit(Instr::Move { dst: obj, src: o });
@@ -2635,7 +2644,7 @@ impl<'a> FnCompiler<'a> {
                     return Ok(dst);
                 }
                 (_, ast::MemberProp::Ident(prop)) => {
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     let name = self.string_name(prop);
                     let cur = self.temp();
                     self.emit(Instr::GetProp {
@@ -2673,7 +2682,7 @@ impl<'a> FnCompiler<'a> {
                     return Ok(dst);
                 }
                 (_, ast::MemberProp::Computed(ke)) => {
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     let key = self.expr(ke)?;
                     // `o[k]++` reads then writes `o[k]` — coerce the key ToPropertyKey
                     // ONCE and reuse it (its toString/valueOf must not run twice).
@@ -2717,7 +2726,7 @@ impl<'a> FnCompiler<'a> {
                 // `obj.#x++` — like a static member, keyed "#x".
                 (_, ast::MemberProp::Private(prop)) => {
                     self.check_private_declared(prop)?;
-                    let obj = self.expr(&m.object)?;
+                    let obj = self.recv_expr(&m.object)?;
                     let name = self.string_name(&private_key(prop));
                     let cur = self.temp();
                     self.emit(Instr::GetProp {
@@ -2817,7 +2826,7 @@ impl<'a> FnCompiler<'a> {
                 upd: true,
             });
             self.emit_with_rmw_write(&name, found, tgt, tmp);
-            self.next_reg -= 1; // reclaim tmp
+            self.dec_next_reg(1); // reclaim tmp
             return Ok(dst); // dst still holds the (coerced) old value
         }
         let binding = self.resolve(&name);
@@ -2882,7 +2891,7 @@ impl<'a> FnCompiler<'a> {
                 upd: true,
             });
             self.store_binding_read_first(&binding, tmp);
-            self.next_reg -= 1; // reclaim tmp
+            self.dec_next_reg(1); // reclaim tmp
             Ok(dst) // dst still holds the (coerced) old value
         }
     }

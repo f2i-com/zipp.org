@@ -701,7 +701,7 @@ impl Compiler {
                         let t = fc.temp();
                         fc.emit(Instr::LoadUndefined { dst: t });
                         fc.emit(Instr::CellSet { cell: reg, src: t });
-                        fc.next_reg -= 1;
+                        fc.dec_next_reg(1);
                     } else {
                         fc.emit(Instr::LoadUndefined { dst: reg });
                     }
@@ -1407,7 +1407,7 @@ impl Compiler {
                     recv: 0,
                 });
             }
-            fc.next_reg = save;
+            fc.set_next_reg(save);
         }
         // …and only now the parameter prologue, when the base-class field
         // initializers above had to precede it (see `fields_first`).

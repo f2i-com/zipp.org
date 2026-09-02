@@ -176,7 +176,7 @@ impl<'a> FnCompiler<'a> {
             });
             self.emit(Instr::Move { dst: reg, src: tmp });
             self.emit(Instr::MakeCell { reg });
-            self.next_reg -= 1; // free tmp
+            self.dec_next_reg(1); // free tmp
         }
     }
 
@@ -514,7 +514,7 @@ impl<'a> FnCompiler<'a> {
         }
         self.patch_jump(jdone, done_path);
         self.patch_jump(jafter, after);
-        self.next_reg = save; // reclaim res/done/exc
+        self.set_next_reg(save); // reclaim res/done/exc
     }
 
     /// Compile a statement list that contains `using` declarations: desugar it onto
@@ -578,7 +578,7 @@ impl<'a> FnCompiler<'a> {
             });
         }
         self.emit(Instr::EndFinally { kind_reg, val_reg });
-        self.next_reg -= 3; // reclaim scope_reg / kind_reg / val_reg
+        self.dec_next_reg(3); // reclaim scope_reg / kind_reg / val_reg
         Ok(())
     }
 
@@ -711,11 +711,11 @@ impl<'a> FnCompiler<'a> {
         self.pop_scope();
         if let (Some(cr), Some(r)) = (self.completion_reg, saved_cmpl) {
             self.emit(Instr::Move { dst: cr, src: r });
-            self.next_reg -= 1; // reclaim the saved-completion temp
+            self.dec_next_reg(1); // reclaim the saved-completion temp
         }
         self.emit(Instr::EndFinally { kind_reg, val_reg });
 
-        self.next_reg -= 2; // reclaim kind_reg / val_reg
+        self.dec_next_reg(2); // reclaim kind_reg / val_reg
         Ok(())
     }
 
@@ -903,7 +903,7 @@ impl<'a> FnCompiler<'a> {
                     });
                     let j = self.here();
                     self.emit(Instr::JumpIfTrue { cond, target: 0 });
-                    self.next_reg = save; // reclaim test/cond temps (disc survives)
+                    self.set_next_reg(save); // reclaim test/cond temps (disc survives)
                     case_jumps.push((i, j));
                 }
                 None => default_index = Some(i),
@@ -1299,7 +1299,7 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::MarkCellConst { reg: var_reg });
             }
         }
-        self.next_reg = save; // reclaim done + elem temps
+        self.set_next_reg(save); // reclaim done + elem temps
 
         // Per-iteration `using` disposal: open a fresh scope, register the loop
         // variable's value, and wrap the body in a finally that disposes it on every
@@ -1331,7 +1331,7 @@ impl<'a> FnCompiler<'a> {
                     });
                 }
                 if var_is_cell {
-                    self.next_reg -= 1;
+                    self.dec_next_reg(1);
                 }
                 let push_at = self.here();
                 self.emit(Instr::PushFinally {
@@ -1468,7 +1468,7 @@ impl<'a> FnCompiler<'a> {
                     } else {
                         self.store_with(id, &with_objs, v);
                     }
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                 }
             }
         }
@@ -1605,7 +1605,7 @@ impl<'a> FnCompiler<'a> {
             });
             jf = self.here();
             self.emit(Instr::JumpIfFalse { cond, target: 0 });
-            self.next_reg -= 1;
+            self.dec_next_reg(1);
         }
 
         let save = self.next_reg;
@@ -1640,7 +1640,7 @@ impl<'a> FnCompiler<'a> {
             cond: live,
             target: 0,
         });
-        self.next_reg -= 1;
+        self.dec_next_reg(1);
         if let Some(p) = pattern {
             if head_lexical {
                 for r in self.pattern_leaf_regs(p) {
@@ -1675,7 +1675,7 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::MarkCellConst { reg: var_reg });
             }
         }
-        self.next_reg = save;
+        self.set_next_reg(save);
 
         self.loop_ctx.push(LoopCtx::loop_frame(
             self.pending_label.take(),

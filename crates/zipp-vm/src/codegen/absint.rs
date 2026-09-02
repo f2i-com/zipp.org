@@ -196,10 +196,58 @@ pub(crate) fn analyze_int_guards_strict(
         }
         match analyze_run(proto, s, e, seeded, dv) {
             None => {
+                if std::env::var_os("ZIPP_ABSINT_LOG").is_some() {
+                    eprintln!("[absint] [{s},{e}] analyze_run=None (unsupported op or no convergence)");
+                }
                 strict_globs.clear();
                 return FxHashSet::default();
             }
             Some((states, elide)) => {
+                if std::env::var_os("ZIPP_ABSINT_LOG").is_some() {
+                    let mut c: Vec<u32> = cands.iter().copied().collect();
+                    c.sort_unstable();
+                    eprintln!("[absint] [{s},{e}] cands={c:?} elided={}", elide.len());
+                    if let Some(g) = std::env::var("ZIPP_ABSINT_GLOB").ok().and_then(|v| v.parse::<u32>().ok()) {
+                        for (off, i) in proto.code[s..=e].iter().enumerate() {
+                            let ip = s + off;
+                            match states[off].as_ref() {
+                                Some(st) => {
+                                    let al: Vec<u16> = st.alias.iter().filter(|(_, &gg)| gg == g).map(|(&r, _)| r).collect();
+                                    let ops: String = match *i {
+                                        Instr::JumpIfNotLt { a, b, .. }
+                                        | Instr::JumpIfNotLe { a, b, .. }
+                                        | Instr::Mul { a, b, .. }
+                                        | Instr::Add { a, b, .. } => {
+                                            format!(" a={:?} b={:?}", st.reg(a), st.reg(b))
+                                        }
+                                        _ => String::new(),
+                                    };
+                                    eprintln!("[absint]     @{ip} g{g}={:?} alias={al:?} {i:?}{ops}", st.glob(g));
+                                }
+                                None => eprintln!("[absint]     @{ip} <unreached> {i:?}"),
+                            }
+                        }
+                    }
+                    for (off, i) in proto.code[s..=e].iter().enumerate() {
+                        let ip = s + off;
+                        if let Instr::Add { a, b, .. } = *i {
+                            if !elide.contains(&ip) {
+                                let st = states[off].as_ref();
+                                eprintln!(
+                                    "[absint]   guarded Add @{ip}: a={:?} b={:?} entry-globs={:?}",
+                                    st.map(|st| st.reg(a)),
+                                    st.map(|st| st.reg(b)),
+                                    states[0].as_ref().map(|st| {
+                                        let mut g: Vec<(u32, Iv)> =
+                                            st.globs.iter().map(|(&k, &v)| (k, v)).collect();
+                                        g.sort_unstable();
+                                        g
+                                    })
+                                );
+                            }
+                        }
+                    }
+                }
                 let bad: Vec<u32> = cands
                     .iter()
                     .copied()

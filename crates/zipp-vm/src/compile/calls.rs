@@ -490,7 +490,7 @@ impl<'a> FnCompiler<'a> {
                 });
                 let end = self.here();
                 self.patch_jump(jend, end);
-                self.next_reg = save;
+                self.set_next_reg(save);
                 return Ok(dst);
             }
             // SYNC `yield*` — the full delegation protocol (spec 14.4.14 step 5):
@@ -552,7 +552,7 @@ impl<'a> FnCompiler<'a> {
             if dst != value {
                 self.emit(Instr::Move { dst, src: value });
             }
-            self.next_reg = save;
+            self.set_next_reg(save);
             return Ok(dst);
         }
         // Evaluate the yielded value (undefined for a bare `yield`); on resume
@@ -683,7 +683,7 @@ impl<'a> FnCompiler<'a> {
         }
         // The result has been copied into `callee`; scratch used while resolving
         // a compound expression is dead before ArgumentListEvaluation starts.
-        self.next_reg = keep;
+        self.set_next_reg(keep);
         Ok(callee)
     }
 
@@ -877,7 +877,7 @@ impl<'a> FnCompiler<'a> {
         // register no argument assigns), in which case the register IS the
         // captured value and the snapshot `Move` would only cost a pin.
         let this_v = if stable_receiver {
-            self.expr(&m.object)?
+            self.recv_expr(&m.object)?
         } else {
             // A named call's receiver snapshot is single-def by construction:
             // allocated above the high-water mark (see the callee below), it
@@ -885,7 +885,7 @@ impl<'a> FnCompiler<'a> {
             // receiver or argument also defines — the pin planner declines a
             // pinned receiver with a second def ("not cleanly excludable").
             if fresh_callee {
-                self.next_reg = self.next_reg.max(self.max_reg);
+                self.set_next_reg(self.next_reg.max(self.max_reg));
             }
             let t = self.alloc_reg();
             let receiver = self.expr_into(&m.object, t)?;
@@ -909,7 +909,7 @@ impl<'a> FnCompiler<'a> {
         // tier — parse-large-js's mix loop, 95ms -> 267ms, from one such
         // collision. Costs one frame slot per captured site.
         if fresh_callee {
-            self.next_reg = self.next_reg.max(self.max_reg);
+            self.set_next_reg(self.next_reg.max(self.max_reg));
         }
         let callee = self.alloc_reg();
         match &m.prop {
@@ -1012,7 +1012,7 @@ impl<'a> FnCompiler<'a> {
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                         self.emit_captured_member_call(m, dst, callee, this_v, arg_base, argc);
                     }
-                    self.next_reg = save.max(dst + 1);
+                    self.set_next_reg(save.max(dst + 1));
                     return Ok(dst);
                 }
                 // `(a?.b)?.()`: a parenthesized-chain member callee still
@@ -1057,7 +1057,7 @@ impl<'a> FnCompiler<'a> {
                     callee,
                     args: args_arr,
                 });
-                self.next_reg = save.max(dst + 1);
+                self.set_next_reg(save.max(dst + 1));
                 return Ok(dst);
             }
             let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
@@ -1067,7 +1067,7 @@ impl<'a> FnCompiler<'a> {
                 arg_base,
                 argc,
             });
-            self.next_reg = save.max(dst + 1);
+            self.set_next_reg(save.max(dst + 1));
             return Ok(dst);
         }
         // Spread call: `f(...args)`, `obj.m(...args)`, `arr.push(...xs)`, etc.
@@ -1122,7 +1122,7 @@ impl<'a> FnCompiler<'a> {
                                     this_v,
                                     args: args_arr,
                                 });
-                                self.next_reg = save.max(dst + 1);
+                                self.set_next_reg(save.max(dst + 1));
                                 return Ok(dst);
                             }
                         }
@@ -1155,7 +1155,7 @@ impl<'a> FnCompiler<'a> {
                     };
                     let args_arr = self.build_spread_args(&c.args)?;
                     self.emit_direct_eval(callee, this_v, args_arr, 0, true, dst, false);
-                    self.next_reg = save.max(dst + 1);
+                    self.set_next_reg(save.max(dst + 1));
                     return Ok(dst);
                 }
             }
@@ -1173,7 +1173,7 @@ impl<'a> FnCompiler<'a> {
                     this_v,
                     args,
                 });
-                self.next_reg = save.max(dst + 1);
+                self.set_next_reg(save.max(dst + 1));
                 return Ok(dst);
             }
             // `(obj?.method)(...args)` retains the member reference across the
@@ -1200,7 +1200,7 @@ impl<'a> FnCompiler<'a> {
                 callee,
                 args: args_arr,
             });
-            self.next_reg = save.max(dst + 1);
+            self.set_next_reg(save.max(dst + 1));
             return Ok(dst);
         }
 
@@ -1258,7 +1258,7 @@ impl<'a> FnCompiler<'a> {
                 };
                 let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                 self.emit_direct_eval(callee, this_v, arg_base, argc, false, dst, false);
-                self.next_reg = save.max(dst + 1);
+                self.set_next_reg(save.max(dst + 1));
                 return Ok(dst);
             }
         }
@@ -1287,7 +1287,7 @@ impl<'a> FnCompiler<'a> {
                     arg_base,
                     argc,
                 });
-                self.next_reg = save.max(dst + 1);
+                self.set_next_reg(save.max(dst + 1));
                 return Ok(dst);
             }
         }
@@ -1312,7 +1312,7 @@ impl<'a> FnCompiler<'a> {
                     arg_base,
                     argc,
                 });
-                self.next_reg = save.max(dst + 1);
+                self.set_next_reg(save.max(dst + 1));
                 return Ok(dst);
             }
             if &**id == "Array" && self.builtin_unshadowed(id) {
@@ -1326,7 +1326,7 @@ impl<'a> FnCompiler<'a> {
                     argc,
                     is_construct: false,
                 });
-                self.next_reg = save.max(dst + 1);
+                self.set_next_reg(save.max(dst + 1));
                 return Ok(dst);
             }
         }
@@ -1393,7 +1393,7 @@ impl<'a> FnCompiler<'a> {
                                 callee,
                                 this_v,
                             });
-                            self.next_reg = save.max(dst + 1);
+                            self.set_next_reg(save.max(dst + 1));
                             return Ok(dst);
                         }
                     }
@@ -1411,7 +1411,7 @@ impl<'a> FnCompiler<'a> {
                                 callee,
                                 this_v,
                             });
-                            self.next_reg = save.max(dst + 1);
+                            self.set_next_reg(save.max(dst + 1));
                             return Ok(dst);
                         }
                     }
@@ -1435,7 +1435,7 @@ impl<'a> FnCompiler<'a> {
                                 callee,
                                 this_v,
                             });
-                            self.next_reg = save.max(dst + 1);
+                            self.set_next_reg(save.max(dst + 1));
                             return Ok(dst);
                         }
                     }
@@ -1483,7 +1483,7 @@ impl<'a> FnCompiler<'a> {
                                     this_v,
                                 },
                             });
-                            self.next_reg = save.max(dst + 1);
+                            self.set_next_reg(save.max(dst + 1));
                             return Ok(dst);
                         }
                     }
@@ -1579,7 +1579,7 @@ impl<'a> FnCompiler<'a> {
                             arg_base,
                             argc,
                         });
-                        self.next_reg = save.max(dst + 1);
+                        self.set_next_reg(save.max(dst + 1));
                         return Ok(dst);
                     }
                     // `Array.from(src[, mapFn])` — needs iteration + optional
@@ -1605,7 +1605,7 @@ impl<'a> FnCompiler<'a> {
                                 this_v,
                                 argc,
                             });
-                            self.next_reg = save.max(dst + 1);
+                            self.set_next_reg(save.max(dst + 1));
                             return Ok(dst);
                         }
                     }
@@ -1662,7 +1662,7 @@ impl<'a> FnCompiler<'a> {
                     Arg::Spread(_) => false,
                 })
             {
-                let obj = self.expr(&m.object)?;
+                let obj = self.recv_expr(&m.object)?;
                 if m.optional {
                     // `obj?.method(args)` — short-circuit on a nullish receiver.
                     self.emit_optional_check(obj);
@@ -2211,7 +2211,7 @@ impl<'a> FnCompiler<'a> {
                     });
                 }
             }
-            self.next_reg = save;
+            self.set_next_reg(save);
         }
         Ok(args_arr)
     }
@@ -2219,11 +2219,11 @@ impl<'a> FnCompiler<'a> {
     /// Evaluate `exprs` into the contiguous register block `[base, base+len)`,
     /// reclaiming each expression's scratch temps. Returns `base`.
     pub(crate) fn eval_contiguous(&mut self, exprs: &[&Expr]) -> R<Reg> {
-        let base = self.next_reg;
-        // Reserve the block up front so arg-evaluation temps allocate above it.
-        for _ in exprs {
-            self.alloc_reg();
-        }
+        // Reserve the block up front so arg-evaluation temps allocate above
+        // it; a boolean argument takes a slot with no numeric history (see
+        // `alloc_block`).
+        let kinds: Vec<bool> = exprs.iter().map(|e| super::scopes::bool_valued(e)).collect();
+        let base = self.alloc_block(&kinds);
         let block_top = self.next_reg;
         for (i, e) in exprs.iter().enumerate() {
             let slot = base + i as Reg;
@@ -2232,7 +2232,7 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::Move { dst: slot, src: v });
             }
             // Reclaim temps this argument used (everything above the block).
-            self.next_reg = block_top;
+            self.set_next_reg(block_top);
         }
         Ok(base)
     }

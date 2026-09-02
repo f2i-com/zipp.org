@@ -103,7 +103,7 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
-        self.next_reg = save;
+        self.set_next_reg(save);
     }
 
     pub(crate) fn func_decl_inner(&mut self, f: &ast::Function, do_sync: bool) -> R<()> {
@@ -167,7 +167,7 @@ impl<'a> FnCompiler<'a> {
                 let tmp = self.temp();
                 self.emit_make_callable(tmp, id, has_upvalues);
                 self.emit(Instr::UpvalSet { idx: ui, src: tmp });
-                self.next_reg -= 1;
+                self.dec_next_reg(1);
                 return Ok(());
             }
         }
@@ -211,7 +211,7 @@ impl<'a> FnCompiler<'a> {
                         src: tmp,
                     });
                 }
-                self.next_reg -= 1;
+                self.dec_next_reg(1);
             }
         } else {
             // Nested function, or a script-level conflict-skip block function:
@@ -321,7 +321,7 @@ impl<'a> FnCompiler<'a> {
                     if let Some(ui) = caller_b33_upval {
                         self.emit(Instr::UpvalSet { idx: ui, src: tmp });
                     }
-                    self.next_reg -= 1;
+                    self.dec_next_reg(1);
                 }
                 _ => {}
             }
@@ -379,14 +379,14 @@ impl<'a> FnCompiler<'a> {
                     cell: *cell,
                     src: *t,
                 });
-                self.next_reg -= 1; // reclaim the temp
+                self.dec_next_reg(1); // reclaim the temp
             }
             Dest::Global(slot, t) => {
                 self.emit(Instr::StoreGlobal {
                     idx: *slot,
                     src: *t,
                 });
-                self.next_reg -= 1;
+                self.dec_next_reg(1);
             }
         }
         Ok(())
@@ -467,7 +467,7 @@ impl<'a> FnCompiler<'a> {
             parent: parent_reg,
         });
         if parent_reg.is_some() {
-            self.next_reg -= 1; // reclaim the parent temp
+            self.dec_next_reg(1); // reclaim the parent temp
         }
         // PHASE 1 — walk the class elements in DOCUMENT order, evaluating each
         // one's DecoratorList and then its ClassElementName. Computed member keys
@@ -513,7 +513,7 @@ impl<'a> FnCompiler<'a> {
                             func: *func,
                             kind: *kind,
                         });
-                        self.next_reg = save;
+                        self.set_next_reg(save);
                         continue;
                     }
                     // An auto-accessor installs TWO members from ONE
@@ -550,7 +550,7 @@ impl<'a> FnCompiler<'a> {
                             kind: if *kind == 4 { 5 } else { 2 },
                         });
                     }
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                 }
                 StepKey::Field(i) => {
                     let (key, _init, is_static) = &computed_fields[i];
@@ -595,7 +595,7 @@ impl<'a> FnCompiler<'a> {
                             class: cls,
                             key: kr,
                         });
-                        self.next_reg = save;
+                        self.set_next_reg(save);
                     }
                 }
             }
@@ -734,7 +734,7 @@ impl<'a> FnCompiler<'a> {
                             recv: cls,
                         });
                     }
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                 }
                 1 => {
                     let Some(kr) = parked[idx] else { continue };
@@ -798,7 +798,7 @@ impl<'a> FnCompiler<'a> {
                             recv: cls,
                         });
                     }
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                 }
                 _ => {
                     let fid = static_block_fns[idx];
@@ -819,7 +819,7 @@ impl<'a> FnCompiler<'a> {
                         arg_base: f,
                         argc: 0,
                     });
-                    self.next_reg = save;
+                    self.set_next_reg(save);
                 }
             }
         }
@@ -862,7 +862,7 @@ impl<'a> FnCompiler<'a> {
         }
         let floor = self.next_reg;
         for (i, d) in list.iter().enumerate() {
-            self.next_reg = floor;
+            self.set_next_reg(floor);
             let dst = base + (i * 2) as Reg;
             let recv = dst + 1;
             // `@(a.b)` parses to the same Member node as `@a.b` — the
@@ -902,7 +902,7 @@ impl<'a> FnCompiler<'a> {
                                 obj: recv,
                                 key: kr,
                             });
-                            self.next_reg = save;
+                            self.set_next_reg(save);
                         }
                     }
                     true
@@ -917,7 +917,7 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::LoadUndefined { dst: recv });
             }
         }
-        self.next_reg = floor;
+        self.set_next_reg(floor);
         Ok((base, list.len() as u16))
     }
 
