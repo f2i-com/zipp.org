@@ -87,12 +87,15 @@ fn exact_array_numeric_callback_proto(
             ArrayNumericCallback::FilterMod3,
             1,
             1,
+            // B263 register classes: the boolean-valued compare is allocated
+            // from its own class and renumbered after the numeric temporaries,
+            // so the result lands in the last register of the five.
             [
-                Instr::LoadInt { dst: 4, val: 3 },
-                Instr::Mod { dst: 3, a: 1, b: 4 },
-                Instr::LoadInt { dst: 4, val: 0 },
-                Instr::Eq { dst: 2, a: 3, b: 4 },
-                Instr::Return { src: 2 },
+                Instr::LoadInt { dst: 3, val: 3 },
+                Instr::Mod { dst: 2, a: 1, b: 3 },
+                Instr::LoadInt { dst: 3, val: 0 },
+                Instr::Eq { dst: 4, a: 2, b: 3 },
+                Instr::Return { src: 4 },
             ],
         ) | (
             ArrayNumericCallback::ReduceAdd,

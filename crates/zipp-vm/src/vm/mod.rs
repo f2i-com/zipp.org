@@ -1136,7 +1136,8 @@ mod register_file_tests {
     }
 
     #[test]
-    #[cfg(not(feature = "safe-sandbox"))]
+    // Same gate as `set_len` itself: only the x86-64 JIT call protocol has it.
+    #[cfg(all(not(feature = "safe-sandbox"), feature = "jit"))]
     fn unsafe_logical_set_len_is_bounded_by_initialized_high_water() {
         let mut regs = RegisterFile::from_vec(vec![Value::int(1), Value::int(2)]);
         regs.truncate(1);

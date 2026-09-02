@@ -29,6 +29,9 @@ fn reg_classes_output_matches_node() {
 /// line under `ZIPP_JITDECLINE=1`. With the shared scratch stack restored the
 /// same loop declines (a recycled receiver or a reused-register type
 /// conflict, whichever the allocator happens to produce first).
+// Only the x86-64 JIT has an INT tier to keep the loop on; the interpreter
+// builds check the same file's output in the two tests around this one.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[test]
 fn reg_classes_keeps_the_tokenizer_on_the_int_tier() {
     if std::env::var_os("ZIPP_REG_CLASSES_CHILD").is_some() {
