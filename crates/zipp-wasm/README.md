@@ -83,7 +83,7 @@ at engine commit `7cb72106c9591613b170ba057d3c07e1cee01379`. It was 5,595,833
 bytes raw, 1,859,668 at gzip-9, and 1,254,075 at Brotli-11, with SHA-256
 `f3d67856f5853c235c12ee62a1cc86032492012e3942c032a08d8d22df85ff0b`.
 
-The current v0.0.6 production artifact uses the same pinned Rust 1.92.0,
+The current v0.0.12 production artifact uses the same pinned Rust 1.92.0,
 wasm-bindgen 0.2.126, `opt-level=3`, and four-codegen-unit policy. It also keeps
 the 1 GiB linked memory maximum, 1 MiB linked stack, and isolated
 `safe-sandbox`, `meter-only`, `wasm-no-fs-loader`, and `wasm-single-agent`
