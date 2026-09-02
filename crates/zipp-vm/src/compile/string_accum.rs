@@ -375,6 +375,18 @@ pub(crate) fn accum_may_read(i: &Instr, r: Reg) -> bool {
             argc,
             ..
         } => callee == r || this_v == r || in_args(arg_base, argc),
+        // The `Array.isArray` / for-in trio a tree walk is made of; fields per
+        // the declarations in `bytecode.rs` (the `typeof` alias lane's dead-def
+        // rewrite scans the whole function with this table, and json-large's
+        // `walk` holds all four).
+        Instr::IsArray {
+            a,
+            callee,
+            this_v,
+            ..
+        } => a == r || callee == r || this_v == r,
+        Instr::ForInKeys { obj, .. } | Instr::LenOf { obj, .. } => obj == r,
+        Instr::ForInLive { obj, key, .. } => obj == r || key == r,
         _ => true, // unrecognised op → assume it reads `r`
     }
 }

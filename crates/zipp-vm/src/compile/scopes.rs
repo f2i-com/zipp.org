@@ -82,6 +82,9 @@ impl<'a> FnCompiler<'a> {
             template_site_count: 0,
             protect_names: std::collections::HashSet::new(),
             entry_lexicals: std::collections::HashSet::new(),
+            typeof_alias: Vec::new(),
+            typeof_alias_depth: 0,
+            typeof_alias_defs: Vec::new(),
         };
         // Register 0 is reserved for `this` in every function (undefined for
         // plain calls, the receiver for method calls). Parameters follow at
@@ -224,6 +227,9 @@ impl<'a> FnCompiler<'a> {
     }
 
     pub(crate) fn emit(&mut self, i: Instr) {
+        if !self.typeof_alias.is_empty() {
+            self.typeof_alias_note_emit(&i);
+        }
         self.code.push(i);
     }
     pub(crate) fn here(&self) -> u32 {

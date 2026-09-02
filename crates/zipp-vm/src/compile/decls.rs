@@ -71,7 +71,17 @@ fn direct_cond_return_parts(expr: &ast::Expr) -> Option<(&ast::Expr, &ast::Expr,
 
 impl<'a> FnCompiler<'a> {
     // ── statements ──
+    /// Every statement passes through here, which is what lets the `typeof`
+    /// alias lane (`typeof_alias.rs`) see statement nesting: a fact recorded
+    /// inside `s` dies with it, and a re-entering `s` starts clean.
     pub(crate) fn stmt(&mut self, s: &ast::Stmt) -> R<()> {
+        self.typeof_alias_stmt_enter(s);
+        let r = self.stmt_inner(s);
+        self.typeof_alias_stmt_exit();
+        r
+    }
+
+    fn stmt_inner(&mut self, s: &ast::Stmt) -> R<()> {
         use ast::Stmt as S;
         match s {
             S::Expr(e) => {
@@ -987,6 +997,7 @@ impl<'a> FnCompiler<'a> {
                         if v != reg {
                             self.emit(Instr::Move { dst: reg, src: v });
                         }
+                        self.typeof_alias_record(name, init, reg);
                     }
                 }
                 continue;
@@ -1045,6 +1056,7 @@ impl<'a> FnCompiler<'a> {
                     if v != reg {
                         self.emit(Instr::Move { dst: reg, src: v });
                     }
+                    self.typeof_alias_record(name, init, reg);
                 }
             }
             if tdz_added {

@@ -1115,6 +1115,7 @@ impl Compiler {
         fc.cx.in_field_init = saved_field_init;
         fc.cx.in_derived_ctor = saved_idc;
         fc.cx.dyn_global_zone = saved_dyn_zone;
+        fc.typeof_alias_finish();
         fc.check_regs()?;
         Ok(FuncProto {
             name: name.unwrap_or("<script>").to_string(),
@@ -1443,6 +1444,7 @@ impl Compiler {
         fc.cx.in_field_init = saved_field_init;
         fc.cx.in_derived_ctor = saved_idc;
         fc.cx.dyn_global_zone = saved_dyn_zone_cls;
+        fc.typeof_alias_finish();
         fc.check_regs()?;
         Ok(FuncProto {
             name: name.to_string(),
@@ -1665,6 +1667,7 @@ impl Compiler {
         fc.cx.in_strict = parent_strict; // restore: nested compiles are done
         fc.cx.dyn_global_zone = saved_dyn_zone_arrow;
         let upvalues: Vec<UpvalSource> = fc.upvalues.borrow().iter().map(|(_, s)| *s).collect();
+        fc.typeof_alias_finish();
         fc.check_regs()?;
         Ok(FuncProto {
             name: "<arrow>".to_string(),

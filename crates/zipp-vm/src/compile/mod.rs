@@ -557,6 +557,11 @@ struct FnCompiler<'a> {
     /// completion value (last evaluated expression statement). `Return`ed at the
     /// end instead of `undefined`. `None` outside eval mode / in nested functions.
     completion_reg: Option<Reg>,
+    /// Live `t = typeof v` facts, their statement-nesting depth, and the ips
+    /// of the `TypeOf` ops that produced them (see `typeof_alias.rs`).
+    typeof_alias: Vec<typeof_alias::TypeofAlias>,
+    typeof_alias_depth: u32,
+    typeof_alias_defs: Vec<(u32, Reg)>,
     /// A named function expression's own name bound to itself (the running
     /// function value): `(name, reg)`. Sits OUTSIDE the parameter/var scope, so
     /// `resolve` consults it only after the scope stack (params/locals shadow it).
@@ -817,6 +822,7 @@ mod funcs;
 mod helpers;
 mod scopes;
 mod string_accum;
+mod typeof_alias;
 mod with_stmt;
 
 pub(crate) use entry::*;

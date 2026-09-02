@@ -4749,16 +4749,9 @@ pub(crate) fn compile_proto_mem(
             Instr::TypeOfIs { dst, a, code, neg } => {
                 // Fused typeof compare — the region arm verbatim. PURE (no
                 // alloc, no user code, total), so unlike `TypeOf` above it owes
-                // no refetch.
-                let code_neg = code as u32 | ((neg as u32) << 8);
-                dynasm!(ops
-                    ; mov rcx, rdi                        // vm
-                    ; mov rdx, [rbx + dreg(a)]            // value bits
-                    ; mov r8d, code_neg as i32            // code | neg<<8
-                    ; mov rax, QWORD heap.typeof_is as i64
-                    ; call rax
-                    ; mov [rbx + dreg(dst)], rax          // Bool Value bits
-                );
+                // no refetch. Non-heap tags answer inline; heap values call
+                // `jit_typeof_is` (`emit_typeof_is`).
+                emit_typeof_is(&mut ops, dst, a, code, neg, heap.typeof_is);
             }
             Instr::TypeOfSame { dst, a, b, neg } => {
                 dynasm!(ops

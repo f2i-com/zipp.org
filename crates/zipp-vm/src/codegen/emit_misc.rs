@@ -24,6 +24,114 @@ fn poly_eq_fast_enabled() -> bool {
     }
 }
 
+/// `ZIPP_NO_TYPEOF_IS_INLINE=1` restores the helper-only `TypeOfIs` arm
+/// (`emit_typeof_is` calls `jit_typeof_is` for every value). Read once.
+#[inline]
+fn typeof_is_inline_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_TYPEOF_IS_INLINE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `TypeOfIs { dst, a, code, neg }` — `dst = (typeof a === TYPEOF_NAMES[code])
+/// != neg` as Bool bits — shared by the Tier-C and region emitters.
+///
+/// A NaN-boxed value's tag decides five of the eight answers without the
+/// heap: any double or Int is "number", the Bool tag is "boolean", the
+/// Undefined tag is "undefined" (with any payload — `Vm::type_of` answers
+/// "undefined" for every non-heap value that is not exactly `null`), the
+/// exact `null` is "object". Each of those is a compile-time constant for
+/// this `code`/`neg`, so the arm is a tag test and a constant store. Only a
+/// heap value — string, object, function, symbol, BigInt, the `[[IsHTMLDDA]]`
+/// exotic, or a Cell/Proxy that unwraps to anything — calls `jit_typeof_is`,
+/// which is where those rules live. PURE and total: no bail, no refetch,
+/// clobbers only rax/rcx/rdx/r8 (the helper call's own set).
+///
+/// `rdi` = vm, `rbx` = register window, as in every arm of both emitters.
+pub(crate) fn emit_typeof_is(
+    ops: &mut dynasmrt::x64::Assembler,
+    dst: u16,
+    a: u16,
+    code: u8,
+    neg: bool,
+    helper: usize,
+) {
+    let code_neg = code as u32 | ((neg as u32) << 8);
+    if !typeof_is_inline_enabled() {
+        dynasm!(ops
+            ; mov rcx, rdi                        // vm
+            ; mov rdx, [rbx + dreg(a)]            // value bits
+            ; mov r8d, code_neg as i32            // code | neg<<8
+            ; mov rax, QWORD helper as i64
+            ; call rax
+            ; mov [rbx + dreg(dst)], rax          // Bool Value bits
+        );
+        return;
+    }
+    let lit = crate::bytecode::TYPEOF_NAMES.get(code as usize).copied();
+    let answer = |name: &str| -> i64 {
+        crate::value::Value::bool((lit == Some(name)) != neg).bits() as i64
+    };
+    let (res_number, res_boolean, res_undefined, res_object) = (
+        answer("number"),
+        answer("boolean"),
+        answer("undefined"),
+        answer("object"),
+    );
+    let is_number = ops.new_dynamic_label();
+    let is_boolean = ops.new_dynamic_label();
+    let is_undefined = ops.new_dynamic_label();
+    let heap = ops.new_dynamic_label();
+    let store = ops.new_dynamic_label();
+    dynasm!(ops
+        ; mov rax, [rbx + dreg(a)]
+        ; mov rdx, rax
+        ; shr rdx, 48
+        ; sub edx, TAG_LO as i32                 // 0 Int, 1 Bool, 2 Null, 3 Undefined, 4 Heap
+        ; cmp edx, (TAG_HI - TAG_LO) as i32
+        ; ja => is_number                        // outside the tag range: a double
+        ; je => heap                             // == 4: heap value → helper
+        ; test edx, edx
+        ; jz => is_number                        // Int
+        ; cmp edx, 1
+        ; je => is_boolean
+        ; cmp edx, 3
+        ; je => is_undefined
+        // Null tag. Exactly `null` is "object"; a Null-tagged payload is not
+        // `is_null()` and classifies as "undefined" like any non-heap leftover.
+        ; mov r8, QWORD crate::value::Value::NULL.bits() as i64
+        ; cmp rax, r8
+        ; jne => is_undefined
+        ; mov rax, QWORD res_object
+        ; jmp => store
+        ; => is_number
+        ; mov rax, QWORD res_number
+        ; jmp => store
+        ; => is_boolean
+        ; mov rax, QWORD res_boolean
+        ; jmp => store
+        ; => is_undefined
+        ; mov rax, QWORD res_undefined
+        ; jmp => store
+        ; => heap
+        ; mov rcx, rdi                            // vm
+        ; mov rdx, rax                            // value bits
+        ; mov r8d, code_neg as i32                // code | neg<<8
+        ; mov rax, QWORD helper as i64
+        ; call rax
+        ; => store
+        ; mov [rbx + dreg(dst)], rax              // Bool Value bits
+    );
+}
+
 /// `ZIPP_NO_MEM_CMPJUMP=1` disables the memory-path fused compare→branch head
 /// (`emit_fused_cmp_branch_head`), restoring the unfused compare + JumpIf pair
 /// byte-identically. Read once per region compile.

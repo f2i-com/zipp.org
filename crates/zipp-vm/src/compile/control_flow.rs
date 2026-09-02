@@ -238,6 +238,9 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
+        // A `typeof` alias recorded by the init must not reach the test, body
+        // or update: they run again without the init (`typeof_alias.rs`).
+        self.typeof_alias_clear();
         // Per-iteration bindings: a `for (let i …)` loop variable captured by a
         // closure in the body gets a FRESH binding each iteration (JS semantics:
         // `for(let i…) fns.push(()=>i)` yields 0,1,2 not 3,3,3). Only when the var
@@ -697,6 +700,9 @@ impl<'a> FnCompiler<'a> {
             self.emit(Instr::LoadUndefined { dst: cr });
             r
         });
+        // A finally body runs after ANY exit of the try/catch — same rule as
+        // the catch body: no `typeof` alias survives into it.
+        self.typeof_alias_clear();
         self.push_scope();
         self.predeclare_lexical_tdz(finalizer);
         for s in finalizer {
@@ -738,6 +744,9 @@ impl<'a> FnCompiler<'a> {
         // abandoned try-block value (`eval("try{'t';throw 0}catch(e){}")` ⇒
         // undefined) while a normally-completing try keeps its own ('t').
         self.reset_loop_completion();
+        // The unwind can arrive from ANY point of the try body: no `typeof`
+        // alias declared there (or before it) is known to hold here.
+        self.typeof_alias_clear();
         self.push_scope();
         // The VM deposits the thrown value into `e_reg`. For `catch (id)` that IS
         // the binding; for `catch ([a,b])` / `catch ({e})` it's a scratch slot we
@@ -912,6 +921,9 @@ impl<'a> FnCompiler<'a> {
         let mut body_start: Vec<u32> = Vec::with_capacity(cases.len());
         for c in cases {
             body_start.push(self.here());
+            // A case can be entered directly, without an earlier case's
+            // declarations having run: no `typeof` alias crosses this line.
+            self.typeof_alias_clear();
             for st in &c.body {
                 self.stmt(st)?;
             }

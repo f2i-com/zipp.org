@@ -1987,6 +1987,25 @@ impl<'a> FnCompiler<'a> {
                 }
             }
         }
+        // ── `t === "lit"` where `t` is a live `typeof v` alias → TypeOfIs over
+        // `v` (see `typeof_alias.rs`). `t` is a plain local holding a typeof
+        // name, so the loose forms agree with the strict ones here too, and a
+        // literal outside the eight names compiles to the never-matching 255.
+        if matches!(op, Op::StrictEq | Op::StrictNotEq | Op::Eq | Op::NotEq) {
+            let aliased = match (left, right) {
+                (ast::Expr::Ident(id), ast::Expr::Str(StrVal::Utf8(lit)))
+                | (ast::Expr::Str(StrVal::Utf8(lit)), ast::Expr::Ident(id)) => Some((id, lit)),
+                _ => None,
+            };
+            if let Some((id, lit)) = aliased {
+                if let Some(a) = self.typeof_alias_lookup(id) {
+                    let neg = matches!(op, Op::StrictNotEq | Op::NotEq);
+                    let code = crate::bytecode::typeof_code(lit).unwrap_or(255);
+                    self.emit(Instr::TypeOfIs { dst, a, code, neg });
+                    return Ok(dst);
+                }
+            }
+        }
         // ── `typeof x === "lit"` → TypeOfIs ── (also `!==`, and the loose
         // forms, which agree with strict when both sides are strings — one side
         // is a string literal and `typeof` always produces a string). The
