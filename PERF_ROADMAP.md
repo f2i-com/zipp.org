@@ -150,6 +150,45 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B263 LANDED — register classes: booleans and global receivers leave the scratch stack
+
+`ZIPP_NO_REG_CLASSES=1` restores the v0.0.5 allocation. The v0.0.5 release
+(`7cb72106`) started reclaiming scratch registers across statements, and the
+INT region tier — which types every register once per loop and pins a
+global-loaded receiver only when its register has exactly one definition — then
+declined whole tokenizer loops: a `LoadGlobal src` slot reused for a literal, an
+`Eq` result slot reused for a number ("type conflict on a reused register").
+parse-large-js went from 44 INT regions to 9 and 251 → 396 ms (0.89× → 1.24×
+node). Now `expr()` places a syntactically boolean expression in a BOOL class
+register and a global-identifier receiver in a RECV class register: provisional
+numbers above the ordinary stack, never reclaimed, renumbered to the top of the
+frame at finalisation by the generated, exhaustive `compile/remap.rs` (the
+`NO_REG` / `BARE_MATH_BY_NAME` sentinels are left alone). Ordinary scratch keeps
+the v0.0.5 reclaim; a per-register kind history keeps numeric temporaries off
+boolean slots and places argument windows where no slot conflicts. On the
+planner side the DataView endian-flag fusion now admits a DEAD flag register
+(no other definition, no other use, every outside read preceded by its own
+definition) and its use scans skip the fused flag operand — without this the
+swizzle loop's flag slots became real Bool homes and the region lost two GPRs.
+Rejected with numbers: monotone allocation inside loops (bytecode-vm +434% from
+xmm/GPR pool exhaustion, regex-log-scan frames 76 → 256 registers) and one
+shared multi-definition receiver register per global (parse-large-js worse than
+base). New diagnostics: `[jit] INT-GPR region … guard kept: first guarded op`
+under `ZIPP_JITLOG`, and `ZIPP_ABSINT_LOG=1` (+ `ZIPP_ABSINT_GLOB=<slot>`) for
+the interval prover.
+
+Gate (2026-09-02, base `37c7fbfa` vs the new binary, 16 interleaved pairs,
+exact output): parse-large-js **−38.9%** [−39.3, −38.1], typedarray-math
+**−5.4%** [−6.7, −4.3]; every other normal row within ±1.3% and inside its
+interval; hostile eight-row geomean −0.2% [−0.9, +0.6] (bytecode-vm −2.3%,
+async-lived +3.4% two-binary / −0.7% one-binary). The one-binary latch A/B
+reproduces both wins (−39.0%, −5.7%). Correctness: 534 lib tests, the compiler
+and tier suites (`reg_classes`, `jit_tier_parity`, `jit_tier_fuzz`,
+`typeof_alias`, `int_split`, `int_gpr_homes`, `int_splice`, `local_sroa`,
+`double_mod`, `real_program_corpus`), every feature configuration, and a
+188-run four-mode output identity against node over every bench and
+syntax-corpus program.
+
 ### B262 LANDED — `typeof` aliases fuse into `TypeOfIs`, answered inline from the tag
 
 `ZIPP_NO_TYPEOF_ALIAS=1` (compiler) and `ZIPP_NO_TYPEOF_IS_INLINE=1` (JIT)
