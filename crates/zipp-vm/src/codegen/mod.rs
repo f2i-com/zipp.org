@@ -193,6 +193,24 @@ pub(crate) fn cross_def_callee_enabled() -> bool {
     }
 }
 
+/// B272 latch: `ZIPP_NO_CROSS_FRAMED_ENTRY=1` restores the rule that a body
+/// containing handler ops (`try`, and the iterator-close bracket every
+/// `for...of` carries) never receives a cross entry, so every call to such a
+/// function takes the framed interpreter route.
+pub(crate) fn cross_framed_entry_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS_FRAMED_ENTRY").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// B270 latch: `ZIPP_NO_CROSS3_SELF=1` stops a Tier-C body from baking a CROSS3
 /// arm against ITSELF — the entry this very compile is about to install — so
 /// a self-recursive site reached through a captured cell or a global goes back
@@ -3547,6 +3565,13 @@ pub struct Jit {
     /// fill. Words contain register indices only — no bytecode, heap, or raw
     /// pointers — and are dropped whenever the corresponding entry is cleared.
     cross_wide_uninit: Vec<Option<Box<[u64]>>>,
+    /// B272: entries whose body carries handler ops. Such an entry is real
+    /// native code but may only be entered FRAME-BACKED: the generic cross
+    /// helper pushes the callee `Frame` first (the handler helpers write the
+    /// active frame's handler stack). `cross_entry` hides these from every
+    /// other reader and the native-visible `cross_table` slot stays null, so
+    /// no emitted lane can enter one frame-free.
+    cross_needs_frame: Vec<bool>,
     /// Compiled fused `map` kernels, keyed by callback `func_id`. `None` =
     /// tried and ineligible (so we don't recompile every `map` call). Keyed by
     /// `func_id` alone: a given callback proto has fixed param_count/body.
@@ -3650,6 +3675,7 @@ impl Jit {
         }
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
         self.cross_wide_uninit.clear();
+        self.cross_needs_frame.clear();
         self.map_kernels.clear();
         self.reduce_kernels.clear();
         self.filter_kernels.clear();
@@ -3710,7 +3736,42 @@ impl Jit {
         Option<MarkdownInlinePlan>,
     )> {
         match self.cross_entries.get(func_id as usize) {
-            Some(&(p, mask, json, markdown)) if !p.is_null() => Some((p, mask, json, markdown)),
+            Some(&(p, mask, json, markdown))
+                if !p.is_null() && !self.cross_needs_frame(func_id) =>
+            {
+                Some((p, mask, json, markdown))
+            }
+            _ => None,
+        }
+    }
+
+    /// B272: whether `func_id`'s entry may only be entered frame-backed.
+    #[inline]
+    pub fn cross_needs_frame(&self, func_id: u32) -> bool {
+        self.cross_needs_frame
+            .get(func_id as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// B272: [`Jit::cross_entry`] including the frame-backed entries, with the
+    /// flag as the last element. Only the generic cross-call helper, which can
+    /// push a `Frame` before entering, may consume a flagged entry.
+    #[inline]
+    pub fn cross_entry_framed(
+        &self,
+        func_id: u32,
+    ) -> Option<(
+        *const u8,
+        u64,
+        Option<JsonWalkPlan>,
+        Option<MarkdownInlinePlan>,
+        bool,
+    )> {
+        match self.cross_entries.get(func_id as usize) {
+            Some(&(p, mask, json, markdown)) if !p.is_null() => {
+                Some((p, mask, json, markdown, self.cross_needs_frame(func_id)))
+            }
             _ => None,
         }
     }
@@ -3734,6 +3795,7 @@ impl Jit {
         wide_uninit_mask: Option<Box<[u64]>>,
         json_walk: Option<JsonWalkPlan>,
         markdown_inline: Option<MarkdownInlinePlan>,
+        needs_frame: bool,
     ) {
         let i = func_id as usize;
         if self.cross_entries.len() <= i {
@@ -3743,6 +3805,10 @@ impl Jit {
         if self.cross_wide_uninit.len() <= i {
             self.cross_wide_uninit.resize(i + 1, None);
         }
+        if self.cross_needs_frame.len() <= i {
+            self.cross_needs_frame.resize(i + 1, false);
+        }
+        self.cross_needs_frame[i] = needs_frame;
         // B199: the mask generation bumps only when the mask CHANGES — a
         // same-shape recompile keeps every dependent lane's baked mask
         // valid, which is what lets a re-set entry resume those lanes
@@ -3779,7 +3845,10 @@ impl Jit {
                 }
             }
         }
-        self.cross_table[i].entry = entry as u64;
+        // B272: a frame-backed entry is never visible to emitted lanes — they
+        // read this slot natively and cannot push a frame — so it stays null
+        // and every lane baked against the fid keeps routing to the helper.
+        self.cross_table[i].entry = if needs_frame { 0 } else { entry as u64 };
         self.cross_code_epoch = self.cross_code_epoch.wrapping_add(1);
         if let Some(callers) = self.cross_pending.remove(&func_id) {
             for caller in callers {
@@ -3923,6 +3992,9 @@ impl Jit {
             // gen guard must observe — a recompile whose analysis declines
             // to u64::MAX — compared equal to the sentinel and did NOT bump.
             *p = (std::ptr::null(), p.1, None, None);
+        }
+        if let Some(flag) = self.cross_needs_frame.get_mut(func_id as usize) {
+            *flag = false;
         }
         if let Some(mask) = self.cross_wide_uninit.get_mut(func_id as usize) {
             *mask = None;
@@ -4115,10 +4187,25 @@ impl Jit {
                 // handler stack; a frame-free cross-call has no frame to hold
                 // them, so such functions never receive a cross entry and every
                 // invocation goes through the ordinary framed call path.
-                if proto_has_handler_ops(proto) {
+                // B272: such a body still receives an entry, flagged so only
+                // the generic helper (which pushes the frame first) enters it.
+                let needs_frame = proto_has_handler_ops(proto);
+                if needs_frame && !cross_framed_entry_enabled() {
                     self.clear_cross_entry(func_id);
                     return;
                 }
+                // A handler-op body always takes the FULL zero-fill: the
+                // may-read-before-write pass follows jumps only, and a throw
+                // inside a bracket reaches the handler with the bracket's
+                // defs possibly unexecuted (a hoisted `var` assigned in the
+                // `try` and read in the `catch` is the concrete shape), so a
+                // masked fill could expose a stale slot there. The
+                // interpreter zero-fills the whole window; so does this.
+                let (uninit_mask, wide_uninit_mask) = if needs_frame {
+                    (u64::MAX, None)
+                } else {
+                    (uninit_mask, wide_uninit_mask)
+                };
                 self.set_cross_entry(
                     func_id,
                     entry,
@@ -4126,6 +4213,7 @@ impl Jit {
                     wide_uninit_mask,
                     json_walk,
                     markdown_inline,
+                    needs_frame,
                 );
                 return;
             }

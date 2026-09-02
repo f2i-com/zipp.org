@@ -155,6 +155,39 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B272 LANDED — handler-op bodies receive a frame-backed cross entry
+
+A Tier-C body containing handler ops (`try`, and the iterator-close bracket
+every `for...of` compiles to: `PushFinally`/`PopFinally`/`IterCloseFinally`/
+`EndFinally`) was statically denied a cross entry, because the emitted
+`push_finally`/`pop_finally` helpers write the ACTIVE frame's handler stack
+and a frame-free activation has none (B213 then made the planners skip such
+callees outright). Every call to such a function from compiled code took the
+framed interpreter route — `setup_call` → `run_loop` → `dispatch_body` →
+`try_run_jit` — which `ZIPP_INTERPSTATS` and the PC profile put at ~10% of
+reactish-reconcile: its recursive `diff` has a `for...of` and is entered
+~130k times per run. `set_cross_entry` now installs such an entry flagged
+`needs_frame`; `cross_entry()` hides it from every reader and the
+native-visible `cross_table` slot stays null, so no emitted lane can enter it
+frame-free, and the generic `jit_cross_call_impl` (via `cross_entry_framed`)
+pushes the callee `Frame` first — the exact record its bail path already
+materialized — enters frame-backed, pops on a clean return, and finishes a
+bail or a throw over that frame the way the framed route does (a pending
+throw first unwinds to a handler at or above the frame). reactish-reconcile:
+two-binary 0.949 median, one-binary latch (`ZIPP_NO_CROSS_FRAMED_ENTRY`)
+1.041 the other way, i.e. ~4-5% for the mechanism; warm-router,
+allocation-survival, map-set-heavy and regex-log-scan neutral on their
+latch A/Bs. `tests/cross_framed_entry.rs` covers normal completion,
+recursion, `break`, a throw unwinding through the callee's frame to the
+caller's `try`, a throw caught inside the callee, and deep recursion ending
+in the ordinary catchable RangeError, in every mode. Such bodies take the
+FULL zero-fill by design, not by accident: the may-read-before-write pass
+follows jumps only, and a throw inside a bracket reaches the handler with
+the bracket's defs possibly unexecuted (a hoisted `var` assigned in the
+`try` and read in the `catch`), so a masked fill could expose a stale slot;
+an exception-edge-aware pass would be the way to earn the fast fill. The
+emitted CROSS3 lane still excludes them (native code cannot push a frame).
+
 ### B271 LANDED — the recycle pool's fallback sort is run-adaptive
 
 `sort_recycle_pool_by_address` proves the common one-run shape in linear time

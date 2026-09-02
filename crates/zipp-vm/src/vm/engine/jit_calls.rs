@@ -406,9 +406,13 @@ impl<'p> Vm<'p> {
             self.osr_deopt_exempt = true;
             return SELF_CALL_DEOPT;
         }
-        let (entry, uninit_mask, json_walk, markdown_inline) = match self.jit.cross_entry(fid) {
-            Some(e) => e,
-            None => {
+        // B272: a handler-op body's entry is flagged `needs_frame`; only this
+        // generic instantiation can honour it (the specialized arrow lane
+        // keeps its frame-free contract and declines).
+        let (entry, uninit_mask, json_walk, markdown_inline, needs_frame) =
+            match self.jit.cross_entry_framed(fid) {
+                Some((e, m, j, md, nf)) if !(nf && SAME_PROTO_ARROW2) => (e, m, j, md, nf),
+                _ => {
                 crate::vm::helpers_misc::crossstats::decline(
                     crate::vm::helpers_misc::crossstats::DECL_NO_ENTRY,
                 );
@@ -620,21 +624,66 @@ impl<'p> Vm<'p> {
             // staged contiguous arg registers); n ≤ argc.
             self.regs[new_base + 1 + i] = Value::from_bits(unsafe { *args.add(i) });
         }
+        // B272: a handler-op body runs FRAME-BACKED. Its `push_finally` /
+        // `pop_finally` helpers write the ACTIVE frame's handler stack, so the
+        // callee's own `Frame` — exactly the record the bail path below
+        // materializes, at ip 0 — goes on before native entry. A clean native
+        // return pops it; a bail or throw finishes the activation the way the
+        // framed route does, over the same frame. What this skips is the
+        // framed route's `setup_call` + `run_loop` + `dispatch_body` prologue
+        // per call — the interpreter trampoline that made every call into a
+        // `for...of`-bearing body cost several times a native cross call.
+        if needs_frame {
+            if self.frames.len() >= MAX_FRAMES {
+                // Let the framed route raise the exact RangeError.
+                self.regs.truncate(new_base);
+                crate::vm::helpers_misc::crossstats::decline(
+                    crate::vm::helpers_misc::crossstats::DECL_DEPTH,
+                );
+                self.osr_deopt_exempt = true;
+                return SELF_CALL_DEOPT;
+            }
+            let arg_win = unsafe { args.offset_from(regs_base) } as u32;
+            let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+            self.frames.push(Frame {
+                super_done: false,
+                args_obj: u32::MAX,
+                eval_scope: u32::MAX,
+                arg_win,
+                argc: argc as u16,
+                is_eval: false,
+                func: fid,
+                base: new_base,
+                ip: 0,
+                ret_dst: 0,
+                closure,
+                handlers: Vec::new(),
+                new_target,
+                callee: cv,
+            });
+        }
         self.jit_call_depth += 1;
         let regs_ptr = unsafe { self.regs.as_mut_ptr().add(new_base) } as *mut u64;
         let vm_ptr = self as *mut Vm as *mut core::ffi::c_void;
         // SAFETY: `entry` is `fid`'s Tier-C win64 code (mmap'd, never moves);
         // the window has `reg_count` valid slots; vm is valid.
-        let activation_token =
-            match self.enter_tierc_activation(closure, cv.heap_index(), true, upvals_raw) {
-                Some(token) => token,
-                None => {
-                    // All window writes are scratch above the caller. Keep the
-                    // initialized high-water mark (those slots remain valid), but
-                    // hide the window and take the emitted call site's ordinary
-                    // Frame-backed fallback before native/user effects.
-                    self.regs.truncate(new_base);
-                    self.jit_call_depth -= 1;
+        let activation_token = match self.enter_tierc_activation(
+            closure,
+            cv.heap_index(),
+            !needs_frame,
+            upvals_raw,
+        ) {
+            Some(token) => token,
+            None => {
+                // All window writes are scratch above the caller. Keep the
+                // initialized high-water mark (those slots remain valid), but
+                // hide the window and take the emitted call site's ordinary
+                // Frame-backed fallback before native/user effects.
+                if needs_frame {
+                    self.frames.pop();
+                }
+                self.regs.truncate(new_base);
+                self.jit_call_depth -= 1;
                     crate::vm::helpers_misc::crossstats::decline(
                         crate::vm::helpers_misc::crossstats::DECL_ACTIVATION,
                     );
@@ -654,8 +703,52 @@ impl<'p> Vm<'p> {
         };
         self.leave_tierc_activation(activation_token);
         let out = if bail == crate::codegen::NO_BAIL {
+            if needs_frame {
+                // B272: the native body completed; its frame carried no live
+                // handler (the brackets are balanced on a normal completion).
+                let popped = self.frames.pop();
+                debug_assert!(
+                    popped.as_ref().is_some_and(|f| f.base == new_base && f.func == fid),
+                    "B272: the frame-backed cross activation must pop its own frame"
+                );
+            }
             self.regs.truncate(new_base);
             bits
+        } else if needs_frame {
+            // B272: the frame is already in place — finish the activation on
+            // the interpreter exactly as the framed route would: a pending
+            // throw first unwinds to a handler AT OR ABOVE this frame (a
+            // `finally` in the body runs here; none means the frame is
+            // popped and the region exits to unwind), a guard bail resumes at
+            // the recorded ip.
+            let stop = self.frames.len() - 1;
+            self.frames[stop].ip = bail as usize;
+            let resumable = match self.pending_throw {
+                Some(tv) => {
+                    if self.unwind_to_handler(tv, stop) {
+                        self.pending_throw = None;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => true,
+            };
+            if resumable {
+                match self.run_loop(stop) {
+                    Ok(v) => {
+                        self.regs.truncate(new_base);
+                        v.bits()
+                    }
+                    Err(_) => {
+                        self.osr_deopt_exempt = true;
+                        CALL_THREW
+                    }
+                }
+            } else {
+                self.osr_deopt_exempt = true;
+                CALL_THREW
+            }
         } else if self.pending_throw.is_some() {
             // The callee's own (deeper) call threw and its native code
             // signalled unwind via a bail with the throw pending (the

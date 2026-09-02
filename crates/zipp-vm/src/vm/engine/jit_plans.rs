@@ -2075,10 +2075,14 @@ impl<'p> Vm<'p> {
                 || callee.is_async
                 || callee.rest_reg.is_some()
                 || callee.arguments_reg.is_some()
-                // B213: handler-op bodies never receive a cross entry, so a
+                // B213: handler-op bodies never received a cross entry, so a
                 // specialized attempt would decline on every call and the
                 // pend below would never resolve — take the framed path.
-                || (crate::codegen::handler_callee_skip_enabled()
+                // B272: they now receive a FRAME-BACKED entry the generic
+                // helper enters, so the site is planned (the CROSS3 arm
+                // builder still excludes them — emitted lanes are frame-free).
+                || (!crate::codegen::cross_framed_entry_enabled()
+                    && crate::codegen::handler_callee_skip_enabled()
                     && crate::codegen::proto_has_handler_ops(callee))
             {
                 continue; // could never hold a cross entry / needs setup_call

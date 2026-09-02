@@ -183,23 +183,14 @@ crosses. sparse-array (0.924×), regex-log-scan (0.953×) and npm-nanoid
 
 ## Highest-value next work
 
-0. **Handler-op bodies never receive a cross entry.** `diff` in
-   reactish-reconcile contains a `for...of` loop, whose iterator-close
-   bracket (`PushFinally`/`PopFinally`/`IterCloseFinally`/`EndFinally`) marks
-   the whole function handler-bearing; such bodies are statically denied a
-   cross entry because the emitted `push_finally` helper writes the ACTIVE
-   frame's handler stack and a frame-free activation has none. Every one of
-   diff's ~250k recursive calls per run therefore takes the framed route
-   (`dispatch_body` 5.5% + `setup_call` 1.9% + `run_loop` 1.3% of the row).
-   The bounded fix: let `jit_cross_call_impl` push the callee `Frame` EAGERLY
-   (the exact record its bail path already materializes) for a callee whose
-   entry is flagged handler-bearing, enter natively frame-backed
-   (`enter_tierc_activation(.., frame_free = false, ..)`), pop on a clean
-   return, and on a bail/throw set the frame's ip and continue the way the
-   framed path does; keep the emitted CROSS3 lane excluded for such bodies
-   (native code cannot push a frame) and keep `cross_entry()` hiding them from
-   every other helper. Expected: ~8% on reactish and a general win for any
-   hot callee with `for...of` or `try`.
+0. **Handler-op bodies on the emitted lanes.** B272 gives them a
+   frame-backed entry through the generic helper (reactish ~4-5%); two
+   follow-ups remain: an exception-edge-aware may-read-before-write pass so
+   the masked fast fill applies (today every such call pays the full
+   zero-fill `resize`, deliberately — see B272), and a frame-pushing variant
+   of the CROSS3 lane for
+   the recursive `diff`-shaped site, whose per-call helper cost (~20 ns) is
+   now the dominant remaining call overhead on that row.
 1. **React reconcile and warm router (`1.574×` / `1.563×`).** The birth/death
    pipeline dominates both (`free_slot`, `refit_finalized_inner`,
    `alloc_finalized`, `alloc_settled`, malloc/free ≈ 19–24% of each row);
