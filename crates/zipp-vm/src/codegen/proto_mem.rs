@@ -2910,7 +2910,10 @@ pub(crate) fn compile_proto_mem(
     // EVERY `MathOp` whose op was baked takes the direct guard, which reads
     // the callee's (and, for the BARE form, the receiver's) heap generation
     // through r13; the captured form always carried a `GetProp` that pinned
-    // r13 anyway, the bare form carries no other reader.
+    // r13 anyway, the bare form carries no other reader. The B205 random
+    // fuse is NOT in this set on purpose: its window is a `CallMethod`, and
+    // its version guards derive the base through the VM per access (a body
+    // entered via the cross3 lane inherits the caller's r13, pinned or not).
     let has_direct_math_guard = heap.math_imul_guard.is_some()
         && (proto.code.iter().any(|i| matches!(i, Instr::MathOp { .. }))
             || leaf_plan
@@ -3134,11 +3137,27 @@ pub(crate) fn compile_proto_mem(
                     // different occupant — the review's ABA finding), its
                     // settled shape, then the random own-slot by VALUE +
                     // VERSION (the B193 shape->vals->value form, hardened).
+                    //
+                    // The version reads derive the versions base THROUGH the
+                    // VM (`versions_raw`, re-cached at the table's sole growth
+                    // site), exactly as the hot-mirror probe below derives
+                    // its base. They must NOT read the pinned r13: this
+                    // window is a `CallMethod` in bytecode, so nothing in
+                    // `refetch_pinned` (GetProp/SetProp/method/leaf/MathOp)
+                    // pins r13 for a body whose only version reader is the
+                    // fuse — and a Tier-C body entered through the cross3
+                    // lane inherits the CALLER's r13, which is 0 when the
+                    // caller region pinned nothing (nanoid: `cmp DWORD
+                    // [r13 + Math*4]` faulted at r13 = 0 under
+                    // ZIPP_JIT_THRESHOLD=1). rcx is free until the shift
+                    // chain below; nothing between the load and the two
+                    // compares can grow the table.
                     ; mov rax, [r12 + (fp.math_slot as i32) * 8]
                     ; mov r10, QWORD fp.math_bits as i64
                     ; cmp rax, r10
                     ; jne => fb
-                    ; cmp DWORD [r13 + math_idx * 4], fp.math_ver as i32
+                    ; mov rcx, [rdi + crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32]
+                    ; cmp DWORD [rcx + math_idx * 4], fp.math_ver as i32
                     ; jne => fb
                     ; mov r10d, eax
                     ; mov r11, [rdi + crate::vm::host_api::JIT_HOT_MIRROR_RAW_OFFSET as i32]
@@ -3150,7 +3169,7 @@ pub(crate) fn compile_proto_mem(
                     ; mov r10, QWORD fp.random_bits as i64
                     ; cmp rax, r10
                     ; jne => fb
-                    ; cmp DWORD [r13 + random_idx * 4], fp.random_ver as i32
+                    ; cmp DWORD [rcx + random_idx * 4], fp.random_ver as i32
                     ; jne => fb
                     // State slot: Int-tagged (the first call after the
                     // double-literal seed bails once and settles it).
@@ -3175,8 +3194,10 @@ pub(crate) fn compile_proto_mem(
                         ; mov r10, QWORD ua.alph_bits as i64
                         ; cmp rcx, r10
                         ; jne => fb
-                        // B207: the alphabet string's version (ABA guard).
-                        ; cmp DWORD [r13 + alph_idx * 4], ua.alph_ver as i32
+                        // B207: the alphabet string's version (ABA guard) —
+                        // through the VM-mirrored base, never r13 (above).
+                        ; mov r11, [rdi + crate::vm::host_api::JIT_VERSIONS_RAW_OFFSET as i32]
+                        ; cmp DWORD [r11 + alph_idx * 4], ua.alph_ver as i32
                         ; jne => fb
                         ; mov [rbx + dreg(ua.dst_alph_b)], r10
                     );

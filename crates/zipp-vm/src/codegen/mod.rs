@@ -913,9 +913,12 @@ pub struct RandomScaleFusePlan {
     pub math_bits: u64,
     pub math_shape: u32,
     /// B207: heap versions of the Math object and the random-closure slot,
-    /// guarded via the pinned r13 versions base — a recycled heap index
-    /// bumps its version at reuse, so bits-equality can never resurrect a
-    /// stale plan against a DIFFERENT occupant (the review's ABA finding).
+    /// guarded through the VM-mirrored versions base (`versions_raw`, read
+    /// per access — NOT the pinned r13, which a fuse-only Tier-C body never
+    /// pins and a cross3-entered body inherits from its caller) — a recycled
+    /// heap index bumps its version at reuse, so bits-equality can never
+    /// resurrect a stale plan against a DIFFERENT occupant (the review's ABA
+    /// finding).
     pub math_ver: u32,
     pub random_ver: u32,
     pub random_slot: u32,
