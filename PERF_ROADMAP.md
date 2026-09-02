@@ -154,6 +154,23 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B265 REFUTED — slot resurrection (refit a dead literal shell in its slot)
+
+Built and measured, not landed. A pool-eligible literal shell stayed in its
+free slot at death (no tombstone write, no pool push) and the next literal was
+refit where it lay; a non-literal reuse evicted the shell into the pool. A
+first-N-deaths budget starved the mechanism (the LIFO free list buried the
+kept shells under later tombstones: shapes-stable kept 4,096, refit 0); a
+demand budget with a FIFO trim fixed the serve rate (refit 589k of 604k) and
+then lost: one-binary latch A/B allocation-survival **−4.8%** but shapes-stable
+**+15.7%**, shapes-megamorphic **+13.7%**, reactish-reconcile **+9.9%**,
+warm-router +2.0% (two-binary +6.5%); every normal row null; exact output and
+a 188-run identity sweep clean. B239's in-place refit from the pool had
+already removed the cost this design targeted; the per-death flag and queue
+writes and the eviction traffic on mixed rows cost more than the tombstone and
+pool round trip they replaced. The birth/death pipeline's remaining cost is
+not in slot bookkeeping. Do not re-derive this.
+
 ### B264 LANDED — inline pinned dense-Array store lane in MEM regions
 
 `ZIPP_NO_INLINE_DENSE_STORE=1` restores the helper-only route. Every `a[i] = v`
