@@ -743,7 +743,12 @@ where
     where
         F: Fn(&T) -> usize + Copy,
     {
-        pool.sort_unstable_by_key(|item| addr(item));
+        // B271: the fallback shape is a few long monotone runs (pool pops come
+        // off the sorted tail in descending order, fresh boxes arrive in
+        // roughly ascending order once the pool runs dry), which the
+        // run-detecting stable sort merges in about linear time; the
+        // unstable sort paid the full n log n for it.
+        pool.sort_by_key(|item| addr(item));
         false
     }
 
