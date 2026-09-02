@@ -136,6 +136,14 @@ all cross-engine-supported rows complete with exact output.
 - default JIT, interpreter-only, forced-JIT, and majors-only-GC identities are
   the conformance gate
 - tier-differential fuzzing remains mandatory for JIT work
+- 2026-09-02: the forced-JIT identity over the benchmark corpus found a
+  segfault the default threshold hid — the B205 random-scale fuse read the
+  versions table through an unpinned r13 when its Tier-C body was entered from
+  a CROSS3 caller (`nanoid` with a user `Math.random`); fixed in 18249988 by
+  deriving the base through the VM-mirrored `versions_raw`. Run the four-mode
+  output identity over every `bench/` and `tests/syntax-corpus` program (about
+  170 runs, two minutes) before merging any emitter change; a `refetch_pinned`
+  audit is the follow-up, since every r13 reader is enumerated by bytecode shape.
 
 Do not edit historical B entries merely because their old pass counts were
 correct for their own commit.
