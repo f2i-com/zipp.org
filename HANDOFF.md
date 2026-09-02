@@ -7,11 +7,11 @@ and the B001–B252 experiment ledger is preserved in
 
 ## Current engine baseline
 
-The v0.0.6 performance candidate includes the runtime work through `52645a0`,
-the tracked production WebAssembly rebuild at `f9bf8d3`, and the fail-closed
-same-suite harness repair at `c778292`. The production browser module is
-5,480,311 bytes raw, 1,825,812 gzip-9, and 1,233,575 Brotli-11, with SHA-256
-`318fc5cf7ee5d55751d829419d4de5af1ab2643b8f7fd30df2e3779c16ad1691`.
+Main is at v0.0.12 with the B263, B264 and B267 levers and the c28781cf
+canonical capture. The tracked production WebAssembly module was rebuilt from
+that engine (sandbox limits at their v0.0.10 sizes, B269's regex fix): the
+landing page ships 5,558,860 bytes raw, 1,812,458 gzip-9, 1,248,649
+Brotli-11, SHA-256 `bd8614fe5f3a3b8ef67f4b917cdefebb3fe69afa39a9804a0d3f6b0b6b267126`.
 
 ## v0.0.6 native interpreter / QuickJS-NG confirmation
 
@@ -201,7 +201,11 @@ crosses. sparse-array (0.924×), regex-log-scan (0.953×) and npm-nanoid
    bounded next step.
 5. **json-large (`1.022×`).** Parsed objects miss the object pool (a fresh
    `Box` and key `String` per object); the pooled birth is drafted as B268.
-6. **Interval prover.** Widening after pass 8 re-widens a compare-narrowed
+6. **Sandbox RegExp exec overhead.** After B269 a sticky `exec` costs about
+   13 µs in the WASM build against 4 µs natively (the spec `split` loop runs
+   one per character); the remaining per-exec work is the limited backtracker
+   setup, the transient reservation and the lastIndex property round trips.
+7. **Interval prover.** Widening after pass 8 re-widens a compare-narrowed
    loop bound inside the body, so `o + 2` keeps its i53 guard; head-only
    widening would free r13/r14 on more INT-GPR regions.
 

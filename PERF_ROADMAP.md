@@ -90,9 +90,9 @@ imply a WASM win.
 
 ### v0.0.6 exact-suite WASM status
 
-The committed production WebAssembly module is 5,480,311 bytes raw, 1,825,812
-gzip-9, and 1,233,575 Brotli-11, SHA-256
-`318fc5cf7ee5d55751d829419d4de5af1ab2643b8f7fd30df2e3779c16ad1691`.
+The committed production WebAssembly module is 5,558,860 bytes raw, 1,812,458
+gzip-9, and 1,248,649 Brotli-11, SHA-256
+`bd8614fe5f3a3b8ef67f4b917cdefebb3fe69afa39a9804a0d3f6b0b6b267126`.
 QuickJS-NG's official reactor is 1,528,293 raw / 417,087 Brotli-11, so Zipp is
 `3.586×` as large raw and `2.958×` as large at Brotli-11.
 
@@ -154,6 +154,24 @@ Do not edit historical B entries merely because their old pass counts were
 correct for their own commit.
 
 ## Latest experiment registry
+
+### B269 LANDED — RegExp exec under a heap ceiling stops auditing the heap
+
+The safe-sandbox profile sizes every RegExp exec's match limits from the
+remaining heap headroom, and that headroom read `heap_bytes()` — the exact
+audit walk over the whole heap — on EVERY exec. The spec `split` loop runs a
+sticky exec at almost every character, so `text.split(/[^a-z]+/)` over a
+400 KB string (~450,000 execs) took 208 s in the browser build against 44 ms
+natively; the landing page's text-processing example hit its deadline. The
+per-exec paths (`instrument_regex_limits`, the transient charge) now read the
+heap's O(1) resident figure plus the non-heap remainder the last exact audit
+cached (`heap_bytes_estimate`), so a ceiling set from the exact figure convicts
+at the same byte and only heap objects that grew in place wait for the strided
+preflight audit or a host-boundary read. Native safe-sandbox runner: 10,000 sticky execs 2,004 →
+230 ms; 60,000 global-exec matches from a 5 s timeout to 416 ms; the browser
+build's split 208 s → 5.9 s. `tests/regex_exec_heap_estimate.rs` pins exact
+counts and a generous wall-clock bound under a 256 MiB ceiling. Still open: the
+remaining ~13 µs per sandbox exec (4 µs natively).
 
 ### B268 NULL — `JSON.parse` object birth from a recycled shell
 
@@ -279,6 +297,7 @@ and tier suites (`reg_classes`, `jit_tier_parity`, `jit_tier_fuzz`,
 188-run four-mode output identity against node over every bench and
 syntax-corpus program. Canonical PGO capture at `b65aa353` (2026-09-02): parse-large-js **0.875× Node** (was 1.239× at `37c7fbfa`, 0.89× at `21288c1`), typedarray-math 0.729×, retained ten **0.903×** [0.899, 0.908], all 13 **0.628×**, hostile 0.836×, all 30 **0.739×** — every aggregate a series best; see the current-status table.
 
+Follow-up (2026-09-02): the interpreter-only array numeric callback classifier (`vm/array_ops.rs`, `cfg(not(jit))`) matches exact bytecode shapes, and the boolean class renumbered `x => x % 3 === 0` so its compare result lands in the last register; the FilterMod3 shape was updated to what the compiler emits, which had left the security workflow's safe-sandbox lib test red and the browser build's mod-3 filter lane unengaged since 07b400dc.
 ### B262 LANDED — `typeof` aliases fuse into `TypeOfIs`, answered inline from the tag
 
 `ZIPP_NO_TYPEOF_ALIAS=1` (compiler) and `ZIPP_NO_TYPEOF_IS_INLINE=1` (JIT)

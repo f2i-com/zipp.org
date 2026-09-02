@@ -173,6 +173,7 @@ impl<'p> Vm<'p> {
             frames: Vec::new(),
             #[cfg(feature = "instrument")]
             instr_rec: None,
+            heap_audit_extra: std::cell::Cell::new(0),
             #[cfg(feature = "instrument")]
             jit_steps: 0,
             output: Vec::new(),
@@ -698,6 +699,15 @@ impl<'p> Vm<'p> {
     /// This is also the public resident-byte figure: reporting and enforcement
     /// must not disagree about allocations that only the periodic audit sees.
     pub(crate) fn audit_heap_bytes(&self) -> usize {
+        let total = self.audit_heap_bytes_inner();
+        // `audit_resident_bytes` reconciles the heap's O(1) figure before
+        // returning, so the remainder is exactly the non-heap part.
+        self.heap_audit_extra
+            .set(total.saturating_sub(self.heap.resident_bytes()));
+        total
+    }
+
+    fn audit_heap_bytes_inner(&self) -> usize {
         // Grow/reuse the RegExp audit scratch first so vm_core_resident_bytes
         // below includes its current capacity in this same audit.
         let regex_program_bytes = self.regex_program_resident_bytes();
@@ -778,6 +788,18 @@ impl<'p> Vm<'p> {
     /// itself takes `&self` and is the single source of truth.
     pub(crate) fn heap_bytes(&self) -> usize {
         self.audit_heap_bytes()
+    }
+
+    /// The O(1) resident figure for headroom checks that run per operation
+    /// (the RegExp limits on every exec). It is the heap's own estimate plus
+    /// nothing else: VM-owned side tables are only counted by the audit walk,
+    /// which the strided preflight and host-boundary reads still perform.
+    #[cfg(feature = "safe-sandbox")]
+    #[inline]
+    pub(crate) fn heap_bytes_estimate(&self) -> usize {
+        self.heap
+            .resident_bytes()
+            .saturating_add(self.heap_audit_extra.get())
     }
 
     /// Force the JIT on/off (overrides the `ZIPP_NOJIT` default). Used by the

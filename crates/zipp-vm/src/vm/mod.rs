@@ -1280,6 +1280,13 @@ pub struct Vm<'p> {
     /// pointer in the hot struct rather than the recorder's whole footprint.
     #[cfg(feature = "instrument")]
     pub(crate) instr_rec: Option<Box<instrument::Recorder>>,
+    /// B269: what the last exact heap audit counted BEYOND the heap's own O(1)
+    /// resident figure (VM-owned side tables, frames, regex programs). The
+    /// per-operation headroom checks add it to the cheap figure, so between
+    /// audits they answer exactly what the audit did for everything but heap
+    /// objects that grew in place -- which is the case the strided audit exists
+    /// to reconcile.
+    pub(crate) heap_audit_extra: std::cell::Cell<usize>,
     /// Steps lent to the native tier, charged directly by compiled code as
     /// `sub QWORD [rdi + off], <block length>` — `rdi` is the VM pointer every
     /// region and whole-function body already holds, so this needs no spare

@@ -743,9 +743,18 @@ impl super::Vm<'_> {
             limits.max_steps = limits.max_steps.min(rec.remaining.max(0) as u64);
         }
         if rec.heap_limit != usize::MAX {
+            // The cheap resident figure, not the audit walk: this runs on
+            // EVERY RegExp exec, and `heap_bytes()` walks the whole heap. A
+            // sticky `split` over a 400 KB string performs ~450,000 execs,
+            // which the walk turned into 208 s in the browser build (44 ms
+            // natively). `heap_bytes_estimate` is the heap's O(1) figure plus
+            // the non-heap remainder the last exact audit cached, so between
+            // audits it equals the exact total for everything but heap
+            // objects that grew in place -- which the strided preflight
+            // audit and every host-boundary read reconcile.
             let headroom = rec
                 .heap_limit
-                .saturating_sub(self.heap_bytes())
+                .saturating_sub(self.heap_bytes_estimate())
                 .saturating_sub(transient);
             limits.max_memory_bytes = limits.max_memory_bytes.min(headroom);
             limits.max_backtrack_bytes = limits.max_backtrack_bytes.min(limits.max_memory_bytes);
@@ -789,8 +798,9 @@ impl super::Vm<'_> {
         let heap_available = if heap_limit == usize::MAX {
             usize::MAX
         } else {
+            // Per-exec path too (see `instrument_regex_limits`): the estimate.
             heap_limit
-                .saturating_sub(self.heap_bytes())
+                .saturating_sub(self.heap_bytes_estimate())
                 .saturating_sub(current)
         };
         if bytes > fixed_available.min(heap_available) {
