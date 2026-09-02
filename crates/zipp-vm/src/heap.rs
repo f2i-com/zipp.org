@@ -6587,6 +6587,7 @@ impl Heap {
     /// Whether a region may emit the inline dense-array store lane (B264): the
     /// nursery is on (so `gen` is materialised and a young holder provably
     /// needs no barrier) and the GC oracle is off (it counts helper stores).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     pub(crate) fn inline_store_lane_ok(&self) -> bool {
         self.nursery && !self.oracle
