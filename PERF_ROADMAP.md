@@ -154,6 +154,33 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B267 LANDED — `(x + y) | 0` fuses into the wrapping add in Tier C
+
+`ZIPP_NO_TRUNC_OR_FUSE=1` restores the three-op emission. A truncation-only
+`Add`/`AddInt` (B260's wrapping add) followed by `LoadInt 0; Bitwise Or` is
+the `| 0` idiom; on the Int path the add now stores its wrapped Int into the
+Or's destination (and the boxed 0 into the literal's register, so a later
+deopt sees the same frame) and jumps past both followers. The f64 and concat
+paths fall into the unchanged code. Admitted only when neither follower is a
+jump or handler target and no step meter charges blocks. Gate (2026-09-02,
+one binary, 16 pairs): calls-closures **−4.1%** [−6.7, −2.4] (two-binary
+−3.9% [−4.9, −2.9]); bytecode-vm, typedarray-math, parse-large-js,
+shapes-stable, json-large, warm-router null. `tests/trunc_or_fuse` is
+node-oracled over both operand orders, doubles, strings/objects/undefined
+operands, a deopt right after the triple and a loop-carried chain, in six
+modes; 188-run identity sweep clean.
+
+### B266 NULL — cross-function interning of equal string literals
+
+Built and measured, not landed. Equal literals in different functions shared
+one heap string through a content-keyed table beside the per-slot constant
+cache (interpreter and JIT constants alike, gated by the same per-function
+shareability rule), so the warm router's route names would compare by
+identity in `Map.get`. One-binary latch A/B over all 21 rows: warm-router
+−1.2% [−2.7, +0.1], every other row null, exact output. The router's Map
+lookups are not bounded by the byte compare; the cost sits in the intrinsic
+proof, the index lookup and the key hashing around it. Reverted.
+
 ### B265 REFUTED — slot resurrection (refit a dead literal shell in its slot)
 
 Built and measured, not landed. A pool-eligible literal shell stayed in its
