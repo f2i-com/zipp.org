@@ -27,16 +27,16 @@ tables; below `1.0×` is faster.
 
 ### Public canonical capture
 
-The public score is the clean four-engine PGO capture at `c28781cf`:
+The public score is the clean four-engine PGO capture at `8229b3fc`:
 
 | Corpus | Node | Bun | Deno | Node point wins |
 |---|---:|---:|---:|---:|
-| retained ten | **0.886×** [0.880, 0.892] | 0.757× [0.752, 0.764] | 0.770× [0.761, 0.778] | 8 / 10 |
-| diagnostics three | **0.189×** [0.186, 0.192] | 0.171× [0.169, 0.175] | 0.149× [0.146, 0.153] | 3 / 3 |
-| all 13 | **0.620×** [0.616, 0.624] | 0.537× [0.534, 0.542] | 0.527× [0.521, 0.532] | 11 / 13 |
-| hostile all 17, ordinary | **0.824×** [0.800, 0.838] | 0.657× [0.648, 0.666] | 0.429× [0.422, 0.436] | 10 / 17 |
-| hostile category-balanced | **0.860×** [0.834, 0.873] | 0.676× [0.663, 0.683] | 0.442× [0.435, 0.449] | — |
-| all 30, equal row weight | **0.729×** [0.716, 0.736] | 0.602× [0.597, 0.607] | 0.469× [0.464, 0.474] | 21 / 30 |
+| retained ten | **0.878×** [0.875, 0.884] | 0.752× [0.747, 0.755] | 0.765× [0.761, 0.774] | 8 / 10 |
+| diagnostics three | **0.186×** [0.183, 0.188] | 0.166× [0.164, 0.169] | 0.145× [0.143, 0.149] | 3 / 3 |
+| all 13 | **0.614×** [0.611, 0.617] | 0.531× [0.528, 0.533] | 0.521× [0.519, 0.526] | 11 / 13 |
+| hostile all 17, ordinary | **0.829×** [0.820, 0.833] | 0.647× [0.643, 0.655] | 0.419× [0.415, 0.423] | 10 / 17 |
+| hostile category-balanced | **0.862×** [0.852, 0.865] | 0.661× [0.656, 0.673] | 0.432× [0.429, 0.436] | — |
+| all 30, equal row weight | **0.728×** [0.723, 0.730] | 0.594× [0.591, 0.598] | 0.460× [0.458, 0.464] | 21 / 30 |
 
 Both source artifacts are `publishable:true`, `ALL_CORRECT=1`, use 15
 counterbalanced repetitions and 10,000 bootstrap samples, and have empty drift

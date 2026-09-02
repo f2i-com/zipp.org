@@ -7,9 +7,10 @@ and the B001–B252 experiment ledger is preserved in
 
 ## Current engine baseline
 
-Main is at v0.0.12 with the B263, B264 and B267 levers and the c28781cf
-canonical capture. The tracked production WebAssembly module was rebuilt from
-that engine (sandbox limits at their v0.0.10 sizes, B269's regex fix): the
+Main is at `8229b3fc`: v0.0.12 plus B263-B273, with the `8229b3fc` canonical
+capture (all-30 0.728× Node, 21/30 Node point wins). The tracked production
+WebAssembly module was rebuilt from the v0.0.12 engine with B269's regex fix
+(B270-B273 landed after it; rebuild the module at the next release): the
 landing page ships 5,558,860 bytes raw, 1,812,458 gzip-9, 1,248,649
 Brotli-11, SHA-256 `bd8614fe5f3a3b8ef67f4b917cdefebb3fe69afa39a9804a0d3f6b0b6b267126`.
 
@@ -118,8 +119,8 @@ silently replace it.
 
 The current raw captures are:
 
-- `bench/real13_c28781cf_pgo_2026-09-02.json`
-- `bench/hostile/head_clean_c28781cf_pgo_2026-09-02.json`
+- `bench/real13_8229b3fc_pgo_2026-09-02.json`
+- `bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json`
 
 Both use Node v24.12.0, Bun 1.3.14, Deno 2.6.10, and Zipp 0.0.11. Both report
 `publishable:true`, `ALL_CORRECT=1`, 15 complete counterbalanced repetitions,
@@ -148,22 +149,28 @@ false.
 
 ## Current Node gaps
 
+Canonical capture `8229b3fc` (2026-09-02); Zipp / Node paired cold medians.
+
 | Row | Zipp / Node | Descriptive 95% interval |
 |---|---:|---:|
-| reactish-reconcile | **1.574×** | [1.477, 1.618] |
-| warm-router | **1.563×** | [1.491, 1.638] |
-| allocation-survival | **1.484×** | [1.455, 1.670] |
-| shapes-megamorphic | **1.226×** | [1.169, 1.273] |
-| shapes-stable | **1.199×** | [1.126, 1.244] |
-| calls-closures | **1.100×** | [0.834, 1.120] |
-| async-promise-chain | **1.074×** | [1.057, 1.104] |
-| async-lived | **1.065×** | [1.015, 1.081] |
-| json-large | **1.022×** | [1.009, 1.031] |
+| reactish-reconcile | **1.578×** | [1.490, 1.608] |
+| allocation-survival | **1.559×** | [1.500, 1.594] |
+| warm-router | **1.520×** | [1.503, 1.592] |
+| shapes-megamorphic | **1.245×** | [1.204, 1.260] |
+| shapes-stable | **1.241×** | [1.226, 1.294] |
+| async-promise-chain | **1.118×** | [1.108, 1.132] |
+| calls-closures | **1.117×** | [1.068, 1.137] |
+| async-lived | **1.005×** | [0.969, 1.039] |
+| json-large | **1.005×** | [0.988, 1.034] |
 
-calls-closures is a point gap whose descriptive interval crosses parity;
-bytecode-vm (0.994× [0.967, 1.007]) is a point win whose interval also
-crosses. sparse-array (0.924×), regex-log-scan (0.953×) and npm-nanoid
-(0.966×) left the gap list with this capture.
+json-large and async-lived are point gaps whose intervals cross parity;
+bytecode-vm (0.978×) and npm-nanoid (0.975×) are point wins. All-30 node point
+wins: 21/30 (normal 11/13, hostile 10/17); all-30 equal-row geomean 0.728× Node
+[0.723, 0.730]. Relative to `c28781cf`: warm-router 1.563 → 1.520, async-lived
+1.065 → 1.005, json-large 1.022 → 1.005; allocation-survival 1.484 → 1.559 and
+shapes-stable 1.199 → 1.241 moved the other way with no covering mechanism (the
+one-binary latches of B270-B273 on the PGO binary are neutral or positive on
+both rows), i.e. PGO-profile and layout variation of the size the intervals show.
 
 ## Verification completed
 

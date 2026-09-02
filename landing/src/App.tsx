@@ -4,8 +4,8 @@ import { formatCount, relativeTime, useRepoStats, type RepoStats } from './repoS
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
 const F2I_URL = 'https://f2i.com'
 const DOCS_URL = `${GITHUB_URL}/blob/main/DOC.md#embedding`
-const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_c28781cf_pgo_2026-09-02.json`
-const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_c28781cf_pgo_2026-09-02.json`
+const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_8229b3fc_pgo_2026-09-02.json`
+const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json`
 const ROADMAP_URL = `${GITHUB_URL}/blob/main/PERF_ROADMAP.md`
 const RELEASE_URL = `${GITHUB_URL}/releases/tag/v0.0.12`
 const RELEASES_URL = `${GITHUB_URL}/releases`
@@ -305,46 +305,46 @@ type BenchmarkRow = {
   nodeRatio: number
 }
 
-// Canonical clean PGO capture at engine commit c28781cf (2026-09-02): cold wall
+// Canonical clean PGO capture at engine commit 8229b3fc (2026-09-02): cold wall
 // time medians in milliseconds over 15 counterbalanced repetitions, exact
 // output on every row. Zipp / Node is the paired median ratio; below 1 is a win.
 const benchmarkRows: BenchmarkRow[] = [
-  { id: 'async-promise-chain', name: 'Async / promises', group: 'headline', times: { node: 344.321, bun: 372.640, deno: 365.741, zipp: 369.366 }, nodeRatio: 1.074364005 },
-  { id: 'class-prototype-hot', name: 'Class / prototype', group: 'headline', times: { node: 302.386, bun: 339.084, deno: 331.811, zipp: 230.240 }, nodeRatio: 0.761261483 },
-  { id: 'json-large', name: 'JSON', group: 'headline', times: { node: 270.749, bun: 199.802, deno: 327.023, zipp: 277.751 }, nodeRatio: 1.022337801 },
-  { id: 'map-set-heavy', name: 'Map / Set', group: 'headline', times: { node: 695.556, bun: 821.199, deno: 1246.528, zipp: 624.996 }, nodeRatio: 0.890409164 },
-  { id: 'markdown-render', name: 'Markdown render', group: 'headline', times: { node: 271.002, bun: 213.136, deno: 317.642, zipp: 214.108 }, nodeRatio: 0.785775701 },
-  { id: 'parse-large-js', name: 'Parse JavaScript', group: 'headline', times: { node: 275.531, bun: 231.822, deno: 294.052, zipp: 239.741 }, nodeRatio: 0.874717990 },
-  { id: 'polymorphic-objects', name: 'Polymorphic objects', group: 'headline', times: { node: 335.470, bun: 337.432, deno: 343.557, zipp: 309.192 }, nodeRatio: 0.920789325 },
-  { id: 'regex-log-scan', name: 'RegExp log scan', group: 'headline', times: { node: 477.108, bun: 573.414, deno: 461.284, zipp: 456.106 }, nodeRatio: 0.953465853 },
-  { id: 'sparse-array', name: 'Sparse array', group: 'headline', times: { node: 81.134, bun: 101.361, deno: 129.746, zipp: 75.030 }, nodeRatio: 0.924017154 },
-  { id: 'typedarray-math', name: 'TypedArray math', group: 'headline', times: { node: 204.063, bun: 935.527, deno: 171.668, zipp: 147.258 }, nodeRatio: 0.718713786 },
-  { id: 'polymorphic-objects-v2', name: 'Polymorphic objects v2', group: 'diagnostic', times: { node: 85.234, bun: 88.551, deno: 135.266, zipp: 24.991 }, nodeRatio: 0.295598405 },
-  { id: 'property-ic-shapes', name: 'Property IC shapes', group: 'diagnostic', times: { node: 265.963, bun: 159.224, deno: 316.274, zipp: 10.278 }, nodeRatio: 0.038544299 },
-  { id: 'sparse-array-v2', name: 'Sparse array v2', group: 'diagnostic', times: { node: 172.310, bun: 375.362, deno: 188.775, zipp: 102.126 }, nodeRatio: 0.591381962 },
+  { id: 'async-promise-chain', name: 'Async / promises', group: 'headline', times: { node: 333.709, bun: 369.218, deno: 358.858, zipp: 372.081 }, nodeRatio: 1.117837201 },
+  { id: 'class-prototype-hot', name: 'Class / prototype', group: 'headline', times: { node: 296.712, bun: 332.470, deno: 329.464, zipp: 226.104 }, nodeRatio: 0.765493100 },
+  { id: 'json-large', name: 'JSON', group: 'headline', times: { node: 269.681, bun: 192.494, deno: 321.981, zipp: 270.987 }, nodeRatio: 1.005076903 },
+  { id: 'map-set-heavy', name: 'Map / Set', group: 'headline', times: { node: 783.680, bun: 855.047, deno: 1264.368, zipp: 671.598 }, nodeRatio: 0.836944805 },
+  { id: 'markdown-render', name: 'Markdown render', group: 'headline', times: { node: 268.494, bun: 207.260, deno: 315.656, zipp: 208.937 }, nodeRatio: 0.766882616 },
+  { id: 'parse-large-js', name: 'Parse JavaScript', group: 'headline', times: { node: 272.752, bun: 230.340, deno: 295.818, zipp: 232.997 }, nodeRatio: 0.858903804 },
+  { id: 'polymorphic-objects', name: 'Polymorphic objects', group: 'headline', times: { node: 327.670, bun: 331.062, deno: 339.806, zipp: 309.218 }, nodeRatio: 0.941870413 },
+  { id: 'regex-log-scan', name: 'RegExp log scan', group: 'headline', times: { node: 477.981, bun: 564.193, deno: 459.624, zipp: 447.904 }, nodeRatio: 0.937927904 },
+  { id: 'sparse-array', name: 'Sparse array', group: 'headline', times: { node: 81.067, bun: 112.802, deno: 129.281, zipp: 73.196 }, nodeRatio: 0.907736876 },
+  { id: 'typedarray-math', name: 'TypedArray math', group: 'headline', times: { node: 199.845, bun: 913.841, deno: 169.910, zipp: 144.073 }, nodeRatio: 0.719316384 },
+  { id: 'polymorphic-objects-v2', name: 'Polymorphic objects v2', group: 'diagnostic', times: { node: 81.101, bun: 87.345, deno: 131.428, zipp: 24.475 }, nodeRatio: 0.301551988 },
+  { id: 'property-ic-shapes', name: 'Property IC shapes', group: 'diagnostic', times: { node: 265.405, bun: 157.550, deno: 318.663, zipp: 9.578 }, nodeRatio: 0.036206078 },
+  { id: 'sparse-array-v2', name: 'Sparse array v2', group: 'diagnostic', times: { node: 171.083, bun: 366.301, deno: 183.858, zipp: 99.229 }, nodeRatio: 0.585244499 },
 ]
 
 // The 17-case hostile corpus from the same capture: closures, mixed locals,
 // shape churn, GC survival, async lifetimes, modules, a React-shaped kernel, a
 // warm router, a bytecode VM and vendored NanoID.
 const hostileRows: BenchmarkRow[] = [
-  { id: 'calls-baseline', name: 'Calls baseline', group: 'scope', times: { node: 35.438, bun: 48.138, deno: 88.908, zipp: 16.832 }, nodeRatio: 0.479671118 },
-  { id: 'calls-closures', name: 'Closure calls', group: 'scope', times: { node: 43.014, bun: 54.772, deno: 93.447, zipp: 45.877 }, nodeRatio: 1.099988047 },
-  { id: 'shapes-stable', name: 'Stable shapes', group: 'objects', times: { node: 40.083, bun: 60.690, deno: 92.940, zipp: 48.101 }, nodeRatio: 1.199181037 },
-  { id: 'shapes-megamorphic', name: 'Megamorphic shapes', group: 'objects', times: { node: 47.882, bun: 68.022, deno: 96.022, zipp: 58.374 }, nodeRatio: 1.226424684 },
-  { id: 'types-stable', name: 'Stable types', group: 'types', times: { node: 36.829, bun: 49.687, deno: 90.369, zipp: 18.509 }, nodeRatio: 0.516750981 },
-  { id: 'types-churn', name: 'Type churn', group: 'types', times: { node: 45.011, bun: 61.786, deno: 99.637, zipp: 33.581 }, nodeRatio: 0.747415271 },
-  { id: 'branch-control', name: 'Branch control', group: 'errors', times: { node: 39.286, bun: 51.767, deno: 90.098, zipp: 31.900 }, nodeRatio: 0.797849099 },
-  { id: 'throw-catch', name: 'Throw / catch', group: 'errors', times: { node: 314.566, bun: 93.826, deno: 106.533, zipp: 155.147 }, nodeRatio: 0.496536981 },
-  { id: 'allocation-ephemeral', name: 'Ephemeral allocation', group: 'allocation', times: { node: 37.099, bun: 70.767, deno: 91.069, zipp: 12.882 }, nodeRatio: 0.345696654 },
-  { id: 'allocation-survival', name: 'Allocation survival', group: 'allocation', times: { node: 59.055, bun: 75.793, deno: 113.320, zipp: 88.570 }, nodeRatio: 1.483715204 },
-  { id: 'async-burst', name: 'Async burst', group: 'async', times: { node: 54.811, bun: 54.611, deno: 107.089, zipp: 33.274 }, nodeRatio: 0.607391801 },
-  { id: 'async-lived', name: 'Long-lived async', group: 'async', times: { node: 41.538, bun: 67.951, deno: 93.018, zipp: 42.489 }, nodeRatio: 1.065282414 },
-  { id: 'reactish-reconcile', name: 'React-shaped reconcile', group: 'applications', times: { node: 45.225, bun: 67.760, deno: 99.424, zipp: 69.868 }, nodeRatio: 1.573522475 },
-  { id: 'warm-router', name: 'Warm router', group: 'server', times: { node: 46.045, bun: 70.003, deno: 101.505, zipp: 70.674 }, nodeRatio: 1.563177836 },
-  { id: 'bytecode-vm', name: 'Bytecode VM', group: 'endurance', times: { node: 44.249, bun: 56.427, deno: 95.007, zipp: 43.612 }, nodeRatio: 0.994103840 },
-  { id: 'module-hot-graph', name: 'Hot module graph', group: 'modules', times: { node: 41.952, bun: 51.150, deno: 94.788, zipp: 16.286 }, nodeRatio: 0.403273005 },
-  { id: 'npm-nanoid', name: 'npm nanoid', group: 'npm', times: { node: 86.019, bun: 98.589, deno: 127.279, zipp: 82.525 }, nodeRatio: 0.966236392 },
+  { id: 'calls-baseline', name: 'Calls baseline', group: 'scope', times: { node: 35.011, bun: 48.041, deno: 89.448, zipp: 16.645 }, nodeRatio: 0.484551966 },
+  { id: 'calls-closures', name: 'Closure calls', group: 'scope', times: { node: 40.840, bun: 54.905, deno: 95.804, zipp: 45.099 }, nodeRatio: 1.117471074 },
+  { id: 'shapes-stable', name: 'Stable shapes', group: 'objects', times: { node: 39.412, bun: 60.900, deno: 93.161, zipp: 49.122 }, nodeRatio: 1.240556978 },
+  { id: 'shapes-megamorphic', name: 'Megamorphic shapes', group: 'objects', times: { node: 46.973, bun: 66.623, deno: 102.152, zipp: 57.708 }, nodeRatio: 1.244923066 },
+  { id: 'types-stable', name: 'Stable types', group: 'types', times: { node: 35.607, bun: 49.166, deno: 91.632, zipp: 18.132 }, nodeRatio: 0.513822180 },
+  { id: 'types-churn', name: 'Type churn', group: 'types', times: { node: 44.496, bun: 61.416, deno: 98.173, zipp: 32.367 }, nodeRatio: 0.739798825 },
+  { id: 'branch-control', name: 'Branch control', group: 'errors', times: { node: 39.439, bun: 50.227, deno: 93.166, zipp: 31.451 }, nodeRatio: 0.828287808 },
+  { id: 'throw-catch', name: 'Throw / catch', group: 'errors', times: { node: 310.219, bun: 94.378, deno: 104.759, zipp: 154.263 }, nodeRatio: 0.497572259 },
+  { id: 'allocation-ephemeral', name: 'Ephemeral allocation', group: 'allocation', times: { node: 35.324, bun: 70.550, deno: 94.108, zipp: 12.778 }, nodeRatio: 0.359466993 },
+  { id: 'allocation-survival', name: 'Allocation survival', group: 'allocation', times: { node: 57.644, bun: 74.927, deno: 111.657, zipp: 88.851 }, nodeRatio: 1.558883643 },
+  { id: 'async-burst', name: 'Async burst', group: 'async', times: { node: 53.767, bun: 53.846, deno: 106.954, zipp: 33.021 }, nodeRatio: 0.612580589 },
+  { id: 'async-lived', name: 'Long-lived async', group: 'async', times: { node: 40.254, bun: 66.679, deno: 93.237, zipp: 40.176 }, nodeRatio: 1.005144446 },
+  { id: 'reactish-reconcile', name: 'React-shaped reconcile', group: 'applications', times: { node: 44.927, bun: 66.858, deno: 97.706, zipp: 69.853 }, nodeRatio: 1.578095226 },
+  { id: 'warm-router', name: 'Warm router', group: 'server', times: { node: 45.753, bun: 69.834, deno: 98.819, zipp: 69.247 }, nodeRatio: 1.520160112 },
+  { id: 'bytecode-vm', name: 'Bytecode VM', group: 'endurance', times: { node: 44.155, bun: 57.216, deno: 97.122, zipp: 42.976 }, nodeRatio: 0.978347456 },
+  { id: 'module-hot-graph', name: 'Hot module graph', group: 'modules', times: { node: 40.302, bun: 51.111, deno: 92.933, zipp: 16.179 }, nodeRatio: 0.401317326 },
+  { id: 'npm-nanoid', name: 'npm nanoid', group: 'npm', times: { node: 84.057, bun: 113.397, deno: 126.571, zipp: 81.913 }, nodeRatio: 0.974690733 },
 ]
 
 const nodeWins = (rows: BenchmarkRow[]) => rows.filter((row) => row.nodeRatio < 1).length
@@ -740,8 +740,8 @@ function App() {
   }, [])
 
   const liveWins = stats?.nodeWins ?? nodeWins(benchmarkRows) + nodeWins(hostileRows)
-  const liveAll30 = stats?.all30 ?? 0.729
-  const liveStartup = stats?.startupMs ?? 7.7
+  const liveAll30 = stats?.all30 ?? 0.728
+  const liveStartup = stats?.startupMs ?? 7.4
 
   const visibleBenchmarks = useMemo(
     () =>
@@ -1160,9 +1160,9 @@ function App() {
                 Native Windows x86-64 CLI, high-performance power mode. Cold wall time includes process launch;
                 15 paired repetitions with deterministically shuffled engine and benchmark order;
                 10,000 paired-bootstrap samples; exact-byte outputs. Node 24.12.0, Bun 1.3.14,
-                Deno 2.6.10, Zipp 0.0.11 at clean PGO source <code>c28781cf</code>; binary SHA-256
-                <code>0b3cfcd0…b7fab6</code>. Median startup: Zipp 7.7 ms, Node 30.6 ms, Bun 44.0 ms,
-                Deno 84.4 ms. The all-30 result gives equal weight to all normal and hostile rows;
+                Deno 2.6.10, Zipp 0.0.12 at clean PGO source <code>8229b3fc</code>; binary SHA-256
+                <code>bf9fddab…dc9986</code>. Median startup: Zipp 7.4 ms, Node 30.4 ms, Bun 43.3 ms,
+                Deno 82.6 ms. The all-30 result gives equal weight to all normal and hostile rows;
                 its bootstrap intervals are descriptive. Ratios above one remain point gaps even when an
                 interval crosses one. These native workloads are evidence, not a claim of universal
                 runtime superiority; they are not browser-WASM results.

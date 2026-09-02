@@ -29,9 +29,9 @@ implementation can be read end to end.
 
 | Strength | Current verified state |
 |---|---|
-| **Starts quickly** | **7.7 ms** median process launch in the canonical four-engine capture (Node 30.6 ms, Bun 44.0 ms, Deno 84.4 ms); no snapshot to load. |
+| **Starts quickly** | **7.4 ms** median process launch in the canonical four-engine capture (Node 30.4 ms, Bun 43.3 ms, Deno 82.6 ms); no snapshot to load. |
 | **Runs modern JavaScript** | **99.997% of test262**: 95,939 / 95,942 required executions. |
-| **Competes today** | Canonical equal-row all-30 geomean **0.729× Node**; normal all-13 **0.620×** and hostile all-17 **0.824×**. Lower is faster. |
+| **Competes today** | Canonical equal-row all-30 geomean **0.728× Node**; normal all-13 **0.614×** and hostile all-17 **0.829×**. Lower is faster. |
 | **Owns the stack** | Project-native parser, VM, GC, object model, regex fork, x86-64 JIT, and guarded ARM64 baseline JIT. |
 | **Measures honestly** | Exact stdout, counterbalanced runs, clean-source provenance, drift checks, confidence intervals, and a fail-closed publication policy. |
 | **Offers explicit trust profiles** | Maximum-throughput CLI, interpreter-only WebAssembly boundary, and a separately resolved hardened native runner. |
@@ -308,43 +308,43 @@ below.
 ### Canonical public capture
 
 The current public evidence is the clean PGO capture at engine commit
-`c28781cf`: [`real13_c28781cf_pgo_2026-09-02.json`](bench/real13_c28781cf_pgo_2026-09-02.json)
-and [`head_clean_c28781cf_pgo_2026-09-02.json`](bench/hostile/head_clean_c28781cf_pgo_2026-09-02.json).
+`8229b3fc`: [`real13_8229b3fc_pgo_2026-09-02.json`](bench/real13_8229b3fc_pgo_2026-09-02.json)
+and [`head_clean_8229b3fc_pgo_2026-09-02.json`](bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json).
 Both artifacts record `publishable:true`, `ALL_CORRECT=1`, 15 complete
 counterbalanced repetitions, 10,000 bootstrap samples, exact output, and no
 source, engine, input, environment, process-health, or harness drift.
 
-Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · Zipp 0.0.11 canonical PGO SHA-256
-`0b3cfcd0…b7fab6`.
+Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · Zipp 0.0.12 canonical PGO SHA-256
+`bf9fddab…dc9986`.
 
 Cold medians include process launch; bold marks the lowest displayed median.
 
 | Retained benchmark | Node | Bun | Deno | Zipp | Zipp / Node |
 |---|---:|---:|---:|---:|---:|
-| async-promise-chain | **344 ms** | 373 ms | 366 ms | 369 ms | 1.07× |
-| class-prototype-hot | 302 ms | 339 ms | 332 ms | **230 ms** | **0.76×** |
-| json-large | 271 ms | **200 ms** | 327 ms | 278 ms | 1.02× |
-| map-set-heavy | 696 ms | 821 ms | 1,247 ms | **625 ms** | **0.89×** |
-| markdown-render | 271 ms | **213 ms** | 318 ms | 214 ms | **0.79×** |
-| parse-large-js | 276 ms | **232 ms** | 294 ms | 240 ms | **0.88×** |
-| polymorphic-objects | 335 ms | 337 ms | 344 ms | **309 ms** | **0.92×** |
-| regex-log-scan | 477 ms | 573 ms | 461 ms | **456 ms** | **0.95×** |
-| sparse-array | 81 ms | 101 ms | 130 ms | **75 ms** | **0.92×** |
-| typedarray-math | 204 ms | 936 ms | 172 ms | **147 ms** | **0.72×** |
-| **Zipp / engine paired geomean** | **0.886×** [0.880, 0.892] | **0.757×** [0.752, 0.764] | **0.770×** [0.761, 0.778] | — | — |
+| async-promise-chain | **334 ms** | 369 ms | 359 ms | 372 ms | 1.12× |
+| class-prototype-hot | 297 ms | 332 ms | 329 ms | **226 ms** | **0.77×** |
+| json-large | 270 ms | **192 ms** | 322 ms | 271 ms | 1.01× |
+| map-set-heavy | 784 ms | 855 ms | 1,264 ms | **672 ms** | **0.84×** |
+| markdown-render | 268 ms | **207 ms** | 316 ms | 209 ms | **0.77×** |
+| parse-large-js | 273 ms | **230 ms** | 296 ms | 233 ms | **0.86×** |
+| polymorphic-objects | 328 ms | 331 ms | 340 ms | **309 ms** | **0.94×** |
+| regex-log-scan | 478 ms | 564 ms | 460 ms | **448 ms** | **0.94×** |
+| sparse-array | 81 ms | 113 ms | 129 ms | **73 ms** | **0.91×** |
+| typedarray-math | 200 ms | 914 ms | 170 ms | **144 ms** | **0.72×** |
+| **Zipp / engine paired geomean** | **0.878×** [0.875, 0.884] | **0.752×** [0.747, 0.755] | **0.765×** [0.761, 0.774] | — | — |
 
 The three architecture diagnostics remain outside the retained-ten headline:
 
 | Diagnostic | Node | Bun | Deno | Zipp | Zipp / Node |
 |---|---:|---:|---:|---:|---:|
-| polymorphic-objects-v2 | 85 ms | 89 ms | 135 ms | **25 ms** | **0.30×** |
-| property-ic-shapes | 266 ms | 159 ms | 316 ms | **10 ms** | **0.04×** |
-| sparse-array-v2 | 172 ms | 375 ms | 189 ms | **102 ms** | **0.59×** |
-| **Zipp / engine paired geomean** | **0.189×** [0.186, 0.192] | **0.171×** [0.169, 0.175] | **0.149×** [0.146, 0.153] | — | — |
+| polymorphic-objects-v2 | 81 ms | 87 ms | 131 ms | **24 ms** | **0.30×** |
+| property-ic-shapes | 265 ms | 158 ms | 319 ms | **10 ms** | **0.04×** |
+| sparse-array-v2 | 171 ms | 366 ms | 184 ms | **99 ms** | **0.59×** |
+| **Zipp / engine paired geomean** | **0.186×** [0.183, 0.188] | **0.166×** [0.164, 0.169] | **0.145×** [0.143, 0.149] | — | — |
 
-Across all 13 normal rows, Zipp measures **0.620× Node** [0.616, 0.624],
-**0.537× Bun** [0.534, 0.542], and **0.527× Deno** [0.521, 0.532]. It wins
-33 of 39 point comparisons and 29 of 39 Bonferroni exact-sign comparisons.
+Across all 13 normal rows, Zipp measures **0.614× Node** [0.611, 0.617],
+**0.531× Bun** [0.528, 0.533], and **0.521× Deno** [0.519, 0.526]. It wins
+33 of 39 point comparisons and 31 of 39 Bonferroni exact-sign comparisons.
 
 The separately measured 17-case hostile corpus covers closures, mixed locals,
 shape churn, GC survival, async lifetimes, modules, a React-shaped kernel, a
@@ -352,12 +352,12 @@ warm router, a JavaScript bytecode VM, and vendored NanoID:
 
 | Hostile metric | vs Node | vs Bun | vs Deno |
 |---|---:|---:|---:|
-| ordinary equal-row geomean | **0.824×** [0.800, 0.838] | **0.657×** [0.648, 0.666] | **0.429×** [0.422, 0.436] |
-| category-balanced geomean | **0.860×** [0.834, 0.873] | **0.676×** [0.663, 0.683] | **0.442×** [0.435, 0.449] |
+| ordinary equal-row geomean | **0.829×** [0.820, 0.833] | **0.647×** [0.643, 0.655] | **0.419×** [0.415, 0.423] |
+| category-balanced geomean | **0.862×** [0.852, 0.865] | **0.661×** [0.656, 0.673] | **0.432×** [0.429, 0.436] |
 
 For the requested project-wide view, the explicit equal-row aggregate across
-all 30 normal and hostile rows is **0.729× Node** [0.716, 0.736], **0.602× Bun**
-[0.597, 0.607], and **0.469× Deno** [0.464, 0.474]. It is calculated as
+all 30 normal and hostile rows is **0.728× Node** [0.723, 0.730], **0.594× Bun**
+[0.591, 0.598], and **0.460× Deno** [0.458, 0.464]. It is calculated as
 `exp((13 × ln(G13) + 17 × ln(G17)) / 30)`; its descriptive bootstrap resamples
 the two separately captured suites as independent strata.
 
@@ -365,7 +365,7 @@ The aggregate is ahead, but the literal every-row target is not met. Zipp has
 21 of 30 Node point wins. The current Node point gaps are async promises and
 JSON in the normal set, plus closure calls, both shape stressors, allocation
 survival, long-lived async, React reconcile, and the warm router in the hostile
-set (the closure-call and JSON intervals sit within a few percent of parity).
+set (the JSON and long-lived async intervals cross parity; both are 1.005×).
 The hostile guide reports each ratio rather than hiding these behind the
 geomean.
 
@@ -374,10 +374,15 @@ FASTER_THAN_NODE_ON_EVERY_ROW=0
 FASTER_THAN_EVERY_ENGINE_ON_EVERY_ROW=0
 ```
 
-The `c28781cf` engine adds the inline pinned dense-Array store lane (a young
-holder needs no barrier; sparse-array 1.01× → 0.92×), fuses `| 0` into the
-wrapping add it truncates (calls-closures 1.18× → 1.10×), and keeps B263's
-register classes that returned parse-large-js to the integer tier. See the
+The `8229b3fc` engine keeps the `c28781cf` levers (the inline dense-Array
+store lane, the fused `| 0` add, B263's register classes) and adds B269-B273:
+RegExp exec under a heap ceiling no longer walks the heap per exec, the recycle
+pool's fallback sort is run-adaptive, a function that reaches itself through a
+captured cell gets the native cross lane, bodies with `for...of` or `try`
+receive a frame-backed cross entry instead of the interpreter trampoline, and
+small holders take the holder-grain write barrier so an overwritten young value
+no longer floats into old space. Each landed with a one-binary latch A/B; the
+capture-to-capture row moves sit inside the intervals. See the
 [`bench` guide](bench/README.md), [hostile suite](bench/hostile/README.md), and
 [`PERF_ROADMAP.md`](PERF_ROADMAP.md) for exact methodology and remaining work.
 
