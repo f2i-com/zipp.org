@@ -142,6 +142,51 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B262 LANDED — `typeof` aliases fuse into `TypeOfIs`, answered inline from the tag
+
+`ZIPP_NO_TYPEOF_ALIAS=1` (compiler) and `ZIPP_NO_TYPEOF_IS_INLINE=1` (JIT)
+restore the old lowering. `var t = typeof v` over two plain locals records a
+compile-time fact; a following `t ===/!==/==/!= "lit"` lowers to
+`TypeOfIs {a: v}` and a `TypeOf` nobody reads to `LoadUndefined`. Facts die on
+any emitted write to either register, at the end of the enclosing statement,
+on loop/switch/try entry, in each case/catch/finally body and after a `for`
+init; sloppy parameters are refused once `arguments` is mentioned. In both JIT
+tiers a non-heap tag answers `TypeOfIs` with a constant store (double/Int →
+number, Bool, Undefined-tagged, exact null → object); heap values still call
+`jit_typeof_is`. json-large's `walk` now runs two `TypeOfIs` where it ran one
+`TypeOf` and three `LoadConst`/`Eq` pairs.
+
+Gate (2026-09-02, one binary at `e46c7e69`, 21 interleaved pairs, exact
+output): json-large **−2.6%** [−4.2, −2.3]; markdown-render +0.3% [−1.0, +1.0],
+polymorphic-objects −0.4% [−1.0, +0.7], parse-large-js −0.4% [−0.6, +0.5]
+(null). Correctness: a 206-run four-mode output identity against node over
+every normal, hostile, PGO-training and syntax-corpus program (the one
+mismatch is the pre-existing forced-JIT segfault on the nanoid row, below);
+`tests/typeof_alias.rs` spawns children under every latch and mode;
+`jit_tier_fuzz`, `jit_tier_parity`, `instr_uses_exhaustive`, `local_sroa`,
+`real_program_corpus` and the accumulator suites pass (`accum_may_read`
+gained `IsArray`/`ForInKeys`/`LenOf`/`ForInLive`).
+
+### B261 LANDED — JSON views parser-proved ASCII as `&str` and parses short integers directly
+
+`ZIPP_NO_JSON_ASCII_UNCHECKED=1` restores every `from_utf8`;
+`ZIPP_NO_JSON_INT_FAST=1` restores `parse::<f64>` for every number token. The
+plain-key scanner tracks whether any byte was ≥ 0x80 and takes an unchecked
+`&str` view for ASCII names; number tokens are ASCII by grammar; the
+serializer passes the flat string's `ascii` flag so ASCII values take the
+`&str` quoter without a second validation or a per-byte surrogate probe. A
+`-?digits` token of at most 15 digits accumulates as `u64` and converts
+exactly (`-0` stays a negative-zero double). The hardened profile keeps the
+checked conversion.
+
+Gate (2026-09-02, one binary at `e46c7e69`, 21 interleaved pairs, exact
+output): json-large **−2.8%** [−3.6, −1.3]; markdown-render +1.2% [−0.3, +2.2],
+parse-large-js −0.0% [−0.7, +0.3] (null). Both JSON levers together against
+the `ab1f85b3` base: json-large −3.7% [−4.7, −1.5], regex-log-scan −0.3%,
+shapes-stable −0.3%, calls-closures −0.4%. Measured and declined:
+`ZIPP_SHAPESTATS` shows the shape tree at its 4,096-node cap with ~1,800
+distinct keys on this row, so a key-sequence shape cache would not hit.
+
 ### B260 LANDED — the i32 add whose only observer is a ToInt32 truncation wraps
 
 `ZIPP_NO_INT32_TRUNC_ADD=1` restores the overflow branch. calls-closures spent
