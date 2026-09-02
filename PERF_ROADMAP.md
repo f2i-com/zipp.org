@@ -142,6 +142,32 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B258 LANDED — pooled literal shells keep their slab value cell
+
+`ZIPP_NO_SHELL_CELL=1` restores the old path. Every finalize-born literal paid
+a decoupled slab round-trip per object: the sweep's `free_slot` returned the
+dying shell's value cell to its class free list (`strip_slab` → `free_cell`)
+before pooling the shell, and the very next `alloc_finalized_thin` popped a cell
+straight back out (`alloc_cell`, 2.3% of shapes-stable's samples on its own) to
+refit that same shell. A pool-bound shell now keeps its cell at death; the thin
+birth path pops the shell first and copies the new values into the cell in
+place when the class matches, stripping on a mismatch, at the general
+`alloc_finalized` path, and at the courier trim, so the courier never sees a
+cell. Folded into `Heap::shell_cell` with the B257 thin fold; every non-thin
+configuration keeps its exact old path.
+
+Gate (2026-09-02, one binary at `51019ac2`, 21 interleaved pairs, exact
+output): shapes-stable **−4.1%** [−6.3, −1.7], shapes-megamorphic **−2.0%**
+[−3.3, −1.0], warm-router **−2.2%** [−3.9, −1.0], reactish-reconcile **−1.3%**
+[−2.3, −0.4], allocation-survival −0.7% [−3.4, +2.9] (null); object-row geomean
+0.9795× [−3.18%, −0.95%]. Two-binary control against the `70702c84` base:
+json-large +0.7% [−0.6, +1.1], calls-closures +0.6% [−0.9, +1.6] (both cross
+parity), shapes-stable −3.5% [−5.6, −2.8]. `tests/shell_cell.rs` pins the
+in-place fill, the mismatch strip and mode parity; `[shellcell]` counters under
+`ZIPP_GCSTATS=1`. B257 (the thin literal-allocation paths, `ZIPP_NO_THIN_ALLOC`)
+landed in the v0.0.6 release without a registry entry; its latch and counters
+are documented in `heap.rs`.
+
 ### B256 LANDED — dense-array pin snapshots stay warm across stores and helper calls
 
 Commit `b1435c7`. PC-profiling the object-lifetime cluster (a `profiling`
