@@ -27,27 +27,28 @@ tables; below `1.0×` is faster.
 
 ### Public canonical capture
 
-The public score is the clean four-engine PGO capture at `b65aa353`:
+The public score is the clean four-engine PGO capture at `c28781cf`:
 
 | Corpus | Node | Bun | Deno | Node point wins |
 |---|---:|---:|---:|---:|
-| retained ten | **0.903×** [0.899, 0.908] | 0.771× [0.767, 0.776] | 0.784× [0.777, 0.790] | 7 / 10 |
-| diagnostics three | **0.187×** [0.183, 0.189] | 0.166× [0.165, 0.169] | 0.147× [0.144, 0.149] | 3 / 3 |
-| all 13 | **0.628×** [0.624, 0.631] | 0.541× [0.539, 0.545] | 0.533× [0.528, 0.537] | 10 / 13 |
-| hostile all 17, ordinary | **0.836×** [0.820, 0.843] | 0.662× [0.652, 0.667] | 0.434× [0.430, 0.438] | 10 / 17 |
-| hostile category-balanced | **0.870×** [0.854, 0.876] | 0.678× [0.664, 0.683] | 0.447× [0.443, 0.451] | — |
-| all 30, equal row weight | **0.739×** [0.730, 0.742] | 0.607× [0.601, 0.610] | 0.474× [0.471, 0.477] | 20 / 30 |
+| retained ten | **0.886×** [0.880, 0.892] | 0.757× [0.752, 0.764] | 0.770× [0.761, 0.778] | 8 / 10 |
+| diagnostics three | **0.189×** [0.186, 0.192] | 0.171× [0.169, 0.175] | 0.149× [0.146, 0.153] | 3 / 3 |
+| all 13 | **0.620×** [0.616, 0.624] | 0.537× [0.534, 0.542] | 0.527× [0.521, 0.532] | 11 / 13 |
+| hostile all 17, ordinary | **0.824×** [0.800, 0.838] | 0.657× [0.648, 0.666] | 0.429× [0.422, 0.436] | 10 / 17 |
+| hostile category-balanced | **0.860×** [0.834, 0.873] | 0.676× [0.663, 0.683] | 0.442× [0.435, 0.449] | — |
+| all 30, equal row weight | **0.729×** [0.716, 0.736] | 0.602× [0.597, 0.607] | 0.469× [0.464, 0.474] | 21 / 30 |
 
 Both source artifacts are `publishable:true`, `ALL_CORRECT=1`, use 15
 counterbalanced repetitions and 10,000 bootstrap samples, and have empty drift
 and failure lists. The all-30 interval is a stratified descriptive bootstrap:
 normal and hostile repetitions are resampled independently, while every row
 inside one suite shares the same repetition indices. Every aggregate is a
-series best; the previous canonical pair (`21288c1`, 2026-08-30) read 0.921× /
-0.192× / 0.642× / 0.881× / 0.913× / 0.768×.
+series best; the previous canonical pair (`b65aa353`, earlier on 2026-09-02)
+read 0.903× / 0.187× / 0.628× / 0.836× / 0.870× / 0.739×, and `21288c1`
+(2026-08-30) 0.921× / 0.192× / 0.642× / 0.881× / 0.913× / 0.768×.
 
-Across Node, Bun, and Deno, the normal suite has 32 / 39 point and 31 / 39
-exact-sign wins; hostile has 40 / 51 point and 36 / 51 exact-sign wins. The
+Across Node, Bun, and Deno, the normal suite has 33 / 39 point and 29 / 39
+exact-sign wins; hostile has 39 / 51 point and 34 / 51 exact-sign wins. The
 literal all-row target remains false. See
 [`README.md`](README.md#performance-measured-honestly) for the tables and raw
 artifact links.

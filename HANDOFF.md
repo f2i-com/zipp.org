@@ -118,22 +118,22 @@ silently replace it.
 
 The current raw captures are:
 
-- `bench/real13_b65aa353_pgo_2026-09-02.json`
-- `bench/hostile/head_clean_b65aa353_pgo_2026-09-02.json`
+- `bench/real13_c28781cf_pgo_2026-09-02.json`
+- `bench/hostile/head_clean_c28781cf_pgo_2026-09-02.json`
 
-Both use Node v24.12.0, Bun 1.3.14, Deno 2.6.10, and Zipp 0.0.10. Both report
+Both use Node v24.12.0, Bun 1.3.14, Deno 2.6.10, and Zipp 0.0.11. Both report
 `publishable:true`, `ALL_CORRECT=1`, 15 complete counterbalanced repetitions,
 10,000 bootstrap samples, and empty provenance, publication, correctness,
 health, source-drift, engine-drift, input-drift, and harness-drift failures.
 
 | Corpus | vs Node | vs Bun | vs Deno |
 |---|---:|---:|---:|
-| retained ten | **0.903×** [0.899, 0.908] | 0.771× [0.767, 0.776] | 0.784× [0.777, 0.790] |
-| diagnostics three | **0.187×** [0.183, 0.189] | 0.166× [0.165, 0.169] | 0.147× [0.144, 0.149] |
-| normal all 13 | **0.628×** [0.624, 0.631] | 0.541× [0.539, 0.545] | 0.533× [0.528, 0.537] |
-| hostile all 17 | **0.836×** [0.820, 0.843] | 0.662× [0.652, 0.667] | 0.434× [0.430, 0.438] |
-| hostile category-balanced | **0.870×** [0.854, 0.876] | 0.678× [0.664, 0.683] | 0.447× [0.443, 0.451] |
-| all 30, equal row weight | **0.739×** [0.730, 0.742] | 0.607× [0.601, 0.610] | 0.474× [0.471, 0.477] |
+| retained ten | **0.886×** [0.880, 0.892] | 0.757× [0.752, 0.764] | 0.770× [0.761, 0.778] |
+| diagnostics three | **0.189×** [0.186, 0.192] | 0.171× [0.169, 0.175] | 0.149× [0.146, 0.153] |
+| normal all 13 | **0.620×** [0.616, 0.624] | 0.537× [0.534, 0.542] | 0.527× [0.521, 0.532] |
+| hostile all 17 | **0.824×** [0.800, 0.838] | 0.657× [0.648, 0.666] | 0.429× [0.422, 0.436] |
+| hostile category-balanced | **0.860×** [0.834, 0.873] | 0.676× [0.663, 0.683] | 0.442× [0.435, 0.449] |
+| all 30, equal row weight | **0.729×** [0.716, 0.736] | 0.602× [0.597, 0.607] | 0.469× [0.464, 0.474] |
 
 The all-30 point is
 `exp((13 × ln(G13) + 17 × ln(G17)) / 30)`. Its 10,000-sample descriptive
@@ -141,32 +141,29 @@ bootstrap shares resampled repetition indices within a suite and resamples the
 normal and hostile captures independently. It is not a hypothesis test and does
 not estimate machine-to-machine variability.
 
-Normal has 32 / 39 point and 31 / 39 Bonferroni exact-sign wins across all
-competitors; hostile has 40 / 51 point and 36 / 51 exact-sign wins. Against
-Node alone, Zipp has 20 / 30 point wins. The literal all-row target remains
+Normal has 33 / 39 point and 29 / 39 Bonferroni exact-sign wins across all
+competitors; hostile has 39 / 51 point and 34 / 51 exact-sign wins. Against
+Node alone, Zipp has 21 / 30 point wins. The literal all-row target remains
 false.
 
 ## Current Node gaps
 
 | Row | Zipp / Node | Descriptive 95% interval |
 |---|---:|---:|
-| reactish-reconcile | **1.563×** | [1.533, 1.580] |
-| allocation-survival | **1.548×** | [1.471, 1.606] |
-| warm-router | **1.493×** | [1.240, 1.530] |
-| shapes-megamorphic | **1.249×** | [1.231, 1.293] |
-| shapes-stable | **1.239×** | [1.141, 1.251] |
-| calls-closures | **1.177×** | [1.155, 1.206] |
-| async-promise-chain | **1.137×** | [1.116, 1.162] |
-| json-large | **1.042×** | [1.006, 1.049] |
-| sparse-array | **1.011×** | [0.997, 1.020] |
-| bytecode-vm | **1.008×** | [0.999, 1.028] |
+| reactish-reconcile | **1.574×** | [1.477, 1.618] |
+| warm-router | **1.563×** | [1.491, 1.638] |
+| allocation-survival | **1.484×** | [1.455, 1.670] |
+| shapes-megamorphic | **1.226×** | [1.169, 1.273] |
+| shapes-stable | **1.199×** | [1.126, 1.244] |
+| calls-closures | **1.100×** | [0.834, 1.120] |
+| async-promise-chain | **1.074×** | [1.057, 1.104] |
+| async-lived | **1.065×** | [1.015, 1.081] |
+| json-large | **1.022×** | [1.009, 1.031] |
 
-sparse-array and bytecode-vm are point gaps whose descriptive intervals cross
-parity; async-lived (0.984× [0.778, 1.033]) and npm-nanoid (0.991× [0.969,
-1.028]) are point wins whose intervals also cross parity. Do not describe any
-of the four as supported either way, but keep the two gaps in the literal
-point-estimate inventory. regex-log-scan (0.932×) left the gap list with this
-capture.
+calls-closures is a point gap whose descriptive interval crosses parity;
+bytecode-vm (0.994× [0.967, 1.007]) is a point win whose interval also
+crosses. sparse-array (0.924×), regex-log-scan (0.953×) and npm-nanoid
+(0.966×) left the gap list with this capture.
 
 ## Verification completed
 
@@ -186,22 +183,27 @@ capture.
 
 ## Highest-value next work
 
-1. **React reconcile and warm router (`1.563×` / `1.493×`).** Re-profile at
-   `b65aa353` and split call dispatch from property/string/allocation costs
-   before designing a lane; the B256 maps in the session scratchpad are the
-   starting point.
-2. **Allocation survival (`1.548×`).** Separate promotion, survivor tracing,
-   free-list, and pool-maintenance costs; the ephemeral row is already 0.36×.
-3. **Stable and megamorphic shapes (`1.239×` / `1.249×`).** Their similar gaps
-   make a purely polymorphic-IC explanation unlikely; compare counters directly.
-4. **Closure calls and async promises (`1.177×`, `1.137×`).** Price one
-   mechanism at a time and require both full safety suites after each candidate.
-5. **Near-parity rows.** Only pursue JSON, sparse arrays, or bytecode-vm when a
-   cheap isolated term is visible; avoid trading away larger wins.
-6. **Register allocation follow-ups (B263).** The interval prover re-widens a
-   compare-narrowed loop bound inside the body (widening applies at every
-   merge after pass 8), so `o + 2` keeps its i53 guard; a widening restricted
-   to loop heads would free r13/r14 on more INT-GPR regions.
+1. **React reconcile and warm router (`1.574×` / `1.563×`).** The birth/death
+   pipeline dominates both (`free_slot`, `refit_finalized_inner`,
+   `alloc_finalized`, `alloc_settled`, malloc/free ≈ 19–24% of each row);
+   B265's slot resurrection lost, so the next design must remove work from the
+   pool refit or the sweep itself, not move it. The router's Map path (about
+   21%) is the intrinsic proof plus index lookup plus key hashing — B266
+   showed the byte compare is not it.
+2. **Allocation survival (`1.484×`).** `free_slot` 12%, `trace_edges` 6%,
+   `jit_get_index` 4% (Tier C reads `this.values[i]` through a helper), the
+   method-call ICs 5.6%.
+3. **Stable and megamorphic shapes (`1.199×` / `1.226×`).** Now the same
+   alloc pipeline; B264 removed the store helper.
+4. **Async (`1.074×`, `1.065×`).** partA's `p.then(addOne)` loop is declined
+   by the call-mix gate (a native-callee site); partB's `await` body is
+   interpreted by the async tier gate. A native `then` lane in regions is the
+   bounded next step.
+5. **json-large (`1.022×`).** Parsed objects miss the object pool (a fresh
+   `Box` and key `String` per object); the pooled birth is drafted as B268.
+6. **Interval prover.** Widening after pass 8 re-widens a compare-narrowed
+   loop bound inside the body, so `o + 2` keeps its i53 guard; head-only
+   widening would free r13/r14 on more INT-GPR regions.
 
 ## Commands for the next session
 
