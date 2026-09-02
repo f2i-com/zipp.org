@@ -1580,6 +1580,18 @@ impl PropAttrs {
         }
     }
 
+    /// The accessor bit alone — no `PropAttr` built, no `assert!` formatting
+    /// in the inlined body (which is what keeps `at` out of line on hot
+    /// re-checks). `false` for every slot of an all-default map and for an
+    /// out-of-range `i`; callers wanting a range panic use `at`.
+    #[inline]
+    fn is_accessor(&self, i: usize) -> bool {
+        match self {
+            PropAttrs::AllData { .. } => false,
+            PropAttrs::Mixed(v) => v.get(i).is_some_and(|a| a.accessor),
+        }
+    }
+
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     #[inline]
     fn get(&self, i: usize) -> Option<PropAttr> {
@@ -1725,6 +1737,14 @@ impl ObjMap {
     #[inline]
     pub fn attr_at(&self, i: usize) -> PropAttr {
         self.attrs.at(i)
+    }
+
+    /// `attr_at(i).accessor` without materializing the `PropAttr` — the one
+    /// attribute bit the pristine-intrinsic warm re-checks read per call
+    /// (`Vm::promise_pristine_bit_identical`). `false` out of range.
+    #[inline]
+    pub fn is_accessor_at(&self, i: usize) -> bool {
+        self.attrs.is_accessor(i)
     }
 
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]

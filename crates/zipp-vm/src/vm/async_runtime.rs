@@ -249,6 +249,16 @@ pub(crate) struct PromisePristineSlots {
     /// can change a `Native`, and both bump). `None` when the key was absent
     /// at fill time (also pristine; adding it would bump the ctor version).
     species: Option<(u32, u32, u32)>,
+    /// The exact value BITS the proof read at `then_slot` / `ctor_slot` /
+    /// the `@@species` slot (`UNDEFINED` when `species` is `None`). The lean
+    /// warm re-check (`promise_pristine_bit_identical`) compares a slot's
+    /// live `Value` against these in one `u64` compare instead of unpacking
+    /// `is_heap()`/`heap_index()`; stored rather than rebuilt from the index
+    /// so the compare is "unchanged since the proof" regardless of how a heap
+    /// `Value`'s payload is encoded.
+    then_val: Value,
+    ctor_val: Value,
+    species_val: Value,
 }
 
 /// `ZIPP_NO_PROMISE_SLOT_CACHE=1` makes `promise_proto_pristine` run the
@@ -265,6 +275,28 @@ fn promise_slot_cache_enabled() -> bool {
         1 => true,
         _ => {
             let v = std::env::var_os("ZIPP_NO_PROMISE_SLOT_CACHE").is_none() as u8;
+            ON.store(v, Ordering::Relaxed);
+            v == 1
+        }
+    }
+}
+
+/// `ZIPP_NO_PRISTINE_LEAN=1` makes the warm pristine re-check run the
+/// original `promise_pristine_from_slots` on every call — the key-string
+/// compares, the `PropAttrs::at` calls and the `is_heap()`/`heap_index()`
+/// unpacking — instead of the bit-identity prefix
+/// (`promise_pristine_bit_identical`). Read once; the two sides of a
+/// one-binary A/B (`tools/bench.py --ab-env`). Same idiom as
+/// `ZIPP_NO_PROMISE_SLOT_CACHE`.
+#[inline]
+fn pristine_lean_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static ON: AtomicU8 = AtomicU8::new(2);
+    match ON.load(Ordering::Relaxed) {
+        0 => false,
+        1 => true,
+        _ => {
+            let v = std::env::var_os("ZIPP_NO_PRISTINE_LEAN").is_none() as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -992,7 +1024,16 @@ impl<'p> Vm<'p> {
         if !promise_slot_cache_enabled() {
             return self.promise_proto_pristine_uncached();
         }
-        if let Some(known) = self.promise_pristine_from_slots() {
+        // Warm path. The lean prefix answers `Some(true)` when every guarded
+        // word is bit-identical to the fill-time proof and otherwise defers
+        // to the original slot re-check, which alone decides every other
+        // outcome (fast `false`, or `None` to re-prove).
+        let known = if pristine_lean_enabled() && self.promise_pristine_bit_identical() {
+            Some(true)
+        } else {
+            self.promise_pristine_from_slots()
+        };
+        if let Some(known) = known {
             return known;
         }
         // Cold cache, or a guarded version moved: run the full proof and
@@ -1121,6 +1162,83 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The lean warm re-check: true only when EVERY word the fill-time proof
+    /// read is bit-identical now — %Promise.prototype%'s and %Promise%'s
+    /// versions, the value bits at the `then`/`constructor` slots, their
+    /// accessor bits, and for `@@species` the slot's value bits, accessor bit
+    /// and the getter's version. A `false` here decides nothing: the caller
+    /// runs [`Self::promise_pristine_from_slots`] unchanged, so the fast
+    /// `false` for an in-place patch, the `None` that re-proves, and the
+    /// provenance of every answer are exactly what they were. This is a pure
+    /// prefix on the `true` side.
+    ///
+    /// What the original re-check spent per call that this does not: three
+    /// key-string compares (`keys[i] != "then"`, …), three `PropAttrs::at`
+    /// calls (an `assert!` + `match` the compiler keeps out of line — 3.5% of
+    /// `async-promise-chain`'s await part on their own), and `is_heap()` +
+    /// `heap_index()` unpacking before each identity compare. Here a slot's
+    /// value is one `u64` compare against the bits the proof saw (`Value:
+    /// PartialEq` is by bits), and an accessor bit is one direct read
+    /// (`ObjMap::is_accessor_at`).
+    ///
+    /// Why the key compares can go: a matching version proves the slot
+    /// indices still name their keys — every key add/delete/redefine,
+    /// `Heap::replace` and GC slot reuse bumps the owner — and compiled code
+    /// already relies on exactly that for MEMORY safety (a baked
+    /// `vals_ptr[slot]` under a version guard). The original re-check kept
+    /// them as belt-and-braces; this one trusts what the JIT trusts, and no
+    /// more. What a version does NOT guard — an in-place `vals[i] = v` from
+    /// the interpreter's `set_prop`, the JIT's `SetProp` own-data hit,
+    /// `Reflect.set`, `Object.assign`, … — is caught by the value compare
+    /// itself: any such write changes the bits. An accessor flip
+    /// (`defineProperty` with `get`) bumps, and the bit is re-read anyway.
+    ///
+    /// GC safety: nothing raw is held. Every read is a bounds-checked index
+    /// (`heap.get`, `version_of`, `val_at`) taken fresh on this call; the
+    /// bounds checks against `vals_len()` are belt-and-braces for a slot the
+    /// version already proves in range.
+    #[inline]
+    fn promise_pristine_bit_identical(&self) -> bool {
+        let Some(c) = self.promise_pristine_slots else {
+            return false;
+        };
+        if self.heap.version_of(self.promise_proto) != c.proto_version
+            || self.heap.version_of(self.promise_ctor_intrinsic) != c.ctor_version
+        {
+            return false;
+        }
+        let m = match self.heap.get(self.promise_proto) {
+            HeapObj::Object(m) => m,
+            _ => return false,
+        };
+        let (ts, cs) = (c.then_slot as usize, c.ctor_slot as usize);
+        if ts >= m.vals_len()
+            || cs >= m.vals_len()
+            || m.val_at(ts) != c.then_val
+            || m.val_at(cs) != c.ctor_val
+            || m.is_accessor_at(ts)
+            || m.is_accessor_at(cs)
+        {
+            return false;
+        }
+        match c.species {
+            // No `@@species` key at fill time: adding one bumps the ctor
+            // version, which already matched above.
+            None => true,
+            Some((slot, getter, getter_version)) => {
+                let mc = match self.heap.get(self.promise_ctor_intrinsic) {
+                    HeapObj::Object(mc) => mc,
+                    _ => return false,
+                };
+                let s = slot as usize;
+                s < mc.vals_len()
+                    && mc.val_at(s) == c.species_val
+                    && mc.is_accessor_at(s)
+                    && self.heap.version_of(getter) == getter_version
+            }
+        }
+    }
+
     /// Run the FULL pristine proof — read-for-read the same checks as
     /// `promise_proto_pristine_uncached` — and, when it holds, capture the
     /// slot indices plus the version of every heap object the proof read:
@@ -1144,6 +1262,7 @@ impl<'p> Vm<'p> {
             HeapObj::Object(mc) => mc,
             _ => return None,
         };
+        let mut species_val = Value::UNDEFINED;
         let species = match mc.pos("@@species") {
             None => None,
             Some(i) => {
@@ -1155,6 +1274,7 @@ impl<'p> Vm<'p> {
                 if !pristine {
                     return None;
                 }
+                species_val = v;
                 Some((
                     i as u32,
                     v.heap_index(),
@@ -1168,6 +1288,9 @@ impl<'p> Vm<'p> {
             then_slot: then_slot as u32,
             ctor_slot: ctor_slot as u32,
             species,
+            then_val: m.val_at(then_slot),
+            ctor_val: m.val_at(ctor_slot),
+            species_val,
         })
     }
 
