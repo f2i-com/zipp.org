@@ -155,6 +155,32 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B273 LANDED — small holders take the holder-grain barrier
+
+A probe that stores each fresh literal into a fixed 1024-slot array
+(`keep[i & 1023] = make(i)`) ran at 66-73 ns per object against 29.5 ns for
+the same loop without the store (Node: 5.3 vs 3.5 ns). `[gc-nursery]` showed
+why: under the value-grain remembered set (W10/B123) every old→young store
+records the VALUE, and the next minor marks every recorded value live whether
+or not its slot was overwritten first — for an overwrite shape that is a 100%
+float: 4M promotions, 15 majors doing half the sweeping, `courier_flush`
+6.5%, `trace_edges` 5.2%. The pre-W10 holder-grain barrier (`ZIPP_NO_
+VALGRAIN_REMSET=1`) took the probe to 160 ms with 3 majors and measured
+neutral to slightly positive on survival, shapes-stable, reactish and
+router — but it was replaced for the retained-append shape, where a huge old
+array re-traced every minor is the cost. The hybrid keeps both: a holder with
+at most `ZIPP_VALGRAIN_SMALL_MAX` (default 4096) traced slots is DIRTIED
+(one remset entry per holder per epoch, re-traced exactly); a larger one
+keeps the value record. Probe 270 → 160 ms; the five hostile rows neutral at
+10 interleaved pairs (survival 0.984, shapes-stable 1.007, reactish 0.999,
+router 1.005, megamorphic 1.013 with the rule latched off vs on).
+`tests/valgrain_small_holder.rs` asserts the ring's majors stay at most an
+eighth of its minors, that pure value grain shows the float, and exact
+output for both shapes in every collector mode. Not yet done: a slot-grain
+record `(holder, slot)` would make LARGE overwrite holders exact too, but it
+needs every element-moving builtin (`shift`, `splice`, `sort`, ...) to
+invalidate the recorded slots — left for a session with time for that audit.
+
 ### B272 LANDED — handler-op bodies receive a frame-backed cross entry
 
 A Tier-C body containing handler ops (`try`, and the iterator-close bracket

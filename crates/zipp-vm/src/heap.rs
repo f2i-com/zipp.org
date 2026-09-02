@@ -5295,11 +5295,24 @@ pub struct Heap {
     vremset: Vec<u32>,
     /// Latched absence of `ZIPP_NO_VALGRAIN_REMSET`.
     valgrain: bool,
+    /// B273: holders with at most this many slots take the HOLDER-grain
+    /// barrier even under value-grain recording. A value recorded in
+    /// `vremset` is kept alive through the next minor whether or not its
+    /// slot was overwritten first — for a fixed-size cache or ring
+    /// (`keep[i & 1023] = fresh`) that floated EVERY young object into old
+    /// space (4M promotions, 15 majors, 2.3x the run time of the same loop
+    /// without the store). Re-tracing a small holder's edges once per minor
+    /// is exact and bounded; large holders (the retained-append arrays the
+    /// value grain was built for) keep the value record. `ZIPP_VALGRAIN_SMALL_MAX`
+    /// overrides the bound; 0 restores pure value grain.
+    valgrain_small_max: usize,
 }
 
 /// Stage-3 generation states (low two bits of a `Heap::gen` byte).
 /// `GEN_YOUNG`: allocated since the last collection (in the young log).
 const GEN_YOUNG: u8 = 0;
+/// B273: see `Heap::valgrain_small_max`.
+const VALGRAIN_SMALL_MAX_DEFAULT: usize = 4096;
 /// `GEN_OLD`: survived a collection, not in the remembered set.
 const GEN_OLD: u8 = 1;
 /// `GEN_DIRTY`: old AND in the remembered set (the dedup bit of the barrier).
@@ -5487,6 +5500,9 @@ impl Heap {
         let pretenure_on = std::env::var_os("ZIPP_NO_PRETENURE").is_none();
         let nonyoung_cache_on = std::env::var_os("ZIPP_NO_NONYOUNG_CACHE").is_none();
         let valgrain = std::env::var_os("ZIPP_NO_VALGRAIN_REMSET").is_none();
+        let valgrain_small_max = std::env::var_os("ZIPP_VALGRAIN_SMALL_MAX")
+            .and_then(|v| v.to_str().and_then(|v| v.parse::<usize>().ok()))
+            .unwrap_or(VALGRAIN_SMALL_MAX_DEFAULT);
         let mut h = Heap {
             objs,
             resident_payload_current: Cell::new(resident_payload_high_water),
@@ -5603,6 +5619,7 @@ impl Heap {
             nonyoung_cache_on,
             vremset: Vec::new(),
             valgrain,
+            valgrain_small_max,
         };
         h.align_slot_table_capacities();
         h.recache_mirror_raws();
@@ -6743,6 +6760,14 @@ impl Heap {
                 && self.gen[v.heap_index() as usize] & (GEN_STATE | GEN_VLOG) == GEN_YOUNG
                 && self.gen[holder as usize] & GEN_STATE == GEN_OLD
             {
+                // B273: a small holder is re-traced instead — one remset
+                // entry per holder per epoch (`GEN_DIRTY` holders skip this
+                // whole test), and an overwritten young value dies at the
+                // minor instead of floating into old space.
+                if self.holder_is_small(holder) {
+                    self.dirty(holder);
+                    return;
+                }
                 self.gen[v.heap_index() as usize] |= GEN_VLOG;
                 self.vremset.push(v.heap_index());
             }
@@ -6751,6 +6776,24 @@ impl Heap {
             && self.gen[v.heap_index() as usize] & GEN_STATE == GEN_YOUNG
         {
             self.dirty(holder);
+        }
+    }
+
+    /// B273: does `holder` have at most `valgrain_small_max` traced slots?
+    /// Only the kinds the barrier's stores land in are sized; anything else
+    /// keeps the value grain.
+    #[inline]
+    fn holder_is_small(&self, holder: u32) -> bool {
+        let max = self.valgrain_small_max;
+        if max == 0 {
+            return false;
+        }
+        match &self.objs[holder as usize] {
+            HeapObj::Array(items) => items.len() <= max,
+            HeapObj::Object(map) => map.vals.len() <= max,
+            HeapObj::Map { keys, .. } => keys.len() <= max,
+            HeapObj::Set(items) => items.len() <= max,
+            _ => false,
         }
     }
 

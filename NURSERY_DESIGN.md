@@ -79,6 +79,17 @@ field-grain), deduped by a per-object "in remset" bit stolen from the same `youn
 (0=young,1=old-clean,2=old-dirty). Minor trace = roots (case 7 rescan) + re-trace every
 dirty old object's edges with `trace_edges` unchanged, pushing only young indices.
 
+W10 (B123) added the VALUE-grain form: record the young value itself (`vremset`, deduped
+by `GEN_VLOG`) so a retained-append into a huge old array does not re-trace the array
+every minor. Its cost is a float: a recorded value is kept through the next minor even if
+its slot was overwritten first, which for a fixed-size cache or ring promotes EVERY young
+store into old space (B273 probe: 4M promotions, 15 majors). B273 therefore sizes the
+choice per store: a holder with at most `ZIPP_VALGRAIN_SMALL_MAX` (4096) traced slots is
+dirtied (holder grain, exact), a larger one keeps the value record. A slot-grain record
+`(holder, slot)` would make large overwrite holders exact as well; it is sound only if
+every element-moving mutation (`shift`, `splice`, `sort`, `reverse`, `copyWithin`, length
+shrink) invalidates the recorded slots, so it waits for that audit.
+
 ## 2. Recommended design — non-moving nursery by index state ("Option 2")
 
 - `alloc` pushes `idx` to `alloc_log` and sets `young[idx]=YOUNG`. No dedicated index

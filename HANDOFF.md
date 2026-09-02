@@ -191,6 +191,33 @@ crosses. sparse-array (0.924×), regex-log-scan (0.953×) and npm-nanoid
    of the CROSS3 lane for
    the recursive `diff`-shaped site, whose per-call helper cost (~20 ns) is
    now the dominant remaining call overhead on that row.
+1a. **Young arena for planned literals (the structural lever).** The churn
+   probes put a number on the pipeline: `scratchpad/examples/churn.js`
+   (literal dies at once) 29.5 ns per object, `churn_keep.js` (literal stored
+   into a 1024-slot ring) 40 ns after B273 — Node 3.5 / 5.3 ns. The PC
+   profile of the store shape splits it as birth ~16 ns (`alloc_finalized` +
+   `refit_finalized_inner` + `finalized_from_store_inner` +
+   `jit_finalize_object_thin` + `reuse_slot_stamp`), death ~9 ns
+   (`free_slot`: mirror read+clear, the 80-byte `objs` tombstone move, pool
+   push, free push), allocator ~3 ns, barrier ~3 ns. Every remaining gap row
+   spends 25-35% here (shapes-stable: `free_slot` 10.1%, `alloc_finalized`
+   7.4%, refit 4.9%). Micro-tuning is exhausted (B185-B268); the design that
+   removes the work: allocate plain finalized literals (Planned keys, slab or
+   short vals, no index tables — the pool's admission set) from a BUMP arena
+   instead of a pooled `Box`, hold the key plan alive from the `FuncProto`
+   rather than a per-object `Arc` so a dead arena object needs no drop, and
+   at each minor copy the FEW survivors out to a `Box` (identity is the slot
+   index, so moving the payload only means rewriting `objs[idx]` and
+   re-settling that slot's hot mirror), then reset the arena: death costs one
+   free-list push (the young log filtered by the mark bits IS the free list),
+   birth a bump + the field writes. Expected ~20 ns per object, i.e. 10-15%
+   on shapes-stable, survival, reactish and router. Risks to plan for: the
+   JIT's `hot_mirror.vals` pointer into moved payloads, the courier and
+   payload accounting (arena bytes are one block), the sandbox heap ceiling
+   (charge the arena as resident), `ObjMap` fields that own heap memory must
+   stay on the `Box` path. Start as a latch (`ZIPP_NO_YOUNG_ARENA`) beside
+   the pool, prove with `nursery_minor`, `shell_cell`, `thin_literal_alloc`
+   and the churn probes, then A/B the four rows.
 1. **React reconcile and warm router (`1.574×` / `1.563×`).** The birth/death
    pipeline dominates both (`free_slot`, `refit_finalized_inner`,
    `alloc_finalized`, `alloc_settled`, malloc/free ≈ 19–24% of each row);
@@ -198,6 +225,14 @@ crosses. sparse-array (0.924×), regex-log-scan (0.953×) and npm-nanoid
    pool refit or the sweep itself, not move it. The router's Map path (about
    21%) is the intrinsic proof plus index lookup plus key hashing — B266
    showed the byte compare is not it.
+1b. **Slot-grain remembered set.** B273 dirties small holders and keeps the
+   value record for large ones; a `(holder, slot)` record would make large
+   overwrite holders exact too (`buf[i % 1e6] = fresh` still floats every
+   store). Sound only with every element-moving array builtin (`shift`,
+   `unshift`, `splice`, `sort`, `reverse`, `copyWithin`, length shrink)
+   invalidating recorded slots — audit `array_ops.rs` for those sites
+   first. The probe pair is `scratchpad/examples/churn.js` /
+   `churn_keep.js` (29.5 vs 40 ns per object after B273; Node 3.5 / 5.3).
 2. **Allocation survival (`1.484×`).** `free_slot` 12%, `trace_edges` 6%,
    `jit_get_index` 4% (Tier C reads `this.values[i]` through a helper), the
    method-call ICs 5.6%.
