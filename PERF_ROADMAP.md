@@ -154,6 +154,32 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B264 LANDED — inline pinned dense-Array store lane in MEM regions
+
+`ZIPP_NO_INLINE_DENSE_STORE=1` restores the helper-only route. Every `a[i] = v`
+on a pinned dense Array in a MEM region was a `jit_set_index` helper call
+(3–5% of the shape rows) plus a barrier check. The lane stores directly when
+the receiver matches its pin snapshot, the key is an in-range integer (never an
+append), the holder is YOUNG (its generation byte, read through the new
+`Heap::gen_raw` mirror, has no state bits — a young holder needs no barrier in
+either barrier mode), and the element is present or the hole-fill is licensed
+by the snapshot flags (`TA_SNAP_INDEX_ABSENT` and the new
+`TA_SNAP_LEN_WRITABLE`, exactly the helper's `creates_new_index` deopt
+conditions). Everything else takes the helper byte-for-byte as before; an
+in-range store never moves the Vec, so no snapshot refetch follows. The lane
+is not emitted with the nursery off or the GC oracle on.
+
+Gate (2026-09-02, one binary, 16 interleaved pairs, exact output):
+sparse-array **−12.1%** [−13.0, −11.8], async-promise-chain **−6.0%** [−6.6,
+−5.2], shapes-stable **−7.2%** [−10.9, −4.8], shapes-megamorphic **−5.1%**
+[−5.9, −4.1], allocation-survival −1.7% [−4.8, +1.4] (two-binary −5.1%),
+every other row inside its interval. Correctness: `tests/inline_dense_store`
+(node-oracled hole fills, appends, an OLD holder across minors, a non-writable
+`length`, an indexed `Array.prototype` setter, a custom prototype, fractional
+and string keys) in nine modes including `ZIPP_NURSERY_VERIFY=1` and
+`ZIPP_GC_STRESS=1`; the nursery, finalize, pool and tier suites; every feature
+configuration; a 188-run four-mode output identity against node.
+
 ### B263 LANDED — register classes: booleans and global receivers leave the scratch stack
 
 `ZIPP_NO_REG_CLASSES=1` restores the v0.0.5 allocation. The v0.0.5 release
