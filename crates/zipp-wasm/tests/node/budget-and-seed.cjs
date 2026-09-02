@@ -117,6 +117,43 @@ function burner() {
   try { e.dispose(); } catch {}
 }
 
+// The host chooses the size of the renewed budget. A call the default refuses
+// — WarbleWire's decoder, a modem correlating a whole recording in one entry,
+// needs more than 50M — goes through when the host grants more, and a smaller
+// grant refuses sooner; the guest still cannot reach either.
+{
+  const e = burner();
+  let refused = false;
+  try { e.renewInstructionBudget(); e.callFunction("burn", [8_000_000]); } catch { refused = true; }
+  check("the default budget refuses ~64M steps in one call", refused);
+  try { e.dispose(); } catch {}
+}
+{
+  const e = burner();
+  let ok = false;
+  try { e.renewInstructionBudget(200_000_000); ok = e.callFunction("burn", [8_000_000]) > 0; } catch {}
+  check("a 200M grant admits the same call", ok);
+  // And the grant is per re-entry: the next call, renewed at the default, is refused again.
+  let refusedAgain = false;
+  try { e.renewInstructionBudget(); e.callFunction("burn", [8_000_000]); } catch { refusedAgain = true; }
+  check("the next renewal at the default refuses it again", refusedAgain);
+  try { e.dispose(); } catch {}
+}
+{
+  const e = burner();
+  let refused = false;
+  try { e.renewInstructionBudget(1_000); e.callFunction("burn", [100_000]); } catch { refused = true; }
+  check("a 1,000-step grant refuses 100k iterations", refused);
+  try { e.dispose(); } catch {}
+}
+{
+  const e = burner();
+  let ok = false;
+  try { e.renewInstructionBudget(Number.NaN); ok = e.callFunction("burn", [1_000_000]) > 0; } catch {}
+  check("a NaN grant means the default", ok);
+  try { e.dispose(); } catch {}
+}
+
 // ── 2. The keyed fingerprint ───────────────────────────────────────────────
 // Constructed against the unkeyed mixer by inverting it: two different values
 // with byte-identical digests. Keyed, the host must see them differ.

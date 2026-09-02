@@ -463,10 +463,24 @@ impl Engine {
     /// binding, unreachable from guest code, so a guest still cannot raise its
     /// own ceiling. Returns false once a budget has actually been spent —
     /// exhaustion stays sticky and a torn-down engine stays torn down.
+    ///
+    /// `steps` is the size of the renewed budget; omitted, it is the default
+    /// 50M. The host chooses it because the host knows what one re-entry is
+    /// allowed to cost: a script on a page's main thread blocks the page for
+    /// the whole of it, so a small budget there is a bound on a stall, while
+    /// a script in a worker blocks nothing and a legitimately long computation
+    /// — a modem decoding a whole recording in one call — needs more than 50M
+    /// and used to be indistinguishable from a runaway. Still host-only, still
+    /// per re-entry, still sticky once spent; a value below one is treated
+    /// as one, and a non-finite or NaN value as the default.
     #[wasm_bindgen(js_name = renewInstructionBudget)]
-    pub fn renew_instruction_budget(&mut self) -> bool {
+    pub fn renew_instruction_budget(&mut self, steps: Option<f64>) -> bool {
+        let max_steps = match steps {
+            Some(s) if s.is_finite() => s.max(1.0).min(u64::MAX as f64) as u64,
+            _ => MAX_LIFETIME_STEPS,
+        };
         match self.state.as_mut() {
-            Some(st) => st.renew_step_budget(MAX_LIFETIME_STEPS),
+            Some(st) => st.renew_step_budget(max_steps),
             None => false,
         }
     }
