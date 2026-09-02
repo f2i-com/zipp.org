@@ -423,6 +423,20 @@ pub(crate) fn compile_region_mem(
         }
     }
     let int_hint = |a: u16, b: u16| !const_dbl_regs.contains(&a) && !const_dbl_regs.contains(&b);
+    // Truncation-only `Add`/`Sub`/`AddInt` results wrap in i32 (the Tier-C
+    // rule; the proof runs over the WHOLE function because an exit hands the
+    // frame's registers to the interpreter). `ZIPP_NO_INT32_TRUNC_ADD=1`
+    // restores the overflow branch.
+    let trunc_arith = trunc_only_arith_ips(proto);
+    if std::env::var_os("ZIPP_JITLOG").is_some() {
+        let sites = (s..=e).filter(|&ip| trunc_arith[ip]).count();
+        if sites != 0 {
+            eprintln!(
+                "[jit] MEM region fn{} [{start},{end}] int32-trunc arith sites={sites}",
+                heap.func_id
+            );
+        }
+    }
 
     // One label per in-region ip (offset by `start`). Out-of-region jump targets
     // resolve to lazily-created exit stubs.
@@ -711,7 +725,8 @@ pub(crate) fn compile_region_mem(
             }
             Instr::Add { dst, a, b } => {
                 // Int+Int fast path (32-bit add + overflow check, Int result —
-                // the interpreter's `checked_add`), then the numeric f64 path;
+                // the interpreter's `checked_add`; a truncation-only result
+                // wraps instead, see `trunc_arith`), then the numeric f64 path;
                 // non-number operands (strings, objects) fall back to
                 // `jit_concat` — the SAME `add_values` the interpreter's Add
                 // runs (concat / numeric / coercion). The helper may allocate
@@ -733,8 +748,10 @@ pub(crate) fn compile_region_mem(
                         ; cmp r10d, INT_TAG_HI as i32
                         ; jne => f64_path
                         ; add eax, ecx
-                        ; jo => f64_path          // overflow → f64 (reloads operands)
                     );
+                    if !trunc_arith[ip] {
+                        dynasm!(ops ; jo => f64_path); // overflow → f64 (reloads operands)
+                    }
                     box_eax(&mut ops, dst);
                     dynasm!(ops ; jmp => done_a);
                 }
@@ -813,6 +830,7 @@ pub(crate) fn compile_region_mem(
                 b,
                 DOp::Sub,
                 int_hint(a, b),
+                trunc_arith[ip],
             ),
             Instr::Mul { dst, a, b } => dbinop(
                 &mut ops,
@@ -824,10 +842,20 @@ pub(crate) fn compile_region_mem(
                 b,
                 DOp::Mul,
                 int_hint(a, b),
+                false,
             ),
-            Instr::Div { dst, a, b } => {
-                dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Div, false)
-            }
+            Instr::Div { dst, a, b } => dbinop(
+                &mut ops,
+                ip,
+                bail,
+                epilogue,
+                dst,
+                a,
+                b,
+                DOp::Div,
+                false,
+                false,
+            ),
             Instr::Mod { dst, a, b } => {
                 // `a % b` for INTEGER-valued operands via i64 idiv (exact, and the
                 // remainder takes the dividend's sign — JS `%` for integers).
@@ -898,7 +926,8 @@ pub(crate) fn compile_region_mem(
             Instr::AddInt { dst, a, imm, .. } => {
                 // Int fast path (the interpreter's `checked_add` — keeps loop
                 // counters Int so element-access keys stay on their cheap
-                // path), f64 fallback otherwise / on overflow.
+                // path), f64 fallback otherwise / on overflow. A truncation-
+                // only result wraps (see the `Add` arm).
                 let f64_path = ops.new_dynamic_label();
                 let done_ai = ops.new_dynamic_label();
                 dynasm!(ops
@@ -908,8 +937,10 @@ pub(crate) fn compile_region_mem(
                     ; cmp r10d, INT_TAG_HI as i32
                     ; jne => f64_path
                     ; add eax, imm
-                    ; jo => f64_path
                 );
+                if !trunc_arith[ip] {
+                    dynasm!(ops ; jo => f64_path);
+                }
                 box_eax(&mut ops, dst);
                 dynasm!(ops ; jmp => done_ai ; => f64_path);
                 load_num_xmm(&mut ops, a, 0, bail);

@@ -668,6 +668,7 @@ pub(crate) fn emit_inline_leaf_call(
                     rg(b),
                     DOp::Add,
                     true,
+                    false,
                 )
             }
             Instr::Sub { dst: d, a, b } => {
@@ -682,6 +683,7 @@ pub(crate) fn emit_inline_leaf_call(
                     rg(b),
                     DOp::Sub,
                     true,
+                    false,
                 )
             }
             Instr::Mul { dst: d, a, b } => {
@@ -696,6 +698,7 @@ pub(crate) fn emit_inline_leaf_call(
                     rg(b),
                     DOp::Mul,
                     true,
+                    false,
                 )
             }
             Instr::Div { dst: d, a, b } => {
@@ -709,6 +712,7 @@ pub(crate) fn emit_inline_leaf_call(
                     rg(a),
                     rg(b),
                     DOp::Div,
+                    false,
                     false,
                 )
             }
@@ -1266,6 +1270,7 @@ pub(crate) fn emit_mi_body(
                     rg(b),
                     DOp::Add,
                     true,
+                    false,
                 )
             }
             Instr::Sub { dst: d, a, b } => {
@@ -1280,6 +1285,7 @@ pub(crate) fn emit_mi_body(
                     rg(b),
                     DOp::Sub,
                     true,
+                    false,
                 )
             }
             Instr::Mul { dst: d, a, b } => {
@@ -1294,6 +1300,7 @@ pub(crate) fn emit_mi_body(
                     rg(b),
                     DOp::Mul,
                     true,
+                    false,
                 )
             }
             Instr::Div { dst: d, a, b } => {
@@ -1307,6 +1314,7 @@ pub(crate) fn emit_mi_body(
                     rg(a),
                     rg(b),
                     DOp::Div,
+                    false,
                     false,
                 )
             }

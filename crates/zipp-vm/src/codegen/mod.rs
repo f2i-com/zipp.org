@@ -1793,6 +1793,24 @@ pub(crate) fn int_splice_enabled() -> bool {
     }
 }
 
+/// The truncation-aware Int add. `ZIPP_NO_INT32_TRUNC_ADD=1` keeps the i32
+/// overflow branch on every boxed-tier `Add`/`Sub`/`AddInt` — the exact
+/// pre-change emission (`trunc_only_arith_ips` then proves nothing). Read once
+/// per process, at plan time only; never on a generated code path.
+pub(crate) fn int32_trunc_add_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INT32_TRUNC_ADD").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// Bounded dense-array computed leaf splice. `ZIPP_NO_INT_COMPUTED_LEAF=1`
 /// restores the existing MEMORY `CallMethodComputed` helper on the same binary.
 /// Kept separate from `ZIPP_NO_INT_SPLICE`: the ordinary global-slot Call

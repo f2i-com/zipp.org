@@ -449,6 +449,8 @@ pub(crate) fn math_op_emittable(op: MathFn, argc: u16) -> bool {
 /// downstream: `(x+y)|0` accumulators and `a[i+1]` keys then take their cheap
 /// Int paths instead of the double→int round-trip. Div is always f64 (JS `/`
 /// has no integer form — mirrors the interpreter). Guards operands are numbers.
+/// `wrap` (Add/Sub only) drops the overflow branch: the caller proved with
+/// `trunc_only_arith_ips` that the result is observed only through ToInt32.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dbinop(
     ops: &mut dynasmrt::x64::Assembler,
@@ -460,6 +462,7 @@ pub(crate) fn dbinop(
     b: u16,
     op: DOp,
     int_hint: bool,
+    wrap: bool,
 ) {
     let f64_path = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -481,10 +484,16 @@ pub(crate) fn dbinop(
             ; jne => f64_path
         );
         match op {
-            DOp::Add => dynasm!(ops ; add eax, ecx ; jo => f64_path),
-            DOp::Sub => dynasm!(ops ; sub eax, ecx ; jo => f64_path),
-            DOp::Mul => dynasm!(ops ; imul eax, ecx ; jo => f64_path),
+            DOp::Add => dynasm!(ops ; add eax, ecx),
+            DOp::Sub => dynasm!(ops ; sub eax, ecx),
+            DOp::Mul => dynasm!(ops ; imul eax, ecx),
             DOp::Div => unreachable!(),
+        }
+        // A truncation-only result WRAPS (see `trunc_only_arith_ips`): the
+        // i33 result's low 32 bits are exactly what every consumer's ToInt32
+        // yields, so the overflow branch and the f64 redo are dead weight.
+        if !(wrap && matches!(op, DOp::Add | DOp::Sub)) {
+            dynasm!(ops ; jo => f64_path);
         }
         box_eax(ops, dst);
         // f64 fallback re-loads both operands from the register file, so the
@@ -504,6 +513,168 @@ pub(crate) fn dbinop(
         dynasm!(ops ; => done);
     }
     emit_region_bail(ops, ip, bail, epilogue);
+}
+
+/// The `Add`/`Sub`/`AddInt` ips whose result is observed ONLY through ToInt32
+/// truncation, so the boxed tiers' Int fast path may WRAP in i32 instead of
+/// branching to the f64 overflow path. `(rotate(v) + 1013904223) | 0`: the sum
+/// leaves i32 range on a quarter of the iterations, mispredicting `jo`, boxing
+/// a double, and paying `cvttsd2si` in the `| 0` that folds it straight back.
+///
+/// WHY WRAPPING IS EXACT. The Int path runs only when both operands are
+/// Int-tagged, so the true result is an integer of magnitude < 2^32 that the
+/// generic path represents exactly (an Int, or an f64 after `jo`). Every
+/// `Bitwise` operand position is ToInt32 / ToUint32 — a reduction mod 2^32 —
+/// and the wrapped i32 IS that residue. A chain `(a + b + c) | 0` holds too:
+/// the generic path stays exact along it (|value| <= depth * 2^31, far below
+/// 2^53) and the residue of a sum is the sum of the residues. `Mul` is never
+/// admitted: its exact product rounds in f64, and ToInt32 of the rounded value
+/// is not the wrapped product.
+///
+/// THE PROOF is a forward walk over the function's CFG from each producer:
+/// every read of the destination register before its next definition, on
+/// every path, must be a `Bitwise` operand or an operand of another PROVEN
+/// member. Reads come from `instr_uses`, the exhaustive operand table;
+/// definitions from `writes_reg`, which may under-approximate — that only
+/// extends a walk (a read of the redefined register then declines the
+/// producer). Control edges are those of `bytecode_control_target`, and every
+/// handler / finally target in the function is additionally a successor of
+/// EVERY ip, over-approximating the exception edges. A deopt at any later ip
+/// resumes the interpreter on this same CFG with the wrapped Int in the frame,
+/// and it reads that register only where the walk allowed, through the same
+/// ToInt32. Members are the LEAST fixpoint of "every arith reader is a
+/// member", so a value can never circulate through members alone (`t = t + k`
+/// per iteration, `| 0` after the loop): there the generic f64 accumulation
+/// may round past 2^53 and the equivalence would break. Declined outright:
+/// functions with a direct eval, `with` or eval-scope op (evaluated code reads
+/// locals by name, invisibly to the operand table) and, when an `arguments`
+/// object exists, parameter registers (a mapped `arguments[i]` aliases them).
+///
+/// All false under `ZIPP_NO_INT32_TRUNC_ADD=1` — the byte-identical old
+/// emission, for a same-binary A/B.
+pub(crate) fn trunc_only_arith_ips(proto: &FuncProto) -> Vec<bool> {
+    let code = &proto.code;
+    let n = code.len();
+    let mut out = vec![false; n];
+    if n == 0 || !crate::codegen::int32_trunc_add_enabled() {
+        return out;
+    }
+    let by_name_scope = !proto.eval_sites.is_empty()
+        || code.iter().any(|i| {
+            matches!(
+                i,
+                Instr::DirectEval { .. }
+                    | Instr::EvalScopeHas { .. }
+                    | Instr::EvalScopeSet { .. }
+                    | Instr::WithHas { .. }
+                    | Instr::WithGet { .. }
+                    | Instr::WithSet { .. }
+            )
+        });
+    if by_name_scope {
+        return out;
+    }
+    fn is_arith(i: &Instr) -> bool {
+        matches!(
+            i,
+            Instr::Add { .. } | Instr::Sub { .. } | Instr::AddInt { .. }
+        )
+    }
+    fn push(q: usize, n: usize, stack: &mut Vec<usize>, visited: &mut [bool]) {
+        if q < n && !visited[q] {
+            visited[q] = true;
+            stack.push(q);
+        }
+    }
+    let uses: Vec<Vec<u16>> = code.iter().map(instr_uses).collect();
+    let defs: Vec<Option<u16>> = code.iter().map(writes_reg).collect();
+    let handler_targets: Vec<usize> = code
+        .iter()
+        .filter_map(|i| match *i {
+            Instr::PushHandler { catch_target, .. } => Some(catch_target as usize),
+            Instr::PushFinally { target, .. } | Instr::JumpFinally { target, .. } => {
+                Some(target as usize)
+            }
+            _ => None,
+        })
+        .filter(|&t| t < n)
+        .collect();
+    // Per candidate: the arith readers its membership waits on; `None` once a
+    // reader is neither truncating nor arithmetic (or the walk was declined).
+    let mut deps: Vec<Option<Vec<usize>>> = vec![None; n];
+    let mut visited = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    for p in 0..n {
+        let t = match code[p] {
+            Instr::Add { dst, .. } | Instr::Sub { dst, .. } | Instr::AddInt { dst, .. } => dst,
+            _ => continue,
+        };
+        if proto.arguments_reg.is_some() && (1..=proto.param_count).contains(&t) {
+            continue;
+        }
+        visited.fill(false);
+        stack.clear();
+        push(p + 1, n, &mut stack, &mut visited);
+        for &h in &handler_targets {
+            push(h, n, &mut stack, &mut visited);
+        }
+        let mut arith_readers: Vec<usize> = Vec::new();
+        let mut ok = true;
+        while let Some(q) = stack.pop() {
+            let i = &code[q];
+            if uses[q].contains(&t) {
+                if is_arith(i) {
+                    arith_readers.push(q);
+                } else if !matches!(i, Instr::Bitwise { .. }) {
+                    ok = false;
+                    break;
+                }
+            }
+            if defs[q] == Some(t) {
+                continue; // redefined: this path ends here
+            }
+            match *i {
+                Instr::Jump { target } => push(target as usize, n, &mut stack, &mut visited),
+                Instr::Return { .. } | Instr::ReturnUndefined => {}
+                Instr::JumpIfFalse { target, .. }
+                | Instr::JumpIfTrue { target, .. }
+                | Instr::JumpIfNotLt { target, .. }
+                | Instr::JumpIfNotLe { target, .. }
+                | Instr::PushFinally { target, .. }
+                | Instr::JumpFinally { target, .. } => {
+                    push(target as usize, n, &mut stack, &mut visited);
+                    push(q + 1, n, &mut stack, &mut visited);
+                }
+                Instr::PushHandler { catch_target, .. } => {
+                    push(catch_target as usize, n, &mut stack, &mut visited);
+                    push(q + 1, n, &mut stack, &mut visited);
+                }
+                _ => push(q + 1, n, &mut stack, &mut visited),
+            }
+        }
+        if ok {
+            deps[p] = Some(arith_readers);
+        }
+    }
+    // Least fixpoint: a candidate joins once every arith reader has.
+    loop {
+        let mut changed = false;
+        for p in 0..n {
+            if out[p] {
+                continue;
+            }
+            if let Some(readers) = &deps[p] {
+                if readers.iter().all(|&q| out[q]) {
+                    out[p] = true;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    out
 }
 
 /// `regs[dst] = (regs[a] <cmp> regs[b]) as Bool` using f64 ordered comparison
@@ -842,4 +1013,263 @@ pub(crate) fn emit_region_bail(
         ; jmp => epilogue
         ; => done
     );
+}
+
+#[cfg(test)]
+mod int32_trunc_tests {
+    use super::*;
+
+    /// ECMA-262 ToInt32, written from the specification: truncate toward
+    /// zero, reduce modulo 2^32, map into [-2^31, 2^31).
+    fn spec_to_int32(x: f64) -> i32 {
+        if !x.is_finite() {
+            return 0;
+        }
+        let m = x.trunc().rem_euclid(4294967296.0);
+        (if m >= 2147483648.0 {
+            m - 4294967296.0
+        } else {
+            m
+        }) as i32
+    }
+
+    /// ECMA-262 ToUint32 (the `>>> 0` view of the same residue).
+    fn spec_to_uint32(x: f64) -> u32 {
+        if !x.is_finite() {
+            return 0;
+        }
+        x.trunc().rem_euclid(4294967296.0) as u32
+    }
+
+    /// The reference: the exact result on checked i64, then proven exactly
+    /// representable as an f64 (what the generic path holds after `jo`).
+    fn exact(a: i32, b: i32, sub: bool) -> f64 {
+        let s = if sub {
+            (a as i64).checked_sub(b as i64)
+        } else {
+            (a as i64).checked_add(b as i64)
+        }
+        .expect("an i32 pair never overflows i64");
+        let d = s as f64;
+        assert_eq!(d as i64, s, "an i33 result is exact in f64");
+        d
+    }
+
+    fn check_pair(a: i32, b: i32) {
+        let sum = exact(a, b, false);
+        let diff = exact(a, b, true);
+        assert_eq!(a.wrapping_add(b), spec_to_int32(sum), "({a} + {b}) | 0");
+        assert_eq!(a.wrapping_sub(b), spec_to_int32(diff), "({a} - {b}) | 0");
+        assert_eq!(
+            a.wrapping_add(b) as u32,
+            spec_to_uint32(sum),
+            "({a} + {b}) >>> 0"
+        );
+        assert_eq!(
+            a.wrapping_sub(b) as u32,
+            spec_to_uint32(diff),
+            "({a} - {b}) >>> 0"
+        );
+        assert_eq!(
+            a.wrapping_add(b) & 0xffff,
+            spec_to_int32(sum) & 0xffff,
+            "({a} + {b}) & 65535"
+        );
+        // The chain rule: residues add, so wrapping an inner Add feeding an
+        // outer Add feeding `| 0` is the outer exact result's ToInt32.
+        let c = b ^ 0x5bd1_e995;
+        let chain = exact(a, b, false) + c as f64;
+        assert_eq!((chain as i64) as f64, chain, "an i34 chain is exact in f64");
+        assert_eq!(
+            a.wrapping_add(b).wrapping_add(c),
+            spec_to_int32(chain),
+            "({a} + {b} + {c}) | 0"
+        );
+    }
+
+    /// `(a + b) | 0 == ToInt32(a + b)` for every i32 pair: the edge lattice
+    /// exhaustively, then four million random pairs against the checked i64
+    /// reference.
+    #[test]
+    fn wrapping_i32_add_sub_is_to_int32_of_the_exact_result() {
+        let edges = [
+            i32::MIN,
+            i32::MIN + 1,
+            -0x4000_0000,
+            -1013904223,
+            -0x8000,
+            -2,
+            -1,
+            0,
+            1,
+            2,
+            0x7fff,
+            1013904223,
+            0x4000_0000,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+        for &a in &edges {
+            for &b in &edges {
+                check_pair(a, b);
+            }
+        }
+        // xorshift64*: deterministic, dependency-free.
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..4_000_000 {
+            s ^= s >> 12;
+            s ^= s << 25;
+            s ^= s >> 27;
+            let r = s.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            check_pair(r as i32, (r >> 32) as i32);
+        }
+    }
+
+    fn named_proto(src: &str, name: &str) -> FuncProto {
+        let ast = crate::front::parse_script(src).expect("parse source");
+        crate::compile::compile_program(&ast, src)
+            .expect("compile source")
+            .functions
+            .into_iter()
+            .find(|proto| proto.name == name)
+            .unwrap_or_else(|| panic!("no function named {name}"))
+    }
+
+    fn arith_ips(proto: &FuncProto) -> Vec<usize> {
+        (0..proto.code.len())
+            .filter(|&ip| {
+                matches!(
+                    proto.code[ip],
+                    Instr::Add { .. } | Instr::Sub { .. } | Instr::AddInt { .. }
+                )
+            })
+            .collect()
+    }
+
+    fn member_ips(proto: &FuncProto) -> Vec<usize> {
+        let m = trunc_only_arith_ips(proto);
+        (0..proto.code.len()).filter(|&ip| m[ip]).collect()
+    }
+
+    /// Every truncation idiom admits its producer, and a chain admits both.
+    #[test]
+    fn truncation_only_producers_are_members() {
+        if std::env::var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
+            return; // the latch pins the analysis empty by design
+        }
+        let src = r#"
+            function or0(a, b) { return (a + b) | 0; }
+            function sub_ushr(a, b) { return (a - b) >>> 0; }
+            function and_mask(a, b) { return (a + b) & 65535; }
+            function shift_count(a, b) { return 1 << (a + b); }
+            function chain(a, b, c) { return (a + b + c) | 0; }
+            function addint(a) { return ((a | 0) + 1013904223) | 0; }
+            function local_then_or(a, b) { let s = a + b; return s | 0; }
+            function redefined(a, b) { return ((a + b) & 65535) + (a + b); }
+        "#;
+        for name in [
+            "or0",
+            "sub_ushr",
+            "and_mask",
+            "shift_count",
+            "chain",
+            "addint",
+            "local_then_or",
+        ] {
+            let p = named_proto(src, name);
+            assert!(!arith_ips(&p).is_empty(), "{name}: no arith op compiled");
+            assert_eq!(
+                member_ips(&p),
+                arith_ips(&p),
+                "{name}: every arith op is truncation-only: {:?}",
+                p.code
+            );
+        }
+        // `((a + b) & 65535) + (a + b)`: the FIRST Add feeds only `&` and is
+        // then redefined by the second; the second feeds the exact outer Add.
+        let p = named_proto(src, "redefined");
+        let adds = arith_ips(&p);
+        assert_eq!(adds.len(), 3, "{:?}", p.code);
+        assert_eq!(member_ips(&p), vec![adds[0]], "{:?}", p.code);
+    }
+
+    /// A read that observes the exact value declines the producer: a second
+    /// consumer, a loop-carried accumulator (least fixpoint), direct eval.
+    #[test]
+    fn observed_producers_are_not_members() {
+        if std::env::var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
+            return;
+        }
+        let src = r#"
+            function twice(a, b) { let s = a + b; return (s | 0) + s; }
+            function carried(n, k) { let t = 0; for (let i = 0; i < n; i++) { t = t + k; } return t | 0; }
+            function evaled(a, b) { eval("1"); return (a + b) | 0; }
+            function returned(a, b) { return a + b; }
+        "#;
+        for name in ["twice", "carried", "evaled", "returned"] {
+            let p = named_proto(src, name);
+            assert!(!arith_ips(&p).is_empty(), "{name}: no arith op compiled");
+            assert!(member_ips(&p).is_empty(), "{name}: {:?}", p.code);
+        }
+    }
+
+    /// The exception edge is over-approximated: a handler that reads the
+    /// producer's register declines it even though no ordinary path reaches
+    /// the handler; a mapped `arguments` object declines parameter dsts.
+    #[test]
+    fn handler_edges_and_mapped_arguments_decline() {
+        if std::env::var_os("ZIPP_NO_INT32_TRUNC_ADD").is_some() {
+            return;
+        }
+        let base = named_proto("function f(a, b) { return (a + b) | 0; }", "f");
+        let (add_ip, add_dst) = base
+            .code
+            .iter()
+            .enumerate()
+            .find_map(|(ip, i)| match *i {
+                Instr::Add { dst, .. } => Some((ip, dst)),
+                _ => None,
+            })
+            .expect("an Add");
+        assert!(trunc_only_arith_ips(&base)[add_ip]);
+        // Trailing `ReturnUndefined` is unreachable by fallthrough (the
+        // `Return` before it ends every path). Make it read the Add's dst and
+        // reach it only through a handler edge.
+        let mut handled = base.clone();
+        let last = handled.code.len() - 1;
+        assert!(matches!(handled.code[last], Instr::ReturnUndefined));
+        handled.code[last] = Instr::Return { src: add_dst };
+        assert!(
+            trunc_only_arith_ips(&handled)[add_ip],
+            "an unreachable exact read is no observer"
+        );
+        handled.code.insert(
+            add_ip + 1,
+            Instr::PushHandler {
+                catch_target: (last + 1) as u32,
+                catch_reg: add_dst + 1,
+            },
+        );
+        assert!(
+            !trunc_only_arith_ips(&handled)[add_ip],
+            "the handler-reachable exact read declines: {:?}",
+            handled.code
+        );
+        // Parameter register as dst with an arguments object present.
+        let mut mapped = base.clone();
+        let Instr::Add { a, b, .. } = mapped.code[add_ip] else {
+            unreachable!()
+        };
+        mapped.code[add_ip] = Instr::Add { dst: 1, a, b };
+        for i in &mut mapped.code[add_ip + 1..] {
+            if let Instr::Bitwise { a, .. } = i {
+                if *a == add_dst {
+                    *a = 1;
+                }
+            }
+        }
+        assert!(trunc_only_arith_ips(&mapped)[add_ip], "{:?}", mapped.code);
+        mapped.arguments_reg = Some(mapped.reg_count - 1);
+        assert!(!trunc_only_arith_ips(&mapped)[add_ip], "{:?}", mapped.code);
+    }
 }

@@ -2698,6 +2698,14 @@ pub(crate) fn compile_proto_mem(
             targeted[target] = true;
         }
     }
+    // Truncation-only `Add`/`Sub`/`AddInt` results wrap in i32 instead of
+    // taking the f64 overflow path — `trunc_only_arith_ips` carries the proof,
+    // `ZIPP_NO_INT32_TRUNC_ADD=1` the exact old emission.
+    let trunc_arith = trunc_only_arith_ips(proto);
+    let n_trunc_arith = trunc_arith.iter().filter(|&&t| t).count();
+    if n_trunc_arith != 0 && std::env::var_os("ZIPP_JITLOG").is_some() {
+        eprintln!("[jit] fn{func_id} Tier-C int32-trunc arith sites={n_trunc_arith}");
+    }
     let block_sroa = if meter.is_none() && tierc_block_sroa_enabled() {
         plan_tierc_block_sroa(proto, &targeted, yield_heads)
     } else {
@@ -4252,6 +4260,7 @@ pub(crate) fn compile_proto_mem(
             Instr::AddInt { dst, a, imm, .. } => {
                 // Int fast path (the interpreter's `checked_add`), f64 fallback
                 // on a non-Int operand or overflow. (Copied from the mem path.)
+                // A truncation-only result wraps (see the `Add` arm).
                 let f64_path = ops.new_dynamic_label();
                 let done_ai = ops.new_dynamic_label();
                 dynasm!(ops
@@ -4261,8 +4270,10 @@ pub(crate) fn compile_proto_mem(
                     ; cmp r10d, INT_TAG_HI as i32
                     ; jne => f64_path
                     ; add eax, imm
-                    ; jo => f64_path
                 );
+                if !trunc_arith[ip] {
+                    dynasm!(ops ; jo => f64_path);
+                }
                 box_eax(&mut ops, dst);
                 dynasm!(ops ; jmp => done_ai ; => f64_path);
                 load_num_xmm(&mut ops, a, 0, bail);
@@ -4371,18 +4382,49 @@ pub(crate) fn compile_proto_mem(
                     ; => done_n
                 );
             }
-            Instr::Sub { dst, a, b } => {
-                dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Sub, int_hint)
-            }
+            Instr::Sub { dst, a, b } => dbinop(
+                &mut ops,
+                ip,
+                bail,
+                epilogue,
+                dst,
+                a,
+                b,
+                DOp::Sub,
+                int_hint,
+                trunc_arith[ip],
+            ),
             Instr::Mul { dst, a, b } => {
                 // `dbinop` excludes Mul from the int fast path (always f64), so no
                 // overflow concern.
-                dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Mul, int_hint)
+                dbinop(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    dst,
+                    a,
+                    b,
+                    DOp::Mul,
+                    int_hint,
+                    false,
+                )
             }
             Instr::Div { dst, a, b } => {
                 // Always f64 — JS `/` has no integer form (mirrors the region arm
                 // and the interpreter).
-                dbinop(&mut ops, ip, bail, epilogue, dst, a, b, DOp::Div, false)
+                dbinop(
+                    &mut ops,
+                    ip,
+                    bail,
+                    epilogue,
+                    dst,
+                    a,
+                    b,
+                    DOp::Div,
+                    false,
+                    false,
+                )
             }
             Instr::Mod { dst, a, b } => {
                 // Integer-valued Number remainder, copied from the MEM-region
@@ -4516,7 +4558,8 @@ pub(crate) fn compile_proto_mem(
                 // Int+Int fast path, then f64, then the `jit_concat` fallback
                 // (string concat / coercion — the interpreter's `add_values`),
                 // which may allocate / run user code ⇒ refetch r13/r14 when
-                // has_prop. (Copied from the region Add arm.)
+                // has_prop. (Copied from the region Add arm.) A truncation-only
+                // result (`trunc_arith`) wraps: no overflow branch, no double.
                 let slow = ops.new_dynamic_label();
                 let f64_path = ops.new_dynamic_label();
                 let done_a = ops.new_dynamic_label();
@@ -4533,8 +4576,10 @@ pub(crate) fn compile_proto_mem(
                         ; cmp r10d, INT_TAG_HI as i32
                         ; jne => f64_path
                         ; add eax, ecx
-                        ; jo => f64_path
                     );
+                    if !trunc_arith[ip] {
+                        dynasm!(ops ; jo => f64_path);
+                    }
                     box_eax(&mut ops, dst);
                     dynasm!(ops ; jmp => done_a);
                 }
