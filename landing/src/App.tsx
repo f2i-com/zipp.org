@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
 import { formatCount, relativeTime, useRepoStats, type RepoStats } from './repoStats'
 
-const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
+const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
 const F2I_URL = 'https://f2i.com'
 const DOCS_URL = `${GITHUB_URL}/blob/main/DOC.md#embedding`
 const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_8229b3fc_pgo_2026-09-02.json`
@@ -358,7 +358,7 @@ const readingGuide = [
   },
   {
     title: 'Cold time, exact output',
-    copy: 'Every number includes process launch, and a row only counts when all four engines print byte-identical output. Zipp’s 7.7 ms launch is real, but the ratios are about the work, not the start.',
+    copy: 'Every number includes process launch, and a row only counts when all four engines print byte-identical output. Zipp’s 7.4 ms launch is real, but the ratios are about the work, not the start.',
   },
   {
     title: 'One number for the whole picture',
@@ -1025,7 +1025,7 @@ function App() {
             <article className="headline-result">
               <div>
                 <span>Native equal-row all-30 headline</span>
-                <strong>0.7288×</strong>
+                <strong>0.7278×</strong>
                 <p>Native Zipp / Node paired geomean · lower is better</p>
               </div>
               <div className="confidence-pill">95% CI&nbsp; 0.7163–0.7359</div>
@@ -1033,16 +1033,16 @@ function App() {
 
             <article className="ratio-card">
               <span>Native all-30 paired geomeans</span>
-              <div className="ratio-row"><b>vs Node</b><span><i className="bar-geomean-node" /></span><strong>0.7288×</strong></div>
-              <div className="ratio-row"><b>vs Bun</b><span><i className="bar-geomean-bun" /></span><strong>0.6022×</strong></div>
-              <div className="ratio-row"><b>vs Deno</b><span><i className="bar-geomean-deno" /></span><strong>0.4692×</strong></div>
+              <div className="ratio-row"><b>vs Node</b><span><i className="bar-geomean-node" /></span><strong>0.7278×</strong></div>
+              <div className="ratio-row"><b>vs Bun</b><span><i className="bar-geomean-bun" /></span><strong>0.5936×</strong></div>
+              <div className="ratio-row"><b>vs Deno</b><span><i className="bar-geomean-deno" /></span><strong>0.4604×</strong></div>
               <small>95% CIs: Node 0.7163–0.7359 · Bun 0.5972–0.6073 · Deno 0.4639–0.4739. Normal 13 + hostile 17; equal weight per row.</small>
             </article>
 
             <article className="ratio-card suite-card">
               <span>Suite geomeans vs Node</span>
-              <div className="ratio-row"><b>Normal 13</b><span><i className="bar-suite-normal" /></span><strong>0.6202×</strong></div>
-              <div className="ratio-row"><b>Hostile 17</b><span><i className="bar-suite-hostile" /></span><strong>0.8244×</strong></div>
+              <div className="ratio-row"><b>Normal 13</b><span><i className="bar-suite-normal" /></span><strong>0.6136×</strong></div>
+              <div className="ratio-row"><b>Hostile 17</b><span><i className="bar-suite-hostile" /></span><strong>0.8293×</strong></div>
               <small>95% CIs: normal 0.6156–0.6240 · hostile 0.7995–0.8378. Rows faster than Node: {nodeWins(benchmarkRows)}/13 + {nodeWins(hostileRows)}/17.</small>
             </article>
           </div>
