@@ -142,6 +142,34 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B260 LANDED — the i32 add whose only observer is a ToInt32 truncation wraps
+
+`ZIPP_NO_INT32_TRUNC_ADD=1` restores the overflow branch. calls-closures spent
+9.9% of the row in the f64 overflow path of `(rotate(value) + 1013904223) | 0`
+and 5.0% in the double-to-int32 `Or` that followed. `trunc_only_arith_ips`
+walks the function's CFG forward from each `Add`/`Sub`/`AddInt` and admits, as
+a least fixpoint, the producers whose destination is read only by `Bitwise`
+operands or other admitted producers before redefinition (handler targets are
+universal successors; direct eval, `with` and `arguments`-mapped parameters
+decline). An admitted site keeps both Int tag checks but emits the 32-bit
+add/sub with no `jo` and no double: the exact result is an i33 every consumer
+reduces mod 2^32, and the wrapped i32 is that residue — ToInt32 of what the
+interpreter, the latch-off binary or a post-deopt resume computes. Tier-C and
+the MEM region tier; the INT-GPR tier's i53 guard is untouched (it needs an
+operand-range proof, not a consumer proof).
+
+Gate (2026-09-02, one binary at `86c513ee`, 21 interleaved pairs, exact
+output): calls-closures **−7.3%** [−8.5, −6.2]; bytecode-vm +0.0%
+[−1.7, +3.3], shapes-stable −0.2% [−4.7, +2.0], allocation-survival +1.9%
+[−3.5, +4.2], warm-router −2.2% [−2.8, +0.4] (all null). Two-binary against
+the `52961c42` base: calls-closures −6.8% [−8.2, −6.5], json-large +0.2%
+[−1.5, +2.1], markdown-render +0.1% [−0.5, +2.7]. Unit tests pin the ToInt32
+identity over the edge lattice plus four million random pairs against a
+checked-i64 reference, and the admission/decline of each idiom on compiled
+shapes; `tests/int32_trunc_add.rs` compares every mode and the latch against
+node. Left on the table: the `LoadInt 0 / Or` itself still executes at the
+admitted sites, and the arrow body's five dead-register materialisations.
+
 ### B259 LANDED — the warm pristine-Promise re-check answers from bit compares
 
 `ZIPP_NO_PRISTINE_LEAN=1` restores the per-call re-proof. The pristine
