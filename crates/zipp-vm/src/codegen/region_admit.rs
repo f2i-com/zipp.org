@@ -1596,6 +1596,8 @@ pub(crate) struct HeapHelpers {
     pub(crate) math_two: usize,
     /// Exact main-realm `Math.imul` identity + heap-generation guard.
     pub(crate) math_imul_guard: Option<MathIntrinsicGuard>,
+    /// B264: whether the inline dense-array store lane may be emitted.
+    pub(crate) inline_store_lane_ok: bool,
     /// Pure `CellGet` helper (cell bits → inner Value bits / TDZ-deopt sentinel).
     pub(crate) cell_get: usize,
     /// `jit_str_index_of` intrinsic.

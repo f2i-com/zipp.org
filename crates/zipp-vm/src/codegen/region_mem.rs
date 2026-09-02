@@ -2395,7 +2395,65 @@ pub(crate) fn compile_region_mem(
                     .get(&ip)
                     .map(|&j| (j as usize, ta_plan.pins[j as usize].kind))
                     .filter(|&(_, kind)| !is_arr_pin(kind));
+                // B264: the dense-Array pin DOES get an inline store lane for
+                // the one case that is a plain memory write: identity guard,
+                // integer key, `i < len` (never an append), a YOUNG holder (a
+                // young holder needs no barrier in either barrier mode -- see
+                // `write_barrier_val`), and either a present element or a
+                // hole whose fill the snapshot flags license (default chain,
+                // no indexed prototype, writable length -- exactly the helper's
+                // `creates_new_index` deopt conditions). Everything else takes
+                // the generic helper below, byte-for-byte as before. An
+                // in-range store leaves base and length untouched, so no
+                // snapshot refetch follows the lane (the B256 `array_store_in_
+                // place` rule); the deopt for a non-number key mirrors the
+                // helper's `!key.is_number()` sentinel.
+                let arr_pinned = ta_plan
+                    .access
+                    .get(&ip)
+                    .map(|&j| (j as usize, ta_plan.pins[j as usize].kind))
+                    .filter(|&(_, kind)| {
+                        is_arr_pin(kind) && heap.inline_store_lane_ok && inline_dense_store_enabled()
+                    });
                 let (ta_slow, ta_done) = (ops.new_dynamic_label(), ops.new_dynamic_label());
+                if let Some((slot, _)) = arr_pinned {
+                    use crate::vm::host_api::JIT_GEN_RAW_OFFSET;
+                    if std::env::var_os("ZIPP_JITLOG").is_some() {
+                        eprintln!("[jit] MEM region [{s},{e}] inline dense store at ip {ip}");
+                    }
+                    let off = ta_slot_off(slot);
+                    let store = ops.new_dynamic_label();
+                    dynasm!(ops
+                        ; mov rax, [rbx + dreg(obj)]      // receiver bits
+                        ; cmp rax, [rsp + off]            // identity vs snapshot
+                        ; jne => ta_slow                  // miss/declined → helper
+                    );
+                    emit_ta_key(&mut ops, key, bail); // rcx = i64 index; non-number → deopt
+                    dynasm!(ops
+                        ; cmp rcx, [rsp + off + 16]       // unsigned: i < len?
+                        ; jae => ta_slow                  // append/sparse/negative → helper
+                        // ── barrier fast path: the holder must be YOUNG ──
+                        ; mov r10d, eax                   // holder heap index (low 32 bits)
+                        ; mov r11, [rdi + JIT_GEN_RAW_OFFSET as i32]
+                        ; test BYTE [r11 + r10], crate::heap::JIT_GEN_STATE_MASK as i8
+                        ; jnz => ta_slow                  // OLD/DIRTY holder → helper barrier
+                        // ── present element, or a licensed hole-fill ──
+                        ; mov rdx, [rsp + off + 8]        // pinned items base
+                        ; mov r11, [rdx + rcx * 8]        // items[i]
+                        ; mov r10, QWORD ARR_HOLE_BITS as i64
+                        ; cmp r11, r10
+                        ; jne => store
+                        ; test QWORD [rsp + off + 24], crate::vm::TA_SNAP_INDEX_ABSENT as i32
+                        ; jz => ta_slow
+                        ; test QWORD [rsp + off + 24], crate::vm::TA_SNAP_LEN_WRITABLE as i32
+                        ; jz => ta_slow
+                        ; => store
+                        ; mov rax, [rbx + dreg(val)]      // value bits
+                        ; mov [rdx + rcx * 8], rax        // the element store
+                        ; jmp => ta_done
+                        ; => ta_slow
+                    );
+                }
                 if let Some((slot, kind)) = pinned {
                     let off = ta_slot_off(slot);
                     let val_int = ops.new_dynamic_label();
@@ -2506,7 +2564,7 @@ pub(crate) fn compile_region_mem(
                 if let Some((snap, plan, cache)) = ta_refetch {
                     emit_cross_refetch_ta(&mut ops, snap, plan, cache);
                 }
-                if pinned.is_some() {
+                if pinned.is_some() || arr_pinned.is_some() {
                     dynasm!(ops ; => ta_done);
                 }
                 emit_region_bail(&mut ops, ip, bail, epilogue);

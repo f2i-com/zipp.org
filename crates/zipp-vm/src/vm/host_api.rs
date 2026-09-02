@@ -166,6 +166,12 @@ pub(crate) const JIT_UPVALS_MIRROR_RAW_OFFSET: usize = core::mem::offset_of!(Vm<
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_ARRAY_SNAPSHOT_EPOCH_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
     + core::mem::offset_of!(crate::heap::Heap, array_snapshot_epoch);
+/// VM-relative offset of `Heap::gen_raw` (B264 inline dense store lane).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_GEN_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
+    + core::mem::offset_of!(crate::heap::Heap, gen_raw);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+const _: () = assert!(JIT_GEN_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = {
     assert!(core::mem::size_of::<u64>() == 8);

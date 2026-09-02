@@ -1508,6 +1508,13 @@ pub(crate) const TA_SNAP_LOCAL: u64 = 1;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const TA_SNAP_INDEX_ABSENT: u64 = 1 << 1;
 
+/// The snapshot's Array receiver has a writable `length` (B264). A hole-fill
+/// below `length` does not move `length`, but `jit_set_index` deopts every
+/// new-index store on a non-writable length, so the inline store lane fills a
+/// hole only when this bit AND `TA_SNAP_INDEX_ABSENT` are both set.
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const TA_SNAP_LEN_WRITABLE: u64 = 1 << 2;
+
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 #[inline]
 fn dense_array_snap_flags(vm: &Vm<'_>, idx: u32) -> u64 {
@@ -1518,7 +1525,13 @@ fn dense_array_snap_flags(vm: &Vm<'_>, idx: u32) -> u64 {
         && vm.obj_proto != 0
         && !vm.proto_of.contains_key(&vm.arr_proto)
         && !vm.proto_of.contains_key(&vm.obj_proto);
-    TA_SNAP_LOCAL | if protected { TA_SNAP_INDEX_ABSENT } else { 0 }
+    TA_SNAP_LOCAL
+        | if protected { TA_SNAP_INDEX_ABSENT } else { 0 }
+        | if vm.array_length_nonwritable.contains(&idx) {
+            0
+        } else {
+            TA_SNAP_LEN_WRITABLE
+        }
 }
 
 /// `ZIPP_ICSTATS=1` evidence counter for B244. It deliberately lives on the
@@ -2194,7 +2207,7 @@ pub(crate) extern "win64" fn jit_array_push3_pinned(
         let arr = Value::from_bits(snap.obj_bits);
         if !arr.is_heap()
             || snap.flags & TA_SNAP_LOCAL == 0
-            || snap.flags & !(TA_SNAP_LOCAL | TA_SNAP_INDEX_ABSENT) != 0
+            || snap.flags & !(TA_SNAP_LOCAL | TA_SNAP_INDEX_ABSENT | TA_SNAP_LEN_WRITABLE) != 0
         {
             return 0;
         }

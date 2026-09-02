@@ -1487,6 +1487,9 @@ pub struct HeapHelperAddrs {
     /// was pristine at compile time. The emitted check still consumes the
     /// per-call captured receiver/callee and their live heap-slot generation.
     pub math_imul_guard: Option<MathIntrinsicGuard>,
+    /// B264: the heap can host the inline dense store lane (nursery on, GC
+    /// oracle off) -- read once per compile from the live heap.
+    pub inline_store_lane_ok: bool,
     /// Helper for `CellGet` / `UpvalGet` reading a captured-local cell: a pure
     /// heap LOAD of the cell's inner Value (no alloc, no user code). Returns the
     /// inner Value bits, or `SELF_CALL_DEOPT` for a still-uninitialized (TDZ)
@@ -1656,6 +1659,7 @@ impl HeapHelperAddrs {
             math_unary: self.math_unary,
             math_two: self.math_two,
             math_imul_guard: self.math_imul_guard,
+            inline_store_lane_ok: self.inline_store_lane_ok,
             cell_get: self.cell_get,
             cell_set: self.cell_set,
             upval_set: self.upval_set,
@@ -1951,6 +1955,25 @@ pub(crate) fn hasprop_jumpfuse_enabled() -> bool {
 /// prototype protector is still valid; the MEM emitter may then answer a hole
 /// or positive out-of-bounds Int key as `false` without crossing the helper.
 /// `ZIPP_NO_HASPROP_PIN_ABSENT=1` restores the old hole/OOB helper route.
+/// B264 inline pinned dense-Array `SetIndex` lane in MEM regions: identity
+/// guard, integer key, in-range, YOUNG holder (no barrier needed), present
+/// element or licensed hole-fill, then a direct 8-byte store -- no helper
+/// call, no snapshot refetch. `ZIPP_NO_INLINE_DENSE_STORE=1` restores the
+/// helper-only route.
+pub(crate) fn inline_dense_store_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_INLINE_DENSE_STORE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub(crate) fn hasprop_pin_absent_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);

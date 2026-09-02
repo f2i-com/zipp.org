@@ -8852,6 +8852,7 @@ impl<'p> Vm<'p> {
             math_unary: jit_math_unary as usize,
             math_two: jit_math_two as usize,
             math_imul_guard,
+            inline_store_lane_ok: self.heap.inline_store_lane_ok(),
             cell_get: jit_cell_get as usize,
             str_index_of: crate::vm::helpers_misc::jit_str_index_of as usize,
             str_substring: crate::vm::helpers_misc::jit_str_substring as usize,

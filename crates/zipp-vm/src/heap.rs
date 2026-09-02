@@ -4986,6 +4986,12 @@ pub struct Heap {
     pub(crate) upvals_mirror_raw: u64,
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) versions_raw: u64,
+    /// Raw base of `gen` (B264): the inline dense-array store lane tests the
+    /// holder's generation byte through it -- a YOUNG holder (state bits 0)
+    /// needs no barrier in either barrier mode. Refreshed wherever `gen` can
+    /// reallocate; 0 while the nursery is off (the lane is then not emitted).
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) gen_raw: u64,
     /// Dead payloads collected by the CURRENT sweep, shipped to the courier
     /// thread at `note_gc_done`/`note_minor_done` (see [`gc_courier`]).
     courier_batch: Vec<gc_courier::Item>,
@@ -5295,6 +5301,10 @@ const GEN_OLD: u8 = 1;
 const GEN_DIRTY: u8 = 2;
 /// Mask selecting the state bits out of a `Heap::gen` byte.
 const GEN_STATE: u8 = 0b11;
+/// `GEN_STATE` for the emitted store lane's `test byte` (a holder whose
+/// state bits are zero is YOUNG and needs no barrier).
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_GEN_STATE_MASK: u8 = GEN_STATE;
 /// Sticky "registered in `Heap::scan_roots`" bit (call-free store target).
 const GEN_SCAN: u8 = 0b100;
 /// W10: "already recorded in `Heap::vremset` this epoch" — the value-grain
@@ -5548,6 +5558,8 @@ impl Heap {
             upvals_mirror_raw: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             versions_raw: 0,
+            #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+            gen_raw: 0,
             versions,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             array_snapshot_epoch: 0,
@@ -5610,6 +5622,17 @@ impl Heap {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
         {
             self.versions_raw = self.versions.as_ptr() as u64;
+            self.gen_raw = self.gen.as_ptr() as u64;
+        }
+    }
+
+    /// Re-cache `gen_raw` after a `gen` growth (`push` / `reserve_exact` may
+    /// move the buffer; `recache_mirror_raws` runs BEFORE the push in `alloc`).
+    #[inline]
+    fn recache_gen_raw(&mut self) {
+        #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+        {
+            self.gen_raw = self.gen.as_ptr() as u64;
         }
     }
 
@@ -6355,6 +6378,7 @@ impl Heap {
             } else {
                 self.gen.push(GEN_OLD);
             }
+            self.recache_gen_raw();
         }
         if self.oracle {
             self.born.push(if self.pretenure == 0 {
@@ -6521,6 +6545,7 @@ impl Heap {
         }
         if self.nursery {
             self.gen.reserve_exact(step);
+            self.recache_gen_raw();
         }
         if self.oracle {
             self.born.reserve_exact(step);
@@ -6559,6 +6584,14 @@ impl Heap {
         self.nursery
     }
 
+    /// Whether a region may emit the inline dense-array store lane (B264): the
+    /// nursery is on (so `gen` is materialised and a young holder provably
+    /// needs no barrier) and the GC oracle is off (it counts helper stores).
+    #[inline]
+    pub(crate) fn inline_store_lane_ok(&self) -> bool {
+        self.nursery && !self.oracle
+    }
+
     /// Test-only: force the nursery latch (materialising the generation
     /// bytes), so the unit tests below hold in a suite run under
     /// `ZIPP_NO_NURSERY=1` too.
@@ -6568,6 +6601,7 @@ impl Heap {
         if on && self.gen.len() != self.objs.len() {
             self.gen = vec![GEN_OLD; self.objs.len()];
         }
+        self.recache_gen_raw();
         self.invalidate_nonyoung_cache();
     }
 
