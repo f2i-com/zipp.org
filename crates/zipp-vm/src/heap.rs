@@ -8024,6 +8024,15 @@ impl Heap {
         }
     }
 
+    /// Whether the string-like object at `idx` is a FLAT string whose bytes
+    /// are all ASCII — the `JsStr::ascii` flag recorded at construction, no
+    /// scan. A rope (or a non-string) answers `false`, meaning "unknown",
+    /// never a wrong `true`. The JSON serializer routes an ASCII value onto
+    /// its `&str` quoter with it (see `json_quote_wtf8_into_hint`).
+    pub fn str_is_ascii(&self, idx: u32) -> bool {
+        matches!(self.get(idx), HeapObj::Str(s) if s.is_ascii())
+    }
+
     /// Whether every flat leaf under a string-like object is well-formed —
     /// from the cached `JsStr` flags only, no flattening or byte scan. All
     /// leaves well-formed ⇒ the concatenation holds no surrogate bytes at

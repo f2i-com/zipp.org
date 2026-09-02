@@ -219,9 +219,15 @@ fn json_quote_bounded(out: &mut String, text: &str) -> Result<(), JsonOutputErro
     Ok(())
 }
 
-fn json_quote_wtf8_bounded(out: &mut String, bytes: &[u8]) -> Result<(), JsonOutputError> {
+/// `ascii` is the heap string's flag (see `json_quote_wtf8_into`): the same
+/// bounded reserve, then the `&str` quoter when the bytes are known ASCII.
+fn json_quote_wtf8_bounded(
+    out: &mut String,
+    bytes: &[u8],
+    ascii: bool,
+) -> Result<(), JsonOutputError> {
     json_reserve_bounded(out, json_quoted_wtf8_len(bytes)?)?;
-    json_quote_wtf8_into(out, bytes);
+    json_quote_wtf8_into(out, bytes, ascii);
     Ok(())
 }
 
@@ -456,12 +462,13 @@ impl<'p> Vm<'p> {
         index: u32,
     ) -> Result<(), Thrown> {
         let prior_capacity = out.capacity();
+        let ascii = self.heap.str_is_ascii(index);
         let appended = if json_leaf_fast_enabled() {
             let bytes = self.heap.str_wtf8_cow(index).unwrap();
-            json_quote_wtf8_bounded(out, &bytes)
+            json_quote_wtf8_bounded(out, &bytes, ascii)
         } else {
             let bytes = self.heap.str_wtf8_cow(index).unwrap().into_owned();
-            json_quote_wtf8_bounded(out, &bytes)
+            json_quote_wtf8_bounded(out, &bytes, ascii)
         };
         self.json_commit_output(out, prior_capacity, appended)
     }
@@ -639,10 +646,11 @@ impl<'p> Vm<'p> {
         let idx = value.heap_index();
         match self.heap.get(idx) {
             HeapObj::Str(_) | HeapObj::Cons { .. } => {
+                let ascii = self.heap.str_is_ascii(idx);
                 let Some(bytes) = self.heap.str_wtf8_cow(idx) else {
                     return false;
                 };
-                json_quote_wtf8_bounded(out, &bytes).is_ok()
+                json_quote_wtf8_bounded(out, &bytes, ascii).is_ok()
             }
             HeapObj::Array(items) => {
                 if depth >= MAX_DEPTH

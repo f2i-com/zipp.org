@@ -56,8 +56,20 @@ pub(crate) fn json_quote_into(out: &mut String, s: &str) {
     out.push('"');
 }
 
-/// `json_quote_wtf8` appending into an existing buffer.
-pub(crate) fn json_quote_wtf8_into(out: &mut String, b: &[u8]) {
+/// `json_quote_wtf8` appending into an existing buffer, carrying the caller's
+/// ASCII knowledge. A flat `JsStr` records `ascii` at construction, and an
+/// ASCII buffer is `&str` material, so it takes the `&str` quoter: same
+/// escapes, same bytes out, but its clean runs are copied without
+/// `json_quote_run`'s `from_utf8` re-validation and without the per-byte
+/// lone-surrogate probe. `ascii == false` means "unknown" and keeps the WTF-8
+/// scan; so does `ZIPP_NO_JSON_ASCII_UNCHECKED=1`.
+pub(crate) fn json_quote_wtf8_into(out: &mut String, b: &[u8], ascii: bool) {
+    if ascii && json_ascii_unchecked_enabled() {
+        if let Some(s) = ascii_bytes_as_str(b) {
+            json_quote_into(out, s);
+            return;
+        }
+    }
     out.reserve(b.len() + 2);
     out.push('"');
     if json_quote_bulk_enabled() {
@@ -188,6 +200,91 @@ pub(crate) fn json_plain_key_enabled() -> bool {
     }
 }
 
+/// Latch for the parser-proved ASCII views: `ZIPP_NO_JSON_ASCII_UNCHECKED=1`
+/// re-validates every escape-free member name, every number token and every
+/// ASCII string value through `core::str::from_utf8`, exactly as before.
+///
+/// Those three sites were the whole `from_utf8` share of json-large (3.4% of
+/// PC samples): ~440,000 member names and ~225,000 number tokens per run on
+/// the parse side, and every string value on the stringify side — all bytes
+/// the scanner in front of the call had already looked at one by one.
+pub(crate) fn json_ascii_unchecked_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JSON_ASCII_UNCHECKED").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// View bytes the CALLER has proved ASCII as `&str` without a second scan.
+/// ASCII is valid UTF-8 by construction, so the unchecked view is sound. The
+/// memory-safe sandbox profile keeps the checked conversion; its `None` (a
+/// failed proof, which cannot happen) sends the caller back to the exact old
+/// path rather than panicking.
+pub(crate) fn ascii_bytes_as_str(bytes: &[u8]) -> Option<&str> {
+    debug_assert!(
+        bytes.is_ascii(),
+        "ascii_bytes_as_str: caller's ascii proof failed"
+    );
+    #[cfg(feature = "safe-sandbox")]
+    return std::str::from_utf8(bytes).ok();
+    // SAFETY: every byte is < 0x80 (the caller's proof, checked above in
+    // debug builds), and a pure-ASCII byte sequence is valid UTF-8.
+    #[cfg(not(feature = "safe-sandbox"))]
+    return Some(unsafe { std::str::from_utf8_unchecked(bytes) });
+}
+
+/// `ZIPP_NO_JSON_INT_FAST=1` sends every number token through
+/// `str::parse::<f64>` again (see `json_int_token_fast`).
+pub(crate) fn json_int_fast_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_JSON_INT_FAST").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// A plain integer token — `-?digits`, at most 15 digits, no fraction and no
+/// exponent — read directly. Below 10^15 every integer is exactly
+/// representable, so `u64 as f64` IS the correctly rounded value
+/// `parse::<f64>` returns; `-0` stays the negative zero `parse` gives (and
+/// `Value::num` keeps it a double). Anything else → `None`, the general
+/// parser. The caller has already validated the token against the JSON
+/// number grammar, so a leading zero can only be the lone `0`.
+fn json_int_token_fast(tok: &[u8]) -> Option<f64> {
+    if !json_int_fast_enabled() {
+        return None;
+    }
+    let (neg, digits) = match tok.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, tok),
+    };
+    if digits.is_empty() || digits.len() > 15 {
+        return None;
+    }
+    let mut n: u64 = 0;
+    for &d in digits {
+        if !d.is_ascii_digit() {
+            return None;
+        }
+        n = n * 10 + (d - b'0') as u64;
+    }
+    let f = n as f64;
+    Some(if neg { -f } else { f })
+}
+
 /// B233: read a member name that needs no decoding, borrowing it from the
 /// source instead of allocating it.
 ///
@@ -202,15 +299,29 @@ pub(crate) fn json_scan_plain_key<'a>(src: &'a [u8], i: &mut usize) -> Option<&'
     debug_assert_eq!(src.get(*i), Some(&b'"'));
     let start = *i + 1;
     let mut j = start;
+    // The scan already looks at every byte; remembering whether one was
+    // >= 0x80 makes the UTF-8 question free for the ASCII name (the common
+    // one), so the `from_utf8` pass below is only paid for a non-ASCII name.
+    let mut ascii = true;
     loop {
         match *src.get(j)? {
             b'"' => break,
             b'\\' => return None,
             c if c < 0x20 => return None,
-            _ => j += 1,
+            c => {
+                ascii &= c < 0x80;
+                j += 1;
+            }
         }
     }
-    let name = std::str::from_utf8(&src[start..j]).ok()?;
+    let raw = &src[start..j];
+    let name = match (ascii && json_ascii_unchecked_enabled())
+        .then(|| ascii_bytes_as_str(raw))
+        .flatten()
+    {
+        Some(s) => s,
+        None => std::str::from_utf8(raw).ok()?,
+    };
     *i = j + 1;
     Some(name)
 }
@@ -312,10 +423,20 @@ pub(crate) fn json_parse_number(b: &[u8], i: &mut usize) -> Result<Value, Thrown
             *i += 1;
         }
     }
-    match std::str::from_utf8(&b[start..*i])
-        .unwrap_or("")
-        .parse::<f64>()
+    // Every byte the grammar above accepted is ASCII (`-`, digits, `.`, `e`,
+    // `E`, `+`), so the token is `&str` material without a UTF-8 pass.
+    let tok = &b[start..*i];
+    if let Some(n) = json_int_token_fast(tok) {
+        return Ok(Value::num(n));
+    }
+    let text = match json_ascii_unchecked_enabled()
+        .then(|| ascii_bytes_as_str(tok))
+        .flatten()
     {
+        Some(s) => s,
+        None => std::str::from_utf8(tok).unwrap_or(""),
+    };
+    match text.parse::<f64>() {
         Ok(n) => Ok(Value::num(n)),
         Err(_) => Err(err()),
     }
