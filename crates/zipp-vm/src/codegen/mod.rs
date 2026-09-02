@@ -1974,6 +1974,26 @@ pub(crate) fn inline_dense_store_enabled() -> bool {
     }
 }
 
+/// B267: in Tier C, a truncation-only `Add`/`AddInt` (see
+/// `trunc_only_arith_ips`) followed by `LoadInt 0; Bitwise Or` -- the `x | 0`
+/// idiom -- writes its wrapped Int straight into the Or's destination on the
+/// Int path and skips both following ops (their registers are still written,
+/// so a later deopt sees the same frame). `ZIPP_NO_TRUNC_OR_FUSE=1` restores
+/// the three-op emission.
+pub(crate) fn trunc_or_fuse_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_TRUNC_OR_FUSE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 pub(crate) fn hasprop_pin_absent_enabled() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
     static STATE: AtomicU8 = AtomicU8::new(0);

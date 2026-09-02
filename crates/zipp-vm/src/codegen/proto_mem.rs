@@ -3061,6 +3061,61 @@ pub(crate) fn compile_proto_mem(
                          // Step metering (a metered VM only) — a Tier C body can loop just as a Tier
                          // A one can, so it needs the same charge. See codegen::meter.
     let blocks = crate::codegen::meter::block_map(meter, &proto.code, 0, n - 1);
+    // B267: `(x + y) | 0` at a truncation-only site. `fuse_or[ip] = Some((z,
+    // d2))` when ip is a wrapping `Add`/`AddInt`, ip+1 is `LoadInt {z, 0}` and
+    // ip+2 is `Bitwise Or {d2, dst, z}` (either operand order), neither
+    // follower is a jump or handler target, and no step meter charges blocks
+    // (skipping two ips would skip a charge). The Int path then stores dst,
+    // the boxed 0 into z and the result into d2, and jumps to ip+3; the f64
+    // and concat paths fall into the unchanged ip+1 / ip+2 code.
+    let fuse_or: Vec<Option<(u16, u16)>> = {
+        let mut v = vec![None; n];
+        if crate::codegen::trunc_or_fuse_enabled() && blocks.is_none() {
+            let mut targeted = vec![false; n];
+            for instr in &proto.code {
+                let t = match *instr {
+                    Instr::Jump { target }
+                    | Instr::JumpIfFalse { target, .. }
+                    | Instr::JumpIfTrue { target, .. }
+                    | Instr::JumpIfNotLt { target, .. }
+                    | Instr::JumpIfNotLe { target, .. }
+                    | Instr::PushFinally { target, .. }
+                    | Instr::JumpFinally { target, .. } => Some(target as usize),
+                    Instr::PushHandler { catch_target, .. } => Some(catch_target as usize),
+                    _ => None,
+                };
+                if let Some(t) = t.filter(|&t| t < n) {
+                    targeted[t] = true;
+                }
+            }
+            for ip in 0..n.saturating_sub(3) {
+                if !trunc_arith[ip] {
+                    continue;
+                }
+                let dst = match proto.code[ip] {
+                    Instr::Add { dst, .. } | Instr::AddInt { dst, .. } => dst,
+                    _ => continue,
+                };
+                let Instr::LoadInt { dst: z, val: 0 } = proto.code[ip + 1] else {
+                    continue;
+                };
+                let Instr::Bitwise {
+                    dst: d2,
+                    a,
+                    b,
+                    op: crate::bytecode::BitwiseOp::Or,
+                } = proto.code[ip + 2]
+                else {
+                    continue;
+                };
+                let pair = (a == dst && b == z) || (a == z && b == dst);
+                if pair && z != dst && !targeted[ip + 1] && !targeted[ip + 2] {
+                    v[ip] = Some((z, d2));
+                }
+            }
+        }
+        v
+    };
     let mut meter_stubs: Vec<(dynasmrt::DynamicLabel, usize)> = Vec::new();
     // B118 fused compare→branch (the region rule, Tier-C shape): `cmp {dst} ;
     // JumpIfTrue/False{cond: dst}` at the very next ip fuses (see
@@ -4296,7 +4351,19 @@ pub(crate) fn compile_proto_mem(
                     dynasm!(ops ; jo => f64_path);
                 }
                 box_eax(&mut ops, dst);
-                dynasm!(ops ; jmp => done_ai ; => f64_path);
+                match fuse_or[ip] {
+                    Some((z, d2)) => {
+                        // B267: see the `Add` arm.
+                        dynasm!(ops
+                            ; mov r10, QWORD INT_TAG as i64
+                            ; mov [rbx + dreg(z)], r10
+                            ; mov [rbx + dreg(d2)], rax
+                            ; jmp => labels[ip + 3]
+                        );
+                    }
+                    None => dynasm!(ops ; jmp => done_ai),
+                }
+                dynasm!(ops ; => f64_path);
                 load_num_xmm(&mut ops, a, 0, bail);
                 dynasm!(ops
                     ; mov eax, imm
@@ -4602,7 +4669,18 @@ pub(crate) fn compile_proto_mem(
                         dynasm!(ops ; jo => f64_path);
                     }
                     box_eax(&mut ops, dst);
-                    dynasm!(ops ; jmp => done_a);
+                    match fuse_or[ip] {
+                        Some((z, d2)) => {
+                            // B267: the `| 0` of a wrapped Int is the identity.
+                            dynasm!(ops
+                                ; mov r10, QWORD INT_TAG as i64
+                                ; mov [rbx + dreg(z)], r10
+                                ; mov [rbx + dreg(d2)], rax
+                                ; jmp => labels[ip + 3]
+                            );
+                        }
+                        None => dynasm!(ops ; jmp => done_a),
+                    }
                 }
                 dynasm!(ops ; => f64_path);
                 load_num_xmm(&mut ops, a, 0, slow);
