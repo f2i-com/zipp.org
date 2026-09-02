@@ -139,6 +139,30 @@ pub(crate) const ABORT_MSG: &str = "RangeError: script execution was aborted by 
 /// Raised when a script exceeds the heap ceiling its host set.
 pub(crate) const MEMORY_MSG: &str = "RangeError: script exceeded its memory budget";
 pub(crate) const OUTPUT_MSG: &str = "RangeError: script exceeded its output budget";
+
+/// What one buffered console line costs beyond the text it carries.
+///
+/// A line is retained as a `String` in a `Vec` and later handed to the host as
+/// one node of the array `takeOutput` returns, so its cost is never zero: there
+/// is a pointer, a length, a capacity and a slot whatever the line says.
+///
+/// Charging `len + 1` made an EMPTY line cost a single byte, so an 8 MiB budget
+/// admitted 8.4 million of them — over a hundred megabytes of retained entries,
+/// and four times as many nodes as the host boundary will convert. Neither
+/// guard was reached in between. `while (true) console.log("")` simply grew
+/// until the WebAssembly instance trapped on `unreachable`, which the host
+/// cannot catch, cannot report, and cannot tell apart from a bug in the engine:
+///
+/// ```text
+/// 3,800,000 empty lines -> ok
+/// 3,900,000 empty lines -> RuntimeError: unreachable
+/// ```
+///
+/// Eight bytes holds the entry count to `output_limit / 8`, which stays under
+/// the host's node cap so `takeOutput` can always return what was buffered,
+/// and leaves the byte budget to bound real text as before. A line with
+/// content is charged what it always was, plus this.
+pub(crate) const OUTPUT_LINE_OVERHEAD_BYTES: usize = 8;
 pub(crate) const DYNAMIC_SOURCE_MSG: &str =
     "RangeError: dynamic code source exceeds its per-compilation limit";
 pub(crate) const DYNAMIC_TOTAL_SOURCE_MSG: &str =
@@ -1285,7 +1309,7 @@ impl super::Vm<'_> {
         let Some(rec) = self.instr_rec.as_mut() else {
             return Ok(());
         };
-        let bytes = line.len().saturating_add(1);
+        let bytes = line.len().saturating_add(OUTPUT_LINE_OVERHEAD_BYTES);
         let Some(total) = rec.output_used.checked_add(bytes) else {
             rec.output_exhausted = true;
             return Err(rec.exhaust(ResourceExhaustion::Output));

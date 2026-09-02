@@ -6,7 +6,7 @@ run against a real wasm build under node.
 
 ```sh
 cd crates/zipp-wasm
-RUSTFLAGS='-Dwarnings -C link-arg=--max-memory=268435456 -C link-arg=-zstack-size=1048576' \
+RUSTFLAGS='-Dwarnings -C link-arg=--max-memory=1073741824 -C link-arg=-zstack-size=1048576' \
   cargo +1.92.0 build --locked --release --target wasm32-unknown-unknown
 wasm-bindgen --target nodejs --out-dir tests/node/pkg \
   target/wasm32-unknown-unknown/release/zipp_wasm.wasm

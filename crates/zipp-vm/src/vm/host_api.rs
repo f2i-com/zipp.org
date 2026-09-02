@@ -28,7 +28,7 @@
 //! reparse on a path a host may run every frame.
 
 use crate::bytecode::Program;
-use crate::heap::{HeapObj, ObjMap};
+use crate::heap::{HeapObj, ObjMap, PropAttr};
 use crate::value::Value;
 use crate::vm::Vm;
 
@@ -512,17 +512,32 @@ impl<'p> Vm<'p> {
     /// Only the step counter moves: `heap_limit`, `output_limit` and the
     /// sticky `exhaustion` are left exactly as they are, so a renewal can
     /// never resurrect an engine that has already spent a different budget.
-    ///
-    /// Instrument-only like the recorder it renews: a build without the
-    /// `instrument` feature has no step budget to restore.
-    #[cfg(feature = "instrument")]
     pub(crate) fn renew_step_budget(&mut self, max_steps: u64) -> bool {
-        match self.instr_rec.as_mut() {
-            Some(rec) if rec.exhaustion.is_none() => {
-                rec.set_step_limit(max_steps);
-                true
+        // `instr_rec` only exists under `instrument`, and this reached for it
+        // unconditionally. The workspace build hides that — some other member
+        // turns the feature on and Cargo unifies it — but `cargo build -p
+        // zipp-vm`, and the `--no-default-features` pure interpreter this
+        // crate's Cargo.toml advertises, both failed to compile.
+        #[cfg(feature = "instrument")]
+        {
+            match self.instr_rec.as_mut() {
+                Some(rec) if rec.exhaustion.is_none() => {
+                    rec.set_step_limit(max_steps);
+                    true
+                }
+                _ => false,
             }
-            _ => false,
+        }
+        // No instrument feature means no step budget was ever imposed, so there
+        // is nothing to restore and nothing that could have been spent. True,
+        // not false: the caller is asking whether it may keep going, and an
+        // engine with no budget always may. Answering false would make a host
+        // that checks the result stop dead in the one configuration that has no
+        // reason to stop.
+        #[cfg(not(feature = "instrument"))]
+        {
+            let _ = max_steps;
+            true
         }
     }
 
@@ -897,45 +912,145 @@ impl<'p> Vm<'p> {
     /// preserved when they are opaque. An explicit non-null write always wins —
     /// this protects what the host could not express, never what it chose.
     fn host_in_over(&mut self, old: Value, hv: &HostValue, depth: usize) -> Value {
+        // An ARRAY has to be walked element-wise for the same reason an object is
+        // walked property-wise. Without this arm the whole preservation rule
+        // stopped at the first array: everything below it was rebuilt from the
+        // host's projection, so a function, or an instance, one element deep was
+        // destroyed by a read-modify-write that changed nothing.
+        //
+        //     [ function () { ... } ]        -> host sees [null] -> element gone
+        //     { list: [ { fn: ... } ] }      -> the array breaks the chain
+        //
+        // The object path already did this correctly, which is what made it look
+        // like arrays were fine too.
+        if let HostValue::Array(items) = hv {
+            if depth < MAX_DEPTH && old.is_heap() {
+                let old_items = match self.heap.get(old.heap_index()) {
+                    HeapObj::Array(items) => Some(items.clone()),
+                    _ => None,
+                };
+                if let Some(old_items) = old_items {
+                    let mut vals: Vec<Value> = Vec::with_capacity(items.len());
+                    for (i, it) in items.iter().enumerate() {
+                        let prev = old_items.get(i).copied();
+                        let v = match (it, prev) {
+                            // The host is echoing back a value it could only ever
+                            // see as Opaque. That is not an edit.
+                            (
+                                HostValue::Null | HostValue::Undefined | HostValue::Opaque,
+                                Some(p),
+                            ) if self.host_is_opaque(p) => p,
+                            (_, Some(p)) => self.host_in_over(p, it, depth + 1),
+                            (_, None) => self.host_in(it, depth + 1),
+                        };
+                        vals.push(v);
+                    }
+                    return Value::heap(self.heap.alloc(HeapObj::Array(vals)));
+                }
+            }
+            return self.host_in(hv, depth);
+        }
         let HostValue::Object(pairs) = hv else {
             return self.host_in(hv, depth);
         };
         if depth >= MAX_DEPTH || !old.is_heap() {
             return self.host_in(hv, depth);
         }
-        // Snapshot the old object's own data properties, then drop the borrow.
-        let old_props: Vec<(String, Value)> = match self.heap.get(old.heap_index()) {
-            HeapObj::Object(m) => (0..m.keys.len())
-                .filter(|&i| !m.attr_at(i).accessor)
-                .map(|i| (m.keys[i].clone(), m.val_at(i)))
-                .collect(),
-            _ => return self.host_in(hv, depth),
+        // Snapshot the old object's own properties WITH their attributes — and
+        // the class it is an instance of — then drop the borrow. Accessors are
+        // kept in the snapshot rather than filtered out: the host never saw
+        // them, so their absence from its echo says nothing.
+        let (old_props, old_class): (Vec<(String, Value, PropAttr)>, Option<u32>) =
+            match self.heap.get(old.heap_index()) {
+                HeapObj::Object(m) => (
+                    (0..m.keys.len())
+                        .map(|i| (m.keys[i].clone(), m.val_at(i), m.attr_at(i)))
+                        .collect(),
+                    m.class,
+                ),
+                _ => return self.host_in(hv, depth),
+            };
+        let find_old = |k: &str| {
+            old_props
+                .iter()
+                .find(|(ok, _, _)| ok == k)
+                .map(|(_, v, a)| (*v, *a))
         };
-        let find_old = |k: &str| old_props.iter().find(|(ok, _)| ok == k).map(|(_, v)| *v);
 
         let mut m = ObjMap::with_capacity(pairs.len().max(old_props.len()));
         for (k, val) in pairs {
             let prev = find_old(k);
+            // An accessor of the same name is handled by the preserve pass
+            // below. What the host echoed back for this key is the GETTER'S
+            // RESULT, and writing that in as a data property would replace the
+            // accessor with a snapshot of one call to it.
+            if matches!(prev, Some((_, a)) if a.accessor) {
+                continue;
+            }
             let v = match (val, prev) {
                 // The host is not overwriting here — it is echoing back a value
                 // it was never able to see. Keep what is really there.
-                (HostValue::Null | HostValue::Undefined | HostValue::Opaque, Some(p))
+                (HostValue::Null | HostValue::Undefined | HostValue::Opaque, Some((p, _)))
                     if self.host_is_opaque(p) =>
                 {
                     p
                 }
-                (_, Some(p)) => self.host_in_over(p, val, depth + 1),
+                (_, Some((p, _))) => self.host_in_over(p, val, depth + 1),
                 (_, None) => self.host_in(val, depth + 1),
             };
-            m.set(k, v);
-        }
-        // Keys the host dropped entirely: preserve the opaque ones for the same
-        // reason. Data the host omitted is treated as deliberately removed.
-        for (k, p) in &old_props {
-            if !pairs.iter().any(|(pk, _)| pk == k) && self.host_is_opaque(*p) {
-                m.set(k, *p);
+            // Carry the property's own attributes. The host is supplying a
+            // VALUE, not a descriptor, so a read-only property that the host
+            // writes keeps its value change and stays read-only rather than
+            // silently becoming writable.
+            match prev {
+                Some((_, a)) => {
+                    m.define(k, v, a);
+                }
+                None => {
+                    m.set(k, v);
+                }
             }
         }
+        // Keys the host did not send back. An enumerable data property is a
+        // deliberate deletion — the host saw it and dropped it. Everything else
+        // it never saw at all, and `host_out` is what decides that: it emits
+        // only enumerable, non-accessor properties.
+        //
+        // That distinction was missing, and the absence of an invisible property
+        // was read as intent to remove it. Mirroring the globals and writing
+        // them straight back — what a host that tracks state does every tick —
+        // deleted every non-enumerable property and every accessor:
+        //
+        //     new Error("boom").message  ->  undefined
+        //     a get-only property        ->  undefined
+        for (k, p, a) in &old_props {
+            let host_sent_it = pairs.iter().any(|(pk, _)| pk == k);
+            let host_could_see_it = a.enumerable && !a.accessor;
+            if host_sent_it && host_could_see_it {
+                continue;
+            }
+            if !host_could_see_it || self.host_is_opaque(*p) {
+                m.define(k, *p, *a);
+            }
+        }
+        // An instance resolves its methods through its class, and this built a
+        // fresh PLAIN object. Everything above is careful to keep what the host
+        // could not represent — a function it echoed back as null, a key it
+        // dropped entirely — and then the one thing that made the value an
+        // instance was dropped anyway.
+        //
+        // The host does not have to do anything unusual to trigger it. Reading
+        // the globals and writing them straight back, which is what a host that
+        // mirrors state does every tick, was enough:
+        //
+        //     counter.next()  ->  1
+        //     (host reads globals, writes the same values back)
+        //     counter.next()  ->  TypeError: undefined is not a function
+        //
+        // Only `class` is carried. Seal/freeze state is deliberately not: this
+        // merge has already applied the host's writes, so marking the result
+        // frozen would describe an object that had just been written to.
+        m.class = old_class;
         Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
     }
 

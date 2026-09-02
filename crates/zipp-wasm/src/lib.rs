@@ -72,9 +72,16 @@ const MAX_DYNAMIC_CODE_FUNCTIONS: usize = 4096;
 const MAX_DYNAMIC_CODE_CLASSES: usize = 1024;
 const MAX_LIFETIME_STEPS: u64 = 50_000_000;
 const MAX_APPROX_HEAP_BYTES: usize = 512 * 1024 * 1024;
-// Keep the byte ceiling below the 100,000-node host conversion cap: even an
-// adversarial stream of empty lines then fits in one bounded `takeOutput()`
-// result (array root + one node per line) without destructive marshal failure.
+// Whatever a script prints has to fit in one bounded `takeOutput()` — an array
+// root plus one node per line — or the host is left holding buffered output it
+// can never retrieve. That is a bound on the number of LINES, and this constant
+// only bounds bytes, so the two are tied together by charging every line the
+// cost of its own entry (see OUTPUT_LINE_OVERHEAD_BYTES in vm/instrument.rs).
+// At 8 bytes a line this admits at most 1,048,576 of them, comfortably inside
+// DEFAULT_HOST_VALUE_MAX_NODES.
+//
+// Before that charge existed an empty line cost a single byte, so a stream of
+// them reached neither guard and grew until the instance trapped.
 const MAX_LIFETIME_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SYNC_BRIDGE_KIND_BYTES: usize = 64;
 const MAX_SYNC_BRIDGE_ARGS: usize = 16;
