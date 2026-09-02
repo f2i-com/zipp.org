@@ -50,6 +50,39 @@ function burner() {
   try { e.dispose(); } catch {}
 }
 
+// A host may SIZE the budget. An embedder that runs the same script on more than
+// one runtime needs their budgets to agree; this is the knob. 20 calls of ~8M
+// steps is ~160M — well past the 50M default, well inside a 200M request.
+{
+  const e = burner();
+  const accepted = e.setInstructionBudget(200_000_000);
+  let calls = 0;
+  let err = "";
+  try { for (let i = 0; i < 20; i++) { e.callFunction("burn", [1_000_000]); calls++; } }
+  catch (x) { err = String(x && x.message ? x.message : x); }
+  check("setInstructionBudget is accepted on a fresh engine", accepted === true);
+  check("a 200M budget runs 20 calls (~160M steps) that the default could not", calls === 20, `survived ${calls}${err ? " — " + err : ""}`);
+  try { e.dispose(); } catch {}
+}
+
+// The fuse stays: a request beyond the ceiling is clamped, never unbounded, and
+// a budget that has been spent cannot be re-sized after the fact.
+{
+  const e = burner();
+  let calls = 0;
+  try { for (let i = 0; i < 40; i++) { e.callFunction("burn", [1_000_000]); calls++; } } catch {}
+  const late = e.setInstructionBudget(200_000_000);
+  check("a spent budget cannot be re-sized", late === false && calls < 40, `late=${late} calls=${calls}`);
+  try { e.dispose(); } catch {}
+}
+{
+  const e = burner();
+  const huge = e.setInstructionBudget(Number.MAX_VALUE);
+  const nan = e.setInstructionBudget(NaN);
+  check("an absurd request is clamped rather than refused (the engine keeps a budget)", huge === true && nan === true, `huge=${huge} nan=${nan}`);
+  try { e.dispose(); } catch {}
+}
+
 // THE IMPORTANT ONE: renewal must not restore any OTHER ceiling. set_limits
 // would have reset heap_limit and output_limit to unlimited, because setup
 // applies those after it.

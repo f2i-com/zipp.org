@@ -71,6 +71,10 @@ const MAX_DYNAMIC_CODE_CALLS: usize = 256;
 const MAX_DYNAMIC_CODE_FUNCTIONS: usize = 4096;
 const MAX_DYNAMIC_CODE_CLASSES: usize = 1024;
 const MAX_LIFETIME_STEPS: u64 = 50_000_000;
+// The most a host may ask for through `setInstructionBudget`: forty times the
+// default, which is the same order as the native embedders' budgets. A host
+// can align with a sibling runtime; it cannot switch the fuse off.
+const MAX_INSTRUCTION_BUDGET_STEPS: u64 = 2_000_000_000;
 const MAX_APPROX_HEAP_BYTES: usize = 512 * 1024 * 1024;
 // Whatever a script prints has to fit in one bounded `takeOutput()` — an array
 // root plus one node per line — or the host is left holding buffered output it
@@ -463,6 +467,34 @@ impl Engine {
     pub fn renew_instruction_budget(&mut self) -> bool {
         match self.state.as_mut() {
             Some(st) => st.renew_step_budget(MAX_LIFETIME_STEPS),
+            None => false,
+        }
+    }
+
+    /// Set this engine's instruction budget to `steps`, clamped to
+    /// `[1, MAX_INSTRUCTION_BUDGET_STEPS]`.
+    ///
+    /// The default lifetime budget is sized for an interactive host. An
+    /// embedder that runs the SAME script on more than one runtime — this
+    /// module in the browser, the engine natively or under WASI on a server —
+    /// needs the budgets to agree, or an expression can complete on one side
+    /// and be cut off on the other. This is the host-side knob for that; the
+    /// clamp is the fuse it cannot remove.
+    ///
+    /// Host-only, like renewal: a method on the Engine binding, unreachable
+    /// from guest code. Setting the budget restores nothing else — heap,
+    /// output and dynamic-code ceilings stay where setup left them. Returns
+    /// false once a budget has actually been spent, exactly as renewal does;
+    /// call it before the first re-entry.
+    #[wasm_bindgen(js_name = setInstructionBudget)]
+    pub fn set_instruction_budget(&mut self, steps: f64) -> bool {
+        let steps = if steps.is_finite() {
+            (steps.max(1.0).min(MAX_INSTRUCTION_BUDGET_STEPS as f64)) as u64
+        } else {
+            MAX_LIFETIME_STEPS
+        };
+        match self.state.as_mut() {
+            Some(st) => st.renew_step_budget(steps),
             None => false,
         }
     }
