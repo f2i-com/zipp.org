@@ -23,31 +23,35 @@ Cold wall time is the headline. Startup-adjusted time is diagnostic, especially
 on short cases. Ratios are new/old for binary A/Bs and Zipp/competitor for engine
 tables; below `1.0×` is faster.
 
-## Current status — 2026-09-01
+## Current status — 2026-09-02
 
 ### Public canonical capture
 
-The public score is the clean four-engine PGO capture at `21288c1`:
+The public score is the clean four-engine PGO capture at `b65aa353`:
 
 | Corpus | Node | Bun | Deno | Node point wins |
 |---|---:|---:|---:|---:|
-| retained ten | **0.921×** [0.913, 0.928] | 0.782× [0.778, 0.789] | 0.797× [0.790, 0.806] | 6 / 10 |
-| diagnostics three | **0.192×** [0.191, 0.195] | 0.171× [0.168, 0.174] | 0.152× [0.150, 0.155] | 3 / 3 |
-| all 13 | **0.642×** [0.638, 0.646] | 0.550× [0.547, 0.555] | 0.544× [0.540, 0.549] | 9 / 13 |
-| hostile all 17, ordinary | **0.881×** [0.874, 0.886] | 0.670× [0.665, 0.677] | 0.455× [0.450, 0.461] | 8 / 17 |
-| hostile category-balanced | **0.913×** [0.907, 0.919] | 0.686× [0.678, 0.695] | 0.467× [0.462, 0.473] | — |
-| all 30, equal row weight | **0.768×** [0.764, 0.771] | 0.615× [0.613, 0.620] | 0.492× [0.489, 0.496] | 17 / 30 |
+| retained ten | **0.903×** [0.899, 0.908] | 0.771× [0.767, 0.776] | 0.784× [0.777, 0.790] | 7 / 10 |
+| diagnostics three | **0.187×** [0.183, 0.189] | 0.166× [0.165, 0.169] | 0.147× [0.144, 0.149] | 3 / 3 |
+| all 13 | **0.628×** [0.624, 0.631] | 0.541× [0.539, 0.545] | 0.533× [0.528, 0.537] | 10 / 13 |
+| hostile all 17, ordinary | **0.836×** [0.820, 0.843] | 0.662× [0.652, 0.667] | 0.434× [0.430, 0.438] | 10 / 17 |
+| hostile category-balanced | **0.870×** [0.854, 0.876] | 0.678× [0.664, 0.683] | 0.447× [0.443, 0.451] | — |
+| all 30, equal row weight | **0.739×** [0.730, 0.742] | 0.607× [0.601, 0.610] | 0.474× [0.471, 0.477] | 20 / 30 |
 
 Both source artifacts are `publishable:true`, `ALL_CORRECT=1`, use 15
 counterbalanced repetitions and 10,000 bootstrap samples, and have empty drift
 and failure lists. The all-30 interval is a stratified descriptive bootstrap:
 normal and hostile repetitions are resampled independently, while every row
-inside one suite shares the same repetition indices.
+inside one suite shares the same repetition indices. Every aggregate is a
+series best; the previous canonical pair (`21288c1`, 2026-08-30) read 0.921× /
+0.192× / 0.642× / 0.881× / 0.913× / 0.768×.
 
-Across Node, Bun, and Deno, the normal suite has 29 / 39 point and exact-sign
-wins; hostile has 36 / 51. The literal all-row target remains false. See
+Across Node, Bun, and Deno, the normal suite has 32 / 39 point and 31 / 39
+exact-sign wins; hostile has 40 / 51 point and 36 / 51 exact-sign wins. The
+literal all-row target remains false. See
 [`README.md`](README.md#performance-measured-honestly) for the tables and raw
 artifact links.
+
 
 ### Historical v0.0.5 QuickJS-NG and Boa diagnostic
 
@@ -187,7 +191,7 @@ and tier suites (`reg_classes`, `jit_tier_parity`, `jit_tier_fuzz`,
 `typeof_alias`, `int_split`, `int_gpr_homes`, `int_splice`, `local_sroa`,
 `double_mod`, `real_program_corpus`), every feature configuration, and a
 188-run four-mode output identity against node over every bench and
-syntax-corpus program.
+syntax-corpus program. Canonical PGO capture at `b65aa353` (2026-09-02): parse-large-js **0.875× Node** (was 1.239× at `37c7fbfa`, 0.89× at `21288c1`), typedarray-math 0.729×, retained ten **0.903×** [0.899, 0.908], all 13 **0.628×**, hostile 0.836×, all 30 **0.739×** — every aggregate a series best; see the current-status table.
 
 ### B262 LANDED — `typeof` aliases fuse into `TypeOfIs`, answered inline from the tag
 

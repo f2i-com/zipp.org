@@ -31,7 +31,7 @@ implementation can be read end to end.
 |---|---|
 | **Starts quickly** | **7.9 ms** median process launch in the canonical four-engine capture; no snapshot to load. |
 | **Runs modern JavaScript** | **99.997% of test262**: 95,939 / 95,942 required executions. |
-| **Competes today** | Canonical equal-row all-30 geomean **0.768× Node**; normal all-13 **0.642×** and hostile all-17 **0.881×**. Lower is faster. |
+| **Competes today** | Canonical equal-row all-30 geomean **0.739× Node**; normal all-13 **0.628×** and hostile all-17 **0.836×**. Lower is faster. |
 | **Owns the stack** | Project-native parser, VM, GC, object model, regex fork, x86-64 JIT, and guarded ARM64 baseline JIT. |
 | **Measures honestly** | Exact stdout, counterbalanced runs, clean-source provenance, drift checks, confidence intervals, and a fail-closed publication policy. |
 | **Offers explicit trust profiles** | Maximum-throughput CLI, interpreter-only WebAssembly boundary, and a separately resolved hardened native runner. |
@@ -308,43 +308,43 @@ below.
 ### Canonical public capture
 
 The current public evidence is the clean PGO capture at engine commit
-`21288c1`: [`real13_21288c1_pgo_2026-08-30.json`](bench/real13_21288c1_pgo_2026-08-30.json)
-and [`head_clean_21288c1_pgo_2026-08-30.json`](bench/hostile/head_clean_21288c1_pgo_2026-08-30.json).
+`b65aa353`: [`real13_b65aa353_pgo_2026-09-02.json`](bench/real13_b65aa353_pgo_2026-09-02.json)
+and [`head_clean_b65aa353_pgo_2026-09-02.json`](bench/hostile/head_clean_b65aa353_pgo_2026-09-02.json).
 Both artifacts record `publishable:true`, `ALL_CORRECT=1`, 15 complete
 counterbalanced repetitions, 10,000 bootstrap samples, exact output, and no
 source, engine, input, environment, process-health, or harness drift.
 
-Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · Zipp 0.0.1 canonical PGO SHA-256
-`c2ddb9e6…6a3cb5`.
+Node v24.12.0 · Bun 1.3.14 · Deno 2.6.10 · Zipp 0.0.10 canonical PGO SHA-256
+`30da5866…3cb267`.
 
 Cold medians include process launch; bold marks the lowest displayed median.
 
 | Retained benchmark | Node | Bun | Deno | Zipp | Zipp / Node |
 |---|---:|---:|---:|---:|---:|
-| async-promise-chain | **329 ms** | 364 ms | 355 ms | 404 ms | 1.23× |
-| class-prototype-hot | 295 ms | 333 ms | 326 ms | **224 ms** | **0.76×** |
-| json-large | 259 ms | **190 ms** | 308 ms | 269 ms | 1.05× |
-| map-set-heavy | 688 ms | 784 ms | 1,156 ms | **579 ms** | **0.85×** |
-| markdown-render | 269 ms | **207 ms** | 311 ms | 232 ms | **0.87×** |
-| parse-large-js | 270 ms | **227 ms** | 286 ms | 240 ms | **0.89×** |
-| polymorphic-objects | 326 ms | 330 ms | 335 ms | **307 ms** | **0.94×** |
-| regex-log-scan | 465 ms | 555 ms | **458 ms** | 476 ms | 1.02× |
-| sparse-array | **80 ms** | 102 ms | 125 ms | 82 ms | 1.05× |
-| typedarray-math | 198 ms | 909 ms | 168 ms | **133 ms** | **0.67×** |
-| **Zipp / engine paired geomean** | **0.921×** [0.913, 0.928] | **0.782×** [0.778, 0.789] | **0.797×** [0.790, 0.806] | — | — |
+| async-promise-chain | **337 ms** | 366 ms | 357 ms | 379 ms | 1.14× |
+| class-prototype-hot | 301 ms | 335 ms | 329 ms | **226 ms** | **0.75×** |
+| json-large | 260 ms | **190 ms** | 319 ms | 268 ms | 1.04× |
+| map-set-heavy | 622 ms | 754 ms | 1,117 ms | **572 ms** | **0.93×** |
+| markdown-render | 271 ms | 206 ms | 308 ms | **206 ms** | **0.76×** |
+| parse-large-js | 268 ms | **227 ms** | 291 ms | 236 ms | **0.88×** |
+| polymorphic-objects | 328 ms | 333 ms | 341 ms | **318 ms** | **0.96×** |
+| regex-log-scan | 465 ms | 561 ms | 458 ms | **436 ms** | **0.93×** |
+| sparse-array | **80 ms** | 98 ms | 129 ms | 81 ms | 1.01× |
+| typedarray-math | 200 ms | 923 ms | 170 ms | **145 ms** | **0.73×** |
+| **Zipp / engine paired geomean** | **0.903×** [0.899, 0.908] | **0.771×** [0.767, 0.776] | **0.784×** [0.777, 0.790] | — | — |
 
 The three architecture diagnostics remain outside the retained-ten headline:
 
 | Diagnostic | Node | Bun | Deno | Zipp | Zipp / Node |
 |---|---:|---:|---:|---:|---:|
-| polymorphic-objects-v2 | 81 ms | 87 ms | 129 ms | **24 ms** | **0.29×** |
-| property-ic-shapes | 259 ms | 158 ms | 311 ms | **11 ms** | **0.04×** |
-| sparse-array-v2 | 168 ms | 366 ms | 182 ms | **101 ms** | **0.60×** |
-| **Zipp / engine paired geomean** | **0.192×** [0.191, 0.195] | **0.171×** [0.168, 0.174] | **0.152×** [0.150, 0.155] | — | — |
+| polymorphic-objects-v2 | 81 ms | 87 ms | 128 ms | **24 ms** | **0.30×** |
+| property-ic-shapes | 265 ms | 157 ms | 314 ms | **10 ms** | **0.04×** |
+| sparse-array-v2 | 170 ms | 369 ms | 184 ms | **100 ms** | **0.59×** |
+| **Zipp / engine paired geomean** | **0.187×** [0.183, 0.189] | **0.166×** [0.165, 0.169] | **0.147×** [0.144, 0.149] | — | — |
 
-Across all 13 normal rows, Zipp measures **0.642× Node** [0.638, 0.646],
-**0.550× Bun** [0.547, 0.555], and **0.544× Deno** [0.540, 0.549]. It wins
-29 of 39 point comparisons and 29 of 39 Bonferroni exact-sign comparisons.
+Across all 13 normal rows, Zipp measures **0.628× Node** [0.624, 0.631],
+**0.541× Bun** [0.539, 0.545], and **0.533× Deno** [0.528, 0.537]. It wins
+32 of 39 point comparisons and 31 of 39 Bonferroni exact-sign comparisons.
 
 The separately measured 17-case hostile corpus covers closures, mixed locals,
 shape churn, GC survival, async lifetimes, modules, a React-shaped kernel, a
@@ -352,31 +352,34 @@ warm router, a JavaScript bytecode VM, and vendored NanoID:
 
 | Hostile metric | vs Node | vs Bun | vs Deno |
 |---|---:|---:|---:|
-| ordinary equal-row geomean | **0.881×** [0.874, 0.886] | **0.670×** [0.665, 0.677] | **0.455×** [0.450, 0.461] |
-| category-balanced geomean | **0.913×** [0.907, 0.919] | **0.686×** [0.678, 0.695] | **0.467×** [0.462, 0.473] |
+| ordinary equal-row geomean | **0.836×** [0.820, 0.843] | **0.662×** [0.652, 0.667] | **0.434×** [0.430, 0.438] |
+| category-balanced geomean | **0.870×** [0.854, 0.876] | **0.678×** [0.664, 0.683] | **0.447×** [0.443, 0.451] |
 
 For the requested project-wide view, the explicit equal-row aggregate across
-all 30 normal and hostile rows is **0.768× Node** [0.764, 0.771], **0.615× Bun**
-[0.613, 0.620], and **0.492× Deno** [0.489, 0.496]. It is calculated as
+all 30 normal and hostile rows is **0.739× Node** [0.730, 0.742], **0.607× Bun**
+[0.601, 0.610], and **0.474× Deno** [0.471, 0.477]. It is calculated as
 `exp((13 × ln(G13) + 17 × ln(G17)) / 30)`; its descriptive bootstrap resamples
 the two separately captured suites as independent strata.
 
 The aggregate is ahead, but the literal every-row target is not met. Zipp has
-17 of 30 Node point wins. The current Node point gaps are async promises, JSON,
-regex, and sparse arrays in the normal set, plus closure calls, both shape
-stressors, allocation survival, long-lived async, React reconcile, warm router,
-the bytecode VM, and NanoID in the hostile set. The hostile guide reports each
-ratio rather than hiding these behind the geomean.
+20 of 30 Node point wins. The current Node point gaps are async promises, JSON,
+and sparse arrays in the normal set, plus closure calls, both shape stressors,
+allocation survival, React reconcile, warm router, and the bytecode VM in the
+hostile set (the bytecode VM and sparse-array intervals cross parity). The
+hostile guide reports each ratio rather than hiding these behind the geomean.
 
 ```text
 FASTER_THAN_NODE_ON_EVERY_ROW=0
 FASTER_THAN_EVERY_ENGINE_ON_EVERY_ROW=0
 ```
 
-The `21288c1` engine adds stable paired-`typeof` fusion, a guarded Tier-C
-loose-null lane, polymorphic Cross3 call routing, and a deferred flat-ASCII
-append cursor. It also fixes protected returns through `finally`. See the
-[`bench` guide](bench/README.md), [hostile suite](bench/hostile/README.md), and
+The `b65aa353` engine gives boolean expressions and global receivers their own
+register classes, so tokenizer-shaped loops stay on the integer register tier
+(parse-large-js 1.24× → 0.88× Node), keeps the DataView swizzle loop's GPR
+homes, and carries the B258–B262 levers (pooled literal shells, the lean
+pristine-Promise check, truncation-aware int32 adds, JSON ASCII views, `typeof`
+alias fusion). See the [`bench` guide](bench/README.md),
+[hostile suite](bench/hostile/README.md), and
 [`PERF_ROADMAP.md`](PERF_ROADMAP.md) for exact methodology and remaining work.
 
 ## Correctness and language coverage

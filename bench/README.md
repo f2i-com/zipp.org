@@ -126,11 +126,13 @@ never turn a noncanonical run into publishable evidence.
 
 The current canonical public artifacts are:
 
-- [`real13_21288c1_pgo_2026-08-30.json`](real13_21288c1_pgo_2026-08-30.json)
-- [`hostile/head_clean_21288c1_pgo_2026-08-30.json`](hostile/head_clean_21288c1_pgo_2026-08-30.json)
+- [`real13_b65aa353_pgo_2026-09-02.json`](real13_b65aa353_pgo_2026-09-02.json)
+- [`hostile/head_clean_b65aa353_pgo_2026-09-02.json`](hostile/head_clean_b65aa353_pgo_2026-09-02.json)
 
 Both report `publishable:true`, `ALL_CORRECT=1`, the complete four-engine order,
 15 repetitions, 10,000 bootstrap samples, and empty failure and drift lists.
+The previous canonical pair (`21288c1`, 2026-08-30) stays in this directory as
+the prior series point.
 
 ### Explicit all-30 view
 
@@ -141,9 +143,9 @@ When one project-wide number is useful, the documented equal-row point is:
 G30 = exp((13 × ln(G13) + 17 × ln(G17)) / 30)
 ```
 
-For the `21288c1` artifacts it is **0.767921× Node**, **0.615368× Bun**, and
-**0.491764× Deno**. The descriptive 95% intervals are respectively
-[0.764219, 0.771162], [0.612514, 0.619948], and [0.488545, 0.495795].
+For the `b65aa353` artifacts it is **0.738544× Node**, **0.606557× Bun**, and
+**0.474146× Deno**. The descriptive 95% intervals are respectively
+[0.729964, 0.742374], [0.601294, 0.609636], and [0.470865, 0.477324].
 
 Each bootstrap replicate draws one shared repetition-index multiset for all 13
 normal rows and an independent shared multiset for all 17 hostile rows, then
