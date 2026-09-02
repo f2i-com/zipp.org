@@ -183,6 +183,23 @@ crosses. sparse-array (0.924×), regex-log-scan (0.953×) and npm-nanoid
 
 ## Highest-value next work
 
+0. **Handler-op bodies never receive a cross entry.** `diff` in
+   reactish-reconcile contains a `for...of` loop, whose iterator-close
+   bracket (`PushFinally`/`PopFinally`/`IterCloseFinally`/`EndFinally`) marks
+   the whole function handler-bearing; such bodies are statically denied a
+   cross entry because the emitted `push_finally` helper writes the ACTIVE
+   frame's handler stack and a frame-free activation has none. Every one of
+   diff's ~250k recursive calls per run therefore takes the framed route
+   (`dispatch_body` 5.5% + `setup_call` 1.9% + `run_loop` 1.3% of the row).
+   The bounded fix: let `jit_cross_call_impl` push the callee `Frame` EAGERLY
+   (the exact record its bail path already materializes) for a callee whose
+   entry is flagged handler-bearing, enter natively frame-backed
+   (`enter_tierc_activation(.., frame_free = false, ..)`), pop on a clean
+   return, and on a bail/throw set the frame's ip and continue the way the
+   framed path does; keep the emitted CROSS3 lane excluded for such bodies
+   (native code cannot push a frame) and keep `cross_entry()` hiding them from
+   every other helper. Expected: ~8% on reactish and a general win for any
+   hot callee with `for...of` or `try`.
 1. **React reconcile and warm router (`1.574×` / `1.563×`).** The birth/death
    pipeline dominates both (`free_slot`, `refit_finalized_inner`,
    `alloc_finalized`, `alloc_settled`, malloc/free ≈ 19–24% of each row);
@@ -201,6 +218,14 @@ crosses. sparse-array (0.924×), regex-log-scan (0.953×) and npm-nanoid
    bounded next step.
 5. **json-large (`1.022×`).** Parsed objects miss the object pool (a fresh
    `Box` and key `String` per object); the pooled birth is drafted as B268.
+5b. **Tier A for cell-captured self-recursion.** Tier A (the leaf-int whole
+   function tier) admits the self-call only as `LoadGlobal(name_global)`; a
+   pure-int recursive function declared inside a closure now takes the Tier-C
+   CROSS3 self arm (B270: 106 ms for IIFE fib(32)) but Tier A's direct
+   `call self_entry` would put it at the top-level figure (47 ms). Extend
+   `is_self_call`/`can_compile` to an `UpvalGet` whose cell holds the
+   running closure, with the entry-time self-binding re-check reading the
+   cell instead of the global.
 6. **Sandbox RegExp exec overhead.** After B269 a sticky `exec` costs about
    13 µs in the WASM build against 4 µs natively (the spec `split` loop runs
    one per character); the remaining per-exec work is the limited backtracker

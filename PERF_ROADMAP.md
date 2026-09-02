@@ -155,6 +155,49 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B271 LANDED — the recycle pool's fallback sort is run-adaptive
+
+`sort_recycle_pool_by_address` proves the common one-run shape in linear time
+and otherwise fell back to `sort_unstable_by_key`, a full n log n every time.
+`[poolsort]` on allocation-survival showed the proof losing 5 of 8 flushes:
+the dead suffix there is two monotone runs (pool pops come off the sorted
+tail descending, fresh boxes arrive roughly ascending once the pool runs
+dry), and the PC profile charged 4.2% of the row to two `quicksort`
+instantiations (the object and array pools). The fallback is now the stable
+`sort_by_key` — Rust's driftsort detects and merges natural runs — with the
+same result. allocation-survival −3.5% at 24 interleaved pairs (median
+0.965), reactish and warm-router neutral; `obj_pool_run_sort`, `shell_cell`
+and the lib pool tests unchanged.
+
+### B270 LANDED — self-recursion through a captured cell gets the native lane
+
+`fib(32)` declared inside an IIFE ran 245 ms against 47 ms for the same
+function at top level (Node 77 ms). Two planner gaps: (1) a body's own
+recursive `Call` always found its cross entry missing — the plan builds
+before the compile installs it, and `note_cross_pending` deliberately never
+retries a self site (Tier A owns the `LoadGlobal`-named shape) — so the
+site took the generic helper for the life of the program; (2) a site whose
+IC was still EMPTY at compile time (the second recursive call, never executed
+during the first descent) received no cross plan at all and every call it
+ever made took the FRAMED interpreter route (`setup_call` → `run_loop` →
+`dispatch_body` → `try_run_jit`; half of all fib calls). Now
+`cross_callee_from_definition` resolves an empty-IC callee from the callee
+register's `UpvalGet` cell or `LoadGlobal` slot read in the live exemplar
+frame (a hint only — every lane revalidates the live callee), and
+`build_cross3_call_arm` bakes a self arm with the proto's own
+`cross_uninit_mask` and the generation `set_cross_entry` will leave
+(`cross_mask_gen_after_set`); bodies over 64 registers, with handler ops, or
+reaching themselves through their own global name are left out. Strict IIFE
+fib 235 → 106 ms, sloppy 242 → 175 ms (the emitted lane needs a strict or
+arrow callee; the sloppy site gains the helper route). Latches
+`ZIPP_NO_CROSS3_SELF`, `ZIPP_NO_CROSS_DEF_CALLEE`; one-binary latch A/Bs on
+reactish are neutral (0.994 / 1.003 — its `diff` is a handler-op body, see the
+open item). `tests/cross3_self_upval.rs` asserts both lanes are planned,
+that a reassigned cell misses the baked guard with the right answer, and
+exact output in every mode. Diagnostics added alongside: `ZIPP_INTERPSTATS=1`
+(which functions the interpreter still enters or resumes, and every compiled
+region's entry → resume-ip counts) — the knob that located both gaps.
+
 ### B269 LANDED — RegExp exec under a heap ceiling stops auditing the heap
 
 The safe-sandbox profile sizes every RegExp exec's match limits from the

@@ -1839,18 +1839,58 @@ impl<'p> Vm<'p> {
         {
             return None;
         }
-        let Some((_entry, uninit_mask, json_walk, markdown_inline)) = self.jit.cross_entry(fid)
-        else {
-            if std::env::var_os("ZIPP_JITLOG").is_some() {
-                eprintln!(
-                    "[cross] fn{caller_fid}@{call_ip} CROSS3 decline: no entry yet for callee fn{fid} (regs={}, params={}, argc={argc})",
-                    callee.reg_count, callee.param_count
-                );
-            }
-            pending.push(fid);
-            return None;
-        };
         let reg_count = callee.reg_count.max(1);
+        // B270: a body's own recursive site always finds its entry missing —
+        // the plan builds before this compile installs it — and
+        // `note_cross_pending` deliberately never retries a self site, so such
+        // a site stayed on the helper (or, with an empty IC, the framed route)
+        // for the life of the program. The lane loads the entry from the live
+        // table per call and guards the mask generation, so an arm against
+        // the entry ABOUT to be installed is sound: the mask is this proto's
+        // own analysis and the generation is the one `set_cross_entry` will
+        // leave. Until the install lands (this compile) the null entry routes
+        // to the helper exactly as an evicted callee's would. Bodies that
+        // reach themselves through their own global name are left out: those
+        // are Tier A's and the reducers' shapes.
+        let self_arm = fid == caller_fid
+            && crate::codegen::cross3_self_enabled()
+            && reg_count <= 64
+            && crate::codegen::markdown_inline_plan(callee).is_none()
+            && callee.name_global.is_none_or(|own| {
+                !callee
+                    .code
+                    .iter()
+                    .any(|i| matches!(i, Instr::LoadGlobal { idx, .. } if *idx == own))
+            });
+        let (uninit_mask, json_walk, markdown_inline, mask_gen) = match self.jit.cross_entry(fid)
+        {
+            Some((_entry, mask, json, markdown)) => {
+                (mask, json, markdown, self.jit.cross_mask_gen(fid))
+            }
+            None if self_arm => {
+                let mask = if crate::codegen::crosscall2_enabled() {
+                    crate::codegen::cross_uninit_mask(callee)
+                } else {
+                    u64::MAX
+                };
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!(
+                        "[cross] fn{caller_fid}@{call_ip} CROSS3 self arm against the entry this compile installs (mask={mask:#x})"
+                    );
+                }
+                (mask, None, None, self.jit.cross_mask_gen_after_set(fid, mask))
+            }
+            None => {
+                if std::env::var_os("ZIPP_JITLOG").is_some() {
+                    eprintln!(
+                        "[cross] fn{caller_fid}@{call_ip} CROSS3 decline: no entry yet for callee fn{fid} (regs={}, params={}, argc={argc})",
+                        callee.reg_count, callee.param_count
+                    );
+                }
+                pending.push(fid);
+                return None;
+            }
+        };
         // B228: a wide callee (> 64 registers) always reports the inline mask
         // as MAX. An exact all-zero wide mask needs no emitted fill, so zero
         // describes it without constraining the window size.
@@ -1881,9 +1921,83 @@ impl<'p> Vm<'p> {
             callee_regs: reg_count,
             argc,
             arrow_this: callee.lexical_this,
-            mask_gen: self.jit.cross_mask_gen(fid),
+            mask_gen,
             uninit_mask,
         })
+    }
+
+    /// B270: the callee a `Call` site resolves to when its IC is empty, read
+    /// from the callee register's nearest preceding definition in the live
+    /// exemplar frame: an `UpvalGet` names a cell of the running closure, a
+    /// `LoadGlobal` a global slot. Anything else, an unfilled cell, a frame
+    /// that is not the one being compiled, or a value that is not a plain user
+    /// function yields `None`. A compile-time hint only — no IC fill, no side
+    /// effect — so an unsound choice of writer costs a guard miss, never
+    /// correctness.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn cross_callee_from_definition(
+        &self,
+        func_id: u32,
+        ip: usize,
+        exemplar_base: Option<usize>,
+    ) -> Option<(u64, u32, u32, u32)> {
+        if !crate::codegen::cross_def_callee_enabled() {
+            return None;
+        }
+        let code = &self.func(func_id as usize).code;
+        let Instr::Call { callee, .. } = *code.get(ip)? else {
+            return None;
+        };
+        // Nearest preceding writer of the callee register. The two shapes this
+        // resolves are matched by hand: `writes_reg` is the int-tier table and
+        // does not know `UpvalGet`; any other recognised writer ends the scan.
+        let mut writer = None;
+        for j in (0..ip).rev() {
+            match code[j] {
+                Instr::UpvalGet { dst, .. } | Instr::LoadGlobal { dst, .. } if dst == callee => {
+                    writer = Some(j);
+                    break;
+                }
+                ref other if crate::codegen::writes_reg(other) == Some(callee) => return None,
+                _ => {}
+            }
+        }
+        let writer = writer?;
+        let value = match code[writer] {
+            Instr::UpvalGet { idx, .. } => {
+                let frame = self.frames.last()?;
+                if frame.func != func_id
+                    || Some(frame.base) != exemplar_base
+                    || frame.closure == NO_CLOSURE
+                {
+                    return None;
+                }
+                let cell = match self.heap.get(frame.closure) {
+                    crate::heap::HeapObj::Closure { upvalues, .. } => {
+                        *upvalues.get(idx as usize)?
+                    }
+                    _ => return None,
+                };
+                self.heap.cell_get(cell)
+            }
+            Instr::LoadGlobal { idx, .. } => *self.globals.get(idx as usize)?,
+            _ => return None,
+        };
+        if !value.is_heap() {
+            return None;
+        }
+        let (fid, closure) = self.ic_plain_fn(value)?;
+        if std::env::var_os("ZIPP_JITLOG").is_some() {
+            eprintln!(
+                "[cross] fn{func_id}@{ip} callee resolved from its definition: fn{fid} (IC empty)"
+            );
+        }
+        Some((
+            value.bits(),
+            self.heap.version_of(value.heap_index()),
+            fid,
+            closure,
+        ))
     }
 
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -1934,6 +2048,17 @@ impl<'p> Vm<'p> {
                 }
             };
             let poly_fid = poly_fids.is_some();
+            // B270: a site whose IC is still EMPTY at compile time used to get
+            // no cross plan at all, so every call it ever made took the framed
+            // interpreter route. The classic case is the second recursive
+            // call of a function that compiles during its first descent (the
+            // descent only ever executes the first). Resolve the callee from
+            // the register's definition instead — a captured cell or a global
+            // slot read in the live exemplar frame. The plan only needs a fid
+            // to bake against; every lane it produces revalidates the live
+            // callee per call and falls through to the helper on a mismatch.
+            let live =
+                live.or_else(|| self.cross_callee_from_definition(func_id, ip, exemplar_base));
             let Some((_bits, _ver, fid, _closure)) = live else {
                 continue;
             };

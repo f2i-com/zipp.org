@@ -174,6 +174,43 @@ pub(crate) fn cross3_mono_enabled() -> bool {
     }
 }
 
+/// B270 latch: `ZIPP_NO_CROSS_DEF_CALLEE=1` stops the cross-call planner from
+/// resolving an EMPTY-IC `Call` site's callee through the callee register's
+/// `UpvalGet` / `LoadGlobal` definition read in the live exemplar frame. Such a
+/// site (the second recursive call of a function compiling during its first
+/// descent is the classic one) then keeps today's framed helper route.
+pub(crate) fn cross_def_callee_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS_DEF_CALLEE").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// B270 latch: `ZIPP_NO_CROSS3_SELF=1` stops a Tier-C body from baking a CROSS3
+/// arm against ITSELF — the entry this very compile is about to install — so
+/// a self-recursive site reached through a captured cell or a global goes back
+/// to the generic helper (and, with an empty IC, the framed route).
+pub(crate) fn cross3_self_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_CROSS3_SELF").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
 /// A body containing handler ops mutates the ACTIVE FRAME's handler stack; a
 /// frame-free cross call has no frame to hold them, so such a function can
 /// NEVER hold a cross entry (the compile-complete path clears it). B213: the
@@ -2265,7 +2302,7 @@ fn tierc_yield_enabled() -> bool {
 /// per call exactly as before W7. Read once per `Jit::compile` (compiles are
 /// rare relative to execution) — zero per-call cost either way.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-fn crosscall2_enabled() -> bool {
+pub(crate) fn crosscall2_enabled() -> bool {
     std::env::var_os("ZIPP_NO_CROSSCALL2").is_none()
 }
 
@@ -2399,7 +2436,7 @@ pub(crate) fn markdown_escape_html_proto(proto: &FuncProto) -> bool {
 /// two equal `LoadGlobal`s recover the helper binding without baking a global
 /// slot number. As with the helper proof, register count is intentionally not a
 /// semantic gate. `ZIPP_NO_MARKDOWN_INLINE_REDUCE=1` omits the plan entirely.
-fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePlan> {
+pub(crate) fn markdown_inline_plan(proto: &FuncProto) -> Option<MarkdownInlinePlan> {
     if std::env::var_os("ZIPP_NO_MARKDOWN_INLINE_REDUCE").is_some()
         || proto.name != "renderInline"
         || proto.param_count != 1
@@ -3851,6 +3888,25 @@ impl Jit {
     /// when the mask does not change).
     pub fn cross_mask_gen(&self, fid: u32) -> u32 {
         self.cross_table.get(fid as usize).map_or(0, |r| r.mask_gen)
+    }
+
+    /// B270: the generation `fid` carries once `set_cross_entry` installs an
+    /// entry with inline mask `mask` — what a lane baked BEFORE that install
+    /// (a body's CROSS3 arm against itself) must guard. Mirrors the bump rule
+    /// in `set_cross_entry` for the inline-mask form; self arms admit only
+    /// bodies of at most 64 registers, whose wide mask is `None` on both
+    /// sides, so the wide comparison cannot bump.
+    pub fn cross_mask_gen_after_set(&self, fid: u32, mask: u64) -> u32 {
+        let prev_mask = self
+            .cross_entries
+            .get(fid as usize)
+            .map_or(u64::MAX, |entry| entry.1);
+        let gen = self.cross_mask_gen(fid);
+        if prev_mask != mask {
+            gen.wrapping_add(1)
+        } else {
+            gen
+        }
     }
 
     fn clear_cross_entry(&mut self, func_id: u32) {
