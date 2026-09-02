@@ -496,6 +496,13 @@ const MODES: &[Mode] = &[
         name: "noobjpoolmajor",
         env: &[("ZIPP_NO_OBJ_POOL_MAJOR", "1")],
     },
+    // B258: a pool-bound shell returns its slab cell at death instead of
+    // carrying it into the pool for the next same-class literal to fill in
+    // place -- a pure fallback to the B187 form.
+    Mode {
+        name: "noshellcell",
+        env: &[("ZIPP_NO_SHELL_CELL", "1")],
+    },
     // B210: the courier's per-item size gate (bulk payloads ship, small ones
     // drop inline). The off-row restores B185's ship-everything, so the full
     // shipping path — batch build, mpsc send, off-thread drop — stays

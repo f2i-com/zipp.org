@@ -1179,9 +1179,11 @@ pub struct ObjMap {
 ///
 /// CONTAINMENT INVARIANT (what makes the raw addresses sound): the `Slab` variant
 /// is ONLY ever constructed by [`Heap::alloc_finalized`] and only ever lives
-/// inside a heap slot; every path that removes such an object from its slot
-/// (`free_slot`, `replace`) returns the cell to the slab first, the courier
-/// never ships it, and VM teardown frees the chunks wholesale. The base
+/// inside a heap slot or (B258) attached to a shell in the heap's own recycle
+/// pool; every path that removes such an object from its slot (`free_slot`,
+/// `replace`) either returns the cell to the slab or parks the shell in the
+/// pool, whose every exit returns or refills the cell, the courier never
+/// ships it, and VM teardown frees the chunks wholesale. The base
 /// pointer aims into a `Box<[Value; VAL_SLAB_CHUNK]>` the heap owns for its
 /// whole life — chunk boxes never move or shrink. The owner pointer aims at
 /// one class in the heap's boxed class array, which likewise never moves even
@@ -4263,6 +4265,34 @@ fn thin_alloc_default() -> bool {
     false
 }
 
+/// B258 latch: `ZIPP_NO_SHELL_CELL=1` makes a pool-bound shell return its
+/// slab cell at death (the B187 form) instead of carrying the cell into the
+/// recycle pool for the next same-class literal to fill in place. Latched on
+/// first use; the heap folds it into [`Heap::shell_cell`] at construction.
+#[cfg(not(feature = "safe-sandbox"))]
+fn shell_cell_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STATE: AtomicU8 = AtomicU8::new(0);
+    match STATE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("ZIPP_NO_SHELL_CELL").is_none();
+            STATE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// B258: the construction-time fold behind [`Heap::shell_cell`]. The thin
+/// birth path is the only pool consumer that REUSES an attached cell, so the
+/// retention is enabled only in the thin configuration; every other
+/// configuration keeps the return-at-death form exactly.
+#[cfg(not(feature = "safe-sandbox"))]
+fn shell_cell_default() -> bool {
+    shell_cell_enabled() && thin_alloc_default()
+}
+
 /// B212: memo size — 2048 entries x 20B = 40KB, charged in `resident_bytes`.
 #[cfg(not(feature = "safe-sandbox"))]
 const CONCAT_MEMO_SLOTS: usize = 2048;
@@ -4980,7 +5010,9 @@ pub struct Heap {
     /// pops one and overwrites it wholesale, removing the allocator
     /// round-trip that is half the literal construction floor (38.6 ->
     /// 19.2ns/obj in `build_floor_micro`). Shells hold NO heap references
-    /// (the plan Arc owns only strings), so the pool is never traced. B239:
+    /// (the plan Arc owns only strings; a slab cell a shell carries in under
+    /// B258 holds only stale bits nothing reads before the refit overwrites
+    /// them), so the pool is never traced. B239:
     /// a popped shell is REFITTED in place, and keeps its plan Arc when the
     /// next literal uses the same plan (the common case at a hot site) —
     /// otherwise the Arc is swapped for the new plan's at the refit.
@@ -5058,6 +5090,18 @@ pub struct Heap {
     /// configuration takes the general paths. Read once at
     /// construction (`thin_alloc_default`).
     thin_alloc: bool,
+    /// B258: a pool-bound settled shell KEEPS its slab cell at death and the
+    /// thin birth path fills that cell in place when the next literal is of
+    /// the same class (`free_slot`'s pool arm; `alloc_finalized_thin`). True
+    /// only with `thin_alloc` set and `ZIPP_NO_SHELL_CELL` unset; every pool
+    /// exit other than the thin refit strips the cell, so the slab's
+    /// containment invariant is unchanged.
+    #[cfg(not(feature = "safe-sandbox"))]
+    shell_cell: bool,
+    /// `ZIPP_GCSTATS=1` only: [cells filled in place, cells returned at a
+    /// class mismatch]. Bumped only under `oracle`.
+    #[cfg(not(feature = "safe-sandbox"))]
+    shell_cell_stats: [u64; 2],
     /// `ZIPP_GCSTATS=1` only: thin-path serve counts — [finalized literals,
     /// object slot reuses, arrays, funcs, closures, plain `MakeFunc` helper
     /// calls]. Bumped only under `oracle`.
@@ -5461,6 +5505,10 @@ impl Heap {
             #[cfg(not(feature = "safe-sandbox"))]
             obj_pool_sort_stats: [0; 4],
             thin_alloc: thin_alloc_default(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            shell_cell: shell_cell_default(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            shell_cell_stats: [0; 2],
             thin_stats: [0; 6],
             #[cfg(any(not(feature = "meter-only"), feature = "jit"))]
             hot_mirror: vec![HotMirror::CLEAR; versions.len()],
@@ -5698,6 +5746,10 @@ impl Heap {
                 if self.oracle {
                     self.obj_pool_stats[1] += 1;
                 }
+                // B258: only the thin path fills an attached slab cell in
+                // place; this path returns it first (a no-op for a stripped
+                // shell), so neither refit form below can drop a live cell.
+                b.vals.strip_slab();
                 if shell_refit_enabled() {
                     b.refit_finalized(plan, store, shape);
                 } else {
@@ -5731,7 +5783,48 @@ impl Heap {
         shape: u32,
     ) -> u32 {
         debug_assert!(self.thin_alloc);
-        let store = match val_slab_class(vals.len()) {
+        let class = val_slab_class(vals.len());
+        // B258: the pooled shell is popped FIRST so the slab cell it may
+        // still carry (see `free_slot`'s pool arm) can hold THIS literal's
+        // values: same class means `cap >= vals.len()`, and the copy below
+        // then lands in the cell the shell already owns — no `free_cell` at
+        // the death and no `alloc_cell` here. A cell of another class, or
+        // one this literal cannot use (no class), goes home at this point
+        // instead, which is where the pre-B258 sweep returned it; a shell
+        // pooled with a `Vec` store (the latch off, or a spilled shell) has
+        // nothing to strip.
+        //
+        // Safe points: none between the pop and the slot write below. The
+        // pop, the class test, the strip and the copy allocate nothing on
+        // the heap (a `Box::new` on the pool-miss path is a malloc, not a
+        // collection), so neither `shell` nor `reuse_base` can be stale.
+        let mut shell = self.obj_pool.pop();
+        let mut reuse_base = None;
+        if let Some(b) = shell.as_deref_mut() {
+            let attached = match &b.vals {
+                ValStore::Slab {
+                    base,
+                    owner_and_len,
+                } => Some((*base, *owner_and_len & !VAL_SLAB_OWNER_LEN_MASK)),
+                ValStore::Vec(_) => None,
+            };
+            if let Some((base, owner)) = attached {
+                let wanted = class
+                    .map(|c| std::ptr::from_ref(&self.val_slab[c as usize]).expose_provenance());
+                if wanted == Some(owner) {
+                    reuse_base = Some(base);
+                    if self.oracle {
+                        self.shell_cell_stats[0] += 1;
+                    }
+                } else {
+                    b.vals.strip_slab();
+                    if self.oracle {
+                        self.shell_cell_stats[1] += 1;
+                    }
+                }
+            }
+        }
+        let store = match class {
             Some(class) => {
                 let cap = val_slab_class_cap(class);
                 let owner = &mut self.val_slab[class as usize];
@@ -5739,14 +5832,23 @@ impl Heap {
                 debug_assert_eq!(owner_addr & VAL_SLAB_OWNER_LEN_MASK, 0);
                 debug_assert!((1..=16).contains(&vals.len()));
                 let owner_and_len = owner_addr | vals.len();
-                let base = owner.alloc_cell(cap);
-                // SAFETY: as in `alloc_finalized` — a fresh cell of `cap >=
+                let base = match reuse_base {
+                    Some(base) => base,
+                    None => owner.alloc_cell(cap),
+                };
+                // SAFETY: as in `alloc_finalized` — a cell of `cap >=
                 // vals.len()` slots inside a live, immovable chunk this heap
-                // owns, aliased by nothing. `vals` may point straight into
-                // the VM's register window (the JIT helper passes it through
-                // without staging): the window is a root, the collector is
-                // non-moving and cannot run between the caller's poll and
-                // this copy, and the slab cell is not part of the window.
+                // owns, aliased by nothing: either fresh from this class's
+                // free list or cursor, or (B258) the cell this same class
+                // carved for the pooled shell's previous occupant, whose
+                // slot holds the sweep's tombstone and whose mirror was
+                // cleared and version bumped by `free_slot`, so no safe or
+                // emitted reference reaches it. `vals` may point straight
+                // into the VM's register window (the JIT helper passes it
+                // through without staging): the window is a root, the
+                // collector is non-moving and cannot run between the
+                // caller's poll and this copy, and the slab cell is not part
+                // of the window.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         vals.as_ptr(),
@@ -5761,7 +5863,7 @@ impl Heap {
             }
             None => ValStore::Vec(vals.to_vec()),
         };
-        let boxed = match self.obj_pool.pop() {
+        let boxed = match shell {
             Some(mut b) => {
                 self.obj_pool_pops += 1;
                 if self.oracle {
@@ -6948,7 +7050,25 @@ impl Heap {
         #[cfg(not(feature = "safe-sandbox"))]
         let dead = match dead {
             HeapObj::Object(mut m) => {
-                m.vals.strip_slab();
+                // B258: settle the pool question BEFORE the cell goes home.
+                // `strip_slab` turns a `Slab` store into exactly the empty
+                // `Vec` the pre-B258 test accepted, so this predicate is the
+                // old one evaluated one step earlier. With `shell_cell` set a
+                // pool-bound shell KEEPS its cell: the next same-class
+                // literal fills it in place at `alloc_finalized_thin`, and
+                // every other pool exit (the general path, the courier trim)
+                // strips it. Otherwise the cell is returned here, as before.
+                let pooled = self.obj_pool_refill
+                    && was_settled
+                    && matches!(m.keys, PropKeys::Planned { .. })
+                    && match &m.vals {
+                        ValStore::Slab { .. } => true,
+                        ValStore::Vec(v) => v.capacity() == 0,
+                    }
+                    && obj_pool_enabled();
+                if !(pooled && self.shell_cell) {
+                    m.vals.strip_slab();
+                }
                 // B220: recycle this object's key buffers. Only OWNED keys
                 // qualify — a `Planned` map's keys belong to a shared plan
                 // Arc and are not ours to take. The Strings are moved out, so
@@ -6977,12 +7097,7 @@ impl Heap {
                 // still pool: their contents drop at the overwrite, which is
                 // rare and bounded, and checking for them here would read
                 // the far cache line this arm exists to avoid.
-                if obj_pool_enabled()
-                    && self.obj_pool_refill
-                    && was_settled
-                    && matches!(m.keys, PropKeys::Planned { .. })
-                    && matches!(&m.vals, ValStore::Vec(v) if v.capacity() == 0)
-                {
+                if pooled {
                     if self.oracle {
                         self.obj_pool_stats[0] += 1;
                     }
@@ -7168,7 +7283,11 @@ impl Heap {
                 .max(OBJ_POOL_FLOOR);
             self.obj_pool_pops = 0;
             while self.obj_pool.len() > keep {
-                let m = self.obj_pool.pop().expect("len checked");
+                let mut m = self.obj_pool.pop().expect("len checked");
+                // B258: the courier never sees a slab cell (the raw-base
+                // single-owner invariant); a shell that carried its cell into
+                // the pool hands it home before shipping.
+                m.vals.strip_slab();
                 if self.oracle {
                     self.obj_pool_stats[2] += 1;
                 }
@@ -9784,6 +9903,11 @@ impl Drop for Heap {
             eprintln!(
                 "[keypool] served={ks} missed={km} recycled={kr} resident={}",
                 self.key_pool.len()
+            );
+            let [reused, mismatched] = self.shell_cell_stats;
+            eprintln!(
+                "[shellcell] on={} reused={reused} mismatched={mismatched}",
+                self.shell_cell
             );
         }
         if self.oracle {
