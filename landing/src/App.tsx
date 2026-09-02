@@ -1,11 +1,166 @@
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
+import { formatCount, relativeTime, useRepoStats, type RepoStats } from './repoStats'
 
-const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
+const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
+const F2I_URL = 'https://f2i.com'
 const DOCS_URL = `${GITHUB_URL}/blob/main/DOC.md#embedding`
 const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_c28781cf_pgo_2026-09-02.json`
 const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_c28781cf_pgo_2026-09-02.json`
 const ROADMAP_URL = `${GITHUB_URL}/blob/main/PERF_ROADMAP.md`
 const RELEASE_URL = `${GITHUB_URL}/releases/tag/v0.0.12`
+const RELEASES_URL = `${GITHUB_URL}/releases`
+const COMMITS_URL = `${GITHUB_URL}/commits/main`
+const BUILT_IN_VERSION = 'v0.0.12'
+
+/** Selectors whose matches fade and rise into view as the reader scrolls. */
+const REVEAL_SELECTORS = [
+  '.proof-grid > div',
+  '.playground-heading > *',
+  '.playground-shell',
+  '.section-heading > *',
+  '.use-case-card',
+  '.controls-copy > *',
+  '.code-window',
+  '.benchmark-heading > *',
+  '.benchmark-summary > article',
+  '.reading-guide > article',
+  '.scoreboard',
+  '.methodology-note',
+  '.release-strip',
+  '.pipeline li',
+  '.runtime-grid > article',
+  '.quickstart-copy',
+  '.terminal-block',
+  '.closing-cta > *',
+].join(', ')
+
+/**
+ * Reveal-on-scroll: every element matched by REVEAL_SELECTORS starts hidden
+ * (`.reveal`) and gets `.is-in` when it approaches the viewport, staggered by
+ * its position among its siblings. Readers who prefer reduced motion, and
+ * browsers without IntersectionObserver, see everything immediately.
+ */
+function useReveal() {
+  useEffect(() => {
+    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    if (reduce || typeof IntersectionObserver === 'undefined') return
+    const nodes = Array.from(document.querySelectorAll<HTMLElement>(REVEAL_SELECTORS))
+    for (const node of nodes) {
+      const siblings = node.parentElement ? Array.from(node.parentElement.children) : [node]
+      const index = Math.max(0, siblings.indexOf(node))
+      node.style.setProperty('--reveal-delay', `${Math.min(index, 7) * 70}ms`)
+      node.classList.add('reveal')
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add('is-in')
+            observer.unobserve(entry.target)
+          }
+        }
+      },
+      { rootMargin: '0px 0px -8% 0px', threshold: 0.08 },
+    )
+    for (const node of nodes) observer.observe(node)
+    return () => observer.disconnect()
+  }, [])
+}
+
+/** Count from 0 to `value` the first time the element scrolls into view. */
+function CountUp({ value, format, duration = 1100 }: { value: number; format: (v: number) => string; duration?: number }) {
+  const ref = useRef<HTMLElement | null>(null)
+  const [shown, setShown] = useState(() => value)
+  const [armed, setArmed] = useState(false)
+
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const reduce = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+    if (reduce || typeof IntersectionObserver === 'undefined') {
+      setShown(value)
+      return
+    }
+    setShown(0)
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) {
+        setArmed(true)
+        observer.disconnect()
+      }
+    }, { threshold: 0.4 })
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
+
+  useEffect(() => {
+    if (!armed) return
+    let frame = 0
+    const start = performance.now()
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - start) / duration)
+      const eased = 1 - Math.pow(1 - t, 3)
+      setShown(value * eased)
+      if (t < 1) frame = requestAnimationFrame(tick)
+    }
+    frame = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(frame)
+  }, [armed, value, duration])
+
+  return <strong ref={ref}>{format(armed || shown === value ? shown : shown)}</strong>
+}
+
+/**
+ * Cursor spotlight: cards expose `--mx`/`--my` so a radial highlight follows
+ * the pointer across their surface (see `.spot` in styles.css). Touch and
+ * reduced-motion readers get the plain card.
+ */
+function useSpotlight() {
+  useEffect(() => {
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return
+    if (window.matchMedia?.('(hover: none)').matches) return
+    const selector = '.use-case-card, .runtime-grid > article, .reading-guide article, .release-strip li, .sandbox-card, .code-window, .benchmark-summary > article, .control-list article'
+    const cards = Array.from(document.querySelectorAll<HTMLElement>(selector))
+    for (const card of cards) card.classList.add('spot')
+    const onMove = (event: PointerEvent) => {
+      const card = (event.target as HTMLElement | null)?.closest<HTMLElement>('.spot')
+      if (!card) return
+      const rect = card.getBoundingClientRect()
+      card.style.setProperty('--mx', `${event.clientX - rect.left}px`)
+      card.style.setProperty('--my', `${event.clientY - rect.top}px`)
+    }
+    document.addEventListener('pointermove', onMove, { passive: true })
+    return () => document.removeEventListener('pointermove', onMove)
+  }, [])
+}
+
+function StarIcon() {
+  return (
+    <svg viewBox="0 0 16 16" aria-hidden="true" className="star-icon">
+      <path d="M8 1.5l1.9 4.1 4.4.5-3.3 3 .9 4.4L8 11.3l-3.9 2.2.9-4.4-3.3-3 4.4-.5z" />
+    </svg>
+  )
+}
+
+function LiveRepoStrip({ stats }: { stats: RepoStats | null }) {
+  const version = stats?.releaseTag ?? (stats?.version ? `v${stats.version}` : BUILT_IN_VERSION)
+  const pushed = relativeTime(stats?.pushedAt ?? stats?.latestCommitDate)
+  return (
+    <div className={`live-repo ${stats ? 'live-repo-loaded' : ''}`} aria-label="Repository status">
+      <span className="live-repo-label"><i />{stats ? 'live from GitHub' : 'from the repository'}</span>
+      <a href={stats?.releaseUrl ?? RELEASE_URL} target="_blank" rel="noreferrer"><b>{version}</b> latest release</a>
+      {stats?.commitCount !== undefined && (
+        <a href={COMMITS_URL} target="_blank" rel="noreferrer"><b>{formatCount(stats.commitCount)}</b> commits on main</a>
+      )}
+      {stats?.stars ? (
+        <a href={GITHUB_URL} target="_blank" rel="noreferrer"><b>{formatCount(stats.stars)}</b> stars</a>
+      ) : null}
+      {pushed && <span><b>updated</b> {pushed}</span>}
+      {stats?.test262Pct !== undefined && (
+        <span><b>{stats.test262Pct}%</b> of test262</span>
+      )}
+    </div>
+  )
+}
 
 const playgroundExample = `const orders = [
   { id: "A-104", total: 48 },
@@ -22,7 +177,104 @@ console.log("priority orders", summary);
 console.log("total", orders.reduce((sum, order) => sum + order.total, 0));`
 
 const PLAYGROUND_BOOT_TIMEOUT_MS = 15_000
-const PLAYGROUND_RUN_TIMEOUT_MS = 2_500
+const PLAYGROUND_RUN_TIMEOUT_MS = 6_000
+
+type PlaygroundExample = { id: string; title: string; blurb: string; source: string }
+
+// Samples for the browser playground. The heavier ones are sized so the
+// interpreter-only WASM build finishes each well inside the 2.5 s deadline and
+// the sandbox's instruction budget: the point is to show a real amount of work
+// completing quickly, not to hit the limits.
+const playgroundExamples: PlaygroundExample[] = [
+  { id: 'orders', title: 'Orders summary', blurb: 'Array pipeline over a few records', source: playgroundExample },
+  { id: 'sieve', title: 'Prime sieve', blurb: '1,000,000 numbers, a Uint8Array and two nested loops', source: `// Sieve of Eratosthenes: count the primes below one million.
+const limit = 1_000_000;
+const composite = new Uint8Array(limit + 1);
+let count = 0;
+for (let n = 2; n <= limit; n++) {
+  if (composite[n]) continue;
+  count++;
+  for (let m = n * n; m <= limit; m += n) composite[m] = 1;
+}
+console.log("primes below", limit, "=", count);` },
+  { id: 'mandel', title: 'Mandelbrot', blurb: '22,000 cells of complex arithmetic, drawn as a 44 x 20 picture', source: `// Mandelbrot set: 22,000 cells of complex arithmetic (up to 200 iterations
+// each), then a 44 x 20 picture of the result.
+const cols = 220, rows = 100, maxIter = 200;
+const shades = " .:-=+*#%@";
+let inside = 0;
+const picture = [];
+for (let y = 0; y < rows; y++) {
+  let line = "";
+  for (let x = 0; x < cols; x++) {
+    const cr = -2.05 + (x / cols) * 2.8, ci = -1.15 + (y / rows) * 2.3;
+    let zr = 0, zi = 0, i = 0;
+    while (i < maxIter && zr * zr + zi * zi < 4) {
+      const t = zr * zr - zi * zi + cr;
+      zi = 2 * zr * zi + ci;
+      zr = t;
+      i++;
+    }
+    if (i === maxIter) inside++;
+    if (y % 5 === 2 && x % 5 === 2) {
+      line += i === maxIter ? "@" : shades[Math.min(shades.length - 2, Math.floor(Math.log2(i + 1) * 1.3))];
+    }
+  }
+  if (line) picture.push(line);
+}
+console.log(picture.join("\\n"));
+console.log("cells inside the set:", inside, "of", cols * rows);` },
+  { id: 'sort', title: 'Sort 100k numbers', blurb: 'three sorts of the same data, checked against each other', source: `// Sort 100,000 pseudo-random numbers three ways and check the results agree.
+let seed = 12345;
+const next = () => (seed = (seed * 1664525 + 1013904223) >>> 0);
+const size = 100_000;
+const data = Array.from({ length: size }, () => next() % 1_000_000);
+const builtin = data.slice().sort((a, b) => a - b);
+function quicksort(a, lo, hi) {
+  while (lo < hi) {
+    const p = a[(lo + hi) >> 1]; let i = lo, j = hi;
+    while (i <= j) { while (a[i] < p) i++; while (a[j] > p) j--; if (i <= j) { const t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; } }
+    if (j - lo < hi - i) { quicksort(a, lo, j); lo = i; } else { quicksort(a, i, hi); hi = j; }
+  }
+}
+const quick = data.slice(); quicksort(quick, 0, quick.length - 1);
+const typed = Float64Array.from(data).sort();
+let agree = true;
+for (let i = 0; i < size; i += 997) if (builtin[i] !== quick[i] || quick[i] !== typed[i]) agree = false;
+console.log("sorted", size, "numbers · min", builtin[0], "· max", builtin[size - 1], "· all three agree:", agree);` },
+  { id: 'json', title: 'JSON round trip', blurb: '40,000 records stringified, parsed back and aggregated', source: `// Build 40,000 records, round-trip them through JSON, and aggregate by region.
+const regions = ["north", "south", "east", "west"];
+const records = [];
+for (let i = 0; i < 40_000; i++) {
+  records.push({ id: i, region: regions[i & 3], amount: (i * 7919) % 1000 / 10, tags: ["t" + (i % 13), "k" + (i % 7)], active: i % 3 === 0 });
+}
+const text = JSON.stringify(records);
+const parsed = JSON.parse(text);
+const totals = new Map();
+for (const r of parsed) totals.set(r.region, (totals.get(r.region) ?? 0) + (r.active ? r.amount : 0));
+console.log("payload", (text.length / 1024).toFixed(0), "KiB ·", parsed.length, "records");
+for (const [region, total] of totals) console.log(region.padEnd(6), total.toFixed(1));` },
+  { id: 'fib', title: 'Recursion & closures', blurb: '630,000 recursive calls, memoisation, 200,000 closure calls', source: `// Recursion and closures: naive fibonacci(27), then the same with memoisation.
+function fib(n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); }
+const memo = new Map();
+const fastFib = (n) => { if (n < 2) return n; if (memo.has(n)) return memo.get(n); const v = fastFib(n - 1) + fastFib(n - 2); memo.set(n, v); return v; };
+console.log("fib(27) by brute force  =", fib(27), "(≈ 630k calls)");
+console.log("fib(90) with memoisation =", fastFib(90));
+const counter = (() => { let n = 0; return () => ++n; })();
+for (let i = 0; i < 200_000; i++) counter();
+console.log("closure called 200,000 times, counter =", counter());` },
+  { id: 'text', title: 'Text processing', blurb: 'a 260 KB document tokenised with a global regex and ranked', source: `// Text processing: generate a 260 KB document, tokenise it with a global
+// regex, rank the words, and build a frequency table.
+const words = ["zipp", "engine", "rust", "sandbox", "script", "fast", "host", "plugin", "rule", "workflow", "browser", "wasm"];
+const parts = [];
+for (let i = 0; i < 40_000; i++) parts.push(words[(i * 31 + (i >> 3)) % words.length] + (i % 11 === 10 ? ".\\n" : " "));
+const doc = parts.join("");
+const tokens = doc.toLowerCase().match(/[a-z]+/g);
+const counts = new Map();
+for (const token of tokens) counts.set(token, (counts.get(token) ?? 0) + 1);
+const top = [...counts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+console.log("characters", doc.length, "· tokens", tokens.length, "· distinct", counts.size, "· lines", doc.split("\\n").length);
+for (const [w, n] of top) console.log(w.padEnd(10), String(n).padStart(6), "#".repeat(Math.round(n / 250)));` },
+]
 
 const installCommands = `git clone https://github.com/f2i-com/zipp.org.git zipp
 cd zipp
@@ -221,6 +473,7 @@ type PlaygroundWorkerMessage =
   | { type: 'error'; runId: number; message: string }
 
 function Playground() {
+  const [exampleId, setExampleId] = useState(playgroundExamples[0].id)
   const [source, setSource] = useState(playgroundExample)
   const [output, setOutput] = useState('Run the sample to see console output from Zipp WASM.')
   const [status, setStatus] = useState<PlaygroundStatus>('idle')
@@ -364,14 +617,21 @@ function Playground() {
     prewarm()
   }
 
-  const resetSource = () => {
+  const currentExample = playgroundExamples.find((example) => example.id === exampleId) ?? playgroundExamples[0]
+
+  const selectExample = (id: string) => {
+    const example = playgroundExamples.find((candidate) => candidate.id === id)
+    if (!example) return
     ++runIdRef.current
     stopWorker()
-    setSource(playgroundExample)
+    setExampleId(id)
+    setSource(example.source)
     setStatus('idle')
     setElapsedMs(null)
-    setOutput('Run the sample to see console output from Zipp WASM.')
+    setOutput(`Run "${example.title}" to see console output from Zipp WASM.`)
   }
+
+  const resetSource = () => selectExample(exampleId)
 
   const statusLabel = {
     idle: 'ready',
@@ -390,10 +650,27 @@ function Playground() {
           <h2>Try JavaScript in Zipp.</h2>
         </div>
         <p>
-          This editor runs the interpreter-only WASM build in a disposable Worker. It has no
-          ambient network, filesystem, Node, or browser authority, and a hung run is terminated
-          from the responsive page outside the guest runtime.
+          Pick an example, edit it, run it. The editor runs the interpreter-only WASM build in a
+          disposable Worker with no ambient network, filesystem, Node, or browser authority; a hung
+          run is terminated from the page outside the guest runtime. The heavier examples do
+          hundreds of thousands of operations each — watch the timer.
         </p>
+      </div>
+
+      <div className="example-picker" role="tablist" aria-label="Choose an example">
+        {playgroundExamples.map((example) => (
+          <button
+            key={example.id}
+            type="button"
+            role="tab"
+            aria-selected={example.id === exampleId}
+            className={example.id === exampleId ? 'active' : ''}
+            onClick={() => selectExample(example.id)}
+          >
+            <strong>{example.title}</strong>
+            <span>{example.blurb}</span>
+          </button>
+        ))}
       </div>
 
       <div className="playground-shell">
@@ -401,7 +678,7 @@ function Playground() {
           <div className="playground-toolbar">
             <div>
               <span className="terminal-dots" aria-hidden="true"><i /><i /><i /></span>
-              <span>playground.js</span>
+              <span>{currentExample.id}.js</span>
             </div>
             <span className={`playground-status status-${status}`}><i />{statusLabel}</span>
           </div>
@@ -423,7 +700,7 @@ function Playground() {
               {status === 'loading' ? 'Loading…' : status === 'running' ? 'Running…' : 'Run with Zipp'}
               <span aria-hidden="true">Ctrl/⌘ + Enter</span>
             </button>
-            <button className="playground-reset" type="button" onClick={resetSource}>Reset sample</button>
+            <button className="playground-reset" type="button" onClick={resetSource}>Reset example</button>
           </div>
         </div>
 
@@ -436,7 +713,7 @@ function Playground() {
           <div className="playground-boundary">
             <span><i />50m instruction lifetime cap</span>
             <span><i />128 MiB VM heap ceiling</span>
-            <span><i />2.5 s host deadline</span>
+            <span><i />6 s host deadline</span>
           </div>
         </div>
       </div>
@@ -449,7 +726,22 @@ function App() {
   const [menuOpen, setMenuOpen] = useState(false)
   const [benchmarkFilter, setBenchmarkFilter] = useState<BenchmarkFilter>('all')
   const [suite, setSuite] = useState<Suite>('normal')
+  const [scrolled, setScrolled] = useState(false)
   const resetTimer = useRef<number | undefined>(undefined)
+  const stats = useRepoStats()
+  useReveal()
+  useSpotlight()
+
+  useEffect(() => {
+    const onScroll = () => setScrolled(window.scrollY > 12)
+    onScroll()
+    window.addEventListener('scroll', onScroll, { passive: true })
+    return () => window.removeEventListener('scroll', onScroll)
+  }, [])
+
+  const liveWins = stats?.nodeWins ?? nodeWins(benchmarkRows) + nodeWins(hostileRows)
+  const liveAll30 = stats?.all30 ?? 0.729
+  const liveStartup = stats?.startupMs ?? 7.7
 
   const visibleBenchmarks = useMemo(
     () =>
@@ -489,7 +781,7 @@ function App() {
     <div className="site-shell">
       <a className="skip-link" href="#main-content">Skip to content</a>
 
-      <header className="site-header">
+      <header className={`site-header ${scrolled ? 'scrolled' : ''}`}>
         <a className="brand" href="#top" aria-label="Zipp home" onClick={closeMenu}>
           <Brand />
         </a>
@@ -512,9 +804,16 @@ function App() {
           <a href="#controls" onClick={closeMenu}>Controls</a>
           <a href="#benchmarks" onClick={closeMenu}>Benchmarks</a>
           <a href="#architecture" onClick={closeMenu}>Engine</a>
+          <a className="nav-star" href={GITHUB_URL} target="_blank" rel="noreferrer" onClick={closeMenu}>
+            <StarIcon /> Star on GitHub{stats?.stars ? ` · ${formatCount(stats.stars)}` : ''}
+          </a>
         </nav>
 
-        <ExternalLink className="header-cta" href={GITHUB_URL}>GitHub</ExternalLink>
+        <a className="header-cta star-cta" href={GITHUB_URL} target="_blank" rel="noreferrer" aria-label="Star Zipp on GitHub">
+          <StarIcon />
+          <span>Star</span>
+          {stats?.stars ? <b>{formatCount(stats.stars)}</b> : null}
+        </a>
       </header>
 
       <main id="main-content">
@@ -522,7 +821,7 @@ function App() {
           <div className="hero-copy">
             <a className="result-pill" href="#benchmarks">
               <span>Native CLI · canonical PGO · 30/30 exact outputs</span>
-              <strong>0.729× Node across all 30 measured rows · faster on 21</strong>
+              <strong>{liveAll30.toFixed(3)}× Node · {liveWins} of 30 rows faster</strong>
               <span aria-hidden="true">↓</span>
             </a>
 
@@ -543,10 +842,12 @@ function App() {
             </div>
 
             <div className="hero-trust" aria-label="Zipp highlights">
-              <span><i />99.997% test262</span>
+              <span><i />{stats?.test262Pct !== undefined ? `${stats.test262Pct}% test262` : '99.997% test262'}</span>
               <span><i />Native + WASM</span>
-              <span><i />Open source</span>
+              <span><i />Open source · MIT</span>
             </div>
+
+            <LiveRepoStrip stats={stats} />
           </div>
 
           <aside className="sandbox-card" aria-label="Illustrative capability-controlled Zipp session">
@@ -612,22 +913,22 @@ function App() {
           <div className="section-wrap proof-grid">
             <div className="proof-lead">
               <span className="metric-index">01</span>
-              <strong>21 / 30</strong>
+              <CountUp value={liveWins} format={(v) => `${Math.round(v)} / 30`} />
               <p>native rows faster than Node</p>
             </div>
             <div>
               <span className="metric-index">02</span>
-              <strong>0.729×</strong>
+              <CountUp value={liveAll30} format={(v) => `${v.toFixed(3)}×`} />
               <p>native Zipp / Node · equal-row all 30</p>
             </div>
             <div>
               <span className="metric-index">03</span>
-              <strong>7.7 ms</strong>
+              <CountUp value={liveStartup} format={(v) => `${v.toFixed(1)} ms`} />
               <p>median native process launch</p>
             </div>
             <div>
               <span className="metric-index">04</span>
-              <strong>30 / 30</strong>
+              <CountUp value={30} format={(v) => `${Math.round(v)} / 30`} />
               <p>exact-output parity</p>
             </div>
           </div>
@@ -813,6 +1114,7 @@ function App() {
                     <th scope="col">Node</th>
                     <th scope="col">Bun</th>
                     <th scope="col">Deno</th>
+                    <th scope="col" className="bar-column">Zipp vs Node <span>relative time</span></th>
                     <th scope="col">Zipp / Node</th>
                   </tr>
                 </thead>
@@ -828,6 +1130,17 @@ function App() {
                         <td data-label="Node">{row.times.node.toFixed(3)}</td>
                         <td data-label="Bun">{row.times.bun.toFixed(3)}</td>
                         <td data-label="Deno">{row.times.deno.toFixed(3)}</td>
+                        <td className="bar-cell" data-label="Zipp vs Node" aria-hidden="true">
+                          {(() => {
+                            const max = Math.max(row.times.zipp, row.times.node)
+                            return (
+                              <div className="row-bars">
+                                <span className="row-bar row-bar-zipp" style={{ width: `${(row.times.zipp / max) * 100}%` }} />
+                                <span className="row-bar row-bar-node" style={{ width: `${(row.times.node / max) * 100}%` }} />
+                              </div>
+                            )
+                          })()}
+                        </td>
                         <td className="lead-cell" data-label="Zipp divided by Node">
                           <strong className={row.nodeRatio < 1 ? 'ratio-win' : 'ratio-gap'}>{row.nodeRatio.toFixed(3)}×</strong>
                           <span>{row.nodeRatio < 1 ? 'faster than Node' : 'slower than Node'}</span>
@@ -961,21 +1274,32 @@ function App() {
           <div>
             <p className="section-kicker">Fast. Explicit. Yours to embed.</p>
             <h2>Give users JavaScript.<br />Keep control of the runtime.</h2>
+            <p className="closing-star-note">
+              Zipp is open source and built in the open. If it is useful to you, a star on GitHub is the
+              simplest way to help other engineers find it{stats?.stars ? ` — ${formatCount(stats.stars)} already have.` : '.'}
+            </p>
           </div>
           <div className="closing-actions">
-            <ExternalLink className="button button-dark" href={GITHUB_URL}>Start with Zipp</ExternalLink>
+            <a className="button button-dark star-button" href={GITHUB_URL} target="_blank" rel="noreferrer">
+              <StarIcon /> Star Zipp on GitHub
+            </a>
             <ExternalLink className="closing-doc-link" href={DOCS_URL}>Read the docs</ExternalLink>
+            <ExternalLink className="closing-doc-link" href={RELEASES_URL}>All releases</ExternalLink>
           </div>
         </section>
       </main>
 
       <footer className="site-footer section-wrap">
         <a className="brand" href="#top" aria-label="Back to top"><Brand /></a>
-        <p>A clean-sheet JavaScript engine in Rust.</p>
+        <p>
+          A clean-sheet JavaScript engine in Rust · part of{' '}
+          <a href={F2I_URL} target="_blank" rel="noreferrer">f2i.com</a>
+        </p>
         <div>
           <ExternalLink href={DOCS_URL}>Docs</ExternalLink>
           <ExternalLink href={BENCHMARK_URL}>Benchmarks</ExternalLink>
           <ExternalLink href={GITHUB_URL}>GitHub</ExternalLink>
+          <ExternalLink href={F2I_URL}>f2i.com</ExternalLink>
         </div>
       </footer>
     </div>

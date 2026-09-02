@@ -29,7 +29,7 @@ implementation can be read end to end.
 
 | Strength | Current verified state |
 |---|---|
-| **Starts quickly** | **7.9 ms** median process launch in the canonical four-engine capture; no snapshot to load. |
+| **Starts quickly** | **7.7 ms** median process launch in the canonical four-engine capture (Node 30.6 ms, Bun 44.0 ms, Deno 84.4 ms); no snapshot to load. |
 | **Runs modern JavaScript** | **99.997% of test262**: 95,939 / 95,942 required executions. |
 | **Competes today** | Canonical equal-row all-30 geomean **0.729× Node**; normal all-13 **0.620×** and hostile all-17 **0.824×**. Lower is faster. |
 | **Owns the stack** | Project-native parser, VM, GC, object model, regex fork, x86-64 JIT, and guarded ARM64 baseline JIT. |
@@ -263,9 +263,9 @@ final engine code; it does not predict WASM performance.
 
 #### v0.0.6 browser-WASM status
 
-The committed production module, built from the v0.0.6 source, is 5,480,311 bytes raw, 1,825,812 at
-gzip-9, and 1,233,575 at Brotli-11 (SHA-256
-`318fc5cf7ee5d55751d829419d4de5af1ab2643b8f7fd30df2e3779c16ad1691`). The
+The committed production module, built from the v0.0.12 source, is 5,558,860 bytes raw, 1,812,458 at
+gzip-9, and 1,248,649 at Brotli-11 (SHA-256
+`bd8614fe5f3a3b8ef67f4b917cdefebb3fe69afa39a9804a0d3f6b0b6b267126`). The
 official QuickJS-NG v0.16.2 reactor is 1,528,293 bytes raw and 417,087 at
 Brotli-11, so Zipp is `3.586×` as large raw and `2.958×` as large on the wire.
 

@@ -336,6 +336,9 @@ svg {
 }
 
 .hero h1 {
+  /* A formatting root: the gradient line below carries a negative bottom
+     margin that must stay inside the heading, not collapse into the intro. */
+  display: flow-root;
   max-width: 780px;
   font-size: clamp(4rem, 6.2vw, 6.35rem);
   font-weight: 830;
@@ -1926,6 +1929,479 @@ svg {
   line-height: 1.6;
 }
 
+/* ── aurora hero ─────────────────────────────────────────────────────────── */
+
+@keyframes aurora-drift {
+  0% {
+    transform: translate3d(-6%, -4%, 0) rotate(0deg) scale(1);
+  }
+  50% {
+    transform: translate3d(5%, 6%, 0) rotate(8deg) scale(1.08);
+  }
+  100% {
+    transform: translate3d(-6%, -4%, 0) rotate(0deg) scale(1);
+  }
+}
+
+@keyframes aurora-drift-b {
+  0% {
+    transform: translate3d(8%, 4%, 0) rotate(0deg) scale(1.05);
+  }
+  50% {
+    transform: translate3d(-4%, -7%, 0) rotate(-10deg) scale(0.96);
+  }
+  100% {
+    transform: translate3d(8%, 4%, 0) rotate(0deg) scale(1.05);
+  }
+}
+
+.hero::before,
+.hero::after {
+  content: '';
+  position: absolute;
+  inset: -20% -10%;
+  z-index: -1;
+  pointer-events: none;
+  filter: blur(70px);
+  opacity: 0.55;
+  will-change: transform;
+}
+
+.hero::before {
+  background:
+    radial-gradient(38% 45% at 28% 30%, rgba(124, 58, 237, 0.55), transparent 70%),
+    radial-gradient(30% 40% at 72% 68%, rgba(34, 211, 238, 0.35), transparent 70%);
+  animation: aurora-drift 22s ease-in-out infinite;
+}
+
+.hero::after {
+  background:
+    radial-gradient(28% 34% at 64% 22%, rgba(196, 181, 253, 0.28), transparent 70%),
+    radial-gradient(26% 30% at 20% 80%, rgba(34, 211, 238, 0.22), transparent 70%);
+  animation: aurora-drift-b 28s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 0% 50%;
+  }
+  100% {
+    background-position: 200% 50%;
+  }
+}
+
+.hero h1 em {
+  /* `background-clip: text` paints only inside the box, and at line-height
+     0.91 the box ends above the descenders, so the "g" in "bring" lost its
+     tail. Give the box room below and take the same room back as margin. */
+  padding-bottom: 0.4em;
+  margin-bottom: -0.4em;
+  background: linear-gradient(100deg, var(--lime) 0%, #a78bfa 30%, var(--cyan) 55%, var(--lime) 80%, #a78bfa 100%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer 9s linear infinite;
+}
+
+.playground-editor-pane textarea,
+.playground-output-pane pre,
+.code-window pre,
+.terminal-block pre {
+  /* Cascadia's ligatures turn `=>` into an arrow and `>=` into ≥: fine in an
+     editor you chose, misleading in code a visitor is reading for the first time. */
+  font-variant-ligatures: none;
+  font-feature-settings: "liga" 0, "calt" 0;
+}
+
+/* ── example picker ──────────────────────────────────────────────────────── */
+
+.example-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.example-picker button {
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+  transition: transform 200ms ease, border-color 200ms ease, background-color 200ms ease, box-shadow 200ms ease;
+}
+
+.example-picker button:hover {
+  transform: translateY(-2px);
+  border-color: var(--line-strong);
+}
+
+.example-picker button.active {
+  border-color: rgba(196, 181, 253, 0.7);
+  background: rgba(124, 58, 237, 0.16);
+  box-shadow: 0 0 0 1px rgba(196, 181, 253, 0.25), 0 14px 34px -24px rgba(124, 58, 237, 0.9);
+}
+
+.example-picker strong {
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.example-picker span {
+  color: #8d9491;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.example-picker button.active span {
+  color: #b7bdba;
+}
+
+/* ── cursor spotlight on cards ───────────────────────────────────────────── */
+
+.spot {
+  position: relative;
+  overflow: hidden;
+}
+
+.spot::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    260px circle at var(--mx, 50%) var(--my, 50%),
+    rgba(196, 181, 253, 0.14),
+    rgba(34, 211, 238, 0.06) 40%,
+    transparent 70%
+  );
+  opacity: 0;
+  transition: opacity 320ms ease;
+}
+
+.spot:hover::after {
+  opacity: 1;
+}
+
+.spot > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* ── relative-time bars in the benchmark table ───────────────────────────── */
+
+.bar-column span {
+  display: block;
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.06em;
+  color: var(--muted-dark);
+}
+
+.bar-cell {
+  min-width: 150px;
+}
+
+.row-bars {
+  display: grid;
+  gap: 5px;
+}
+
+.row-bar {
+  display: block;
+  height: 6px;
+  border-radius: 999px;
+  transform-origin: left center;
+  transition: width 900ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+.row-bar-zipp {
+  background: linear-gradient(90deg, var(--lime-dark), var(--lime));
+  box-shadow: 0 0 12px rgba(196, 181, 253, 0.35);
+}
+
+.row-bar-node {
+  background: #3a4045;
+}
+
+/* ── motion ──────────────────────────────────────────────────────────────── */
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateY(26px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes bolt-glow {
+  0%, 100% {
+    filter: drop-shadow(0 0 9px rgba(124, 58, 237, 0.5));
+  }
+  50% {
+    filter: drop-shadow(0 0 16px rgba(34, 211, 238, 0.7));
+  }
+}
+
+@keyframes pulse-dot {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(196, 181, 253, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 7px rgba(196, 181, 253, 0);
+  }
+}
+
+@keyframes budget-fill {
+  from {
+    width: 0;
+  }
+  to {
+    width: 37%;
+  }
+}
+
+@keyframes log-line {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.hero-copy > * {
+  animation: rise-in 700ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+.hero-copy > :nth-child(1) { animation-delay: 40ms; }
+.hero-copy > :nth-child(2) { animation-delay: 120ms; }
+.hero-copy > :nth-child(3) { animation-delay: 220ms; }
+.hero-copy > :nth-child(4) { animation-delay: 300ms; }
+.hero-copy > :nth-child(5) { animation-delay: 380ms; }
+.hero-copy > :nth-child(6) { animation-delay: 460ms; }
+
+.sandbox-card {
+  animation: card-in 900ms cubic-bezier(0.2, 0.7, 0.2, 1) 260ms both;
+}
+
+.brand-symbol {
+  animation: bolt-glow 4.5s ease-in-out infinite;
+}
+
+.live-status i {
+  animation: pulse-dot 2.4s ease-out infinite;
+}
+
+.budget-track span {
+  animation: budget-fill 1.4s cubic-bezier(0.2, 0.7, 0.2, 1) 700ms both;
+}
+
+.sandbox-log > div {
+  animation: log-line 500ms ease-out both;
+}
+
+.sandbox-log > div:nth-child(1) { animation-delay: 900ms; }
+.sandbox-log > div:nth-child(2) { animation-delay: 1150ms; }
+.sandbox-log > div:nth-child(3) { animation-delay: 1400ms; }
+
+.reveal {
+  opacity: 0;
+  transform: translateY(16px);
+  transition:
+    opacity 640ms cubic-bezier(0.2, 0.7, 0.2, 1) var(--reveal-delay, 0ms),
+    transform 640ms cubic-bezier(0.2, 0.7, 0.2, 1) var(--reveal-delay, 0ms);
+  will-change: opacity, transform;
+}
+
+.reveal.is-in {
+  opacity: 1;
+  transform: none;
+}
+
+.ratio-row i {
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 1100ms cubic-bezier(0.2, 0.7, 0.2, 1) 180ms;
+}
+
+.benchmark-summary > article.is-in .ratio-row i,
+.benchmark-summary > article:not(.reveal) .ratio-row i {
+  transform: scaleX(1);
+}
+
+.button,
+.use-case-card,
+.runtime-grid > article,
+.reading-guide article,
+.release-strip li,
+.filter-tabs button,
+.nav-links a,
+.text-link {
+  transition:
+    transform 220ms ease,
+    border-color 220ms ease,
+    background-color 220ms ease,
+    color 220ms ease,
+    box-shadow 220ms ease;
+}
+
+.button:hover {
+  transform: translateY(-1px);
+}
+
+.use-case-card:hover,
+.runtime-grid > article:hover,
+.reading-guide article:hover,
+.release-strip li:hover {
+  transform: translateY(-3px);
+  border-color: var(--line-strong);
+  box-shadow: 0 18px 40px -28px rgba(124, 58, 237, 0.55);
+}
+
+.site-header {
+  transition: background-color 260ms ease, box-shadow 260ms ease;
+}
+
+.site-header.scrolled {
+  background: rgba(8, 9, 13, 0.78);
+  box-shadow: 0 1px 0 var(--line);
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+}
+
+/* ── star call to action ─────────────────────────────────────────────────── */
+
+.star-icon {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+  flex: none;
+}
+
+.star-cta {
+  gap: 8px;
+}
+
+.star-cta b {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(196, 181, 253, 0.16);
+  color: var(--lime);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.star-cta .star-icon {
+  color: var(--lime);
+}
+
+.star-cta:hover .star-icon,
+.star-cta:focus-visible .star-icon {
+  color: inherit;
+}
+
+.star-cta:hover b,
+.star-cta:focus-visible b {
+  color: inherit;
+  background: rgba(10, 12, 13, 0.14);
+}
+
+.nav-links .nav-star {
+  display: none;
+}
+
+.star-button .star-icon {
+  color: var(--lime-dark);
+}
+
+.closing-star-note {
+  max-width: 560px;
+  margin: 18px 0 0;
+  color: #4d5350;
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+/* ── live repository strip ───────────────────────────────────────────────── */
+
+.live-repo {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+  margin-top: 22px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.025);
+  color: #a4aaa8;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0.01em;
+}
+
+.live-repo a,
+.live-repo span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.live-repo a:hover b {
+  color: var(--cyan);
+}
+
+.live-repo b {
+  color: var(--ink);
+  font-weight: 600;
+  transition: color 200ms ease;
+}
+
+.live-repo-label {
+  color: #7b8280;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 10px;
+}
+
+.live-repo-label i {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #6b7270;
+}
+
+.live-repo-loaded .live-repo-label i {
+  background: var(--cyan);
+  box-shadow: 0 0 10px rgba(34, 211, 238, 0.6);
+  animation: pulse-dot 2.4s ease-out infinite;
+}
+
 .architecture-section {
   padding-block: 126px;
   border-top: 1px solid var(--line);
@@ -2186,10 +2662,18 @@ svg {
   font-size: 9px;
 }
 
+.site-footer p a {
+  color: #b9bfbc;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: rgba(196, 181, 253, 0.55);
+}
+
 .site-footer > div {
   justify-self: end;
   display: flex;
-  gap: 20px;
+  flex-wrap: wrap;
+  gap: 0 20px;
 }
 
 .site-footer > div a {
@@ -2280,6 +2764,36 @@ svg {
   .reading-guide,
   .release-strip ol {
     grid-template-columns: 1fr;
+  }
+
+  .hero::before,
+  .hero::after {
+    filter: blur(48px);
+    opacity: 0.45;
+  }
+
+  .example-picker {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .bar-cell {
+    min-width: 0;
+  }
+
+  .nav-links .nav-star {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--lime);
+  }
+
+  .live-repo {
+    font-size: 11px;
+    gap: 6px 12px;
+  }
+
+  .closing-actions {
+    flex-wrap: wrap;
   }
 
   .scoreboard-controls {
@@ -2978,6 +3492,37 @@ svg {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .hero-copy > *,
+  .sandbox-card,
+  .brand-symbol,
+  .live-status i,
+  .budget-track span,
+  .sandbox-log > div,
+  .live-repo-loaded .live-repo-label i {
+    animation: none;
+  }
+
+  .reveal {
+    opacity: 1;
+    transform: none;
+    transition: none;
+  }
+
+  .hero::before,
+  .hero::after,
+  .hero h1 em {
+    animation: none;
+  }
+
+  .spot::after {
+    display: none;
+  }
+
+  .ratio-row i {
+    transform: none;
+    transition: none;
+  }
+
   html {
     scroll-behavior: auto;
   }

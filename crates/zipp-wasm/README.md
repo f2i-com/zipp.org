@@ -91,10 +91,10 @@ features. Name, producers, and optional `target_features` sections are removed;
 no `wasm-opt` pass is used. The exact tracked module is:
 
 ```text
-raw         5,480,311 bytes
-gzip-9      1,825,812 bytes
-Brotli-11   1,233,575 bytes
-SHA-256     318fc5cf7ee5d55751d829419d4de5af1ab2643b8f7fd30df2e3779c16ad1691
+raw         5,558,860 bytes
+gzip-9      1,812,458 bytes
+Brotli-11   1,248,649 bytes
+SHA-256     bd8614fe5f3a3b8ef67f4b917cdefebb3fe69afa39a9804a0d3f6b0b6b267126
 ```
 
 QuickJS-NG v0.16.2's official reactor is 1,528,293 bytes raw and 417,087 at

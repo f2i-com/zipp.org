@@ -7,11 +7,16 @@ the clean four-engine canonical captures:
 and
 [`../bench/hostile/head_clean_c28781cf_pgo_2026-09-02.json`](../bench/hostile/head_clean_c28781cf_pgo_2026-09-02.json).
 The all-30 headline is the equal-row geomean of the normal 13 and hostile 17;
-development-only A/Bs do not silently change the public ratios.
+development-only A/Bs do not silently change the public ratios. At runtime the
+page also asks `api/stats.php` (a small PHP endpoint in `public/api/`) for the
+live repository facts -- version, commit count, stars, latest release and the
+README's own figures -- and fills them in when it answers; a static host keeps
+the built-in figures.
 
-The checked-in v0.0.6 browser module is the section-stripped production build:
-5,480,311 bytes raw, 1,825,812 at gzip-9, and 1,233,575 at Brotli-11, with
-SHA-256 `318fc5cf7ee5d55751d829419d4de5af1ab2643b8f7fd30df2e3779c16ad1691`.
+The checked-in browser module is the section-stripped production build of the
+engine at v0.0.12 (`crates/zipp-wasm/README.md` has the exact recipe): 5,558,860
+bytes raw, 1,812,458 at gzip-9, and 1,248,649 at Brotli-11, with SHA-256
+`bd8614fe5f3a3b8ef67f4b917cdefebb3fe69afa39a9804a0d3f6b0b6b267126`.
 The separate pinned QuickJS-NG and Boa comparison documents both the incomplete
 exact-suite WASM attempt and the specialization-sensitive micro diagnostic in
 [`../bench/comparison/README.md`](../bench/comparison/README.md).
