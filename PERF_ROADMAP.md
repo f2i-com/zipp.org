@@ -155,6 +155,21 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B268 NULL — `JSON.parse` object birth from a recycled shell
+
+Built and measured, not landed. `JSON.parse` built each object straight into a
+recycled shell reset to an empty owned-key map, with key buffers from the key
+pool and a settled allocation (no pairs buffer, no fresh `Box`). One-binary
+latch A/B, 21 pairs: json-large +0.5% [−1.4, +2.1], controls null; exact
+output, tests in nine modes, 188-run identity sweep clean. `ZIPP_GCSTATS`
+told why before the numbers did: `[objpool] pushed=0 popped=0` on json-large —
+a dying JSON object has OWNED keys and the pool admits only planned-key shells,
+so the recycled box was never there to take — and `[keypool] served=8192
+missed=436726`: the key pool's 8,192 cap is a small fraction of one parse
+cycle's keys, which die together at a collection. The lever for json-large's
+allocator share (~6%) is therefore pool admission for owned-key shells (drain
+the keys, keep the box) plus a demand-sized key pool, not the parser. Reverted.
+
 ### B267 LANDED — `(x + y) | 0` fuses into the wrapping add in Tier C
 
 `ZIPP_NO_TRUNC_OR_FUSE=1` restores the three-op emission. A truncation-only
