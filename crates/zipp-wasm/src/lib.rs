@@ -66,9 +66,23 @@ const MAX_EVAL_SOURCE_BYTES: usize =
     MAX_DYNAMIC_CODE_SOURCE_BYTES - EVAL_PREFIX.len() - EVAL_SUFFIX.len();
 const MAX_EVAL_RETAINED_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_EVAL_CALLS: u32 = 256;
-const MAX_DYNAMIC_CODE_RETAINED_SOURCE_BYTES: usize = 1024 * 1024;
-const MAX_DYNAMIC_CODE_CALLS: usize = 256;
-const MAX_DYNAMIC_CODE_FUNCTIONS: usize = 4096;
+// Sized for a guest that generates code, not for one that calls `eval` a
+// handful of times. The previous ceilings -- 256 compiles and 1 MB of source
+// for the life of the engine -- were the snippet-shaped bounds the comment
+// above warns about. An emulator that compiles its hot paths into JavaScript,
+// which is a real workload and one of the few ways a guest gets fast, hit them
+// after 158 compiled traces and stopped dead: a spent dynamic-code allowance is
+// terminal, not an exception the guest can catch and back off from.
+//
+// Retained source is the bound that matters here, because dynamic functions are
+// leaked deliberately to keep stable addresses and are never reclaimed. 16 MB is
+// where an absurd request begins: it is fixed for the life of one Engine, a
+// guest still cannot raise it, and it stays far below MAX_APPROX_HEAP_BYTES,
+// which remains the bound that catches a runaway bundle whatever shape it
+// allocates.
+const MAX_DYNAMIC_CODE_RETAINED_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_DYNAMIC_CODE_CALLS: usize = 16384;
+const MAX_DYNAMIC_CODE_FUNCTIONS: usize = 16384;
 const MAX_DYNAMIC_CODE_CLASSES: usize = 1024;
 const MAX_LIFETIME_STEPS: u64 = 50_000_000;
 // The most a host may ask for through `setInstructionBudget`: forty times the
