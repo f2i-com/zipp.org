@@ -323,8 +323,29 @@ const POSTFLIGHT_AUDIT_STRIDE: u32 = 256;
 /// walk only reconciles capacity growth inside objects already counted, which
 /// scales with bytes, not calls, so the stride is bytes. Same bargain as
 /// `POSTFLIGHT_AUDIT_STRIDE`; the window is now this many bytes of preflighted
-/// allocation rather than 256 allocations of any size.
+/// allocation rather than 256 allocations of any size. This is the floor;
+/// `preflight_audit_bytes_for` widens it with the heap.
 const PREFLIGHT_AUDIT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Bytes preflighted between reconciliation walks, by heap size in slots.
+///
+/// The walk is O(slots) and a fixed byte window is independent of the heap,
+/// so on its own the byte stride still taxes a string-building loop in
+/// proportion to everything the guest retains. `join` is the sharp case:
+/// each part preflights the builder's running total, so a 4,000-part join
+/// of a 23 KB result preflights about 46 MB and walked the heap six times
+/// whatever that heap held -- 5 ms per join on a small heap, and on the
+/// wasm build with 300,000 objects live the walk alone was most of the
+/// call. Widening the window with the slot count (4 KiB of preflighted
+/// allocation per slot, the same reasoning `heap_walk_stride_for` applies
+/// to the dispatch poll) holds the walk's share of such a loop near a
+/// constant few percent. Every call still convicts on the O(1) estimate,
+/// which sees every new allocation; only growth in place inside objects
+/// already counted waits for a walk, bounded as it is for the
+/// interpreter's own stride.
+fn preflight_audit_bytes_for(slots: usize) -> usize {
+    slots.saturating_mul(4096).max(PREFLIGHT_AUDIT_BYTES)
+}
 
 /// Periodic polls between forced full heap walks in the dispatch loop. Ordinary
 /// and unlimited meters poll every 65,536 dispatches; the finite release-wasm
@@ -1017,9 +1038,13 @@ impl super::Vm<'_> {
             .as_mut()
             .expect("recorder checked present above");
         rec.preflight_bytes_since_audit = rec.preflight_bytes_since_audit.saturating_add(bytes);
-        if rec.preflight_bytes_since_audit < PREFLIGHT_AUDIT_BYTES {
+        if rec.preflight_bytes_since_audit < preflight_audit_bytes_for(self.heap.len()) {
             return Ok(());
         }
+        let rec = self
+            .instr_rec
+            .as_mut()
+            .expect("recorder checked present above");
         rec.preflight_bytes_since_audit = 0;
 
         let resident = self.heap_bytes();
@@ -2121,6 +2146,15 @@ mod tests {
         rec.remaining = 1_000_000;
         vm.set_instrumentation(rec);
         vm
+    }
+
+    #[test]
+    fn preflight_audit_window_scales_with_the_heap_above_its_floor() {
+        assert_eq!(preflight_audit_bytes_for(0), PREFLIGHT_AUDIT_BYTES);
+        assert_eq!(preflight_audit_bytes_for(2_047), PREFLIGHT_AUDIT_BYTES);
+        assert_eq!(preflight_audit_bytes_for(2_048), PREFLIGHT_AUDIT_BYTES);
+        assert_eq!(preflight_audit_bytes_for(300_000), 300_000 * 4096);
+        assert_eq!(preflight_audit_bytes_for(usize::MAX), usize::MAX);
     }
 
     #[cfg(feature = "safe-sandbox")]
