@@ -1241,6 +1241,9 @@ pub struct Vm<'p> {
     /// guard model; intentionally NOT a GC root (entries are validated or
     /// re-read against live, guard-checked objects before any use).
     site_ics: Vec<Option<Box<[Option<Box<ic::SiteIc>>]>>>,
+    /// Bytes of `site_ics` storage drawn by runtime-installed (`eval` /
+    /// `new Function`) functions, against `ic::DYNAMIC_IC_BUDGET_BYTES`.
+    dynamic_ic_bytes: usize,
     /// Bounded interpreter `LoadConst` memo for short string literals, keyed by
     /// the immutable unified `(func_id, constant-slot)` pair. JavaScript strings
     /// are primitives, so repeated loads may share a representation; entries

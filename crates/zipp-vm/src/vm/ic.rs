@@ -324,14 +324,55 @@ fn builtin_object_method(key: &str) -> bool {
     )
 }
 
+/// `ZIPP_NO_DYNAMIC_IC=1` keeps runtime `eval` / `new Function` code out of
+/// the interpreter inline caches (the pre-B274 behaviour) for A/B runs.
+fn dynamic_ic_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("ZIPP_NO_DYNAMIC_IC").is_none())
+}
+
+/// Cache storage every runtime-installed function of one VM may draw on
+/// together (per-function `ip` tables plus site payloads). Main-program code
+/// is bounded by its source; dynamic code is bounded by the dynamic-code
+/// ceilings, which admit 16,384 functions in the wasm build, so its feedback
+/// gets a budget of its own. Past it a site simply runs uncached, which
+/// changes nothing a program can observe.
+const DYNAMIC_IC_BUDGET_BYTES: usize = 8 << 20;
+
 impl<'p> Vm<'p> {
-    /// Main code and exact loader-recorded module ranges may own IC state.
-    /// Ordinary eval/new-Function gaps remain excluded even when they sit
-    /// between two eligible module ranges in the unified function table.
-    #[inline]
+    /// Main code, exact loader-recorded module ranges, and installed runtime
+    /// code (`eval` / `new Function`) may own IC state.
+    ///
+    /// Dynamic functions used to be excluded wholesale, which left the
+    /// programs that compile their hot paths into JavaScript (an emulator
+    /// installing its traces) running every property site uncached: the
+    /// same monomorphic property loop measured 70% slower installed through
+    /// `new Function` than as main code. Eligibility is exact, not a range:
+    /// `eval_funcs` is append-only and its protos are leaked at stable
+    /// addresses, so an id past `main_func_count` names one installed
+    /// function for the life of the VM and is never repurposed — the property
+    /// every guard in this module relies on. Ids are assigned in
+    /// `prepare_eval_program` only after the program's global/function/class
+    /// remap, and a site can only fill once its code runs, so no cache ever
+    /// sees a pre-remap instruction.
+    ///
+    /// This sits on every IC probe. Main code, the overwhelmingly common
+    /// case, must stay one compare in the caller: the module and dynamic
+    /// checks (two lazily read switches, a range scan, a subtraction) live
+    /// out of line so their size can never cost the hot path its inlining.
+    #[inline(always)]
     fn ic_func_eligible(&self, func_id: u32) -> bool {
-        (func_id as usize) < self.main_func_count
-            || (module_ic_enabled() && self.loader_module_func(func_id))
+        (func_id as usize) < self.main_func_count || self.ic_func_eligible_installed(func_id)
+    }
+
+    /// The runtime-installed half of `ic_func_eligible`: loader-recorded
+    /// module ranges and, past `main_func_count`, installed dynamic code.
+    #[cold]
+    #[inline(never)]
+    fn ic_func_eligible_installed(&self, func_id: u32) -> bool {
+        (module_ic_enabled() && self.loader_module_func(func_id))
+            || (dynamic_ic_enabled()
+                && (func_id as usize).wrapping_sub(self.main_func_count) < self.eval_funcs.len())
     }
 
     /// Exclusions shared with `get_member`'s fast path: objects with live /
@@ -375,6 +416,33 @@ impl<'p> Vm<'p> {
             self.site_ics.resize_with(func_count, || None);
         }
         let code_len = self.func(f).code.len();
+        if f >= self.main_func_count {
+            // Runtime-installed code draws its cache storage from the fixed
+            // per-VM budget: charge what THIS call would allocate (the
+            // function's ip table and/or this site's payload) before
+            // allocating either, and run the site uncached once it is spent.
+            let table_new = self.site_ics[f].is_none();
+            let site_new = ip < code_len
+                && self.site_ics[f]
+                    .as_ref()
+                    .is_none_or(|table| table[ip].is_none());
+            let mut need = 0usize;
+            if table_new {
+                need = need.saturating_add(
+                    code_len.saturating_mul(std::mem::size_of::<Option<Box<SiteIc>>>()),
+                );
+            }
+            if site_new {
+                need = need.saturating_add(std::mem::size_of::<SiteIc>());
+            }
+            if need > 0 {
+                let total = self.dynamic_ic_bytes.saturating_add(need);
+                if total > DYNAMIC_IC_BUDGET_BYTES {
+                    return None;
+                }
+                self.dynamic_ic_bytes = total;
+            }
+        }
         let slots = self.site_ics[f].get_or_insert_with(|| {
             let mut v = Vec::new();
             v.resize_with(code_len, || None);
