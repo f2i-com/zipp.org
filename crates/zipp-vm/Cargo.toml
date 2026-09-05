@@ -22,7 +22,7 @@ unicode-normalization = "0.1"
 # Arbitrary-precision BigInt (pure Rust). The common path stays `i128`
 # (`HeapObj::BigInt`); `num-bigint` only backs values outside i128 range
 # (`HeapObj::BigIntBig`) — see vm/bigint.rs for the canonical-form invariant.
-num-bigint = "0.4"
+num-bigint = "0.5"
 num-traits = "0.2"
 dynasm = { workspace = true, optional = true }
 dynasmrt = { workspace = true, optional = true }
