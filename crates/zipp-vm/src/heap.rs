@@ -2642,17 +2642,30 @@ impl ObjMap {
 /// where the i-th unit is the i-th byte — O(1) random access. `wellformed`
 /// (no lone surrogates ⇔ the bytes are valid UTF-8) is computed once at
 /// construction; only well-formed strings may be viewed as `&str`.
+///
+/// `cursor` is the position memo for non-ASCII indexing: the code-point
+/// boundary most recently located by `seek`, packed as
+/// `unit position << 32 | byte offset`. It is an accelerator, never an
+/// authority — every reader re-decodes at the boundary it names — and it is
+/// always a boundary of the CURRENT bytes: constructors start it at (0, 0),
+/// appends keep every existing boundary, no path shortens a buffer in place,
+/// and the one append that rewrites its tail (a surrogate seam merge) resets
+/// it. Interior mutability keeps the read leaves `&self`, which the JIT
+/// helpers and the `&Heap` accessors require.
 #[derive(Clone, Debug)]
 pub struct JsStr {
     bytes: Vec<u8>,
-    units: usize,
+    /// `u32` (every string is bounded by `MAX_STRING_UNITS`, 1 << 28) so the
+    /// memo fits the same 40-byte layout the former `usize` field used.
+    units: u32,
     ascii: bool,
     wellformed: bool,
     /// Bit zero freezes every concat-memo result against in-place mutation;
     /// bit one marks only a size-bounded B212 head as eligible for B253's
     /// one-link suffix memo. Replacing B212's former `bool` with this `u8`
-    /// keeps the exact 40-byte layout and one-byte constructor initialization.
+    /// keeps the one-byte constructor initialization.
     memo_state: u8,
+    cursor: Cell<u64>,
 }
 
 const STR_MEMO_FROZEN: u8 = 1;
@@ -2982,10 +2995,11 @@ impl JsStr {
         };
         JsStr {
             bytes: bytes.into_bytes(),
-            units,
+            units: units as u32,
             ascii,
             wellformed: true,
             memo_state: 0,
+            cursor: Cell::new(0),
         }
     }
 
@@ -3001,22 +3015,24 @@ impl JsStr {
     pub fn from_ascii(bytes: Vec<u8>) -> JsStr {
         debug_assert!(bytes.is_ascii(), "from_ascii: caller's ascii proof failed");
         JsStr {
-            units: bytes.len(),
+            units: bytes.len() as u32,
             bytes,
             ascii: true,
             wellformed: true,
             memo_state: 0,
+            cursor: Cell::new(0),
         }
     }
 
     pub fn from_wtf8(bytes: Vec<u8>) -> JsStr {
         if bytes.is_ascii() {
             return JsStr {
-                units: bytes.len(),
+                units: bytes.len() as u32,
                 bytes,
                 ascii: true,
                 wellformed: true,
                 memo_state: 0,
+                cursor: Cell::new(0),
             };
         }
         let wellformed = wtf8_is_wellformed(&bytes);
@@ -3040,10 +3056,11 @@ impl JsStr {
         let units = wtf8_units(&bytes);
         JsStr {
             bytes,
-            units,
+            units: units as u32,
             ascii: false,
             wellformed,
             memo_state: 0,
+            cursor: Cell::new(0),
         }
     }
 
@@ -3111,7 +3128,7 @@ impl JsStr {
     /// Length in UTF-16 code units — the JS `.length`.
     #[inline]
     pub fn units(&self) -> usize {
-        self.units
+        self.units as usize
     }
 
     #[inline]
@@ -3226,7 +3243,7 @@ impl JsStr {
         // SAFETY: the caller's contract proves the newly exposed range was
         // initialized in-bounds through this exact allocation.
         unsafe { self.bytes.set_len(new_len) };
-        self.units += new_len - old_len;
+        self.units += (new_len - old_len) as u32;
         true
     }
 
@@ -3238,7 +3255,7 @@ impl JsStr {
     #[allow(dead_code)]
     pub fn push_str(&mut self, add: &str) {
         debug_assert!(!self.frozen(), "mutated a frozen concat-memo string");
-        self.units += str_units(add);
+        self.units += str_units(add) as u32;
         self.ascii &= add.is_ascii();
         self.bytes.extend_from_slice(add.as_bytes());
     }
@@ -3252,7 +3269,7 @@ impl JsStr {
             add.len()
         } else {
             wtf8_units(add)
-        };
+        } as u32;
         if self.wellformed && (add_ascii || wtf8_is_wellformed(add)) {
             // Surrogate-free on both sides: plain append, no seam possible.
             self.ascii &= add_ascii;
@@ -3261,31 +3278,76 @@ impl JsStr {
             self.ascii = false;
             wtf8_push(&mut self.bytes, add);
             self.wellformed = wtf8_is_wellformed(&self.bytes);
+            // A seam merge rewrites the tail, and the memo may name a
+            // boundary at the old end that now falls inside the merged
+            // scalar: start over from byte zero.
+            self.cursor.set(0);
         }
     }
 
-    /// Locate unit position `i`: the code point containing it and `i`'s offset
-    /// within that code point's units (0 = lead, 1 = the trail of an astral
-    /// pair). O(1) for ASCII, O(i) otherwise.
-    fn locate_unit(&self, i: usize) -> Option<(u32, usize)> {
-        if self.ascii {
-            return self.bytes.get(i).map(|&b| (b as u32, 0));
-        }
-        if i >= self.units {
-            return None;
-        }
-        let mut pos = 0usize;
-        let mut bi = 0usize;
-        while bi < self.bytes.len() {
+    /// The code-point boundary at or before unit position `i` (clamped to
+    /// the end) of a NON-ASCII string, as `(unit position, byte offset)`.
+    ///
+    /// The walk starts from whichever of the string's start, its end, or the
+    /// position memo is nearest — decoding forward, or stepping back over
+    /// continuation bytes (WTF-8 is self-synchronizing) — and leaves the memo
+    /// on the answer. A scan that moves by small steps in either direction
+    /// therefore pays O(step) per call rather than O(i) from byte zero, which
+    /// made every `charCodeAt(i)` / `s[i]` / one-unit `slice` loop over
+    /// non-ASCII text quadratic: on the wasm build a 64K-unit sequential
+    /// scan took 4.5 s against 2.5 ms for the same loop over ASCII, and a
+    /// word tokenizer over 64K mostly-ASCII units with a few accents 7.6 s.
+    /// Random access still costs the distance to the nearest anchor.
+    fn seek(&self, i: usize) -> (usize, usize) {
+        debug_assert!(!self.ascii);
+        let units = self.units as usize;
+        let i = i.min(units);
+        let memo = self.cursor.get();
+        let (mpos, mbyte) = ((memo >> 32) as usize, memo as u32 as usize);
+        let from_memo = mpos.abs_diff(i);
+        let (mut pos, mut bi) = if from_memo <= i && from_memo <= units - i {
+            (mpos, mbyte)
+        } else if i <= units - i {
+            (0, 0)
+        } else {
+            (units, self.bytes.len())
+        };
+        while pos < i {
             let (cp, blen) = wtf8_decode(&self.bytes, bi);
             let n = cp_units(cp);
-            if i < pos + n {
-                return Some((cp, i - pos));
+            if pos + n > i {
+                // `i` addresses the trail half of this astral scalar.
+                break;
             }
             pos += n;
             bi += blen;
         }
-        None
+        while pos > i {
+            bi -= 1;
+            while self.bytes[bi] & 0xC0 == 0x80 {
+                bi -= 1;
+            }
+            let (cp, _) = wtf8_decode(&self.bytes, bi);
+            pos -= cp_units(cp);
+        }
+        self.cursor.set(((pos as u64) << 32) | bi as u64);
+        (pos, bi)
+    }
+
+    /// Locate unit position `i`: the code point containing it and `i`'s offset
+    /// within that code point's units (0 = lead, 1 = the trail of an astral
+    /// pair). O(1) for ASCII; otherwise the distance from the nearest of the
+    /// string's ends and the position memo (see `seek`).
+    fn locate_unit(&self, i: usize) -> Option<(u32, usize)> {
+        if self.ascii {
+            return self.bytes.get(i).map(|&b| (b as u32, 0));
+        }
+        if i >= self.units as usize {
+            return None;
+        }
+        let (pos, bi) = self.seek(i);
+        let (cp, _) = wtf8_decode(&self.bytes, bi);
+        Some((cp, i - pos))
     }
 
     /// The UTF-16 code unit at unit position `i` (a lone surrogate's own
@@ -3321,24 +3383,33 @@ impl JsStr {
                 self.bytes[a..b].to_vec()
             });
         }
-        let mut out: Vec<u8> = Vec::new();
-        if a < b {
-            let (mut pos, mut bi) = (0usize, 0usize);
-            while bi < self.bytes.len() && pos < b {
-                let (cp, blen) = wtf8_decode(&self.bytes, bi);
-                let n = cp_units(cp);
-                if pos >= a && pos + n <= b {
-                    out.extend_from_slice(&self.bytes[bi..bi + blen]);
-                } else if n == 2 && pos >= a && pos < b {
-                    // Window covers only the lead half.
-                    push_cp_raw(&mut out, unit_of_cp(cp, 0) as u32);
-                } else if n == 2 && pos + 1 >= a && pos + 1 < b {
-                    // Window covers only the trail half.
-                    push_cp_raw(&mut out, unit_of_cp(cp, 1) as u32);
-                }
-                pos += n;
-                bi += blen;
-            }
+        let units = self.units as usize;
+        let (a, b) = (a.min(units), b.min(units));
+        if a >= b {
+            return JsStr::from_wtf8(Vec::new());
+        }
+        // Both endpoints resolve through the position memo, and the second
+        // seek walks forward from the first, so the call costs O(b - a) plus
+        // the distance from the memo — not O(b) from byte zero — and leaves
+        // the memo at `b`, where a scanning loop reads next.
+        let (pa, mut ba) = self.seek(a);
+        let mut trail = None;
+        if pa < a {
+            // `a` addresses the trail half of the astral scalar at `ba`.
+            let (cp, blen) = wtf8_decode(&self.bytes, ba);
+            trail = Some(unit_of_cp(cp, 1) as u32);
+            ba += blen;
+        }
+        let (pb, bb) = self.seek(b);
+        let mut out: Vec<u8> = Vec::with_capacity(bb - ba + 6);
+        if let Some(u) = trail {
+            push_cp_raw(&mut out, u);
+        }
+        out.extend_from_slice(&self.bytes[ba..bb]);
+        if pb < b {
+            // `b` splits the astral scalar at `bb`: the window keeps its lead half.
+            let (cp, _) = wtf8_decode(&self.bytes, bb);
+            push_cp_raw(&mut out, unit_of_cp(cp, 0) as u32);
         }
         JsStr::from_wtf8(out)
     }
@@ -7794,10 +7865,11 @@ impl Heap {
                 let ascii = l.ascii && r.ascii;
                 return self.alloc(HeapObj::Str(JsStr {
                     bytes,
-                    units,
+                    units: units as u32,
                     ascii,
                     wellformed: true,
                     memo_state: 0,
+                    cursor: Cell::new(0),
                 }));
             }
         }
@@ -7823,10 +7895,11 @@ impl Heap {
                 bytes.extend_from_slice(tail);
                 JsStr {
                     bytes,
-                    units: l.units() + tail.len(),
+                    units: (l.units() + tail.len()) as u32,
                     ascii: l.ascii,
                     wellformed: l.wellformed,
                     memo_state: 0,
+                    cursor: Cell::new(0),
                 }
             }
             _ => return None,
@@ -8019,10 +8092,11 @@ impl Heap {
                 bytes.extend_from_slice(&r.bytes);
                 JsStr {
                     bytes,
-                    units: head.len() + r.units(),
+                    units: (head.len() + r.units()) as u32,
                     ascii: r.ascii,
                     wellformed: r.wellformed,
                     memo_state: 0,
+                    cursor: Cell::new(0),
                 }
             }
             _ => return None,
