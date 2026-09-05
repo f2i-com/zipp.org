@@ -269,6 +269,35 @@ gzip-9, and 1,248,649 at Brotli-11 (SHA-256
 official QuickJS-NG v0.16.2 reactor is 1,528,293 bytes raw and 417,087 at
 Brotli-11, so Zipp is `3.586×` as large raw and `2.958×` as large on the wire.
 
+Main has moved past that module. On 2026-09-05 an external audit of the
+WASM build was implemented as B274-B278 (see
+[`PERF_ROADMAP.md`](PERF_ROADMAP.md)): interpreter-side changes that close
+four cliffs the native PGO capture never sees. Every unit-addressed read on a
+non-ASCII string decoded from byte zero, so scanning loops were quadratic;
+the string-part allocation preflight walked the whole heap on a window blind
+to the heap's size; `eval` / `new Function` code owned no inline caches; and
+an array with a named property lost its dense read path. The figures below
+are interleaved A/B medians of the wasm artifact built from `400bcfe3`
+against the same artifact with these changes, on a shared developer machine
+with other work running, so they are diagnostic, not a canonical capture;
+the control kernels (ASCII scans, plain and fused calls, main-code property
+loops) moved within ±4%.
+
+| Wasm kernel | `400bcfe3` | with B274-B278 |
+|---|---:|---:|
+| sequential `charCodeAt` over 64K non-ASCII units | 4,462 ms | 3.2 ms |
+| word tokenizer over 64K mostly-ASCII units with a few accents | 9,828 ms | 8.2 ms |
+| one-unit `slice` loop, 16K non-ASCII units | 449 ms | 4.3 ms |
+| `join` of 4,000 parts × 200, 300K objects retained | 8,423 ms | 138 ms |
+| `join` of 4,000 parts × 200, small heap | 548 ms | 130 ms |
+| monomorphic property loop installed through `new Function` | 20.9 ms | 14.8 ms |
+| `a[i]` loop on an array carrying a named property | 13.3 ms | 9.6 ms |
+
+The committed module above predates these; it is rebuilt at the next
+release, and the harness that produced the rows is
+`crates/zipp-wasm/tests/node/bench.cjs`-style (persistent `Engine`, warmed,
+interleaved builds).
+
 We also attempted a direct, unscaled WASM run over the same v0.0.6
 normal 13 and hostile 17 sources used by the v0.0.6 Node/Bun/Deno reruns in
 `target/bench-results/real13-v006-6650647a718c-pgo-15.json` and
@@ -382,7 +411,9 @@ captured cell gets the native cross lane, bodies with `for...of` or `try`
 receive a frame-backed cross entry instead of the interpreter trampoline, and
 small holders take the holder-grain write barrier so an overwritten young value
 no longer floats into old space. Each landed with a one-binary latch A/B; the
-capture-to-capture row moves sit inside the intervals. See the
+capture-to-capture row moves sit inside the intervals. Main has since added
+B274-B278, which are interpreter-side (the wasm rows above) and leave this
+native capture as the current public score. See the
 [`bench` guide](bench/README.md), [hostile suite](bench/hostile/README.md), and
 [`PERF_ROADMAP.md`](PERF_ROADMAP.md) for exact methodology and remaining work.
 
