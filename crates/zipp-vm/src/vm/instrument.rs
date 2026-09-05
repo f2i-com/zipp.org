@@ -333,12 +333,23 @@ const HEAP_WALK_STRIDE: u32 = 64;
 /// bookkeeping, so small heaps -- where in-place payload growth is the whole
 /// story -- reconcile every time.
 fn heap_walk_stride_for(slots: usize) -> u32 {
+    // The walk is O(slots), so a fixed stride taxes a large heap in
+    // proportion to everything it holds. A worker profile of a guest holding
+    // a few thousand compiled functions (SoftDOS running DOOM) put 7.7% of
+    // all time in this walk at a stride of 64. The stride grows with the heap
+    // past 65,536 slots so the walk's share of run time stays bounded; the
+    // O(1) estimate still convicts fresh allocations at every poll, and the
+    // linear-memory maximum remains the backstop for growth in place.
     if slots < 4_096 {
         1
     } else if slots < 65_536 {
         8
-    } else {
+    } else if slots < 262_144 {
         HEAP_WALK_STRIDE
+    } else if slots < 1_048_576 {
+        HEAP_WALK_STRIDE * 4
+    } else {
+        HEAP_WALK_STRIDE * 16
     }
 }
 
