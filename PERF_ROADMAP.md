@@ -155,6 +155,113 @@ correct for their own commit.
 
 ## Latest experiment registry
 
+### B279 NULL — an inline cache for captured member calls (not built)
+
+The external WASM audit of 2026-09-05 proposed probing the `Call` IC at
+`CallWithThis` sites (the captured `GetProp` + arguments + `CallWithThis`
+lowering every non-order-transparent argument takes). Measured first on the
+wasm build, interleaved: `o.m(f(i))` (captured) 18.9 ms against
+`v = f(i); o.m(v)` (fused `CallMethod`) 19.9 ms and `g(f(i))` (two plain
+`Call`s through `ic_call`) 16.7 ms per 200K iterations. The captured arm's
+plain-function check — one heap fetch and two proto flag loads — already
+costs what `ic_call`'s site probe costs (site table, slot box, entry scan,
+version load), so an entry there would add dependent loads and remove
+nothing. Not built; the ordinary captured call is not a gap.
+
+### B278 LANDED — async generator request queue is a `VecDeque`
+
+`AsyncGenState::queue` was a `Vec` popped with `remove(0)`, quadratic for a
+generator with many queued `next()` calls. Same order, same accounting
+(capacity times the request size).
+
+### B277 LANDED — dense reads on arrays carrying named metadata
+
+`interp_dense_int_get` declined any array with an `arr_props` entry, so
+`a.meta = 1` sent every `a[i]` read through `get_index`: a dense read loop
+measured 43% slower on the wasm build with one named property on the array.
+Only an ELEMENT key in the overlay — a defineProperty'd index or a sparse
+element — can override a present dense slot, and `ObjMap::has_element_key`
+already answers exactly that; integrity flags govern writes, not reads.
+Interleaved A/B: 13.6 → 9.1 ms, the plain array unchanged.
+`tests/dense_named_metadata.rs` keeps the accessor-at-index, sparse-element,
+frozen and hole-through-prototype cases exact.
+
+### B276 LANDED — installed dynamic code owns inline caches, under a budget
+
+`ic_func_eligible` admitted main code and loader-recorded module ranges only,
+so every property and call site in `eval` / `new Function` code ran uncached
+for the life of the VM — exactly the code an emulator that compiles its hot
+paths into JavaScript executes most. Wasm measurement: the same monomorphic
+property loop 7.5 ms as main code, 12.9 ms installed through `new Function`
+or indirect eval (call sites were within noise: the plain-callee check is as
+cheap as the IC probe, see B279). Eligibility is now exact rather than a
+range: `eval_funcs` is append-only with leaked protos, so an id past
+`main_func_count` names one installed function for the VM's life and is
+never repurposed; `prepare_eval_program` assigns ids after the program's
+global/function/class remap, and a site can only fill once its code runs.
+`ic_site_mut` charges each dynamic function's `ip` table and each site
+payload against `DYNAMIC_IC_BUDGET_BYTES` (8 MiB per VM; the wasm build
+admits 16,384 dynamic functions) and runs a site uncached past it, which
+changes nothing a program can observe. Latch `ZIPP_NO_DYNAMIC_IC=1`.
+Interleaved A/B: `new Function` property loop 19.8 → 14.0 ms, indirect eval
+20.1 → 14.4 ms, main code 13.5 ms in the same run. `tests/dynamic_code_ic.rs`
+runs one shape-transition workload as main code, `new Function`, indirect,
+direct and nested eval, re-executes filled functions, exercises 3,000
+distinct dynamic functions past any budget, and checks live prototype and
+global changes through installed sites.
+
+### B275 LANDED — the preflight heap-audit window scales with the heap
+
+`instrument_preflight_heap_growth` — the per-part string paths: `join`, the
+builders, `JSON.stringify`, `repeat`, regex results, host-call arguments —
+forced a full O(slots) `heap_bytes()` walk every 256 calls, so under a
+finite heap ceiling (the wasm build always sets one) every part paid a tax
+proportional to everything the guest retained: `join` over 4,000 parts took
+5 ms with a small heap and 96 ms with 300,000 objects live, all of it in
+walks. `b69f29db` (the same day) made the window 8 MB of preflighted bytes
+instead of 256 calls, which halves the walks on a small heap but leaves
+their count independent of the heap: each `join` part preflights the
+builder's running total, so a 4,000-part join of a 23 KB result preflights
+about 46 MB and still walked six times whatever the heap held. The window
+is now `max(8 MB, 4 KiB × slots)` (`preflight_audit_bytes_for`), by the
+reasoning `heap_walk_stride_for` applies to the dispatch poll: the walk's
+share of a part loop stays a constant few percent. Every call still
+convicts on the O(1) estimate, which sees every new allocation; only
+in-place growth inside already-counted objects waits for a walk, bounded as
+it is for the interpreter's own stride. Wasm A/B against `b69f29db`'s byte
+window: `join` × 200 548 → 130 ms on a small heap and 8,423 → 138 ms with
+300K objects retained (the 256-call stride had read 1,332 and 19,824 ms);
+`JSON.stringify` unchanged (its serializer charges on capacity change
+only). If a tighter drift bound is ever wanted, the principled successor is
+dirty-holder accounting at the `Heap::get_mut` chokepoint, so a reconcile
+walks only the slots mutated since the last one.
+
+### B274 LANDED — non-ASCII string reads carry a position memo
+
+Every unit-addressed read on a non-ASCII flat string — `charCodeAt`,
+`codePointAt`, `s[i]`, `charAt`, `at`, and both ends of `slice` /
+`substring` — decoded WTF-8 from byte zero to unit `i`, so a scanning loop
+was quadratic: on the wasm build a sequential `charCodeAt` pass over 64K
+BMP units took 4.5-6.5 s against 2.5 ms for the same loop over ASCII, and a
+word tokenizer over 64K mostly-ASCII units with a few accents 7.6-9.2 s.
+`JsStr` now keeps a `Cell<u64>` memo of the code-point boundary most
+recently located (unit position and byte offset); `seek` starts from the
+nearest of the string's start, its end and the memo, decoding forward or
+stepping back over continuation bytes, and leaves the memo on the answer.
+The field fits the existing 40-byte layout by narrowing `units` to `u32`
+(every string is bounded by `MAX_STRING_UNITS`, 1 << 28). Appends keep every
+boundary; the one tail-rewriting append, a surrogate seam merge, resets the
+memo. Interleaved A/B, 5 pairs: sequential 64K units 6,529 → 4.3 ms,
+reversed 16K 413 → 1.5 ms, `s[i]` 443 → 2.2 ms, one-unit slices 512 →
+2.7 ms, `codePointAt` over astral text 261 → 1.4 ms, the tokenizer 9,200 →
+5.8 ms; uniformly random access 174 → 130 ms (still O(distance to the
+nearest anchor): a sparse checkpoint index is the follow-up if a
+random-access workload appears); the ASCII control within noise.
+`tests/string_index_memo.rs` checks every read and every `(a, b)` slice pair
+against a unit-array reference in forward, backward, alternating and random
+order, across lone surrogates, in-place appends and seam merges, and bounds
+the 64K scan.
+
 ### B273 LANDED — small holders take the holder-grain barrier
 
 A probe that stores each fresh literal into a fixed 1024-slot array

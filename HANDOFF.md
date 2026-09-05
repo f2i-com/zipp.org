@@ -14,6 +14,20 @@ WebAssembly module was rebuilt from the v0.0.12 engine with B269's regex fix
 landing page ships 5,558,860 bytes raw, 1,812,458 gzip-9, 1,248,649
 Brotli-11, SHA-256 `bd8614fe5f3a3b8ef67f4b917cdefebb3fe69afa39a9804a0d3f6b0b6b267126`.
 
+2026-09-05 (B274-B278, from the external WASM audit's handoff): the wasm
+interpreter's four cliffs are closed — non-ASCII string indexing was
+quadratic (64K-unit sequential scan 4.5 s → 3 ms; a word tokenizer over
+mostly-ASCII text 7.6 s → 8 ms), `join`/builder parts paid a full heap walk
+on a window blind to the heap's size (`join` × 200 with 300K objects
+retained 19.8 s with the 256-call stride, 8.4 s with the 8 MB byte window,
+138 ms with the window scaled by slots),
+`eval` / `new Function` code ran with no inline caches (a property loop
+70% slower than main code, now within 5%), and an array with a named
+property lost its dense read path (43%). These are interpreter-only rows
+measured with `crates/zipp-wasm/tests/node/bench.cjs`-style interleaved
+A/Bs, not the native PGO capture; the tracked module must be rebuilt to
+ship them. The audit's captured-call IC was measured and not built (B279).
+
 ## v0.0.6 native interpreter / QuickJS-NG confirmation
 
 The clean default-feature release binary at `e3acee352074` reran the current
@@ -266,6 +280,19 @@ both rows), i.e. PGO-profile and layout variation of the size the intervals show
 7. **Interval prover.** Widening after pass 8 re-widens a compare-narrowed
    loop bound inside the body, so `o + 2` keeps its i53 guard; head-only
    widening would free r13/r14 on more INT-GPR regions.
+8. **WASM follow-ups from the 2026-09-05 audit.** (a) Uniformly random
+   access into a long non-ASCII string is still O(distance to the nearest of
+   start/end/memo) after B274; a sparse UTF-16→byte checkpoint table (one
+   entry per 32-64 units, built lazily through a `&mut` path with a per-VM
+   budget) makes it O(1) if a workload shows up. `indexOf(x, from)` loops
+   still convert `from` and the result through `unit_byte_bounds` on the
+   `&str` view. (b) The preflight audit stride is proportional (B275);
+   dirty-holder accounting at `Heap::get_mut` is the exact successor.
+   (c) `embed::compile_script` leaks its `Program` under `safe-sandbox`
+   (the `Drop` reclaim is `cfg(not(safe-sandbox))`), so a host that
+   creates many `Engine`s in one wasm instance never gets that memory back;
+   a safe self-referential holder or a program arena is the fix, and a
+   repeated create/dispose test should track allocator live bytes.
 
 ## Commands for the next session
 
