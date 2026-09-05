@@ -302,11 +302,6 @@ const ABORT_CHECK_MASK: u64 = 0xFFF;
 /// cheap abort poll. New objects and known large buffers are charged eagerly;
 /// this audit catches capacity growth of already-existing collections.
 const HEAP_AUDIT_MASK: u64 = 0xFFFF;
-#[cfg(any(
-    all(feature = "meter-only", not(feature = "jit"), not(test)),
-    all(feature = "meter-only", test)
-))]
-const HEAP_AUDIT_INTERVAL: u64 = HEAP_AUDIT_MASK + 1;
 
 /// Host re-entries between forced full heap audits in the postflight. The
 /// interpreter reconciles on a tick stride; a host that re-enters without
@@ -354,6 +349,17 @@ pub(crate) struct Recorder {
     /// native tier charges a whole basic block at a time and can overshoot zero
     /// by up to one block; `i64::MAX` means unlimited.
     pub(crate) remaining: i64,
+    /// The release wasm meter's next stop: the `remaining` balance at or below
+    /// which the dispatch hook leaves its one-compare fast path -- a heap poll
+    /// is due, the final allowance was just consumed, or a terminal state was
+    /// set. Unused by the other profiles.
+    #[allow(dead_code)]
+    pub(crate) stop: i64,
+    /// The release wasm meter: whether `remaining` is a finite countdown. Its
+    /// unlimited meter counts down from `i64::MAX` too, so the sentinel test
+    /// the other profiles use does not apply there.
+    #[allow(dead_code)]
+    pub(crate) finite: bool,
     /// Instructions executed outside the interpreter dispatch loop: the native
     /// tier's net lending (lent at `meter_lend`, unspent refunded at
     /// `meter_return`) and off-loop work charged through `charge_steps`.
@@ -439,6 +445,8 @@ impl Recorder {
     pub(crate) fn new() -> Self {
         Self {
             remaining: i64::MAX,
+            stop: i64::MAX - (HEAP_AUDIT_MASK as i64 + 1),
+            finite: false,
             used: 0,
             abort: None,
             heap_limit: usize::MAX,
@@ -496,12 +504,10 @@ impl Recorder {
         self.remaining = max_steps.min(i64::MAX as u64) as i64;
         #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
         {
-            self.ticks = if self.remaining == i64::MAX {
-                0
-            } else {
-                self.remaining as u64
-            };
-            self.used = finite_next_heap_poll_balance(self.ticks);
+            self.finite = self.remaining != i64::MAX;
+            self.ticks = if self.finite { self.remaining as u64 } else { 0 };
+            self.used = 0;
+            self.stop = next_stop(self.remaining);
         }
     }
 
@@ -511,15 +517,35 @@ impl Recorder {
     #[inline]
     pub(crate) fn steps_used(&self) -> u64 {
         #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
-        if self.remaining != i64::MAX {
-            return finite_meter_total_used(self.ticks, self.remaining);
+        {
+            if self.finite {
+                return finite_meter_total_used(self.ticks, self.remaining);
+            }
+            // The unlimited meter counts down from `i64::MAX`.
+            return self.used.wrapping_add((i64::MAX - self.remaining).max(0) as u64);
         }
+        #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
         self.used.wrapping_add(self.ticks)
     }
 
     #[inline]
     fn exhaust(&mut self, cause: ResourceExhaustion) -> &'static str {
+        // A terminal state is sticky: make the very next dispatch stop.
+        self.stop = i64::MAX;
         self.exhaustion.get_or_insert(cause).message()
+    }
+
+    /// Steps left when the meter is finite, `None` when it is unlimited.
+    #[inline]
+    pub(crate) fn finite_remaining(&self) -> Option<u64> {
+        #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
+        if !self.finite {
+            return None;
+        }
+        if self.remaining == i64::MAX {
+            return None;
+        }
+        Some(self.remaining.max(0) as u64)
     }
 
     #[inline]
@@ -661,13 +687,15 @@ fn finite_meter_total_used(initial: u64, remaining: i64) -> u64 {
     initial.saturating_sub(remaining)
 }
 
+/// The release wasm meter's next stop from a balance: the heap poll due
+/// `HEAP_AUDIT_MASK + 1` steps on, never below the exhaustion point.
 #[cfg(any(
     all(feature = "meter-only", not(feature = "jit"), not(test)),
     all(feature = "meter-only", test)
 ))]
 #[inline(always)]
-fn finite_next_heap_poll_balance(balance: u64) -> u64 {
-    balance.saturating_sub(HEAP_AUDIT_INTERVAL)
+fn next_stop(remaining: i64) -> i64 {
+    (remaining - (HEAP_AUDIT_MASK as i64 + 1)).max(0)
 }
 
 /// Strip a row back to a bare "a step happened here" claim.
@@ -739,8 +767,8 @@ impl super::Vm<'_> {
         let Some(rec) = self.instr_rec.as_ref() else {
             return limits;
         };
-        if rec.remaining != i64::MAX {
-            limits.max_steps = limits.max_steps.min(rec.remaining.max(0) as u64);
+        if let Some(left) = rec.finite_remaining() {
+            limits.max_steps = limits.max_steps.min(left);
         }
         if rec.heap_limit != usize::MAX {
             // The cheap resident figure, not the audit walk: this runs on
@@ -1272,21 +1300,29 @@ impl super::Vm<'_> {
     pub(crate) fn charge_steps(&mut self, n: i64) {
         if let Some(rec) = self.instr_rec.as_mut() {
             let n = n.max(0);
-            if rec.remaining != i64::MAX {
+            #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
+            {
+                // The release wasm meter counts down whether or not it is
+                // finite; only a finite one can run out. The work has already
+                // completed: exactly consuming the final allowance is valid,
+                // only a strict overshoot is exhaustion.
                 let before = rec.remaining;
                 rec.remaining = rec.remaining.saturating_sub(n);
-                // The work has already completed. Exactly consuming the final
-                // allowance is valid; only a strict overshoot is exhaustion.
-                if n > before {
+                if rec.finite && n > before {
                     rec.exhaust(ResourceExhaustion::Steps);
                 }
             }
-            #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
-            if rec.remaining == i64::MAX {
-                rec.used = rec.used.wrapping_add(n as u64);
-            }
             #[cfg(not(all(feature = "meter-only", not(feature = "jit"), not(test))))]
             {
+                if rec.remaining != i64::MAX {
+                    let before = rec.remaining;
+                    rec.remaining = rec.remaining.saturating_sub(n);
+                    // The work has already completed. Exactly consuming the final
+                    // allowance is valid; only a strict overshoot is exhaustion.
+                    if n > before {
+                        rec.exhaust(ResourceExhaustion::Steps);
+                    }
+                }
                 rec.used = rec.used.wrapping_add(n as u64);
             }
         }
@@ -1342,41 +1378,39 @@ impl super::Vm<'_> {
             Some(rec) => rec,
             None => return Ok(()),
         };
+        // `meter-only` is the zipp-wasm artifact profile. Its deadline is an
+        // external Worker termination and it never installs the cooperative
+        // abort flag; output exhaustion is sticky in `exhaustion` at the write
+        // that crosses the limit. So the whole per-instruction cost is a
+        // countdown and one compare against the next stop; everything else
+        // is folded into where that stop sits and handled out of line.
+        rec.remaining = rec.remaining.wrapping_sub(1);
+        if rec.remaining <= rec.stop {
+            return self.instrument_step_stop();
+        }
+        Ok(())
+    }
+
+    /// The release wasm meter at a stop: the step that consumed the final
+    /// allowance (allowed; the next is refused), a step past it, a heap poll
+    /// falling due, or a terminal state set outside the dispatch loop.
+    #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
+    #[cold]
+    #[inline(never)]
+    fn instrument_step_stop(&mut self) -> Tick {
+        let rec = match self.instr_rec.as_mut() {
+            Some(rec) => rec,
+            None => return Ok(()),
+        };
         if let Some(message) = rec.terminal_message() {
             return Err(message);
         }
-        // `meter-only` is the zipp-wasm artifact profile. Its deadline is an
-        // external Worker termination and it never installs the cooperative
-        // abort flag. Output exhaustion is already sticky in `exhaustion` at
-        // the write that crosses the limit, so neither state needs a second
-        // per-instruction probe here.
-        let heap_poll = if rec.remaining != i64::MAX {
-            if rec.remaining <= 0 {
-                return Err(rec.exhaust(ResourceExhaustion::Steps));
-            }
-            rec.remaining -= 1;
-            let balance = rec.remaining as u64;
-            if balance <= rec.used {
-                // Off-loop work can cross a threshold between dispatches. Poll
-                // on the next dispatch and schedule from the current balance,
-                // bounding the next interval by 65,536 additional metered
-                // steps without maintaining a per-dispatch counter.
-                rec.used = finite_next_heap_poll_balance(balance);
-                true
-            } else {
-                false
-            }
-        } else {
-            // With no finite starting balance there is no countdown from which
-            // to recover the dispatch clock, so retain the real counter.
-            rec.ticks = rec.ticks.wrapping_add(1);
-            rec.ticks & HEAP_AUDIT_MASK == 0
-        };
-
-        if heap_poll {
-            self.instrument_heap_poll()?;
+        if rec.finite && rec.remaining < 0 {
+            rec.remaining = 0;
+            return Err(rec.exhaust(ResourceExhaustion::Steps));
         }
-        Ok(())
+        rec.stop = next_stop(rec.remaining);
+        self.instrument_heap_poll()
     }
 
     #[cfg(all(feature = "meter-only", any(feature = "jit", test)))]
@@ -2193,43 +2227,42 @@ mod tests {
 
     #[cfg(feature = "meter-only")]
     #[test]
-    fn finite_countdown_accounts_for_weighted_threshold_crossings() {
-        let initial = 200_000_u64;
-        let first_threshold = finite_next_heap_poll_balance(initial);
-        let balance_before_weighted_charge = first_threshold + 1;
-        assert!(balance_before_weighted_charge > first_threshold);
+    fn finite_countdown_stops_on_a_weighted_threshold_crossing() {
+        let interval = HEAP_AUDIT_MASK as i64 + 1;
+        let initial = 200_000_i64;
+        let first_stop = next_stop(initial);
+        assert_eq!(initial - first_stop, interval);
 
-        // A weighted operation may jump across the exact threshold between
-        // dispatch hooks. The following dispatch still observes `<=`, polls,
-        // and schedules a full interval from the balance it actually saw.
-        let balance_at_next_dispatch = balance_before_weighted_charge - 37 - 1;
-        assert!(balance_at_next_dispatch <= first_threshold);
-        let second_threshold = finite_next_heap_poll_balance(balance_at_next_dispatch);
-        assert_eq!(
-            balance_at_next_dispatch - second_threshold,
-            HEAP_AUDIT_INTERVAL
-        );
+        // A weighted operation may jump across the exact stop between dispatch
+        // hooks. The following dispatch still observes `<=`, polls, and
+        // schedules a full interval from the balance it actually saw.
+        let balance_at_next_dispatch = first_stop + 1 - 37 - 1;
+        assert!(balance_at_next_dispatch <= first_stop);
+        let second_stop = next_stop(balance_at_next_dispatch);
+        assert_eq!(balance_at_next_dispatch - second_stop, interval);
 
         assert_eq!(
-            finite_meter_total_used(initial, balance_at_next_dispatch as i64),
-            initial - balance_at_next_dispatch,
+            finite_meter_total_used(initial as u64, balance_at_next_dispatch),
+            (initial - balance_at_next_dispatch) as u64,
             "the public total includes both dispatch and off-loop countdown charges"
         );
 
-        // A final partial interval polls at zero and never wraps its threshold.
-        let partial_balance = HEAP_AUDIT_INTERVAL - 9;
-        let final_threshold = finite_next_heap_poll_balance(partial_balance);
-        assert_eq!(final_threshold, 0);
-        let poll_due = |balance| balance <= final_threshold;
-        assert!(!poll_due(1), "a positive final balance is not due yet");
-        assert!(poll_due(0), "the final permitted step is due");
+        // A final partial interval stops at zero and never goes below it: the
+        // step that consumes the last allowance is still allowed, and the one
+        // after it is refused by the balance having gone negative.
+        let partial_balance = interval - 9;
+        assert_eq!(next_stop(partial_balance), 0);
+        let due = |balance: i64| balance <= 0;
+        assert!(!due(1), "a positive final balance is not due yet");
+        assert!(due(0), "the final permitted step is due");
+        assert!(due(-1), "a step past the allowance is due, and refused");
 
         assert_eq!(
-            finite_meter_total_used(initial, -9),
-            initial,
+            finite_meter_total_used(initial as u64, -9),
+            initial as u64,
             "an overshoot must saturate rather than wrapping the billed total"
         );
-        assert_eq!(finite_meter_total_used(initial, initial as i64 + 1), 0);
+        assert_eq!(finite_meter_total_used(initial as u64, initial + 1), 0);
     }
 
     #[test]

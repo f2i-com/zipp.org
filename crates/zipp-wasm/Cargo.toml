@@ -15,11 +15,20 @@ resolver = "2"
 # never silently become an index/limit bypass in the hardened artifact.
 overflow-checks = true
 panic = "abort"
-# Measured in the isolated, section-stripped A/B: four units cut raw/Brotli
-# size by 1.81%/1.30% with no aggregate throughput regression. Eight units
-# were larger and slower; one unit was smaller but slower on the steady-state
-# WebAssembly gate.
-codegen-units = 4
+# MEASURED 2026-09-05 on tests/node/bench.cjs, the artifact post-processed as
+# shipped (wasm-opt -O3): fat LTO with one codegen unit runs the integer
+# arithmetic workloads 18-22% faster (arith-int 9.87 -> 7.67 ms, arith-mod
+# 12.44 -> 10.17) and is 280 KB smaller, for ~45 s more build time. The
+# interpreter's hot path spans zipp-vm, the regress fork and the allocator, so
+# cross-crate inlining is what pays; wasm-opt alone did not recover it. The
+# earlier codegen-units measurement (four units 1.8% smaller than one, no
+# throughput change) was made without LTO.
+#
+# Also measured: turning `overflow-checks` off on top of LTO gains nothing
+# the bench can see (arith-int 8.01 vs 7.67, within noise), so the hardening
+# stays.
+lto = "fat"
+codegen-units = 1
 
 [lib]
 crate-type = ["cdylib", "rlib"]

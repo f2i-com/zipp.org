@@ -662,10 +662,10 @@ impl ScriptState {
         let Some(rec) = vm.instr_rec.as_ref() else {
             return u64::MAX;
         };
-        if rec.remaining == i64::MAX {
+        let Some(left) = rec.finite_remaining() else {
             return u64::MAX;
-        }
-        (rec.remaining + vm.jit_steps.max(0)).max(0) as u64
+        };
+        (left as i64 + vm.jit_steps.max(0)).max(0) as u64
     }
 
     /// Instructions actually executed since [`Self::set_limits`] attached the
