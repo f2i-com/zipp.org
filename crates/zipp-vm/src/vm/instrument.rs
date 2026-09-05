@@ -328,28 +328,27 @@ const PREFLIGHT_AUDIT_STRIDE: u32 = 256;
 /// without the walk riding every instruction.
 const HEAP_WALK_STRIDE: u32 = 64;
 
-/// Polls between reconciliation walks, by heap size in slots. The walk is
-/// O(slots); below a few thousand it is cheaper than the poll's own
-/// bookkeeping, so small heaps -- where in-place payload growth is the whole
-/// story -- reconcile every time.
+/// Polls between reconciliation walks, by heap size in slots.
+///
+/// The walk is O(slots) and a poll comes every `HEAP_AUDIT_MASK + 1`
+/// instructions, so a stride proportional to the heap holds the walk's
+/// share of run time roughly constant whatever the guest retains: at
+/// slots / 1024 it is about half a percent. A fixed stride taxed a heap in
+/// proportion to everything it held for code that allocated nothing; a
+/// guest holding a few thousand compiled functions (SoftDOS running DOOM)
+/// spent 5% of its steady state in the walk at a stride of 8. Below a few
+/// thousand slots the walk is cheaper than the poll's own bookkeeping, so
+/// small heaps -- where in-place payload growth is the whole story --
+/// reconcile every time. Between walks the O(1) estimate still convicts
+/// fresh allocations at every poll; only growth in place inside an object
+/// already counted waits for the walk, bounded by what the interpreter can
+/// push in slots * 64 instructions, with the linear-memory maximum as the
+/// backstop.
 fn heap_walk_stride_for(slots: usize) -> u32 {
-    // The walk is O(slots), so a fixed stride taxes a large heap in
-    // proportion to everything it holds. A worker profile of a guest holding
-    // a few thousand compiled functions (SoftDOS running DOOM) put 7.7% of
-    // all time in this walk at a stride of 64. The stride grows with the heap
-    // past 65,536 slots so the walk's share of run time stays bounded; the
-    // O(1) estimate still convicts fresh allocations at every poll, and the
-    // linear-memory maximum remains the backstop for growth in place.
     if slots < 4_096 {
         1
-    } else if slots < 65_536 {
-        8
-    } else if slots < 262_144 {
-        HEAP_WALK_STRIDE
-    } else if slots < 1_048_576 {
-        HEAP_WALK_STRIDE * 4
     } else {
-        HEAP_WALK_STRIDE * 16
+        ((slots / 1_024) as u32).clamp(4, 4_096)
     }
 }
 
@@ -1567,7 +1566,7 @@ impl super::Vm<'_> {
     ///
     /// `advance_walk_stride: false` is the whole difference, and it is what
     /// keeps this caller free. `ticks_since_heap_walk` schedules the O(heap
-    /// slots) walk once per `HEAP_WALK_STRIDE` polls; it counts POLLS, and its
+    /// slots) walk once per `heap_walk_stride_for` polls; it counts POLLS, and its
     /// budget was sized for polls that arrive every 65,536 instructions.
     /// Letting a GC-driven poll advance it too would make the walk fire far
     /// more often in exactly the allocation-heavy code that collects most —
