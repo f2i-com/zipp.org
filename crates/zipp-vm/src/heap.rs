@@ -3730,7 +3730,7 @@ pub struct AsyncGenState {
     /// Pending requests, FIFO. The argument must be stored (not just the promise)
     /// because a request can be QUEUED while the generator is awaiting/running, and
     /// the value must be delivered when the request is finally serviced.
-    pub queue: Vec<AsyncGenRequest>,
+    pub queue: std::collections::VecDeque<AsyncGenRequest>,
     /// Spec state "awaiting-return": the front request is a `.return(v)` whose
     /// argument is being awaited (AsyncGeneratorAwaitReturn / the Await step of
     /// UnwrapYieldResumption). While set, new requests only enqueue; the await's
@@ -4792,7 +4792,12 @@ impl HeapObj {
             HeapObj::AsyncGenerator(state) => std::mem::size_of::<AsyncGenState>()
                 .saturating_add(vec_capacity_bytes(&state.regs))
                 .saturating_add(vec_capacity_bytes(&state.handlers))
-                .saturating_add(vec_capacity_bytes(&state.queue)),
+                .saturating_add(
+                    state
+                        .queue
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<AsyncGenRequest>()),
+                ),
             HeapObj::AsyncState(state) => std::mem::size_of::<AsyncStateData>()
                 .saturating_add(vec_capacity_bytes(&state.regs))
                 .saturating_add(vec_capacity_bytes(&state.handlers)),

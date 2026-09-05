@@ -1848,7 +1848,7 @@ impl<'p> Vm<'p> {
                 state,
                 regs,
                 handlers: Vec::new(),
-                queue: Vec::new(),
+                queue: std::collections::VecDeque::new(),
                 awaiting_return: false,
             })));
         self.async_activations.push(ag);
@@ -1894,7 +1894,7 @@ impl<'p> Vm<'p> {
         // `p` is always young here, so the card fires on any old holder.
         self.heap.write_barrier(idx);
         match self.heap.get_mut(idx) {
-            HeapObj::AsyncGenerator(g) => g.queue.push(crate::heap::AsyncGenRequest {
+            HeapObj::AsyncGenerator(g) => g.queue.push_back(crate::heap::AsyncGenRequest {
                 kind,
                 arg: arg0,
                 promise: p,
@@ -1919,7 +1919,7 @@ impl<'p> Vm<'p> {
                     g.state,
                     g.func,
                     g.awaiting_return,
-                    g.queue.first().map(|r| (r.kind, r.arg, r.promise)),
+                    g.queue.front().map(|r| (r.kind, r.arg, r.promise)),
                 ),
                 _ => return,
             };
@@ -1995,9 +1995,7 @@ impl<'p> Vm<'p> {
     /// Pop the front request (its promise is being settled by the caller).
     fn async_gen_pop_front(&mut self, idx: u32) {
         if let HeapObj::AsyncGenerator(g) = self.heap.get_mut(idx) {
-            if !g.queue.is_empty() {
-                g.queue.remove(0);
-            }
+            g.queue.pop_front();
         }
     }
 
@@ -2087,7 +2085,7 @@ impl<'p> Vm<'p> {
             } else {
                 self.async_gen_complete(idx);
                 let front = match self.heap.get(idx) {
-                    HeapObj::AsyncGenerator(g) => g.queue.first().map(|r| r.promise),
+                    HeapObj::AsyncGenerator(g) => g.queue.front().map(|r| r.promise),
                     _ => None,
                 };
                 self.async_gen_pop_front(idx);
@@ -2133,7 +2131,7 @@ impl<'p> Vm<'p> {
             }
             let e = self.alloc_error_from_message("RangeError: Maximum call stack size exceeded");
             let front = match self.heap.get(idx) {
-                HeapObj::AsyncGenerator(g) => g.queue.first().map(|r| r.promise),
+                HeapObj::AsyncGenerator(g) => g.queue.front().map(|r| r.promise),
                 _ => None,
             };
             if let Some(p) = front {
@@ -2256,7 +2254,7 @@ impl<'p> Vm<'p> {
                     g.state = GenState::Suspended(yield_ip);
                     g.regs = back;
                     g.handlers = handlers;
-                    (!g.queue.is_empty()).then(|| g.queue.remove(0))
+                    g.queue.pop_front()
                 }
                 _ => None,
             };
@@ -2292,7 +2290,7 @@ impl<'p> Vm<'p> {
                         g.state = GenState::Completed;
                         g.regs.clear();
                         g.handlers.clear();
-                        (!g.queue.is_empty()).then(|| g.queue.remove(0))
+                        g.queue.pop_front()
                     }
                     _ => None,
                 };
@@ -2313,7 +2311,7 @@ impl<'p> Vm<'p> {
                         g.state = GenState::Completed;
                         g.regs.clear();
                         g.handlers.clear();
-                        (!g.queue.is_empty()).then(|| g.queue.remove(0))
+                        g.queue.pop_front()
                     }
                     _ => None,
                 };
