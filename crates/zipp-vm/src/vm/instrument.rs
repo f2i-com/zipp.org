@@ -311,13 +311,20 @@ const HEAP_AUDIT_MASK: u64 = 0xFFFF;
 /// rather than to whatever the embedding happens to do.
 const POSTFLIGHT_AUDIT_STRIDE: u32 = 256;
 
-/// Preflight calls between forced full heap audits. The preflight sits on the
-/// per-part string paths — `JSON.stringify`, `join`, the string builders, regex
-/// results — so it runs orders of magnitude more often than either the tick
-/// stride or the boundary stride, and it is the one place where an unconditional
-/// walk turns linear work quadratic. Same bargain as `POSTFLIGHT_AUDIT_STRIDE`,
-/// same window.
-const PREFLIGHT_AUDIT_STRIDE: u32 = 256;
+/// Bytes preflighted between forced full heap audits. The preflight sits on
+/// the per-part string paths — `JSON.stringify`, `join`, the string builders,
+/// regex results, every host-call argument and reply — so it runs orders of
+/// magnitude more often than either the tick stride or the boundary stride,
+/// and it is the one place where an unconditional walk turns linear work
+/// quadratic. It used to count calls (a walk every 256), which made a
+/// program that builds many small strings pay a walk of its whole heap every
+/// few kilobytes: a guest generating code (SoftDOS's trace compiler) spent 5%
+/// of its time there, and 12% once its traces called the host per chain. The
+/// walk only reconciles capacity growth inside objects already counted, which
+/// scales with bytes, not calls, so the stride is bytes. Same bargain as
+/// `POSTFLIGHT_AUDIT_STRIDE`; the window is now this many bytes of preflighted
+/// allocation rather than 256 allocations of any size.
+const PREFLIGHT_AUDIT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Periodic polls between forced full heap walks in the dispatch loop. Ordinary
 /// and unlimited meters poll every 65,536 dispatches; the finite release-wasm
@@ -430,11 +437,12 @@ pub(crate) struct Recorder {
     /// the host boundary — which is what SoftN does between frames — would
     /// never reconcile at all.
     postflight_since_audit: u32,
-    /// Preflight calls since the last full audit. Starts at the stride so the
-    /// very first preflight audits: `Heap::audit_resident_bytes` is what turns
-    /// payload accounting on, and until it has run once the O(1) estimate omits
-    /// object payload entirely and would read far too low to be trusted.
-    preflight_since_audit: u32,
+    /// Bytes preflighted since the last full audit. Starts at the stride so
+    /// the very first preflight audits: `Heap::audit_resident_bytes` is what
+    /// turns payload accounting on, and until it has run once the O(1)
+    /// estimate omits object payload entirely and would read far too low to
+    /// be trusted.
+    preflight_bytes_since_audit: usize,
     /// `HEAP_AUDIT_MASK` polls since the last full walk in the dispatch loop.
     /// Starts at the stride so the first poll reconciles, which is also what
     /// switches payload accounting on.
@@ -465,7 +473,7 @@ impl Recorder {
             output_exhausted: false,
             exhaustion: None,
             postflight_since_audit: 0,
-            preflight_since_audit: PREFLIGHT_AUDIT_STRIDE,
+            preflight_bytes_since_audit: PREFLIGHT_AUDIT_BYTES,
             ticks_since_heap_walk: HEAP_WALK_STRIDE,
             external_heap_dirty: false,
             heap_audit_non_heap: std::cell::Cell::new(0),
@@ -1008,11 +1016,11 @@ impl super::Vm<'_> {
             .instr_rec
             .as_mut()
             .expect("recorder checked present above");
-        rec.preflight_since_audit = rec.preflight_since_audit.saturating_add(1);
-        if rec.preflight_since_audit < PREFLIGHT_AUDIT_STRIDE {
+        rec.preflight_bytes_since_audit = rec.preflight_bytes_since_audit.saturating_add(bytes);
+        if rec.preflight_bytes_since_audit < PREFLIGHT_AUDIT_BYTES {
             return Ok(());
         }
-        rec.preflight_since_audit = 0;
+        rec.preflight_bytes_since_audit = 0;
 
         let resident = self.heap_bytes();
         let rec = self
@@ -1058,7 +1066,7 @@ impl super::Vm<'_> {
             .instr_rec
             .as_mut()
             .expect("recorder checked present above");
-        rec.preflight_since_audit = 0;
+        rec.preflight_bytes_since_audit = 0;
         rec.external_heap_dirty = false;
         if bytes > heap_limit.saturating_sub(resident) {
             return Err(rec.exhaust(ResourceExhaustion::Heap));
