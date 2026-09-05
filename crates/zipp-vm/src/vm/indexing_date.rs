@@ -70,7 +70,16 @@ impl<'p> Vm<'p> {
         let HeapObj::Array(items) = self.heap.get(idx) else {
             return None;
         };
-        if self.arr_props.contains_key(&idx) || self.arguments_objs.contains_key(&idx) {
+        // Named metadata on an array (`a.meta = 1`) lives in `arr_props` too,
+        // and used to decline every read; only an ELEMENT key there — a
+        // defineProperty'd index or a sparse element — can override a present
+        // dense slot. Integrity flags govern writes, not reads.
+        if self
+            .arr_props
+            .get(&idx)
+            .is_some_and(|m| m.has_element_key())
+            || self.arguments_objs.contains_key(&idx)
+        {
             return None;
         }
         let value = *items.get(i as usize)?;
