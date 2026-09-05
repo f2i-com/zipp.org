@@ -22,16 +22,38 @@
 
 use std::collections::HashSet;
 
+use rustc_hash::FxHashSet;
+
 use crate::parse::ast::{
     Arg, ArrayElem, Arrow, ArrowBody, Class, ClassMember, Expr, ForInit, ForTarget, Function,
     MemberProp, ObjectMember, Params, Pattern, PropKey, Stmt, Target,
 };
 
+/// The working set of every walk below: names borrowed from the AST, hashed
+/// with the engine's fast hasher. A profile of the compiler on a guest that
+/// compiles a great deal of code (SoftDOS running DOOM) put a third of its
+/// time in this module, most of it allocating a `String` per identifier
+/// reference and SipHashing it; the sets only ever answer "is this name in
+/// it", so nothing needs owning until a result leaves the module.
+type Names<'a> = FxHashSet<&'a str>;
+
+fn owned(set: Names<'_>) -> HashSet<String> {
+    set.into_iter().map(str::to_string).collect()
+}
+
+fn borrowed(params: &[String]) -> Vec<&str> {
+    params.iter().map(String::as_str).collect()
+}
+
 /// Names a function body references but does not bind (propagated through nested
 /// functions). `params` are the function's parameters.
 pub fn free_vars(params: &[String], body: &[Stmt]) -> HashSet<String> {
-    let mut refs = HashSet::new();
-    let mut bound: HashSet<String> = params.iter().cloned().collect();
+    owned(free_vars_in(&borrowed(params), body))
+}
+
+fn free_vars_in<'a>(params: &[&'a str], body: &'a [Stmt]) -> Names<'a> {
+    let mut refs = Names::default();
+    let mut bound: Names<'a> = params.iter().copied().collect();
     collect_bound_in_body(body, &mut bound);
     for s in body {
         stmt_refs(s, &mut refs);
@@ -49,11 +71,15 @@ pub fn free_vars(params: &[String], body: &[Stmt]) -> HashSet<String> {
 /// The expression arm is byte-identical to what the synthetic statement gave:
 /// an expression body declares nothing, so only `params` are bound.
 pub fn free_vars_arrow(params: &[String], body: &ArrowBody) -> HashSet<String> {
+    owned(free_vars_arrow_in(&borrowed(params), body))
+}
+
+fn free_vars_arrow_in<'a>(params: &[&'a str], body: &'a ArrowBody) -> Names<'a> {
     match body {
-        ArrowBody::Block(b) => free_vars(params, &b.stmts),
+        ArrowBody::Block(b) => free_vars_in(params, &b.stmts),
         ArrowBody::Expr(e) => {
-            let mut refs = HashSet::new();
-            let bound: HashSet<String> = params.iter().cloned().collect();
+            let mut refs = Names::default();
+            let bound: Names<'a> = params.iter().copied().collect();
             expr_refs(e, &mut refs);
             refs.retain(|n| !bound.contains(n));
             refs
@@ -65,9 +91,9 @@ pub fn free_vars_arrow(params: &[String], body: &ArrowBody) -> HashSet<String> {
 /// Deliberately over-approximate (a name bound by a nested function still shows
 /// up): the one caller uses it as a "could this possibly see X?" guard.
 pub fn expr_refs_all(e: &Expr) -> HashSet<String> {
-    let mut refs = HashSet::new();
+    let mut refs = Names::default();
     expr_refs(e, &mut refs);
-    refs
+    owned(refs)
 }
 
 /// Every name a STATEMENT LIST references, ignoring what it binds — the
@@ -76,17 +102,17 @@ pub fn expr_refs_all(e: &Expr) -> HashSet<String> {
 /// shows up here, which is what a "may this body direct-eval?" guard needs —
 /// 13.3.6.1 directness tests the callee VALUE, not the binding's location.
 pub fn stmts_refs_all(body: &[Stmt]) -> HashSet<String> {
-    let mut refs = HashSet::new();
+    let mut refs = Names::default();
     for s in body {
         stmt_refs(s, &mut refs);
     }
-    refs
+    owned(refs)
 }
 
 /// Whether any parameter DEFAULT expression references `name` (free) — used
 /// to detect a possible direct eval in the parameter scope.
 pub fn params_reference(name: &str, params: &Params) -> bool {
-    let mut refs = HashSet::new();
+    let mut refs = Names::default();
     // A parameter default is `Pattern::Assign` and the rest parameter is
     // `Pattern::Rest`, both INSIDE `items` — oxc kept the initializer on
     // `FormalParameter::initializer` and the rest in its own field, so the two
@@ -102,7 +128,7 @@ pub fn params_reference(name: &str, params: &Params) -> bool {
 /// Mirrors `pattern_init_refs`, but feeds `collect_nested_free_expr` so a
 /// function written as a default (`const {f = () => x} = o`) has its own free
 /// names accounted for.
-fn collect_nested_free_pattern(pat: &Pattern, out: &mut HashSet<String>) {
+fn collect_nested_free_pattern<'a>(pat: &'a Pattern, out: &mut Names<'a>) {
     match pat {
         Pattern::Ident(_) => {}
         Pattern::Assign { left, right } => {
@@ -131,7 +157,7 @@ fn collect_nested_free_pattern(pat: &Pattern, out: &mut HashSet<String>) {
 
 /// Collect every name referenced by a DEFAULT-VALUE expression nested anywhere
 /// inside a binding pattern (array/object destructuring element defaults).
-fn pattern_init_refs(pat: &Pattern, out: &mut HashSet<String>) {
+fn pattern_init_refs<'a>(pat: &'a Pattern, out: &mut Names<'a>) {
     match pat {
         Pattern::Ident(_) => {}
         Pattern::Assign { left, right } => {
@@ -175,13 +201,13 @@ fn pattern_init_refs(pat: &Pattern, out: &mut HashSet<String>) {
 ///
 /// The parameter names themselves are treated as bound: a default referring to
 /// an earlier parameter is not a capture of anything outer.
-fn params_free(p: &Params, bound: &[String], out: &mut HashSet<String>) {
+fn params_free<'a>(p: &'a Params, bound: &[&str], out: &mut Names<'a>) {
     // `pattern_init_refs` already walks a Pattern for every expression that
     // evaluates in the parameter scope — defaults (`Pattern::Assign.right`) at
     // any depth, and computed keys in object patterns. In this AST a defaulted
     // parameter IS a `Pattern::Assign` inside `items`, so what used to need a
     // separate `initializer` field is one pass.
-    let mut refs = HashSet::new();
+    let mut refs = Names::default();
     for item in &p.items {
         pattern_init_refs(item, &mut refs);
     }
@@ -196,15 +222,15 @@ fn params_free(p: &Params, bound: &[String], out: &mut HashSet<String>) {
 
 /// The function's own bindings that some directly-nested function captures.
 pub fn captured_locals(params: &[String], body: &[Stmt]) -> HashSet<String> {
-    let mut bound: HashSet<String> = params.iter().cloned().collect();
+    let mut bound: Names<'_> = params.iter().map(String::as_str).collect();
     collect_bound_in_body(body, &mut bound);
 
     // Union of free vars of each directly-nested function.
-    let mut nested_free = HashSet::new();
+    let mut nested_free = Names::default();
     for s in body {
         collect_nested_free(s, &mut nested_free);
     }
-    bound.intersection(&nested_free).cloned().collect()
+    bound.intersection(&nested_free).map(|n| n.to_string()).collect()
 }
 
 /// The same, for an ARROW body — see [`free_vars_arrow`] for why this exists.
@@ -212,10 +238,10 @@ pub fn captured_locals_arrow(params: &[String], body: &ArrowBody) -> HashSet<Str
     match body {
         ArrowBody::Block(b) => captured_locals(params, &b.stmts),
         ArrowBody::Expr(e) => {
-            let bound: HashSet<String> = params.iter().cloned().collect();
-            let mut nested_free = HashSet::new();
+            let bound: Names<'_> = params.iter().map(String::as_str).collect();
+            let mut nested_free = Names::default();
             collect_nested_free_expr(e, &mut nested_free);
-            bound.intersection(&nested_free).cloned().collect()
+            bound.intersection(&nested_free).map(|n| n.to_string()).collect()
         }
     }
 }
@@ -225,7 +251,7 @@ pub fn captured_locals_arrow(params: &[String], body: &ArrowBody) -> HashSet<Str
 /// `arguments`. The nearest enclosing ordinary function must then materialize and
 /// box its `arguments` object so the arrow can capture it lexically as an upvalue.
 pub fn nested_uses_arguments(body: &[Stmt]) -> bool {
-    let mut nested_free = HashSet::new();
+    let mut nested_free = Names::default();
     for s in body {
         collect_nested_free(s, &mut nested_free);
     }
@@ -237,7 +263,7 @@ pub fn nested_uses_arguments(body: &[Stmt]) -> bool {
 /// and captures the same `arguments` object, so the binding has to be boxed
 /// before `bind_params` — the body-only scan above never sees it.
 pub fn params_nested_use_arguments(params: &Params) -> bool {
-    let mut nested_free = HashSet::new();
+    let mut nested_free = Names::default();
     for item in &params.items {
         collect_nested_free_pattern(item, &mut nested_free);
     }
@@ -246,22 +272,22 @@ pub fn params_nested_use_arguments(params: &Params) -> bool {
 
 // ── bound-name collection (this scope only; does NOT descend into nested fns) ──
 
-fn collect_bound_in_body(body: &[Stmt], out: &mut HashSet<String>) {
+fn collect_bound_in_body<'a>(body: &'a [Stmt], out: &mut Names<'a>) {
     for s in body {
         collect_bound_stmt(s, out);
     }
 }
 
-fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
+fn collect_bound_stmt<'a>(s: &'a Stmt, out: &mut Names<'a>) {
     match s {
         Stmt::VarDecl(d) => {
             for decl in &d.decls {
-                collect_pattern_names(&decl.id, out);
+                pattern_names(&decl.id, out);
             }
         }
         Stmt::FnDecl(f) => {
             if let Some(n) = &f.name {
-                out.insert(n.to_string());
+                out.insert(&**n);
             }
         }
         // A class declaration is a lexical binding like `let`/`const`: a nested
@@ -269,7 +295,7 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
         // function can hold its cell).
         Stmt::ClassDecl(c) => {
             if let Some(n) = &c.name {
-                out.insert(n.to_string());
+                out.insert(&**n);
             }
         }
         // Recurse into nested *statements* (blocks, loops, if) but NOT into
@@ -286,7 +312,7 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
         Stmt::For { init, body, .. } => {
             if let Some(ForInit::Var(d)) = init {
                 for decl in &d.decls {
-                    collect_pattern_names(&decl.id, out);
+                    pattern_names(&decl.id, out);
                 }
             }
             collect_bound_stmt(body, out);
@@ -296,7 +322,7 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
         Stmt::ForOf { left, body, .. } => {
             if let ForTarget::Var(d) = left {
                 for decl in &d.decls {
-                    collect_pattern_names(&decl.id, out);
+                    pattern_names(&decl.id, out);
                 }
             }
             collect_bound_stmt(body, out);
@@ -304,7 +330,7 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
         Stmt::ForIn { left, body, .. } => {
             if let ForTarget::Var(d) = left {
                 for decl in &d.decls {
-                    collect_pattern_names(&decl.id, out);
+                    pattern_names(&decl.id, out);
                 }
             }
             collect_bound_stmt(body, out);
@@ -326,7 +352,7 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
                 // (`try{throw 5}catch(e){ f = () => e }`). It only appeared to
                 // work when a same-named OUTER binding put the name in the set.
                 if let Some(p) = &h.param {
-                    collect_pattern_names(p, out);
+                    pattern_names(p, out);
                 }
                 collect_bound_in_body(&h.body, out);
             }
@@ -350,25 +376,31 @@ fn collect_bound_stmt(s: &Stmt, out: &mut HashSet<String>) {
 /// array destructuring, defaults (`= d`), and rest elements — so a destructured
 /// local captured by a nested closure is detected and boxed.
 pub(crate) fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
+    let mut names = Names::default();
+    pattern_names(pat, &mut names);
+    out.extend(names.into_iter().map(str::to_string));
+}
+
+fn pattern_names<'a>(pat: &'a Pattern, out: &mut Names<'a>) {
     match pat {
         Pattern::Ident(n) => {
-            out.insert(n.to_string());
+            out.insert(&**n);
         }
-        Pattern::Assign { left, .. } => collect_pattern_names(left, out),
-        Pattern::Rest(inner) => collect_pattern_names(inner, out),
+        Pattern::Assign { left, .. } => pattern_names(left, out),
+        Pattern::Rest(inner) => pattern_names(inner, out),
         Pattern::Object { props, rest } => {
             for prop in props {
-                collect_pattern_names(&prop.value, out);
+                pattern_names(&prop.value, out);
             }
             if let Some(rest) = rest {
-                collect_pattern_names(rest, out);
+                pattern_names(rest, out);
             }
         }
         Pattern::Array(elems) => {
             // Holes are `None`; the rest element lives in the list as a
             // `Pattern::Rest`, so one pass covers both.
             for el in elems.iter().flatten() {
-                collect_pattern_names(&el.pat, out);
+                pattern_names(&el.pat, out);
             }
         }
     }
@@ -376,7 +408,7 @@ pub(crate) fn collect_pattern_names(pat: &Pattern, out: &mut HashSet<String>) {
 
 // ── reference collection (descends into nested functions) ──
 
-fn stmt_refs(s: &Stmt, out: &mut HashSet<String>) {
+fn stmt_refs<'a>(s: &'a Stmt, out: &mut Names<'a>) {
     match s {
         Stmt::Expr(e) => expr_refs(e, out),
         // The with OBJECT expression and every reference in the body count
@@ -513,18 +545,18 @@ fn stmt_refs(s: &Stmt, out: &mut HashSet<String>) {
 /// target register, which matters when a form writes the destination partway
 /// through evaluating itself.
 pub(crate) fn references_name(e: &Expr, name: &str) -> bool {
-    let mut set = HashSet::new();
+    let mut set = Names::default();
     expr_refs(e, &mut set);
     set.contains(name)
 }
 
-fn expr_refs(e: &Expr, out: &mut HashSet<String>) {
+fn expr_refs<'a>(e: &'a Expr, out: &mut Names<'a>) {
     match e {
         Expr::Ident(n) => {
             // `undefined` is an ordinary IdentifierReference.  Its immutable
             // global value is only the final fallback: a parameter/local in an
             // enclosing function must be captured just like any other name.
-            out.insert(n.to_string());
+            out.insert(&**n);
         }
         Expr::Binary { left, right, .. } => {
             expr_refs(left, out);
@@ -658,11 +690,11 @@ fn expr_refs(e: &Expr, out: &mut HashSet<String>) {
 /// One function for both `=` and `++`: oxc split these across `AssignmentTarget`
 /// and `SimpleAssignmentTarget` with identical arms, and the destructuring forms
 /// only ever reached the assignment side.
-fn target_refs(t: &Target, out: &mut HashSet<String>) {
+fn target_refs<'a>(t: &'a Target, out: &mut Names<'a>) {
     match t {
         // An assignment target names a binding just like an identifier read.
         Target::Ident { name, .. } => {
-            out.insert(name.to_string());
+            out.insert(&**name);
         }
         // `o.x = v` / `o.#x = v` / `o[k] = v`: the OBJECT (and key) are reads an
         // enclosing arrow/function must capture.
@@ -717,7 +749,7 @@ fn target_refs(t: &Target, out: &mut HashSet<String>) {
 
 /// Functions nested one level down inside an assignment TARGET — only a
 /// default, a member base or a computed key can hold one (`[a = () => x] = []`).
-fn target_nested_free(t: &Target, out: &mut HashSet<String>) {
+fn target_nested_free<'a>(t: &'a Target, out: &mut Names<'a>) {
     match t {
         Target::Ident { .. } => {}
         Target::Member(m) => {
@@ -763,7 +795,7 @@ fn target_nested_free(t: &Target, out: &mut HashSet<String>) {
 /// names (subtracted later) but still READS its defaults; a target head assigns
 /// EXISTING bindings once per iteration, which is a reference to each of them —
 /// the case `Stmt::ForOf`/`Stmt::ForIn` used to drop entirely.
-fn for_head_refs(left: &ForTarget, out: &mut HashSet<String>) {
+fn for_head_refs<'a>(left: &'a ForTarget, out: &mut Names<'a>) {
     match left {
         ForTarget::Var(d) => {
             for decl in &d.decls {
@@ -779,7 +811,7 @@ fn for_head_refs(left: &ForTarget, out: &mut HashSet<String>) {
 }
 
 /// `for_head_refs` for the nested-function walk.
-fn for_head_nested_free(left: &ForTarget, out: &mut HashSet<String>) {
+fn for_head_nested_free<'a>(left: &'a ForTarget, out: &mut Names<'a>) {
     match left {
         ForTarget::Var(d) => {
             for decl in &d.decls {
@@ -795,7 +827,7 @@ fn for_head_nested_free(left: &ForTarget, out: &mut HashSet<String>) {
 
 /// A computed property key evaluates expressions in the surrounding scope; a
 /// literal / private key names nothing.
-fn prop_key_refs(k: &PropKey, out: &mut HashSet<String>) {
+fn prop_key_refs<'a>(k: &'a PropKey, out: &mut Names<'a>) {
     if let PropKey::Computed(e) = k {
         expr_refs(e, out);
     }
@@ -803,20 +835,20 @@ fn prop_key_refs(k: &PropKey, out: &mut HashSet<String>) {
 
 /// Add a nested function's free variables to `out`. The nested function's own
 /// bindings are subtracted, so only names it captures from further out remain.
-fn fn_node_free(f: &Function, out: &mut HashSet<String>) {
+fn fn_node_free<'a>(f: &'a Function, out: &mut Names<'a>) {
     let mut param_names = param_names(&f.params);
     // An ordinary function BINDS its own `arguments` (and `this`), so a reference
     // to `arguments` inside it is NOT free — it must not leak out as a capture of
     // the enclosing scope. (Arrows, handled by `arrow_free`, do not bind it.)
-    param_names.push("arguments".to_string());
-    let inner = free_vars(&param_names, &f.body.stmts);
+    param_names.push("arguments");
+    let inner = free_vars_in(&param_names, &f.body.stmts);
     out.extend(inner);
     params_free(&f.params, &param_names, out);
 }
 
-fn arrow_free(a: &Arrow, out: &mut HashSet<String>) {
+fn arrow_free<'a>(a: &'a Arrow, out: &mut Names<'a>) {
     let param_names = param_names(&a.params);
-    let inner = free_vars_arrow(&param_names, &a.body);
+    let inner = free_vars_arrow_in(&param_names, &a.body);
     out.extend(inner);
     params_free(&a.params, &param_names, out);
 }
@@ -829,7 +861,7 @@ fn arrow_free(a: &Arrow, out: &mut HashSet<String>) {
 /// `captured_locals` (boxing) and `free_vars` (transitive capture). Over-
 /// inclusion is harmless: it at most boxes an enclosing local used only
 /// directly, which is transparent.
-fn class_free(class: &Class, out: &mut HashSet<String>) {
+fn class_free<'a>(class: &'a Class, out: &mut Names<'a>) {
     if let Some(sc) = &class.superclass {
         expr_refs(sc, out);
     }
@@ -846,14 +878,14 @@ fn class_free(class: &Class, out: &mut HashSet<String>) {
                 prop_key_refs(&p.key, out);
             }
             ClassMember::StaticBlock(b) => {
-                out.extend(free_vars(&[], b));
+                out.extend(free_vars_in(&[], b));
             }
         }
     }
 }
 
 /// Union of free vars of functions nested DIRECTLY in `s` (one level down).
-fn collect_nested_free(s: &Stmt, out: &mut HashSet<String>) {
+fn collect_nested_free<'a>(s: &'a Stmt, out: &mut Names<'a>) {
     match s {
         Stmt::Expr(e) => collect_nested_free_expr(e, out),
         Stmt::VarDecl(d) => {
@@ -973,7 +1005,7 @@ fn collect_nested_free(s: &Stmt, out: &mut HashSet<String>) {
     }
 }
 
-fn collect_nested_free_expr(e: &Expr, out: &mut HashSet<String>) {
+fn collect_nested_free_expr<'a>(e: &'a Expr, out: &mut Names<'a>) {
     match e {
         Expr::Function(f) => fn_node_free(f, out),
         Expr::Arrow(a) => arrow_free(a, out),
@@ -1090,15 +1122,15 @@ fn collect_nested_free_expr(e: &Expr, out: &mut HashSet<String>) {
     }
 }
 
-fn param_names(p: &Params) -> Vec<String> {
+fn param_names<'a>(p: &'a Params) -> Vec<&'a str> {
     // Every name a parameter list binds — plain identifiers, destructuring-pattern
     // leaves, and the rest parameter — so a nested function's own params shadow
     // outer bindings (they must NOT be reported as free / captured). Defaults are
     // `Pattern::Assign` and the rest parameter is `Pattern::Rest`, both inside
     // `items`, so one pass covers what used to need three.
-    let mut set = HashSet::new();
+    let mut set = Names::default();
     for item in &p.items {
-        collect_pattern_names(item, &mut set);
+        pattern_names(item, &mut set);
     }
     set.into_iter().collect()
 }
