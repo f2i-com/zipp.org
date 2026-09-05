@@ -1085,6 +1085,10 @@ mod tests {
         );
     }
 
+    // Reads the pinned region through its raw address, which the
+    // `safe-sandbox` profile forbids (`forbid(unsafe_code)`); the region
+    // contract is a native-host feature, so the test stays with that build.
+    #[cfg(not(feature = "safe-sandbox"))]
     #[test]
     fn host_context_resolves_regions_and_calls_back() {
         let mut st = compile_script(
