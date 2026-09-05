@@ -1308,6 +1308,12 @@ pub struct Vm<'p> {
     /// Taken out of the `Vm` for the duration of the call so the closure may
     /// re-enter the VM (a host that evaluates JS re-borrows `&mut self`).
     pub(crate) host: Option<Box<dyn FnMut(&str, &[String]) -> Result<String, String>>>,
+    /// The context-taking twin of `host`: the closure receives the VM as
+    /// [`crate::vm::host_api::HostCtx`], so a host may resolve the guest's
+    /// typed arrays to memory regions and call guest functions while the
+    /// call runs. Preferred over `host` when both are installed; taken out
+    /// of the `Vm` for the duration of the call like `host`.
+    pub(crate) host_ctx: Option<crate::vm::host_api::HostCallCtx>,
     /// Monotonic-clock reading at VM start — the zero point for
     /// `performance.now()` (which reports fractional milliseconds elapsed
     /// since the program began). A host-installed clock's reading when one
@@ -1939,6 +1945,10 @@ pub struct Vm<'p> {
     /// getter is true, they are never resizable/detachable, and writes through a
     /// TypedArray view throw a TypeError.
     immutable_buffers: std::collections::HashSet<u32>,
+    /// ArrayBuffers a host holds a view over ([`HostCtx::typed_array_region`]):
+    /// GC roots for the VM's lifetime, and never resized, transferred or
+    /// detached, so the host's view stays over the bytes it was given.
+    pub(crate) pinned_buffers: std::collections::HashSet<u32>,
     /// Heap indices of objects that have the [[ErrorData]] internal slot (real
     /// Error instances — built-in error ctors, internal throws, and
     /// `class X extends Error` instances). Distinguishes a true error from a

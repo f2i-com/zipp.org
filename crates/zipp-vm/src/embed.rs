@@ -32,6 +32,7 @@ use crate::bytecode::Program;
 use crate::value::Value;
 use crate::vm::Vm;
 
+pub use crate::vm::host_api::{HostCallCtx, HostCtx};
 pub use crate::vm::host_api::{
     HostValue, HostValueBudget, Symbol, SymbolScope, DEFAULT_HOST_VALUE_MAX_NODES,
     DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
@@ -173,6 +174,16 @@ impl ScriptState {
     pub fn set_host_call(&mut self, host: HostCall) {
         if let Some(vm) = self.vm.as_mut() {
             vm.host = Some(host);
+        }
+    }
+
+    /// Install the context-taking host closure backing `__zippHostCall`. It
+    /// is served in preference to [`Self::set_host_call`]'s, and receives the
+    /// VM as [`HostCtx`] so it can resolve the guest's typed arrays to memory
+    /// regions and call guest functions with numbers while it runs.
+    pub fn set_host_call_ctx(&mut self, host: HostCallCtx) {
+        if let Some(vm) = self.vm.as_mut() {
+            vm.host_ctx = Some(host);
         }
     }
 
@@ -1072,6 +1083,39 @@ mod tests {
             caught,
             Ok(JsValue::String("Error: no such host call nope".into()))
         );
+    }
+
+    #[test]
+    fn host_context_resolves_regions_and_calls_back() {
+        let mut st = compile_script(
+            "var A = new Int32Array(4); A[2] = 7; \
+             function add(a, b) { return a + b; } \
+             function go() { return __zippHostCall('probe', 'x'); }",
+        )
+        .unwrap();
+        st.run_init().unwrap();
+        st.set_host_call_ctx(Box::new(|ctx, kind, args| {
+            assert_eq!(kind, "probe");
+            assert_eq!(args, ["x"]);
+            let (ptr, len, kind) = ctx.typed_array_region("A")?;
+            assert!(ptr != 0);
+            assert_eq!((len, kind), (4, 5));
+            // The region is the array's own bytes.
+            let third = unsafe { *((ptr + 8) as *const i32) };
+            assert_eq!(third, 7);
+            assert!(ctx.typed_array_region("add").is_err());
+            assert!(ctx.typed_array_region("nothing").is_err());
+            let r = ctx.call_global_numbers("add", &[2.0, 3.0])?;
+            Ok(format!("{r}"))
+        }));
+        assert_eq!(st.call_global("go", &[]).unwrap().as_str(), Some("5"));
+        // Pinned: the buffer refuses to be transferred or resized.
+        assert!(st
+            .eval_in_context("(function(){ try { A.buffer.transfer(); return 'moved'; } catch (e) { return String(e); } })()")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("pinned"));
     }
 
     #[test]

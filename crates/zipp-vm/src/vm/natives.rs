@@ -4820,6 +4820,11 @@ impl<'p> Vm<'p> {
             // test262 `$262.detachArrayBuffer(ab)` / `$262.gc()`.
             DOLLAR262_DETACH => {
                 if let Some(buf) = self.as_array_buffer(a0) {
+                    if self.pinned_buffers.contains(&buf) {
+                        return Err(Thrown(
+                            "TypeError: Cannot detach an ArrayBuffer the host has pinned".into(),
+                        ));
+                    }
                     if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buf) {
                         *detached = true;
                         // resize_bytes(0) == clear for a Local Vec; a (harness-
@@ -5096,14 +5101,24 @@ impl<'p> Vm<'p> {
                     self.preflight_guest_string_size(aggregate)?;
                     rest.push(value);
                 }
-                let Some(mut host) = self.host.take() else {
-                    return Err(Thrown(format!(
-                        "TypeError: {HOST_CALL_NAME}(\"{kind}\") with no host installed \
-                         (or called re-entrantly from within a host call)"
-                    )));
+                // The context-taking hook first: it receives the VM, so the
+                // host may resolve typed arrays and call guest functions while
+                // it runs (`crate::vm::host_api::HostCtx`).
+                let reply = if let Some(mut host) = self.host_ctx.take() {
+                    let reply = host(self, &kind, &rest);
+                    self.host_ctx = Some(host);
+                    reply
+                } else {
+                    let Some(mut host) = self.host.take() else {
+                        return Err(Thrown(format!(
+                            "TypeError: {HOST_CALL_NAME}(\"{kind}\") with no host installed \
+                             (or called re-entrantly from within a host call)"
+                        )));
+                    };
+                    let reply = host(&kind, &rest);
+                    self.host = Some(host);
+                    reply
                 };
-                let reply = host(&kind, &rest);
-                self.host = Some(host);
                 match reply {
                     Ok(s) => {
                         self.preflight_guest_string_size(s.len())?;

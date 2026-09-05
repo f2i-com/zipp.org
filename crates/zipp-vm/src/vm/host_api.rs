@@ -1091,3 +1091,105 @@ impl<'p> Vm<'p> {
         }
     }
 }
+
+/// What a context-taking host closure ([`HostCallCtx`]) may do with the VM
+/// while a `__zippHostCall` is being served. Both operations name a global
+/// of the running program; nothing else of the VM is reachable.
+pub trait HostCtx {
+    /// A guest typed array, by the name of the global holding it, as a region
+    /// of this process's memory: the address of its first element, its element
+    /// count, and its element kind (the index into the engine's kind table:
+    /// 0 Int8, 1 Uint8, 2 Uint8Clamped, 3 Int16, 4 Uint16, 5 Int32, 6 Uint32,
+    /// 7 Float32, 8 Float64). Pins the buffer: it stays alive and is never
+    /// resized, transferred or detached, so a view the host builds over the
+    /// region stays over those bytes. BigInt and length-tracking views are
+    /// refused, as is a detached buffer.
+    fn typed_array_region(&mut self, name: &str) -> Result<(usize, usize, u8), String>;
+    /// Call the guest function a global names, with numbers, for a number.
+    /// Runs the guest re-entrantly inside the host call; the guest cannot make
+    /// a nested host call while it does.
+    fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, String>;
+}
+
+/// The context-taking twin of [`crate::embed::HostCall`]: the same string
+/// contract, plus the VM as [`HostCtx`] for the duration of the call.
+pub type HostCallCtx =
+    Box<dyn FnMut(&mut dyn HostCtx, &str, &[String]) -> Result<String, String>>;
+
+impl<'p> Vm<'p> {
+    /// The slot of a top-level binding, by name.
+    fn global_slot_by_name(&self, name: &str) -> Option<u32> {
+        let p: &Program = self.program;
+        p.global_names
+            .iter()
+            .position(|n| n == name)
+            .map(|i| i as u32)
+    }
+
+    fn named_global(&self, name: &str) -> Result<Value, String> {
+        let slot = self
+            .global_slot_by_name(name)
+            .ok_or_else(|| format!("ReferenceError: no global named {name:?}"))?;
+        Ok(self
+            .globals
+            .get(slot as usize)
+            .copied()
+            .unwrap_or(Value::UNDEFINED))
+    }
+}
+
+impl<'p> HostCtx for Vm<'p> {
+    fn typed_array_region(&mut self, name: &str) -> Result<(usize, usize, u8), String> {
+        let v = self.named_global(name)?;
+        if !v.is_heap() {
+            return Err(format!("TypeError: {name} is not a typed array"));
+        }
+        let ta = v.heap_index();
+        let (buffer, kind, byte_offset, length) = match self.heap.get(ta) {
+            crate::heap::HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                length,
+            } => (*buffer, *kind, *byte_offset, *length),
+            _ => return Err(format!("TypeError: {name} is not a typed array")),
+        };
+        if crate::vm::native::TA_KINDS[kind as usize].2 {
+            return Err(format!("TypeError: {name} is a BigInt typed array"));
+        }
+        if self.ta_tracking.contains(&ta) {
+            return Err(format!("TypeError: {name} is a length-tracking view"));
+        }
+        let size = crate::vm::native::TA_KINDS[kind as usize].1;
+        let (ptr, buf_len) = match self.heap.get(buffer) {
+            crate::heap::HeapObj::ArrayBuffer {
+                data,
+                detached: false,
+            } => (data.as_ptr() as usize, data.len()),
+            _ => return Err(format!("TypeError: {name} is over a detached buffer")),
+        };
+        let bytes = length
+            .checked_mul(size)
+            .ok_or_else(|| format!("RangeError: {name} is too long"))?;
+        if byte_offset
+            .checked_add(bytes)
+            .is_none_or(|end| end > buf_len)
+        {
+            return Err(format!("RangeError: {name} is out of its buffer's bounds"));
+        }
+        self.pinned_buffers.insert(buffer);
+        Ok((ptr + byte_offset, length, kind))
+    }
+
+    fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, String> {
+        let callee = self.named_global(name)?;
+        if !self.is_callable(callee) {
+            return Err(format!("TypeError: {name} is not a function"));
+        }
+        let argv: Vec<Value> = args.iter().map(|&a| Value::num(a)).collect();
+        let v = self
+            .call_value(callee, Value::UNDEFINED, &argv)
+            .map_err(|t| t.0)?;
+        self.to_number(v).map_err(|t| t.0)
+    }
+}

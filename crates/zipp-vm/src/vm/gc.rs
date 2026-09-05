@@ -312,6 +312,10 @@ impl Vm<'_> {
         for &v in &self.globals {
             root_val!(v);
         }
+        // A host's view over a pinned buffer outlives every guest reference.
+        for &i in &self.pinned_buffers {
+            root_idx!(i);
+        }
         // Short interpreter string constants memoized by immutable
         // (function, constant-slot). The cache is bounded and its Values are
         // roots just like the region-embedded constant strings below.
@@ -824,6 +828,7 @@ impl Vm<'_> {
         }
         self.shared_buffers.retain(|&k| marks[k as usize]);
         self.immutable_buffers.retain(|&k| marks[k as usize]);
+        self.pinned_buffers.retain(|&k| marks[k as usize]);
         self.error_data.retain(|&k| marks[k as usize]);
         self.arguments_objs.retain(|&k, _| marks[k as usize]);
         self.gen_args_obj
@@ -1156,6 +1161,7 @@ impl Vm<'_> {
         }
         prune_set!(self.shared_buffers);
         prune_set!(self.immutable_buffers);
+        prune_set!(self.pinned_buffers);
         prune_set!(self.error_data);
         prune_slots!(self.arguments_objs);
         // Dies with EITHER endpoint: the generator (key) or its arguments

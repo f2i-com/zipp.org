@@ -2324,6 +2324,11 @@ impl<'p> Vm<'p> {
             // buffer (created with maxByteLength); grows with zero-fill, shrinks
             // by truncation, within [0, maxByteLength].
             "resize" => {
+                if self.pinned_buffers.contains(&idx) {
+                    return Err(Thrown(
+                        "TypeError: Cannot resize an ArrayBuffer the host has pinned".into(),
+                    ));
+                }
                 let max = match self.ab_max.get(&idx) {
                     Some(&m) => m,
                     None => return Err(Thrown("TypeError: ArrayBuffer is not resizable".into())),
@@ -2608,6 +2613,11 @@ impl<'p> Vm<'p> {
             // bytes and detach the source. `transfer` preserves resizability (keeps
             // maxByteLength); `transferToFixedLength` produces a fixed buffer.
             "transfer" | "transferToFixedLength" => {
+                if self.pinned_buffers.contains(&idx) {
+                    return Err(Thrown(
+                        "TypeError: Cannot transfer an ArrayBuffer the host has pinned".into(),
+                    ));
+                }
                 // ArrayBufferCopyAndDetach order: coerce newLength (observable)
                 // BEFORE the detached and immutable receiver checks.
                 let new_len = match args.first() {
