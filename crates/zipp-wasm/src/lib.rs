@@ -23,7 +23,9 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
-use zipp_vm::embed::{compile_script, HostValue, HostValueBudget, ScriptState, SymbolScope};
+use zipp_vm::embed::{
+    compile_script, HostCtx, HostValue, HostValueBudget, ScriptState, SymbolScope,
+};
 
 // js-sys's stable Array::is_array/Object::keys/Array indexing bindings do not
 // catch JavaScript exceptions. A revoked Proxy, or an ownKeys/length/index trap,
@@ -127,6 +129,7 @@ const PREAMBLE_BINDINGS: &[&str] = &[
     "localStorage",
     "db",
     "host",
+    "accel",
     "__zListenerTypes",
     "__zDispatchEvent",
     "__zDrainHostCalls",
@@ -170,6 +173,10 @@ struct Bridges {
     db: Option<js_sys::Object>,
     local_storage: Option<js_sys::Object>,
     clipboard: Option<js_sys::Object>,
+    /// The accelerator: compiles guest-generated numeric functions with the
+    /// host's own engine and runs them over views of the guest's typed
+    /// arrays. See `accel` in the preamble and [`Engine::set_accel_bridge`].
+    accel: Option<js_sys::Object>,
     /// Exact synchronous operations this Engine was explicitly granted. A
     /// bridge handle and authority are deliberately separate: merely
     /// installing a host object must not expose all of its methods to a guest.
@@ -261,6 +268,21 @@ impl Engine {
     pub fn set_clipboard_bridge(&mut self, bridge: JsValue) -> Result<(), JsValue> {
         self.ensure_host_configuration_open()?;
         self.bridges.borrow_mut().clipboard = Some(require_bridge(bridge, "clipboard")?);
+        Ok(())
+    }
+
+    /// Install the object backing `accel.*`: a host that compiles guest-
+    /// generated functions with its own engine. Its methods receive what
+    /// the guest passed, except that `make` sees every `g:NAME` entry of the
+    /// spec resolved to `r:address:length:kind` -- the region of engine
+    /// memory holding that global's typed array, pinned for the VM's
+    /// lifetime -- and `state` receives the region of the named array as
+    /// three numbers. During `run` the host may call [`accelGuestCall`] to
+    /// run a guest function by name with numbers.
+    #[wasm_bindgen(js_name = setAccelBridge)]
+    pub fn set_accel_bridge(&mut self, bridge: JsValue) -> Result<(), JsValue> {
+        self.ensure_host_configuration_open()?;
+        self.bridges.borrow_mut().accel = Some(require_bridge(bridge, "accel")?);
         Ok(())
     }
 
@@ -358,8 +380,8 @@ impl Engine {
             st.disable_vm_jit();
 
             let bridges = Rc::clone(&self.bridges);
-            st.set_host_call(Box::new(move |kind, args| {
-                host_dispatch(&bridges, kind, args)
+            st.set_host_call_ctx(Box::new(move |ctx, kind, args| {
+                host_dispatch_ctx(&bridges, ctx, kind, args)
             }));
 
             let init = st.run_init();
@@ -859,8 +881,155 @@ fn sync_host_call_arity(kind: &str) -> Option<usize> {
         "db.delete" | "db.startSync" | "db.stopSync" | "db.getSyncStatus" | "ls.getItem"
         | "ls.removeItem" | "nav.clipboardWrite" => 1,
         "db.getSavedSyncRoom" | "ls.clear" | "nav.clipboardRead" => 0,
+        "accel.compile" | "accel.make" | "accel.run" | "accel.install" => 2,
+        "accel.state" => 1,
         _ => return None,
     })
+}
+
+thread_local! {
+    /// The context of the `accel.run` call in progress, for
+    /// [`accel_guest_call`]. Set for the duration of the bridge call and
+    /// cleared after it; a callback outside that window is refused.
+    static ACCEL_CTX: std::cell::Cell<Option<*mut (dyn HostCtx + 'static)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run a guest function by global name with numbers, from inside a host
+/// `accel.run` bridge call and only from there: the engine is re-entered
+/// through the context of the call in progress. The guest cannot make a
+/// nested host call while it runs.
+#[wasm_bindgen(js_name = accelGuestCall)]
+pub fn accel_guest_call(name: &str, args: &[f64]) -> Result<f64, JsValue> {
+    let raw = ACCEL_CTX
+        .with(|c| c.get())
+        .ok_or_else(|| JsValue::from_str("Error: accelGuestCall outside accel.run"))?;
+    // SAFETY: the pointer was taken from the `&mut dyn HostCtx` that
+    // `host_dispatch_ctx` holds across the bridge call, is only dereferenced
+    // while that call is in progress (the cell is cleared before it
+    // returns), and the holder does not touch its own reference meanwhile.
+    let ctx = unsafe { &mut *raw };
+    ctx.call_global_numbers(name, args)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+/// The spec `accel.make` forwards, with every `NAME=g:GLOBAL` entry resolved
+/// to `NAME=r:address:length:kind` through the VM; other entries pass as
+/// they are. A global that is not a typed array is an error the guest sees.
+fn resolve_accel_spec(ctx: &mut dyn HostCtx, spec: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(spec.len() + 64);
+    for (i, entry) in spec.split(',').enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match entry.split_once("=g:") {
+            Some((name, global)) => {
+                let (ptr, len, kind) = ctx.typed_array_region(global)?;
+                out.push_str(name);
+                out.push_str("=r:");
+                out.push_str(&ptr.to_string());
+                out.push(':');
+                out.push_str(&len.to_string());
+                out.push(':');
+                out.push_str(&kind.to_string());
+            }
+            None => out.push_str(entry),
+        }
+    }
+    Ok(out)
+}
+
+/// The synchronous dispatch with the VM at hand: `accel.*` is served here,
+/// everything else exactly as [`host_dispatch`].
+fn host_dispatch_ctx(
+    bridges: &Rc<RefCell<Bridges>>,
+    ctx: &mut dyn HostCtx,
+    kind: &str,
+    args: &[String],
+) -> Result<String, String> {
+    let Some(method) = kind.strip_prefix("accel.") else {
+        return host_dispatch(bridges, kind, args);
+    };
+    let Some(expected_arity) = sync_host_call_arity(kind) else {
+        return Err(format!("TypeError: unknown host call '{kind}'"));
+    };
+    if args.len() != expected_arity {
+        return Err(format!(
+            "TypeError: host bridge call '{kind}' requires exactly {expected_arity} arguments"
+        ));
+    }
+    let input_bytes = args.iter().try_fold(kind.len(), |total, arg| {
+        total
+            .checked_add(arg.len())
+            .filter(|n| *n <= MAX_SYNC_BRIDGE_BYTES)
+    });
+    if input_bytes.is_none() {
+        return Err(format!(
+            "RangeError: host bridge arguments exceed the {MAX_SYNC_BRIDGE_BYTES}-byte limit"
+        ));
+    }
+    let target = {
+        let bridges = bridges.borrow();
+        if !bridges.allowed_sync_operations.contains(kind) {
+            return Err("SecurityError: synchronous host capability denied".into());
+        }
+        bridges.accel.clone()
+    };
+    let Some(target) = target else {
+        return Err("Error: authorized host bridge is unavailable".into());
+    };
+    let f = js_sys::Reflect::get(&target, &JsValue::from_str(method))
+        .ok()
+        .filter(JsValue::is_function)
+        .map(JsValue::unchecked_into::<js_sys::Function>)
+        .ok_or_else(|| "Error: authorized host bridge is unavailable".to_owned())?;
+    let number = |s: &str| -> Result<JsValue, String> {
+        s.trim()
+            .parse::<f64>()
+            .map(JsValue::from_f64)
+            .map_err(|_| format!("TypeError: host bridge call '{kind}' expects a number"))
+    };
+    let call = match method {
+        "compile" => f.call2(
+            &target,
+            &JsValue::from_str(&args[0]),
+            &JsValue::from_str(&args[1]),
+        ),
+        "make" => {
+            let spec = resolve_accel_spec(ctx, &args[1])?;
+            f.call2(&target, &number(&args[0])?, &JsValue::from_str(&spec))
+        }
+        "state" => {
+            let (ptr, len, kind) = ctx.typed_array_region(&args[0])?;
+            f.call3(
+                &target,
+                &JsValue::from_f64(ptr as f64),
+                &JsValue::from_f64(len as f64),
+                &JsValue::from_f64(kind as f64),
+            )
+        }
+        "install" => f.call2(&target, &number(&args[0])?, &number(&args[1])?),
+        "run" => {
+            let id = number(&args[0])?;
+            let hops = number(&args[1])?;
+            let raw: *mut (dyn HostCtx + '_) = ctx;
+            // SAFETY: the lifetime is erased only for storage; the pointer is
+            // cleared before this function returns, and `ctx` is not used
+            // again until then.
+            let raw: *mut (dyn HostCtx + 'static) = unsafe { std::mem::transmute(raw) };
+            let previous = ACCEL_CTX.with(|c| c.replace(Some(raw)));
+            let r = f.call2(&target, &id, &hops);
+            ACCEL_CTX.with(|c| c.set(previous));
+            r
+        }
+        _ => return Err(format!("TypeError: unknown host call '{kind}'")),
+    };
+    let ret = call.map_err(|_| "Error: host bridge call failed".to_owned())?;
+    let reply = match js_sys::JSON::stringify(&ret) {
+        Ok(serialized) => serialized.as_string().unwrap_or_else(|| "null".to_owned()),
+        Err(_) => return Err("Error: host bridge reply is not serializable".into()),
+    };
+    Ok(reply)
 }
 
 fn host_dispatch(
@@ -1295,6 +1464,11 @@ mod tests {
             ("ls.clear", 0),
             ("nav.clipboardWrite", 1),
             ("nav.clipboardRead", 0),
+            ("accel.compile", 2),
+            ("accel.make", 2),
+            ("accel.run", 2),
+            ("accel.install", 2),
+            ("accel.state", 1),
         ] {
             assert!(
                 is_allowed_sync_host_call(kind),

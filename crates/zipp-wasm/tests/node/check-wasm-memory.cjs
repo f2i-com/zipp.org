@@ -51,6 +51,7 @@ const expectedImportStems = [
   "__wbg_call",
   "__wbg_call",
   "__wbg_call",
+  "__wbg_call",
   "__wbg_defineProperty",
   "__wbg_delete",
   "__wbg_error",

@@ -79,6 +79,29 @@ var host = {
   },
 };
 
+// accel: the host compiles a numeric function the script generates -- with
+// its own engine, which runs such code many times faster than this one --
+// and runs it over views of the script's typed arrays. Every call is
+// synchronous and answers a number. `compile(params, body)` validates and
+// compiles, answering an id (or throwing); `make(id, spec)` calls that
+// function with arguments described by `spec` ("NAME=g:GLOBAL" binds a view
+// of a typed-array global, "NAME=c:GLOBAL" a callback into a global
+// function, "NAME=a:ID" another compiled function, "NAME=t" the host's
+// trace table, "NAME=n:NUMBER" a number) and answers the id of the function
+// it returned; `state(GLOBAL)` names the typed array `run` passes as the
+// first argument; `run(id, h)` calls a made function with (state, h);
+// `install(slot, id)` fills the host's trace table. Denied unless the host
+// granted it, in which case every method throws.
+var accel = {
+  compile: function (params, body) {
+    return Number(__zippHostCall("accel.compile", JSON.stringify(params), String(body)));
+  },
+  make: function (id, spec) { return Number(__zippHostCall("accel.make", String(id), String(spec))); },
+  state: function (name) { __zippHostCall("accel.state", String(name)); },
+  run: function (id, h) { return Number(__zippHostCall("accel.run", String(id), String(h))); },
+  install: function (slot, id) { __zippHostCall("accel.install", String(slot), String(id)); },
+};
+
 // ---- host-facing helpers (called by slot, never by eval) -------------------
 
 function __zListenerTypes() {
