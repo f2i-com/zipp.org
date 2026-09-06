@@ -14,6 +14,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A manual run of any branch: the control runs that attribute a runner-
+  # specific failure to the audited commit are dispatched this way.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -41,6 +44,12 @@ jobs:
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.92.0 --profile minimal --no-self-update
+      # The parity tests take their expected values from `node -e` and are
+      # written against Node 24 (`Float16Array` exists there; the runner's
+      # default Node lacks it and typedarray_interp_index_fast diverges).
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
