@@ -333,12 +333,16 @@ impl<'p> Vm<'p> {
     /// values expose their methods as first-class values.
     /// The effective prototype for an Array's method/inherited-index resolution: a
     /// `class extends Array` instance records its own (subclass) prototype in proto_of
-    /// (which chains to %Array.prototype%); a plain array has no entry → %Array.prototype%.
+    /// (which chains to %Array.prototype%); a plain array has no entry → %Array.prototype%;
+    /// a NULL entry (`Object.setPrototypeOf(arr, null)`) → 0, nothing inherited
+    /// (B289 — it used to fall back to %Array.prototype%, so `arr.push` still
+    /// resolved after the prototype was removed).
     pub(crate) fn array_eff_proto(&self, idx: u32) -> u32 {
-        self.proto_of
-            .get(&idx)
-            .and_then(|p| p.is_heap().then(|| p.heap_index()))
-            .unwrap_or(self.arr_proto)
+        match self.proto_of.get(&idx) {
+            Some(p) if p.is_heap() => p.heap_index(),
+            Some(_) => 0,
+            None => self.arr_proto,
+        }
     }
 
     /// Flag that `Array.prototype` / `Object.prototype` now carries an integer

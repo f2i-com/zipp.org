@@ -1823,6 +1823,7 @@ pub(crate) fn compile_region_mem(
                             this_v,
                             arg_base,
                             argc: 0,
+                            ..
                         } if callee == dst && this_v == obj => method_plan
                             .get(&(ip + 1))
                             .map(|mp| (mp, call_dst, arg_base)),
@@ -3410,6 +3411,7 @@ pub(crate) fn compile_region_mem(
                 this_v,
                 arg_base,
                 argc,
+                ..
             } => {
                 // The callee and receiver were captured by the preceding
                 // reference evaluation. A method plan may inline its exact

@@ -365,6 +365,217 @@ impl<'p> Vm<'p> {
         self.proto_method_is_baseline(self.arr_proto, name, memo_id, true)
     }
 
+    /// B289: `recv.name` for an Array or String receiver answered from the
+    /// B191 baseline proof (see [`Vm::proto_intrinsic_bits`]) — `Some(bits)`
+    /// only when a real Get would resolve to exactly that boot intrinsic:
+    /// an Array with no own property of that name in the side table and its
+    /// default [[Prototype]] (a `proto_of` entry means a replaced prototype
+    /// or a child realm's array), or a primitive string, whose prototype
+    /// slot still holds the intrinsic as a data property. The receiver-side
+    /// exclusions are the ones `proto_intrinsic_bits` documents as the
+    /// caller's; `length` never answers here (an Int, not in the table).
+    pub(crate) fn proto_intrinsic_read(&mut self, recv: Value, name: &str) -> Option<u64> {
+        let idx = recv.heap_index();
+        let is_arr = match self.heap.get(idx) {
+            HeapObj::Array(_) => {
+                if (!self.arr_props.is_empty()
+                    && self
+                        .arr_props
+                        .get(&idx)
+                        .is_some_and(|m| m.pos(name).is_some()))
+                    || (!self.proto_of.is_empty()
+                        && self
+                            .proto_of
+                            .get(&idx)
+                            .is_some_and(|&actual| actual != Value::heap(self.arr_proto)))
+                {
+                    return None;
+                }
+                true
+            }
+            HeapObj::Str(_) | HeapObj::Cons { .. } => false,
+            HeapObj::Map { .. } | HeapObj::Set(_) => {
+                let kind = if matches!(self.heap.get(idx), HeapObj::Map { .. }) {
+                    4
+                } else {
+                    3
+                };
+                return self.collection_intrinsic_bits(idx, name, kind);
+            }
+            _ => return None,
+        };
+        self.proto_intrinsic_bits(name, is_arr)
+    }
+
+    /// B289: the Value bits of the intrinsic a Get of `name` on this Map
+    /// (`kind` 4) or Set (`kind` 3) receiver resolves to — the full
+    /// [`Vm::collection_method_is_intrinsic`] proof (own shadow, custom
+    /// prototype, realm, prototype slot) with the proven slot's bits handed
+    /// back for the captured-callee identity test and the property read.
+    pub(crate) fn collection_intrinsic_bits(
+        &mut self,
+        idx: u32,
+        name: &str,
+        kind: u8,
+    ) -> Option<u64> {
+        if !self.collection_method_is_intrinsic(idx, name, kind) {
+            return None;
+        }
+        let kind_idx = (kind == 4) as usize;
+        let name_id = match name {
+            "get" => Some(0usize),
+            "set" => Some(1),
+            "has" => Some(2),
+            "add" => Some(3),
+            "delete" => Some(4),
+            "clear" => Some(5),
+            _ => None,
+        };
+        // A proven hot name has just refilled (or hit) the memo, whose bits
+        // the proof compared against the live slot.
+        if let Some(nid) = name_id {
+            if let Some((_, _, bits)) = self.coll_intrinsic_memo[kind_idx][nid] {
+                return Some(bits);
+            }
+        }
+        let proto = if kind == 4 {
+            self.map_proto
+        } else {
+            self.set_proto
+        };
+        match self.heap.get(proto) {
+            HeapObj::Object(map) => map.pos(name).map(|slot| map.val_at(slot).bits()),
+            _ => None,
+        }
+    }
+
+    /// The interpreter's inline `arr.push(v)` lane — the most common
+    /// per-element array idiom — shared by the fused `CallMethod` and the
+    /// captured-intrinsic path (B289). Appends directly, skipping the
+    /// try_builtin_method → dispatch_builtin_method → array_method layering
+    /// (and the args-gather), and answers the new length; `None` declines
+    /// read-only so the caller's routed path handles the receiver.
+    ///
+    /// Declines while `push` is not the boot intrinsic on %Array.prototype%
+    /// (B191: a shadow must resolve through the generic Get and call the
+    /// override); when the prototype carries integer indices (push's new
+    /// index may resolve to a prototype setter — OrdinarySet); for a FROZEN
+    /// array or one whose `length` was made non-writable (both must throw,
+    /// via array_method's guard); and for a SPARSE array, whose length is
+    /// virtual — push must place the element AT that length. The side
+    /// tables are empty for an ordinary array, so this is a no-op in the
+    /// build-a-list case.
+    #[inline]
+    pub(crate) fn interp_array_push_fast(&mut self, recv: Value, v: Value) -> Option<Value> {
+        if !recv.is_heap()
+            || !self.array_method_is_intrinsic("push")
+            || self.array_proto_has_index
+            // Frozen, or carrying an OWN `push` (B289: `arr.push = fn;
+            // arr.push(1)` must call `fn` — a real Get finds the own
+            // property before the prototype intrinsic).
+            || (!self.arr_props.is_empty()
+                && self
+                    .arr_props
+                    .get(&recv.heap_index())
+                    .map_or(false, |m| m.is_frozen() || m.pos("push").is_some()))
+            // A subclass instance or a replaced/null [[Prototype]] does not
+            // inherit %Array.prototype%'s push (B289).
+            || (!self.proto_of.is_empty()
+                && self
+                    .proto_of
+                    .get(&recv.heap_index())
+                    .is_some_and(|&actual| actual != Value::heap(self.arr_proto)))
+            || (!self.array_length_nonwritable.is_empty()
+                && self.array_length_nonwritable.contains(&recv.heap_index()))
+            || (!self.array_js_len.is_empty()
+                && self.array_js_len.contains_key(&recv.heap_index()))
+        {
+            return None;
+        }
+        // Nursery barrier: the interpreter's inline `arr.push(v)` lane
+        // (B119's retained-array idiom).
+        self.heap.write_barrier_val(recv.heap_index(), v);
+        match self.heap.get_mut(recv.heap_index()) {
+            HeapObj::Array(items) => {
+                items.push(v);
+                Some(Value::int(items.len() as i32))
+            }
+            _ => None,
+        }
+    }
+
+    /// B289: the spec-order lowering of `recv.name(args)` — `GetProp` of the
+    /// callee before the arguments, `CallWithThis` after them — reaches the
+    /// same builtin lanes as the fused `CallMethod` when the captured callee
+    /// is provably the boot intrinsic that a Get of `name` on this
+    /// receiver's prototype resolves to RIGHT NOW. Identity is the whole
+    /// proof: a captured Value that differs from the live prototype slot (an
+    /// own shadow, an override installed before the capture, an intrinsic of
+    /// another name assigned under this one, a child realm's twin) declines,
+    /// and the generic tail invokes exactly the captured Value. An override
+    /// installed BY the arguments leaves the captured intrinsic in hand and
+    /// the prototype slot changed, so the proof fails and the generic tail
+    /// calls the captured intrinsic — the spec's answer either way.
+    ///
+    /// Array and string receivers prove identity against the B191 baseline
+    /// table, Map and Set receivers against the collection proof; every
+    /// other receiver kind declines and pays the generic native call, as it
+    /// did before this lane.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn captured_intrinsic_lane(
+        &mut self,
+        func_id: u32,
+        base: usize,
+        recv: Value,
+        callee: Value,
+        name: u32,
+        arg_base: u16,
+        argc: u16,
+    ) -> Result<Option<Value>, Thrown> {
+        if !recv.is_heap()
+            || !callee.is_heap()
+            || !matches!(self.heap.get(callee.heap_index()), HeapObj::Native(_))
+        {
+            return Ok(None);
+        }
+        let key: &'p str = &self.func(func_id as usize).string_constants[name as usize];
+        let idx = recv.heap_index();
+        let is_arr = match self.heap.get(idx) {
+            HeapObj::Array(_) => true,
+            HeapObj::Str(_) | HeapObj::Cons { .. } => false,
+            HeapObj::Map { .. } | HeapObj::Set(_) => {
+                let kind = if matches!(self.heap.get(idx), HeapObj::Map { .. }) {
+                    4
+                } else {
+                    3
+                };
+                if self.collection_intrinsic_bits(idx, key, kind) != Some(callee.bits()) {
+                    return Ok(None);
+                }
+                return self.try_builtin_method(recv, key, base, arg_base, argc);
+            }
+            _ => return Ok(None),
+        };
+        if self.proto_intrinsic_bits(key, is_arr) != Some(callee.bits()) {
+            return Ok(None);
+        }
+        if argc == 1 {
+            let arg = self.regs[base + arg_base as usize];
+            if is_arr {
+                if key == "push" {
+                    if let Some(len) = self.interp_array_push_fast(recv, arg) {
+                        return Ok(Some(len));
+                    }
+                }
+            } else if key == "charCodeAt" {
+                if let Some(unit) = self.interp_char_code_at_fast(recv, arg) {
+                    return Ok(Some(unit));
+                }
+            }
+        }
+        self.try_builtin_method(recv, key, base, arg_base, argc)
+    }
+
     /// The VALUE of `name` on %Array.prototype% (`is_arr`) / %String.prototype%
     /// when it is provably still the boot intrinsic, else `None` — the same
     /// proof as the two predicates above, returning the callable's bits so a
@@ -373,7 +584,6 @@ impl<'p> Vm<'p> {
     /// handful of loads; the fallback proves through the baseline table.
     /// Receiver-side exotics (an own side-table shadow, a custom
     /// [[Prototype]], an arguments object) are the CALLER's to exclude.
-    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn proto_intrinsic_bits(&mut self, name: &str, is_arr: bool) -> Option<u64> {
         let (proto, memo_id) = if is_arr {
             (self.arr_proto, arr_memo_id(name))
@@ -730,6 +940,22 @@ impl<'p> Vm<'p> {
             return Ok(None);
         }
         let idx = recv.heap_index();
+        // An OWN property named `name` on a non-`Object` receiver (their own
+        // named properties live in the `arr_props` side table) is what a
+        // real Get finds first, so no receiver-kind arm below may serve the
+        // intrinsic over it: `arr.push = fn; arr.push(1)` calls `fn`, and
+        // `arr.indexOf = fn; arr.indexOf(1)` likewise (B289 — the fused
+        // lowering served the intrinsic for both at v0.0.14). The caller's
+        // generic Get + call observes the shadow. Ordinary receivers have no
+        // entry, so this is one `is_empty` in the common case.
+        if !self.arr_props.is_empty()
+            && self
+                .arr_props
+                .get(&idx)
+                .is_some_and(|m| m.pos(name).is_some())
+        {
+            return Ok(None);
+        }
         // ── strings first ──
         // A string receiver reaches the same `string_method` call further down,
         // but only after a Temporal probe, `is_callable`, a realm lookup and a
@@ -966,7 +1192,17 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Array(_) => {
                 // B191: as for strings above — serve only the boot intrinsic.
-                if !self.array_method_is_intrinsic(name) {
+                // B289: and only for a receiver that inherits from
+                // %Array.prototype% — a subclass instance, a replaced or null
+                // [[Prototype]] resolves `name` elsewhere (the own-shadow
+                // half was excluded above, as the collection proof does).
+                if !self.array_method_is_intrinsic(name)
+                    || (!self.proto_of.is_empty()
+                        && self
+                            .proto_of
+                            .get(&idx)
+                            .is_some_and(|&actual| actual != Value::heap(self.arr_proto)))
+                {
                     return Ok(None);
                 }
                 self.array_method(idx, name, args)

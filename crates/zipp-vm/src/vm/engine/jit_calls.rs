@@ -1694,6 +1694,7 @@ mod own_method_preflight_tests {
                                 this_v,
                                 arg_base,
                                 argc,
+                                ..
                             },
                         ) if callee == call_callee && obj == this_v => {
                             Some((fid, ip + 1, *dst, *obj, *name, *arg_base, *argc))

@@ -1056,7 +1056,7 @@ fn gpr_deopt_shadow_captured_dv(
         )
         || !matches!(
             proto.code.get(site.call_ip),
-            Some(Instr::CallWithThis { dst, callee, this_v, arg_base, argc })
+            Some(Instr::CallWithThis { dst, callee, this_v, arg_base, argc, .. })
                 if *dst == site.dst
                     && *callee == site.callee
                     && *this_v == site.obj

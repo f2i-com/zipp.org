@@ -15,6 +15,9 @@ use crate::value::Value;
 /// A register index within a function's frame.
 pub type Reg = u16;
 
+/// `CallWithThis::name` when the call is not a named member call.
+pub const NO_NAME: u32 = u32::MAX;
+
 /// "No register" for an operand slot that an op may leave unused. Today only
 /// `MathOp` uses it: `callee == NO_REG` marks the BARE form (see the op).
 pub const NO_REG: Reg = Reg::MAX;
@@ -1709,13 +1712,22 @@ pub enum Instr {
     /// Like `Call` but with an explicit `this` value (register `this_v`):
     /// a `with`-resolved identifier call binds `this` to the with-object
     /// (spec WithBaseObject) — the callee value was already fetched by the
-    /// `WithGet` protocol, so no further property read happens here.
+    /// `WithGet` protocol, so no further property read happens here. Also
+    /// the call half of the spec-order member-call lowering (`GetProp` of
+    /// the callee, then the arguments, then this), where `name` records the
+    /// member the callee was read from.
     CallWithThis {
         dst: Reg,
         callee: Reg,
         this_v: Reg,
         arg_base: Reg,
         argc: u16,
+        /// The `string_constants` index of the member name the captured
+        /// `callee` was read from, when this is the spec-order lowering of
+        /// `obj.name(args)`; [`NO_NAME`] otherwise. Semantically inert: it
+        /// lets the interpreter serve a captured boot intrinsic through the
+        /// same builtin lanes as the fused `CallMethod` (B289).
+        name: u32,
     },
     /// Captured-reference call for the four RegExp-heavy method spellings.
     /// `callee` and `this_v` were resolved before the argument list exactly as

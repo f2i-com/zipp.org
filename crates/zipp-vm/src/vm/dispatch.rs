@@ -5847,6 +5847,20 @@ impl<'p> Vm<'p> {
                             }
                             GetAct::None => {}
                         }
+                        // B289: a prototype-intrinsic read on an Array or
+                        // String receiver — `arr.push`, `s.charCodeAt`, the
+                        // captured half of the strict member-call lowering.
+                        // The property IC is shape-keyed and these receivers
+                        // have no shape, so every such read took the generic
+                        // walk (~70ns over an own-property hit). The B191
+                        // baseline proof answers it in a few loads.
+                        if o.is_heap() {
+                            if let Some(bits) = self.proto_intrinsic_read(o, &key) {
+                                self.set(base, dst, Value::from_bits(bits));
+                                ip += 1;
+                                continue;
+                            }
+                        }
                         // Name the enclosing function when a property read
                         // fails. "Cannot read properties of undefined (reading
                         // 'x')" with an empty Error.stack gives an embedder no
@@ -6742,6 +6756,7 @@ impl<'p> Vm<'p> {
                         this_v,
                         arg_base,
                         argc,
+                        name,
                     } => {
                         // A `with`-resolved identifier call: `this` = the
                         // with-object. A plain user function pushes a frame in
@@ -6796,6 +6811,23 @@ impl<'p> Vm<'p> {
                                     callee_v,
                                 )?;
                                 break;
+                            }
+                        }
+                        // B289: a captured boot intrinsic (`arr.push(i % 13)`,
+                        // `s.charCodeAt(starts[i])` — a member call whose
+                        // argument was not order-transparent, so the strict
+                        // default lowering captured the callee first) takes the
+                        // same builtin lanes as the fused `CallMethod` once the
+                        // captured Value is proven identical to the live
+                        // prototype intrinsic; any other captured Value falls
+                        // through and is invoked exactly as captured.
+                        if name != crate::bytecode::NO_NAME {
+                            if let Some(result) = self.captured_intrinsic_lane(
+                                func_id, base, this_val, callee_v, name, arg_base, argc,
+                            )? {
+                                self.set(base, dst, result);
+                                ip += 1;
+                                continue;
                             }
                         }
                         // `with_argv`: a stack buffer for the common arity. A
@@ -7241,43 +7273,10 @@ impl<'p> Vm<'p> {
                         // must throw â€” skip the fast path so it routes through
                         // array_method's guard. The side tables are empty for an
                         // ordinary array, so this is a no-op in the build-a-list case.
-                        if argc == 1
-                            && key == "push"
-                            && recv.is_heap()
-                            // B191: only while `push` is still the boot intrinsic
-                            // on %Array.prototype% — a shadow must resolve through
-                            // the generic Get and call the override.
-                            && self.array_method_is_intrinsic("push")
-                            // A prototype carrying integer indices means push's new
-                            // index may resolve to a prototype setter (OrdinarySet) â€”
-                            // route through array_method's proto-aware path.
-                            && !self.array_proto_has_index
-                            && !(!self.arr_props.is_empty()
-                                && self
-                                    .arr_props
-                                    .get(&recv.heap_index())
-                                    .map_or(false, |m| m.is_frozen()))
-                            && !(!self.array_length_nonwritable.is_empty()
-                                && self.array_length_nonwritable.contains(&recv.heap_index()))
-                            // A SPARSE array's length is virtual — push must place
-                            // the element AT that length (array_method's routed path).
-                            && !(!self.array_js_len.is_empty()
-                                && self.array_js_len.contains_key(&recv.heap_index()))
-                        {
+                        if argc == 1 && key == "push" {
                             let v = self.get(base, arg_base);
-                            // Nursery barrier: the interpreter's inline
-                            // `arr.push(v)` lane (B119's retained-array idiom).
-                            self.heap.write_barrier_val(recv.heap_index(), v);
-                            let len = if let HeapObj::Array(items) =
-                                self.heap.get_mut(recv.heap_index())
-                            {
-                                items.push(v);
-                                Some(items.len() as i32)
-                            } else {
-                                None
-                            };
-                            if let Some(len) = len {
-                                self.set(base, dst, Value::int(len));
+                            if let Some(len) = self.interp_array_push_fast(recv, v) {
+                                self.set(base, dst, len);
                                 ip += 1;
                                 continue;
                             }

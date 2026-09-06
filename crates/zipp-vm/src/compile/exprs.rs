@@ -1080,6 +1080,7 @@ impl<'a> FnCompiler<'a> {
                     this_v,
                     arg_base,
                     argc,
+                    name: crate::bytecode::NO_NAME,
                 })
             }
         }

@@ -215,6 +215,7 @@ fn captured_arr_push(proto: &FuncProto, ip: usize, ta_plan: &TaPinPlan) -> Optio
                 this_v,
                 arg_base,
                 argc,
+                ..
             },
         ) if *dst == site.callee
             && *obj == site.obj
@@ -406,6 +407,7 @@ fn arr_push3_steps(
                         this_v,
                         arg_base,
                         argc: 1,
+                        ..
                     } => (dst, callee, this_v, arg_base),
                     _ => {
                         ok = false;

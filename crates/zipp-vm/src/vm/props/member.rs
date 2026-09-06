@@ -692,12 +692,14 @@ impl<'p> Vm<'p> {
         // variant re-branded with its own prototype recorded in `proto_of` (which chains
         // to the builtin's prototype), so resolve through it — subclass methods AND the
         // inherited builtin methods both resolve. A plain builtin instance has no
-        // `proto_of` entry → the builtin's default prototype.
-        let eff = self
-            .proto_of
-            .get(&obj.heap_index())
-            .and_then(|p| p.is_heap().then(|| p.heap_index()))
-            .unwrap_or(proto);
+        // `proto_of` entry → the builtin's default prototype. A NULL entry
+        // (`Object.setPrototypeOf(x, null)`) ends the chain: nothing inherited
+        // (B289 — it used to fall back to the default prototype).
+        let eff = match self.proto_of.get(&obj.heap_index()) {
+            Some(p) if !p.is_heap() => return Ok(Value::UNDEFINED),
+            Some(p) => p.heap_index(),
+            None => proto,
+        };
         // Accessor-aware so an inherited getter on the type's prototype (e.g. a
         // user-redefined `set`/`add`) is INVOKED with `obj` as the receiver, not
         // returned as the raw getter function.

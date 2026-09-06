@@ -114,6 +114,79 @@ P1/P2 findings are closed in v0.0.15; the rest are recorded below as open.
   the architecture as well; the register-kind history only serves the
   x86-64 register tiers.
 
+- **B289 — the captured call keeps the builtin lanes.** B280's cost was
+  not in the harness rows (below) but in the shapes it does not contain: a
+  method call whose argument reads a global, an element or a property, or
+  does arithmetic on a local — `arr.push(i % 13)`, `s.charCodeAt(a[i])`,
+  `m.get(k + 1)`, the house style of a SoftN `.logic` file and of this
+  repository's own JIT fixtures (133 of the 342 fixtures in the 61 x86-64
+  mechanism tests change lowering under the default; the relaxed switch
+  reproduces `40993c4d`'s bytecode for all 342). Two costs, measured on
+  the production wasm build: the captured `GetProp` on an Array or String
+  receiver took the generic walk, since the property IC is shape-keyed and
+  those receivers have no shape (~70ns over an own-property hit); and
+  `CallWithThis` invoked a native through the generic `call_value`, missing
+  the fused lowering's inline `push`, `charCodeAt`, DataView and
+  name-dispatched builtin lanes (an `arr.push` went from 89ns to 200ns).
+  Now: `CallWithThis` carries the member name it was captured from
+  (`NO_NAME` for `with`-calls, chains and static blocks; the field is
+  semantically inert and the instruction did not grow); the interpreter's
+  `captured_intrinsic_lane` serves a captured native through the same
+  lanes once the captured Value is proven identical to the live prototype
+  intrinsic — the B191 baseline bits for Array/String receivers, the B215
+  collection proof (given a bits-returning form) for Map/Set — and any
+  other captured Value, including an intrinsic whose prototype slot the
+  arguments replaced, is invoked exactly as captured; `proto_intrinsic_read`
+  answers the read itself from the same proofs (own-shadow and custom
+  [[Prototype]] excluded receiver-side, as `proto_intrinsic_bits` documents
+  is the caller's duty); the inline push lane is one helper shared by both
+  lowerings. Identity probes against node found three pre-existing defects
+  in the name-dispatched paths, all at `40993c4d`: an own `push`/`indexOf`
+  on an array instance was ignored by the fused call (`arr.push = fn;
+  arr.push(1)` ran the intrinsic), a `class extends Array` instance's own
+  `push` was ignored the same way, and a null [[Prototype]]
+  (`Object.setPrototypeOf(arr, null)`) still resolved `Array.prototype`
+  methods, for arrays (`array_eff_proto`) and exotics
+  (`exotic_own_or_proto`) alike. All fixed; `tests/captured_intrinsic_lane.rs`
+  pins the contract with three node-checked probe programs (captured push
+  and charCodeAt, own shadows, argument-installed and pre-capture
+  overrides, a foreign intrinsic under the name, frozen receivers, ropes,
+  subclass instances, replaced and null prototypes, accessors, Map/Set) in
+  the default, relaxed, interpreter and GC-stress modes.
+
+  The shapes, same harness conditions as the table below, best of 20, ms
+  per 100,000 calls (the imul/charCodeAt rows loop 4,096 elements per
+  call), baseline `40993c4d` → B280 alone → B280 + B289:
+
+  | shape | 40993c4d | B280 | B280+B289 |
+  |---|---:|---:|---:|
+  | `arr.push(g % 13)`, global `g` | 8.9 | 20.2 | 12.8 |
+  | `a.push(i % 13)`, local `i` | 6.1 | 17.5 | 10.1 |
+  | `src.charCodeAt(starts[ti])` | 16.1 | 26.0 | 21.5 |
+  | `e.indexOf(w0 + (i & 3))` | 16.4 | 24.5 | 20.6 |
+  | `m.get((i & 63) + 0)`, Map | 17.4 | 25.6 | 21.6 |
+  | `Math.imul(h, C)`, global `h` | 37.3 | 41.8 | 45.1 |
+  | `ctx.fillRect(px, py, size, i)`, plain function | 16.9 | 15.8 | 15.9 |
+  | bare `arr.push` read | 11.6 | 11.6 | 5.6 |
+  | bare `s.charCodeAt` read | 9.2 | 9.2 | 5.4 |
+  | the same calls over plain locals | unchanged | unchanged | unchanged |
+
+  The remaining gap is the second dispatch the spec-order lowering pays,
+  plus proving the intrinsic twice (once for the read, once for the call)
+  and the name-keyed memo lookups. Next, in order of value: a per-site
+  memo on the captured pair (name → proven bits under the prototype
+  version) so both halves are a few loads; the same identity proof for
+  TypedArray, DataView and RegExp receivers (`ta.fill(i & 255)` is +6%,
+  the DataView getters have a fused lane the captured form cannot reach);
+  and the x86-64 register tiers, whose method lanes recognise only the
+  fused shape — the two mechanism tests whose logged children now opt into
+  `ZIPP_RELAXED_CALL_ORDER=1` (`multi_split`, `gpr_deopt_shadow`) are the
+  first of that set, and the CI run names the rest. `Math.imul` with
+  global operands is the one row that lost ground twice: `Math` is a plain
+  object, so neither proof applies, and the captured form pays the
+  `GetProp` plus a generic native call; a Math-intrinsic identity lane is
+  the same shape as the collection one.
+
 **Call-order cost, measured.** `tests/node/bench.cjs`, the production wasm
 build (interpreter-only, fat LTO), Node 22.15 / V8 12.4 on a Snapdragon X
 Plus (win32-arm64), baseline `40993c4d` against this tree, best of two

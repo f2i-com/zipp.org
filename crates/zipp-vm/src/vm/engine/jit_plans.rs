@@ -296,6 +296,7 @@ fn captured_span_code_unit_pred_plan(
             this_v,
             arg_base,
             argc,
+            ..
         } => (dst, callee, this_v, arg_base, argc),
         _ => return None,
     };
@@ -565,6 +566,7 @@ impl<'p> Vm<'p> {
                     this_v,
                     arg_base,
                     argc,
+                    ..
                 } => {
                     let Some(get_ip) = (s..aip)
                         .rev()
@@ -4464,6 +4466,7 @@ impl<'p> Vm<'p> {
                     this_v: 0,
                     arg_base,
                     argc: 0,
+                    ..
                 }),
             ) = (body[ip].clone(), body.get(ip + 1))
             {

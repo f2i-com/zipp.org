@@ -818,6 +818,7 @@ impl<'a> FnCompiler<'a> {
                         this_v: cls,
                         arg_base: f,
                         argc: 0,
+                        name: crate::bytecode::NO_NAME,
                     });
                     self.set_next_reg(save);
                 }

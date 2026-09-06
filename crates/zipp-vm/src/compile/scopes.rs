@@ -793,6 +793,16 @@ impl<'a> FnCompiler<'a> {
         self.string_constants.push(s.to_string());
         si
     }
+
+    /// `string_name` for a name that was almost certainly interned moments
+    /// ago (the captured call's member, whose `GetProp` just added it):
+    /// found from the end, else added.
+    pub(crate) fn string_name_reused(&mut self, s: &str) -> u32 {
+        match self.string_constants.iter().rposition(|c| c == s) {
+            Some(i) => i as u32,
+            None => self.string_name(s),
+        }
+    }
 }
 
 /// `reg_kinds` bits (see `FnCompiler::note_reg_kind`).

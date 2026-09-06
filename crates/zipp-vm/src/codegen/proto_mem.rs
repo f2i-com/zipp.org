@@ -1640,6 +1640,7 @@ fn cross_ud(i: &Instr) -> Option<(smallvec::Uses, Option<u16>)> {
                 this_v,
                 arg_base,
                 argc,
+                ..
             }
             | Instr::RegExpMethod {
                 dst,
@@ -5601,6 +5602,7 @@ pub(crate) fn compile_proto_mem(
                 this_v,
                 arg_base,
                 argc,
+                ..
             } => {
                 // Exact captured-reference call. The helper reads both Value
                 // operands from the rooted VM register window on every

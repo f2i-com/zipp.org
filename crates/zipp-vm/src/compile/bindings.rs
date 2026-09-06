@@ -473,6 +473,7 @@ impl<'a> FnCompiler<'a> {
                             this_v: this_reg,
                             arg_base,
                             argc,
+                            name: crate::bytecode::NO_NAME,
                         });
                         self.emit(Instr::Return { src: dst });
                         self.set_next_reg(save);

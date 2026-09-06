@@ -231,8 +231,15 @@ inline caches, intrinsic arms and inlining key on — is used only for
 arguments that provably cannot observe the order (literals, register-resident
 locals, arithmetic over literals, array/object/closure literals of such
 parts); every other argument shape takes the captured `GetProp` +
-`CallWithThis` path. Two environment variables exist for diagnostics and
-benchmarking, read once per process:
+`CallWithThis` path. That path is not the slow one: the interpreter serves
+a captured boot intrinsic (`arr.push(i % 13)`, `s.charCodeAt(a[i])`,
+`m.get(k + 1)`) through the same inline and name-dispatched builtin lanes as
+the fused form once the captured value is proven identical to the live
+prototype intrinsic, and answers the read itself from the same proof; a
+captured value that differs — an own shadow, an override installed before or
+by the arguments, a subclass method — is invoked exactly as captured. Two
+environment variables exist for diagnostics and benchmarking, read once per
+process:
 
 | Variable | Effect |
 |---|---|

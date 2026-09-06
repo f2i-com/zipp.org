@@ -180,6 +180,7 @@ pub(crate) fn computed_call_site(
             this_v,
             arg_base,
             argc,
+            ..
         } => {
             let get_ip = (region_start..call_ip)
                 .rev()
@@ -1532,6 +1533,7 @@ fn splice_ud(i: &Instr) -> Option<(Vec<u16>, Option<u16>)> {
             this_v,
             arg_base,
             argc,
+            ..
         } => {
             let mut v: Vec<u16> = (0..argc).map(|k| arg_base + k).collect();
             v.push(callee);

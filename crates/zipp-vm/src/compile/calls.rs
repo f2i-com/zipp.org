@@ -982,12 +982,20 @@ impl<'a> FnCompiler<'a> {
                 argc,
             });
         } else {
+            // The member name rides along so the interpreter can serve a
+            // captured boot intrinsic through the fused lowering's builtin
+            // lanes (B289); a private or computed member has no such lane.
+            let name = match &m.prop {
+                MemberProp::Ident(prop) => self.string_name_reused(prop),
+                _ => crate::bytecode::NO_NAME,
+            };
             self.emit(Instr::CallWithThis {
                 dst,
                 callee,
                 this_v,
                 arg_base,
                 argc,
+                name,
             });
         }
     }
@@ -1051,6 +1059,7 @@ impl<'a> FnCompiler<'a> {
                                 this_v: obj,
                                 arg_base,
                                 argc,
+                                name: crate::bytecode::NO_NAME,
                             });
                         }
                         return Ok(dst);
@@ -1298,6 +1307,7 @@ impl<'a> FnCompiler<'a> {
                     this_v: this_reg,
                     arg_base,
                     argc,
+                    name: crate::bytecode::NO_NAME,
                 });
                 self.set_next_reg(save.max(dst + 1));
                 return Ok(dst);
@@ -1638,6 +1648,7 @@ impl<'a> FnCompiler<'a> {
                     this_v,
                     arg_base,
                     argc,
+                    name: crate::bytecode::NO_NAME,
                 });
                 return Ok(dst);
             }
