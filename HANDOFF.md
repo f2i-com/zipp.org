@@ -100,7 +100,13 @@ P1/P2 findings are closed in v0.0.15; the rest are recorded below as open.
   WebAssembly module under every Node harness. The manual and release
   lanes are unchanged. Not gated: `cargo fmt` (the native workspace is not
   fmt-clean) and clippy (the engine crate does not pass it); both are
-  worth a separate change.
+  worth a separate change. The gate runs every binary (`--no-fail-fast`)
+  and quarantines, by name and with a notice in the log, three of
+  `bool_home_clobber`'s INT-GPR planning assertions that fail on the
+  GitHub runner at `40993c4d` itself (control run 34034702340, the audited
+  commit plus only the workflow) on bytecode identical to the developer
+  machine's; the planner's expectation there is machine-dependent, and is
+  a separate investigation.
 - **B288 — the ARM64 default-feature build.** `note_reg_kind` named
   `codegen::writes_reg`, which exists only for x86-64, under
   `feature = "jit"` alone, so `cargo test -p zipp-vm` did not compile on an
