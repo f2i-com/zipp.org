@@ -220,6 +220,29 @@ runner is language/process/resource containment, not a kernel sandbox; use a
 restricted account, container, or OS sandbox when the threat model requires
 one. See [`SECURITY.md`](SECURITY.md) for the full deployment checklist.
 
+### Semantics switches
+
+Every shipping profile evaluates a method call's reference before its
+arguments, as EvaluateCall requires: `receiver.m(input.value)` runs the
+getter on `m` before the getter on `value`, an argument's coercion cannot
+replace the method already fetched, and when both sides throw the method's
+exception is the one seen. The fused `CallMethod` lowering — the op the method
+inline caches, intrinsic arms and inlining key on — is used only for
+arguments that provably cannot observe the order (literals, register-resident
+locals, arithmetic over literals, array/object/closure literals of such
+parts); every other argument shape takes the captured `GetProp` +
+`CallWithThis` path. Two environment variables exist for diagnostics and
+benchmarking, read once per process:
+
+| Variable | Effect |
+|---|---|
+| `ZIPP_RELAXED_CALL_ORDER=1` | Re-admits the pre-audit "primitive-operand" class (global, cell and property reads and arithmetic over them) to the fused lowering. Faster on some rows; observably wrong for a getter or proxy trap on either side of the call. Never a shipping profile. |
+| `ZIPP_STRICT_CALL_ORDER=1` | Forces the default, and wins when both are set. |
+
+`crates/zipp-vm/tests/call_order_default.rs` runs the audit's probes under the
+default, the interpreter, forced JIT, GC stress and both switches in clean
+child processes.
+
 ## Performance, measured honestly
 
 ### QuickJS-NG and Boa diagnostics

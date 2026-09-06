@@ -28,6 +28,140 @@ measured with `crates/zipp-wasm/tests/node/bench.cjs`-style interleaved
 A/Bs, not the native PGO capture; the tracked module must be rebuilt to
 ship them. The audit's captured-call IC was measured and not built (B279).
 
+## 2026-09-06 (B280-B288, from the ZIPP engineering audit)
+
+The audit reviewed `40993c4d` (v0.0.14). Its two P0 findings and six of the
+P1/P2 findings are closed in v0.0.15; the rest are recorded below as open.
+
+- **B280 (Z01, P0) — correct call evaluation is the default.** The fused
+  `CallMethod` lowering performed its property Get after the arguments were
+  in their registers, and the default "primitive-operand" argument class
+  admitted property, global, cell and upvalue reads and arithmetic over
+  them, so `receiver.m(input.value)` ran the argument's getter before the
+  method's. That class is now opt-in (`ZIPP_RELAXED_CALL_ORDER=1`,
+  diagnostics and benchmarking only; `ZIPP_STRICT_CALL_ORDER=1` wins when
+  both are set). The provable class grew to keep fusion where it is
+  actually safe: arithmetic, comparison, concatenation and template forms
+  over literals (`provably_primitive`), and array, plain-keyed object and
+  closure literals of provable parts, since an allocation runs no user
+  code. `tests/call_order_default.rs` runs the audit's probes — getter
+  order, coercion that replaces the method, a getter that writes the
+  argument's global, proxy trap order, which of two throws is seen, a
+  warmed site — under the default, interpreter, forced-JIT, GC-stress,
+  strict and both-switches modes in clean child processes, and pins that
+  the relaxed switch still reorders (change that when B279's captured-call
+  IC lands). `call_reference_order` and `bare_math_op` now clear both
+  switches from their child environments and add both as modes.
+- **B281 (Z02, P0 before untrusted acceleration) — accel.make forwards only
+  the public grammar.** `resolve_accel_spec` refused nothing but a
+  non-typed-array `g:` target and forwarded every other entry verbatim, so
+  a guest could hand the adapter an `r:address:length:kind` region of its
+  own spelling, indistinguishable from an engine-resolved one. Every entry
+  is now held to `NAME=g:GLOBAL`, `NAME=c:GLOBAL`, `NAME=a:ID`,
+  `NAME=n:NUMBER`, `NAME=t` with identifier names bound once, integral
+  ids and finite numbers, before the adapter is invoked;
+  `tests/node/audit-defaults.cjs` drives a recording adapter and shows no
+  refused spec reaches it. Still open from Z02: opaque per-engine region
+  handles instead of raw addresses, and a bounded reference adapter with
+  a defined numeric language, allocation and deadline.
+- **B282 (Z06, P1) — `setInstructionBudget` before `initScript` governs the
+  top level.** The engine records the allowance and attaches it as the
+  limit at initialization; a renewal restores the size the host chose.
+  NaN and infinities select the default, fractions truncate, zero and
+  negatives clamp to one step, a disposed engine answers false. Pinned in
+  `audit-defaults.cjs`.
+- **B283 (Z07, P1) — the monotonic clock keeps its receiver.** `mono_now`
+  called `performance.now` with an undefined receiver; a receiver-strict
+  host threw "Illegal invocation", the error was swallowed, and every
+  reading came from `Date.now()`. Invoked with the Performance object now;
+  the Node test installs a receiver-strict stub and counts its calls.
+- **B284 (Z08, P2) — own-key event storage.** `__zEvents` and `__zHostCbs`
+  are null-prototype dictionaries keyed by `String(type)`; a non-function
+  listener is skipped at dispatch; `constructor`, `toString` and
+  `__proto__` are ordinary event names.
+- **B285 (Z09, P2) — transactional `host.call`.** Arguments are converted
+  before an id is taken or a callback registered, so a throwing
+  `toString` retains nothing. Bounded: 4,096 requests queued between
+  drains, 65,536 callbacks awaiting a reply (both a `RangeError` to the
+  guest), with `__zHostPending` as the count.
+- **B286 (Z04, P1) — the artifact describes itself.** `zippProfile()`
+  exports engine, version, isolated features, `callOrder: "strict"` and
+  every limit the module owns as JSON, read from the constants the engine
+  enforces. The README's resource table had four rows from an older build
+  (2 MiB / 16 MiB initial source, 128 / 512 MiB heap, 256 MiB / 1 GiB
+  linked memory, four codegen units / one with fat LTO) and five more that
+  had drifted (dynamic-code retained bytes, attempts and functions;
+  lifetime output; sync bridge bytes); it is corrected and held to the
+  profile by `tests/node/profile-matches-readme.cjs`.
+- **B287 (Z03, P1) — an automatic gate.** `.github/workflows/ci.yml` runs
+  on every push and pull request: the engine suite with default features
+  (whose semantic regressions run their own mode matrix), the isolated
+  host workspace, the advertised feature combinations, and the production
+  WebAssembly module under every Node harness. The manual and release
+  lanes are unchanged. Not gated: `cargo fmt` (the native workspace is not
+  fmt-clean) and clippy (the engine crate does not pass it); both are
+  worth a separate change.
+- **B288 — the ARM64 default-feature build.** `note_reg_kind` named
+  `codegen::writes_reg`, which exists only for x86-64, under
+  `feature = "jit"` alone, so `cargo test -p zipp-vm` did not compile on an
+  aarch64 host (the ARM64 lane is manual and had not caught it). Gated on
+  the architecture as well; the register-kind history only serves the
+  x86-64 register tiers.
+
+**Call-order cost, measured.** `tests/node/bench.cjs`, the production wasm
+build (interpreter-only, fat LTO), Node 22.15 / V8 12.4 on a Snapdragon X
+Plus (win32-arm64), baseline `40993c4d` against this tree, best of two
+order-balanced runs, ms:
+
+| row | 40993c4d | B280 | delta |
+|---|---:|---:|---:|
+| arith-int | 18.65 | 18.82 | +0.9% |
+| arith-mod | 25.94 | 26.17 | +0.9% |
+| arith-float | 30.51 | 31.23 | +2.4% |
+| prop-mono | 10.45 | 10.57 | +1.1% |
+| prop-poly | 9.74 | 9.73 | -0.1% |
+| alloc-object | 16.08 | 16.47 | +2.4% |
+| array-build | 11.39 | 11.38 | 0.0% |
+| array-hof | 5.51 | 5.52 | +0.2% |
+| string-build | 4.59 | 4.49 | -2.2% |
+| regex | 274.79 | 274.60 | -0.1% |
+| json | 12.36 | 12.39 | +0.3% |
+
+Within this machine's noise on every row (the harness reports 1-6% spread
+on the host rows). That is expected rather than reassuring: the harness's
+method calls take literals and register-resident locals, which stay fused.
+The shape that now takes the captured path is a method call whose argument
+reads a property, a global or a captured variable, or does arithmetic on a
+local — `s.charCodeAt(i + 1)`, `out.push(a[i])`, `ctx.fill(x * 2)` — and no
+harness row is built from those. The next measurement should be: a row of
+exactly those shapes, A/B against `ZIPP_RELAXED_CALL_ORDER=1` on the native
+CLI (the wasm build has no environment), to size what B279's captured-call
+IC would recover.
+
+Verified on an aarch64 Windows host (the first time the default-feature
+suite has compiled there, see B288): 1,279 engine tests pass; the
+call-order, captured-argument, bare-Math and register-class suites pass in
+every mode; the wasm crate's host tests and every Node harness pass on a
+fresh production build. Failures on that host, each re-run under
+`ZIPP_RELAXED_CALL_ORDER=1` to prove it is the host and not B280:
+`accessor_ic_way`'s gate tests, `regexp_call_direct`,
+`regexp_string_call_direct` and `int32_trunc_add` assert x86-64 JIT lanes
+the ARM64 baseline tier declines; `typedarray_interp_index_fast` compares
+against a Node 22 that lacks `Float16Array`; `nursery_minor`'s sustained-
+garbage test runs past twenty CPU-minutes in a debug build there; and
+Windows refuses to start `clock_installed`, `promise_pristine_dispatch`,
+`regexp_dispatch_arm` and `tier_a_call_setup` without elevation, because
+their file names look like installers (os error 740). The x86-64 lane in
+`ci.yml` is the authoritative run.
+
+Open from the audit, with what a decision would need: **Z05** compiled-code
+lifetime (retained-code accounting first, then container-owned programs);
+**Z10** a fresh production-WASM coverage capture with per-case outcomes;
+**Z11** the four profiling experiments (IC site indexing, numeric host-call
+transport, GC scratch reuse, heap-accounting chokepoints); **Z12** browser
+acceptance in real Workers, a versioned host SDK, a machine-checkable
+opcode contract; and the rest of Z02 above.
+
 ## v0.0.6 native interpreter / QuickJS-NG confirmation
 
 The clean default-feature release binary at `e3acee352074` reran the current

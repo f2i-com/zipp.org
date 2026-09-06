@@ -137,17 +137,25 @@ fn bytecode_shape_uses_the_local_directly_only_when_safe() {
     );
 
     // Captured and direct-eval-visible locals are cells, never direct windows.
+    // Under the default call order (B280) a cell read is not order-transparent
+    // either — a getter on the callee could write the cell before the spec
+    // reads it — so these calls take the captured `CallWithThis` lowering
+    // rather than the fused `CallMethod`; `ZIPP_RELAXED_CALL_ORDER=1` fuses
+    // them. Either way the argument is a cell-backed read, which is what a
+    // direct window must never replace.
     let captured = text_of(
         "function f(){var s='ab', i=1; function read(){return i;} return s.charCodeAt(i)+read();} f();",
     );
     assert!(
-        captured.contains("CellGet") && captured.contains("CallMethod"),
+        captured.contains("CellGet")
+            && (captured.contains("CallMethod") || captured.contains("CallWithThis")),
         "captured argument stopped using a cell-backed read:\n{captured}"
     );
     let eval_visible =
         text_of("function f(){var s='ab', i=0; eval('i=1'); return s.charCodeAt(i);} f();");
     assert!(
-        eval_visible.contains("CellGet") && eval_visible.contains("CallMethod"),
+        eval_visible.contains("CellGet")
+            && (eval_visible.contains("CallMethod") || eval_visible.contains("CallWithThis")),
         "eval-visible argument stopped using a cell-backed read:\n{eval_visible}"
     );
 }

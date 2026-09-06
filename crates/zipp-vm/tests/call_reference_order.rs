@@ -320,13 +320,19 @@ fn call_reference_order_modes_match() {
             ("interpreter", Some(("ZIPP_NOJIT", "1"))),
             ("forced-jit", Some(("ZIPP_JIT_THRESHOLD", "1"))),
             ("gc-stress", Some(("ZIPP_GC_STRESS", "1"))),
+            // The captured lowering's order holds under both call-order
+            // switches; an inherited setting must not decide which is tested.
+            ("strict-order", Some(("ZIPP_STRICT_CALL_ORDER", "1"))),
+            ("relaxed-order", Some(("ZIPP_RELAXED_CALL_ORDER", "1"))),
         ] {
             let mut cmd = std::process::Command::new(&exe);
             cmd.args(["--exact", test, "--nocapture"])
                 .env(marker, "1")
                 .env_remove("ZIPP_NOJIT")
                 .env_remove("ZIPP_JIT_THRESHOLD")
-                .env_remove("ZIPP_GC_STRESS");
+                .env_remove("ZIPP_GC_STRESS")
+                .env_remove("ZIPP_STRICT_CALL_ORDER")
+                .env_remove("ZIPP_RELAXED_CALL_ORDER");
             if let Some((key, value)) = env {
                 cmd.env(key, value);
             }

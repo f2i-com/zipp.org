@@ -48,12 +48,22 @@ Keep the release profile at `opt-level = 3`. `opt-level = "s"` and `"z"` were
 measured: `"z"` cuts the wire to 974,657 bytes and makes the interpreter
 **1.9x-2.5x slower**, which is not a trade this artifact should take.
 
-### Why release uses four codegen units
+### Why release uses one codegen unit with fat LTO
+
+The release profile is one codegen unit with fat LTO (see the measurement in
+`Cargo.toml`, 2026-09-05): the interpreter's hot path spans `zipp-vm`, the
+regress fork and the allocator, and cross-crate inlining ran the integer
+arithmetic rows 18-22% faster for a 280 KB smaller module. That superseded the
+earlier four-codegen-unit policy below, which was chosen without LTO and is kept
+as the historical screen it was; the tracked v0.0.12 landing-page module was
+still built under it.
+
+#### The earlier four-codegen-unit screen (historical)
 
 Codegen-unit count changes both duplicate code and the layout V8 sees, so the
-smallest module was not automatically the fastest one. The production setting
-was selected from this complete bounded screen; sizes are the final
-section-stripped `wasm-bindgen --target web` module:
+smallest module was not automatically the fastest one. The setting was selected
+from this complete bounded screen; sizes are the final section-stripped
+`wasm-bindgen --target web` module:
 
 | release profile | raw | gzip-9 | brotli-11 | observed steady time vs previous default | decision |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -83,8 +93,9 @@ at engine commit `7cb72106c9591613b170ba057d3c07e1cee01379`. It was 5,595,833
 bytes raw, 1,859,668 at gzip-9, and 1,254,075 at Brotli-11, with SHA-256
 `f3d67856f5853c235c12ee62a1cc86032492012e3942c032a08d8d22df85ff0b`.
 
-The current v0.0.12 production artifact uses the same pinned Rust 1.92.0,
-wasm-bindgen 0.2.126, `opt-level=3`, and four-codegen-unit policy. It also keeps
+The tracked v0.0.12 production artifact uses the same pinned Rust 1.92.0,
+wasm-bindgen 0.2.126, `opt-level=3`, and four-codegen-unit policy (a module
+built from this source uses one codegen unit with fat LTO). It also keeps
 the 1 GiB linked memory maximum, 1 MiB linked stack, and isolated
 `safe-sandbox`, `meter-only`, `wasm-no-fs-loader`, and `wasm-single-agent`
 features. Name, producers, and optional `target_features` sections are removed;
@@ -263,16 +274,23 @@ Every `Engine` has fixed fail-closed ceilings. Cumulative counters are lifetime
 limits rather than per-entry allowances, so repeatedly re-entering one VM cannot
 reset them; size and nesting limits apply to each live value or operation:
 
+The table is held to the artifact by `tests/node/profile-matches-readme.cjs`:
+every figure below that the engine owns is read back from `zippProfile()`, the
+JSON record the module exports of its own limits and semantics, so a host can
+inspect what it loaded rather than trust this page. The rows the table does not
+cover that way (string, regex, BigInt, array and nesting ceilings) come from
+`zipp-vm`'s own constants.
+
 | Resource | Limit |
 | --- | ---: |
-| Initial guest source | 2,097,152 UTF-8 bytes, checked before preamble concatenation or compilation |
+| Initial guest source | 16,777,216 UTF-8 bytes, checked before preamble concatenation or compilation |
 | One `evalInContext` expression | 65,490 UTF-8 bytes (plus its fixed 46-byte host wrapper) |
 | Retained `evalInContext` wrapper source | 1,048,576 UTF-8 bytes total and 256 calls per engine |
-| All runtime compilation (`eval`, `Function`, `ShadowRealm`, and host eval) | 65,536 UTF-8 bytes per complete source, 1,048,576 source bytes and 256 attempts total; at most 4,096 retained function definitions and 1,024 retained class definitions |
+| All runtime compilation (`eval`, `Function`, `ShadowRealm`, and host eval) | 65,536 UTF-8 bytes per complete source, 16,777,216 retained source bytes and 16,384 attempts total; at most 16,384 retained function definitions and 1,024 retained class definitions |
 | Source syntax/compile nesting | 48 active recursive parser entries, 16 links in one iterative operator/member grammar chain, and 32 structural AST levels before recursive compiler/capture walks |
-| VM execution | 50,000,000 bytecode instructions total, starting at guest top-level execution |
-| Payload-aware VM heap high-water | 134,217,728 bytes |
-| WebAssembly linear memory | 268,435,456-byte link-time maximum |
+| VM execution | 50,000,000 bytecode instructions total by default, starting at guest top-level execution; a host may size the allowance through `setInstructionBudget`, before or after `initScript`, up to 2,000,000,000 |
+| Payload-aware VM heap high-water | 536,870,912 bytes |
+| WebAssembly linear memory | 1,073,741,824-byte link-time maximum |
 | One materialized guest string | 1,048,576 WTF-8 bytes; concatenation ropes and padding additionally cap their UTF-16-unit growth at 262,144 |
 | One regular-expression pattern | 16,384 UTF-8/WTF-8 source bytes; 32 nested groups/Unicode sets and 64 explicit alternatives per disjunction; Unicode-property expansion limited to 32,768 intervals, 4,096 string alternatives, and 65,536 string code points; 4,194,304 retained compiled-program bytes; compile cache limited to 32 entries |
 | One BigInt magnitude | 1,048,576 bits (approximately 128 KiB) |
@@ -284,8 +302,10 @@ reset them; size and nesting limits apply to each live value or operation:
 | Array `join`/`toString`/`toLocaleString` recursion | 4 active nested arrays; cycles contribute an empty element and deeper acyclic graphs throw `RangeError` |
 | JSON parse/stringify nesting | 64 levels, with bounded traversal/output work |
 | JSON replacer/object-key snapshots | 8,388,608 private allocation bytes per stringify, including key and container capacities |
-| Lifetime console output | 98,304 UTF-8 bytes total, including newlines |
-| Synchronous host bridge | 64-byte kind, exact operation-specific arity (and never more than 16 arguments), 1,048,576 combined kind/argument bytes, and a 1,048,576-byte serialized reply |
+| Lifetime console output | 8,388,608 UTF-8 bytes total, including newlines, each line charged the cost of its own entry |
+| Synchronous host bridge | 64-byte kind, exact operation-specific arity (and never more than 16 arguments), 33,554,432 combined kind/argument bytes, and a 33,554,432-byte serialized reply |
+| Asynchronous `host.call` | 4,096 requests queued between drains and 65,536 callbacks awaiting a reply; a request registers nothing until its arguments have converted |
+| `accel.make` binding spec | the public grammar only — `NAME=g:GLOBAL`, `NAME=c:GLOBAL`, `NAME=a:ID`, `NAME=n:NUMBER`, `NAME=t` — with identifier names bound once; the engine's own `r:` region form is refused from guest text before the adapter sees the spec |
 
 The instruction, dynamic-compilation and output counters are not credited when
 an entry returns or when `takeOutput()` drains buffered lines. Dynamic source and
@@ -322,9 +342,21 @@ remain recoverable.
 
 ## Notes
 
+- `zippProfile()` returns the artifact's own record — engine, version, isolated
+  features, semantics (`callOrder: "strict"`) and every limit above that the
+  module owns — as JSON. Read it from the loaded module for a diagnostic panel
+  or a compatibility check instead of copying figures from this page.
+- `setInstructionBudget(steps)` may be called before `initScript`, in which case
+  the allowance governs top-level execution and `_init`; called after, it
+  resizes the running budget, and `renewInstructionBudget` then restores the
+  size the host chose. A non-finite number selects the default, a fraction is
+  truncated, zero and negatives clamp to one step, and anything above the
+  maximum clamps to it.
 - `Engine::new()` must not be constructed before the module's `start` function has
   run — wasm32 has no clock, `Vm::new` reads one, and an un-shimmed VM traps on
-  construction. `wasm-bindgen(start)` handles this; nothing else should.
+  construction. `wasm-bindgen(start)` handles this; nothing else should. The
+  monotonic clock calls `performance.now` with the Performance object as its
+  receiver, so a receiver-strict host is used rather than fallen back from.
 - `callFunction` resolves by slot. `evalInContext` compiles fresh on every call and
   installs stable-address definitions, so it is for one-off host
   queries, never a per-frame path; the per-source, retained-source and call-count

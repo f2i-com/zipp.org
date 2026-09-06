@@ -123,7 +123,10 @@ const PREAMBLE_BINDINGS: &[&str] = &[
     "__zEvents",
     "__zHostQueue",
     "__zHostCbs",
+    "__zHostPending",
     "__zHostId",
+    "__zHostQueueMax",
+    "__zHostPendingMax",
     "window",
     "navigator",
     "localStorage",
@@ -154,14 +157,24 @@ pub fn zipp_start() {
 
 /// `performance.now()` where the host has one, else the wall clock — coarser
 /// and not strictly monotonic, but never absent.
+///
+/// The method is invoked WITH the Performance object as its receiver. It used
+/// to be called with an undefined receiver, which a receiver-strict host
+/// (Node, and browsers' `Performance.prototype.now`) rejects with "Illegal
+/// invocation"; the error was swallowed and every reading silently came from
+/// `Date.now()` instead, on hosts that had a perfectly good monotonic clock
+/// (the 6 September 2026 audit's Z07).
 fn mono_now() -> f64 {
     js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("performance"))
         .ok()
         .filter(|p| !p.is_undefined() && !p.is_null())
-        .and_then(|p| js_sys::Reflect::get(&p, &JsValue::from_str("now")).ok())
-        .filter(JsValue::is_function)
-        .map(JsValue::unchecked_into::<js_sys::Function>)
-        .and_then(|f| f.call0(&JsValue::UNDEFINED).ok())
+        .and_then(|performance| {
+            js_sys::Reflect::get(&performance, &JsValue::from_str("now"))
+                .ok()
+                .filter(JsValue::is_function)
+                .map(JsValue::unchecked_into::<js_sys::Function>)
+                .and_then(|now| now.call0(&performance).ok())
+        })
         .and_then(|v| v.as_f64())
         .unwrap_or_else(js_sys::Date::now)
 }
@@ -217,6 +230,12 @@ pub struct Engine {
     /// only after successful initialization, so it cannot itself freeze bridge
     /// handles and grants against a callback during top-level execution.
     host_configuration_frozen: bool,
+    /// The instruction allowance this engine runs under: the default, or what
+    /// the host last asked for through `setInstructionBudget`. Held here as
+    /// well as in the recorder so a request made BEFORE `initScript` governs
+    /// top-level execution, and so a renewal restores the size the host chose
+    /// rather than the default.
+    instruction_budget: u64,
 }
 
 #[wasm_bindgen]
@@ -233,6 +252,7 @@ impl Engine {
             eval_retained_source_bytes: 0,
             disposed: false,
             host_configuration_frozen: false,
+            instruction_budget: MAX_LIFETIME_STEPS,
         }
     }
 
@@ -367,7 +387,9 @@ impl Engine {
             // The Cargo dependency disables native JIT features; the explicit
             // runtime switch also keeps this true in native workspace builds
             // where Cargo feature unification may enable zipp-vm's JIT.
-            st.set_limits(MAX_LIFETIME_STEPS, None);
+            // Top-level execution runs under the allowance the host chose
+            // before initialization, or the default; see setInstructionBudget.
+            st.set_limits(self.instruction_budget, None);
             st.set_dynamic_code_limits(
                 MAX_DYNAMIC_CODE_SOURCE_BYTES,
                 MAX_DYNAMIC_CODE_RETAINED_SOURCE_BYTES,
@@ -502,7 +524,7 @@ impl Engine {
     #[wasm_bindgen(js_name = renewInstructionBudget)]
     pub fn renew_instruction_budget(&mut self) -> bool {
         match self.state.as_mut() {
-            Some(st) => st.renew_step_budget(MAX_LIFETIME_STEPS),
+            Some(st) => st.renew_step_budget(self.instruction_budget),
             None => false,
         }
     }
@@ -517,21 +539,36 @@ impl Engine {
     /// and be cut off on the other. This is the host-side knob for that; the
     /// clamp is the fuse it cannot remove.
     ///
-    /// Host-only, like renewal: a method on the Engine binding, unreachable
-    /// from guest code. Setting the budget restores nothing else — heap,
-    /// output and dynamic-code ceilings stay where setup left them. Returns
-    /// false once a budget has actually been spent, exactly as renewal does;
-    /// call it before the first re-entry.
+    /// Called BEFORE `initScript`, the allowance governs top-level execution
+    /// and `_init` as well: it used to need existing script state, so the one
+    /// phase a host most wants to bound — a stranger's top level — always ran
+    /// under the default (the 6 September 2026 audit's Z06). Called after,
+    /// it renews the running budget to the new size, and every later
+    /// `renewInstructionBudget` restores that size rather than the default.
+    ///
+    /// The value's handling is defined, not incidental: a non-finite number
+    /// selects the default; a fraction is truncated; zero and negatives clamp
+    /// to one step; anything above the maximum clamps to it. Host-only, like
+    /// renewal: a method on the Engine binding, unreachable from guest code.
+    /// Setting the budget restores nothing else — heap, output and
+    /// dynamic-code ceilings stay where setup left them. Returns false once a
+    /// budget has actually been spent, exactly as renewal does, and on a
+    /// disposed engine.
     #[wasm_bindgen(js_name = setInstructionBudget)]
     pub fn set_instruction_budget(&mut self, steps: f64) -> bool {
+        if self.disposed {
+            return false;
+        }
         let steps = if steps.is_finite() {
             (steps.max(1.0).min(MAX_INSTRUCTION_BUDGET_STEPS as f64)) as u64
         } else {
             MAX_LIFETIME_STEPS
         };
+        self.instruction_budget = steps;
         match self.state.as_mut() {
             Some(st) => st.renew_step_budget(steps),
-            None => false,
+            // Recorded; applied when initScript attaches the limits.
+            None => true,
         }
     }
 
@@ -913,17 +950,53 @@ pub fn accel_guest_call(name: &str, args: &[f64]) -> Result<f64, JsValue> {
         .map_err(|e| JsValue::from_str(&e))
 }
 
-/// The spec `accel.make` forwards, with every `NAME=g:GLOBAL` entry resolved
-/// to `NAME=r:address:length:kind` through the VM; other entries pass as
-/// they are. A global that is not a typed array is an error the guest sees.
+/// The spec `accel.make` forwards, held to the PUBLIC binding grammar the
+/// preamble documents — `NAME=g:GLOBAL`, `NAME=c:GLOBAL`, `NAME=a:ID`,
+/// `NAME=n:NUMBER`, `NAME=t` — with every `g:` entry resolved to
+/// `NAME=r:address:length:kind` through the VM. A global that is not a typed
+/// array is an error the guest sees.
+///
+/// `r:` is the engine's own transport form and never one the guest may
+/// write. An adapter cannot tell an engine-resolved region from guest text
+/// that spells one, so any entry outside the public grammar — an `r:` region
+/// above all — is refused here, before the adapter sees the spec, rather than
+/// forwarded for the adapter to trust (the 6 September 2026 audit's Z02).
+/// Names must be identifiers and unique; a `c:` target is an identifier; an
+/// `a:` id is a non-negative integer; an `n:` operand is a finite number.
 fn resolve_accel_spec(ctx: &mut dyn HostCtx, spec: &str) -> Result<String, String> {
+    fn is_identifier(s: &str) -> bool {
+        let mut chars = s.chars();
+        matches!(chars.next(), Some(c) if c == '_' || c == '$' || c.is_ascii_alphabetic())
+            && chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
+    }
+    fn refuse(entry: &str, why: &str) -> String {
+        format!("TypeError: accel.make: {entry:?} {why}")
+    }
+    if spec.is_empty() {
+        return Ok(String::new());
+    }
     let mut out = String::with_capacity(spec.len() + 64);
+    let mut names: Vec<&str> = Vec::new();
     for (i, entry) in spec.split(',').enumerate() {
         if i > 0 {
             out.push(',');
         }
-        match entry.split_once("=g:") {
-            Some((name, global)) => {
+        let Some((name, binding)) = entry.split_once('=') else {
+            return Err(refuse(entry, "is not NAME=BINDING"));
+        };
+        if !is_identifier(name) {
+            return Err(refuse(entry, "does not name a binding"));
+        }
+        if names.contains(&name) {
+            return Err(refuse(entry, "binds a name twice"));
+        }
+        names.push(name);
+        let (tag, value) = match binding.split_once(':') {
+            Some((tag, value)) => (tag, Some(value)),
+            None => (binding, None),
+        };
+        match (tag, value) {
+            ("g", Some(global)) if is_identifier(global) => {
                 let (ptr, len, kind) = ctx.typed_array_region(global)?;
                 out.push_str(name);
                 out.push_str("=r:");
@@ -933,10 +1006,87 @@ fn resolve_accel_spec(ctx: &mut dyn HostCtx, spec: &str) -> Result<String, Strin
                 out.push(':');
                 out.push_str(&kind.to_string());
             }
-            None => out.push_str(entry),
+            ("c", Some(global)) if is_identifier(global) => out.push_str(entry),
+            ("a", Some(id)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
+                out.push_str(entry)
+            }
+            ("n", Some(number)) if number.parse::<f64>().is_ok_and(f64::is_finite) => {
+                out.push_str(entry)
+            }
+            ("t", None) => out.push_str(entry),
+            _ => {
+                return Err(refuse(
+                    entry,
+                    "is not a public binding (NAME=g:GLOBAL, NAME=c:GLOBAL, NAME=a:ID, NAME=n:NUMBER or NAME=t)",
+                ))
+            }
         }
     }
     Ok(out)
+}
+
+/// Linked WebAssembly linear-memory maximum, in bytes. Set by the linker from
+/// `.cargo/config.toml` (and repeated in the release workflow's RUSTFLAGS);
+/// stated here so the profile can report it, and checked against the built
+/// artifact by `tests/node/check-wasm-memory.cjs`.
+const LINKED_MEMORY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The limits and semantics this artifact was built with, as JSON.
+///
+/// A host used to have only the README's table to go by, and at v0.0.14 four
+/// of its rows described an older build (the 6 September 2026 audit's Z04).
+/// This is read from the same constants the engine enforces, so it cannot
+/// drift; `tests/node/profile-matches-readme.cjs` holds the README to it.
+#[wasm_bindgen(js_name = zippProfile)]
+pub fn zipp_profile() -> String {
+    format!(
+        concat!(
+            "{{",
+            "\"engine\":\"zipp-wasm\",",
+            "\"version\":\"{version}\",",
+            "\"features\":[\"safe-sandbox\",\"meter-only\",\"wasm-no-fs-loader\",\"wasm-single-agent\"],",
+            "\"semantics\":{{\"callOrder\":\"strict\"}},",
+            "\"limits\":{{",
+            "\"initialSourceBytes\":{initial_source},",
+            "\"evalExpressionBytes\":{eval_expression},",
+            "\"evalRetainedSourceBytes\":{eval_retained},",
+            "\"evalCalls\":{eval_calls},",
+            "\"dynamicCodeSourceBytes\":{dynamic_source},",
+            "\"dynamicCodeRetainedSourceBytes\":{dynamic_retained},",
+            "\"dynamicCodeCalls\":{dynamic_calls},",
+            "\"dynamicCodeFunctions\":{dynamic_functions},",
+            "\"dynamicCodeClasses\":{dynamic_classes},",
+            "\"lifetimeSteps\":{lifetime_steps},",
+            "\"maxInstructionBudgetSteps\":{max_budget},",
+            "\"approxHeapBytes\":{heap},",
+            "\"linkedMemoryMaxBytes\":{linked_memory},",
+            "\"lifetimeOutputBytes\":{output},",
+            "\"syncBridgeKindBytes\":{bridge_kind},",
+            "\"syncBridgeArgs\":{bridge_args},",
+            "\"syncBridgeBytes\":{bridge_bytes},",
+            "\"syncCapabilityEntries\":{capability_entries}",
+            "}}}}"
+        ),
+        version = env!("CARGO_PKG_VERSION"),
+        initial_source = MAX_INITIAL_SOURCE_BYTES,
+        eval_expression = MAX_EVAL_SOURCE_BYTES,
+        eval_retained = MAX_EVAL_RETAINED_SOURCE_BYTES,
+        eval_calls = MAX_EVAL_CALLS,
+        dynamic_source = MAX_DYNAMIC_CODE_SOURCE_BYTES,
+        dynamic_retained = MAX_DYNAMIC_CODE_RETAINED_SOURCE_BYTES,
+        dynamic_calls = MAX_DYNAMIC_CODE_CALLS,
+        dynamic_functions = MAX_DYNAMIC_CODE_FUNCTIONS,
+        dynamic_classes = MAX_DYNAMIC_CODE_CLASSES,
+        lifetime_steps = MAX_LIFETIME_STEPS,
+        max_budget = MAX_INSTRUCTION_BUDGET_STEPS,
+        heap = MAX_APPROX_HEAP_BYTES,
+        linked_memory = LINKED_MEMORY_MAX_BYTES,
+        output = MAX_LIFETIME_OUTPUT_BYTES,
+        bridge_kind = MAX_SYNC_BRIDGE_KIND_BYTES,
+        bridge_args = MAX_SYNC_BRIDGE_ARGS,
+        bridge_bytes = MAX_SYNC_BRIDGE_BYTES,
+        capability_entries = MAX_SYNC_CAPABILITY_ENTRIES,
+    )
 }
 
 /// The synchronous dispatch with the VM at hand: `accel.*` is served here,

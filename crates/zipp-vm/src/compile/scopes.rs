@@ -267,13 +267,18 @@ impl<'a> FnCompiler<'a> {
     /// opcodes the region planner types `Bool`, a `Move` of a boolean, and
     /// everything else as a number/other. Class registers are not tracked --
     /// they are never handed out again.
-    #[cfg(not(feature = "jit"))]
+    #[cfg(not(all(feature = "jit", target_arch = "x86_64")))]
     fn note_reg_kind(&mut self, _i: &Instr) {
-        // The history only serves the register tiers' one-type-per-register
-        // model; a build without the JIT has no consumer (and no def table).
+        // The history only serves the x86-64 register tiers' one-type-per-
+        // register model; a build without them — no JIT, or the ARM64
+        // baseline tier, whose `codegen_aarch64` has no def table — has no
+        // consumer. Gated on the architecture as well as the feature: with the
+        // feature alone, an aarch64 default-feature build named
+        // `codegen::writes_reg`, which only exists for x86-64, and failed to
+        // compile.
     }
 
-    #[cfg(feature = "jit")]
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     fn note_reg_kind(&mut self, i: &Instr) {
         let Some(dst) = crate::codegen::writes_reg(i) else {
             return;
@@ -923,7 +928,14 @@ mod reg_classes_tests {
                 _ => None,
             })
             .collect();
-        assert!(receivers.len() >= 10, "tokenize lost its method calls:\n{f:#?}");
+        // Nine of tokenize's method calls fuse: `charCodeAt(i)` and the
+        // `push` calls, whose arguments are register-resident locals or
+        // literals. The two `charCodeAt(i + 1)` sites take the captured
+        // lowering under the default call order (B280): `i + 1` is not
+        // provably primitive, since nothing proves the local holds a number
+        // rather than an object with a `valueOf` that could replace the
+        // method. `ZIPP_RELAXED_CALL_ORDER=1` fuses those too.
+        assert!(receivers.len() >= 9, "tokenize lost its method calls:\n{f:#?}");
         for r in receivers {
             let defs: Vec<&Instr> = f
                 .code

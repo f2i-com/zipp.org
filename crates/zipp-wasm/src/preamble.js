@@ -8,18 +8,28 @@
 // Everything declared here is reported to the host as a preamble name and
 // filtered out of the symbol map, so none of it is mistaken for script state.
 
-var __zEvents = {};
+// Dictionaries keyed by guest-chosen strings have no prototype: with a plain
+// object, an event named "constructor", "toString" or "__proto__" found an
+// inherited value where a listener array was expected and threw (the
+// 6 September 2026 audit's Z08). Every read of them below is an own-key read.
+var __zEvents = Object.create(null);
 var __zHostQueue = [];
-var __zHostCbs = {};
+var __zHostCbs = Object.create(null);
+var __zHostPending = 0;
 var __zHostId = 0;
+// Bounds on what a guest may leave waiting for the host: requests queued
+// between drains, and callbacks awaiting a completion.
+var __zHostQueueMax = 4096;
+var __zHostPendingMax = 65536;
 
 var window = {
   addEventListener: function (type, fn) {
     if (typeof fn !== "function") return;
-    (__zEvents[type] = __zEvents[type] || []).push(fn);
+    var key = String(type);
+    (__zEvents[key] || (__zEvents[key] = [])).push(fn);
   },
   removeEventListener: function (type, fn) {
-    var a = __zEvents[type];
+    var a = __zEvents[String(type)];
     if (!a) return;
     for (var i = 0; i < a.length; i++) {
       if (a[i] === fn) { a.splice(i, 1); return; }
@@ -71,11 +81,20 @@ var db = {
 // resolveHostCallback. It must NOT reach __zippHostCall, which is synchronous.
 var host = {
   call: function (kind, args, cb) {
-    var id = ++__zHostId;
-    if (typeof cb === "function") __zHostCbs[id] = cb;
+    // Normalize first, register second. The callback used to be stored
+    // before the arguments were converted, so a conversion that threw (a
+    // toString that does) left a callback registered for a request that was
+    // never queued, which no completion would ever release (the 6 September
+    // 2026 audit's Z09). Nothing is retained until the request is whole.
+    var k = String(kind);
     var flat = [];
     if (args) for (var i = 0; i < args.length; i++) flat.push(String(args[i]));
-    __zHostQueue.push({ id: id, kind: String(kind), args: flat });
+    if (__zHostQueue.length >= __zHostQueueMax) throw new RangeError("host.call: too many requests queued");
+    var wantsCb = typeof cb === "function";
+    if (wantsCb && __zHostPending >= __zHostPendingMax) throw new RangeError("host.call: too many requests awaiting a reply");
+    var id = ++__zHostId;
+    if (wantsCb) { __zHostCbs[id] = cb; __zHostPending++; }
+    __zHostQueue.push({ id: id, kind: k, args: flat });
   },
 };
 
@@ -107,22 +126,24 @@ var accel = {
 function __zListenerTypes() {
   var out = [];
   for (var t in __zEvents) {
-    if (Object.prototype.hasOwnProperty.call(__zEvents, t) && __zEvents[t].length) out.push(t);
+    if (__zEvents[t].length) out.push(t);
   }
   return out;
 }
 
 function __zDispatchEvent(type, evt) {
-  var hs = __zEvents[type];
+  var hs = __zEvents[String(type)];
   if (!hs || !hs.length) return 0;
   if (evt && typeof evt.preventDefault !== "function") {
     evt.preventDefault = function () {};
     evt.stopPropagation = function () {};
   }
   var n = 0;
-  // Copy first: a handler may remove itself while we are iterating.
+  // Copy first: a handler may remove itself while we are iterating, and it
+  // must not skip the unrelated listener after it.
   var copy = hs.slice();
   for (var i = 0; i < copy.length; i++) {
+    if (typeof copy[i] !== "function") continue;
     copy[i](evt);
     n++;
   }
@@ -139,6 +160,7 @@ function __zResolveHostCall(id, result) {
   var cb = __zHostCbs[id];
   if (!cb) return 0;
   delete __zHostCbs[id];
+  __zHostPending--;
   cb(result);
   return 1;
 }

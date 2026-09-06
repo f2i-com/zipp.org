@@ -39,10 +39,20 @@ fn pad2_cond_fuse_enabled() -> bool {
     }
 }
 
-/// `ZIPP_STRICT_CALL_ORDER=1` confines method-call fusion to the PROVABLE
-/// argument class (see `FnCompiler::arg_order_transparent`): every other
-/// `obj.name(args)` then takes the captured `GetProp` + `CallWithThis`
-/// lowering. A compile-time switch, read once.
+/// Method-call fusion is confined to the PROVABLE argument class by default
+/// (see `FnCompiler::arg_order_transparent`): every other `obj.name(args)`
+/// takes the captured `GetProp` + `CallWithThis` lowering, which evaluates the
+/// reference before the arguments as EvaluateCall requires.
+///
+/// `ZIPP_RELAXED_CALL_ORDER=1` re-admits the PRIMITIVE-OPERAND class — the
+/// pre-audit default, under which an argument's own property read, coercion or
+/// global read ran BEFORE the callee's property Get, and a getter or proxy
+/// trap on either side could observe the difference (the 6 September 2026
+/// audit's Z01: `receiver.m(input.value)` logged `argument` before `method`).
+/// It is a diagnostic and benchmarking switch, not a shipping profile.
+/// `ZIPP_STRICT_CALL_ORDER=1` wins when both are set, so a run that asks for
+/// strict order gets it whatever else the environment carries. A compile-time
+/// switch, read once.
 #[inline]
 fn strict_call_order() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -51,7 +61,9 @@ fn strict_call_order() -> bool {
         0 => false,
         1 => true,
         _ => {
-            let v = std::env::var_os("ZIPP_STRICT_CALL_ORDER").is_some() as u8;
+            let relaxed = std::env::var_os("ZIPP_RELAXED_CALL_ORDER").is_some()
+                && std::env::var_os("ZIPP_STRICT_CALL_ORDER").is_none();
+            let v = (!relaxed) as u8;
             ON.store(v, Ordering::Relaxed);
             v == 1
         }
@@ -1950,25 +1962,30 @@ impl<'a> FnCompiler<'a> {
     ///   code, cannot throw and reads nothing a getter could mutate: a literal,
     ///   `this` outside a derived constructor's TDZ, a register-resident local
     ///   (never captured, so no closure — and no getter — can write it), the
-    ///   `undefined`/`NaN`/`Infinity` constant folds, and `!`/`typeof`/`void`,
-    ///   `&&`/`||`/`??` and `?:` over such operands (ToBoolean runs no code).
-    /// * The PRIMITIVE-OPERAND class — accepted unless `ZIPP_STRICT_CALL_ORDER`
-    ///   is set. Reads of globals, cells and upvalues; arithmetic /
-    ///   comparison / string-concatenation / template forms over transparent
-    ///   operands; array and plain-keyed object literals of transparent parts;
-    ///   closure literals; property, element and private reads over
-    ///   transparent parts. These run user code ONLY through an object
-    ///   operand's `valueOf`/`toString`/`Symbol.toPrimitive` or an accessor /
-    ///   proxy trap on a read's own base, throw only on a TDZ, a never-declared
-    ///   name, a nullish base or a private brand miss, and read state only a
-    ///   side-effecting
-    ///   accessor on the CALLEE property could have changed first. Every one of
-    ///   those needs an exotic partner at the same site (a getter or proxy trap
-    ///   on `obj.name` that mutates the caller's state, or an object operand
-    ///   with a callee-replacing coercion) — patterns without a legitimate
-    ///   use, and exactly what the pre-hardening engine assumed at every call
-    ///   site. The latch exists so a conformance or differential run can prove
-    ///   the split lowering against the provable class alone.
+    ///   `undefined`/`NaN`/`Infinity` constant folds, `!`/`typeof`/`void`,
+    ///   `&&`/`||`/`??` and `?:` over such operands (ToBoolean runs no code),
+    ///   arithmetic / comparison / concatenation / template forms whose every
+    ///   operand is PROVABLY PRIMITIVE (`provably_primitive`: a literal or a
+    ///   fold of literals, so there is no ToPrimitive hook to run and nothing
+    ///   to throw), and array, plain-keyed object and closure literals of
+    ///   provable parts (an allocation runs no user code).
+    /// * The PRIMITIVE-OPERAND class — accepted only under
+    ///   `ZIPP_RELAXED_CALL_ORDER=1` (see `strict_call_order`). Reads of
+    ///   globals, cells and upvalues; arithmetic / comparison / concatenation /
+    ///   template forms over operands that are transparent but not provably
+    ///   primitive; property, element and private reads over transparent
+    ///   parts. These run user code through an object operand's
+    ///   `valueOf`/`toString`/`Symbol.toPrimitive` or an accessor / proxy trap
+    ///   on a read's own base, throw on a TDZ, a never-declared name, a
+    ///   nullish base or a private brand miss, and read state a side-effecting
+    ///   accessor on the CALLEE property could have changed first. Each needs
+    ///   an exotic partner at the same site — a getter or proxy trap on
+    ///   `obj.name` that mutates the caller's state, or an object operand with
+    ///   a callee-replacing coercion — which is rare, but is ordinary
+    ///   JavaScript that the pre-audit engine reordered silently. The class is
+    ///   kept, off by default, so the fused lanes' cost can be measured
+    ///   against it and so a differential run can prove the split lowering
+    ///   against the provable class alone.
     ///
     /// Everything else stays captured: a
     /// call, `new`, an assignment/update, a spread, `in`/`instanceof` (proxy
@@ -1978,6 +1995,49 @@ impl<'a> FnCompiler<'a> {
     pub(crate) fn arg_order_transparent(&mut self, e: &Expr) -> bool {
         let relaxed = !strict_call_order();
         self.arg_transparent_in(e, relaxed)
+    }
+
+    /// The subset of the provable class whose VALUE is a primitive without
+    /// anything running: a literal, a constant fold, `!`/`typeof`/`void` of a
+    /// provable operand (always a boolean, a string, undefined), and the
+    /// arithmetic, comparison, concatenation, logical, conditional and
+    /// template forms over such operands. No operand can carry a
+    /// `valueOf`/`toString`/`Symbol.toPrimitive` hook, and none of these
+    /// expressions throws: a BigInt literal is not in the set, so the
+    /// mixed-type TypeError cannot arise, and a Symbol cannot be spelled.
+    /// `in`/`instanceof` are refused as in the transparent class.
+    fn provably_primitive(&mut self, e: &Expr) -> bool {
+        match e {
+            Expr::Num(_) | Expr::Str(_) | Expr::Bool(_) | Expr::Null => true,
+            Expr::Ident(id) => {
+                let name: &str = id;
+                matches!(name, "undefined" | "NaN" | "Infinity")
+                    && self.ident_order_transparent(name, false)
+            }
+            Expr::Unary {
+                op: UnaryOp::Not | UnaryOp::Typeof | UnaryOp::Void,
+                arg,
+            } => self.arg_transparent_in(arg, false),
+            Expr::Unary {
+                op: UnaryOp::Minus | UnaryOp::Plus | UnaryOp::BitNot,
+                arg,
+            } => self.provably_primitive(arg),
+            Expr::Binary { op, left, right } => {
+                !matches!(op, BinaryOp::In | BinaryOp::Instanceof)
+                    && self.provably_primitive(left)
+                    && self.provably_primitive(right)
+            }
+            Expr::Logical { left, right, .. } => {
+                self.provably_primitive(left) && self.provably_primitive(right)
+            }
+            Expr::Cond { test, cons, alt } => {
+                self.provably_primitive(test)
+                    && self.provably_primitive(cons)
+                    && self.provably_primitive(alt)
+            }
+            Expr::Template(t) => t.exprs.iter().all(|x| self.provably_primitive(x)),
+            _ => false,
+        }
     }
 
     fn arg_transparent_in(&mut self, e: &Expr, relaxed: bool) -> bool {
@@ -2001,62 +2061,63 @@ impl<'a> FnCompiler<'a> {
                     && self.arg_transparent_in(alt, relaxed)
             }
             Expr::Ident(id) => self.ident_order_transparent(id, relaxed),
-            // ── primitive-operand class ──────────────────────────────────
-            // ToNumber / ToPrimitive on an OBJECT operand is user code.
+            // ── provable when every operand is provably primitive ─────────
+            // ToNumber / ToPrimitive on an OBJECT operand is user code; on a
+            // literal or a fold of literals there is no object to ask.
+            // Otherwise this is the primitive-operand class.
             Expr::Unary {
                 op: UnaryOp::Minus | UnaryOp::Plus | UnaryOp::BitNot,
                 arg,
-            } => relaxed && self.arg_transparent_in(arg, relaxed),
+            } => self.provably_primitive(arg) || (relaxed && self.arg_transparent_in(arg, relaxed)),
             // `in` probes (proxy `has`) and `instanceof` (Symbol.hasInstance)
             // run user code on ordinary operands; every other operator only
             // through an object operand's coercion.
             Expr::Binary { op, left, right } => {
-                relaxed
-                    && !matches!(op, BinaryOp::In | BinaryOp::Instanceof)
-                    && self.arg_transparent_in(left, relaxed)
-                    && self.arg_transparent_in(right, relaxed)
+                !matches!(op, BinaryOp::In | BinaryOp::Instanceof)
+                    && ((self.provably_primitive(left) && self.provably_primitive(right))
+                        || (relaxed
+                            && self.arg_transparent_in(left, relaxed)
+                            && self.arg_transparent_in(right, relaxed)))
             }
             // ToString of an object substitution is user code.
             Expr::Template(t) => {
-                relaxed && t.exprs.iter().all(|x| self.arg_transparent_in(x, relaxed))
+                t.exprs.iter().all(|x| self.provably_primitive(x))
+                    || (relaxed && t.exprs.iter().all(|x| self.arg_transparent_in(x, relaxed)))
             }
-            // An allocation; holes are fine, a spread iterates user code.
-            Expr::Array(elems, _) => {
-                relaxed
-                    && elems.iter().all(|el| match el {
-                        None => true,
-                        Some(ArrayElem::Expr(x)) => self.arg_transparent_in(x, relaxed),
-                        Some(ArrayElem::Spread(_)) => false,
-                    })
-            }
+            // ── provable: allocations run no user code ───────────────────
+            // An array literal of transparent parts; holes are fine, a spread
+            // iterates user code.
+            Expr::Array(elems, _) => elems.iter().all(|el| match el {
+                None => true,
+                Some(ArrayElem::Expr(x)) => self.arg_transparent_in(x, relaxed),
+                Some(ArrayElem::Spread(_)) => false,
+            }),
             // An allocation with plain (identifier / string / number) keys and
             // transparent values; a method/accessor DEFINITION only allocates
             // its closure. A computed key runs ToPropertyKey and a spread
             // enumerates (ownKeys/get traps) — both user code.
-            Expr::Object(members, _) => {
-                relaxed
-                    && members.iter().all(|mbr| match mbr {
-                        ObjectMember::Prop {
-                            key,
-                            value,
-                            init: None,
-                            ..
-                        } => {
-                            matches!(key, PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_))
-                                && self.arg_transparent_in(value, relaxed)
-                        }
-                        ObjectMember::Method { key, .. }
-                        | ObjectMember::Get { key, .. }
-                        | ObjectMember::Set { key, .. } => {
-                            matches!(key, PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_))
-                        }
-                        _ => false,
-                    })
-            }
+            Expr::Object(members, _) => members.iter().all(|mbr| match mbr {
+                ObjectMember::Prop {
+                    key,
+                    value,
+                    init: None,
+                    ..
+                } => {
+                    matches!(key, PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_))
+                        && self.arg_transparent_in(value, relaxed)
+                }
+                ObjectMember::Method { key, .. }
+                | ObjectMember::Get { key, .. }
+                | ObjectMember::Set { key, .. } => {
+                    matches!(key, PropKey::Ident(_) | PropKey::Str(_) | PropKey::Num(_))
+                }
+                _ => false,
+            }),
             // A closure literal is an allocation (its captures are already
             // cells); a class expression evaluates computed keys and static
             // blocks, so it stays captured.
-            Expr::Arrow(_) | Expr::Function(_) => relaxed,
+            Expr::Arrow(_) | Expr::Function(_) => true,
+            // ── primitive-operand class ──────────────────────────────────
             // A plain property / element / private read (optional or not)
             // over transparent parts: `x.prop`, `x[i]`, `this.#p`. It runs
             // user code ONLY through an accessor or proxy trap on the
