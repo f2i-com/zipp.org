@@ -154,9 +154,11 @@ P1/P2 findings are closed in v0.0.15; the rest are recorded below as open.
   subclass instances, replaced and null prototypes, accessors, Map/Set) in
   the default, relaxed, interpreter and GC-stress modes.
 
-  The shapes, same harness conditions as the table below, best of 20, ms
-  per 100,000 calls (the imul/charCodeAt rows loop 4,096 elements per
-  call), baseline `40993c4d` → B280 alone → B280 + B289:
+  The shapes (`crates/zipp-wasm/tests/node/bench-shapes.cjs`, an A/B over
+  two package directories, run in both orders), same harness conditions as
+  the table below, best of 20, ms per 100,000 calls (the imul/charCodeAt
+  rows loop 4,096 elements per call), baseline `40993c4d` → B280 alone →
+  B280 + B289:
 
   | shape | 40993c4d | B280 | B280+B289 |
   |---|---:|---:|---:|
