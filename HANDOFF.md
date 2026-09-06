@@ -9,10 +9,12 @@ and the B001–B252 experiment ledger is preserved in
 
 Main is at `8229b3fc`: v0.0.12 plus B263-B273, with the `8229b3fc` canonical
 capture (all-30 0.728× Node, 21/30 Node point wins). The tracked production
-WebAssembly module was rebuilt from the v0.0.12 engine with B269's regex fix
-(B270-B273 landed after it; rebuild the module at the next release): the
-landing page ships 5,558,860 bytes raw, 1,812,458 gzip-9, 1,248,649
-Brotli-11, SHA-256 `bd8614fe5f3a3b8ef67f4b917cdefebb3fe69afa39a9804a0d3f6b0b6b267126`.
+WebAssembly module (`landing/public/wasm/`) is the v0.0.15 engine, built
+with release.yml's recipe (locked release build, `--target web`, name and
+producers sections removed, target-features section stripped): the landing
+page ships 5,119,419 bytes raw, 1,764,573 gzip-9, 1,202,447 Brotli-11,
+SHA-256 `7c40f488d8b69209eea9e56dea2b0be13b3da0fd3810f3d8ec1d44c3d95972e4`
+(v0.0.12's module was 5,558,860 / 1,812,458 / 1,248,649).
 
 2026-09-05 (B274-B278, from the external WASM audit's handoff): the wasm
 interpreter's four cliffs are closed — non-ASCII string indexing was

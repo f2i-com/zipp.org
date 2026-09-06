@@ -2,6 +2,7 @@
 /* eslint-disable */
 export const memory: WebAssembly.Memory;
 export const __wbg_engine_free: (a: number, b: number) => void;
+export const accelGuestCall: (a: number, b: number, c: number, d: number) => [number, number, number];
 export const engine_callFunction: (a: number, b: number, c: number, d: any) => [number, number, number];
 export const engine_dispatchEvent: (a: number, b: number, c: number, d: any) => [number, number, number];
 export const engine_dispose: (a: number) => void;
@@ -17,14 +18,17 @@ export const engine_preambleLines: (a: number) => number;
 export const engine_pump: (a: number) => [number, number];
 export const engine_renewInstructionBudget: (a: number) => number;
 export const engine_resolveHostCallback: (a: number, b: number, c: any) => [number, number];
+export const engine_setAccelBridge: (a: number, b: any) => [number, number];
 export const engine_setClipboardBridge: (a: number, b: any) => [number, number];
 export const engine_setDbBridge: (a: number, b: any) => [number, number];
 export const engine_setFingerprintSeed: (a: number, b: number, c: number) => void;
 export const engine_setGlobalByIndex: (a: number, b: number, c: any) => [number, number];
 export const engine_setGlobalsBatch: (a: number, b: any, c: any) => [number, number];
+export const engine_setInstructionBudget: (a: number, b: number) => number;
 export const engine_setLocalStorageBridge: (a: number, b: any) => [number, number];
 export const engine_setSyncHostCapabilities: (a: number, b: any) => [number, number];
 export const engine_takeOutput: (a: number) => [number, number, number];
+export const zippProfile: () => [number, number];
 export const zipp_install_panic_hook: () => void;
 export const zipp_start: () => void;
 export const __wbindgen_malloc: (a: number, b: number) => number;

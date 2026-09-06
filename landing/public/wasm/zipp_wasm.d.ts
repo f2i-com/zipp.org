@@ -104,6 +104,17 @@ export class Engine {
      */
     resolveHostCallback(call_id: number, result: any): void;
     /**
+     * Install the object backing `accel.*`: a host that compiles guest-
+     * generated functions with its own engine. Its methods receive what
+     * the guest passed, except that `make` sees every `g:NAME` entry of the
+     * spec resolved to `r:address:length:kind` -- the region of engine
+     * memory holding that global's typed array, pinned for the VM's
+     * lifetime -- and `state` receives the region of the named array as
+     * three numbers. During `run` the host may call [`accelGuestCall`] to
+     * run a guest function by name with numbers.
+     */
+    setAccelBridge(bridge: any): void;
+    /**
      * Install the object backing `navigator.clipboard.*`. Clipboard authority
      * is intentionally separate from local storage authority.
      */
@@ -136,6 +147,34 @@ export class Engine {
      */
     setGlobalsBatch(indices: any, values: any): void;
     /**
+     * Set this engine's instruction budget to `steps`, clamped to
+     * `[1, MAX_INSTRUCTION_BUDGET_STEPS]`.
+     *
+     * The default lifetime budget is sized for an interactive host. An
+     * embedder that runs the SAME script on more than one runtime — this
+     * module in the browser, the engine natively or under WASI on a server —
+     * needs the budgets to agree, or an expression can complete on one side
+     * and be cut off on the other. This is the host-side knob for that; the
+     * clamp is the fuse it cannot remove.
+     *
+     * Called BEFORE `initScript`, the allowance governs top-level execution
+     * and `_init` as well: it used to need existing script state, so the one
+     * phase a host most wants to bound — a stranger's top level — always ran
+     * under the default (the 6 September 2026 audit's Z06). Called after,
+     * it renews the running budget to the new size, and every later
+     * `renewInstructionBudget` restores that size rather than the default.
+     *
+     * The value's handling is defined, not incidental: a non-finite number
+     * selects the default; a fraction is truncated; zero and negatives clamp
+     * to one step; anything above the maximum clamps to it. Host-only, like
+     * renewal: a method on the Engine binding, unreachable from guest code.
+     * Setting the budget restores nothing else — heap, output and
+     * dynamic-code ceilings stay where setup left them. Returns false once a
+     * budget has actually been spent, exactly as renewal does, and on a
+     * disposed engine.
+     */
+    setInstructionBudget(steps: number): boolean;
+    /**
      * Install the object backing `localStorage.*`. This never provides the
      * clipboard bridge, even when the object happens to have clipboard-like
      * methods.
@@ -159,6 +198,24 @@ export class Engine {
 }
 
 /**
+ * Run a guest function by global name with numbers, from inside a host
+ * `accel.run` bridge call and only from there: the engine is re-entered
+ * through the context of the call in progress. The guest cannot make a
+ * nested host call while it runs.
+ */
+export function accelGuestCall(name: string, args: Float64Array): number;
+
+/**
+ * The limits and semantics this artifact was built with, as JSON.
+ *
+ * A host used to have only the README's table to go by, and at v0.0.14 four
+ * of its rows described an older build (the 6 September 2026 audit's Z04).
+ * This is read from the same constants the engine enforces, so it cannot
+ * drift; `tests/node/profile-matches-readme.cjs` holds the README to it.
+ */
+export function zippProfile(): string;
+
+/**
  * Route Rust panics to `console.error` with a message instead of a bare
  * `unreachable` trap — without this a panic in wasm is undiagnosable.
  */
@@ -176,6 +233,7 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly __wbg_engine_free: (a: number, b: number) => void;
+    readonly accelGuestCall: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly engine_callFunction: (a: number, b: number, c: number, d: any) => [number, number, number];
     readonly engine_dispatchEvent: (a: number, b: number, c: number, d: any) => [number, number, number];
     readonly engine_dispose: (a: number) => void;
@@ -191,14 +249,17 @@ export interface InitOutput {
     readonly engine_pump: (a: number) => [number, number];
     readonly engine_renewInstructionBudget: (a: number) => number;
     readonly engine_resolveHostCallback: (a: number, b: number, c: any) => [number, number];
+    readonly engine_setAccelBridge: (a: number, b: any) => [number, number];
     readonly engine_setClipboardBridge: (a: number, b: any) => [number, number];
     readonly engine_setDbBridge: (a: number, b: any) => [number, number];
     readonly engine_setFingerprintSeed: (a: number, b: number, c: number) => void;
     readonly engine_setGlobalByIndex: (a: number, b: number, c: any) => [number, number];
     readonly engine_setGlobalsBatch: (a: number, b: any, c: any) => [number, number];
+    readonly engine_setInstructionBudget: (a: number, b: number) => number;
     readonly engine_setLocalStorageBridge: (a: number, b: any) => [number, number];
     readonly engine_setSyncHostCapabilities: (a: number, b: any) => [number, number];
     readonly engine_takeOutput: (a: number) => [number, number, number];
+    readonly zippProfile: () => [number, number];
     readonly zipp_install_panic_hook: () => void;
     readonly zipp_start: () => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
