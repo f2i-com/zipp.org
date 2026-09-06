@@ -28,7 +28,7 @@ measured with `crates/zipp-wasm/tests/node/bench.cjs`-style interleaved
 A/Bs, not the native PGO capture; the tracked module must be rebuilt to
 ship them. The audit's captured-call IC was measured and not built (B279).
 
-## 2026-09-06 (B280-B288, from the ZIPP engineering audit)
+## 2026-09-06 (B280-B289, from the ZIPP engineering audit)
 
 The audit reviewed `40993c4d` (v0.0.14). Its two P0 findings and six of the
 P1/P2 findings are closed in v0.0.15; the rest are recorded below as open.
@@ -101,12 +101,21 @@ P1/P2 findings are closed in v0.0.15; the rest are recorded below as open.
   lanes are unchanged. Not gated: `cargo fmt` (the native workspace is not
   fmt-clean) and clippy (the engine crate does not pass it); both are
   worth a separate change. The gate runs every binary (`--no-fail-fast`)
-  and quarantines, by name and with a notice in the log, three of
-  `bool_home_clobber`'s INT-GPR planning assertions that fail on the
-  GitHub runner at `40993c4d` itself (control run 34034702340, the audited
-  commit plus only the workflow) on bytecode identical to the developer
-  machine's; the planner's expectation there is machine-dependent, and is
-  a separate investigation.
+  and quarantines, by name and with a notice in the log, the x86-64
+  register-tier mechanism assertions that fail on the GitHub runner at
+  `40993c4d` itself — control runs of the audited commit plus only the
+  workflow: 34034702340 (the first binary) and 34042369088 (every binary,
+  120-minute cap): three of `bool_home_clobber`'s INT-GPR planning
+  assertions, `multi_split`'s four split-receiver mechanism tests,
+  `gpr_deopt_shadow`'s census, `split_recv_writethrough`'s three
+  write-through mechanism tests (one of which passes on some runs) and
+  `sroa_objref_slot`'s four SROA mechanism tests — on bytecode identical
+  to the developer machine's (the relaxed switch reproduces `40993c4d`'s
+  bytecode for every fixture, and the first two binaries' logged children
+  run under it). The planner's expectation there is machine-dependent and
+  is a separate investigation; the parity tests in the same binaries run
+  and pass on the runner. Nothing else in the 228-binary suite fails
+  there, with Node 24 installed for the node-comparison tests.
 - **B288 — the ARM64 default-feature build.** `note_reg_kind` named
   `codegen::writes_reg`, which exists only for x86-64, under
   `feature = "jit"` alone, so `cargo test -p zipp-vm` did not compile on an
@@ -181,9 +190,11 @@ P1/P2 findings are closed in v0.0.15; the rest are recorded below as open.
   TypedArray, DataView and RegExp receivers (`ta.fill(i & 255)` is +6%,
   the DataView getters have a fused lane the captured form cannot reach);
   and the x86-64 register tiers, whose method lanes recognise only the
-  fused shape — the two mechanism tests whose logged children now opt into
-  `ZIPP_RELAXED_CALL_ORDER=1` (`multi_split`, `gpr_deopt_shadow`) are the
-  first of that set, and the CI run names the rest. `Math.imul` with
+  fused shape — `multi_split` and `gpr_deopt_shadow`'s logged children now
+  opt into `ZIPP_RELAXED_CALL_ORDER=1` to keep studying the fused lanes,
+  and the other 31 mechanism binaries whose fixtures change lowering pass
+  under the default on the runner, so their lanes either accept the
+  captured shape or are pinned by fixtures over locals. `Math.imul` with
   global operands is the one row that lost ground twice: `Math` is a plain
   object, so neither proof applies, and the captured form pays the
   `GetProp` plus a generic native call; a Math-intrinsic identity lane is

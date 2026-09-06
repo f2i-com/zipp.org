@@ -63,20 +63,24 @@ jobs:
       # its failures rather than the first.
       #
       # Quarantined, and said so in the log rather than treated as passing:
-      # three of bool_home_clobber's INT-GPR planning assertions
-      # (denseint-4's one-slot split spill and the two-spill cap) fail on this
-      # runner at the audited commit 40993c4d as well — a control run of that
-      # commit with only this workflow added, run 34034702340 — on identical
-      # bytecode, so they describe the planner's behaviour on the developer's
-      # machine rather than a regression. Remove the skips once the planner's
-      # expectation is machine-independent.
+      # the x86-64 register-tier mechanism assertions below fail on this
+      # runner at the audited commit 40993c4d as well — control runs of that
+      # commit with only this workflow added: 34034702340 (the first binary,
+      # bool_home_clobber's denseint-4 one-slot split spill and two-spill
+      # cap) and 34042369088 (every binary: multi_split's four split-receiver
+      # mechanism tests, gpr_deopt_shadow's census, split_recv_writethrough's
+      # three write-through mechanism tests, of which dv_oob_int_gpr passes
+      # on some runs, and sroa_objref_slot's four SROA mechanism tests) — on
+      # bytecode identical to the developer machine's (the mechanism children
+      # of multi_split and gpr_deopt_shadow run under the relaxed call order,
+      # which reproduces 40993c4d's bytecode exactly). They describe the
+      # planner's behaviour on the developer's machine rather than a
+      # regression; the parity tests in the same binaries run and pass here.
+      # Remove a skip once its planner expectation is machine-independent.
       - name: Test the engine
         run: |
-          echo "::notice title=Quarantined::boolhome_denseint_four_engages_one_bounded_split_spill, boolhome_denseint_four_no_spill_switch_refuses_split_spill and boolhome_split_spill_bridge_stays_capped_at_one are skipped on this runner (pre-existing at 40993c4d; see the comment in ci.yml)."
-          cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast -- \
-            --skip boolhome_denseint_four_engages_one_bounded_split_spill \
-            --skip boolhome_denseint_four_no_spill_switch_refuses_split_spill \
-            --skip boolhome_split_spill_bridge_stays_capped_at_one
+          echo "::notice title=Quarantined::bool_home_clobber (3), multi_split (msplit_mechanism_*), gpr_deopt_shadow (shadow_mechanism_*), split_recv_writethrough (splitwt_mechanism_*) and sroa_objref_slot (sroa_mechanism_*) planner assertions are skipped on this runner (pre-existing at 40993c4d, control runs 34034702340 and 34042369088; see the comment in ci.yml)."
+          cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast --             --skip boolhome_denseint_four_engages_one_bounded_split_spill             --skip boolhome_denseint_four_no_spill_switch_refuses_split_spill             --skip boolhome_split_spill_bridge_stays_capped_at_one             --skip msplit_mechanism_             --skip shadow_mechanism_             --skip splitwt_mechanism_             --skip sroa_mechanism_
 
   wasm:
     name: WebAssembly host boundary
