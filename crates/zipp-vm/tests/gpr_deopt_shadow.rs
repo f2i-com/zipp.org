@@ -182,6 +182,11 @@ console.log(minHuge, minWide, minCount, typeof minHuge, typeof minWide);
     );
 }
 
+/// The census below describes the fused method-call lowering, and these
+/// fixtures read their operands from top-level `var`s (global reads), which
+/// the strict default lowering (B280) captures rather than fuses. The logged
+/// child therefore opts into the relaxed lowering; the parity tests above run
+/// under the default, so both lowerings stay checked against node.
 fn logged_child(test: &str, extra: &[(&str, &str)]) -> String {
     let exe = std::env::current_exe().expect("test exe path");
     let mut cmd = std::process::Command::new(&exe);
@@ -189,6 +194,8 @@ fn logged_child(test: &str, extra: &[(&str, &str)]) -> String {
         .arg("--exact")
         .arg("--nocapture")
         .env("ZIPP_JITLOG", "1")
+        .env("ZIPP_RELAXED_CALL_ORDER", "1")
+        .env_remove("ZIPP_STRICT_CALL_ORDER")
         .env_remove("ZIPP_NO_GPR_DEOPT_SHADOW")
         .env_remove("ZIPP_NO_DV_GPR")
         .env_remove("ZIPP_NO_GPR_HOMES")

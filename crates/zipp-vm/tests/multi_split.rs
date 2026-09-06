@@ -318,6 +318,12 @@ fn msplit_all_modes_answer_identically() {
     }
 }
 
+/// The mechanism under study is the fused method-call lowering's split
+/// receivers, and these fixtures keep their state in top-level `var`s (global
+/// reads), which the strict default lowering (B280) captures rather than
+/// fuses. The logged child therefore opts into the relaxed lowering; the
+/// parity tests above still run under the default, so both lowerings stay
+/// checked against node.
 fn jitlog_of(test_name: &str, env: &[(&str, &str)]) -> String {
     let exe = std::env::current_exe().expect("test exe path");
     let mut cmd = std::process::Command::new(&exe);
@@ -325,7 +331,9 @@ fn jitlog_of(test_name: &str, env: &[(&str, &str)]) -> String {
         .arg("--exact")
         .arg("--nocapture") // libtest swallows a PASSING child's stderr otherwise
         .env("ZIPP_JITLOG", "1")
-        .env("ZIPP_JITDECLINE", "1");
+        .env("ZIPP_JITDECLINE", "1")
+        .env("ZIPP_RELAXED_CALL_ORDER", "1")
+        .env_remove("ZIPP_STRICT_CALL_ORDER");
     for (k, v) in env {
         cmd.env(k, v);
     }

@@ -31,7 +31,10 @@ jobs:
   engine:
     name: Engine tests (default features)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # The suite is 228 binaries, several of which sweep every execution mode
+    # in child processes and a few of which run sustained-garbage loops for
+    # minutes; 45 minutes cut the first run off at 144 binaries.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
