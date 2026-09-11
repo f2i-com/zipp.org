@@ -30,6 +30,196 @@ measured with `crates/zipp-wasm/tests/node/bench.cjs`-style interleaved
 A/Bs, not the native PGO capture; the tracked module must be rebuilt to
 ship them. The audit's captured-call IC was measured and not built (B279).
 
+## 2026-09-11 (B315-B324, from the ZIPP close audit of `1477070`)
+
+The second audit of the day reviewed the tree the first batch produced
+(`1477070306d6ab08abd4e00cbf17014e5679f0a0`) — 14 tickets, ZA-01..14, six
+P1, read-only, with an SDK transcription probe, seven reduced models and
+three proposed WASM cases, none run against the engine. Every ticket was
+reproduced against the real checkout or the real artifact before it was
+changed; the audit's own probes now pass where they applied (SDK 4 of 4,
+WASM 3 of 3) and two of its "source-confirmed" findings turned out
+worse in execution than on paper (ZA-04 poisoned the instance; ZA-05's test
+surfaced a second, unrelated defect). Nothing here claims a speedup.
+
+- **B315 (ZA-05, P1) — a host entry's completion value is rooted across
+  the microtask drain.** `host_call_slot_bounded` and `host_eval_rich` held
+  the callee's result in a Rust local while the drain ran guest jobs and
+  polled the collector between them; the callee's frame was already gone, so
+  nothing traced it. Under `ZIPP_GC_STRESS` every shape of result came back
+  freed (the object read as empty; a string as garbage). `host_result_roots`
+  is a stack the collector traces: each entry pushes before the drain and
+  pops on every exit (success, throw, conversion failure), so nested drains
+  keep their discipline and collection stays ON during long jobs.
+  `tests/audit_20260911_za_host_roots.rs` is the deterministic proof — the
+  variable is read at `Vm::new`, so the binary sets it before its first VM:
+  six shapes, all red on `a75eac9f`, green after — and the artifact test
+  runs the audit's allocation-pressure case beside it.
+- **B316 — a throw delivered to the host resurfaced in the next call**
+  (surfaced by B315's test; not in the audit). `run_loop` leaves
+  `pending_throw` set so an ENCLOSING interpreter loop can catch the value,
+  and at the host boundary nothing cleared it: the next call that reached a
+  compiled-code exit or deopt check (`try_run_osr`, the function-JIT bail
+  path, `invoke_cb_windowed`) read the stale value as a throw in flight and
+  failed with the PREVIOUS call's error — a `throw` followed by a call into
+  any function with a loop, on the native JIT profiles. The WASM build runs
+  no compiled tier and was not affected. Every host entry that turns a
+  `Thrown` into a message (`call_slot`, `call_global`, `eval_in_context`,
+  `run_init`, the by-name resolver) now goes through `take_host_throw`,
+  which clears it. Pinned by the same test binary through three entries.
+- **B317 (ZA-04, P1) — long lone-surrogate strings cross in bounded
+  chunks.** The UTF-16 rebuild passed the whole code-unit slice to the
+  variadic `String.fromCharCode` binding. Executed against the `1477070`
+  artifact, the audit's 200,000-unit case threw the engine's argument-count
+  `RangeError` uncaught — and, worse than the audit could see from source,
+  the uncaught JS exception left wasm-bindgen's borrow flag set, so EVERY
+  later call on that engine failed with "recursive use of an object
+  detected which would lead to unsafe aliasing": the instance was poisoned.
+  Now 4,096 units per `fromCharCode` call, joined with
+  `String.prototype.concat` (the one new host import, added to the pinned
+  surface with its reason: 45 functions). Pinned at 0, 1, 4,095, 4,096,
+  4,097, 8,192, 100,000 and 200,000 units, mixed text, NUL, inbound
+  120,000 units, and the engine usable after every conversion, including a
+  refused over-ceiling one. The audit's own three-case WASM probe: ZA-04
+  FAIL → PASS (wasm `36107dd2…` → `19ccf9cc…`).
+- **B318 (ZA-01/02/03, P1/P1/P2) — the reference SDK is v1.1.0.** Categories
+  come from a structured envelope, never from text: the engine gained
+  `lastErrorKind()` (`guest`, `conversion`, `usage`, `source`, `resource`,
+  recorded where each error is BUILT — `finish_execution` for a guest throw
+  or the recorder's verdict, the conversion helper for a budget, the
+  initialization path for `source`) and a `disposed` getter as the trusted
+  terminal signal; the Worker relays `{ category, message, terminal }`, the
+  main thread dies only on `terminal` or a deadline/termination. A guest
+  `throw new Error("business limit reached")` is `guest` and the host stays
+  ready; `conversion` is a new recoverable category. Every request settles
+  exactly once through one idempotent path — reply, send failure (a payload
+  structured clone refuses is rejected locally as `usage` with no timer or
+  entry left, before anything is posted), deadline, death. `dead` is
+  monotonic (an initialization reply in flight when the host was terminated
+  cannot make it ready; a message for a dead generation settles nothing),
+  ordinary operations before `ready` are refused locally (no initialization
+  queue; nothing reaches a Worker that may still be loading), deadlines
+  must be finite, positive and at most 2^31−1 ms, and the configuration is
+  frozen at creation. `categorizeEngineError` kept its name with the new
+  contract (an envelope; a bare message is `guest`), so the audit's probe
+  migrated rather than being deleted: 0 of 4 on the `1477070` SDK, 4 of 4
+  now. `tests/node/sdk-contract.mjs` (14 checks, mocked Worker, in the
+  boundary suite) pins the main thread; `tests/browser/index.html` gained
+  three scenarios for the Worker half (a limit-named guest error, an
+  over-budget result, a clone failure with the host usable before and after
+  its former deadline, before-init refusal, the init/terminate race).
+- **B319 (ZA-06, P1) — the drain is transactional across the whole call.**
+  Three changes. (1) The peek and commit helpers run WITHOUT a microtask
+  drain (`call_slot_bounded_no_drain`), so no guest job can touch the queue
+  between a snapshot and its commit — the preamble's comment claiming that
+  was untrue before. (2) The commit names the prefix it means: its length
+  and its first and last request ids (strictly increasing), and a queue that
+  is not what was peeked commits nothing (`-1`), the drain retries, and the
+  attempt ceiling ends a queue that keeps changing. (3) A request committed
+  off the guest queue reaches the host in THIS call whatever happens next: a
+  recoverable failure later in the drain (a tampered helper throwing) ends
+  the drain with what was delivered and is thrown by the NEXT
+  `drainPendingHostCalls`, once, before it does anything; a terminal failure
+  still throws (the engine is disposed and every callback with it). The
+  rejection helper's error reporting can no longer abort a drain: rendering
+  the thrown value and `console.error` itself are both guest-replaceable and
+  now both guarded. Pinned: an early good chunk of 256 then a throwing
+  commit (256 delivered, the cause on the next drain, the remaining 344
+  after, 600 ids exactly once, 600 callbacks still pending), a peek that
+  shifts the queue (nothing delivered under another's identity), a rejection
+  whose callback, `toString` and `console.error` all throw.
+- **B320 (ZA-08, P2) — a drain's ATTEMPTED work is bounded.** Beside the two
+  representation budgets (charged only by committed prefixes, still), one
+  monotonic account of everything attempted — nodes, inspected entries and
+  string bytes of every peek, successful or not, charged from the difference
+  between an attempt's budget and the committed one it was cloned from — with
+  ceilings of 64 attempts, 8,000,000 nodes and 134,217,728 bytes per drain;
+  the rest waits. A failed prefix now retries with ONE request rather than
+  half: halving re-walked a bad head nine times under fresh allowances
+  before reaching one, which under the work ceiling never got there (a 40 MiB
+  request wedged the drain: the ZIPP-02 test caught it). Pinned: 100
+  oversize requests settled across bounded drains each making progress,
+  wide requests that spend the byte allowance before failing, a
+  callback-enqueued replacement delivered once, ten 4 MB requests that fit
+  alone but not together split across drains exactly once. The profile
+  reports `hostCallDrainAttempts`/`WorkNodes`/`WorkBytes`.
+- **B321 (ZA-07, P1) — inspected entries are work.** Both budgets carry a
+  third counter: every object visited charges `2 × entries` (the visible
+  count, then the walk), hidden and accessor entries included, BEFORE either
+  scan; the ceiling is 8 per node of the node ceiling (16,000,000 by
+  default; `with_work_limit` sets it exactly), a read fails with the
+  recoverable `inspection work limit` conversion error and a digest is
+  unknown, never partial. A batched read now threads one VM-side allowance
+  through its slots too (`try_get_slot_bounded`), as the digest did.
+  `tests/audit_20260911_za_host_work.rs` pins the exact counts (20,000
+  hidden entries: 1 node, 40,000 work; refused at 39,999 with 0 work spent;
+  accessors never invoked; 400 repeated slots fit, the 401st is refused);
+  the profile reports `hostValueWorkPerNode`.
+- **B322 (ZA-09, P2) — native name entries use the lexer's IdentifierName
+  rule.** `char::is_alphabetic`/`is_alphanumeric` are not `ID_Start`/
+  `ID_Continue`: `a\u0301`, `a\u200c`, `a\u200d` and `\u2118` were refused
+  for functions the script had defined by exactly those names.
+  `Lexer::is_identifier_name` is the validator now; expressions, dotted
+  paths and calls are still refused and nothing is compiled.
+- **B323 (ZA-13/14, P2) — provenance and distribution.** `ci.yml` records
+  `git rev-parse HEAD` after checkout and stamps THAT into
+  `ZIPP_SOURCE_SHA` (as a reusable workflow called with `ref`, `github.sha`
+  is the caller's event revision), then asserts the built module's
+  `source.sha` equals it. The release web archive now ships `host-sdk/`
+  beside the bindings at the same revision, syntax-checked, with
+  `host-sdk=<version>` in `BUILD-INFO.txt`; the READMEs say so. The cheap SDK
+  and density-statistics checks ride in the boundary suite (no engine
+  needed); browser-specific failure modes stay in `tests/browser/`.
+- **B324 (ZA-11/12, P2; ZA-10 stage one) — measurements that mean what they
+  say.** `bench-density.cjs` reports POOLED per-unit percentiles over every
+  unit of every healthy worker (the old p50 was a mean of worker medians and
+  p95/p99 maxima of worker percentiles: 1,000 one-millisecond units beside
+  one 100 ms unit reported p50 50.5, p99 100; pooled they are 1, 1) with the
+  per-worker summaries kept under their own names (`worst_worker_p99`,
+  `mean_worker_p50`), counts the hostile tenant's cycles apart from useful
+  units (`attack_cycles`; CPU per HEALTHY unit labelled as the cost under
+  interference), and runs each cell in synchronized phases — load (reported
+  as `load_ms`, never inside the window), one shared wall-clock window on a
+  monotonic clock, a snapshot with every instance of the cell alive and none
+  of the next, then disposal (`dispose_ms`) and joined exits. Units are
+  validated exactly (the counter's expected value, the exact alloc figure),
+  latency samples are capped per worker with the overflow reported, and the
+  command line is validated. `density-stats.cjs` pins the arithmetic against
+  small exact pooled references. ZA-10's first stage: `resourceUsage()` and
+  `zippInstanceUsage()` report `retainedFunctionBytes`/`retainedClassBytes`
+  — the bytes the leaked definitions own (the struct, bytecode, constants,
+  tables, retained source), exact for what they count and distinct from
+  allocator reservation and RSS — so the remaining lifetime work has a byte
+  figure to be measured against. The reclaim itself (VM-owned stable
+  allocation for `eval_funcs`/`eval_classes`, audited against the JIT,
+  frames, closures, modules and ICs) is still open.
+- **Still open from this audit:** ZA-10's reclaim stage; a fresh density
+  capture on the corrected harness (B311's figures predate ZA-11/12 and are
+  not comparable); the two optimization experiments in the audit's part D
+  (state-sync as a whole operation; GC scratch reuse), which are measurement
+  programmes, not defects.
+
+Verification for this batch: `cargo test -p zipp-vm --lib` (542
+passed, 2 ignored); on the default profile the touched integration binaries
+(`audit_20260911_host_work`, `global_fingerprint`, `call_order_default`,
+`captured_intrinsic_lane`, `audit_20260911_test262_gaps`, the lib's embed
+tests) and the three new `audit_20260911_za_*` binaries; the same three plus
+`audit_20260911_native` under `--features instrument`; the safe-sandbox
+library (481) with the five boundary binaries under `--features
+safe-sandbox`; `cargo test --locked` in `crates/zipp-wasm` (8); the
+production wasm32 build under the release RUSTFLAGS with wasm-bindgen
+0.2.126 and the boundary suite, 16 of 16 (`audit-2026-09-11-close.cjs` 71
+assertions, `sdk-contract.mjs` 14, `density-stats.cjs` 8, the import
+surface at 45 functions); the three-browser Worker smoke on the stripped web
+package, 40 of 40 on Chromium 153, Firefox 155 and WebKit 26.6; every
+density scenario at two instances for one second (all units validated); the
+audit's own probes — the SDK regressions 0 of 4 on the `1477070` adapter and
+4 of 4 now, the WASM cases red for ZA-04 on a build of the `1477070` binding
+(`RangeError: Maximum call stack size exceeded`, then "recursive use of an
+object detected" on every later call) and 3 of 3 now. Not run: test262, the
+full engine suite, the ARM64 matrix, the release workflow end to end, and a
+full density capture on the corrected harness.
+
 ## 2026-09-11 (B290-B305, from the ZIPP engineering audit)
 
 The audit reviewed `e6e0f65d` (v0.0.15) from source only — it built nothing
@@ -853,6 +1043,8 @@ cargo test --locked -p zipp-vm --no-fail-fast -- $(python tools/ci_quarantine.py
 # the safe profile and the instrumented embedding contracts
 cargo test --locked -p zipp-vm --no-default-features --features safe-sandbox --lib
 cargo test --locked -p zipp-vm --features instrument --test audit_20260911_native
+# the close audit's deterministic proofs (forced GC; exact work counts; Unicode names)
+cargo test --locked -p zipp-vm --test audit_20260911_za_host_roots --test audit_20260911_za_host_work --test audit_20260911_za_names
 # the WASM boundary and the browser Workers (from crates/zipp-wasm)
 cargo build --locked --release --target wasm32-unknown-unknown   # RUSTFLAGS as in ci.yml
 wasm-bindgen --target nodejs --out-dir tests/node/pkg target/wasm32-unknown-unknown/release/zipp_wasm.wasm
