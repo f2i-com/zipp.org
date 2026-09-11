@@ -271,9 +271,10 @@ audit's own vocabulary.
   `tests/browser/worker-smoke.mjs` serves the exact stripped web package and
   runs 28 scenario assertions through the adapter in real Workers; passed on
   Chromium 153.0.8010.12, Firefox 155.0 and WebKit 26.6 (Playwright 1.63.0)
-  and on the installed Chrome 152. CI runs it on Chromium/Firefox/WebKit in
-  a `browser` job. Mobile memory/startup profiles and a downstream SoftN
-  integration run remain open.
+  and on the installed Chrome 152. It is a local check (and runs weekly in
+  `security.yml`); the minimum CI gate does not run browsers. Mobile
+  memory/startup profiles and a downstream SoftN integration run remain
+  open.
 - **B309 (ZIPP-19) — fresh conformance evidence, no performance claim.**
   test262 (checkout `424966138`, 26 May 2026) against the release CLI built
   from `ab56a840` with the JIT on: **95,665 / 95,680 pass, 15 fail**. The same
@@ -795,6 +796,32 @@ wins: 21/30 (normal 11/13, hostile 10/17); all-30 equal-row geomean 0.728× Node
 shapes-stable 1.199 → 1.241 moved the other way with no covering mechanism (the
 one-binary latches of B270-B273 on the PGO binary are neutral or positive on
 both rows), i.e. PGO-profile and layout variation of the size the intervals show.
+
+## Local verification
+
+CI (`ci.yml`) is deliberately the minimum: the VM's unit tests plus the
+audit-day regression binaries, the advertised feature builds, the isolated
+host workspace and the Node boundary suite against the production wasm32
+artifact. Everything else runs LOCALLY before a push (and weekly in
+`security.yml`):
+
+```sh
+# the full engine suite (about 30 minutes; the quarantine manifest is exact)
+cargo test --locked -p zipp-vm --no-fail-fast -- $(python tools/ci_quarantine.py --emit-skips)
+# the safe profile and the instrumented embedding contracts
+cargo test --locked -p zipp-vm --no-default-features --features safe-sandbox --lib
+cargo test --locked -p zipp-vm --features instrument --test audit_20260911_native
+# the WASM boundary and the browser Workers (from crates/zipp-wasm)
+cargo build --locked --release --target wasm32-unknown-unknown   # RUSTFLAGS as in ci.yml
+wasm-bindgen --target nodejs --out-dir tests/node/pkg target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+node tests/node/run-boundary-suite.cjs
+wasm-bindgen --target web --out-dir tests/browser/pkg --remove-name-section --remove-producers-section target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+node tests/browser/worker-smoke.mjs --browsers chromium,firefox,webkit
+# conformance (the failures must equal tools/test262-expected-failures.txt)
+python tools/run_test262.py --t262 <checkout> --dump-fails fails.txt
+# density (idle host)
+node tests/node/bench-density.cjs
+```
 
 ## Verification completed
 

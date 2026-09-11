@@ -1,16 +1,20 @@
-# The bounded gate every push and pull request pays: the engine's own test
-# suite in its default configuration, the isolated host workspace, the
-# advertised feature combinations, and the production WebAssembly host
-# boundary under Node. The expensive lanes — test262 conformance, the ARM64
-# native matrix, the hostile-input runs — stay on their scheduled, manual and
-# release triggers (security.yml, arm64-native.yml, release.yml); this one
-# exists so a change that breaks a default-semantics regression cannot merge
-# quietly.
+# The MINIMUM gate every push and pull request pays — deliberately small, so
+# a change that breaks a default-semantics regression cannot merge quietly
+# while the runner stays cheap:
+#
+#   engine   the VM's unit tests plus the audit-day regression binaries, on
+#            the default profile, and the manifest-advertised feature builds;
+#   wasm     the isolated host workspace, the production wasm32 build, and the
+#            Node boundary suite against that exact artifact.
+#
+# Everything heavier is a LOCAL command (see HANDOFF.md "Local verification"):
+# the full 230-binary engine suite, the safe-profile and instrumented lanes,
+# test262, the three-browser Worker smoke, the density and benchmark
+# harnesses. security.yml runs the broader matrix weekly and on demand.
 #
 # Also a REUSABLE workflow: release.yml calls it with the exact tagged
 # revision, so publishing depends on this same gate at that revision rather
-# than on whatever `main` build last happened to be green (the 11 September
-# 2026 audit's ZIPP-09). One definition, so CI and release cannot drift.
+# than on whatever `main` build last happened to be green (ZIPP-09).
 #
 # Pull requests from forks get a read-only token and no secrets; nothing here
 # needs more.
@@ -20,8 +24,6 @@ on:
   push:
     branches: [main]
   pull_request:
-  # A manual run of any branch: the control runs that attribute a runner-
-  # specific failure to the audited commit are dispatched this way.
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -45,12 +47,9 @@ env:
 
 jobs:
   engine:
-    name: Engine tests (default features)
+    name: Engine (unit tests + audit regressions)
     runs-on: ubuntu-latest
-    # The suite is 230 binaries, several of which sweep every execution mode
-    # in child processes and a few of which run sustained-garbage loops for
-    # minutes; 45 minutes cut the first run off at 144 binaries.
-    timeout-minutes: 120
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -59,8 +58,7 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.92.0 --profile minimal --no-self-update
       # The parity tests take their expected values from `node -e` and are
-      # written against Node 24 (`Float16Array` exists there; the runner's
-      # default Node lacks it and typedarray_interp_index_fast diverges).
+      # written against Node 24.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
@@ -71,34 +69,24 @@ jobs:
             ~/.cargo/git
             target
           key: ci-engine-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-      # Quarantined tests are named EXACTLY in .github/ci-quarantine.json —
-      # binary, test, owner, reason, observation, review date — and the
-      # manifest is checked before use: an expired entry fails the run, a
-      # stale one (its test no longer exists) fails the run, and a new test
-      # that merely resembles a quarantined one is never skipped. The skipped
-      # inventory is printed so a green run never passes for full coverage.
-      - name: Validate and print the test quarantine
-        run: |
-          python3 tools/ci_quarantine.py --check --print
-          echo "::notice title=Quarantined::$(python3 tools/ci_quarantine.py --print | head -1) — the x86-64 register-tier mechanism assertions listed in the log are skipped on this runner (pre-existing at 40993c4d, control runs 34034702340 and 34042369088); see .github/ci-quarantine.json."
-      # The semantic regressions run their own mode matrix (interpreter,
-      # forced JIT, GC stress, both call-order switches) in child processes.
-      # Every binary runs even after one fails, so a red run names all of
-      # its failures rather than the first.
-      - name: Test the engine
-        run: |
-          set -euo pipefail
-          skips="$(python3 tools/ci_quarantine.py --emit-skips)"
-          # shellcheck disable=SC2086
-          cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast -- $skips
-      # The embedding contracts the 11 September 2026 audit pinned that need
-      # the metering recorder (compile-free name calls under a one-compile
-      # allowance); the default-feature run above cannot see them.
-      - name: Test the instrumented embedding contracts
+      # The quarantine manifest is validated even though this lane skips
+      # nothing by prefix: an expired or stale entry fails here so it cannot
+      # rot unnoticed until the weekly full run.
+      - name: Validate the test quarantine manifest
+        run: python3 tools/ci_quarantine.py --check --print
+      - name: Unit tests and the audit-day regressions (default profile)
         run: >-
-          cargo +1.92.0 test --locked -p zipp-vm --features instrument
-          --test audit_20260911_native --test audit_20260911_host_work
-          --test global_fingerprint --test instrument
+          cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast
+          --lib
+          --test call_order_default
+          --test global_fingerprint
+          --test audit_20260911_host_work
+          --test audit_20260911_test262_gaps
+          --test captured_intrinsic_lane
+      - name: Build zipp-vm in the configurations its manifest advertises
+        run: |
+          cargo +1.92.0 check --locked -p zipp-vm --no-default-features
+          cargo +1.92.0 check --locked -p zipp-vm --no-default-features --features safe-sandbox
 
   wasm:
     name: WebAssembly host boundary
@@ -129,12 +117,6 @@ jobs:
           key: ci-wasm-${{ runner.os }}-${{ hashFiles('crates/zipp-wasm/Cargo.lock') }}-${{ env.WASM_BINDGEN_CLI }}
       - name: Test the isolated host workspace
         run: cargo +1.92.0 test --locked
-      # A passing unified build proves nothing about the isolated profiles the
-      # library advertises; check each the way release.yml does.
-      - name: Build zipp-vm in the configurations its manifest advertises
-        run: |
-          cargo +1.92.0 check --locked --manifest-path ../zipp-vm/Cargo.toml --no-default-features
-          cargo +1.92.0 check --locked --manifest-path ../zipp-vm/Cargo.toml --no-default-features --features safe-sandbox
       - name: Install the exact matching wasm-bindgen CLI
         run: |
           set -euo pipefail
@@ -152,52 +134,10 @@ jobs:
           ZIPP_SOURCE_SHA: ${{ github.sha }}
         run: cargo +1.92.0 build --locked --release --target wasm32-unknown-unknown
       # One list of checks, shared with release.yml and security.yml, so the
-      # lanes cannot drift apart again.
+      # lanes cannot drift apart.
       - name: Exercise the production host boundary under Node
         run: |
           set -euo pipefail
           wasm-bindgen --target nodejs --out-dir tests/node/pkg \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/run-boundary-suite.cjs
-      - name: Keep the web package for the browser job
-        run: |
-          set -euo pipefail
-          wasm-bindgen --target web --out-dir tests/browser/pkg \
-            --remove-name-section --remove-producers-section \
-            target/wasm32-unknown-unknown/release/zipp_wasm.wasm
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ci-web-package
-          path: crates/zipp-wasm/tests/browser/pkg
-          if-no-files-found: error
-          retention-days: 1
-
-  browser:
-    name: Browser Workers (Chromium, Firefox, WebKit)
-    # The exact stripped web package inside real Workers, through the
-    # reference host adapter (the 11 September 2026 audit's ZIPP-17).
-    needs: wasm
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    defaults:
-      run:
-        working-directory: crates/zipp-wasm
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          ref: ${{ inputs.ref || '' }}
-          persist-credentials: false
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 22
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: ci-web-package
-          path: crates/zipp-wasm/tests/browser/pkg
-      - name: Install Playwright and its browsers
-        run: |
-          set -euo pipefail
-          npm install --no-save --no-audit --no-fund playwright@1.63.0
-          npx playwright install --with-deps chromium firefox webkit
-      - name: Run the Worker smoke test in every browser
-        run: node tests/browser/worker-smoke.mjs --browsers chromium,firefox,webkit

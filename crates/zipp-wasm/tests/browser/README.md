@@ -36,6 +36,7 @@ node tests/browser/worker-smoke.mjs --channel chrome   # an installed Chrome
 ```
 
 The page runs the exact stripped web package (`tests/browser/pkg/`), which is
-not committed. Passing here is Worker behaviour on the browsers named in the
+not committed. This is a local (and weekly `security.yml`) check, not part of
+the minimum CI gate. Passing here is Worker behaviour on the browsers named in the
 output; it is not conformance coverage, and it does not replace the Node
 boundary suite, which pins the resource contracts in detail.

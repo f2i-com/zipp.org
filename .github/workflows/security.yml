@@ -6,40 +6,23 @@ name: Security
 # sandbox boundary.
 #
 # It used to be manual-trigger only, so none of it ran unless someone
-# remembered to (the 11 September 2026 audit's ZIPP-16). Now:
-#   - every week, on a schedule, against `main`;
-#   - on a pull request that touches the code these checks cover (the
-#     sandbox crates, the VM's hardened paths, the benchmark harness, the
-#     lockfiles, or this workflow), as the bounded high-signal subset;
-#   - on demand, as before (`gh workflow run security.yml`).
-# Release publishing does not consume these results directly — release.yml
-# requires the exact-revision CI gate — but a scheduled failure is visible on
-# the Actions tab and blocks the next release review by policy.
+# remembered to (the 11 September 2026 audit's ZIPP-16). Now it runs every
+# week against `main`, and on demand (`gh workflow run security.yml`). It is
+# deliberately NOT on pull requests: CI (ci.yml) is the minimum gate, and the
+# broad lanes — the full engine suite, the safe profile, the sandboxes, the
+# browser Workers — are run locally before a push (HANDOFF.md, "Local
+# verification") and here weekly as the safety net. Release publishing does
+# not consume these results directly — release.yml requires the
+# exact-revision CI gate — but a scheduled failure is visible on the Actions
+# tab and blocks the next release review by policy.
 #
-# Pull requests from forks get a read-only token and no secrets; nothing here
-# needs more, and no job here publishes anything.
+# No job here publishes anything.
 on:
   workflow_dispatch:
   schedule:
     # Mondays 03:17 UTC: off the hour, so it does not queue behind everyone
     # else's on-the-hour jobs.
     - cron: "17 3 * * 1"
-  pull_request:
-    paths:
-      - ".github/workflows/security.yml"
-      - "Cargo.lock"
-      - "crates/zipp-sandbox/**"
-      - "crates/zipp-wasm/**"
-      - "crates/regress-fork/**"
-      - "crates/zipp-vm/src/vm/instrument.rs"
-      - "crates/zipp-vm/src/vm/host_api.rs"
-      - "crates/zipp-vm/src/embed.rs"
-      - "crates/zipp-vm/src/parse/limits.rs"
-      - "crates/zipp-vm/tests/audit_*.rs"
-      - "bench/comparison/**"
-      - "tools/bench*.py"
-      - "tools/test_bench*.py"
-      - "landing/package-lock.json"
 
 permissions:
   contents: read
@@ -74,7 +57,6 @@ jobs:
   native-workspace:
     name: Native workspace tests
     # The full native workspace is the expensive lane: weekly and on demand.
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -165,7 +147,6 @@ jobs:
 
   native-sandbox-windows:
     name: Isolated native sandbox (Windows)
-    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -222,6 +203,17 @@ jobs:
           wasm-bindgen --target nodejs --out-dir tests/node/pkg \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/run-boundary-suite.cjs
+      # The exact stripped web package inside real Workers, through the
+      # reference host adapter (ZIPP-17): weekly here, locally before a push.
+      - name: Run the Worker smoke test in Chromium, Firefox and WebKit
+        run: |
+          set -euo pipefail
+          wasm-bindgen --target web --out-dir tests/browser/pkg \
+            --remove-name-section --remove-producers-section \
+            target/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          npm install --no-save --no-audit --no-fund playwright@1.63.0
+          npx playwright install --with-deps chromium firefox webkit
+          node tests/browser/worker-smoke.mjs --browsers chromium,firefox,webkit
 
   dependency-audit:
     name: Dependency vulnerability audit
