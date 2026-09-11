@@ -1,0 +1,161 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>zipp-wasm browser Worker smoke test</title>
+<pre id="log"></pre>
+<script type="module">
+// Runs the exact released web package inside real browser Workers through
+// the reference host adapter (host-sdk/zipp-host.mjs), and records one
+// result per scenario in window.__zippResults for the Playwright runner.
+import { createZippHost } from "/host-sdk/zipp-host.mjs";
+
+const results = [];
+const log = document.getElementById("log");
+function record(name, ok, detail) {
+  results.push({ name, ok, detail: detail === undefined ? null : detail });
+  log.textContent += `${ok ? "ok  " : "FAIL"} ${name}${detail !== undefined && !ok ? " — " + JSON.stringify(detail) : ""}\n`;
+}
+async function expectError(promise, category) {
+  try { await promise; return { ok: false, detail: "no error" }; }
+  catch (e) { return { ok: e && e.category === category, detail: { category: e && e.category, message: String(e && e.message) } }; }
+}
+function host(extra = {}) {
+  return createZippHost({
+    moduleUrl: "/tests/browser/pkg/zipp_wasm.js",
+    wasmUrl: "/tests/browser/pkg/zipp_wasm_bg.wasm",
+    workerUrl: "/host-sdk/zipp-host.worker.mjs",
+    deadlineMs: 4000,
+    ...extra,
+  });
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+try {
+  // 1. Initialization, a call, structured reads and writes, fingerprints.
+  {
+    const h = host();
+    const symbols = await h.init(`
+      "use strict";
+      var state = { items: [1, 2], name: "a" };
+      function tick(n) { state.items.push(n); return state.items.length; }
+      function strictThis() { return this === undefined; }
+    `);
+    record("init returns the symbol map", symbols.state && typeof symbols.state.index === "number" && symbols.tick.scope === "function", symbols);
+    record("a call runs and returns", (await h.call("tick", [3])) === 3);
+    record("the guest's strict mode survives the preamble in the browser", (await h.call("strictThis", [])) === true);
+    const idx = [symbols.state.index];
+    const before = await h.fingerprint(idx);
+    record("structured reads cross", JSON.stringify(await h.readGlobals(idx)) === JSON.stringify([{ items: [1, 2, 3], name: "a" }]));
+    await h.writeGlobals(idx, [{ items: [9], name: "b" }]);
+    const after = await h.fingerprint(idx);
+    record("a write moves the fingerprint and the value", before[0] !== after[0] && (await h.readGlobals(idx))[0].name === "b");
+    const rich = await h.evalRich("[state.items.length, -0, NaN]");
+    record("evalRich marshals structured values", rich[0] === 1 && Object.is(rich[1], -0) && Number.isNaN(rich[2]), rich);
+    const usage = await h.resourceUsage();
+    record("resourceUsage reports from inside the Worker", usage.heapBytes > 0 && usage.stepsUsed > 0, usage);
+    h.terminate();
+    record("terminate is terminal", h.dead && h.deathCause.category === "terminated");
+    const late = await expectError(h.call("tick", [1]), "usage");
+    record("a call after terminate is a usage error", late.ok, late.detail);
+  }
+
+  // 2. Source failure: the host is dead afterwards, and says why.
+  {
+    const h = host();
+    const r = await expectError(h.init("function ("), "source");
+    record("a syntax error is a source error", r.ok, r.detail);
+    record("…and the host is dead", h.dead && h.deathCause.category === "source");
+  }
+
+  // 3. Resource failure: a tiny instruction budget stops a runaway call;
+  //    the engine is disposed and the host is dead, other hosts unaffected.
+  {
+    const h = host({ instructionBudget: 200000 });
+    await h.init("function spin() { for (;;) {} }");
+    const r = await expectError(h.call("spin", []), "resource");
+    record("crossing the instruction budget is a resource error", r.ok, r.detail);
+    record("…and the host is dead", h.dead && h.deathCause.category === "resource");
+  }
+
+  // 4. Host calls: queue, drain, resolve, cancel, duplicate completion.
+  {
+    const h = host();
+    const s = await h.init(`
+      var got = [];
+      function ask(n) { for (var i = 0; i < n; i++) host.call('probe', ['arg' + i], function (r) { got.push(r); }); }
+      function seen() { return got; }
+    `);
+    await h.call("ask", [3]);
+    const requests = await h.drainHostCalls();
+    record("queued requests drain once, in order", requests.length === 3 && requests[0].kind === "probe" && requests[2].args[0] === "arg2", requests);
+    record("a second drain is empty", (await h.drainHostCalls()).length === 0);
+    record("a completion runs the callback", (await h.resolveHostCall(requests[0].id, "r0")) === true);
+    record("a duplicate completion is a visible no-op", (await h.resolveHostCall(requests[0].id, "again")) === false);
+    record("cancellation releases without running", (await h.cancelHostCall(requests[1].id)) === true && (await h.resolveHostCall(requests[1].id, "late")) === false);
+    await h.resolveHostCall(requests[2].id, { deep: [1] });
+    record("callbacks saw exactly the deliveries", JSON.stringify(await h.call("seen", [])) === JSON.stringify(["r0", { deep: [1] }]));
+    h.terminate();
+  }
+
+  // 5. Synchronous bridges inside the Worker, default-deny.
+  {
+    const denied = host({ capabilities: [] , bridgeModuleUrl: "/tests/browser/bridges.mjs" });
+    await denied.init("function read() { try { return localStorage.getItem('k'); } catch (e) { return 'denied:' + e; } }");
+    const deniedResult = await denied.call("read", []);
+    record("an ungranted sync operation is denied", /^denied:.*SecurityError/.test(deniedResult), deniedResult);
+    denied.terminate();
+    const granted = host({ capabilities: ["ls.getItem", "ls.setItem", "db.create", "db.query"], bridgeModuleUrl: "/tests/browser/bridges.mjs" });
+    await granted.init(`
+      function go() { localStorage.setItem('k', 'v'); db.create('notes', { text: 'hi' }); return [localStorage.getItem('k'), db.query('notes').length]; }
+    `);
+    record("granted sync operations reach the Worker-side bridges", JSON.stringify(await granted.call("go", [])) === JSON.stringify(["v", 1]));
+    granted.terminate();
+  }
+
+  // 6. Deadline: a runaway guest under a large budget is stopped ONLY by the
+  //    main thread terminating the Worker; the pending request rejects
+  //    promptly, later replies from that Worker are dropped, and a new host
+  //    works afterwards.
+  {
+    const h = host({ deadlineMs: 700, instructionBudget: 2000000000 });
+    await h.init("function spin() { for (;;) {} }", { deadlineMs: 15000 });
+    const t0 = performance.now();
+    const r = await expectError(h.call("spin", []), "deadline");
+    const elapsed = performance.now() - t0;
+    record("a request past its deadline is rejected as such", r.ok, r.detail);
+    record("…promptly, by terminating the Worker", elapsed < 3000 && h.dead && h.deathCause.category === "deadline", elapsed);
+    const fresh = host();
+    await fresh.init("function ok() { return 'alive'; }");
+    record("a new host after termination works", (await fresh.call("ok", [])) === "alive");
+    fresh.terminate();
+  }
+
+  // 7. Two tenants at once do not share state or generations.
+  {
+    const a = host();
+    const b = host();
+    await a.init("var who = 'a'; function me() { return who; }");
+    await b.init("var who = 'b'; function me() { return who; }");
+    record("two live hosts keep their own state", (await a.call("me", [])) === "a" && (await b.call("me", [])) === "b");
+    record("generations are distinct", a.generation !== b.generation);
+    a.terminate();
+    record("terminating one leaves the other alive", (await b.call("me", [])) === "b");
+    b.terminate();
+  }
+
+  // 8. window.dispatchEvent and console records reach the host.
+  {
+    const h = host();
+    await h.init("var hits = 0; window.addEventListener('ping', function () { hits++; console.log('ping ' + hits); }); function fire() { return window.dispatchEvent({ type: 'ping' }); }");
+    await h.call("fire", []);
+    await h.dispatchEvent("ping", {});
+    const lines = await h.takeConsole();
+    record("dispatched events reach listeners and log in order", JSON.stringify(lines) === JSON.stringify([{ stream: "stdout", text: "ping 1" }, { stream: "stdout", text: "ping 2" }]), lines);
+    h.terminate();
+  }
+} catch (error) {
+  record("harness", false, String(error && error.stack || error));
+}
+await sleep(50);
+window.__zippResults = results;
+window.__zippDone = true;
+</script>
