@@ -355,12 +355,49 @@ audit's own vocabulary.
   reported a failure. Not measured: representative downstream (SoftN)
   workloads, browser-hosted instances, mobile profiles, or any comparison
   with another engine.
-- **Still open:** ZIPP-06 stage two (an owned, reclaimable compiled program
-  under `safe-sandbox`, now with the retention measured), ZIPP-11's lossless
-  string transport (documented as Unicode-scalar), ZIPP-21–23 (IC/GC/
-  footprint experiments — measurement programmes, not defects; nothing here
-  claims a speedup; ZIPP-20's density harness and first capture are B311). B309's twelve unblessed test262
-  gaps are closed by B310: two fixed, ten blessed with reasons.
+- **B312 (ZIPP-11) — lossless string transport, implemented.** `HostValue`
+  gained `Utf16(Vec<u16>)` for a guest string that is not well-formed UTF-16;
+  well-formed strings keep the `String` form, now taken from the exact WTF-8
+  bytes rather than the lossy renderer. Writing `Utf16` recreates the exact
+  string in the guest, and the fingerprint digests the exact bytes, so a lone
+  surrogate and U+FFFD are different strings to the host as to the guest.
+  The WASM boundary rebuilds such a string with `String.fromCharCode` and
+  re-reads a host string's code units only when wasm-bindgen's decoding left
+  a replacement character in it; the pinned host-import surface grew by
+  exactly those two String bindings. `zippProfile().semantics.stringTransport`
+  is `"utf16"`. Property keys, the synchronous bridge envelope and `initScript`
+  source stay UTF-8 and the README says so. The audit's own 15-case probe
+  bundle now passes 15 of 15; `audit-2026-09-11.cjs` pins both directions,
+  nested values, NUL, real U+FFFD, the digest, the JSON projection and the
+  rich eval.
+- **B313 (ZIPP-06, stage two) — the compiled program is reclaimed in every
+  profile.** `ScriptState` no longer leaks its `Program` to `&'static`: an
+  `OwnedVm` cell (`self_cell` 1.3.0, the one new dependency; this crate
+  itself stays `forbid(unsafe_code)` under `safe-sandbox`) holds the boxed
+  `Program` and the `Vm` borrowing it in one allocation, hands the VM out
+  only through closures so the pair can never be split, and drops the VM
+  before the program. The `unsafe` `Drop` the native profile used is gone
+  with it. A consequence worth knowing: the `Vm` no longer moves when its
+  `ScriptState` does, so the epoch-guard test that relied on moving it now
+  pins the stable address instead. Measured on the same 100-engine
+  create/init/call/dispose churn as B306, steady-state phase: 86 KB per
+  engine before, 36 KB after without dynamic code; 55 KB before, about 5 KB
+  after with one `eval` per engine (the Node process's RSS, so allocator
+  high-water and GC noise are in the figure). What still outlives
+  `dispose()` is the stable-address definitions dynamic compilations
+  install (`retainedFunctions`/`retainedClasses` in `zippInstanceUsage()`),
+  bounded by the dynamic-code caps; reclaiming those needs the same
+  ownership treatment for the eval function table and is the remaining
+  stage. Verified: the embed, host_api, fingerprint, audit and resource
+  integration tests on the default profile; the 481 safe-profile library
+  tests; the instrumented audit tests; the workspace and sandbox checks; the
+  WASM boundary suite (13 of 13) and the browser smoke on Chromium, Firefox
+  and WebKit.
+- **Still open:** reclaiming the stable-address definitions dynamic code
+  installs (B313's remaining stage), and ZIPP-21–23 (IC/GC/footprint
+  experiments — measurement programmes, not defects; nothing here claims a
+  speedup). ZIPP-11 is closed by B312, ZIPP-06's program leak by B313, and
+  ZIPP-20's harness and first capture are B311.
 
 Verification for this batch: `cargo test -p zipp-vm` (default features, the
 manifest's 15 quarantined mechanism tests skipped as CI skips them);
