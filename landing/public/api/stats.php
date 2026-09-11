@@ -15,16 +15,16 @@ declare(strict_types=1);
  * writable cache location (`api/cache/` beside this file, else the system
  * temp directory). Set ZIPP_GITHUB_TOKEN in the server environment to lift
  * GitHub's anonymous rate limit (60 requests/hour per address; this script
- * makes five per cache miss).
+ * makes six per cache miss).
  */
 
 const REPO = 'f2i-com/zipp.org';
 const BRANCH = 'main';
 const CACHE_TTL = 900;          // fresh for 15 minutes
-const STALE_MAX_AGE = 7 * 86400; // serve a failed refresh from cache up to a week
+const STALE_MAX_AGE = 86400;    // serve a failed refresh from cache up to a day
 
 header('Content-Type: application/json; charset=utf-8');
-header('Cache-Control: public, max-age=300');
+header('Cache-Control: no-store');
 header('X-Content-Type-Options: nosniff');
 
 $cacheDir = is_writable(__DIR__ . '/cache') ? __DIR__ . '/cache' : sys_get_temp_dir();
@@ -37,7 +37,7 @@ if (is_file($cacheFile)) {
     if (is_array($decoded) && isset($decoded['generated_at'])) {
         $cached = $decoded;
         $age = time() - strtotime((string) $decoded['generated_at']);
-        if ($age >= 0 && $age < CACHE_TTL) {
+        if ($age >= 0 && $age < CACHE_TTL && isset($decoded['releases'])) {
             $decoded['cached'] = true;
             echo json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
             exit;
@@ -88,7 +88,7 @@ function fetch(string $url): ?array
         'X-GitHub-Api-Version: 2022-11-28',
     ];
     $token = getenv('ZIPP_GITHUB_TOKEN');
-    if (is_string($token) && $token !== '') {
+    if (is_string($token) && $token !== '' && str_starts_with($url, 'https://api.github.com/')) {
         $headers[] = 'Authorization: Bearer ' . $token;
     }
     if (function_exists('curl_init')) {
@@ -176,20 +176,39 @@ if ($repo !== null) {
         'pushed_at' => $repo['pushed_at'] ?? null,
         'default_branch' => $repo['default_branch'] ?? BRANCH,
         'url' => $repo['html_url'] ?? ('https://github.com/' . REPO),
+        'license' => $repo['license']['spdx_id'] ?? null,
     ];
 } else {
     $failures[] = 'repo';
 }
 
 // ── latest release (tag, name, date) ────────────────────────────────────────
-$release = fetchJson($api . '/releases/latest');
-if ($release !== null && isset($release['tag_name'])) {
-    $out['release'] = [
-        'tag' => $release['tag_name'],
-        'name' => $release['name'] ?? $release['tag_name'],
-        'published_at' => $release['published_at'] ?? null,
-        'url' => $release['html_url'] ?? null,
-    ];
+$releases = fetchJson($api . '/releases?per_page=10');
+$latestRelease = fetchJson($api . '/releases/latest');
+if ($releases !== null && array_is_list($releases)) {
+    $out['releases'] = [];
+    foreach ($releases as $release) {
+        if (($release['draft'] ?? false) || ($release['prerelease'] ?? false)) continue;
+        $out['releases'][] = [
+            'tag' => $release['tag_name'],
+            'name' => $release['name'] ?? $release['tag_name'],
+            'published_at' => $release['published_at'] ?? null,
+            'url' => $release['html_url'] ?? null,
+        ];
+        if (count($out['releases']) === 3) break;
+    }
+    if ($latestRelease !== null && isset($latestRelease['tag_name'])) {
+        $out['release'] = [
+            'tag' => $latestRelease['tag_name'],
+            'name' => $latestRelease['name'] ?? $latestRelease['tag_name'],
+            'published_at' => $latestRelease['published_at'] ?? null,
+            'url' => $latestRelease['html_url'] ?? null,
+        ];
+    } elseif (count($out['releases']) > 0) {
+        $failures[] = 'latest_release';
+    } else {
+        $out['release'] = null;
+    }
 } else {
     $failures[] = 'release';
 }
@@ -203,6 +222,10 @@ if ($commits !== null && $commits[0] === 200) {
     }
     $first = json_decode($commits[1], true);
     $latest = is_array($first) && isset($first[0]) ? $first[0] : null;
+    if ($latest !== null && preg_match('/^[a-f0-9]{40}$/', $latest['sha'] ?? '')) {
+        $out['source']['commit'] = $latest['sha'];
+        $rawBase = 'https://raw.githubusercontent.com/' . REPO . '/' . $latest['sha'] . '/';
+    }
     $out['commits'] = [
         'count' => $count,
         'latest' => $latest === null ? null : [
@@ -264,31 +287,23 @@ if ($readme !== null && $readme[0] === 200) {
 
 $out['failures'] = $failures;
 
-// Every upstream call failed: serve the last good cache if it is not ancient.
-if (count($failures) >= 5 && $cached !== null) {
-    $age = time() - strtotime((string) $cached['generated_at']);
-    if ($age < STALE_MAX_AGE) {
-        $cached['cached'] = true;
-        $cached['stale'] = true;
-        echo json_encode($cached, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
-        exit;
-    }
-}
-
-// Merge partial failures over the cache so one missing call does not blank a field.
-if ($cached !== null) {
-    foreach (['repo', 'release', 'commits', 'version', 'readme'] as $key) {
-        if (!isset($out[$key]) && isset($cached[$key])) {
-            $out[$key] = $cached[$key];
-            $out['stale'] = true;
+// Publish coherent snapshots only. A partial refresh keeps the old timestamp;
+// failed requests must never turn yesterday's data into a fresh success.
+if (count($failures) > 0) {
+    if ($cached !== null) {
+        $age = time() - strtotime((string) $cached['generated_at']);
+        if ($age >= 0 && $age < STALE_MAX_AGE) {
+            $cached['cached'] = true;
+            $cached['stale'] = true;
+            echo json_encode($cached, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
+            exit;
         }
     }
+    http_response_code(503);
+    echo json_encode(['error' => 'Repository updates are temporarily unavailable.']);
+    exit;
 }
 
 $json = json_encode($out, JSON_UNESCAPED_SLASHES | JSON_PRETTY_PRINT);
-// Cache only what is worth serving again: a full or partial success. A run
-// where every upstream call failed leaves the previous cache (or none) alone.
-if (count($failures) < 5) {
-    @file_put_contents($cacheFile, $json, LOCK_EX);
-}
+@file_put_contents($cacheFile, $json, LOCK_EX);
 echo $json;

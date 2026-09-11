@@ -1,126 +1,65 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import snapshot from './repo-snapshot.json'
+import { parseRepoStats, type RepoStats } from './repoData'
+export { formatCount, relativeTime, formatDate, type RepoStats } from './repoData'
 
-/**
- * Live repository facts from `api/stats.php` (see `public/api/stats.php`).
- * Every field is optional: the page renders its built-in figures first and
- * upgrades to live values only when the endpoint answers with a well-formed
- * document, so a static host (no PHP) or an offline GitHub API changes
- * nothing visible.
- */
-export type RepoStats = {
-  generatedAt: string
-  stale: boolean
-  stars?: number
-  forks?: number
-  openIssues?: number
-  pushedAt?: string
-  releaseTag?: string
-  releaseUrl?: string
-  releasePublishedAt?: string
-  version?: string
-  commitCount?: number
-  latestCommitSha?: string
-  latestCommitMessage?: string
-  latestCommitDate?: string
-  latestCommitUrl?: string
-  all30?: number
-  all13?: number
-  hostile17?: number
-  nodeWins?: number
-  test262Pct?: number
-  test262Pass?: number
-  test262Total?: number
-  captureCommit?: string
-  startupMs?: number
-}
+export type RepoStatus = 'snapshot' | 'synced' | 'stale' | 'offline'
+export const bundledStats = parseRepoStats(snapshot)!
+const REFRESH_MS = 15 * 60 * 1000
 
-const num = (v: unknown): number | undefined =>
-  typeof v === 'number' && Number.isFinite(v) ? v : undefined
-const str = (v: unknown): string | undefined =>
-  typeof v === 'string' && v.length > 0 ? v : undefined
-const obj = (v: unknown): Record<string, unknown> =>
-  typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : {}
+export function useRepoStats() {
+  const [stats, setStats] = useState<RepoStats>(bundledStats)
+  const [status, setStatus] = useState<RepoStatus>('snapshot')
+  const [refreshing, setRefreshing] = useState(false)
+  const active = useRef<AbortController | null>(null)
+  const lastAttempt = useRef(0)
 
-export function parseRepoStats(raw: unknown): RepoStats | null {
-  const root = obj(raw)
-  const generatedAt = str(root.generated_at)
-  if (!generatedAt) return null
-  const repo = obj(root.repo)
-  const release = obj(root.release)
-  const commits = obj(root.commits)
-  const latest = obj(commits.latest)
-  const readme = obj(root.readme)
-  return {
-    generatedAt,
-    stale: root.stale === true,
-    stars: num(repo.stars),
-    forks: num(repo.forks),
-    openIssues: num(repo.open_issues),
-    pushedAt: str(repo.pushed_at),
-    releaseTag: str(release.tag),
-    releaseUrl: str(release.url),
-    releasePublishedAt: str(release.published_at),
-    version: str(root.version),
-    commitCount: num(commits.count),
-    latestCommitSha: str(latest.sha),
-    latestCommitMessage: str(latest.message),
-    latestCommitDate: str(latest.date),
-    latestCommitUrl: str(latest.url),
-    all30: num(readme.all30),
-    all13: num(readme.all13),
-    hostile17: num(readme.hostile17),
-    nodeWins: num(readme.node_wins),
-    test262Pct: num(readme.test262_pct),
-    test262Pass: num(readme.test262_pass),
-    test262Total: num(readme.test262_total),
-    captureCommit: str(readme.capture_commit),
-    startupMs: num(readme.startup_ms),
-  }
-}
-
-export function useRepoStats(): RepoStats | null {
-  const [stats, setStats] = useState<RepoStats | null>(null)
-  useEffect(() => {
+  const refresh = useCallback(async () => {
+    if (active.current) return
     const controller = new AbortController()
-    const url = new URL(`${import.meta.env.BASE_URL}api/stats.php`, document.baseURI)
-    fetch(url.href, { signal: controller.signal, headers: { Accept: 'application/json' } })
-      .then((response) => (response.ok ? response.json() : null))
-      .then((json) => {
-        const parsed = parseRepoStats(json)
-        if (parsed) setStats(parsed)
-      })
-      .catch(() => {
-        // The built-in figures stay. Nothing to report to the reader.
-      })
-    return () => controller.abort()
-  }, [])
-  return stats
-}
-
-/** "3 days ago" style relative time for a timestamp; empty when unparseable. */
-export function relativeTime(iso: string | undefined, now = Date.now()): string {
-  if (!iso) return ''
-  const then = Date.parse(iso)
-  if (!Number.isFinite(then)) return ''
-  const seconds = Math.max(0, Math.round((now - then) / 1000))
-  const units: [number, Intl.RelativeTimeFormatUnit][] = [
-    [60, 'second'],
-    [60, 'minute'],
-    [24, 'hour'],
-    [7, 'day'],
-    [4.35, 'week'],
-    [12, 'month'],
-    [Number.POSITIVE_INFINITY, 'year'],
-  ]
-  let value = seconds
-  for (const [size, unit] of units) {
-    if (value < size) {
-      return new Intl.RelativeTimeFormat('en', { numeric: 'auto' }).format(-Math.round(value), unit)
+    active.current = controller
+    lastAttempt.current = Date.now()
+    setRefreshing(true)
+    const timeout = window.setTimeout(() => controller.abort(), 25_000)
+    try {
+      let parsed: RepoStats | null = null
+      // The Worker handles /api/stats; existing PHP hosting keeps working too.
+      for (const path of ['api/stats', 'api/stats.php']) {
+        if (controller.signal.aborted) break
+        try {
+          const response = await fetch(new URL(`${import.meta.env.BASE_URL}${path}`, document.baseURI), { signal: controller.signal, headers: { Accept: 'application/json' }, cache: 'no-cache' })
+          if (response.status === 503 || response.status === 429) break
+          if (response.ok && response.headers.get('content-type')?.includes('application/json')) parsed = parseRepoStats(await response.json())
+          if (parsed) break
+        } catch { /* Try the legacy endpoint when available. */ }
+      }
+      if (active.current !== controller) return
+      if (parsed) {
+        setStats(parsed)
+        const old = Date.now() - Date.parse(parsed.generatedAt) > REFRESH_MS
+        setStatus(parsed.stale || old ? 'stale' : 'synced')
+      } else setStatus('offline')
+    } finally {
+      window.clearTimeout(timeout)
+      if (active.current === controller) { active.current = null; setRefreshing(false) }
     }
-    value /= size
-  }
-  return ''
-}
+  }, [])
 
-export const formatCount = (n: number | undefined): string =>
-  n === undefined ? '' : new Intl.NumberFormat('en').format(n)
+  useEffect(() => {
+    void refresh()
+    const onVisible = () => {
+      if (document.visibilityState === 'visible' && Date.now() - lastAttempt.current >= REFRESH_MS) void refresh()
+    }
+    const interval = window.setInterval(onVisible, REFRESH_MS)
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', onVisible)
+    return () => {
+      window.clearInterval(interval)
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', onVisible)
+      active.current?.abort()
+      active.current = null
+    }
+  }, [refresh])
+  return { stats, status, refreshing, refresh }
+}

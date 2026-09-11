@@ -49,6 +49,9 @@ export default defineConfig(({ command }) => ({
             "script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline';",
           )
           .replace("style-src 'self';", "style-src 'self' 'unsafe-inline';")
+          // Local previews use HTTP. Upgrading their module requests to HTTPS
+          // leaves the app blank when the loopback server has no TLS listener.
+          .replace('; upgrade-insecure-requests', '')
       },
     },
   ],

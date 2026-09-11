@@ -1,0 +1,56 @@
+{
+  "generated_at": "2026-09-11T04:51:30.529Z",
+  "stale": false,
+  "source": {
+    "repo": "f2i-com/zipp.org",
+    "branch": "main",
+    "commit": "e6e0f65dd402f1bf75b9675d7acd904cb239c5a3"
+  },
+  "repo": {
+    "stars": 0,
+    "forks": 0,
+    "open_issues": 15,
+    "pushed_at": "2026-09-07T20:56:39Z",
+    "license": "Apache-2.0"
+  },
+  "release": {
+    "tag": "v0.0.15",
+    "name": "ZIPP v0.0.15",
+    "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.15",
+    "published_at": "2026-09-06T21:40:35Z"
+  },
+  "releases": [
+    {
+      "tag": "v0.0.15",
+      "name": "ZIPP v0.0.15",
+      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.15",
+      "published_at": "2026-09-06T21:40:35Z"
+    },
+    {
+      "tag": "v0.0.14",
+      "name": "ZIPP v0.0.14",
+      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.14",
+      "published_at": "2026-09-05T14:33:48Z"
+    },
+    {
+      "tag": "v0.0.13",
+      "name": "ZIPP v0.0.13",
+      "url": "https://github.com/f2i-com/zipp.org/releases/tag/v0.0.13",
+      "published_at": "2026-09-02T12:32:12Z"
+    }
+  ],
+  "commits": {
+    "latest": {
+      "sha": "e6e0f65dd402f1bf75b9675d7acd904cb239c5a3",
+      "message": "Landing: the v0.0.15 module",
+      "date": "2026-09-06T21:34:38Z",
+      "url": "https://github.com/f2i-com/zipp.org/commit/e6e0f65dd402f1bf75b9675d7acd904cb239c5a3"
+    }
+  },
+  "version": "0.0.15",
+  "readme": {
+    "test262_pct": 99.997,
+    "test262_pass": 95939,
+    "test262_total": 95942
+  }
+}

@@ -1,4 +1,5 @@
 /// <reference lib="webworker" />
+import { injectStorySeed } from './storySeed'
 
 type WarmRequest = {
   type: 'warm'
@@ -10,6 +11,7 @@ type RunRequest = {
   type: 'run'
   runId: number
   source: string
+  storySeed?: number
   moduleUrl: string
   wasmUrl: string
 }
@@ -102,7 +104,7 @@ workerScope.onmessage = async (event: MessageEvent<Request>) => {
 
     const started = performance.now()
     engine = new zipp.Engine()
-    engine.initScript(request.source)
+    engine.initScript(injectStorySeed(request.source, request.storySeed))
     const captured = engine.takeOutput()
     const output = Array.isArray(captured) ? captured.map((line) => String(line)) : []
 

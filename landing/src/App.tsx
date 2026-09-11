@@ -1,5 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'react'
-import { formatCount, relativeTime, useRepoStats, type RepoStats } from './repoStats'
+import { formatCount, relativeTime, useRepoStats, type RepoStats, type RepoStatus } from './repoStats'
+import { SandboxStack, ProjectShowcase } from './Experience'
+import { RepositoryActivity } from './RepositoryActivity'
 
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
 const F2I_URL = 'https://f2i.com'
@@ -7,10 +9,10 @@ const DOCS_URL = `${GITHUB_URL}/blob/main/DOC.md#embedding`
 const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_8229b3fc_pgo_2026-09-02.json`
 const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json`
 const ROADMAP_URL = `${GITHUB_URL}/blob/main/PERF_ROADMAP.md`
-const RELEASE_URL = `${GITHUB_URL}/releases/tag/v0.0.12`
+const RELEASE_URL = `${GITHUB_URL}/releases/latest`
 const RELEASES_URL = `${GITHUB_URL}/releases`
 const COMMITS_URL = `${GITHUB_URL}/commits/main`
-const BUILT_IN_VERSION = 'v0.0.12'
+const CAPTURE_README_URL = `${GITHUB_URL}/blob/e6e0f65dd402f1bf75b9675d7acd904cb239c5a3/README.md#canonical-public-capture`
 
 /** Selectors whose matches fade and rise into view as the reader scrolls. */
 const REVEAL_SELECTORS = [
@@ -141,15 +143,15 @@ function StarIcon() {
   )
 }
 
-function LiveRepoStrip({ stats }: { stats: RepoStats | null }) {
-  const version = stats?.releaseTag ?? (stats?.version ? `v${stats.version}` : BUILT_IN_VERSION)
+function LiveRepoStrip({ stats, status }: { stats: RepoStats; status: RepoStatus }) {
+  const version = stats.releaseTag ?? 'View releases'
   const pushed = relativeTime(stats?.pushedAt ?? stats?.latestCommitDate)
   return (
-    <div className={`live-repo ${stats ? 'live-repo-loaded' : ''}`} aria-label="Repository status">
-      <span className="live-repo-label"><i />{stats ? 'live from GitHub' : 'from the repository'}</span>
+    <div className={`live-repo ${status === 'synced' ? 'live-repo-loaded' : ''}`} aria-label="Repository status">
+      <a className="live-repo-label" href="#updates">{status === 'synced' ? 'Synced with GitHub' : 'Saved GitHub data'}</a>
       <a href={stats?.releaseUrl ?? RELEASE_URL} target="_blank" rel="noreferrer"><b>{version}</b> latest release</a>
-      {stats?.commitCount !== undefined && (
-        <a href={COMMITS_URL} target="_blank" rel="noreferrer"><b>{formatCount(stats.commitCount)}</b> commits on main</a>
+      {stats.latestCommitSha && (
+        <a href={stats.latestCommitUrl ?? COMMITS_URL} target="_blank" rel="noreferrer"><b>{stats.latestCommitSha.slice(0, 8)}</b> on {stats.branch}</a>
       )}
       {stats?.stars ? (
         <a href={GITHUB_URL} target="_blank" rel="noreferrer"><b>{formatCount(stats.stars)}</b> stars</a>
@@ -186,6 +188,80 @@ type PlaygroundExample = { id: string; title: string; blurb: string; source: str
 // the sandbox's instruction budget: the point is to show a real amount of work
 // completing quickly, not to hit the limits.
 const playgroundExamples: PlaygroundExample[] = [
+  { id: 'adventure', title: 'A story in a sandbox', blurb: 'Random heroes, branching encounters, and a seed to replay.', source: `// A standalone ZIPP demo, not code from Outerstead.
+// The playground passes a fresh STORY_SEED from browser crypto on each run.
+// Replace STORY_SEED below with a printed number to replay that adventure.
+const SEED = typeof STORY_SEED === "number" ? STORY_SEED : 42;
+const CHAPTERS = 5; // Try a longer journey!
+let state = SEED >>> 0;
+const roll = (sides) => {
+  state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+  return 1 + Math.floor((state / 4294967296) * sides);
+};
+const pick = (items) => items[roll(items.length) - 1];
+
+class Adventurer {
+  constructor(name, calling) {
+    this.name = name;
+    this.calling = calling;
+    this.spirit = 10;
+    this.bag = new Map([["biscuits", 2]]);
+    this.places = new Set();
+  }
+  collect(item) { this.bag.set(item, (this.bag.get(item) || 0) + 1); }
+  get title() { return this.name + " the " + this.calling; }
+}
+
+const hero = new Adventurer(
+  pick(["Moss", "Pip", "Clover", "Wren", "Juniper"]),
+  pick(["mapmaker", "cloud collector", "reluctant wizard", "mushroom knight"])
+);
+const quest = pick(["find the missing moon", "deliver a letter to tomorrow", "wake the sleeping sea"]);
+const places = ["Whispering Woods", "Clockwork Marsh", "Lantern Library", "Upside-Down Orchard", "Glass Mountain"];
+const weather = ["under a violet sky", "as warm snow falls", "beneath two tiny suns", "in a rain of golden leaves"];
+const encounters = [
+  { who: "a fox selling borrowed dreams", gift: "bottled dream", good: "trades a dream for a terrible joke", bad: "insists on a riddle with no answer" },
+  { who: "a bridge that has forgotten its name", gift: "silver compass", good: "remembers its name when you sing", bad: "sends you on a very long detour" },
+  { who: "a dragon the size of a teacup", gift: "dragon ember", good: "shares a spark and a secret", bad: "sneezes sparks into your boots" },
+  { who: "a librarian made of autumn leaves", gift: "tomorrow's map", good: "lends you a page from the future", bad: "assigns you three hours of shelving" },
+  { who: "an extremely dramatic moon", gift: "moon fragment", good: "applauds your courage and offers a fragment", bad: "demands an encore of your worst memory" },
+];
+
+const journal = [];
+console.log("THE LITTLE CHRONICLES / seed " + SEED);
+console.log(hero.title + " sets out to " + quest + ".\\n");
+
+for (let chapter = 1; chapter <= CHAPTERS && hero.spirit > 0; chapter++) {
+  const place = pick(places);
+  const encounter = pick(encounters);
+  const luck = roll(20);
+  hero.places.add(place);
+  const success = luck >= 8;
+  const twist = success ? encounter.good : encounter.bad;
+  if (success) hero.collect(encounter.gift);
+  else hero.spirit = Math.max(0, hero.spirit - roll(4));
+  const line = "Chapter " + chapter + ": " + place + "\\n"
+    + "Arriving " + pick(weather) + ", " + hero.name + " meets " + encounter.who + ".\\n"
+    + "The stranger " + twist + ". "
+    + (success ? "A keepsake joins the collection." : "Spirit remaining: " + hero.spirit + "/10.");
+  journal.push({ chapter, place, luck, success });
+  console.log(line + "\\n");
+}
+
+const treasures = [...hero.bag.keys()].filter(item => item !== "biscuits");
+const ending = hero.spirit === 0
+  ? "The quest can wait. A warm hearth and a new friend are adventure enough."
+  : treasures.length >= 3
+    ? "The keepsakes glow together. The impossible quest suddenly seems possible."
+    : "The road bends toward home. Some stories need a second journey.";
+console.log("EPILOGUE\\n" + ending);
+console.log("Satchel: " + [...hero.bag].map(([item, n]) => n + " " + item).join(", "));
+console.log("\\nSAVE GAME " + JSON.stringify({
+  seed: SEED, hero: hero.title, spirit: hero.spirit,
+  uniquePlaces: hero.places.size,
+  luckyEncounters: journal.filter(entry => entry.success).length,
+  chapters: journal.length
+}));` },
   { id: 'orders', title: 'Orders summary', blurb: 'Array pipeline over a few records', source: playgroundExample },
   { id: 'sieve', title: 'Prime sieve', blurb: '1,000,000 numbers, a Uint8Array and two nested loops', source: `// Sieve of Eratosthenes: count the primes below one million.
 const limit = 1_000_000;
@@ -278,7 +354,7 @@ for (const [w, n] of top) console.log(w.padEnd(10), String(n).padStart(6), "#".r
 
 const installCommands = `git clone https://github.com/f2i-com/zipp.org.git zipp
 cd zipp
-cargo build --release
+cargo build --locked --release
 ./target/release/zipp js examples/hello.js`
 
 const sandboxCode = `let mut script = compile_script(user_code)?;
@@ -364,12 +440,6 @@ const readingGuide = [
     title: 'One number for the whole picture',
     copy: 'The all-30 figure gives every normal and hostile row equal weight and reports a descriptive bootstrap interval. It is a summary, not a proof of universal speed — the table is the evidence.',
   },
-]
-
-const releaseNotes = [
-  ['v0.0.12', 'Array element stores run inline in compiled loops; the `x | 0` idiom fuses into its add. sparse-array 1.01× → 0.92×, closure calls 1.18× → 1.10×.'],
-  ['v0.0.11', 'Booleans and receivers get their own registers, so tokenizer-shaped loops stay on the integer tier. parse-large-js 1.24× → 0.88×.'],
-  ['v0.0.10', 'Hardened limits sized for applications: megabyte-scale strings and buffers, a 512 MB heap budget.'],
 ]
 
 const useCases = [
@@ -474,7 +544,7 @@ type PlaygroundWorkerMessage =
 
 function Playground() {
   const [exampleId, setExampleId] = useState(playgroundExamples[0].id)
-  const [source, setSource] = useState(playgroundExample)
+  const [source, setSource] = useState(playgroundExamples[0].source)
   const [output, setOutput] = useState('Run the sample to see console output from Zipp WASM.')
   const [status, setStatus] = useState<PlaygroundStatus>('idle')
   const [elapsedMs, setElapsedMs] = useState<number | null>(null)
@@ -612,7 +682,8 @@ function Playground() {
       setOutput(event.message || 'The Zipp Worker could not start.')
     }
 
-    worker.postMessage({ type: 'run', runId, source, ...wasmUrls() })
+    const storySeed = exampleId === 'adventure' ? crypto.getRandomValues(new Uint32Array(1))[0] : undefined
+    worker.postMessage({ type: 'run', runId, source, storySeed, ...wasmUrls() })
 
     prewarm()
   }
@@ -646,24 +717,22 @@ function Playground() {
     <section className="playground-section section-wrap" id="playground">
       <div className="playground-heading">
         <div>
-          <p className="section-kicker">Live browser runtime</p>
-          <h2>Try JavaScript in Zipp.</h2>
+          <p className="section-kicker">LESS TALK. MORE TINKERING.</p>
+          <h2>Your code.<br />ZIPP’s sandbox.</h2>
         </div>
         <p>
-          Pick an example, edit it, run it. The editor runs the interpreter-only WASM build in a
-          disposable Worker with no ambient network, filesystem, Node, or browser authority; a hung
-          run is terminated from the page outside the guest runtime. The heavier examples do
-          hundreds of thousands of operations each — watch the timer.
+          Generate a little adventure, find a million primes, or bring your own idea. Pick a sample,
+          change the code, and hit Run. This is the real ZIPP WASM engine executing
+          JavaScript inside your browser — with a sandbox of its own.
         </p>
       </div>
 
-      <div className="example-picker" role="tablist" aria-label="Choose an example">
+      <div className="example-picker" role="group" aria-label="Choose an example">
         {playgroundExamples.map((example) => (
           <button
             key={example.id}
             type="button"
-            role="tab"
-            aria-selected={example.id === exampleId}
+            aria-pressed={example.id === exampleId}
             className={example.id === exampleId ? 'active' : ''}
             onClick={() => selectExample(example.id)}
           >
@@ -697,7 +766,7 @@ function Playground() {
           />
           <div className="playground-actions">
             <button className="button playground-run" type="button" onClick={runSource} disabled={status === 'loading' || status === 'running'}>
-              {status === 'loading' ? 'Loading…' : status === 'running' ? 'Running…' : 'Run with Zipp'}
+              {status === 'loading' ? 'Loading…' : status === 'running' ? 'Running…' : '▶ Run with ZIPP'}
               <span aria-hidden="true">Ctrl/⌘ + Enter</span>
             </button>
             <button className="playground-reset" type="button" onClick={resetSource}>Reset example</button>
@@ -709,7 +778,7 @@ function Playground() {
             <div><span className="output-mark" aria-hidden="true">›_</span><span>Console output</span></div>
             <span>WASM · safe-sandbox</span>
           </div>
-          <pre aria-live="polite" aria-label="Zipp console output"><code>{output}</code></pre>
+          <pre tabIndex={0} aria-live="polite" aria-label="Zipp console output"><code>{output}</code></pre>
           <div className="playground-boundary">
             <span><i />50m instruction lifetime cap</span>
             <span><i />128 MiB VM heap ceiling</span>
@@ -717,6 +786,7 @@ function Playground() {
           </div>
         </div>
       </div>
+      <p className="playground-build-note">Bundled engine: <a href={`${GITHUB_URL}/releases/tag/v0.0.15`} target="_blank" rel="noreferrer">ZIPP WASM v0.0.15</a>. Each run uses a disposable Worker with a host-enforced deadline. Repository updates do not swap the engine underneath your code.</p>
     </section>
   )
 }
@@ -728,7 +798,7 @@ function App() {
   const [suite, setSuite] = useState<Suite>('normal')
   const [scrolled, setScrolled] = useState(false)
   const resetTimer = useRef<number | undefined>(undefined)
-  const stats = useRepoStats()
+  const { stats, status: repoStatus, refreshing, refresh } = useRepoStats()
   useReveal()
   useSpotlight()
 
@@ -739,9 +809,10 @@ function App() {
     return () => window.removeEventListener('scroll', onScroll)
   }, [])
 
-  const liveWins = stats?.nodeWins ?? nodeWins(benchmarkRows) + nodeWins(hostileRows)
-  const liveAll30 = stats?.all30 ?? 0.728
-  const liveStartup = stats?.startupMs ?? 7.4
+  // These figures belong to the pinned 2 September capture, not today's release.
+  const liveWins = nodeWins(benchmarkRows) + nodeWins(hostileRows)
+  const liveAll30 = 0.728
+  const liveStartup = 7.4
 
   const visibleBenchmarks = useMemo(
     () =>
@@ -801,6 +872,7 @@ function App() {
         <nav className={`nav-links ${menuOpen ? 'nav-open' : ''}`} id="primary-navigation" aria-label="Primary navigation">
           <a href="#playground" onClick={closeMenu}>Playground</a>
           <a href="#use-cases" onClick={closeMenu}>Use cases</a>
+          <a href="#updates" onClick={closeMenu}>What’s new</a>
           <a href="#controls" onClick={closeMenu}>Controls</a>
           <a href="#benchmarks" onClick={closeMenu}>Benchmarks</a>
           <a href="#architecture" onClick={closeMenu}>Engine</a>
@@ -819,97 +891,41 @@ function App() {
       <main id="main-content">
         <section className="hero section-wrap" id="top">
           <div className="hero-copy">
-            <a className="result-pill" href="#benchmarks">
-              <span>Native CLI · canonical PGO · 30/30 exact outputs</span>
-              <strong>{liveAll30.toFixed(3)}× Node · {liveWins} of 30 rows faster</strong>
-              <span aria-hidden="true">↓</span>
+            <a className="result-pill" href="#use-cases">
+              <span>BUILT TO BE EMBEDDED</span>
+              <strong>Already at play in Softn</strong>
+              <span aria-hidden="true">↗</span>
             </a>
 
             <h1>
-              Fast JavaScript for the code <em>your users bring.</em>
+              Big ideas.<br /><em>Tiny sandbox.</em>
             </h1>
 
             <p className="hero-intro">
-              Zipp is a Rust-native, embeddable JavaScript engine for user-authored rules,
-              plugin logic, workflow steps, and interactive scripts. Keep a VM alive,
-              expose only the host capabilities you choose, and put hard limits around hostile jobs.
+              Give the code your users bring a place to play. ZIPP is a fast,
+              embeddable JavaScript engine built in Rust. Run it natively, or use
+              <strong> ZIPP WASM to run sandboxed JavaScript on top of JavaScript.</strong>
             </p>
 
             <div className="hero-actions">
-              <a className="button button-primary" href="#playground">Try Zipp in browser <span aria-hidden="true">↓</span></a>
+              <a className="button button-primary" href="#playground">Let’s play with JavaScript <span aria-hidden="true">↗</span></a>
               <ExternalLink className="button button-secondary" href={GITHUB_URL}>Explore on GitHub</ExternalLink>
-              <a className="button button-secondary" href="#benchmarks">See the numbers <span aria-hidden="true">↓</span></a>
             </div>
 
             <div className="hero-trust" aria-label="Zipp highlights">
-              <span><i />{stats?.test262Pct !== undefined ? `${stats.test262Pct}% test262` : '99.997% test262'}</span>
+              <a href={`${GITHUB_URL}/blob/${stats.sourceCommit ?? 'main'}/README.md`} target="_blank" rel="noreferrer" title="Compatibility reported by the repository README">{stats.test262Pct !== undefined ? `${stats.test262Pct}% test262` : 'ECMAScript compatibility'}</a>
               <span><i />Native + WASM</span>
-              <span><i />Open source · MIT</span>
+              <a href={`${GITHUB_URL}/blob/main/LICENSE-APACHE`} target="_blank" rel="noreferrer">Open source · {stats.license ?? 'Apache-2.0'}</a>
             </div>
 
-            <LiveRepoStrip stats={stats} />
+            <LiveRepoStrip stats={stats} status={repoStatus} />
           </div>
 
-          <aside className="sandbox-card" aria-label="Illustrative capability-controlled Zipp session">
-            <div className="sandbox-card-header">
-              <span className="terminal-dots" aria-hidden="true"><i /><i /><i /></span>
-              <span>execution / session-042</span>
-              <span className="live-status"><i /> within budget</span>
-            </div>
-
-            <div className="boundary-map">
-              <div className="boundary-node host-node">
-                <span className="node-label">Trusted</span>
-                <strong>Your product</strong>
-                <small>Rust host</small>
-              </div>
-              <div className="bridge-line" aria-hidden="true">
-                <span>capability bridge</span>
-                <i />
-              </div>
-              <div className="boundary-node vm-node">
-                <span className="node-label">Guest</span>
-                <strong>Zipp VM</strong>
-                <small>user-script.js</small>
-              </div>
-            </div>
-
-            <div className="capability-panel">
-              <div className="panel-label">
-                <span>Exposed capabilities</span>
-                <span>2 allowed</span>
-              </div>
-              <div className="capability-chips">
-                <span><i />orders.read</span>
-                <span><i />email.queue</span>
-                <span className="capability-denied">filesystem ×</span>
-                <span className="capability-denied">network ×</span>
-              </div>
-            </div>
-
-            <div className="budget-panel">
-              <div className="budget-heading">
-                <span>Instruction budget</span>
-                <strong>1.84m <small>/ 5m</small></strong>
-              </div>
-              <div className="budget-track"><span /></div>
-              <div className="budget-meta">
-                <span>approx. heap indicator <b>32 MB</b></span>
-                <span>abort <b>armed</b></span>
-              </div>
-            </div>
-
-            <div className="sandbox-log" aria-label="Illustrative session log">
-              <div><span>09:42:08.114</span><b>compile</b><em>bytecode ready</em></div>
-              <div><span>09:42:08.117</span><b>host.call</b><em>orders.read</em></div>
-              <div><span>09:42:08.118</span><b>return</b><em className="log-success">score: 0.94</em></div>
-            </div>
-
-            <p className="sandbox-footnote"><span>↳</span> Illustrative session · no host access unless you install it.</p>
-          </aside>
+          <SandboxStack />
         </section>
 
         <section className="proof-band" aria-label="Measured native Zipp results">
+          <div className="proof-caption section-wrap"><span>NATIVE BENCHMARK SNAPSHOT</span><a href="#benchmarks">2 Sep 2026 · v0.0.12 · see the evidence ↗</a></div>
           <div className="section-wrap proof-grid">
             <div className="proof-lead">
               <span className="metric-index">01</span>
@@ -934,9 +950,13 @@ function App() {
           </div>
         </section>
 
+        <ProjectShowcase />
+
+        <RepositoryActivity stats={stats} status={repoStatus} refreshing={refreshing} refresh={refresh} />
+
         <Playground />
 
-        <section className="use-case-section section-wrap" id="use-cases">
+        <section className="use-case-section section-wrap" id="possibilities">
           <div className="section-heading split-heading">
             <div>
               <p className="section-kicker">Built for the edge of trust</p>
@@ -1021,6 +1041,7 @@ function App() {
             </div>
           </div>
 
+          <p className="benchmark-capture-note">Measured 2 September 2026 · native Windows x86-64 · engine <code>8229b3fc</code>. These are retained benchmark results, not measurements of the latest release or browser playground. <a href={CAPTURE_README_URL} target="_blank" rel="noreferrer">Read the capture summary ↗</a></p>
           <div className="benchmark-summary">
             <article className="headline-result">
               <div>
@@ -1028,7 +1049,7 @@ function App() {
                 <strong>0.7278×</strong>
                 <p>Native Zipp / Node paired geomean · lower is better</p>
               </div>
-              <div className="confidence-pill">95% CI&nbsp; 0.7163–0.7359</div>
+              <div className="confidence-pill">95% interval&nbsp; 0.723–0.730</div>
             </article>
 
             <article className="ratio-card">
@@ -1036,14 +1057,14 @@ function App() {
               <div className="ratio-row"><b>vs Node</b><span><i className="bar-geomean-node" /></span><strong>0.7278×</strong></div>
               <div className="ratio-row"><b>vs Bun</b><span><i className="bar-geomean-bun" /></span><strong>0.5936×</strong></div>
               <div className="ratio-row"><b>vs Deno</b><span><i className="bar-geomean-deno" /></span><strong>0.4604×</strong></div>
-              <small>95% CIs: Node 0.7163–0.7359 · Bun 0.5972–0.6073 · Deno 0.4639–0.4739. Normal 13 + hostile 17; equal weight per row.</small>
+              <small>95% intervals: Node 0.723–0.730 · Bun 0.591–0.598 · Deno 0.458–0.464. Normal 13 + hostile 17; equal weight per row. Reported in the capture README.</small>
             </article>
 
             <article className="ratio-card suite-card">
               <span>Suite geomeans vs Node</span>
               <div className="ratio-row"><b>Normal 13</b><span><i className="bar-suite-normal" /></span><strong>0.6136×</strong></div>
               <div className="ratio-row"><b>Hostile 17</b><span><i className="bar-suite-hostile" /></span><strong>0.8293×</strong></div>
-              <small>95% CIs: normal 0.6156–0.6240 · hostile 0.7995–0.8378. Rows faster than Node: {nodeWins(benchmarkRows)}/13 + {nodeWins(hostileRows)}/17.</small>
+              <small>95% intervals: normal 0.611–0.617 · hostile 0.820–0.833. Rows faster than Node: {nodeWins(benchmarkRows)}/13 + {nodeWins(hostileRows)}/17.</small>
             </article>
           </div>
 
@@ -1179,24 +1200,11 @@ function App() {
             <div className="methodology-links">
               <ExternalLink className="text-link" href={BENCHMARK_URL}>Normal capture</ExternalLink>
               <ExternalLink className="text-link" href={HOSTILE_BENCHMARK_URL}>Hostile capture</ExternalLink>
+              <ExternalLink className="text-link" href={CAPTURE_README_URL}>Aggregate & intervals</ExternalLink>
               <ExternalLink className="text-link" href={ROADMAP_URL}>What is next</ExternalLink>
             </div>
           </div>
 
-          <div className="release-strip" aria-label="Recent releases">
-            <div className="release-strip-heading">
-              <p className="section-kicker">Recent releases</p>
-              <ExternalLink className="text-link" href={RELEASE_URL}>Latest release</ExternalLink>
-            </div>
-            <ol>
-              {releaseNotes.map(([version, note]) => (
-                <li key={version}>
-                  <strong>{version}</strong>
-                  <p>{note}</p>
-                </li>
-              ))}
-            </ol>
-          </div>
         </section>
 
         <section className="architecture-section" id="architecture">
