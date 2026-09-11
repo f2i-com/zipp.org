@@ -33,8 +33,8 @@ use crate::value::Value;
 use crate::vm::Vm;
 
 pub use crate::vm::host_api::{
-    FingerprintBudget, HostCallError, HostValue, HostValueBudget, Symbol, SymbolScope,
-    DEFAULT_HOST_VALUE_MAX_NODES, DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
+    FingerprintBudget, HostCallError, HostValue, HostValueBudget, ResourceUsage, Symbol,
+    SymbolScope, DEFAULT_HOST_VALUE_MAX_NODES, DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
 };
 pub use crate::vm::host_api::{HostCallCtx, HostCtx};
 /// The execution-trace row and its opcode contract. Full `instrument` builds
@@ -694,6 +694,34 @@ impl ScriptState {
         }
     }
 
+    /// Evaluate `src` in the script's global context and marshal its
+    /// completion value as a structured [`HostValue`] — the rich-value
+    /// counterpart of [`Self::eval_in_context`]'s shallow `ToString`
+    /// marshalling, with a slot read's cycle, depth, opaque and budget rules
+    /// (nothing is stringified; a cycle reads as `Null`, a function as
+    /// `Opaque`). Declarations persist exactly as with `eval_in_context`, and
+    /// microtasks are drained afterwards as [`Self::call_slot`] drains them.
+    /// The same cost note applies: each call compiles and retains a program.
+    pub fn eval_in_context_rich(
+        &mut self,
+        src: &str,
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, HostCallError> {
+        match self.vm.as_mut() {
+            Some(vm) => vm.host_eval_rich(src, budget),
+            None => Err(HostCallError::Thrown("zipp: VM has been torn down".into())),
+        }
+    }
+
+    /// What this VM currently retains and has spent — see [`ResourceUsage`].
+    /// Cheap (no walk), so a host may read it between every re-entry.
+    pub fn resource_usage(&self) -> ResourceUsage {
+        self.vm
+            .as_ref()
+            .map(|vm| vm.host_resource_usage())
+            .unwrap_or_default()
+    }
+
     // ---- Untrusted-code controls (`instrument` feature) -------------------
     //
     // A host running code it did not write needs to bound it and, for some
@@ -1297,6 +1325,66 @@ mod tests {
             .expect("duplicate parameters are a strict early error");
             assert!(err.contains("SyntaxError"), "{err}");
         }
+    }
+
+    #[test]
+    fn rich_eval_marshals_structures_and_reports_usage() {
+        let mut st = compile_script("var log = []; function f() { return 1; }").expect("compiles");
+        st.run_init().expect("runs");
+        let before = st.resource_usage();
+        assert_eq!(before.retained_functions, 0);
+        let mut budget = HostValueBudget::default();
+        let got = st
+            .eval_in_context_rich(
+                "var later = function () { return 2; }; \
+                 Promise.resolve().then(function () { log.push('ran'); }); \
+                 ({ a: [1, -0, NaN], f: f, s: 'x' })",
+                &mut budget,
+            )
+            .expect("evaluates");
+        // -0 and NaN cross as themselves, a function as Opaque (NaN is not
+        // equal to itself, so the array is checked element-wise).
+        let HostValue::Object(pairs) = got else {
+            panic!("object expected")
+        };
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].0, "a");
+        let HostValue::Array(items) = &pairs[0].1 else {
+            panic!("array expected")
+        };
+        assert!(matches!(items[0], HostValue::Number(n) if n == 1.0));
+        assert!(matches!(items[1], HostValue::Number(n) if n == 0.0 && n.is_sign_negative()));
+        assert!(matches!(items[2], HostValue::Number(n) if n.is_nan()));
+        assert_eq!(pairs[1], ("f".to_string(), HostValue::Opaque));
+        assert_eq!(pairs[2], ("s".to_string(), HostValue::String("x".into())));
+        // Declarations persist and microtasks were drained.
+        assert_eq!(st.call_global("later", &[]), Ok(JsValue::Number(2.0)));
+        assert_eq!(st.eval_in_context("log.length"), Ok(JsValue::Number(1.0)));
+        assert_eq!(
+            st.eval_in_context_rich("cyc = {}; cyc.self = cyc; cyc", &mut budget)
+                .expect("evaluates"),
+            HostValue::Object(vec![("self".into(), HostValue::Null)])
+        );
+        let err = st
+            .eval_in_context_rich("(function () { throw new Error('boom'); })()", &mut budget)
+            .expect_err("a throw is a throw");
+        assert!(
+            matches!(err, HostCallError::Thrown(ref m) if m.contains("boom")),
+            "{err:?}"
+        );
+        let mut tiny = HostValueBudget::new(2, 1 << 20);
+        let err = st
+            .eval_in_context_rich("[1, 2, 3, 4]", &mut tiny)
+            .expect_err("over budget");
+        assert!(matches!(err, HostCallError::Conversion(_)), "{err:?}");
+
+        let after = st.resource_usage();
+        assert!(
+            after.retained_functions > before.retained_functions,
+            "{after:?}"
+        );
+        assert!(after.heap_bytes > 0);
+        assert_eq!(after.console_lines_buffered, 0);
     }
 
     #[test]

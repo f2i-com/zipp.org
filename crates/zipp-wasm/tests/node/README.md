@@ -50,6 +50,9 @@ top of each file if you put it elsewhere).
   callback ids with cancellation, chronological console output,
   `window.dispatchEvent`, and the profile's provenance and policy fields. The
   audit's own 15-case probe bundle ran red on v0.0.15 for 13 of them.
+- **resource-usage.cjs** — `resourceUsage()`/`zippInstanceUsage()` and the
+  rich eval: a 200-engine create/run/dispose churn in one instance, reporting
+  what the instance retains next to the process RSS delta (ZIPP-06 stage 1).
 - **profile-matches-readme.cjs** — holds the README's resource table to the
   figures `zippProfile()` reports.
 - **softn-snakegame.cjs** — a real SoftN bundle's `.logic`, unmodified, driven the

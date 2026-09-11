@@ -328,6 +328,51 @@ pub enum HostValue {
     Opaque,
 }
 
+/// What a VM currently retains and has spent, as counters a host can read
+/// between re-entries: the first stage of the 11 September 2026 audit's
+/// ZIPP-06 (measure retained compiled code before attempting to reclaim it).
+///
+/// The dynamic-code figures are the recorder's lifetime counters: compilation
+/// attempts, the source bytes they were charged, and the stable-address
+/// function and class definitions retained by successful ones — which is
+/// what `dispose()` does NOT reclaim within one WASM instance. They are exact
+/// counts, not allocator bytes: the compiler's own allocations are not
+/// introspectable, so a host compares these against the WASM instance's
+/// linear-memory pages and its process memory separately, and recycles the
+/// instance when the retained definitions have grown past what it accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ResourceUsage {
+    /// Payload-aware resident guest heap estimate, in bytes.
+    pub heap_bytes: usize,
+    /// Bytecode instructions executed since limits were set (0 without a
+    /// recorder).
+    pub steps_used: u64,
+    /// Dynamic compilations attempted (`eval`, `Function`, `ShadowRealm`,
+    /// host eval), successful or not.
+    pub dynamic_code_calls: usize,
+    /// Source bytes those attempts were charged.
+    pub dynamic_code_source_bytes: usize,
+    /// Function definitions installed by successful dynamic compilations and
+    /// retained for the VM's lifetime.
+    pub retained_functions: usize,
+    /// Class definitions likewise retained.
+    pub retained_classes: usize,
+    /// Console lines buffered and not yet taken.
+    pub console_lines_buffered: usize,
+    /// Console bytes charged over the VM's lifetime (never credited on take).
+    pub console_bytes_lifetime: usize,
+    /// ArrayBuffers pinned for the accelerator.
+    pub pinned_buffers: usize,
+    /// Functions in the compiled program itself (the preamble-plus-guest
+    /// script), and its bytecode and retained source bytes: the allocation
+    /// the `safe-sandbox` profile keeps for the WASM instance's lifetime
+    /// rather than freeing on `dispose()`. Exact for what they count; the
+    /// compiler's side tables are not included.
+    pub program_functions: usize,
+    pub program_bytecode_bytes: usize,
+    pub program_source_bytes: usize,
+}
+
 /// How deep the walk will follow an object graph before giving up. Deep enough
 /// for any UI state a host would sensibly hold, shallow enough that a pathological
 /// graph cannot exhaust the native stack (this walk is natively recursive).
@@ -977,6 +1022,85 @@ impl<'p> Vm<'p> {
     /// continuations observe the write.
     pub(crate) fn host_pump(&mut self) {
         self.drain_microtasks();
+    }
+
+    /// Evaluate `src` as indirect eval in the global scope and marshal the
+    /// completion value as a structured [`HostValue`] under `budget` — the
+    /// rich-value counterpart of the JSON projection the WASM
+    /// `evalInContext` performs, with the same cycle, depth, opaque and
+    /// budget rules as a slot read. Microtasks are drained afterwards, as
+    /// [`Self::host_call_slot`] drains them. Each call compiles and retains a
+    /// program; it is for one-off queries, never a per-frame path.
+    pub(crate) fn host_eval_rich(
+        &mut self,
+        src: &str,
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, HostCallError> {
+        let res = self.do_eval(
+            src,
+            false,            // force_strict: inherit the source's own directive
+            false,            // force_new_target_ok
+            None,             // this_override: the realm global
+            None,             // inherit_super
+            false,            // ban_arguments
+            false,            // direct
+            Value::UNDEFINED, // caller_new_target
+            None,             // caller_home_obj
+            true,             // var_env_global: declarations persist
+            None,             // param_collisions
+            Vec::new(),       // lexical_collisions
+            None,             // caller_scope
+            None,             // eval_scope_idx
+            None,             // exact_src
+        );
+        self.drain_microtasks();
+        match res {
+            Ok(v) => {
+                let _g = self.gc_lock_guard();
+                let mut seen: Vec<u32> = Vec::new();
+                self.host_out(v, 0, &mut seen, budget)
+                    .map_err(HostCallError::Conversion)
+            }
+            Err(t) => Err(HostCallError::Thrown(t.0)),
+        }
+    }
+
+    /// A snapshot of what this VM currently retains and has spent — see
+    /// [`ResourceUsage`].
+    pub(crate) fn host_resource_usage(&self) -> ResourceUsage {
+        #[cfg(feature = "instrument")]
+        let (steps_used, dynamic_code_calls, dynamic_code_source_bytes) = match &self.instr_rec {
+            Some(rec) => {
+                let (calls, bytes) = rec.dynamic_code_usage();
+                (rec.steps_used(), calls, bytes)
+            }
+            None => (0, 0, 0),
+        };
+        #[cfg(not(feature = "instrument"))]
+        let (steps_used, dynamic_code_calls, dynamic_code_source_bytes) = (0, 0, 0);
+        #[cfg(feature = "instrument")]
+        let console_bytes_lifetime = self.instr_rec.as_ref().map_or(0, |rec| rec.output_used);
+        #[cfg(not(feature = "instrument"))]
+        let console_bytes_lifetime = 0;
+        ResourceUsage {
+            heap_bytes: self.heap_bytes(),
+            steps_used,
+            dynamic_code_calls,
+            dynamic_code_source_bytes,
+            retained_functions: self.eval_funcs.len(),
+            retained_classes: self.eval_classes.len(),
+            console_lines_buffered: self.output.len() + self.errput.len(),
+            console_bytes_lifetime,
+            pinned_buffers: self.pinned_buffers.len(),
+            program_functions: self.program.functions.len(),
+            program_bytecode_bytes: self
+                .program
+                .functions
+                .iter()
+                .map(|f| f.code.len() * std::mem::size_of::<crate::bytecode::Instr>())
+                .sum(),
+            program_source_bytes: self.program.functions.iter().map(|f| f.source.len()).sum(),
+        }
     }
 
     /// Does this value refuse to cross as data?

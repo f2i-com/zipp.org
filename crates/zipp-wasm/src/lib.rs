@@ -48,6 +48,12 @@ extern "C" {
 const PREAMBLE: &str = include_str!("preamble.js");
 const EVAL_PREFIX: &str = "JSON.stringify((function () { return (";
 const EVAL_SUFFIX: &str = "); })())";
+// `evalInContextRich` marshals the value itself; only the expression wrapper
+// remains. It shares `evalInContext`'s per-expression ceiling, which is
+// derived from the longer JSON wrapper, so the rich form is never the more
+// permissive one.
+const RICH_EVAL_PREFIX: &str = "(function () { return (";
+const RICH_EVAL_SUFFIX: &str = "); })()";
 
 // Sized for applications, not for snippets. Every one of these was small
 // enough that ordinary media work hit it as a wall rather than as a guard:
@@ -298,6 +304,11 @@ pub struct Engine {
 impl Engine {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Engine {
+        INSTANCE_USAGE.with(|c| {
+            let mut u = c.get();
+            u.engines_created += 1;
+            c.set(u);
+        });
         Engine {
             state: None,
             slots: Vec::new(),
@@ -787,60 +798,22 @@ impl Engine {
     /// getters run; own enumerable data properties cross and accessors are
     /// evaluated; a cycle throws — and a guest that replaced its `JSON`
     /// facilities changes the answer, which is reported as an error rather
-    /// than as `undefined`. Polling state should use the slot/batch APIs,
-    /// which neither compile nor project.
+    /// than as `undefined`. [`Engine::evalInContextRich`] is the rich-value
+    /// form. Polling state should use the slot/batch APIs, which neither
+    /// compile nor project.
     ///
     /// Each call compiles fresh and installs stable-address definitions, so this
     /// is for one-off host queries — never a per-frame path. Use
     /// [`Engine::callFunction`] there.
     #[wasm_bindgen(js_name = evalInContext)]
     pub fn eval_in_context(&mut self, expr: &str) -> Result<JsValue, JsValue> {
-        self.ensure_live()?;
-        if self.state.is_none() {
-            return Err(JsValue::from_str("zipp: not initialized"));
-        }
-        if expr.len() > MAX_EVAL_SOURCE_BYTES {
-            self.terminate();
-            return Err(JsValue::from_str(&format!(
-                "RangeError: evalInContext source exceeds the {MAX_EVAL_SOURCE_BYTES}-byte per-call limit"
-            )));
-        }
-        if self.eval_calls >= MAX_EVAL_CALLS {
-            self.terminate();
-            return Err(JsValue::from_str(&format!(
-                "RangeError: evalInContext exceeded its {MAX_EVAL_CALLS}-call lifetime limit"
-            )));
-        }
-        let wrapped_len = EVAL_PREFIX
-            .len()
-            .checked_add(expr.len())
-            .and_then(|n| n.checked_add(EVAL_SUFFIX.len()))
-            .ok_or_else(|| JsValue::from_str("RangeError: evalInContext source size overflow"))?;
-        let retained = self
-            .eval_retained_source_bytes
-            .checked_add(wrapped_len)
-            .ok_or_else(|| {
-                JsValue::from_str("RangeError: evalInContext retained source size overflow")
-            })?;
-        if retained > MAX_EVAL_RETAINED_SOURCE_BYTES {
-            self.terminate();
-            return Err(JsValue::from_str(&format!(
-                "RangeError: evalInContext exceeded its {MAX_EVAL_RETAINED_SOURCE_BYTES}-byte retained-source lifetime limit"
-            )));
-        }
-        self.eval_calls += 1;
-        self.eval_retained_source_bytes = retained;
-
         // Route the result through JSON so structured values survive; the
         // shallow `eval_in_context` marshaller would render them as ToString.
-        let mut wrapped = String::with_capacity(wrapped_len);
-        wrapped.push_str(EVAL_PREFIX);
-        wrapped.push_str(expr);
-        wrapped.push_str(EVAL_SUFFIX);
+        let wrapped = self.account_eval("evalInContext", expr, EVAL_PREFIX, EVAL_SUFFIX)?;
         let result = self
             .state
             .as_mut()
-            .expect("initialization checked above")
+            .expect("initialization checked by account_eval")
             .eval_in_context(&wrapped);
         let value = self.finish_execution(result)?;
         match value.as_str() {
@@ -863,6 +836,115 @@ impl Engine {
             // `JSON.stringify` yields undefined for a function or undefined.
             None => Ok(JsValue::UNDEFINED),
         }
+    }
+
+    /// Evaluate `expr` in the script's global context and return its value
+    /// as STRUCTURED DATA, under the same contract as `callFunction` and the
+    /// slot reads: `-0`, `NaN` and the infinities cross as themselves, a
+    /// function, class, `Map`, `Date`, typed array or proxy reads as `null`,
+    /// a cycle reads as `null`, accessors are not invoked, and the result is
+    /// bounded by the host-value conversion budget. Nothing is stringified
+    /// and the guest's `JSON` facilities are not involved. Microtasks the
+    /// evaluation schedules are drained before this returns, as they are for
+    /// `callFunction`.
+    ///
+    /// Shares `evalInContext`'s lifetime ceilings (per-expression bytes,
+    /// retained wrapper source, call count) and its cost: each call compiles
+    /// and retains a program. One-off host queries only.
+    #[wasm_bindgen(js_name = evalInContextRich)]
+    pub fn eval_in_context_rich(&mut self, expr: &str) -> Result<JsValue, JsValue> {
+        let wrapped = self.account_eval(
+            "evalInContextRich",
+            expr,
+            RICH_EVAL_PREFIX,
+            RICH_EVAL_SUFFIX,
+        )?;
+        let mut budget = HostValueBudget::default();
+        let result = self
+            .state
+            .as_mut()
+            .expect("initialization checked by account_eval")
+            .eval_in_context_rich(&wrapped, &mut budget);
+        // A resource ceiling is terminal whatever the typed error says.
+        let result = result.map_err(HostCallError::into_message);
+        let value = self.finish_execution(result)?;
+        // The JS-side conversion has its own copy of the same budget shape.
+        let mut js_budget = HostValueBudget::default();
+        to_js_bounded(&value, &mut js_budget).map_err(to_js_error)
+    }
+
+    /// What this engine currently retains and has spent, as a plain object a
+    /// host can read between re-entries (cheap: no walk). The first stage of
+    /// the 11 September 2026 audit's ZIPP-06 — measure retained compiled code
+    /// before attempting to reclaim it:
+    ///
+    /// - `heapBytes`: the payload-aware guest heap estimate the heap ceiling
+    ///   is enforced against;
+    /// - `stepsUsed`: bytecode instructions executed under the current budget;
+    /// - `instructionBudget`: the allowance the host chose;
+    /// - `evalCalls`, `evalRetainedSourceBytes`: this engine's `evalInContext`
+    ///   / `evalInContextRich` accounting;
+    /// - `dynamicCodeCalls`, `dynamicCodeSourceBytes`: every dynamic
+    ///   compilation attempt (`eval`, `Function`, `ShadowRealm`, host eval)
+    ///   and the source bytes charged;
+    /// - `retainedFunctions`, `retainedClasses`: stable-address definitions
+    ///   retained by successful dynamic compilations — the figure
+    ///   `dispose()` does NOT reclaim within one WASM instance, so a host
+    ///   recycles the Worker/WASM instance when their sum across tenants
+    ///   passes what it accepts;
+    /// - `consoleLinesBuffered`, `consoleBytesLifetime`, `pinnedBuffers`.
+    ///
+    /// These are exact counts, not allocator bytes: compare them with the
+    /// WASM instance's `memory.buffer.byteLength` (linear-memory high-water)
+    /// and the process's own memory, which this module cannot see.
+    #[wasm_bindgen(js_name = resourceUsage)]
+    pub fn resource_usage(&mut self) -> Result<JsValue, JsValue> {
+        self.ensure_live()?;
+        let usage = self
+            .state
+            .as_ref()
+            .map(ScriptState::resource_usage)
+            .unwrap_or_default();
+        let n = |v: usize| HostValue::Number(v as f64);
+        to_js(&HostValue::Object(vec![
+            ("heapBytes".into(), n(usage.heap_bytes)),
+            (
+                "stepsUsed".into(),
+                HostValue::Number(usage.steps_used as f64),
+            ),
+            (
+                "instructionBudget".into(),
+                HostValue::Number(self.instruction_budget as f64),
+            ),
+            ("evalCalls".into(), n(self.eval_calls as usize)),
+            (
+                "evalRetainedSourceBytes".into(),
+                n(self.eval_retained_source_bytes),
+            ),
+            ("dynamicCodeCalls".into(), n(usage.dynamic_code_calls)),
+            (
+                "dynamicCodeSourceBytes".into(),
+                n(usage.dynamic_code_source_bytes),
+            ),
+            ("retainedFunctions".into(), n(usage.retained_functions)),
+            ("retainedClasses".into(), n(usage.retained_classes)),
+            (
+                "consoleLinesBuffered".into(),
+                n(usage.console_lines_buffered),
+            ),
+            (
+                "consoleBytesLifetime".into(),
+                n(usage.console_bytes_lifetime),
+            ),
+            ("pinnedBuffers".into(), n(usage.pinned_buffers)),
+            ("programFunctions".into(), n(usage.program_functions)),
+            (
+                "programBytecodeBytes".into(),
+                n(usage.program_bytecode_bytes),
+            ),
+            ("programSourceBytes".into(), n(usage.program_source_bytes)),
+        ]))
+        .map_err(to_js_error)
     }
 
     /// Event types the script has registered listeners for, e.g. `["keydown"]`.
@@ -1220,7 +1302,77 @@ impl Engine {
         self.finish_execution(result)
     }
 
+    /// The lifetime accounting both eval entry points share: the
+    /// per-expression source ceiling, the call count and the retained wrapper
+    /// source, checked and charged BEFORE anything is compiled. Returns the
+    /// wrapped source to evaluate. A ceiling crossed is terminal.
+    fn account_eval(
+        &mut self,
+        api: &str,
+        expr: &str,
+        prefix: &str,
+        suffix: &str,
+    ) -> Result<String, JsValue> {
+        self.ensure_live()?;
+        if self.state.is_none() {
+            return Err(JsValue::from_str("zipp: not initialized"));
+        }
+        if expr.len() > MAX_EVAL_SOURCE_BYTES {
+            self.terminate();
+            return Err(JsValue::from_str(&format!(
+                "RangeError: {api} source exceeds the {MAX_EVAL_SOURCE_BYTES}-byte per-call limit"
+            )));
+        }
+        if self.eval_calls >= MAX_EVAL_CALLS {
+            self.terminate();
+            return Err(JsValue::from_str(&format!(
+                "RangeError: {api} exceeded its {MAX_EVAL_CALLS}-call lifetime limit"
+            )));
+        }
+        let wrapped_len = prefix
+            .len()
+            .checked_add(expr.len())
+            .and_then(|n| n.checked_add(suffix.len()))
+            .ok_or_else(|| JsValue::from_str(&format!("RangeError: {api} source size overflow")))?;
+        let retained = self
+            .eval_retained_source_bytes
+            .checked_add(wrapped_len)
+            .ok_or_else(|| {
+                JsValue::from_str(&format!("RangeError: {api} retained source size overflow"))
+            })?;
+        if retained > MAX_EVAL_RETAINED_SOURCE_BYTES {
+            self.terminate();
+            return Err(JsValue::from_str(&format!(
+                "RangeError: {api} exceeded its {MAX_EVAL_RETAINED_SOURCE_BYTES}-byte retained-source lifetime limit"
+            )));
+        }
+        self.eval_calls += 1;
+        self.eval_retained_source_bytes = retained;
+        let mut wrapped = String::with_capacity(wrapped_len);
+        wrapped.push_str(prefix);
+        wrapped.push_str(expr);
+        wrapped.push_str(suffix);
+        Ok(wrapped)
+    }
+
     fn terminate(&mut self) {
+        // Account what this engine leaves behind in the instance before the
+        // state that knows the figures is dropped.
+        if let Some(st) = self.state.as_ref() {
+            let usage = st.resource_usage();
+            INSTANCE_USAGE.with(|c| {
+                let mut u = c.get();
+                u.engines_disposed += 1;
+                u.retained_functions += usage.retained_functions as u64;
+                u.retained_classes += usage.retained_classes as u64;
+                u.dynamic_code_calls += usage.dynamic_code_calls as u64;
+                u.dynamic_code_source_bytes += usage.dynamic_code_source_bytes as u64;
+                u.program_functions += usage.program_functions as u64;
+                u.program_bytecode_bytes += usage.program_bytecode_bytes as u64;
+                u.program_source_bytes += usage.program_source_bytes as u64;
+                c.set(u);
+            });
+        }
         self.state = None;
         self.slots.clear();
         self.helpers = Helpers::default();
@@ -1252,11 +1404,78 @@ fn sync_host_call_arity(kind: &str) -> Option<usize> {
 }
 
 thread_local! {
+    /// What this WASM instance has accumulated across the engines it has
+    /// disposed: the definitions `dispose()` cannot give back, and the
+    /// compilation work that produced them. Live engines report their own
+    /// figures through `resourceUsage()`; these are the disposed ones', so a
+    /// host can decide when to recycle the instance (ZIPP-06, stage 1).
+    static INSTANCE_USAGE: std::cell::Cell<InstanceUsage> =
+        const { std::cell::Cell::new(InstanceUsage::ZERO) };
     /// The context of the `accel.run` call in progress, for
     /// [`accel_guest_call`]. Set for the duration of the bridge call and
     /// cleared after it; a callback outside that window is refused.
     static ACCEL_CTX: std::cell::Cell<Option<*mut (dyn HostCtx + 'static)>> =
         const { std::cell::Cell::new(None) };
+}
+
+#[derive(Clone, Copy)]
+struct InstanceUsage {
+    engines_created: u64,
+    engines_disposed: u64,
+    retained_functions: u64,
+    retained_classes: u64,
+    dynamic_code_calls: u64,
+    dynamic_code_source_bytes: u64,
+    program_functions: u64,
+    program_bytecode_bytes: u64,
+    program_source_bytes: u64,
+}
+
+impl InstanceUsage {
+    const ZERO: InstanceUsage = InstanceUsage {
+        engines_created: 0,
+        engines_disposed: 0,
+        retained_functions: 0,
+        retained_classes: 0,
+        dynamic_code_calls: 0,
+        dynamic_code_source_bytes: 0,
+        program_functions: 0,
+        program_bytecode_bytes: 0,
+        program_source_bytes: 0,
+    };
+}
+
+/// What this WASM instance has accumulated over every engine it has disposed
+/// so far, as JSON-shaped data: `enginesCreated`, `enginesDisposed`, and the
+/// disposed engines' summed `retainedFunctions`, `retainedClasses`,
+/// `dynamicCodeCalls`, `dynamicCodeSourceBytes`, and — the larger figure —
+/// `programFunctions`, `programBytecodeBytes` and `programSourceBytes`: each
+/// engine's compiled preamble-plus-guest program, which the `safe-sandbox`
+/// profile leaks for the instance's lifetime. Retained definitions and
+/// programs survive `dispose()`; when their total passes
+/// what a host accepts, the host recycles the Worker/WASM instance, which is
+/// the only reclamation this artifact offers (the 11 September 2026 audit's
+/// ZIPP-06, stage 1: measure before reclaiming). Live engines are not
+/// included; read each one's `resourceUsage()`.
+#[wasm_bindgen(js_name = zippInstanceUsage)]
+pub fn zipp_instance_usage() -> Result<JsValue, JsValue> {
+    let u = INSTANCE_USAGE.with(|c| c.get());
+    let n = |v: u64| HostValue::Number(v as f64);
+    to_js(&HostValue::Object(vec![
+        ("enginesCreated".into(), n(u.engines_created)),
+        ("enginesDisposed".into(), n(u.engines_disposed)),
+        ("retainedFunctions".into(), n(u.retained_functions)),
+        ("retainedClasses".into(), n(u.retained_classes)),
+        ("dynamicCodeCalls".into(), n(u.dynamic_code_calls)),
+        (
+            "dynamicCodeSourceBytes".into(),
+            n(u.dynamic_code_source_bytes),
+        ),
+        ("programFunctions".into(), n(u.program_functions)),
+        ("programBytecodeBytes".into(), n(u.program_bytecode_bytes)),
+        ("programSourceBytes".into(), n(u.program_source_bytes)),
+    ]))
+    .map_err(to_js_error)
 }
 
 /// Run a guest function by global name with numbers, from inside a host

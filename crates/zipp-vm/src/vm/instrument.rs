@@ -554,6 +554,12 @@ impl Recorder {
     /// dispatch/off-loop counters. A finite release-wasm meter instead derives
     /// the total from its immutable initial balance and current countdown.
     #[inline]
+    /// Dynamic compilations attempted so far (successful or not) and the
+    /// source bytes they were charged, for resource reporting.
+    pub(crate) fn dynamic_code_usage(&self) -> (usize, usize) {
+        (self.dynamic_calls, self.dynamic_source_bytes)
+    }
+
     pub(crate) fn steps_used(&self) -> u64 {
         #[cfg(all(feature = "meter-only", not(feature = "jit"), not(test)))]
         {

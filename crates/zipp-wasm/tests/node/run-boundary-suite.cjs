@@ -36,6 +36,7 @@ const CHECKS = [
   ["worker-deadline.cjs"],
   ["audit-defaults.cjs"],
   ["audit-2026-09-11.cjs"],
+  ["resource-usage.cjs"],
   ["profile-matches-readme.cjs"],
   ["syntax-corpus.cjs"],
 ];

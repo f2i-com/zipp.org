@@ -389,6 +389,27 @@ remain recoverable.
   the module owns — as JSON. Read it from the loaded module for a diagnostic
   panel or a compatibility check instead of copying figures from this page.
   Fields are only ever added.
+- `evalInContextRich(expr)` is the rich-value form of `evalInContext`: the
+  completion value crosses under the slot-read contract (`-0`, `NaN` and the
+  infinities as themselves, functions and opaque objects as `null`, cycles as
+  `null`, accessors not invoked, the conversion budget enforced), microtasks
+  are drained as for `callFunction`, and the same lifetime ceilings apply.
+- `resourceUsage()` reports what an engine retains and has spent — heap bytes,
+  steps used, the eval and dynamic-compilation counters, retained dynamic
+  function/class definitions, buffered and lifetime console figures, pinned
+  buffers, and the compiled program's function count, bytecode bytes and
+  retained source bytes. `zippInstanceUsage()` sums the disposed engines'
+  figures for the whole WASM instance: under `safe-sandbox` each engine's
+  compiled program (about 36 program functions and 18 KB of bytecode for a
+  small guest, dominated by the preamble) and its dynamic definitions outlive
+  `dispose()`, so a host recycles the Worker/WASM instance when that total
+  passes what it accepts. Measured: 200 create/run/dispose cycles retain
+  3.7 MB of bytecode and grow the Node process by about 110 MB.
+- `host-sdk/` is the reference host adapter for browsers — one Worker and
+  WASM instance per guest, generation-scoped messages, external deadlines
+  that terminate the Worker, immutable capability setup, Worker-side bridges
+  and seven error categories — and `tests/browser/` runs it in real Chromium,
+  Firefox and WebKit Workers against the exact stripped web package.
 - `takeOutput()` drains every console line — `log`/`info`/`debug` and
   `warn`/`error` — in the order it was written; `takeConsole()` returns the same
   lines as `{ stream: "stdout" | "stderr", text }` records. Either drains both
