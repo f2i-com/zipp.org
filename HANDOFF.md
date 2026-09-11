@@ -237,10 +237,61 @@ audit's own vocabulary.
   and the conformance runner; the WASM guest states `Compat`), pinned by
   `grammar_goal_is_per_compilation`. Live retained-resource counters
   (ZIPP-06's first stage) were not added: **still open**.
-- **Still open, unchanged:** ZIPP-06 (compiled-code reclamation and
-  retained-compiler accounting), ZIPP-19–23 (fresh conformance/performance
-  evidence, workload density, IC/GC/footprint experiments — measurement
-  programmes, not defects; nothing here claims a speedup).
+- **B306 (ZIPP-06, stage 1) — implemented: retained resources are measured
+  before anyone tries to reclaim them.** `ScriptState::resource_usage` and
+  the WASM `resourceUsage()` report, per engine and cheaply: heap bytes,
+  steps used, the eval and dynamic-compilation counters, the stable-address
+  function and class definitions retained by dynamic code, buffered and
+  lifetime console figures, pinned buffers, and the compiled program's own
+  function count, bytecode bytes and retained source bytes.
+  `zippInstanceUsage()` sums the disposed engines' figures for the WASM
+  instance: that is what `dispose()` cannot give back and what a host
+  recycles the instance on. `tests/node/resource-usage.cjs` churns 200
+  create/init/eval/dispose cycles in one instance and reports, separately,
+  what the instance retains (7,200 program functions, 3.68 MB of bytecode and
+  1.0 MB of source, plus 800 dynamic functions) and the process RSS delta
+  (about 110 MB, roughly 550 KB per engine). That is the measured cost of
+  the leaked `Program` under `safe-sandbox` — the number stage two (an
+  owned, reclaimable Program) has to bring down; it is recorded, not fixed.
+- **B307 (ZIPP-12) — implemented. A rich-value eval next to the JSON
+  projection.** `ScriptState::eval_in_context_rich` and the WASM
+  `evalInContextRich(expr)` marshal the completion value under the slot-read
+  contract (`-0`, `NaN` and the infinities as themselves, functions and
+  opaque objects as `null`, cycles as `null`, accessors not invoked, the
+  conversion budget enforced) and drain microtasks like `callFunction`.
+  They share `evalInContext`'s lifetime ceilings through one accounting
+  path. The JSON projection is unchanged.
+- **B308 (ZIPP-17) — implemented: real browser Workers and a reference host
+  adapter.** `host-sdk/zipp-host.mjs` + `zipp-host.worker.mjs` (v1.0.0) give
+  embedders one lifecycle (`created → initializing → ready → dead`, one
+  Worker and WASM instance per guest, termination as the whole boundary),
+  generation-scoped messages (stale replies dropped, pending requests
+  rejected on death), external deadlines that terminate the Worker, seven
+  error categories, immutable capability setup and Worker-side bridges.
+  `tests/browser/worker-smoke.mjs` serves the exact stripped web package and
+  runs 28 scenario assertions through the adapter in real Workers; passed on
+  Chromium 153.0.8010.12, Firefox 155.0 and WebKit 26.6 (Playwright 1.63.0)
+  and on the installed Chrome 152. CI runs it on Chromium/Firefox/WebKit in
+  a `browser` job. Mobile memory/startup profiles and a downstream SoftN
+  integration run remain open.
+- **B309 (ZIPP-19) — fresh conformance evidence, no performance claim.**
+  test262 (checkout `424966138`, 26 May 2026) against the release CLI built
+  from `ab56a840` with the JIT on: **95,665 / 95,680 pass, 15 fail**. The same
+  fifteen fail identically on a release CLI built from the audited baseline
+  `e6e0f65d` (six subtrees re-run against both binaries), so none is a
+  regression from this batch: three are the blessed entries in
+  `tools/test262-expected-failures.txt`, the other twelve are tests newer
+  than the checkout the README's 95,939 / 95,942 figure was measured on
+  (six `staging/sm/Error`, two `Array.prototype.copyWithin` coerced-start,
+  two `TypedArray.prototype.slice` species-buffer, two arrow-function
+  `thisArg`) and are pre-existing gaps to file, not to bless. No benchmark
+  was rerun; the historical performance records stay labelled historical.
+- **Still open:** ZIPP-06 stage two (an owned, reclaimable compiled program
+  under `safe-sandbox`, now with the retention measured), ZIPP-11's lossless
+  string transport (documented as Unicode-scalar), ZIPP-20–23 (workload
+  density, IC/GC/footprint experiments — measurement programmes, not
+  defects; nothing here claims a speedup), and the twelve unblessed test262
+  gaps B309 lists.
 
 Verification for this batch: `cargo test -p zipp-vm` (default features, the
 manifest's 15 quarantined mechanism tests skipped as CI skips them);
