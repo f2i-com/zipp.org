@@ -32,6 +32,47 @@ use crate::heap::{HeapObj, ObjMap, PropAttr};
 use crate::value::Value;
 use crate::vm::Vm;
 use rustc_hash::FxHashMap;
+use std::borrow::Cow;
+
+/// Encode UTF-16 code units as WTF-8: pairs become one four-byte sequence,
+/// a lone surrogate its own three-byte sequence (which is what makes the
+/// result WTF-8 rather than UTF-8), everything else ordinary UTF-8.
+pub(crate) fn utf16_to_wtf8(units: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(units.len() * 3);
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i] as u32;
+        let cp = if (0xD800..0xDC00).contains(&u)
+            && i + 1 < units.len()
+            && (0xDC00..0xE000).contains(&(units[i + 1] as u32))
+        {
+            i += 1;
+            0x10000 + ((u - 0xD800) << 10) + (units[i] as u32 - 0xDC00)
+        } else {
+            u
+        };
+        i += 1;
+        match cp {
+            0..=0x7F => out.push(cp as u8),
+            0x80..=0x7FF => {
+                out.push(0xC0 | (cp >> 6) as u8);
+                out.push(0x80 | (cp & 0x3F) as u8);
+            }
+            0x800..=0xFFFF => {
+                out.push(0xE0 | (cp >> 12) as u8);
+                out.push(0x80 | ((cp >> 6) & 0x3F) as u8);
+                out.push(0x80 | (cp & 0x3F) as u8);
+            }
+            _ => {
+                out.push(0xF0 | (cp >> 18) as u8);
+                out.push(0x80 | ((cp >> 12) & 0x3F) as u8);
+                out.push(0x80 | ((cp >> 6) & 0x3F) as u8);
+                out.push(0x80 | (cp & 0x3F) as u8);
+            }
+        }
+    }
+    out
+}
 
 /// Old-object size above which a write-back merge indexes the old keys
 /// instead of scanning them. Below it a scan over a handful of short keys is
@@ -317,7 +358,15 @@ pub enum HostValue {
     Null,
     Bool(bool),
     Number(f64),
+    /// A well-formed JavaScript string (every UTF-16 code unit paired), as
+    /// UTF-8. Every string a host can build from Rust text lands here.
     String(String),
+    /// A JavaScript string that is NOT well-formed UTF-16 — it holds a lone
+    /// surrogate — as its exact code units, so nothing is replaced on the way
+    /// out or back in (the 11 September 2026 audit's ZIPP-11). Produced only
+    /// for such strings; a host that never makes one never sees this. Writing
+    /// one recreates the exact string in the guest.
+    Utf16(Vec<u16>),
     Array(Vec<HostValue>),
     /// A plain object, as its own enumerable data properties in insertion
     /// order. Accessors are not invoked and do not appear.
@@ -551,7 +600,13 @@ impl HostValueBudget {
     }
 
     pub fn charge_string(&mut self, value: &str) -> Result<(), String> {
-        let Some(total) = self.used_string_bytes.checked_add(value.len()) else {
+        self.charge_string_bytes(value.len())
+    }
+
+    /// [`Self::charge_string`] for text already counted in bytes (WTF-8 or
+    /// UTF-16 units, each at least one byte).
+    pub fn charge_string_bytes(&mut self, bytes: usize) -> Result<(), String> {
+        let Some(total) = self.used_string_bytes.checked_add(bytes) else {
             return Err(self.string_limit_error());
         };
         if total > self.max_string_bytes {
@@ -852,19 +907,21 @@ impl<'p> Vm<'p> {
                 true
             }
             Shape::Str { units } => {
-                // UTF-8 needs at least one byte per UTF-16 unit, so this
+                // WTF-8 needs at least one byte per UTF-16 unit, so this
                 // refuses without materializing; the exact byte count is
-                // charged once the text exists.
+                // charged once the bytes exist. The EXACT bytes are hashed —
+                // a lone surrogate is a different string from U+FFFD, and the
+                // digest must say so.
                 if !budget.charge_string_bytes(units) {
                     return false;
                 }
                 fp_mix(h, 10);
-                let s = self.to_js_string(v).unwrap_or_default();
-                if s.len() > units && !budget.charge_string_bytes(s.len() - units) {
+                let bytes = self.heap.str_wtf8_cow(idx).unwrap_or_default();
+                if bytes.len() > units && !budget.charge_string_bytes(bytes.len() - units) {
                     return false;
                 }
-                fp_mix(h, s.len() as u64);
-                fp_mix_bytes(h, s.as_bytes());
+                fp_mix(h, bytes.len() as u64);
+                fp_mix_bytes(h, &bytes);
                 true
             }
             Shape::Array { len } => {
@@ -1187,9 +1244,7 @@ impl<'p> Vm<'p> {
             Shape::Opaque => Ok(HostValue::Opaque),
             Shape::Str { units } => {
                 budget.ensure_string_units(units)?;
-                let s = self.to_js_string(v).unwrap_or_default();
-                budget.charge_string(&s)?;
-                Ok(HostValue::String(s))
+                Ok(self.host_out_string(idx, budget)?)
             }
             Shape::Array(items) => {
                 seen.push(idx);
@@ -1219,6 +1274,29 @@ impl<'p> Vm<'p> {
                 seen.pop();
                 Ok(HostValue::Object(out?))
             }
+        }
+    }
+
+    /// The string at heap index `idx` as a host value: `String` when it is
+    /// well-formed UTF-16 (its WTF-8 bytes are then valid UTF-8, taken
+    /// without a copy through the lossy renderer), `Utf16` with the exact
+    /// code units when it holds a lone surrogate. Charged by its byte count.
+    fn host_out_string(
+        &mut self,
+        idx: u32,
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, String> {
+        let bytes = self
+            .heap
+            .str_wtf8_cow(idx)
+            .map(Cow::into_owned)
+            .unwrap_or_default();
+        budget.charge_string_bytes(bytes.len())?;
+        match String::from_utf8(bytes) {
+            Ok(s) => Ok(HostValue::String(s)),
+            Err(err) => Ok(HostValue::Utf16(
+                crate::heap::wtf8_units_iter(err.as_bytes()).collect(),
+            )),
         }
     }
 
@@ -1418,6 +1496,12 @@ impl<'p> Vm<'p> {
             HostValue::Number(n) => Value::num(*n),
             HostValue::String(s) => {
                 let i = self.heap.alloc_str(s.clone());
+                Value::heap(i)
+            }
+            HostValue::Utf16(units) => {
+                let i = self
+                    .heap
+                    .alloc_js(crate::heap::JsStr::from_wtf8(utf16_to_wtf8(units)));
                 Value::heap(i)
             }
             HostValue::Array(items) => {

@@ -1387,6 +1387,48 @@ mod tests {
         assert_eq!(after.console_lines_buffered, 0);
     }
 
+    /// A string holding a lone surrogate crosses as its exact code units in
+    /// both directions, digests differently from its U+FFFD rendering, and
+    /// well-formed text keeps the `String` form.
+    #[test]
+    fn strings_with_lone_surrogates_cross_exactly() {
+        let mut st = compile_script(
+            "var lone = '\\ud800'; var pair = '\\ud83d\\ude00'; var mixed = 'a\\u0000b\\udc00c'; \
+             var lengths = null; function measure(v) { lengths = [v.length, isNaN(v.charCodeAt(1)), v === lone]; }",
+        )
+        .expect("compiles");
+        st.run_init().expect("runs");
+        let lone = slot_of(&st, "lone");
+        assert_eq!(st.get_slot(lone), HostValue::Utf16(vec![0xD800]));
+        assert_eq!(
+            st.get_slot(slot_of(&st, "pair")),
+            HostValue::String("\u{1F600}".into()),
+            "a valid pair is ordinary text"
+        );
+        assert_eq!(
+            st.get_slot(slot_of(&st, "mixed")),
+            HostValue::Utf16(vec![0x61, 0, 0x62, 0xDC00, 0x63])
+        );
+        // Inbound: the exact units are recreated, and identity holds.
+        let measure = slot_of(&st, "measure");
+        st.call_slot(measure, &[HostValue::Utf16(vec![0xD800])])
+            .expect("calls");
+        assert_eq!(
+            st.get_slot(slot_of(&st, "lengths")),
+            HostValue::Array(vec![
+                HostValue::Number(1.0),
+                HostValue::Bool(true),
+                HostValue::Bool(true)
+            ]),
+            "one unit, no second unit, identical to the guest's own"
+        );
+        // The digest tells a lone surrogate from its replacement character.
+        let a = st.fingerprint_slot(lone);
+        assert!(st.set_slot(lone, &HostValue::String("\u{FFFD}".into())));
+        let b = st.fingerprint_slot(lone);
+        assert_ne!(a, b);
+    }
+
     #[test]
     fn eval_declarations_persist_across_calls() {
         let mut st = compile_script("var x = 1;").expect("compiles");

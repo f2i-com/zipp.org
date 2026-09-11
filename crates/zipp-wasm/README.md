@@ -279,14 +279,19 @@ accessors as an authority boundary.
 `JSON.stringify` can express none of the three: it *drops* function-valued
 properties and *throws* on a cycle.
 
-**Strings cross as Unicode scalar values.** The engine's strings are UTF-16 and
-may hold a lone surrogate; the boundary's Rust `String` cannot. A lone surrogate
-is replaced with U+FFFD in either direction — property keys, source input,
-callback payloads and ordinary values alike — and the profile says so
-(`semantics.stringTransport: "unicode-scalar"`). Valid pairs, mixed text and
-embedded NUL round-trip exactly. This is the documented contract, decided at the
-11 September 2026 audit's ZIPP-11 rather than left implicit; a lossless
-code-unit transport would be an additive, separately versioned API.
+**Strings cross as their exact UTF-16 code units.** A guest string that is not
+well-formed — it holds a lone surrogate — is rebuilt on the host from its exact
+code units, and a host string holding one reaches the guest as itself; valid
+pairs, mixed text and embedded NUL were always exact. That covers every rich
+value: globals read and written, call arguments and results, event payloads,
+host-call completions, the JSON projection and the rich eval, and the
+fingerprint digests the exact bytes (a lone surrogate and U+FFFD are different
+strings). The profile says so (`semantics.stringTransport: "utf16"`); it said
+`"unicode-scalar"` before the 11 September 2026 audit's ZIPP-11. Two places stay
+scalar and are documented as such: property KEYS (the engine stores keys as
+UTF-8 text), and the synchronous bridge's string-in/string-out envelope and
+the `initScript` source text, which cross as UTF-8 through wasm-bindgen — write
+a lone surrogate there as a `\uXXXX` escape.
 
 `evalInContext` is a **JSON projection**, not a rich-value read: the result goes
 through the guest's `JSON.stringify` and is parsed on the host side. `undefined`,

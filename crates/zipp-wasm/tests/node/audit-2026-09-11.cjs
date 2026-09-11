@@ -344,13 +344,40 @@ function thrown(fn) {
   close(e);
 }
 
+// ── ZIPP-11: strings cross as their exact code units ───────────────────────
+{
+  const { e, symbols } = init(String.raw`
+    var lone = "\ud800"; var low = "\udc00"; var pair = "\ud83d\ude00"; var mixed = "a\u0000b\udc00c"; var fffd = "\ufffd";
+    var obj = { s: lone, arr: [pair, mixed] };
+    var got = ""; function receive(v) { got = v; return [v.length, v.charCodeAt(0), v === lone]; }
+    function same(v) { return v === mixed; }
+  `);
+  const lone = e.getGlobalByIndex(symbols.lone.index);
+  check("a lone high surrogate reads as one unit, exactly", lone.length === 1 && lone.charCodeAt(0) === 0xd800, JSON.stringify([...lone].map((c) => c.charCodeAt(0))));
+  const low = e.getGlobalByIndex(symbols.low.index);
+  check("a lone low surrogate too", low.length === 1 && low.charCodeAt(0) === 0xdc00);
+  same("a valid pair, mixed text with NUL, and a real U+FFFD are unchanged", [e.getGlobalByIndex(symbols.pair.index), e.getGlobalByIndex(symbols.mixed.index), e.getGlobalByIndex(symbols.fffd.index)], ["\ud83d\ude00", "a\u0000b\udc00c", "\ufffd"]);
+  same("nested values keep their units", e.getGlobalByIndex(symbols.obj.index), { s: "\ud800", arr: ["\ud83d\ude00", "a\u0000b\udc00c"] });
+  same("inbound: a lone surrogate reaches the guest as itself", e.callFunction("receive", ["\ud800"]), [1, 0xd800, true]);
+  same("inbound: a mixed string with NUL and a lone low surrogate is identical to the guest's", e.callFunction("same", ["a\u0000b\udc00c"]), true);
+  e.setGlobalByIndex(symbols.lone.index, "x\udbff");
+  same("a written lone surrogate reads back exactly", e.getGlobalByIndex(symbols.lone.index), "x\udbff");
+  const before = e.getGlobalsFingerprint([symbols.lone.index]);
+  e.setGlobalByIndex(symbols.lone.index, "x\ufffd");
+  check("the fingerprint tells a lone surrogate from its replacement character", before[0] !== e.getGlobalsFingerprint([symbols.lone.index])[0]);
+  same("the JSON projection escapes and restores it too", e.evalInContext("mixed"), "a\u0000b\udc00c");
+  same("the rich eval crosses it too", e.evalInContextRich("[lone, pair]"), ["x\ufffd", "\ud83d\ude00"]);
+  same("the profile states the transport", JSON.parse(zippProfile()).semantics.stringTransport, "utf16");
+  close(e);
+}
+
 // ── ZIPP-18 / ZIPP-24: provenance and policy in the profile ────────────────
 {
   const profile = JSON.parse(zippProfile());
   same("profileVersion 2", profile.profileVersion, 2);
   check("source.sha is a hex revision or null", profile.source.sha === null || /^[0-9a-f]{7,64}$/.test(profile.source.sha), String(profile.source.sha));
   same("the grammar goal and strictness policy are stated", [profile.semantics.parseGoal, profile.semantics.topLevelReturn, profile.semantics.guestStrictMode], ["script-compat", true, "directive-prologue"]);
-  same("the boundary contracts are stated", [profile.semantics.stringTransport, profile.semantics.batchWriteArity, profile.semantics.hostCallIdBits, profile.semantics.consoleOutput, profile.semantics.hostCallDrain], ["unicode-scalar", "strict", 53, "chronological", "transactional"]);
+  same("the boundary contracts are stated", [profile.semantics.stringTransport, profile.semantics.batchWriteArity, profile.semantics.hostCallIdBits, profile.semantics.consoleOutput, profile.semantics.hostCallDrain], ["utf16", "strict", 53, "chronological", "transactional"]);
   for (const key of ["hostValueNodes", "hostValueStringBytes", "fingerprintNodes", "fingerprintStringBytes", "hostCallQueue", "hostCallPending", "hostCallRequestUnits", "hostCallDrainRequests", "hostCallDrainStringBytes", "accelSpecBytes", "accelSpecEntries", "accelSpecNameBytes"]) {
     check(`limits.${key} is a positive integer`, Number.isSafeInteger(profile.limits[key]) && profile.limits[key] > 0, String(profile.limits[key]));
   }

@@ -52,9 +52,14 @@ const expectedImportStems = [
   "__wbg_call",
   "__wbg_call",
   "__wbg_call",
+  // String.prototype.charCodeAt and String.fromCharCode: the exact-code-unit
+  // string transport (ZIPP-11) reads and rebuilds a string holding a lone
+  // surrogate through them.
+  "__wbg_charCodeAt",
   "__wbg_defineProperty",
   "__wbg_delete",
   "__wbg_error",
+  "__wbg_fromCharCode",
   "__wbg_get",
   "__wbg_get",
   "__wbg_has",

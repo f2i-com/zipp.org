@@ -1685,7 +1685,7 @@ pub fn zipp_profile() -> String {
             "\"parseGoal\":\"script-compat\",",
             "\"topLevelReturn\":true,",
             "\"guestStrictMode\":\"directive-prologue\",",
-            "\"stringTransport\":\"unicode-scalar\",",
+            "\"stringTransport\":\"utf16\",",
             "\"batchWriteArity\":\"strict\",",
             "\"hostCallIdBits\":53,",
             "\"consoleOutput\":\"chronological\",",
@@ -2109,6 +2109,13 @@ fn to_js_bounded(v: &HostValue, budget: &mut HostValueBudget) -> Result<JsValue,
             budget.charge_string(s)?;
             Ok(JsValue::from_str(s))
         }
+        // A guest string holding a lone surrogate: rebuilt from its exact
+        // code units, so the host sees the string the guest has (the
+        // 11 September 2026 audit's ZIPP-11).
+        HostValue::Utf16(units) => {
+            budget.charge_string_bytes(units.len().saturating_mul(3))?;
+            Ok(js_sys::JsString::from_char_code(units).into())
+        }
         HostValue::Array(items) => {
             budget.ensure_nodes(items.len())?;
             let a = js_sys::Array::new_with_length(items.len() as u32);
@@ -2180,6 +2187,17 @@ fn from_js_bounded(
         let value: &js_sys::JsString = v.unchecked_ref();
         budget.ensure_string_units(value.length() as usize)?;
         let s = v.as_string().unwrap_or_default();
+        // wasm-bindgen's text decoding replaces a lone surrogate with U+FFFD.
+        // A replacement character in the result is the only sign, so only
+        // then re-read the exact code units (a string that genuinely holds
+        // U+FFFD costs one extra pass and comes back as itself).
+        if s.contains('\u{FFFD}') {
+            let units: Vec<u16> = value.iter().collect();
+            if String::from_utf16(&units).is_err() {
+                budget.charge_string_bytes(units.len().saturating_mul(3))?;
+                return Ok(HostValue::Utf16(units));
+            }
+        }
         budget.charge_string(&s)?;
         return Ok(HostValue::String(s));
     }
