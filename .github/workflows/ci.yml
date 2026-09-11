@@ -100,6 +100,14 @@ jobs:
         with:
           ref: ${{ inputs.ref || '' }}
           persist-credentials: false
+      # The revision actually checked out — which, as a reusable workflow
+      # called with `ref`, is NOT `github.sha` (the caller's event revision).
+      # Everything below that names a source revision uses this output, so
+      # a module built here can never report a commit it was not built from
+      # (the 11 September 2026 close audit's ZA-13).
+      - name: Record the checked-out source revision
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - name: Install the pinned Rust toolchain and wasm32 target
         run: |
           rustup toolchain install 1.92.0 --profile minimal --no-self-update
@@ -130,8 +138,9 @@ jobs:
             -C link-arg=--max-memory=1073741824
             -C link-arg=-zstack-size=1048576
           # Stamped into zippProfile().source.sha so a loaded artifact can
-          # name the revision it was built from.
-          ZIPP_SOURCE_SHA: ${{ github.sha }}
+          # name the revision it was built from: the CHECKED-OUT revision,
+          # not the event's (ZA-13).
+          ZIPP_SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: cargo +1.92.0 build --locked --release --target wasm32-unknown-unknown
       # One list of checks, shared with release.yml and security.yml, so the
       # lanes cannot drift apart.
@@ -141,3 +150,15 @@ jobs:
           wasm-bindgen --target nodejs --out-dir tests/node/pkg \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/run-boundary-suite.cjs
+      - name: Assert the built module names the checked-out revision
+        env:
+          EXPECTED_SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          node -e '
+            const { zippProfile } = require("./tests/node/pkg/zipp_wasm.js");
+            const sha = JSON.parse(zippProfile()).source.sha;
+            if (sha !== process.env.EXPECTED_SOURCE_SHA) {
+              throw new Error(`module reports source ${sha}, checked out ${process.env.EXPECTED_SOURCE_SHA}`);
+            }
+            console.log(`module source revision ${sha} matches the checkout`);
+          '

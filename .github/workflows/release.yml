@@ -494,12 +494,24 @@ jobs:
           }
           JS
           install -m 0644 README.md ../../LICENSE-APACHE "dist/$bundle/"
+          # The reference host adapter ships WITH the bindings it was written
+          # against, at this exact revision: the README's host-adapter section
+          # used to refer to a directory the archive did not contain (the
+          # 11 September 2026 close audit's ZA-14). Its version is recorded
+          # beside the commit so a consumer can check SDK/API compatibility.
+          mkdir -p "dist/$bundle/host-sdk"
+          install -m 0644 host-sdk/zipp-host.mjs host-sdk/zipp-host.worker.mjs host-sdk/README.md \
+            "dist/$bundle/host-sdk/"
+          sdk_version="$(node -e 'import("./host-sdk/zipp-host.mjs").then((m) => console.log(m.ZIPP_HOST_SDK_VERSION))')"
+          node --input-type=module --check < "dist/$bundle/host-sdk/zipp-host.mjs"
+          node --input-type=module --check < "dist/$bundle/host-sdk/zipp-host.worker.mjs"
           {
             printf 'version=%s\n' "$RELEASE_VERSION"
             printf 'commit=%s\n' "$(git rev-parse HEAD)"
             printf 'rustc=%s\n' "$(rustc --version)"
             printf 'wasm-bindgen=%s\n' "$(wasm-bindgen --version)"
             printf 'target=wasm32-unknown-unknown\n'
+            printf 'host-sdk=%s\n' "$sdk_version"
           } > "dist/$bundle/BUILD-INFO.txt"
           (
             cd "dist/$bundle"
