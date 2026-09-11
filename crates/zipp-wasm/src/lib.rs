@@ -27,6 +27,7 @@ use zipp_vm::embed::{
     compile_script_with_preamble, CompileOptions, ConsoleStream, FingerprintBudget, HostCallError,
     HostCtx, HostValue, HostValueBudget, ScriptGoal, ScriptState, SymbolScope,
     DEFAULT_HOST_VALUE_MAX_NODES, DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
+    DEFAULT_HOST_VALUE_WORK_PER_NODE,
 };
 
 // js-sys's stable Array::is_array/Object::keys/Array indexing bindings do not
@@ -133,6 +134,19 @@ const PREAMBLE_HOST_CALL_PENDING_MAX: u32 = 65536;
 const PREAMBLE_HOST_CALL_REQUEST_MAX_UNITS: u32 = 4_194_304;
 const MAX_HOST_CALL_DRAIN_CHUNK: u32 = 256;
 const MAX_HOST_CALL_DRAIN_STRING_BYTES: usize = 32 * 1024 * 1024;
+/// Peeks, retries and rejections one drain may ATTEMPT, whatever it
+/// delivers: a rejection settles a request without delivering it, and a
+/// failed attempt's work is spent even though its representation budget is
+/// rolled back, so neither the request ceiling nor the two representation
+/// allowances bounded a drain's work by themselves (the 11 September 2026
+/// close audit's ZA-08). The rest of the queue waits for the next drain.
+const MAX_HOST_CALL_DRAIN_ATTEMPTS: u32 = 64;
+/// Nodes and inspected entries one drain may attempt across every peek,
+/// including the failed ones: four times what a single delivered
+/// representation may hold.
+const MAX_HOST_CALL_DRAIN_WORK_NODES: usize = 4 * DEFAULT_HOST_VALUE_MAX_NODES;
+/// String bytes one drain may attempt, on the same terms.
+const MAX_HOST_CALL_DRAIN_WORK_BYTES: usize = 4 * MAX_HOST_CALL_DRAIN_STRING_BYTES;
 /// The largest request id the guest's counter can hand over exactly (the
 /// largest safe integer). Ids are
 /// JavaScript Numbers on both sides now; they used to cross as `u32`, so the
@@ -280,6 +294,12 @@ pub struct Engine {
     /// Worker/WASM instance to reclaim those definitions between tenants.
     eval_calls: u32,
     eval_retained_source_bytes: usize,
+    /// A recoverable failure that ended a drain AFTER it had committed
+    /// requests off the guest queue: the committed requests were returned to
+    /// the host (they had left the queue, so nothing else can deliver them)
+    /// and the failure is reported by the next `drainPendingHostCalls`,
+    /// once. See that method (ZA-06).
+    deferred_drain_error: Option<String>,
     /// Disposal is terminal: a disposed engine cannot acquire new bridges or
     /// be initialized with another tenant's script.
     disposed: bool,
@@ -318,6 +338,7 @@ impl Engine {
             eval_calls: 0,
             eval_retained_source_bytes: 0,
             disposed: false,
+            deferred_drain_error: None,
             host_configuration_frozen: false,
             instruction_budget: MAX_LIFETIME_STEPS,
             fingerprint_seed: None,
@@ -450,7 +471,10 @@ impl Engine {
             // prologue stays in force even though preamble statements now
             // precede it (the 11 September 2026 audit's ZIPP-01).
             let mut st = compile_script_with_preamble(PREAMBLE, source, &GUEST_COMPILE_OPTIONS)
-                .map_err(|e| JsValue::from_str(&e))?;
+                .map_err(|e| {
+                    note_error_kind("source");
+                    JsValue::from_str(&e)
+                })?;
             if let Some(seed) = self.fingerprint_seed {
                 st.set_fingerprint_seed(seed);
             }
@@ -480,9 +504,13 @@ impl Engine {
 
             let init = st.run_init();
             if let Some(error) = st.resource_limit_error() {
+                note_error_kind("resource");
                 return Err(JsValue::from_str(error));
             }
-            init.map_err(|e| JsValue::from_str(&e))?;
+            init.map_err(|e| {
+                note_error_kind("source");
+                JsValue::from_str(&e)
+            })?;
 
             let mut slots = Vec::new();
             let mut exposed = Vec::new();
@@ -574,8 +602,12 @@ impl Engine {
         if let Some(st) = self.state.as_mut() {
             budget.charge_node().map_err(to_js_error)?;
             budget.ensure_nodes(indices.len()).map_err(to_js_error)?;
+            // One VM-side allowance for the whole batch, repeated slots
+            // included: nodes, bytes and inspected work (ZA-07), beside the
+            // JS-side one the loop below already shared.
+            let mut walk = HostValueBudget::default();
             for i in indices {
-                let value = st.try_get_slot(i).map_err(to_js_error)?;
+                let value = st.try_get_slot_bounded(i, &mut walk).map_err(to_js_error)?;
                 out.push(&to_js_bounded(&value, &mut budget).map_err(to_js_error)?);
             }
         }
@@ -779,11 +811,11 @@ impl Engine {
                 ))
             }
         };
-        let result = self
+        let st = self
             .state
             .as_mut()
-            .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?
-            .call_slot(slot, &argv);
+            .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
+        let result = classified_call(st, slot, &argv);
         let value = self.finish_execution(result)?;
         to_js(&value).map_err(to_js_error)
     }
@@ -866,7 +898,13 @@ impl Engine {
             .expect("initialization checked by account_eval")
             .eval_in_context_rich(&wrapped, &mut budget);
         // A resource ceiling is terminal whatever the typed error says.
-        let result = result.map_err(HostCallError::into_message);
+        let result = result.map_err(|error| match error {
+            HostCallError::Conversion(message) => {
+                note_error_kind("conversion");
+                message
+            }
+            HostCallError::Thrown(message) => message,
+        });
         let value = self.finish_execution(result)?;
         // The JS-side conversion has its own copy of the same budget shape.
         let mut js_budget = HostValueBudget::default();
@@ -892,6 +930,11 @@ impl Engine {
     ///   `dispose()` does NOT reclaim within one WASM instance, so a host
     ///   recycles the Worker/WASM instance when their sum across tenants
     ///   passes what it accepts;
+    /// - `retainedFunctionBytes`, `retainedClassBytes`: the bytes those
+    ///   definitions own (the definition, its bytecode, constants, tables
+    ///   and retained source) — owned bytes, not the allocator's
+    ///   reservation, so a host can put a byte figure beside the counts
+    ///   (ZA-10, stage one);
     /// - `programFunctions`, `programBytecodeBytes`, `programSourceBytes`: the
     ///   size of this engine's own compiled program, which IS freed with the
     ///   engine (B306 stage two);
@@ -932,6 +975,11 @@ impl Engine {
             ("retainedFunctions".into(), n(usage.retained_functions)),
             ("retainedClasses".into(), n(usage.retained_classes)),
             (
+                "retainedFunctionBytes".into(),
+                n(usage.retained_function_bytes),
+            ),
+            ("retainedClassBytes".into(), n(usage.retained_class_bytes)),
+            (
                 "consoleLinesBuffered".into(),
                 n(usage.console_lines_buffered),
             ),
@@ -957,7 +1005,7 @@ impl Engine {
         let (Some(slot), Some(st)) = (self.helpers.listener_types, self.state.as_mut()) else {
             return Ok(js_sys::Array::new().into());
         };
-        let result = st.call_slot(slot, &[]);
+        let result = classified_call(st, slot, &[]);
         let value = self.finish_execution(result)?;
         let value = match value {
             HostValue::Array(items) => HostValue::Array(
@@ -986,7 +1034,7 @@ impl Engine {
         let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
         let event = from_js_bounded(&event, 0, &seen, &mut budget).map_err(to_js_error)?;
         let args = [HostValue::String(event_type.to_string()), event];
-        let result = st.call_slot(slot, &args);
+        let result = classified_call(st, slot, &args);
         match self.finish_execution(result)? {
             HostValue::Number(n) => Ok(n as u32),
             _ => Ok(0),
@@ -1012,9 +1060,39 @@ impl Engine {
     /// the queue before its return value crossed the converter, so a
     /// conversion failure discarded every queued request while their
     /// callbacks stayed registered forever.
+    ///
+    /// The transfer is transactional across the WHOLE drain, not only per
+    /// prefix (the 11 September 2026 close audit's ZA-06):
+    ///
+    /// - the peek and commit helpers run without a microtask drain, so no
+    ///   guest job can touch the queue between a snapshot and its commit,
+    ///   and the commit names the prefix by its length and its first and
+    ///   last request ids — a queue that is not what was peeked commits
+    ///   nothing, and the drain tries again;
+    /// - a request that has been committed off the queue is delivered by
+    ///   THIS call whatever happens afterwards. A recoverable failure later
+    ///   in the same drain (a tampered helper throwing, say) ends the drain
+    ///   with what was delivered; its cause is thrown by the NEXT
+    ///   `drainPendingHostCalls`, once, before that drain does anything. A
+    ///   terminal failure (a resource ceiling) still throws here: the engine
+    ///   is disposed, so every callback is gone with it and nothing could
+    ///   be completed anyway.
+    ///
+    /// And bounded in attempted WORK, not only in delivered output (ZA-08):
+    /// at most [`MAX_HOST_CALL_DRAIN_ATTEMPTS`] peeks, retries and
+    /// rejections, and at most [`MAX_HOST_CALL_DRAIN_WORK_NODES`] nodes and
+    /// [`MAX_HOST_CALL_DRAIN_WORK_BYTES`] string bytes attempted across them,
+    /// counted monotonically — a failed attempt's work is not rolled back
+    /// with its representation budget. Whatever remains waits for the next
+    /// drain; a host that wants an empty queue keeps draining until this
+    /// returns an empty array with nothing deferred.
     #[wasm_bindgen(js_name = drainPendingHostCalls)]
     pub fn drain_pending_host_calls(&mut self) -> Result<JsValue, JsValue> {
         self.ensure_live()?;
+        if let Some(message) = self.deferred_drain_error.take() {
+            note_error_kind("guest");
+            return Err(JsValue::from_str(&message));
+        }
         let out = js_sys::Array::new();
         let (Some(peek), Some(commit), Some(reject)) = (
             self.helpers.peek_host_calls,
@@ -1026,88 +1104,22 @@ impl Engine {
         if self.state.is_none() {
             return Ok(out.into());
         }
-        // Two aggregate budgets for the whole drain, one per conversion stage
-        // (VM graph to host values, host values to JS), each charged only by
-        // committed prefixes.
-        let mut walk_budget = HostValueBudget::new(
-            DEFAULT_HOST_VALUE_MAX_NODES,
-            MAX_HOST_CALL_DRAIN_STRING_BYTES,
-        );
-        let mut js_budget = HostValueBudget::new(
-            DEFAULT_HOST_VALUE_MAX_NODES,
-            MAX_HOST_CALL_DRAIN_STRING_BYTES,
-        );
-        let mut chunk = MAX_HOST_CALL_DRAIN_CHUNK;
         let mut delivered: u32 = 0;
-        loop {
-            if delivered >= MAX_HOST_CALL_DRAIN_REQUESTS {
-                break;
-            }
-            let want = chunk.min(MAX_HOST_CALL_DRAIN_REQUESTS - delivered);
-            let mut attempt_walk = walk_budget.clone();
-            let mut attempt_js = js_budget.clone();
-            match self.peek_host_calls(peek, want, &mut attempt_walk, &mut attempt_js)? {
-                Ok(items) => {
-                    // Engine-built, so the audited Reflect bindings suffice
-                    // (no new host import for the artifact's pinned surface).
-                    let count =
-                        checked_array_length(&items, "host call batch").map_err(to_js_error)?;
-                    if count == 0 {
-                        break;
-                    }
-                    // Commit BEFORE appending: the guest queue is the source of
-                    // truth until the prefix is off it.
-                    self.call_helper(commit, &[HostValue::Number(count as f64)])?;
-                    for i in 0..count {
-                        out.push(
-                            &checked_array_get(&items, i, "host call batch")
-                                .map_err(to_js_error)?,
-                        );
-                    }
-                    walk_budget = attempt_walk;
-                    js_budget = attempt_js;
-                    delivered += count;
-                    if count < want {
-                        break;
-                    }
-                    chunk = (chunk * 2).min(MAX_HOST_CALL_DRAIN_CHUNK);
-                }
-                Err(_) if want > 1 => {
-                    chunk = (want / 2).max(1);
-                }
-                Err(reason) => {
-                    // One request did not fit under the drain's remaining
-                    // allowance. Alone, under a fresh full allowance, it
-                    // either fits — then the AGGREGATE is what ran out and
-                    // the request stays queued for the next drain — or it
-                    // does not, and it can never cross: settle it.
-                    let mut solo_walk = HostValueBudget::new(
-                        DEFAULT_HOST_VALUE_MAX_NODES,
-                        MAX_HOST_CALL_DRAIN_STRING_BYTES,
-                    );
-                    let mut solo_js = HostValueBudget::new(
-                        DEFAULT_HOST_VALUE_MAX_NODES,
-                        MAX_HOST_CALL_DRAIN_STRING_BYTES,
-                    );
-                    if delivered > 0
-                        && self
-                            .peek_host_calls(peek, 1, &mut solo_walk, &mut solo_js)?
-                            .is_ok()
-                    {
-                        break;
-                    }
-                    let message = format!(
-                        "host.call: request exceeds the {MAX_HOST_CALL_DRAIN_STRING_BYTES}-byte transport limit ({reason})"
-                    );
-                    let removed = self.call_helper(reject, &[HostValue::String(message)])?;
-                    if !matches!(removed, HostValue::Number(n) if n == 1.0) {
-                        break;
-                    }
-                    chunk = MAX_HOST_CALL_DRAIN_CHUNK;
-                }
+        let outcome = self.drain_loop(peek, commit, reject, &out, &mut delivered);
+        match outcome {
+            Ok(()) => Ok(out.into()),
+            Err(error) if delivered == 0 || self.disposed => Err(error),
+            Err(error) => {
+                // Requests already off the guest queue reach the host now;
+                // the cause is reported by the next drain (ZA-06).
+                self.deferred_drain_error = Some(
+                    error
+                        .as_string()
+                        .unwrap_or_else(|| "zipp: host call drain failed".to_string()),
+                );
+                Ok(out.into())
             }
         }
-        Ok(out.into())
     }
 
     /// Invoke the callback the script passed to `host.call` for `call_id`,
@@ -1137,7 +1149,7 @@ impl Engine {
         let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
         let result = from_js_bounded(&result, 0, &seen, &mut budget).map_err(to_js_error)?;
         let args = [HostValue::Number(call_id), result];
-        let result = st.call_slot(slot, &args);
+        let result = classified_call(st, slot, &args);
         Ok(matches!(
             self.finish_execution(result)?,
             HostValue::Number(n) if n == 1.0
@@ -1155,7 +1167,7 @@ impl Engine {
         let (Some(slot), Some(st)) = (self.helpers.cancel_host_call, self.state.as_mut()) else {
             return Ok(false);
         };
-        let result = st.call_slot(slot, &[HostValue::Number(call_id)]);
+        let result = classified_call(st, slot, &[HostValue::Number(call_id)]);
         Ok(matches!(
             self.finish_execution(result)?,
             HostValue::Number(n) if n == 1.0
@@ -1216,6 +1228,38 @@ impl Engine {
     pub fn dispose(&mut self) {
         self.terminate();
     }
+
+    /// Whether this engine has been torn down — by `dispose()`, by a
+    /// resource ceiling, or by a failed initialization. The TRUSTED terminal
+    /// signal: a host decides "this engine is gone" from this, never from
+    /// the text of an error (ZA-01).
+    #[wasm_bindgen(getter)]
+    pub fn disposed(&self) -> bool {
+        self.disposed
+    }
+
+    /// The engine's own classification of the last error a method of this
+    /// instance threw:
+    ///
+    /// - `"guest"`: the guest threw (recoverable; the engine is usable);
+    /// - `"conversion"`: a value did not fit the host-value budget, or could
+    ///   not be inspected safely (recoverable);
+    /// - `"usage"`: the host misused the API — a bad argument, a call on a
+    ///   disposed engine, a lifetime allowance such as the eval call count
+    ///   (recoverable unless `disposed` says otherwise);
+    /// - `"source"`: `initScript` failed to compile or its top level threw
+    ///   (the engine is disposed);
+    /// - `"resource"`: the resource recorder reported a ceiling (the engine
+    ///   is disposed).
+    ///
+    /// Recorded where the error is built, so a guest `throw new
+    /// Error("budget exceeded")` is `"guest"` however it reads. Meaningful
+    /// only for the most recent throw; a successful call leaves it stale.
+    #[wasm_bindgen(js_name = lastErrorKind)]
+    pub fn last_error_kind(&self) -> String {
+        let kind = LAST_ERROR_KIND.with(|k| k.get());
+        if kind.is_empty() { "usage" } else { kind }.to_string()
+    }
 }
 
 impl Default for Engine {
@@ -1226,7 +1270,9 @@ impl Default for Engine {
 
 impl Engine {
     fn ensure_live(&self) -> Result<(), JsValue> {
+        LAST_ERROR_KIND.with(|k| k.set(""));
         if self.disposed {
+            note_error_kind("usage");
             Err(JsValue::from_str("zipp: engine is disposed"))
         } else {
             Ok(())
@@ -1254,31 +1300,168 @@ impl Engine {
             .as_mut()
             .and_then(ScriptState::resource_limit_error);
         if let Some(error) = resource_error {
+            note_error_kind("resource");
             let error = JsValue::from_str(error);
             self.terminate();
             return Err(error);
         }
-        result.map_err(|error| JsValue::from_str(&error))
+        result.map_err(|error| {
+            // A kind already recorded on this entry (a conversion failure
+            // routed through here) stands; anything else the guest threw.
+            if LAST_ERROR_KIND.with(|k| k.get().is_empty()) {
+                note_error_kind("guest");
+            }
+            JsValue::from_str(&error)
+        })
+    }
+
+    /// The drain's loop: `Ok` when the drain ended on its own terms (queue
+    /// empty, a ceiling reached), `Err` when a helper or the engine failed;
+    /// `delivered` counts what `out` holds either way.
+    fn drain_loop(
+        &mut self,
+        peek: u32,
+        commit: u32,
+        reject: u32,
+        out: &js_sys::Array,
+        delivered: &mut u32,
+    ) -> Result<(), JsValue> {
+        // Two aggregate budgets for the whole drain, one per conversion stage
+        // (VM graph to host values, host values to JS), each charged only by
+        // committed prefixes — and one monotonic account of everything
+        // attempted, charged by every peek whether or not it succeeded.
+        let mut walk_budget = HostValueBudget::new(
+            DEFAULT_HOST_VALUE_MAX_NODES,
+            MAX_HOST_CALL_DRAIN_STRING_BYTES,
+        );
+        let mut js_budget = HostValueBudget::new(
+            DEFAULT_HOST_VALUE_MAX_NODES,
+            MAX_HOST_CALL_DRAIN_STRING_BYTES,
+        );
+        let mut work = DrainWork::default();
+        let mut chunk = MAX_HOST_CALL_DRAIN_CHUNK;
+        let mut attempts: u32 = 0;
+        loop {
+            if *delivered >= MAX_HOST_CALL_DRAIN_REQUESTS
+                || attempts >= MAX_HOST_CALL_DRAIN_ATTEMPTS
+                || work.exhausted()
+            {
+                return Ok(());
+            }
+            attempts += 1;
+            let want = chunk.min(MAX_HOST_CALL_DRAIN_REQUESTS - *delivered);
+            let mut attempt_walk = walk_budget.clone();
+            let mut attempt_js = js_budget.clone();
+            let peeked = self.peek_host_calls(peek, want, &mut attempt_walk, &mut attempt_js);
+            work.charge(&walk_budget, &attempt_walk);
+            work.charge(&js_budget, &attempt_js);
+            match peeked? {
+                Ok(batch) => {
+                    if batch.count == 0 {
+                        return Ok(());
+                    }
+                    // Commit BEFORE appending: the guest queue is the source of
+                    // truth until the prefix is off it — and the commit names
+                    // the prefix, so a queue that changed commits nothing.
+                    let committed = self.call_helper_no_drain(
+                        commit,
+                        &[
+                            HostValue::Number(batch.count as f64),
+                            HostValue::Number(batch.first_id),
+                            HostValue::Number(batch.last_id),
+                        ],
+                    )?;
+                    if !matches!(committed, HostValue::Number(n) if n == batch.count as f64) {
+                        // Not the queue that was peeked: nothing left it, so
+                        // nothing is delivered from this attempt. Try again
+                        // (the attempt ceiling bounds a queue that keeps
+                        // changing).
+                        chunk = MAX_HOST_CALL_DRAIN_CHUNK;
+                        continue;
+                    }
+                    for i in 0..batch.count {
+                        out.push(
+                            &checked_array_get(&batch.items, i, "host call batch")
+                                .map_err(to_js_error)?,
+                        );
+                    }
+                    walk_budget = attempt_walk;
+                    js_budget = attempt_js;
+                    *delivered += batch.count;
+                    if batch.count < want {
+                        return Ok(());
+                    }
+                    chunk = (chunk * 2).min(MAX_HOST_CALL_DRAIN_CHUNK);
+                }
+                Err(_) if want > 1 => {
+                    // Retry with ONE request, not half: a prefix that does
+                    // not fit may be failing on its very first request, and
+                    // each retry re-walks it under a fresh attempt allowance
+                    // (halving used to spend nine such walks before reaching
+                    // one; under the work ceiling that never got there).
+                    // Growth resumes from a delivered chunk.
+                    chunk = 1;
+                }
+                Err(reason) => {
+                    // One request did not fit under the drain's remaining
+                    // allowance. Alone, under a fresh full allowance, it
+                    // either fits — then the AGGREGATE is what ran out and
+                    // the request stays queued for the next drain — or it
+                    // does not, and it can never cross: settle it.
+                    if *delivered > 0 {
+                        let mut solo_walk = HostValueBudget::new(
+                            DEFAULT_HOST_VALUE_MAX_NODES,
+                            MAX_HOST_CALL_DRAIN_STRING_BYTES,
+                        );
+                        let mut solo_js = HostValueBudget::new(
+                            DEFAULT_HOST_VALUE_MAX_NODES,
+                            MAX_HOST_CALL_DRAIN_STRING_BYTES,
+                        );
+                        let solo = self.peek_host_calls(peek, 1, &mut solo_walk, &mut solo_js);
+                        work.charge(&HostValueBudget::new(0, 0), &solo_walk);
+                        work.charge(&HostValueBudget::new(0, 0), &solo_js);
+                        if solo?.is_ok() {
+                            return Ok(());
+                        }
+                    }
+                    let message = format!(
+                        "host.call: request exceeds the {MAX_HOST_CALL_DRAIN_STRING_BYTES}-byte transport limit ({reason})"
+                    );
+                    // The rejection runs the request's callback (guest code),
+                    // so this helper drains afterwards as any call would; the
+                    // queue's head is unchanged since the failed peek because
+                    // nothing ran in between.
+                    let removed = self.call_helper(reject, &[HostValue::String(message)])?;
+                    if !matches!(removed, HostValue::Number(n) if n == 1.0) {
+                        return Ok(());
+                    }
+                    chunk = MAX_HOST_CALL_DRAIN_CHUNK;
+                }
+            }
+        }
     }
 
     /// Read the first `want` queued requests through the preamble's peek
     /// helper and convert them to a JS array, charging `walk` and `js`. The
     /// outer `Err` is terminal (a resource ceiling, or a guest throw from a
     /// tampered helper); the inner `Err` is a conversion failure carrying the
-    /// limit that was crossed, which the drain answers by trying less.
+    /// limit that was crossed, which the drain answers by trying less. No
+    /// microtask runs inside: the snapshot is the queue as the commit will
+    /// find it (ZA-06).
     fn peek_host_calls(
         &mut self,
         peek: u32,
         want: u32,
         walk: &mut HostValueBudget,
         js: &mut HostValueBudget,
-    ) -> Result<Result<JsValue, String>, JsValue> {
+    ) -> Result<Result<PeekedBatch, String>, JsValue> {
         let st = self
             .state
             .as_mut()
             .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
-        let peeked = st.call_slot_bounded(peek, &[HostValue::Number(want as f64)], walk);
+        let peeked = st.call_slot_bounded_no_drain(peek, &[HostValue::Number(want as f64)], walk);
         if let Some(error) = st.resource_limit_error() {
+            note_error_kind("resource");
             let error = JsValue::from_str(error);
             self.terminate();
             return Err(error);
@@ -1286,12 +1469,57 @@ impl Engine {
         let value = match peeked {
             Ok(value) => value,
             Err(HostCallError::Conversion(limit)) => return Ok(Err(limit)),
-            Err(HostCallError::Thrown(message)) => return Err(JsValue::from_str(&message)),
+            Err(HostCallError::Thrown(message)) => {
+                note_error_kind("guest");
+                return Err(JsValue::from_str(&message));
+            }
         };
-        if !matches!(value, HostValue::Array(_)) {
+        let HostValue::Array(items) = &value else {
+            note_error_kind("guest");
             return Err(JsValue::from_str("zipp: host call queue is not an array"));
-        }
-        Ok(to_js_bounded(&value, js))
+        };
+        // The identities the commit will name. A tampered entry without a
+        // numeric id yields NaN, which no queue entry can match: the commit
+        // then refuses, and the attempt ceiling ends the drain.
+        let id_of = |request: &HostValue| match request {
+            HostValue::Object(pairs) => pairs
+                .iter()
+                .find(|(key, _)| key == "id")
+                .and_then(|(_, id)| match id {
+                    HostValue::Number(n) => Some(*n),
+                    _ => None,
+                })
+                .unwrap_or(f64::NAN),
+            _ => f64::NAN,
+        };
+        let count = items.len() as u32;
+        let first_id = items.first().map(id_of).unwrap_or(f64::NAN);
+        let last_id = items.last().map(id_of).unwrap_or(f64::NAN);
+        Ok(to_js_bounded(&value, js).map(|items| PeekedBatch {
+            items,
+            count,
+            first_id,
+            last_id,
+        }))
+    }
+
+    /// Call a preamble helper by slot WITHOUT draining microtasks afterwards
+    /// — the commit of a peeked prefix, which must see the queue exactly as
+    /// the peek left it (ZA-06). Terminal handling as [`Self::call_helper`].
+    fn call_helper_no_drain(
+        &mut self,
+        slot: u32,
+        args: &[HostValue],
+    ) -> Result<HostValue, JsValue> {
+        let st = self
+            .state
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
+        let mut budget = HostValueBudget::default();
+        let result = st
+            .call_slot_bounded_no_drain(slot, args, &mut budget)
+            .map_err(HostCallError::into_message);
+        self.finish_execution(result)
     }
 
     /// Call a preamble helper by slot, with the usual terminal handling of a
@@ -1301,7 +1529,7 @@ impl Engine {
             .state
             .as_mut()
             .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
-        let result = st.call_slot(slot, args);
+        let result = classified_call(st, slot, args);
         self.finish_execution(result)
     }
 
@@ -1368,6 +1596,8 @@ impl Engine {
                 u.engines_disposed += 1;
                 u.retained_functions += usage.retained_functions as u64;
                 u.retained_classes += usage.retained_classes as u64;
+                u.retained_function_bytes += usage.retained_function_bytes as u64;
+                u.retained_class_bytes += usage.retained_class_bytes as u64;
                 u.dynamic_code_calls += usage.dynamic_code_calls as u64;
                 u.dynamic_code_source_bytes += usage.dynamic_code_source_bytes as u64;
                 c.set(u);
@@ -1378,8 +1608,45 @@ impl Engine {
         self.helpers = Helpers::default();
         self.eval_calls = 0;
         self.eval_retained_source_bytes = 0;
+        self.deferred_drain_error = None;
         *self.bridges.borrow_mut() = Bridges::default();
         self.disposed = true;
+    }
+}
+
+/// One peeked, converted prefix of the host-call queue: the JS array the
+/// host receives, its length, and the first and last request ids the commit
+/// must find at the head of the queue.
+struct PeekedBatch {
+    items: JsValue,
+    count: u32,
+    first_id: f64,
+    last_id: f64,
+}
+
+/// What one drain has ATTEMPTED so far, across every peek, successful or
+/// not: charged from the difference between an attempt's budget and the
+/// committed budget it was cloned from, so a failed attempt's partial charge
+/// counts exactly once and is never rolled back (ZA-08).
+#[derive(Default)]
+struct DrainWork {
+    nodes: usize,
+    bytes: usize,
+}
+
+impl DrainWork {
+    fn charge(&mut self, before: &HostValueBudget, after: &HostValueBudget) {
+        let nodes = after.nodes_used().saturating_sub(before.nodes_used())
+            + after.work_used().saturating_sub(before.work_used());
+        let bytes = after
+            .string_bytes_used()
+            .saturating_sub(before.string_bytes_used());
+        self.nodes = self.nodes.saturating_add(nodes);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    fn exhausted(&self) -> bool {
+        self.nodes > MAX_HOST_CALL_DRAIN_WORK_NODES || self.bytes > MAX_HOST_CALL_DRAIN_WORK_BYTES
     }
 }
 
@@ -1404,6 +1671,12 @@ fn sync_host_call_arity(kind: &str) -> Option<usize> {
 }
 
 thread_local! {
+    /// The engine's own account of the LAST error it threw — `usage`,
+    /// `conversion`, `guest`, `source` or `resource` — recorded where the
+    /// error is built, so a host can classify a failure without reading its
+    /// message (which a guest can write: the 11 September 2026 close audit's
+    /// ZA-01). Reset at every entry; `Engine::last_error_kind` reads it.
+    static LAST_ERROR_KIND: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
     /// What this WASM instance has accumulated across the engines it has
     /// disposed: the definitions `dispose()` cannot give back, and the
     /// compilation work that produced them. Live engines report their own
@@ -1424,6 +1697,8 @@ struct InstanceUsage {
     engines_disposed: u64,
     retained_functions: u64,
     retained_classes: u64,
+    retained_function_bytes: u64,
+    retained_class_bytes: u64,
     dynamic_code_calls: u64,
     dynamic_code_source_bytes: u64,
 }
@@ -1434,6 +1709,8 @@ impl InstanceUsage {
         engines_disposed: 0,
         retained_functions: 0,
         retained_classes: 0,
+        retained_function_bytes: 0,
+        retained_class_bytes: 0,
         dynamic_code_calls: 0,
         dynamic_code_source_bytes: 0,
     };
@@ -1460,6 +1737,8 @@ pub fn zipp_instance_usage() -> Result<JsValue, JsValue> {
         ("enginesDisposed".into(), n(u.engines_disposed)),
         ("retainedFunctions".into(), n(u.retained_functions)),
         ("retainedClasses".into(), n(u.retained_classes)),
+        ("retainedFunctionBytes".into(), n(u.retained_function_bytes)),
+        ("retainedClassBytes".into(), n(u.retained_class_bytes)),
         ("dynamicCodeCalls".into(), n(u.dynamic_code_calls)),
         (
             "dynamicCodeSourceBytes".into(),
@@ -1703,6 +1982,7 @@ pub fn zipp_profile() -> String {
             "\"syncCapabilityEntries\":{capability_entries},",
             "\"hostValueNodes\":{host_value_nodes},",
             "\"hostValueStringBytes\":{host_value_string_bytes},",
+            "\"hostValueWorkPerNode\":{host_value_work_per_node},",
             "\"fingerprintNodes\":{host_value_nodes},",
             "\"fingerprintStringBytes\":{host_value_string_bytes},",
             "\"hostCallQueue\":{host_call_queue},",
@@ -1710,6 +1990,9 @@ pub fn zipp_profile() -> String {
             "\"hostCallRequestUnits\":{host_call_request_units},",
             "\"hostCallDrainRequests\":{host_call_drain_requests},",
             "\"hostCallDrainStringBytes\":{host_call_drain_string_bytes},",
+            "\"hostCallDrainAttempts\":{host_call_drain_attempts},",
+            "\"hostCallDrainWorkNodes\":{host_call_drain_work_nodes},",
+            "\"hostCallDrainWorkBytes\":{host_call_drain_work_bytes},",
             "\"accelSpecBytes\":{accel_spec_bytes},",
             "\"accelSpecEntries\":{accel_spec_entries},",
             "\"accelSpecNameBytes\":{accel_spec_name_bytes}",
@@ -1742,6 +2025,10 @@ pub fn zipp_profile() -> String {
         host_call_request_units = PREAMBLE_HOST_CALL_REQUEST_MAX_UNITS,
         host_call_drain_requests = MAX_HOST_CALL_DRAIN_REQUESTS,
         host_call_drain_string_bytes = MAX_HOST_CALL_DRAIN_STRING_BYTES,
+        host_value_work_per_node = DEFAULT_HOST_VALUE_WORK_PER_NODE,
+        host_call_drain_attempts = MAX_HOST_CALL_DRAIN_ATTEMPTS,
+        host_call_drain_work_nodes = MAX_HOST_CALL_DRAIN_WORK_NODES,
+        host_call_drain_work_bytes = MAX_HOST_CALL_DRAIN_WORK_BYTES,
         accel_spec_bytes = MAX_ACCEL_SPEC_BYTES,
         accel_spec_entries = MAX_ACCEL_SPEC_ENTRIES,
         accel_spec_name_bytes = MAX_ACCEL_SPEC_NAME_BYTES,
@@ -2015,8 +2302,43 @@ fn parse_bridge_json(text: &str) -> Result<JsValue, String> {
         .map_err(|_| "TypeError: malformed JSON in host bridge argument".to_owned())
 }
 
+/// The engine-authored errors that reach the host through here are of two
+/// kinds: a value that did not fit the conversion budget or could not be
+/// inspected (recoverable; the engine is untouched), and everything else,
+/// which is the host's own misuse of the API. The message is the engine's,
+/// so classifying by it is safe here — a guest never writes these strings.
 fn to_js_error(error: String) -> JsValue {
+    if error.starts_with("RangeError: host value exceeds")
+        || error.ends_with("could not be inspected safely")
+    {
+        note_error_kind("conversion");
+    } else {
+        note_error_kind("usage");
+    }
     JsValue::from_str(&error)
+}
+
+fn note_error_kind(kind: &'static str) {
+    LAST_ERROR_KIND.with(|k| k.set(kind));
+}
+
+/// A slot call under the default result budget whose failure keeps its
+/// classification: a result that did not fit is `conversion` (the engine is
+/// untouched), a throw is the guest's — `finish_execution` records that.
+fn classified_call(
+    st: &mut ScriptState,
+    slot: u32,
+    args: &[HostValue],
+) -> Result<HostValue, String> {
+    let mut budget = HostValueBudget::default();
+    st.call_slot_bounded(slot, args, &mut budget)
+        .map_err(|error| match error {
+            HostCallError::Conversion(message) => {
+                note_error_kind("conversion");
+                message
+            }
+            HostCallError::Thrown(message) => message,
+        })
 }
 
 fn inspection_error(label: &str) -> String {
@@ -2105,7 +2427,7 @@ fn to_js_bounded(v: &HostValue, budget: &mut HostValueBudget) -> Result<JsValue,
         // 11 September 2026 audit's ZIPP-11).
         HostValue::Utf16(units) => {
             budget.charge_string_bytes(units.len().saturating_mul(3))?;
-            Ok(js_sys::JsString::from_char_code(units).into())
+            Ok(utf16_units_to_js_string(units).into())
         }
         HostValue::Array(items) => {
             budget.ensure_nodes(items.len())?;
@@ -2126,6 +2448,29 @@ fn to_js_bounded(v: &HostValue, budget: &mut HostValueBudget) -> Result<JsValue,
             Ok(o.into())
         }
     }
+}
+
+/// `String.fromCharCode` takes its code units as ARGUMENTS, and every JS
+/// engine caps an argument list (Node refused 200,000; the browsers differ).
+/// One call per this many units stays far under all of them; a guest string
+/// is bounded at 1,048,576 WTF-8 bytes, so the longest string is a few
+/// hundred calls, each a rope concatenation.
+const FROM_CHAR_CODE_CHUNK_UNITS: usize = 4096;
+
+/// Rebuild a guest string from its exact UTF-16 code units, lone surrogates
+/// included, without one variadic call over the whole string (the
+/// 11 September 2026 close audit's ZA-04: the whole-slice call threw the
+/// engine's argument-count `RangeError` at 200,000 units, uncaught, well
+/// under the transport's byte ceiling). Only `String.fromCharCode` and
+/// `String.prototype.concat` are involved: no decoder, so nothing can replace
+/// a lone surrogate on the way.
+fn utf16_units_to_js_string(units: &[u16]) -> js_sys::JsString {
+    let mut chunks = units.chunks(FROM_CHAR_CODE_CHUNK_UNITS);
+    let mut out = js_sys::JsString::from_char_code(chunks.next().unwrap_or(&[]));
+    for chunk in chunks {
+        out = out.concat(&js_sys::JsString::from_char_code(chunk));
+    }
+    out
 }
 
 /// Define an ordinary enumerable data property without invoking the legacy

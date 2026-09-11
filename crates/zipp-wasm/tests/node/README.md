@@ -50,6 +50,26 @@ top of each file if you put it elsewhere).
   callback ids with cancellation, chronological console output,
   `window.dispatchEvent`, and the profile's provenance and policy fields. The
   audit's own 15-case probe bundle ran red on v0.0.15 for 13 of them.
+- **audit-2026-09-11-close.cjs** — the 11 September 2026 CLOSE audit's
+  contracts (ZA-01..10) against the artifact: `lastErrorKind()`/`disposed`
+  as the engine's own classification of every error (a guest throw naming a
+  limit is `guest`, only the recorder is `resource`), long lone-surrogate
+  strings crossing in bounded chunks with the engine usable afterwards,
+  results surviving the microtasks they schedule, the drain transactional
+  across the whole call (a later helper throw, a tampered queue, a
+  rejection whose error reporting throws) and bounded in attempted work,
+  hidden/accessor entries charged as inspected work, and retained dynamic
+  metadata reported in bytes. The audit's own three-case WASM probe ran
+  red on `1477070` for ZA-04 (an uncaught argument-count `RangeError` that
+  also left the instance unusable).
+- **sdk-contract.mjs** — the reference host adapter's main-thread contract
+  under a mocked Worker and deterministic timers (ZA-01/02/03): envelope-
+  based categories, send-failure cleanup, monotonic death, no operation
+  posted before `ready`, validated deadlines, exactly-once settlement. No
+  engine build needed; the Worker half runs in `tests/browser/`.
+- **density-stats.cjs** — the density harness's aggregation against small
+  exact pooled references (ZA-11): pooled percentiles, named per-worker
+  summaries, hostile cycles apart from useful units, idle workers, failures.
 - **resource-usage.cjs** — `resourceUsage()`/`zippInstanceUsage()` and the
   rich eval: a 200-engine create/run/dispose churn in one instance, reporting
   what the instance retains next to the process RSS delta (ZIPP-06 stage 1).
@@ -57,9 +77,13 @@ top of each file if you put it elsewhere).
   worker_threads, each with its own WASM instance, run engine-shaped scenarios
   (turnover, idle frames, state sync, call bursts, allocation-heavy work, and a
   hostile tenant beside `sync` peers) for a fixed window at 1/2/4/8 instances,
-  reporting units, per-unit latency percentiles, CPU seconds per unit, RSS,
-  the engine heap estimate and what each instance retains — raw figures, no
-  headline. Not part of the boundary suite; run it on an otherwise idle host.
+  in synchronized load / measure / snapshot / teardown phases (ZA-12),
+  reporting useful units, POOLED per-unit latency percentiles beside the
+  named worst-worker p99 and mean-of-medians (ZA-11), CPU seconds per
+  useful unit, hostile cycles apart, RSS with every instance alive, the
+  engine heap estimate, cold-start and disposal cost, and what each
+  instance retains — raw figures, no headline. Not part of the boundary
+  suite; run it on an otherwise idle host.
 - **profile-matches-readme.cjs** — holds the README's resource table to the
   figures `zippProfile()` reports.
 - **softn-snakegame.cjs** — a real SoftN bundle's `.logic`, unmodified, driven the

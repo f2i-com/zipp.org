@@ -337,8 +337,8 @@ cover that way (string, regex, BigInt, array and nesting ceilings) come from
 | JSON replacer/object-key snapshots | 8,388,608 private allocation bytes per stringify, including key and container capacities |
 | Lifetime console output | 8,388,608 UTF-8 bytes total, including newlines, each line charged the cost of its own entry |
 | Synchronous host bridge | 64-byte kind, exact operation-specific arity (and never more than 16 arguments), 33,554,432 combined kind/argument bytes, and a 33,554,432-byte serialized reply |
-| Host value conversion | 2,000,000 nodes and 16,777,216 string bytes per boundary crossing (`getGlobalsBatch`, `setGlobalsBatch`, `callFunction`, `dispatchEvent`, `evalInContext`); a fingerprint batch walks under the same 2,000,000-node, 16,777,216-byte budget — every element, hole, key and string byte charged, duplicate indices included — and answers `NaN` for what it cannot walk |
-| Asynchronous `host.call` | 4,096 requests queued between drains, 65,536 callbacks awaiting a reply, and 4,194,304 UTF-16 code units per request (kind plus arguments), all checked before anything registers; one drain delivers at most 4,096 requests and 33,554,432 string bytes, leaves the rest queued, and rejects (with explicit settlement) a single request that does not fit that allowance on its own |
+| Host value conversion | 2,000,000 nodes and 16,777,216 string bytes per boundary crossing (`getGlobalsBatch`, `setGlobalsBatch`, `callFunction`, `dispatchEvent`, `evalInContext`), plus 8 inspected property entries per node of that ceiling (16,000,000 in all: every entry of every object scanned, hidden and accessor entries included, charged before the scan); a fingerprint batch walks under the same 2,000,000-node, 16,777,216-byte, 16,000,000-entry budget — every element, hole, key and string byte charged, duplicate indices included — and answers `NaN` for what it cannot walk |
+| Asynchronous `host.call` | 4,096 requests queued between drains, 65,536 callbacks awaiting a reply, and 4,194,304 UTF-16 code units per request (kind plus arguments), all checked before anything registers; one drain delivers at most 4,096 requests and 33,554,432 string bytes, leaves the rest queued, and rejects (with explicit settlement) a single request that does not fit that allowance on its own; a drain also ATTEMPTS at most 64 peeks, retries and rejections and 8,000,000 nodes and 134,217,728 string bytes of walking across them, counted whether or not an attempt succeeded, and leaves the rest for the next drain |
 | `accel.make` binding spec | the public grammar only — `NAME=g:GLOBAL`, `NAME=c:GLOBAL`, `NAME=a:ID`, `NAME=n:NUMBER`, `NAME=t` — at most 8,192 bytes, 64 entries and 64-byte identifiers, names bound once (a set, not a scan), ids finite non-negative safe integers; the whole spec is validated before any region is resolved, regions are pinned as one transaction, and the engine's own `r:` region form is refused from guest text before the adapter sees the spec |
 
 The instruction, dynamic-compilation and output counters are not credited when
@@ -412,8 +412,18 @@ remain recoverable.
 - `host-sdk/` is the reference host adapter for browsers — one Worker and
   WASM instance per guest, generation-scoped messages, external deadlines
   that terminate the Worker, immutable capability setup, Worker-side bridges
-  and seven error categories — and `tests/browser/` runs it in real Chromium,
-  Firefox and WebKit Workers against the exact stripped web package.
+  and eight error categories taken from the engine's own account of each
+  failure (`lastErrorKind()` and `disposed`, never message text) — and
+  `tests/browser/` runs it in real Chromium, Firefox and WebKit Workers
+  against the exact stripped web package. The released web archive ships
+  the directory beside the bindings at the same revision (`BUILD-INFO.txt`
+  names the SDK version); its main-thread state handling is pinned by
+  `tests/node/sdk-contract.mjs` in the boundary suite.
+- `lastErrorKind()` is the engine's classification of the last error a
+  method threw — `guest`, `conversion`, `usage`, `source` or `resource` —
+  recorded where the error is built, and `disposed` is the trusted terminal
+  signal. A guest `throw new Error("budget exceeded")` is `guest`; only the
+  resource recorder produces `resource`.
 - `takeOutput()` drains every console line — `log`/`info`/`debug` and
   `warn`/`error` — in the order it was written; `takeConsole()` returns the same
   lines as `{ stream: "stdout" | "stderr", text }` records. Either drains both

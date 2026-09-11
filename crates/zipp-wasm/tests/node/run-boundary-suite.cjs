@@ -36,6 +36,13 @@ const CHECKS = [
   ["worker-deadline.cjs"],
   ["audit-defaults.cjs"],
   ["audit-2026-09-11.cjs"],
+  ["audit-2026-09-11-close.cjs"],
+  // The reference host adapter's main-thread contract under a mocked Worker
+  // (no engine needed; ZA-01/02/03). Cheap, so it rides in the minimum gate.
+  ["sdk-contract.mjs"],
+  // The density harness's aggregation against exact pooled references
+  // (ZA-11); no engine involved, so it is cheap enough for the gate.
+  ["density-stats.cjs"],
   ["resource-usage.cjs"],
   ["profile-matches-readme.cjs"],
   ["syntax-corpus.cjs"],

@@ -171,27 +171,37 @@ function __zDispatchEvent(type, evt) {
 }
 
 // The drain is a two-phase transfer. The engine PEEKS a bounded prefix,
-// converts it to host values, and only then COMMITS that many off the queue;
-// a conversion that fails leaves the queue exactly as it was and the engine
-// retries with less. The old single-step drain emptied the queue before its
-// return value crossed the converter, so a conversion failure lost every
-// queued request while their callbacks stayed registered forever (the
-// 11 September 2026 audit's ZIPP-02). No guest code runs between a peek and
-// its commit, so the committed prefix is the peeked one.
+// converts it to host values, and only then COMMITS that prefix off the
+// queue; a conversion that fails leaves the queue exactly as it was and the
+// engine retries with less. The old single-step drain emptied the queue
+// before its return value crossed the converter, so a conversion failure
+// lost every queued request while their callbacks stayed registered forever
+// (the 11 September 2026 audit's ZIPP-02).
+//
+// The engine calls these two WITHOUT draining microtasks, so no guest job
+// runs between a peek and its commit; and the commit names the prefix it
+// means — its length and its first and last request ids, which are strictly
+// increasing — so a queue that is not what was peeked (only tampering with
+// this bookkeeping can arrange that) commits nothing rather than different
+// requests (the 11 September 2026 close audit's ZA-06).
 function __zPeekHostCalls(limit) {
   return __zHostQueue.slice(0, limit);
 }
 
-function __zCommitHostCalls(count) {
+function __zCommitHostCalls(count, firstId, lastId) {
+  if (!(count >= 1) || __zHostQueue.length < count) return -1;
+  if (__zHostQueue[0].id !== firstId || __zHostQueue[count - 1].id !== lastId) return -1;
   __zHostQueue.splice(0, count);
-  return __zHostQueue.length;
+  return count;
 }
 
 // A request that cannot cross even on its own is settled here rather than
 // left queued forever or dropped silently: it leaves the queue and its
 // callback receives a RangeError. A throw from that callback is reported to
 // the console, as an uncaught exception in any asynchronous callback would
-// be, so that it cannot abort the drain that other requests are part of.
+// be, so that it cannot abort the drain that other requests are part of —
+// and neither can the REPORTING: rendering the thrown value and the console
+// method itself are both guest-replaceable and may throw (ZA-06).
 function __zRejectHostCall(reason) {
   var req = __zHostQueue.shift();
   if (!req) return 0;
@@ -200,7 +210,11 @@ function __zRejectHostCall(reason) {
     delete __zHostCbs[req.id];
     __zHostPending--;
     try { cb(new RangeError(String(reason))); }
-    catch (e) { console.error("host.call: callback for rejected request " + req.id + " threw: " + e); }
+    catch (e) {
+      var text;
+      try { text = String(e); } catch (_) { text = "<unprintable>"; }
+      try { console.error("host.call: callback for rejected request " + req.id + " threw: " + text); } catch (_) {}
+    }
   }
   return 1;
 }

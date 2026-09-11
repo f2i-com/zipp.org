@@ -38,8 +38,10 @@ row("Payload-aware VM heap high-water", limits.approxHeapBytes);
 row("WebAssembly linear memory", limits.linkedMemoryMaxBytes);
 row("Lifetime console output", limits.lifetimeOutputBytes);
 row("Synchronous host bridge", limits.syncBridgeKindBytes, limits.syncBridgeArgs, limits.syncBridgeBytes);
-row("Host value conversion", limits.hostValueNodes, limits.hostValueStringBytes, limits.fingerprintNodes, limits.fingerprintStringBytes);
-row("Asynchronous `host.call`", limits.hostCallQueue, limits.hostCallPending, limits.hostCallRequestUnits, limits.hostCallDrainRequests, limits.hostCallDrainStringBytes);
+row("Host value conversion", limits.hostValueNodes, limits.hostValueStringBytes, limits.hostValueWorkPerNode,
+  limits.hostValueNodes * limits.hostValueWorkPerNode, limits.fingerprintNodes, limits.fingerprintStringBytes);
+row("Asynchronous `host.call`", limits.hostCallQueue, limits.hostCallPending, limits.hostCallRequestUnits, limits.hostCallDrainRequests, limits.hostCallDrainStringBytes,
+  limits.hostCallDrainAttempts, limits.hostCallDrainWorkNodes, limits.hostCallDrainWorkBytes);
 row("`accel.make` binding spec", limits.accelSpecBytes, limits.accelSpecEntries, limits.accelSpecNameBytes);
 
 // The version itself is held to the release tag by release.yml, not here.

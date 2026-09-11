@@ -54,8 +54,10 @@ const expectedImportStems = [
   "__wbg_call",
   // String.prototype.charCodeAt and String.fromCharCode: the exact-code-unit
   // string transport (ZIPP-11) reads and rebuilds a string holding a lone
-  // surrogate through them.
+  // surrogate through them. String.prototype.concat joins the bounded
+  // fromCharCode chunks a long such string is rebuilt from (ZA-04).
   "__wbg_charCodeAt",
+  "__wbg_concat",
   "__wbg_defineProperty",
   "__wbg_delete",
   "__wbg_error",

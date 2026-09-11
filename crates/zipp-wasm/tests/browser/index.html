@@ -152,6 +152,59 @@ try {
     record("dispatched events reach listeners and log in order", JSON.stringify(lines) === JSON.stringify([{ stream: "stdout", text: "ping 1" }, { stream: "stdout", text: "ping 2" }]), lines);
     h.terminate();
   }
+  // 9. ZA-01: categories come from the engine, not from message text. A
+  //    guest error that names a limit is recoverable; a real ceiling is not.
+  {
+    const h = host({ instructionBudget: 500000000 });
+    await h.init(`
+      function limitText() { throw new Error("business limit reached"); }
+      function budgetText() { throw new RangeError("instruction budget exceeded"); }
+      function ok() { return "still here"; }
+      var big = []; for (var i = 0; i < 2000001; i++) big.push(0);
+      function overBudget() { return big; }
+    `);
+    const a = await expectError(h.call("limitText", []), "guest");
+    record("a guest error naming a limit is a guest error", a.ok && !a.detail.terminal, a.detail);
+    const b = await expectError(h.call("budgetText", []), "guest");
+    record("…however closely it imitates the engine's text", b.ok, b.detail);
+    record("and the host is still ready", h.state === "ready" && (await h.call("ok", [])) === "still here");
+    const c = await expectError(h.call("overBudget", []), "conversion");
+    record("a result over the conversion budget is a conversion error", c.ok, c.detail);
+    record("…and the host is still ready", h.state === "ready" && (await h.call("ok", [])) === "still here");
+    h.terminate();
+  }
+
+  // 10. ZA-02: a payload structured clone refuses is rejected locally; the
+  //     host stays usable before and after that request's former deadline.
+  {
+    const h = host({ deadlineMs: 300 });
+    await h.init("function f(x) { return typeof x; }", { deadlineMs: 15000 });
+    const r = await expectError(h.call("f", [() => 1]), "usage");
+    record("a function argument is refused before it is posted", r.ok && /could not be sent/.test(r.detail.message), r.detail);
+    record("the host is still ready", h.state === "ready" && h.pendingRequests === 0 && (await h.call("f", [1])) === "number");
+    await sleep(450);
+    record("…and after the rejected request's former deadline", h.state === "ready" && (await h.call("f", ["s"])) === "string");
+    h.terminate();
+  }
+
+  // 11. ZA-03: nothing is posted before initialization; a terminated host
+  //     never becomes ready even if its initialization reply was in flight.
+  {
+    const h = host();
+    const early = await expectError(h.call("f", []), "usage");
+    record("a call before init is refused locally", early.ok && /state created/.test(early.detail.message), early.detail);
+    const p = h.init("function f() { return 1; }");
+    const during = await expectError(h.readGlobals([0]), "usage");
+    record("a read during initialization is refused locally", during.ok && /state initializing/.test(during.detail.message), during.detail);
+    await p;
+    record("then the host is ready", h.state === "ready" && (await h.call("f", [])) === 1);
+    h.terminate();
+    const raced = host();
+    const init = raced.init("var x = 1;");
+    raced.terminate();
+    const outcome = await expectError(init, "terminated");
+    record("init on a host terminated meanwhile rejects as terminated and the host is dead", outcome.ok && raced.state === "dead", { ...outcome.detail, state: raced.state });
+  }
 } catch (error) {
   record("harness", false, String(error && error.stack || error));
 }
