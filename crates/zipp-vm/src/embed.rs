@@ -96,25 +96,37 @@ impl JsValue {
 
 /// A compiled program plus the live VM executing it.
 ///
-/// `Vm<'p>` borrows its `Program`, which makes the pair self-referential and so
-/// not expressible in safe Rust. The `Program` is therefore heap-allocated and
-/// leaked to `&'static` for the VM to borrow, and reclaimed in `Drop` after the
-/// VM is torn down. The invariant that makes this sound: the `&'static Program`
-/// is handed to exactly one `Vm`, that `Vm` is owned by this struct and never
-/// escapes it, and `Drop` drops the `Vm` before freeing the `Program`.
+/// `Vm<'p>` borrows its `Program`, which makes the pair self-referential. It
+/// used to be expressed by leaking the `Program` to `&'static` and, in builds
+/// that allow `unsafe`, reclaiming it in `Drop`; the `safe-sandbox` profile
+/// could not reclaim it at all, so every engine a WASM instance created left
+/// its compiled program behind for the instance's lifetime (the 11 September
+/// 2026 audit's ZIPP-06). [`OwnedVm`] now holds both in one allocation with
+/// the borrow expressed safely (`self_cell`): the `Vm` is built over the boxed
+/// `Program`, is reachable only through this struct, and is dropped before
+/// the `Program` — in every profile, with no `unsafe` in this crate.
 ///
 /// Not `Send`: the VM holds raw pointers into its own heap and register file
 /// (the JIT pins them), so a `ScriptState` stays on the thread that built it.
 pub struct ScriptState {
-    /// `Option` purely so `Drop` can run the VM's destructor at a chosen moment
-    /// — before the `Program` it borrows is freed.
-    vm: Option<Vm<'static>>,
-    /// Owning pointer to the leaked `Program`. Freed in `Drop`, after `vm`.
-    #[cfg(not(feature = "safe-sandbox"))]
-    program: *mut Program,
+    /// `Option` so a torn-down state is expressible; `None` only after an
+    /// explicit teardown.
+    vm: Option<OwnedVm>,
     /// Key for [`Self::fingerprint_slot`]. See [`Self::set_fingerprint_seed`].
     fp_seed: u64,
 }
+
+self_cell::self_cell!(
+    /// The compiled program and the VM borrowing it, dropped in that order.
+    /// The pair lives in one heap allocation, so moving a `ScriptState` never
+    /// moves the `Vm` (native code keeps deriving VM-relative addresses from
+    /// the live VM argument regardless).
+    struct OwnedVm {
+        owner: Box<Program>,
+        #[covariant]
+        dependent: Vm,
+    }
+);
 
 /// Parse and compile `src` as a classic script, returning a VM ready to run it.
 ///
@@ -222,44 +234,54 @@ pub fn compile_script_with_preamble(
 impl ScriptState {
     /// Take ownership of a compiled program and boot a VM over it.
     fn from_program(program: Program) -> ScriptState {
-        // Leak, hand the `&'static` to the VM, and keep the raw pointer so `Drop`
-        // can reclaim it. See the invariant on `ScriptState`.
-        let leaked: &'static mut Program = Box::leak(Box::new(program));
-        #[cfg(feature = "safe-sandbox")]
-        let mut vm = Vm::new(&*leaked);
-        #[cfg(not(feature = "safe-sandbox"))]
-        let program = leaked as *mut Program;
-        // SAFETY: `leaked` is a live, uniquely-owned allocation; reborrowing it as
-        // shared for the VM is fine because `program` is only dereferenced again in
-        // `Drop`, after the VM (the sole holder of the shared borrow) is gone.
-        #[cfg(not(feature = "safe-sandbox"))]
-        let mut vm = Vm::new(unsafe { &*program });
-        // No test262 host object for embedded code. `$262.agent.start()` spawns a
-        // detached OS thread running its own VM — outside any budget, abort flag,
-        // trace or timeout the embedder set — and `createRealm`/`evalScript`/
-        // `detachArrayBuffer` are equally not things a page script or a sandboxed
-        // job should reach. This API is the untrusted-code path; it does not get
-        // the harness. `zipp js` and the test262 runner still do.
-        vm.host_262 = false;
+        let cell = OwnedVm::new(Box::new(program), |program| {
+            let mut vm = Vm::new(program);
+            // No test262 host object for embedded code. `$262.agent.start()`
+            // spawns a detached OS thread running its own VM — outside any
+            // budget, abort flag, trace or timeout the embedder set — and
+            // `createRealm`/`evalScript`/`detachArrayBuffer` are equally not
+            // things a page script or a sandboxed job should reach. This API
+            // is the untrusted-code path; it does not get the harness.
+            // `zipp js` and the test262 runner still do.
+            vm.host_262 = false;
+            vm
+        });
         ScriptState {
-            vm: Some(vm),
-            #[cfg(not(feature = "safe-sandbox"))]
-            program,
+            vm: Some(cell),
             // Unkeyed until a host supplies randomness. Documented on
             // set_fingerprint_seed: a fixed start is solvable.
             fp_seed: 0,
         }
     }
+
+    /// The VM, shared. `None` once torn down.
+    fn vm(&self) -> Option<&Vm<'_>> {
+        self.vm.as_ref().map(OwnedVm::borrow_dependent)
+    }
+
+    /// Run `f` over the VM. `None` once torn down. The closure form is what
+    /// keeps the program borrow inside the cell; nothing hands a `&mut Vm`
+    /// out, so the pair can never be split.
+    fn with_vm<R>(&mut self, f: impl for<'a> FnOnce(&mut Vm<'a>) -> R) -> Option<R> {
+        self.vm
+            .as_mut()
+            .map(|cell| cell.with_dependent_mut(|_, vm| f(vm)))
+    }
 }
+
+/// The error every entry point reports after teardown.
+fn torn_down<T>() -> Result<T, String> {
+    Err(TORN_DOWN.into())
+}
+
+const TORN_DOWN: &str = "zipp: VM has been torn down";
 
 impl ScriptState {
     /// Install the host closure backing `__zippHostCall`. Replaces any previous
     /// one. Until this is called the native throws, so a script cannot reach
     /// host state the embedder has not deliberately exposed.
     pub fn set_host_call(&mut self, host: HostCall) {
-        if let Some(vm) = self.vm.as_mut() {
-            vm.host = Some(host);
-        }
+        self.with_vm(|vm| vm.host = Some(host));
     }
 
     /// Install the context-taking host closure backing `__zippHostCall`. It
@@ -267,9 +289,7 @@ impl ScriptState {
     /// VM as [`HostCtx`] so it can resolve the guest's typed arrays to memory
     /// regions and call guest functions with numbers while it runs.
     pub fn set_host_call_ctx(&mut self, host: HostCallCtx) {
-        if let Some(vm) = self.vm.as_mut() {
-            vm.host_ctx = Some(host);
-        }
+        self.with_vm(|vm| vm.host_ctx = Some(host));
     }
 
     /// Enable filesystem module loading, confined to one canonical directory.
@@ -287,17 +307,20 @@ impl ScriptState {
         root: &std::path::Path,
         max_module_bytes: u64,
     ) -> Result<(), String> {
-        let vm = self.vm.as_mut().ok_or("zipp: VM has been torn down")?;
-        vm.set_module_root(root.to_path_buf(), max_module_bytes)?;
-        let base = vm.resolve_module_path(base_dir).map_err(|e| e.0)?;
-        if !base.is_dir() {
-            return Err(format!(
-                "module base '{}' is not a directory",
-                base_dir.display()
-            ));
-        }
-        vm.set_module_base_dir(Some(base));
-        Ok(())
+        let root = root.to_path_buf();
+        self.with_vm(|vm| {
+            vm.set_module_root(root, max_module_bytes)?;
+            let base = vm.resolve_module_path(base_dir).map_err(|e| e.0)?;
+            if !base.is_dir() {
+                return Err(format!(
+                    "module base '{}' is not a directory",
+                    base_dir.display()
+                ));
+            }
+            vm.set_module_base_dir(Some(base));
+            Ok(())
+        })
+        .unwrap_or_else(torn_down)
     }
 
     /// The dedicated WebAssembly artifact has no filesystem module-loader
@@ -321,9 +344,7 @@ impl ScriptState {
     #[cfg(feature = "instrument")]
     pub fn disable_vm_jit(&mut self) {
         #[cfg(all(feature = "jit", any(target_arch = "x86_64", target_arch = "aarch64")))]
-        if let Some(vm) = self.vm.as_mut() {
-            vm.set_jit_enabled(false);
-        }
+        self.with_vm(|vm| vm.set_jit_enabled(false));
     }
 
     /// Execute the program's top level and drain the job queue.
@@ -332,11 +353,11 @@ impl ScriptState {
     /// throw is preserved and still readable via [`Self::take_output`] — the
     /// engine flushes what it managed to print, like a real one.
     pub fn run_init(&mut self) -> Result<JsValue, String> {
-        let vm = self.vm.as_mut().ok_or("zipp: VM has been torn down")?;
-        match vm.run() {
+        self.with_vm(|vm| match vm.run() {
             Ok(v) => Ok(marshal(vm, v)),
             Err(thrown) => Err(thrown.0),
-        }
+        })
+        .unwrap_or_else(torn_down)
     }
 
     /// Evaluate `src` in the running script's global context and return its
@@ -361,11 +382,11 @@ impl ScriptState {
     /// memory without bound. Prefer defining a function once and calling it
     /// with [`Self::call_global`].
     pub fn eval_in_context(&mut self, src: &str) -> Result<JsValue, String> {
-        let vm = self.vm.as_mut().ok_or("zipp: VM has been torn down")?;
-        match eval_indirect(vm, src) {
+        self.with_vm(|vm| match eval_indirect(vm, src) {
             Ok(v) => Ok(marshal(vm, v)),
             Err(thrown) => Err(thrown.0),
-        }
+        })
+        .unwrap_or_else(torn_down)
     }
 
     /// Call the global function `name` with `args`, returning its result.
@@ -392,16 +413,18 @@ impl ScriptState {
         if !is_identifier(name) {
             return Err(format!("zipp: {name:?} is not a global identifier"));
         }
-        let vm = self.vm.as_mut().ok_or("zipp: VM has been torn down")?;
-        let callee = vm.host_resolve_global_by_name(name)?;
-        if !vm.is_callable(callee) {
-            return Err(format!("TypeError: {name} is not a function"));
-        }
-        let argv: Vec<Value> = args.iter().map(|a| unmarshal(vm, a)).collect();
-        match vm.call_value(callee, Value::UNDEFINED, &argv) {
-            Ok(v) => Ok(marshal(vm, v)),
-            Err(thrown) => Err(thrown.0),
-        }
+        self.with_vm(|vm| {
+            let callee = vm.host_resolve_global_by_name(name)?;
+            if !vm.is_callable(callee) {
+                return Err(format!("TypeError: {name} is not a function"));
+            }
+            let argv: Vec<Value> = args.iter().map(|a| unmarshal(vm, a)).collect();
+            match vm.call_value(callee, Value::UNDEFINED, &argv) {
+                Ok(v) => Ok(marshal(vm, v)),
+                Err(thrown) => Err(thrown.0),
+            }
+        })
+        .unwrap_or_else(torn_down)
     }
 
     /// Whether `name` resolves to a callable global — lets a host probe for an
@@ -416,13 +439,11 @@ impl ScriptState {
         if !is_identifier(name) {
             return false;
         }
-        let Some(vm) = self.vm.as_mut() else {
-            return false;
-        };
-        match vm.host_resolve_global_by_name(name) {
+        self.with_vm(|vm| match vm.host_resolve_global_by_name(name) {
             Ok(v) => vm.is_callable(v),
             Err(_) => false,
-        }
+        })
+        .unwrap_or(false)
     }
 
     /// Run queued microtasks (promise reactions, `queueMicrotask`) to
@@ -438,35 +459,29 @@ impl ScriptState {
     /// without draining, the update never happens and the interaction silently
     /// does nothing.
     pub fn run_microtasks(&mut self) {
-        if let Some(vm) = self.vm.as_mut() {
-            vm.drain_microtasks();
-        }
+        self.with_vm(|vm| vm.drain_microtasks());
     }
 
     /// Take the `console.log`/`info`/`debug` lines produced so far, clearing the
     /// buffer. Un-drained output accumulates for the VM's lifetime, so a
     /// long-lived embedder should drain (or discard) periodically.
     pub fn take_output(&mut self) -> Vec<String> {
-        self.vm
-            .as_mut()
-            .map(|vm| {
-                vm.console_order
-                    .retain(|stream| *stream == ConsoleStream::Stderr);
-                std::mem::take(&mut vm.output)
-            })
-            .unwrap_or_default()
+        self.with_vm(|vm| {
+            vm.console_order
+                .retain(|stream| *stream == ConsoleStream::Stderr);
+            std::mem::take(&mut vm.output)
+        })
+        .unwrap_or_default()
     }
 
     /// Take the `console.error`/`console.warn` lines produced so far.
     pub fn take_errput(&mut self) -> Vec<String> {
-        self.vm
-            .as_mut()
-            .map(|vm| {
-                vm.console_order
-                    .retain(|stream| *stream == ConsoleStream::Stdout);
-                std::mem::take(&mut vm.errput)
-            })
-            .unwrap_or_default()
+        self.with_vm(|vm| {
+            vm.console_order
+                .retain(|stream| *stream == ConsoleStream::Stdout);
+            std::mem::take(&mut vm.errput)
+        })
+        .unwrap_or_default()
     }
 
     /// Take BOTH console streams in the order the lines were produced, each
@@ -476,27 +491,28 @@ impl ScriptState {
     /// here empties both buffers; the per-stream takes remain available for
     /// hosts that keep separate consumers.
     pub fn take_console(&mut self) -> Vec<(ConsoleStream, String)> {
-        let Some(vm) = self.vm.as_mut() else {
-            return Vec::new();
-        };
-        let order = std::mem::take(&mut vm.console_order);
-        let mut out = std::mem::take(&mut vm.output).into_iter();
-        let mut err = std::mem::take(&mut vm.errput).into_iter();
-        let mut lines = Vec::with_capacity(order.len());
-        for stream in order {
-            let line = match stream {
-                ConsoleStream::Stdout => out.next(),
-                ConsoleStream::Stderr => err.next(),
-            };
-            if let Some(line) = line {
-                lines.push((stream, line));
+        self.with_vm(|vm| {
+            let order = std::mem::take(&mut vm.console_order);
+            let mut out = std::mem::take(&mut vm.output).into_iter();
+            let mut err = std::mem::take(&mut vm.errput).into_iter();
+            let mut lines = Vec::with_capacity(order.len());
+            for stream in order {
+                let line = match stream {
+                    ConsoleStream::Stdout => out.next(),
+                    ConsoleStream::Stderr => err.next(),
+                };
+                if let Some(line) = line {
+                    lines.push((stream, line));
+                }
             }
-        }
-        // Lines the order vector does not account for (none in practice; a
-        // buffer written by a path that bypassed the recorder) still drain.
-        lines.extend(out.map(|line| (ConsoleStream::Stdout, line)));
-        lines.extend(err.map(|line| (ConsoleStream::Stderr, line)));
-        lines
+            // Lines the order vector does not account for (none in practice;
+            // a buffer written by a path that bypassed the recorder) still
+            // drain.
+            lines.extend(out.map(|line| (ConsoleStream::Stdout, line)));
+            lines.extend(err.map(|line| (ConsoleStream::Stderr, line)));
+            lines
+        })
+        .unwrap_or_default()
     }
 
     // ---- Rich-value API (see `crate::vm::host_api`) -----------------------
@@ -509,10 +525,7 @@ impl ScriptState {
     /// The program's top-level bindings, each with a stable slot index. Call
     /// after [`Self::run_init`] so function declarations have been hoisted.
     pub fn symbols(&self) -> Vec<Symbol> {
-        self.vm
-            .as_ref()
-            .map(|vm| vm.host_symbols())
-            .unwrap_or_default()
+        self.vm().map(|vm| vm.host_symbols()).unwrap_or_default()
     }
 
     /// Read the global in `index` as a structured value.
@@ -523,10 +536,8 @@ impl ScriptState {
     /// Read the global in `index` as a structured value, reporting when its
     /// representation exceeds the host-conversion budget.
     pub fn try_get_slot(&mut self, index: u32) -> Result<HostValue, String> {
-        match self.vm.as_mut() {
-            Some(vm) => vm.host_get_slot(index),
-            None => Err("zipp: VM has been torn down".into()),
-        }
+        self.with_vm(|vm| vm.host_get_slot(index))
+            .unwrap_or_else(torn_down)
     }
 
     /// Renew the instruction budget without disturbing any other limit.
@@ -551,10 +562,8 @@ impl ScriptState {
     /// Returns false when the budget is already spent: exhaustion is sticky by
     /// design, and a spent engine must stay spent.
     pub fn renew_step_budget(&mut self, max_steps: u64) -> bool {
-        match self.vm.as_mut() {
-            Some(vm) => vm.renew_step_budget(max_steps),
-            None => false,
-        }
+        self.with_vm(|vm| vm.renew_step_budget(max_steps))
+            .unwrap_or(false)
     }
 
     /// Key the global fingerprints for this engine.
@@ -596,16 +605,14 @@ impl ScriptState {
         budget: &mut FingerprintBudget,
     ) -> Option<u64> {
         let seed = self.fp_seed;
-        self.vm.as_mut()?.host_fingerprint_slot(index, seed, budget)
+        self.with_vm(|vm| vm.host_fingerprint_slot(index, seed, budget))?
     }
 
     /// Write the global in `index`. `false` means the write was declined
     /// because the slot holds something that cannot be represented as data (a
     /// function, a class, a `Map`, …) — see [`HostValue::Opaque`].
     pub fn set_slot(&mut self, index: u32, value: &HostValue) -> bool {
-        self.vm
-            .as_mut()
-            .map(|vm| vm.host_set_slot(index, value))
+        self.with_vm(|vm| vm.host_set_slot(index, value))
             .unwrap_or(false)
     }
 
@@ -615,10 +622,8 @@ impl ScriptState {
     /// index, while a name is looked up through the global environment on
     /// every call (no compilation either way).
     pub fn call_slot(&mut self, index: u32, args: &[HostValue]) -> Result<HostValue, String> {
-        match self.vm.as_mut() {
-            Some(vm) => vm.host_call_slot(index, args),
-            None => Err("zipp: VM has been torn down".into()),
-        }
+        self.with_vm(|vm| vm.host_call_slot(index, args))
+            .unwrap_or_else(torn_down)
     }
 
     /// [`Self::call_slot`] with the caller's own conversion budget for the
@@ -632,10 +637,8 @@ impl ScriptState {
         args: &[HostValue],
         budget: &mut HostValueBudget,
     ) -> Result<HostValue, HostCallError> {
-        match self.vm.as_mut() {
-            Some(vm) => vm.host_call_slot_bounded(index, args, budget),
-            None => Err(HostCallError::Thrown("zipp: VM has been torn down".into())),
-        }
+        self.with_vm(|vm| vm.host_call_slot_bounded(index, args, budget))
+            .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())))
     }
 
     /// Cap the approximate resident heap a script may reach.
@@ -653,26 +656,26 @@ impl ScriptState {
     /// lives in; without it this is a no-op. `usize::MAX` means unlimited.
     #[cfg(feature = "instrument")]
     pub fn set_heap_limit(&mut self, bytes: usize) {
-        if let Some(vm) = self.vm.as_mut() {
+        self.with_vm(|vm| {
             if let Some(rec) = vm.instr_rec.as_mut() {
                 rec.heap_limit = bytes;
             }
             // Let the slot table refuse to double past the ceiling too.
             vm.set_resident_ceiling(bytes);
-        }
+        });
     }
 
     /// Cap combined buffered console output, counted as UTF-8 plus one newline
     /// per line. Requires [`Self::set_limits`] first; without it this is a no-op.
     #[cfg(feature = "instrument")]
     pub fn set_output_limit(&mut self, bytes: usize) {
-        if let Some(vm) = self.vm.as_mut() {
+        self.with_vm(|vm| {
             if let Some(rec) = vm.instr_rec.as_mut() {
                 rec.output_limit = bytes;
                 rec.output_used = 0;
                 rec.output_exhausted = false;
             }
-        }
+        });
     }
 
     /// Payload-aware resident heap estimate, in bytes.
@@ -684,14 +687,12 @@ impl ScriptState {
     /// are not all introspectable. Hosts requiring a hard memory boundary must
     /// additionally cap a worker process/container or WebAssembly linear memory.
     pub fn heap_bytes(&self) -> usize {
-        self.vm.as_ref().map_or(0, |vm| vm.heap_bytes())
+        self.vm().map_or(0, |vm| vm.heap_bytes())
     }
 
     /// Run pending microtasks without calling anything.
     pub fn pump(&mut self) {
-        if let Some(vm) = self.vm.as_mut() {
-            vm.host_pump();
-        }
+        self.with_vm(|vm| vm.host_pump());
     }
 
     /// Evaluate `src` in the script's global context and marshal its
@@ -707,17 +708,14 @@ impl ScriptState {
         src: &str,
         budget: &mut HostValueBudget,
     ) -> Result<HostValue, HostCallError> {
-        match self.vm.as_mut() {
-            Some(vm) => vm.host_eval_rich(src, budget),
-            None => Err(HostCallError::Thrown("zipp: VM has been torn down".into())),
-        }
+        self.with_vm(|vm| vm.host_eval_rich(src, budget))
+            .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())))
     }
 
     /// What this VM currently retains and has spent — see [`ResourceUsage`].
     /// Cheap (no walk), so a host may read it between every re-entry.
     pub fn resource_usage(&self) -> ResourceUsage {
-        self.vm
-            .as_ref()
+        self.vm()
             .map(|vm| vm.host_resource_usage())
             .unwrap_or_default()
     }
@@ -768,12 +766,12 @@ impl ScriptState {
             abort.is_none(),
             "meter-only relies on Worker termination and does not poll an abort flag"
         );
-        if let Some(vm) = self.vm.as_mut() {
+        self.with_vm(|vm| {
             let mut rec = crate::vm::instrument::Recorder::new();
             rec.set_step_limit(max_steps);
             rec.abort = abort;
             vm.set_instrumentation(rec);
-        }
+        });
     }
 
     /// Bound runtime compilation for this script state.
@@ -802,7 +800,7 @@ impl ScriptState {
         functions: usize,
         classes: usize,
     ) {
-        if let Some(vm) = self.vm.as_mut() {
+        self.with_vm(|vm| {
             vm.set_dynamic_code_limits(
                 per_source_bytes,
                 lifetime_source_bytes,
@@ -810,7 +808,7 @@ impl ScriptState {
                 functions,
                 classes,
             );
-        }
+        });
     }
 
     /// Start recording an execution trace, stopping at `max_steps` rows.
@@ -829,15 +827,17 @@ impl ScriptState {
     /// prove and take it back with [`Self::finish_trace`] straight after.
     #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
     pub fn start_trace(&mut self, max_steps: usize) {
-        let Some(vm) = self.vm.as_mut() else { return };
-        if vm.instr_rec.is_none() {
-            return;
-        }
-        // A trace must be a complete record, and native code produces no rows.
-        vm.enter_trace_mode();
-        if let Some(rec) = vm.instr_rec.as_mut() {
-            rec.start_trace(max_steps);
-        }
+        self.with_vm(|vm| {
+            if vm.instr_rec.is_none() {
+                return;
+            }
+            // A trace must be a complete record, and native code produces no
+            // rows.
+            vm.enter_trace_mode();
+            if let Some(rec) = vm.instr_rec.as_mut() {
+                rec.start_trace(max_steps);
+            }
+        });
     }
 
     /// Stop recording and take the trace, appending a terminal halt row that
@@ -850,17 +850,14 @@ impl ScriptState {
     /// to an execution that did not happen.
     #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
     pub fn finish_trace(&mut self, result: u64) -> Option<Vec<TraceStep>> {
-        self.vm
-            .as_mut()
-            .and_then(|vm| vm.instr_rec.as_mut())?
-            .finish(result)
+        self.with_vm(|vm| vm.instr_rec.as_mut().and_then(|rec| rec.finish(result)))
+            .flatten()
     }
 
     /// Whether the last recording stopped early at the row cap.
     #[cfg(all(feature = "instrument", not(feature = "meter-only")))]
     pub fn trace_truncated(&self) -> bool {
-        self.vm
-            .as_ref()
+        self.vm()
             .and_then(|vm| vm.instr_rec.as_ref())
             .is_some_and(|r| r.truncated())
     }
@@ -872,7 +869,7 @@ impl ScriptState {
     /// the same whether or not the JIT happened to be running.
     #[cfg(feature = "instrument")]
     pub fn steps_remaining(&self) -> u64 {
-        let Some(vm) = self.vm.as_ref() else {
+        let Some(vm) = self.vm() else {
             return u64::MAX;
         };
         let Some(rec) = vm.instr_rec.as_ref() else {
@@ -896,7 +893,7 @@ impl ScriptState {
     /// point — so a script stopped by its budget reports exactly the cap.
     #[cfg(feature = "instrument")]
     pub fn steps_used(&self) -> u64 {
-        let Some(vm) = self.vm.as_ref() else { return 0 };
+        let Some(vm) = self.vm() else { return 0 };
         let Some(rec) = vm.instr_rec.as_ref() else {
             return 0;
         };
@@ -912,21 +909,7 @@ impl ScriptState {
     /// promise instead of returning it directly from the original call.
     #[cfg(feature = "instrument")]
     pub fn resource_limit_error(&mut self) -> Option<&'static str> {
-        self.vm.as_mut()?.instrument_resource_limit_error()
-    }
-}
-
-#[cfg(not(feature = "safe-sandbox"))]
-impl Drop for ScriptState {
-    fn drop(&mut self) {
-        // Order is the whole point: the VM borrows the `Program`, so it must be
-        // destroyed first. A manual `Drop` impl runs before field drops, so
-        // dropping the VM here — rather than letting the field drop do it —
-        // guarantees the borrow is over before the allocation is freed.
-        self.vm = None;
-        // SAFETY: `program` came from `Box::leak` in `compile_script`, has not
-        // been freed (this runs once), and its only borrower is now gone.
-        unsafe { drop(Box::from_raw(self.program)) };
+        self.with_vm(|vm| vm.instrument_resource_limit_error())?
     }
 }
 
@@ -939,7 +922,7 @@ impl Drop for ScriptState {
 /// and `var_env_global = true` (top-level `var`/`function` bind realm globals
 /// rather than a throwaway scope, which is what makes declarations persist
 /// between calls).
-fn eval_indirect(vm: &mut Vm<'static>, src: &str) -> Result<Value, crate::vm::Thrown> {
+fn eval_indirect(vm: &mut Vm<'_>, src: &str) -> Result<Value, crate::vm::Thrown> {
     vm.do_eval(
         src,
         false,            // force_strict: inherit the source's own directive
@@ -972,7 +955,7 @@ fn is_identifier(s: &str) -> bool {
 
 /// VM `Value` → embedder [`JsValue`]. Needs `&mut Vm` because `ToString` on an
 /// object is observable JS (it can call a user `toString`).
-fn marshal(vm: &mut Vm<'static>, v: Value) -> JsValue {
+fn marshal(vm: &mut Vm<'_>, v: Value) -> JsValue {
     if v.is_undefined() {
         return JsValue::Undefined;
     }
@@ -1006,7 +989,7 @@ fn marshal(vm: &mut Vm<'static>, v: Value) -> JsValue {
 /// Embedder [`JsValue`] → VM `Value`. `Object(s)` crosses as the string `s`;
 /// there is no way to rebuild an arbitrary object from its `ToString`, and
 /// inventing one would be worse than being explicit about the limit.
-fn unmarshal(vm: &mut Vm<'static>, v: &JsValue) -> Value {
+fn unmarshal(vm: &mut Vm<'_>, v: &JsValue) -> Value {
     match v {
         JsValue::Undefined => Value::UNDEFINED,
         JsValue::Null => Value::NULL,
@@ -1121,22 +1104,19 @@ mod tests {
             Ok(JsValue::Number(37.0))
         );
 
-        // Keep the first Vec's allocation alive while moving the state into a
-        // separately allocated Vec. A stale absolute epoch pointer therefore
-        // remains readable (and unchanged), making this a deterministic
-        // regression rather than relying on freed-memory behaviour.
-        let before = first[0].vm.as_ref().unwrap() as *const Vm<'static> as usize;
+        // Move the state into a separately allocated Vec. The VM itself lives
+        // in the self-owned cell's allocation, so it does NOT move with its
+        // `ScriptState` (B306 stage two); the guards below are exercised by
+        // the live route/epoch changes regardless, and native code keeps
+        // deriving VM-relative addresses from the live VM argument.
+        let before = first[0].vm().unwrap() as *const Vm<'_> as usize;
         let mut second = Vec::with_capacity(1);
         second.push(first.pop().unwrap());
-        let after = second[0].vm.as_ref().unwrap() as *const Vm<'static> as usize;
-        assert_ne!(before, after, "the test must physically move the VM");
-        // Refill the exact old allocation with a different live VM whose
-        // epochs are both zero. Before the fix, absolute pointers baked while
-        // warming `first[0]` legally read these unchanged sentinel fields and
-        // deterministically missed both mutations below.
-        first.push(compile_script("0;").expect("sentinel compiles"));
-        let sentinel = first[0].vm.as_ref().unwrap() as *const Vm<'static> as usize;
-        assert_eq!(before, sentinel, "the old VM address must remain live");
+        let after = second[0].vm().unwrap() as *const Vm<'_> as usize;
+        assert_eq!(
+            before, after,
+            "the VM's address is stable across a state move"
+        );
         let st = &mut second[0];
 
         st.eval_in_context(

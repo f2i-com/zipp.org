@@ -892,6 +892,9 @@ impl Engine {
     ///   `dispose()` does NOT reclaim within one WASM instance, so a host
     ///   recycles the Worker/WASM instance when their sum across tenants
     ///   passes what it accepts;
+    /// - `programFunctions`, `programBytecodeBytes`, `programSourceBytes`: the
+    ///   size of this engine's own compiled program, which IS freed with the
+    ///   engine (B306 stage two);
     /// - `consoleLinesBuffered`, `consoleBytesLifetime`, `pinnedBuffers`.
     ///
     /// These are exact counts, not allocator bytes: compare them with the
@@ -1367,9 +1370,6 @@ impl Engine {
                 u.retained_classes += usage.retained_classes as u64;
                 u.dynamic_code_calls += usage.dynamic_code_calls as u64;
                 u.dynamic_code_source_bytes += usage.dynamic_code_source_bytes as u64;
-                u.program_functions += usage.program_functions as u64;
-                u.program_bytecode_bytes += usage.program_bytecode_bytes as u64;
-                u.program_source_bytes += usage.program_source_bytes as u64;
                 c.set(u);
             });
         }
@@ -1426,9 +1426,6 @@ struct InstanceUsage {
     retained_classes: u64,
     dynamic_code_calls: u64,
     dynamic_code_source_bytes: u64,
-    program_functions: u64,
-    program_bytecode_bytes: u64,
-    program_source_bytes: u64,
 }
 
 impl InstanceUsage {
@@ -1439,20 +1436,17 @@ impl InstanceUsage {
         retained_classes: 0,
         dynamic_code_calls: 0,
         dynamic_code_source_bytes: 0,
-        program_functions: 0,
-        program_bytecode_bytes: 0,
-        program_source_bytes: 0,
     };
 }
 
 /// What this WASM instance has accumulated over every engine it has disposed
 /// so far, as JSON-shaped data: `enginesCreated`, `enginesDisposed`, and the
 /// disposed engines' summed `retainedFunctions`, `retainedClasses`,
-/// `dynamicCodeCalls`, `dynamicCodeSourceBytes`, and — the larger figure —
-/// `programFunctions`, `programBytecodeBytes` and `programSourceBytes`: each
-/// engine's compiled preamble-plus-guest program, which the `safe-sandbox`
-/// profile leaks for the instance's lifetime. Retained definitions and
-/// programs survive `dispose()`; when their total passes
+/// `dynamicCodeCalls` and `dynamicCodeSourceBytes`. An engine's compiled
+/// preamble-plus-guest program is freed with the engine since B306 stage two
+/// (the state owns it; nothing is leaked); the stable-address definitions
+/// that successful dynamic compilations install are what still survive
+/// `dispose()`. When their total passes
 /// what a host accepts, the host recycles the Worker/WASM instance, which is
 /// the only reclamation this artifact offers (the 11 September 2026 audit's
 /// ZIPP-06, stage 1: measure before reclaiming). Live engines are not
@@ -1471,9 +1465,6 @@ pub fn zipp_instance_usage() -> Result<JsValue, JsValue> {
             "dynamicCodeSourceBytes".into(),
             n(u.dynamic_code_source_bytes),
         ),
-        ("programFunctions".into(), n(u.program_functions)),
-        ("programBytecodeBytes".into(), n(u.program_bytecode_bytes)),
-        ("programSourceBytes".into(), n(u.program_source_bytes)),
     ]))
     .map_err(to_js_error)
 }

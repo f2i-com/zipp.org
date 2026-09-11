@@ -404,12 +404,11 @@ remain recoverable.
   function/class definitions, buffered and lifetime console figures, pinned
   buffers, and the compiled program's function count, bytecode bytes and
   retained source bytes. `zippInstanceUsage()` sums the disposed engines'
-  figures for the whole WASM instance: under `safe-sandbox` each engine's
-  compiled program (about 36 program functions and 18 KB of bytecode for a
-  small guest, dominated by the preamble) and its dynamic definitions outlive
-  `dispose()`, so a host recycles the Worker/WASM instance when that total
-  passes what it accepts. Measured: 200 create/run/dispose cycles retain
-  3.7 MB of bytecode and grow the Node process by about 110 MB.
+  figures for the whole WASM instance. An engine's compiled program (about 36
+  functions and 18 KB of bytecode for a small guest, dominated by the
+  preamble) is freed with the engine; what outlives `dispose()` is the
+  stable-address definitions its dynamic compilations installed, so a host
+  recycles the Worker/WASM instance when that total passes what it accepts.
 - `host-sdk/` is the reference host adapter for browsers — one Worker and
   WASM instance per guest, generation-scoped messages, external deadlines
   that terminate the Worker, immutable capability setup, Worker-side bridges

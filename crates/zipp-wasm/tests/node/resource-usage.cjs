@@ -61,6 +61,7 @@ function close(e) { try { e.dispose(); } catch {} try { e.free(); } catch {} }
   const rss0 = process.memoryUsage().rss;
   const rounds = 200;
   let retainedPerEngine = 0;
+  let programBytesPerEngine = 0;
   for (let i = 0; i < rounds; i++) {
     const e = new Engine();
     e.initScript("var n = 0; function tick() { n++; return n; }");
@@ -68,7 +69,7 @@ function close(e) { try { e.dispose(); } catch {} try { e.free(); } catch {} }
     // Two dynamic compilations per engine: one host eval, one guest eval.
     e.evalInContext("(function () { return eval('n + 1'); })()");
     const u = e.resourceUsage();
-    if (i === 0) retainedPerEngine = u.retainedFunctions;
+    if (i === 0) { retainedPerEngine = u.retainedFunctions; programBytesPerEngine = u.programBytecodeBytes; }
     if (u.retainedFunctions !== retainedPerEngine) { fail++; console.log(`  FAIL engine ${i} retained ${u.retainedFunctions} functions, expected ${retainedPerEngine}`); break; }
     close(e);
   }
@@ -76,12 +77,12 @@ function close(e) { try { e.dispose(); } catch {} try { e.free(); } catch {} }
   same("every churned engine was counted as created and disposed", [end.enginesCreated - start.enginesCreated, end.enginesDisposed - start.enginesDisposed], [rounds, rounds]);
   check("the instance total grows by exactly what each disposed engine retained", end.retainedFunctions - start.retainedFunctions === rounds * retainedPerEngine && end.dynamicCodeCalls - start.dynamicCodeCalls === rounds * 2, JSON.stringify({ start, end, retainedPerEngine }));
   check("a fresh engine starts from zero: retention is the instance's, not the engine's", retainedPerEngine > 0);
-  check("each disposed engine's compiled program is counted as retained by the instance", end.programFunctions - start.programFunctions >= rounds && end.programBytecodeBytes - start.programBytecodeBytes > 0 && end.programSourceBytes - start.programSourceBytes > 0, JSON.stringify({ start, end }));
+  check("a disposed engine's compiled program is freed with it, so the instance does not count programs", end.programFunctions === undefined && end.programBytecodeBytes === undefined && programBytesPerEngine > 0, JSON.stringify(end));
   const rss1 = process.memoryUsage().rss;
   // Reported, not asserted: a linear-memory high-water mark that does not
   // shrink is not by itself proof of a live-allocation leak, and RSS is the
   // process's, not the instance's.
-  console.log(`  info churn of ${rounds} engines: instance retains ${end.retainedFunctions - start.retainedFunctions} dynamic functions (${end.dynamicCodeSourceBytes - start.dynamicCodeSourceBytes} source bytes) and ${end.programFunctions - start.programFunctions} program functions (${end.programBytecodeBytes - start.programBytecodeBytes} bytecode bytes, ${end.programSourceBytes - start.programSourceBytes} source bytes); process RSS ${rss0} -> ${rss1} (+${rss1 - rss0} bytes)`);
+  console.log(`  info churn of ${rounds} engines: instance retains ${end.retainedFunctions - start.retainedFunctions} dynamic functions (${end.dynamicCodeSourceBytes - start.dynamicCodeSourceBytes} source bytes); each engine's own program (${programBytesPerEngine} bytes of bytecode) was freed with it; process RSS ${rss0} -> ${rss1} (+${rss1 - rss0} bytes)`);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
