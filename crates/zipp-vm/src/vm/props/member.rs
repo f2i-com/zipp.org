@@ -118,6 +118,18 @@ impl<'p> Vm<'p> {
                     vm.get_member(Value::heap(cur), key, receiver)
                 });
             }
+            // An ARRAY spliced into the chain (`Object.setPrototypeOf(a, [..])`)
+            // keeps its named properties in the array side table and chains to
+            // %Array.prototype% (or its own recorded prototype) — neither of
+            // which `own_member` + `proto_of` see, so the walk stopped there and
+            // `a.push` read as undefined (test262
+            // Array/prototype/copyWithin/coerced-values-start-change-start).
+            // Hand the rest of the chain to the Array-aware member path.
+            if matches!(self.heap.get(cur), HeapObj::Array(_)) {
+                return self.with_native_recursion_guard(|vm| {
+                    vm.get_member(Value::heap(cur), key, receiver)
+                });
+            }
             if let Some((attr, raw)) = self.own_member(cur, key) {
                 return if attr.accessor {
                     if raw == Value::UNDEFINED {
@@ -166,6 +178,14 @@ impl<'p> Vm<'p> {
             }
             match self.proto_of.get(&cur) {
                 Some(p) if p.is_heap() => cur = p.heap_index(),
+                // An Array in the chain with no recorded prototype chains to
+                // %Array.prototype%, not nowhere (see proto_member_get).
+                None if matches!(self.heap.get(cur), HeapObj::Array(_))
+                    && self.arr_proto != 0
+                    && self.arr_proto != cur =>
+                {
+                    cur = self.arr_proto
+                }
                 _ => break,
             }
         }

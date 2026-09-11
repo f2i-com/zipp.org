@@ -1007,6 +1007,72 @@ impl<'p> Vm<'p> {
         self.run_loop(stop_depth)
     }
 
+    /// Resume `callee`'s activation on the interpreter at bytecode `ip`, over
+    /// the register window already populated at `base` — the continuation of
+    /// a native callback entry that bailed mid-body (see
+    /// `invoke_cb_windowed`). The window holds `this`, the arguments and every
+    /// register the native code materialised up to `ip`, so no prologue runs:
+    /// no `this` binding, no argument copy, no `arguments` object (the native
+    /// entry never compiles a callback that materialises one). Realm context
+    /// is installed as `call_value_plain` installs it.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    pub(crate) fn resume_frame_window(
+        &mut self,
+        callee: Value,
+        func_id: u32,
+        closure: u32,
+        base: usize,
+        ip: usize,
+    ) -> Result<Value, Thrown> {
+        if self.realm_global_objs.nonempty_raw == 0 {
+            return self.resume_frame_window_body(callee, func_id, closure, base, ip);
+        }
+        let caller_native_realm = self.native_callee_realm.take();
+        let caller_active_realm = self.active_realm;
+        let callee_realm = self.get_function_realm(callee);
+        self.active_realm = self.realm_global_obj(callee_realm);
+        let result = self.resume_frame_window_body(callee, func_id, closure, base, ip);
+        self.active_realm = caller_active_realm;
+        self.native_callee_realm = caller_native_realm;
+        result
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    fn resume_frame_window_body(
+        &mut self,
+        callee: Value,
+        func_id: u32,
+        closure: u32,
+        base: usize,
+        ip: usize,
+    ) -> Result<Value, Thrown> {
+        if self.frames.len() >= MAX_FRAMES {
+            return Err(Thrown(
+                "RangeError: Maximum call stack size exceeded".into(),
+            ));
+        }
+        let stop_depth = self.frames.len();
+        let new_target = std::mem::replace(&mut self.pending_new_target, Value::UNDEFINED);
+        let is_eval = std::mem::take(&mut self.pending_eval_frame);
+        self.frames.push(Frame {
+            super_done: false,
+            args_obj: u32::MAX,
+            eval_scope: u32::MAX,
+            arg_win: u32::MAX,
+            argc: 0,
+            is_eval,
+            func: func_id,
+            base,
+            ip,
+            ret_dst: 0,
+            closure,
+            handlers: Vec::new(),
+            new_target,
+            callee,
+        });
+        self.run_loop(stop_depth)
+    }
+
     /// Bind each named top-level function to its reserved global slot as a
     /// heap function object, so `Call` of a global resolves correctly. The
     /// compiler marks function-name globals; here we fill them.

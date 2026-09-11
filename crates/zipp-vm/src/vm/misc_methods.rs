@@ -385,9 +385,24 @@ impl<'p> Vm<'p> {
         if self.pending_throw.is_some() {
             return Err(Thrown(String::new()));
         }
-        // Plain deopt (non-int operand / overflow): re-run this element on the
-        // interpreter, which nests its frame above the reused window.
-        self.call_value(cb, this_val, args)
+        // A bail at the entry (ip 0) ran nothing: calling the callback on the
+        // interpreter is exact. A bail PAST the entry means native code has
+        // already executed `[0, bail)` — its side effects included (a global
+        // `calls++`, a queued host call) — so the callback must RESUME at
+        // `bail` over the same window, exactly as an ordinary frame resumes
+        // after `try_run_jit`, never run again from the top. It used to re-run
+        // here, and `[1].forEach(v => { calls++; assert._isSameValue(this, u); }, u)`
+        // counted two calls (test262 arrow-function/cannot-override-this-with-thisArg).
+        if bail == 0 {
+            return self.call_value(cb, this_val, args);
+        }
+        let (func_id, closure) = match self.heap.get(cb.heap_index()) {
+            HeapObj::Func(id) => (*id, crate::vm::NO_CLOSURE),
+            HeapObj::Closure { func, .. } => (*func, cb.heap_index()),
+            // `native_cb_entry` only compiles Func/Closure callees.
+            _ => return self.call_value(cb, this_val, args),
+        };
+        self.resume_frame_window(cb, func_id, closure, win, bail as usize)
     }
 
     /// One per-element callback invocation: native fast path when `native` is
@@ -402,8 +417,14 @@ impl<'p> Vm<'p> {
         this_val: Value,
     ) -> Result<Value, Thrown> {
         #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-        if let Some((entry, _callee_regs, param_count)) = native {
-            return self.invoke_cb_windowed(entry, win, param_count, cb, args, this_val);
+        if let Some((entry, callee_regs, param_count)) = native {
+            let result = self.invoke_cb_windowed(entry, win, param_count, cb, args, this_val);
+            // A resumed interpreter frame releases the window when it pops;
+            // the next element expects it to be there again.
+            if self.regs.len() < win + callee_regs {
+                self.regs.resize(win + callee_regs, Value::UNDEFINED);
+            }
+            return result;
         }
         let _ = (native, win);
         self.call_value(cb, this_val, args)
