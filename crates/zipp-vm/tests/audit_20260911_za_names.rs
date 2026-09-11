@@ -18,8 +18,14 @@ const NAMES: &[(&str, &str)] = &[
     ("a\u{0301}", "combining acute accent (ID_Continue, Mn)"),
     ("a\u{200C}", "ZWNJ (added to IdentifierPart by the grammar)"),
     ("a\u{200D}", "ZWJ (added to IdentifierPart by the grammar)"),
-    ("\u{2118}", "SCRIPT CAPITAL P (Other_ID_Start, not Alphabetic)"),
-    ("\u{1D49C}x", "MATHEMATICAL SCRIPT CAPITAL A (supplementary plane)"),
+    (
+        "\u{2118}",
+        "SCRIPT CAPITAL P (Other_ID_Start, not Alphabetic)",
+    ),
+    (
+        "\u{1D49C}x",
+        "MATHEMATICAL SCRIPT CAPITAL A (supplementary plane)",
+    ),
     ("ünïcödé", "Latin-1 letters"),
     ("$_ok1", "ASCII with the two extra start characters"),
     ("a\u{00B7}b", "MIDDLE DOT (Other_ID_Continue)"),
@@ -49,17 +55,36 @@ fn a_reassigned_binding_is_read_live() {
         "var \u{2118} = function () { return 'first'; };
          function swap() { \u{2118} = function () { return 'second'; }; }",
     );
-    assert_eq!(st.call_global("\u{2118}", &[]), Ok(JsValue::String("first".into())));
+    assert_eq!(
+        st.call_global("\u{2118}", &[]),
+        Ok(JsValue::String("first".into()))
+    );
     st.call_global("swap", &[]).expect("swap");
-    assert_eq!(st.call_global("\u{2118}", &[]), Ok(JsValue::String("second".into())));
+    assert_eq!(
+        st.call_global("\u{2118}", &[]),
+        Ok(JsValue::String("second".into()))
+    );
 }
 
 #[test]
 fn expressions_and_invalid_spellings_are_still_refused() {
     let mut st = prepare("function f() { return 1; } var o = { f: f };");
     for bad in [
-        "", " f", "f ", "o.f", "f()", "f;", "1f", "f\u{0301}()", "\u{0301}a", "f\n", "f\u{0000}",
-        "\\u0066", "f\u{2E2F}", "f\u{00B2}", "this", // a reserved word resolves to nothing
+        "",
+        " f",
+        "f ",
+        "o.f",
+        "f()",
+        "f;",
+        "1f",
+        "f\u{0301}()",
+        "\u{0301}a",
+        "f\n",
+        "f\u{0000}",
+        "\\u0066",
+        "f\u{2E2F}",
+        "f\u{00B2}",
+        "this", // a reserved word resolves to nothing
     ] {
         assert!(!st.has_global_function(bad), "accepted {bad:?}");
         assert!(st.call_global(bad, &[]).is_err(), "called {bad:?}");
