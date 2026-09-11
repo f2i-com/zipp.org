@@ -7,14 +7,17 @@ and the B001–B252 experiment ledger is preserved in
 
 ## Current engine baseline
 
-Main is at `8229b3fc`: v0.0.12 plus B263-B273, with the `8229b3fc` canonical
-capture (all-30 0.728× Node, 21/30 Node point wins). The tracked production
-WebAssembly module (`landing/public/wasm/`) is the v0.0.15 engine, built
-with release.yml's recipe (locked release build, `--target web`, name and
+Main is v0.0.16 (`0de9f375`): the two audits of 11 September, B290-B324,
+with the `14770703` canonical capture (all-13 0.6766× Node, hostile 0.8749×
+Node; B314). The tracked production WebAssembly module
+(`landing/public/wasm/`) is the v0.0.16 engine built from `0de9f375` with
+release.yml's recipe (locked release build, `--target web`, name and
 producers sections removed, target-features section stripped): the landing
-page ships 5,119,419 bytes raw, 1,764,573 gzip-9, 1,202,447 Brotli-11,
-SHA-256 `7c40f488d8b69209eea9e56dea2b0be13b3da0fd3810f3d8ec1d44c3d95972e4`
-(v0.0.12's module was 5,558,860 / 1,812,458 / 1,248,649).
+page ships 5,274,932 bytes raw, 1,800,228 gzip-9, 1,234,688 Brotli-11,
+SHA-256 `6442217be123884fa96d972ed35c487e8fbf270c29d86347da923b09c359c58e`,
+and its `zippProfile().source.sha` is that commit (v0.0.15's module was
+5,119,419 / 1,764,573 / 1,202,447; v0.0.12's 5,558,860 / 1,812,458 /
+1,248,649).
 
 2026-09-05 (B274-B278, from the external WASM audit's handoff): the wasm
 interpreter's four cliffs are closed — non-ASCII string indexing was
