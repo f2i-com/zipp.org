@@ -286,12 +286,81 @@ audit's own vocabulary.
   two `TypedArray.prototype.slice` species-buffer, two arrow-function
   `thisArg`) and are pre-existing gaps to file, not to bless. No benchmark
   was rerun; the historical performance records stay labelled historical.
+- **B310 — two engine defects from B309's twelve unblessed test262 gaps,
+  fixed; the rest blessed with reasons.** Reducing the twelve against the
+  engine's own API found two real bugs and eight tests that no
+  spec-conformant engine passes as written:
+  - A native array-builtin callback entry (`native_cb_entry` /
+    `invoke_cb_windowed`, the JIT lane `forEach`/`map`/`filter`/`reduce` use
+    for a non-capturing callback) answered ANY deopt by re-running the
+    callback from the top on the interpreter. A bail past the first
+    instruction had already executed the prefix natively — a global
+    `calls++`, a queued host call — so those side effects ran twice:
+    `[1].forEach(v => { calls++; assert._isSameValue(this, u); }, u)` counted
+    two calls (any method call on a function-valued receiver, a call through
+    a local, or `.call` inside the callback bailed that way). The
+    continuation now resumes the interpreter at the bail ip over the same
+    window (`resume_frame_window`, the frame `try_run_jit` would have
+    resumed); a bail at ip 0 still re-enters through `call_value`. This is
+    the exact hazard the audit's guardrails name ("do not reintroduce ...
+    re-execution"): a JIT-only defect the interpreter never had.
+  - Named lookup stopped at an ARRAY spliced into a prototype chain
+    (`Object.setPrototypeOf(a, [..])`): `proto_member_get`/`proto_member`
+    only saw plain-object storage and `proto_of`, so `a.push` read as
+    `undefined` and the copyWithin test never reached its assertion. The walk
+    now hands an Array link to the Array-aware member path (and, in the
+    side-effect-free walk, advances to `%Array.prototype%`).
+  - Blessed in `tools/test262-expected-failures.txt`, with the reason here
+    rather than in semantics: the six `staging/sm/Error` tests iterate the
+    standard harness's `nativeErrors`, which INCLUDES `Error` itself, and
+    assert `Reflect.getPrototypeOf(Error) === Error`, `getPrototypeOf(Error.prototype)
+    === Error.prototype` and own keys without `toString` — true of no engine;
+    `TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset`
+    runs the harness's immutable-buffer factory (present because the engine
+    implements `transferToImmutable`) against a species result that the
+    proposal's write-mode `ValidateTypedArray` must reject, so the expected
+    `[20, 20, 20, 60]` cannot be produced from an immutable buffer. Eleven
+    blessed entries in total, the three original ones included.
+  - Pinned by `tests/audit_20260911_test262_gaps.rs` (the callback shape at
+    two elements, a throwing callback, `map` with a thisArg, arrays and plain
+    objects behind an Array prototype, and the copyWithin scenario end to
+    end); confirmed on the corpus: `built-ins/Array` 6,115 / 6,115,
+    `language/expressions` 21,164 / 21,164, `language/statements` 18,001 /
+    18,001, `Promise`/`Map`/`Set`/`Function`/`TypedArrayConstructors` all
+    clean, and the full run below.
+- **B311 (ZIPP-20) — workload density measured; no headline claimed.**
+  `tests/node/bench-density.cjs` runs N worker_threads, each with its own
+  WASM instance, through six engine-shaped scenarios for a fixed window and
+  reports units, per-unit latency percentiles, process CPU seconds per unit,
+  RSS, the engine heap estimate and what each instance retains. First
+  capture (this artifact, sha256 `3d8a9651…ac6f1`, Node v24.12.0, Ryzen 9
+  9950X3D, Windows 11, 3 s per cell, idle host):
+
+  | scenario | 1 instance | 8 instances | p99 (1 → 8) | cpu s/unit (1 → 8) |
+  | --- | ---: | ---: | ---: | ---: |
+  | turnover (create/init/call/dispose) | 1,063/s | 5,545/s | 1.78 → 8.17 ms | 0.0016 → 0.0015 |
+  | idle (one tiny call per 16 ms frame) | 62/s | 493/s | 0.10 → 0.14 ms | 0.0008 → 0.0002 |
+  | sync (mutate, fingerprint, read changed) | 1,218/s | 8,987/s | 1.69 → 1.89 ms | 0.0008 → 0.0009 |
+  | burst (100 short calls) | 13,118/s | 96,369/s | 0.11 → 0.14 ms | 0.00008 → 0.00008 |
+  | alloc (10,000 objects + JSON round trip) | 139/s | 904/s | 12.9 → 23.4 ms | 0.0075 → 0.0089 |
+  | hostile tenant beside `sync` peers | — | 8,089/s | peers 1.72 → 1.87 ms | 0.0014 → 0.0010 |
+
+  Readings, not conclusions: `sync`, `burst` and `idle` scale close to
+  linearly to eight instances with flat tail latency; `turnover` and `alloc`
+  are where contention shows (p99 4–5× at eight instances), and `turnover`
+  is also where RSS climbs (257 → 1,068 MB, the leaked programs and the
+  allocator high-water of eight instances — B306's figure, not a live
+  leak). A runaway tenant under a 2,000,000-step budget costs its peers
+  nothing visible at this scale. Every unit validated its output; no cell
+  reported a failure. Not measured: representative downstream (SoftN)
+  workloads, browser-hosted instances, mobile profiles, or any comparison
+  with another engine.
 - **Still open:** ZIPP-06 stage two (an owned, reclaimable compiled program
   under `safe-sandbox`, now with the retention measured), ZIPP-11's lossless
-  string transport (documented as Unicode-scalar), ZIPP-20–23 (workload
-  density, IC/GC/footprint experiments — measurement programmes, not
-  defects; nothing here claims a speedup), and the twelve unblessed test262
-  gaps B309 lists.
+  string transport (documented as Unicode-scalar), ZIPP-21–23 (IC/GC/
+  footprint experiments — measurement programmes, not defects; nothing here
+  claims a speedup; ZIPP-20's density harness and first capture are B311). B309's twelve unblessed test262
+  gaps are closed by B310: two fixed, ten blessed with reasons.
 
 Verification for this batch: `cargo test -p zipp-vm` (default features, the
 manifest's 15 quarantined mechanism tests skipped as CI skips them);

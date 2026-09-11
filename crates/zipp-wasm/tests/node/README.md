@@ -53,6 +53,13 @@ top of each file if you put it elsewhere).
 - **resource-usage.cjs** — `resourceUsage()`/`zippInstanceUsage()` and the
   rich eval: a 200-engine create/run/dispose churn in one instance, reporting
   what the instance retains next to the process RSS delta (ZIPP-06 stage 1).
+- **bench-density.cjs** — the workload-density measurement (ZIPP-20): N
+  worker_threads, each with its own WASM instance, run engine-shaped scenarios
+  (turnover, idle frames, state sync, call bursts, allocation-heavy work, and a
+  hostile tenant beside `sync` peers) for a fixed window at 1/2/4/8 instances,
+  reporting units, per-unit latency percentiles, CPU seconds per unit, RSS,
+  the engine heap estimate and what each instance retains — raw figures, no
+  headline. Not part of the boundary suite; run it on an otherwise idle host.
 - **profile-matches-readme.cjs** — holds the README's resource table to the
   figures `zippProfile()` reports.
 - **softn-snakegame.cjs** — a real SoftN bundle's `.logic`, unmodified, driven the
