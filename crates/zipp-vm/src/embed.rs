@@ -952,13 +952,11 @@ fn eval_indirect(vm: &mut Vm<'_>, src: &str) -> Result<Value, crate::vm::Thrown>
 
 /// A plain JS identifier — no dots, no call syntax, no operators. Guards the
 /// `name`-taking entry points so a caller cannot smuggle an expression in.
+/// The lexer's own IdentifierName classification (ZA-09): a decoded name,
+/// `ID_Start` then `ID_Continue`/ZWNJ/ZWJ — never an expression, a dotted
+/// path or a call, which is what keeps the name entries compile-free.
 fn is_identifier(s: &str) -> bool {
-    let mut chars = s.chars();
-    match chars.next() {
-        Some(c) if c.is_alphabetic() || c == '_' || c == '$' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    crate::parse::lexer::Lexer::is_identifier_name(s)
 }
 
 /// VM `Value` → embedder [`JsValue`]. Needs `&mut Vm` because `ToString` on an

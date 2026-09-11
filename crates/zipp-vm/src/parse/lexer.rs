@@ -193,6 +193,23 @@ impl<'s> Lexer<'s> {
         c == '\u{200C}' || c == '\u{200D}' || unicode_id_start::is_id_continue_unicode(c)
     }
 
+    /// Whether `s` is exactly one IdentifierName as this lexer classifies
+    /// it — the decoded spelling (no `\u` escapes), `ID_Start` then
+    /// `ID_Continue`/ZWNJ/ZWJ. The host's compile-free name lookup uses this
+    /// so the embedding accepts the names the parser accepts (the
+    /// 11 September 2026 close audit's ZA-09): `char::is_alphabetic` and
+    /// `is_alphanumeric` rejected `a\u0301`, `a\u200c`, `a\u200d` and
+    /// `\u2118`, which are all valid function names. Reserved words are
+    /// IdentifierNames too; they simply resolve to nothing.
+    pub(crate) fn is_identifier_name(s: &str) -> bool {
+        let mut chars = s.chars();
+        match chars.next() {
+            Some(c) if Self::is_id_start(c) => {}
+            _ => return false,
+        }
+        chars.all(Self::is_id_part)
+    }
+
     /// Test-only windows onto the identifier predicates, so the unit test can
     /// assert the REJECTED side too (a rejected char never reaches `names()`).
     #[cfg(test)]
