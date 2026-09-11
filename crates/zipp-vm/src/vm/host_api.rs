@@ -406,6 +406,16 @@ pub struct ResourceUsage {
     pub retained_functions: usize,
     /// Class definitions likewise retained.
     pub retained_classes: usize,
+    /// Bytes those retained function definitions own: each `FuncProto`
+    /// itself plus the bytecode, constants, names, plans, upvalue and eval
+    /// site tables and retained source it holds. An exact count of what it
+    /// counts — the allocator's own overhead, page reservation and
+    /// high-water mark are not in it, and are what a process's RSS adds on
+    /// top (the 11 September 2026 close audit's ZA-10, stage one: measure
+    /// before reclaiming).
+    pub retained_function_bytes: usize,
+    /// Bytes the retained class definitions own, on the same terms.
+    pub retained_class_bytes: usize,
     /// Console lines buffered and not yet taken.
     pub console_lines_buffered: usize,
     /// Console bytes charged over the VM's lifetime (never credited on take).
@@ -420,6 +430,54 @@ pub struct ResourceUsage {
     pub program_functions: usize,
     pub program_bytecode_bytes: usize,
     pub program_source_bytes: usize,
+}
+
+/// Bytes a dynamically installed function definition owns (see
+/// [`ResourceUsage::retained_function_bytes`]).
+fn retained_func_bytes(f: &crate::bytecode::FuncProto) -> usize {
+    use std::mem::size_of_val;
+    let strings = |v: &[String]| v.iter().map(|s| size_of_val(s) + s.len()).sum::<usize>();
+    size_of_val(f)
+        + f.name.len()
+        + size_of_val(f.code.as_slice())
+        + size_of_val(f.constants.as_slice())
+        + strings(&f.string_constants)
+        + size_of_val(f.static_key_plans.as_slice())
+        + f.bigint_consts
+            .iter()
+            .map(|b| size_of_val(b) + (b.bits() as usize).div_ceil(8))
+            .sum::<usize>()
+        + size_of_val(f.upvalues.as_slice())
+        + f.eval_sites
+            .iter()
+            .map(|(scope, params, lexicals)| {
+                size_of_val(scope.as_slice())
+                    + scope.iter().map(|(name, _, _)| name.len()).sum::<usize>()
+                    + params.as_ref().map_or(0, |p| strings(p))
+                    + strings(lexicals)
+            })
+            .sum::<usize>()
+        + f.source.len()
+}
+
+/// Bytes a dynamically installed class definition owns (see
+/// [`ResourceUsage::retained_class_bytes`]).
+fn retained_class_bytes(c: &crate::bytecode::ClassDef) -> usize {
+    use std::mem::size_of_val;
+    let strings = |v: &[String]| v.iter().map(|s| size_of_val(s) + s.len()).sum::<usize>();
+    let members =
+        |v: &[(String, u32)]| size_of_val(v) + v.iter().map(|(name, _)| name.len()).sum::<usize>();
+    size_of_val(c)
+        + c.name.len()
+        + members(&c.methods)
+        + members(&c.getters)
+        + members(&c.setters)
+        + members(&c.statics)
+        + members(&c.static_getters)
+        + members(&c.static_setters)
+        + strings(&c.proto_order)
+        + strings(&c.instance_field_names)
+        + c.source.len()
 }
 
 /// How deep the walk will follow an object graph before giving up. Deep enough
@@ -455,16 +513,28 @@ pub struct FingerprintBudget {
     used_nodes: usize,
     max_string_bytes: usize,
     used_string_bytes: usize,
+    max_work: usize,
+    used_work: usize,
 }
 
 impl FingerprintBudget {
+    /// The work ceiling is [`DEFAULT_HOST_VALUE_WORK_PER_NODE`] times the
+    /// node ceiling; [`Self::with_work_limit`] sets it exactly.
     pub fn new(max_nodes: usize, max_string_bytes: usize) -> Self {
         Self {
             max_nodes,
             used_nodes: 0,
             max_string_bytes,
             used_string_bytes: 0,
+            max_work: max_nodes.saturating_mul(DEFAULT_HOST_VALUE_WORK_PER_NODE),
+            used_work: 0,
         }
+    }
+
+    /// Replace the inspected-work ceiling.
+    pub fn with_work_limit(mut self, max_work: usize) -> Self {
+        self.max_work = max_work;
+        self
     }
 
     /// Nodes (values, elements, holes, properties) visited so far.
@@ -475,6 +545,24 @@ impl FingerprintBudget {
     /// Key and string bytes hashed so far.
     pub fn string_bytes_used(&self) -> usize {
         self.used_string_bytes
+    }
+
+    /// Property entries inspected so far, visible or not (see
+    /// [`HostValueBudget::charge_work`]).
+    pub fn work_used(&self) -> usize {
+        self.used_work
+    }
+
+    /// Charge `n` inspected entries; `false` when that would cross the
+    /// work ceiling.
+    fn charge_work(&mut self, n: usize) -> bool {
+        match self.used_work.checked_add(n) {
+            Some(total) if total <= self.max_work => {
+                self.used_work = total;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Charge `n` nodes; `false` when that would cross the ceiling. Used
@@ -548,6 +636,14 @@ fn fp_mix_bytes(h: &mut u64, bytes: &[u8]) {
 // fetch. Equal budgets make the two agree by construction.
 pub const DEFAULT_HOST_VALUE_MAX_NODES: usize = 2_000_000;
 pub const DEFAULT_HOST_VALUE_MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
+/// Inspected property entries a conversion or digest may charge per node of
+/// its node ceiling: the work ceiling is this times the node ceiling. An
+/// object's entries are scanned twice (the visible count, then the walk),
+/// hidden and accessor entries included, so an object whose exported view
+/// is empty used to cost the host that scan for free (the 11 September 2026
+/// close audit's ZA-07). Eight keeps every ordinary graph — where visible
+/// entries dominate — far inside the ceiling while bounding the hidden ones.
+pub const DEFAULT_HOST_VALUE_WORK_PER_NODE: usize = 8;
 
 /// Why a slot call did not produce a host value: the guest threw, or the
 /// result exists but exceeds the conversion budget the caller supplied. A
@@ -576,15 +672,61 @@ pub struct HostValueBudget {
     used_nodes: usize,
     max_string_bytes: usize,
     used_string_bytes: usize,
+    max_work: usize,
+    used_work: usize,
 }
 
 impl HostValueBudget {
+    /// The work ceiling is [`DEFAULT_HOST_VALUE_WORK_PER_NODE`] times the
+    /// node ceiling; [`Self::with_work_limit`] sets it exactly.
     pub fn new(max_nodes: usize, max_string_bytes: usize) -> Self {
         Self {
             max_nodes,
             used_nodes: 0,
             max_string_bytes,
             used_string_bytes: 0,
+            max_work: max_nodes.saturating_mul(DEFAULT_HOST_VALUE_WORK_PER_NODE),
+            used_work: 0,
+        }
+    }
+
+    /// Replace the inspected-work ceiling.
+    pub fn with_work_limit(mut self, max_work: usize) -> Self {
+        self.max_work = max_work;
+        self
+    }
+
+    /// Nodes charged so far.
+    pub fn nodes_used(&self) -> usize {
+        self.used_nodes
+    }
+
+    /// String bytes charged so far.
+    pub fn string_bytes_used(&self) -> usize {
+        self.used_string_bytes
+    }
+
+    /// Property entries inspected so far, visible or not.
+    pub fn work_used(&self) -> usize {
+        self.used_work
+    }
+
+    /// Charge `n` inspected property entries. Output size and inspected work
+    /// are different quantities: a hidden or accessor entry contributes no
+    /// node and no bytes, but the scan that skips it is still work the host
+    /// paid for (ZA-07). The ceiling stops a walk before it exceeds its
+    /// declared allowance; the failure is the documented recoverable
+    /// conversion error, and no getter is ever invoked.
+    pub fn charge_work(&mut self, n: usize) -> Result<(), String> {
+        match self.used_work.checked_add(n) {
+            Some(total) if total <= self.max_work => {
+                self.used_work = total;
+                Ok(())
+            }
+            _ => Err(format!(
+                "RangeError: host value exceeds the inspection work limit ({} property entries)",
+                self.max_work
+            )),
         }
     }
 
@@ -723,6 +865,18 @@ impl<'p> Vm<'p> {
     /// never-initialized slots read as `Undefined`, matching what the script
     /// itself would observe.
     pub(crate) fn host_get_slot(&mut self, index: u32) -> Result<HostValue, String> {
+        let mut budget = HostValueBudget::default();
+        self.host_get_slot_bounded(index, &mut budget)
+    }
+
+    /// [`Self::host_get_slot`] under the caller's budget, so a batch of
+    /// reads shares one allowance — nodes, bytes and inspected work alike
+    /// (ZA-07) — the way a batched digest does.
+    pub(crate) fn host_get_slot_bounded(
+        &mut self,
+        index: u32,
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, String> {
         let v = match self.globals.get(index as usize) {
             Some(v) => *v,
             None => return Ok(HostValue::Undefined),
@@ -732,8 +886,7 @@ impl<'p> Vm<'p> {
         }
         let _g = self.gc_lock_guard();
         let mut seen: Vec<u32> = Vec::new();
-        let mut budget = HostValueBudget::default();
-        self.host_out(v, 0, &mut seen, &mut budget)
+        self.host_out(v, 0, &mut seen, budget)
     }
 
     /// Mirror the recorder's heap ceiling into the heap, so the slot table
@@ -881,6 +1034,14 @@ impl<'p> Vm<'p> {
             Array { len: usize },
             Object { keys: usize, visible: usize },
             Opaque,
+        }
+        // Every entry of an object is inspected twice below — once to count
+        // the visible ones, once to walk them — whether or not it is visible;
+        // that is work, charged before either scan (ZA-07).
+        if let HeapObj::Object(m) = self.heap.get(idx) {
+            if !budget.charge_work(m.keys.len().saturating_mul(2)) {
+                return false;
+            }
         }
         let shape = match self.heap.get(idx) {
             HeapObj::Str(s) => Shape::Str { units: s.units() },
@@ -1042,6 +1203,23 @@ impl<'p> Vm<'p> {
         args: &[HostValue],
         budget: &mut HostValueBudget,
     ) -> Result<HostValue, HostCallError> {
+        self.host_call_slot_bounded_opts(index, args, budget, true)
+    }
+
+    /// [`Self::host_call_slot_bounded`], draining the microtask queue after
+    /// the call only when `drain_microtasks` is set. The engine's own
+    /// bookkeeping helpers (the host-call queue's peek and commit) run
+    /// WITHOUT a drain, so no guest job can run between a snapshot of the
+    /// queue and its commit (the 11 September 2026 close audit's ZA-06);
+    /// the jobs run at the next draining entry, as they would after a
+    /// slot write.
+    pub(crate) fn host_call_slot_bounded_opts(
+        &mut self,
+        index: u32,
+        args: &[HostValue],
+        budget: &mut HostValueBudget,
+        drain_microtasks: bool,
+    ) -> Result<HostValue, HostCallError> {
         let callee = match self.globals.get(index as usize) {
             Some(v) => *v,
             None => {
@@ -1063,7 +1241,7 @@ impl<'p> Vm<'p> {
         // Drain regardless of outcome: a throw can still have queued jobs, and
         // leaving them parked would surface them at an arbitrary later call.
         // The completion value is rooted across the drain (ZA-05).
-        self.marshal_after_drain(res, budget)
+        self.marshal_after_drain(res, budget, drain_microtasks)
     }
 
     /// Root `res`'s value, drain the microtask queue, then marshal the value
@@ -1079,6 +1257,7 @@ impl<'p> Vm<'p> {
         &mut self,
         res: Result<Value, crate::vm::Thrown>,
         budget: &mut HostValueBudget,
+        drain_microtasks: bool,
     ) -> Result<HostValue, HostCallError> {
         let res = match res {
             Ok(v) => {
@@ -1092,7 +1271,9 @@ impl<'p> Vm<'p> {
             // BEFORE the drain, so neither a job nor the next entry sees it.
             Err(t) => Err(self.take_host_throw(t)),
         };
-        self.drain_microtasks();
+        if drain_microtasks {
+            self.drain_microtasks();
+        }
         match res {
             Ok(v) => {
                 let out = {
@@ -1169,7 +1350,7 @@ impl<'p> Vm<'p> {
             None,             // exact_src
         );
         // Rooted across the drain, as a slot call's result is (ZA-05).
-        self.marshal_after_drain(res, budget)
+        self.marshal_after_drain(res, budget, true)
     }
 
     /// A snapshot of what this VM currently retains and has spent — see
@@ -1196,6 +1377,12 @@ impl<'p> Vm<'p> {
             dynamic_code_source_bytes,
             retained_functions: self.eval_funcs.len(),
             retained_classes: self.eval_classes.len(),
+            retained_function_bytes: self.eval_funcs.iter().map(|f| retained_func_bytes(f)).sum(),
+            retained_class_bytes: self
+                .eval_classes
+                .iter()
+                .map(|c| retained_class_bytes(c))
+                .sum(),
             console_lines_buffered: self.output.len() + self.errput.len(),
             console_bytes_lifetime,
             pinned_buffers: self.pinned_buffers.len(),
@@ -1270,6 +1457,9 @@ impl<'p> Vm<'p> {
                 Shape::Array(items.clone())
             }
             HeapObj::Object(m) => {
+                // Two scans of every entry, visible or not: inspected work,
+                // charged before either (ZA-07).
+                budget.charge_work(m.keys.len().saturating_mul(2))?;
                 let count = (0..m.keys.len())
                     .filter(|&i| m.attr_at(i).enumerable && !m.attr_at(i).accessor)
                     .count();

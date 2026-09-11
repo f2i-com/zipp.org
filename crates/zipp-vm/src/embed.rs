@@ -35,6 +35,7 @@ use crate::vm::Vm;
 pub use crate::vm::host_api::{
     FingerprintBudget, HostCallError, HostValue, HostValueBudget, ResourceUsage, Symbol,
     SymbolScope, DEFAULT_HOST_VALUE_MAX_NODES, DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
+    DEFAULT_HOST_VALUE_WORK_PER_NODE,
 };
 pub use crate::vm::host_api::{HostCallCtx, HostCtx};
 /// The execution-trace row and its opcode contract. Full `instrument` builds
@@ -540,6 +541,19 @@ impl ScriptState {
             .unwrap_or_else(torn_down)
     }
 
+    /// [`Self::try_get_slot`] under the caller's own budget, so a batch of
+    /// reads shares one allowance for nodes, bytes and inspected work (the
+    /// 11 September 2026 close audit's ZA-07), as a batched digest does. The
+    /// budget is charged as the value is walked.
+    pub fn try_get_slot_bounded(
+        &mut self,
+        index: u32,
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, String> {
+        self.with_vm(|vm| vm.host_get_slot_bounded(index, budget))
+            .unwrap_or_else(torn_down)
+    }
+
     /// Renew the instruction budget without disturbing any other limit.
     ///
     /// The budget exists so a runaway script cannot occupy the host forever.
@@ -638,6 +652,21 @@ impl ScriptState {
         budget: &mut HostValueBudget,
     ) -> Result<HostValue, HostCallError> {
         self.with_vm(|vm| vm.host_call_slot_bounded(index, args, budget))
+            .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())))
+    }
+
+    /// [`Self::call_slot_bounded`] WITHOUT the microtask drain afterwards:
+    /// for an engine's own bookkeeping helpers, where no guest job may run
+    /// between the call and what the host does with its result (the
+    /// 11 September 2026 close audit's ZA-06). Jobs the call scheduled run
+    /// at the next draining entry.
+    pub fn call_slot_bounded_no_drain(
+        &mut self,
+        index: u32,
+        args: &[HostValue],
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, HostCallError> {
+        self.with_vm(|vm| vm.host_call_slot_bounded_opts(index, args, budget, false))
             .unwrap_or_else(|| Err(HostCallError::Thrown(TORN_DOWN.into())))
     }
 

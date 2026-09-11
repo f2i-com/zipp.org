@@ -75,11 +75,11 @@ fn a_call_result_survives_the_microtasks_it_scheduled() {
     ));
     let expected = object(&[
         ("marker", HostValue::String("host-return-only".into())),
-        ("nested", HostValue::Array(vec![num(1.0), num(2.0), num(3.0)])),
         (
-            "deep",
-            object(&[("s", HostValue::String("x".repeat(40)))]),
+            "nested",
+            HostValue::Array(vec![num(1.0), num(2.0), num(3.0)]),
         ),
+        ("deep", object(&[("s", HostValue::String("x".repeat(40)))])),
     ]);
     for round in 1..=3 {
         assert_eq!(call(&mut st, "makeResult"), expected, "round {round}");
@@ -97,7 +97,10 @@ fn every_heap_shape_of_result_survives() {
         function arr() {{ Promise.resolve().then(churn); return [ [1], [2, [3]], 'z' ]; }}
         function prim() {{ Promise.resolve().then(churn); return 41 + 1; }}"
     ));
-    assert_eq!(call(&mut st, "str"), HostValue::String("a fresh string 0".into()));
+    assert_eq!(
+        call(&mut st, "str"),
+        HostValue::String("a fresh string 0".into())
+    );
     assert_eq!(
         call(&mut st, "arr"),
         HostValue::Array(vec![
@@ -142,7 +145,10 @@ fn a_result_survives_jobs_that_schedule_jobs() {
     ));
     assert_eq!(
         call(&mut st, "chain"),
-        HostValue::Array(vec![object(&[("id", num(1.0))]), object(&[("id", num(2.0))])])
+        HostValue::Array(vec![
+            object(&[("id", num(1.0))]),
+            object(&[("id", num(2.0))])
+        ])
     );
     assert_eq!(call(&mut st, "jobs"), num(3.0));
 }
@@ -151,8 +157,10 @@ fn a_result_survives_jobs_that_schedule_jobs() {
 /// after the drain.
 #[test]
 fn a_rich_eval_result_survives_the_microtasks_it_scheduled() {
-    let mut st = prepare(&format!("{CHURN}
- function jobs() {{ return jobRuns; }}"));
+    let mut st = prepare(&format!(
+        "{CHURN}
+ function jobs() {{ return jobRuns; }}"
+    ));
     let mut budget = HostValueBudget::default();
     let value = st
         .eval_in_context_rich(
@@ -164,7 +172,10 @@ fn a_rich_eval_result_survives_the_microtasks_it_scheduled() {
         value,
         object(&[
             ("marker", HostValue::String("eval-return-only".into())),
-            ("nested", HostValue::Array(vec![num(1.0), num(2.0), num(3.0)])),
+            (
+                "nested",
+                HostValue::Array(vec![num(1.0), num(2.0), num(3.0)])
+            ),
         ])
     );
     assert_eq!(call(&mut st, "jobs"), num(1.0));
@@ -196,11 +207,18 @@ fn the_root_is_released_on_every_exit() {
         .expect("over budget");
     let message = err.into_message();
     assert!(
-        message.contains("conversion node limit"),
-        "expected the conversion failure, got {message:?}"
+        message.contains("host value exceeds"),
+        "expected a conversion failure, got {message:?}"
     );
-    assert_eq!(st.host_result_roots_for_test(), 0, "no root outlives its call");
-    assert_eq!(call(&mut st, "fine"), object(&[("ok", HostValue::Bool(true))]));
+    assert_eq!(
+        st.host_result_roots_for_test(),
+        0,
+        "no root outlives its call"
+    );
+    assert_eq!(
+        call(&mut st, "fine"),
+        object(&[("ok", HostValue::Bool(true))])
+    );
     assert_eq!(st.host_result_roots_for_test(), 0);
     assert_eq!(call(&mut st, "jobs"), num(3.0));
 }
