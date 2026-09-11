@@ -1,10 +1,45 @@
 name: Security
 
-# Manual-trigger only because this is a deliberately broad security matrix.
-# Run from the GitHub UI (Actions -> this workflow -> Run workflow) or:
-#   gh workflow run security.yml
+# The broad security matrix: dependency audits, the benchmark-harness
+# adversarial tests, the safe-profile VM, the hostile-input and resource-limit
+# regressions, the separately resolved native sandbox, and the WebAssembly
+# sandbox boundary.
+#
+# It used to be manual-trigger only, so none of it ran unless someone
+# remembered to (the 11 September 2026 audit's ZIPP-16). Now:
+#   - every week, on a schedule, against `main`;
+#   - on a pull request that touches the code these checks cover (the
+#     sandbox crates, the VM's hardened paths, the benchmark harness, the
+#     lockfiles, or this workflow), as the bounded high-signal subset;
+#   - on demand, as before (`gh workflow run security.yml`).
+# Release publishing does not consume these results directly — release.yml
+# requires the exact-revision CI gate — but a scheduled failure is visible on
+# the Actions tab and blocks the next release review by policy.
+#
+# Pull requests from forks get a read-only token and no secrets; nothing here
+# needs more, and no job here publishes anything.
 on:
   workflow_dispatch:
+  schedule:
+    # Mondays 03:17 UTC: off the hour, so it does not queue behind everyone
+    # else's on-the-hour jobs.
+    - cron: "17 3 * * 1"
+  pull_request:
+    paths:
+      - ".github/workflows/security.yml"
+      - "Cargo.lock"
+      - "crates/zipp-sandbox/**"
+      - "crates/zipp-wasm/**"
+      - "crates/regress-fork/**"
+      - "crates/zipp-vm/src/vm/instrument.rs"
+      - "crates/zipp-vm/src/vm/host_api.rs"
+      - "crates/zipp-vm/src/embed.rs"
+      - "crates/zipp-vm/src/parse/limits.rs"
+      - "crates/zipp-vm/tests/audit_*.rs"
+      - "bench/comparison/**"
+      - "tools/bench*.py"
+      - "tools/test_bench*.py"
+      - "landing/package-lock.json"
 
 permissions:
   contents: read
@@ -38,17 +73,28 @@ jobs:
 
   native-workspace:
     name: Native workspace tests
+    # The full native workspace is the expensive lane: weekly and on demand.
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - name: Select stable Rust
+      # A deliberately labelled stable-toolchain canary: the pinned 1.92.0
+      # toolchain is what CI and release use, so a failure here that CI does
+      # not show is a toolchain drift signal, not a release blocker.
+      - name: Select stable Rust (canary)
         run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Validate and print the test quarantine
+        run: python3 tools/ci_quarantine.py --check --print
       - name: Test the root native workspace
-        run: cargo +stable test --locked --workspace
+        run: |
+          set -euo pipefail
+          skips="$(python3 tools/ci_quarantine.py --emit-skips)"
+          # shellcheck disable=SC2086
+          cargo +stable test --locked --workspace --no-fail-fast -- $skips
       - name: Test bounded backtracking executor limits
         run: >-
           cargo +stable test --locked -p zipp-regress
@@ -68,7 +114,11 @@ jobs:
         run: rustup toolchain install stable --profile minimal --no-self-update
       - name: Test the safe-profile VM library
         run: cargo +stable test --locked -p zipp-vm --no-default-features --features safe-sandbox --lib
-      - name: Test hostile-input and resource-limit regressions
+      # The hostile-input and resource-limit regressions, plus the embedding
+      # contracts the 11 September 2026 audit pinned (compile-free name calls
+      # under a one-compile allowance; bounded fingerprint work), which the
+      # safe profile's recorder can observe.
+      - name: Test hostile-input, resource-limit and embedding-contract regressions
         run: |
           cargo +stable test --locked -p zipp-vm \
             --no-default-features --features safe-sandbox \
@@ -83,7 +133,10 @@ jobs:
             --test side_table_heap_limits \
             --test string_growth_limits \
             --test syntax_nesting_limits \
-            --test json_plain_stringify
+            --test json_plain_stringify \
+            --test audit_20260911_native \
+            --test audit_20260911_host_work \
+            --test global_fingerprint
 
   native-sandbox:
     name: Isolated native sandbox
@@ -112,6 +165,7 @@ jobs:
 
   native-sandbox-windows:
     name: Isolated native sandbox (Windows)
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     timeout-minutes: 45
     steps:
@@ -140,6 +194,10 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup +stable target add wasm32-unknown-unknown
+      - name: Select the Node.js runtime
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
       - name: Test the isolated host build
         run: cargo +stable test --locked
       - name: Test artifact-only VM specializations
@@ -151,14 +209,19 @@ jobs:
       - name: Install matching wasm-bindgen CLI
         run: cargo +stable install wasm-bindgen-cli --locked --version 0.2.126
       - name: Build the production wasm32 artifact
+        env:
+          RUSTFLAGS: >-
+            -Dwarnings
+            -C link-arg=--max-memory=1073741824
+            -C link-arg=-zstack-size=1048576
+          ZIPP_SOURCE_SHA: ${{ github.sha }}
         run: cargo +stable build --locked --release --target wasm32-unknown-unknown
+      # The same list CI and release run; see tests/node/run-boundary-suite.cjs.
       - name: Test the production host boundary under Node
         run: |
           wasm-bindgen --target nodejs --out-dir tests/node/pkg \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
-          node tests/node/check-wasm-memory.cjs tests/node/pkg/zipp_wasm_bg.wasm
-          node tests/node/host-contract.cjs
-          node tests/node/worker-deadline.cjs
+          node tests/node/run-boundary-suite.cjs
 
   dependency-audit:
     name: Dependency vulnerability audit

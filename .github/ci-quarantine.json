@@ -1,0 +1,144 @@
+{
+  "$comment": "Tests CI skips on the GitHub runner, each named EXACTLY (no prefixes: a future test with a similar name is never quarantined by accident). tools/ci_quarantine.py prints this inventory, fails the run when an entry has passed its review date, and emits the exact --skip arguments. Remove an entry once its planner expectation is machine-independent. The 11 September 2026 audit's ZIPP-15.",
+  "policy": {
+    "expiry": "An entry whose review_by date has passed fails CI until it is reviewed: either the fix landed and the entry is removed, or the date is moved with a fresh observation recorded here.",
+    "scope": "x86-64 register-tier MECHANISM assertions (planner/emitter fixtures) only. Semantic equivalence tests are never quarantined; the parity tests in the same binaries run and pass on the runner."
+  },
+  "entries": [
+    {
+      "binary": "bool_home_clobber",
+      "test": "boolhome_denseint_four_engages_one_bounded_split_spill",
+      "owner": "engine/x86-64 register tier",
+      "reason": "denseint-4 one-slot split spill planner expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34034702340",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "bool_home_clobber",
+      "test": "boolhome_denseint_four_no_spill_switch_refuses_split_spill",
+      "owner": "engine/x86-64 register tier",
+      "reason": "denseint-4 no-spill switch planner expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34034702340",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "bool_home_clobber",
+      "test": "boolhome_split_spill_bridge_stays_capped_at_one",
+      "owner": "engine/x86-64 register tier",
+      "reason": "two-spill cap planner expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34034702340",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "multi_split",
+      "test": "msplit_mechanism_budget_declines_past_four",
+      "owner": "engine/x86-64 register tier",
+      "reason": "split-receiver mechanism expectation differs on the CI runner (relaxed call order reproduces 40993c4d bytecode exactly)",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "multi_split",
+      "test": "msplit_mechanism_string_receiver_gate",
+      "owner": "engine/x86-64 register tier",
+      "reason": "split-receiver mechanism expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "multi_split",
+      "test": "msplit_mechanism_two_receivers_split_and_reach_the_int_tier",
+      "owner": "engine/x86-64 register tier",
+      "reason": "split-receiver mechanism expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "multi_split",
+      "test": "msplit_mechanism_xmm_emitter_carries_three_splits_and_a_clean_pin",
+      "owner": "engine/x86-64 register tier",
+      "reason": "split-receiver mechanism expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "gpr_deopt_shadow",
+      "test": "shadow_mechanism_engages_and_switch_falls_back",
+      "owner": "engine/x86-64 register tier",
+      "reason": "shadow census mechanism expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "split_recv_writethrough",
+      "test": "splitwt_mechanism_array_elem_deopt",
+      "owner": "engine/x86-64 register tier",
+      "reason": "write-through mechanism expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "split_recv_writethrough",
+      "test": "splitwt_mechanism_dv_oob_int_gpr",
+      "owner": "engine/x86-64 register tier",
+      "reason": "write-through mechanism expectation differs on the CI runner; passes on some runs (flaky there)",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "split_recv_writethrough",
+      "test": "splitwt_mechanism_ta_oob_store_strict",
+      "owner": "engine/x86-64 register tier",
+      "reason": "write-through mechanism expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "sroa_objref_slot",
+      "test": "sroa_mechanism_in_function",
+      "owner": "engine/x86-64 register tier",
+      "reason": "SROA mechanism expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "sroa_objref_slot",
+      "test": "sroa_mechanism_many_tail_args",
+      "owner": "engine/x86-64 register tier",
+      "reason": "SROA mechanism expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "sroa_objref_slot",
+      "test": "sroa_mechanism_object_bench",
+      "owner": "engine/x86-64 register tier",
+      "reason": "SROA mechanism expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    },
+    {
+      "binary": "sroa_objref_slot",
+      "test": "sroa_mechanism_read_object_after",
+      "owner": "engine/x86-64 register tier",
+      "reason": "SROA mechanism expectation differs on the CI runner",
+      "observed": "fails at audited commit 40993c4d; control run 34042369088",
+      "last_reviewed": "2026-09-11",
+      "review_by": "2026-12-31"
+    }
+  ]
+}

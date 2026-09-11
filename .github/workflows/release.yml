@@ -3,6 +3,15 @@ name: Release
 # A release is always built from an existing immutable-looking version tag.
 # The manual entry point is useful for retrying infrastructure failures, but it
 # deliberately does not create a tag or release an arbitrary branch/SHA.
+#
+# Publishing is gated on the complete CI workflow (ci.yml, called as a
+# reusable workflow) at the EXACT tagged revision — the engine suite, the
+# instrumented embedding contracts, the isolated host workspace and the
+# production WebAssembly boundary suite — in addition to this workflow's own
+# validation, native and WASM jobs. A green `main` at some other revision is
+# not a release gate (the 11 September 2026 audit's ZIPP-09). The Node
+# boundary checks the WASM job runs come from the one shared list
+# (tests/node/run-boundary-suite.cjs) so this lane cannot drift from CI.
 on:
   push:
     tags:
@@ -115,6 +124,16 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "commit=$tag_commit" >> "$GITHUB_OUTPUT"
           echo "tag_object=$tag_object" >> "$GITHUB_OUTPUT"
+
+  # The exact-revision correctness gate: everything ordinary CI proves, at
+  # the tagged commit. Quarantined tests are the manifest's, printed in the
+  # log there; nothing else is skipped.
+  ci:
+    name: CI at the tagged revision
+    needs: validate
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.validate.outputs.commit }}
 
   native:
     name: Native CLI (${{ matrix.rust_target }})
@@ -344,37 +363,36 @@ jobs:
 
       - name: Build the locked production WebAssembly module
         # RUSTFLAGS overrides target config, so repeat both security-critical
-        # linker limits while making compiler warnings fatal.
+        # linker limits while making compiler warnings fatal. The tagged
+        # commit is stamped into zippProfile().source.sha so a loaded artifact
+        # names the revision it came from; the artifact hashes stay external
+        # (SHA256SUMS), never embedded.
         env:
           RUSTFLAGS: >-
             -Dwarnings
             -C link-arg=--max-memory=1073741824
             -C link-arg=-zstack-size=1048576
+          ZIPP_SOURCE_SHA: ${{ needs.validate.outputs.commit }}
         run: cargo build --locked --release --target wasm32-unknown-unknown
 
+      # The one shared list (tests/node/run-boundary-suite.cjs): the same
+      # checks CI runs, including the parse-shape limits calibrated against
+      # this artifact's 1 MiB linker stack (v0.0.1 shipped limits that
+      # rejected two working applications because the only browser check at
+      # the time parsed three tokens) and the audit regression suites the
+      # release lane used to omit.
       - name: Exercise the production host boundary under Node
         run: |
           set -euo pipefail
           wasm-bindgen --target nodejs --out-dir tests/node/pkg \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
-          node tests/node/check-wasm-memory.cjs tests/node/pkg/zipp_wasm_bg.wasm
-          node tests/node/host-contract.cjs
-          node tests/node/buffer-ceiling.cjs
-          node tests/node/budget-and-seed.cjs
-          node tests/node/large-alloc-gc.cjs
-          node tests/node/output-budget.cjs
-          node tests/node/host-writeback-identity.cjs
-          node tests/node/worker-deadline.cjs
-          # The parse-shape limits are calibrated against the artifact built by
-          # the step above, with its 1 MiB linker stack. v0.0.1 shipped limits
-          # that rejected two working applications because the only browser
-          # check below parses three tokens.
-          node tests/node/syntax-corpus.cjs
+          node tests/node/run-boundary-suite.cjs
 
       - name: Package browser JS, TypeScript declarations, and WebAssembly
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
         run: |
           set -euo pipefail
           bundle="zipp-wasm-$RELEASE_VERSION-web"
@@ -399,6 +417,8 @@ jobs:
           mv "dist/$bundle/zipp_wasm_bg.stripped.wasm" \
             "dist/$bundle/zipp_wasm_bg.wasm"
           node --input-type=module --check < "dist/$bundle/zipp_wasm.js"
+          # Validation on the artifact AFTER stripping: memory/import surface,
+          # and that the shipped module reports the tagged revision.
           node tests/node/check-wasm-memory.cjs "dist/$bundle/zipp_wasm_bg.wasm"
           # Pin all generated type surfaces as well as the runtime smoke below:
           # a mutually stale JS+WASM pair can execute successfully while
@@ -409,7 +429,7 @@ jobs:
             "dist/$bundle/zipp_wasm.d.ts"
           grep -Fq 'export const engine_getGlobalsFingerprint:' \
             "dist/$bundle/zipp_wasm_bg.wasm.d.ts"
-          BUNDLE_PATH="$(pwd)/dist/$bundle" node --input-type=module <<'JS'
+          BUNDLE_PATH="$(pwd)/dist/$bundle" EXPECTED_COMMIT="$EXPECTED_COMMIT" node --input-type=module <<'JS'
           import fs from "node:fs";
           import path from "node:path";
           import { pathToFileURL } from "node:url";
@@ -429,6 +449,13 @@ jobs:
           await zipp.default({
             module_or_path: wasmModule,
           });
+          const profile = JSON.parse(zipp.zippProfile());
+          if (profile.source?.sha !== process.env.EXPECTED_COMMIT) {
+            throw new Error(`browser package reports source ${profile.source?.sha}, expected ${process.env.EXPECTED_COMMIT}`);
+          }
+          if (profile.version !== process.env.RELEASE_VERSION) {
+            throw new Error(`browser package reports version ${profile.version}, expected ${process.env.RELEASE_VERSION}`);
+          }
           const engine = new zipp.Engine();
           try {
             const symbols = engine.initScript(`
@@ -496,7 +523,9 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [validate, native, wasm]
+    # `ci` is the exact-revision gate: a tagged revision that fails a required
+    # semantic, profile or boundary test does not publish.
+    needs: [validate, ci, native, wasm]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

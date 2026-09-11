@@ -30,6 +30,231 @@ measured with `crates/zipp-wasm/tests/node/bench.cjs`-style interleaved
 A/Bs, not the native PGO capture; the tracked module must be rebuilt to
 ship them. The audit's captured-call IC was measured and not built (B279).
 
+## 2026-09-11 (B290-B305, from the ZIPP engineering audit)
+
+The audit reviewed `e6e0f65d` (v0.0.15) from source only — it built nothing
+and ran nothing but a Node model — and filed 24 tickets: source-confirmed
+defects, contract decisions, release-process gaps and measurement plans. Its
+15-case WASM probe bundle, run here against the v0.0.15 artifact
+(`zipp_wasm_bg.wasm` sha256 `c5239150…8920a`), failed 13 cases; against the
+artifact built from this batch 13 pass and the two `utf16_*` cases remain
+red by decision (B300). Every fix below is proven on the real artifact or the
+native crate, never on the audit's Node model. Classification follows the
+audit's own vocabulary.
+
+- **B290 (ZIPP-01, P1) — verified fixed. The guest's `"use strict"` survives
+  the preamble.** `initScript` compiled `PREAMBLE + "\n" + source` as one
+  program, so the guest's directive was no longer in the directive prologue:
+  a strict guest ran sloppy (undeclared assignment succeeded, a strict
+  function's `this` was the global object, duplicate parameters compiled).
+  `embed::compile_script_with_preamble` now reads the guest's prologue with
+  the parser's own directive-prologue production (raw-text rule, so
+  `"use\x20strict"` and `"use strict" + 1` are not directives; comments, a BOM
+  and a hashbang ahead of it are skipped) and parses the concatenation under
+  that strictness; `compile_program_inner` honours the parser's folded
+  `prog.strict` instead of re-deriving it from the directive list, which is
+  the one-line compiler change that made `force_strict` mean anything for a
+  main program. Positions stay those of the concatenation (`preambleLines`
+  still corrects them); a guest hashbang becomes a same-length comment. The
+  preamble is strict-clean and runs identically either way. Pinned by the
+  `guest_directive_prologue_survives_the_preamble` unit test and the
+  `ZIPP-01` block of `tests/node/audit-2026-09-11.cjs` (the audit's five
+  probes plus BOM, hashbang, comment, second-directive and persistence
+  cases). Not run: test262 (no parser production changed; the compiler now
+  reads a flag it already had).
+- **B291 (ZIPP-02, P1) — verified fixed; contract decided. The `host.call`
+  drain is transactional.** `__zDrainHostCalls` emptied the queue before its
+  return value crossed the converter; a conversion failure lost every
+  request while their callbacks stayed registered. The preamble now peeks a
+  bounded prefix, the engine converts it under two aggregate budgets
+  (4,096 requests, 32 MiB of string payload per drain, one budget per
+  conversion stage, charged only by committed prefixes), commits exactly
+  that prefix, and halves on failure. Every accepted request ends delivered
+  once, still queued (the host drains until an empty array), or — for a
+  single request that does not fit a drain even alone — rejected: removed,
+  its callback invoked with a `RangeError`, a throw from that callback
+  reported to the console rather than aborting the drain. The guest-side
+  `host.call` also refuses a request over 4,194,304 UTF-16 code units before
+  anything registers (guest bookkeeping, not authority; the engine bounds
+  the drain again). Pinned in `audit-2026-09-11.cjs`: the audit's probe (300
+  × 64 KiB delivered whole), a 600-request queue delivered across two drains
+  with no id twice, a 40 MiB request queued by tampering with the internal
+  queue and settled with its neighbours delivered, and the guest-side
+  refusal. Native: `ScriptState::call_slot_bounded` and `HostCallError`
+  separate "the guest threw" from "the result is over budget".
+- **B292 (ZIPP-03, P1) — verified fixed. Native name calls compile
+  nothing.** `call_global` resolved its callee through indirect `eval` of the
+  name and `has_global_function` evaluated generated `typeof` source, so
+  every name call and optional-entry probe spent the dynamic-code allowance
+  and interned a program for the VM's lifetime, against the method's own
+  contract. `Vm::host_resolve_global_by_name` performs the `LoadGlobal`
+  family's lookup with no activation: a main-program or eval-pool slot (live
+  and unshadowed read directly, otherwise the interpreter's own slow path —
+  TDZ, a real own property shadowing the slot, a deleted builtin), then the
+  global object's own properties and prototype chain, then the builtin
+  table. Nothing is cached; a reassigned binding is seen on the next call.
+  `tests/audit_20260911_native.rs` (the audit's three tests, adjusted to
+  the real API, plus reassignment/builtin/lexical/own-property/throw cases
+  and a proof that the one-compile allowance is live) passes under
+  `--features instrument`; `embed::tests::call_global_resolves_every_binding_kind_without_compiling`
+  covers the same on default features. The documented microtask policy is
+  unchanged and now stated on both methods.
+- **B293 (ZIPP-04, P1) — verified fixed; proposed contract adopted. The
+  fingerprint has a work budget.** `host_fp` cloned array/object contents
+  before checking their size, charged nothing for holes, hashed strings
+  without an aggregate byte bound, and every slot in a batch started a fresh
+  2,000,000-node allowance. `FingerprintBudget` charges every visited value,
+  element, hole and property, and every key and string byte, refuses a
+  container before entering it when it alone exceeds what remains, and is
+  threaded through the whole `getGlobalsFingerprint` batch, duplicate
+  indices included, with the batched read's own ceilings (2,000,000 nodes,
+  16 MiB) so digest and read agree by construction. Containers are
+  re-borrowed per element; nothing is cloned. `NaN` (native `None`) is
+  never evidence of equality. Counters are deterministic:
+  `tests/audit_20260911_host_work.rs` pins exact node and byte counts for
+  hole arrays, repeated long strings, a 10,000-key object, cycles, a
+  200-deep chain, the 2^32-node DAG and a shared budget across duplicate
+  slots; `audit-2026-09-11.cjs` runs the audit's two probes and a shared-
+  budget batch on the artifact. Not measured: latency on SoftN-shaped state
+  (the walk does strictly less work than before; a timing series is B305's).
+- **B294 (ZIPP-05, P1/P2) — verified fixed. Write-back key matching is
+  linear.** `host_in_over` matched each incoming key by scanning the old
+  property vector and then scanned the incoming keys once per old
+  property. The old keys are indexed once (an `FxHashMap` above eight
+  properties, a scan below), and the positions the host sent are flagged
+  during the first pass so the preservation pass is one walk.
+  `vm::host_api::merge_tests` counts key probes through a `cfg(test)`
+  thread-local and pins them at ≤ 2n + 16 for 256/512/1,024/4,096 keys over
+  equal, disjoint, overlapping and shuffled sets (the audit's model counted
+  65,792 / 262,656 / 1,049,600 comparisons at the first three sizes), and
+  re-proves every preservation rule at 1,024 keys: accessors keep their
+  descriptor, non-enumerables the host never saw survive, functions echoed
+  back as null survive, a class instance stays an instance, nested objects
+  merge. Allocation bytes were not recorded (no allocator instrumentation
+  in the crate); the extra allocation is one hash table per merge above the
+  threshold.
+- **B295 (ZIPP-07, P2) — verified fixed. A pre-init fingerprint seed is
+  retained.** `setFingerprintSeed` before `initScript` was a silent no-op.
+  The `Engine` records the seed and applies it at initialization; a seed
+  set before and the same seed set after produce equal digests, and
+  re-keying changes every digest (documented: a host drops cached digests
+  when it re-keys). Pinned in `audit-2026-09-11.cjs`.
+- **B296 (ZIPP-08, P1 for accelerator hosts) — verified fixed. The accel
+  spec is validated before anything is pinned.** `resolve_accel_spec`
+  checked duplicates with a growing vector's `contains` and pinned each
+  valid `g:` entry while later entries were still being validated. It now
+  bounds the spec (8 KiB, 64 entries, 64-byte identifiers), parses the
+  whole spec into a validated form with a hash set for names, and only
+  then resolves every region through the new transactional
+  `HostCtx::typed_array_regions` — all pinned or none. `make`/`install`/
+  `run` identifiers must be finite, integral, non-negative and safe;
+  a bare `f64` parse no longer suffices. A recording mock context proves no
+  invalid spec reaches the resolver or pins anything (unit test); the Node
+  suite proves it against a real adapter, with `buffer.transfer()` as the
+  pin witness. Adapter-failure lifetime policy and opaque region handles
+  remain open (B281's carry-forward).
+- **B297 (ZIPP-09, P1) — implemented. Release publishing is gated on CI at
+  the exact tagged revision.** `ci.yml` is now also a reusable workflow
+  taking a `ref`; `release.yml` calls it with the tagged commit and `publish`
+  requires it alongside `validate`, `native` and `wasm`. The Node boundary
+  checks come from one list (`tests/node/run-boundary-suite.cjs`, shared by
+  CI, release and security) so the release lane can no longer omit checks
+  ordinary CI runs (it omitted two). The stripped browser artifact is
+  checked for its memory/import surface and must report the tagged revision
+  through `zippProfile().source.sha` (stamped from `ZIPP_SOURCE_SHA` at
+  build time; artifact hashes stay external in `SHA256SUMS`). Not run: a
+  deliberately failing development tag in a non-publishing environment —
+  the gate is expressed as `needs`, which GitHub enforces, but the workflow
+  has not been exercised end to end here.
+- **B298 (ZIPP-10, P2) — contract decision implemented. `setGlobalsBatch`
+  is strict.** `indices` and `values` must have equal length and an index
+  may appear once; both are checked before any value is converted or any
+  slot written (a throwing getter in `values` is never reached), a hole is
+  an explicit `undefined`, an empty batch is fine. Pinned in the Node suite.
+- **B299 (ZIPP-12, P2) — contract documented; one behaviour fixed.**
+  `evalInContext` is documented as a JSON projection with its type matrix
+  (`undefined`/function → `undefined`; `NaN`/infinities → `null`; `-0` →
+  `0`; BigInt and cycles throw the guest's `TypeError`; `toJSON` and getters
+  run; own enumerable data only). A guest that replaced `JSON.stringify`
+  now gets a `SyntaxError` instead of a silent `undefined`. A rich-value
+  eval API was not added — the slot/batch APIs already cover polling
+  without compilation — and is recorded as open.
+- **B300 (ZIPP-11, P2) — contract decision: documented as Unicode-scalar.**
+  The boundary's Rust `String` cannot carry a lone surrogate; it is replaced
+  with U+FFFD in both directions, for keys, source, payloads and values.
+  This is now stated in the README and in
+  `zippProfile().semantics.stringTransport = "unicode-scalar"`. The audit's
+  `utf16_inbound`/`utf16_outbound` probes pin a lossless contract this
+  release deliberately does not make; a code-unit transport would be an
+  additive, versioned API. **Still open** as a feature, closed as an
+  undocumented risk.
+- **B301 (ZIPP-13, P2) — verified fixed; lifecycle made explicit.**
+  `resolveHostCallback` took a `u32`, so the 2^32nd request could never be
+  completed. Ids are JavaScript Numbers end to end, validated as
+  non-negative safe integers (a `TypeError` otherwise, never a truncation);
+  `resolveHostCallback` returns whether a callback ran (late and duplicate
+  completions are visible no-ops); `cancelHostCallback(id)` releases a
+  pending callback without invoking it. The audit's rollover probe passes.
+  Generation-scoped handles and timeouts remain the host adapter's (the
+  README's guidance stands; a reusable adapter is B304's).
+- **B302 (ZIPP-14, P2) — verified fixed. Console output is chronological.**
+  The VM records which stream each line went to (one enum per line; the
+  lines are stored once), `ScriptState::take_console` merges them in
+  order, `takeOutput()` returns that order and `takeConsole()` returns
+  `{ stream, text }` records; the per-stream native takes keep their
+  interfaces and prune only their own order entries. Pinned natively
+  (through microtasks, a throw and a mixed per-stream drain) and on the
+  artifact.
+- **B303 (ZIPP-15 / ZIPP-16, P2) — implemented. Quarantines are exact and
+  accountable; security checks run on a schedule and on relevant PRs.**
+  `.github/ci-quarantine.json` names every skipped test exactly with its
+  binary, owner, reason, observation and review date; `tools/ci_quarantine.py`
+  prints the inventory, emits the `--skip` arguments, and fails CI on an
+  expired, stale (test no longer exists) or malformed entry, so a new
+  `msplit_mechanism_*`-shaped regression is never skipped by a prefix.
+  `security.yml` runs weekly, on pull requests touching the sandbox crates,
+  hardened VM paths, harness and lockfiles (the bounded subset; the full
+  native workspace stays weekly/manual), and on demand; its stable toolchain
+  is labelled a canary. The instrumented embedding contracts run in CI's
+  engine job and in the safe-profile job.
+- **B304 (ZIPP-17, P1/P2) — partly implemented; browser tests still
+  open.** `window.dispatchEvent` now dispatches to the listeners registered
+  on `window` for `String(event.type)` and reports the event uncancelled,
+  with the facade's limits (no `Event`, no bubbling, no DOM) stated in the
+  preamble and README; it used to return `true` without dispatching.
+  Chromium/Firefox/WebKit Worker smoke tests against the released web
+  package and a versioned host SDK were not built: **still open**.
+- **B305 (ZIPP-18 / ZIPP-24, P1 docs / P2) — verified fixed / implemented.**
+  The quick-start commands referred to v0.0.14 (fixed, as its own commit).
+  `zippProfile()` is `profileVersion` 2: `source.sha` and target, the grammar
+  goal (`script-compat`, top-level `return` legal), the strict-mode policy
+  (`directive-prologue`), string transport, batch arity, id width, console
+  and drain contracts, and the host-boundary work limits (value nodes and
+  bytes, fingerprint budget, queue/pending/request-unit/drain ceilings,
+  accel spec bounds); `profile-matches-readme.cjs` holds three new README
+  rows to it. `embed::CompileOptions`/`ScriptGoal` make the grammar goal a
+  per-compilation option (`Inherit` keeps the process switch for the CLI
+  and the conformance runner; the WASM guest states `Compat`), pinned by
+  `grammar_goal_is_per_compilation`. Live retained-resource counters
+  (ZIPP-06's first stage) were not added: **still open**.
+- **Still open, unchanged:** ZIPP-06 (compiled-code reclamation and
+  retained-compiler accounting), ZIPP-19–23 (fresh conformance/performance
+  evidence, workload density, IC/GC/footprint experiments — measurement
+  programmes, not defects; nothing here claims a speedup).
+
+Verification for this batch: `cargo test -p zipp-vm` (default features, the
+manifest's 15 quarantined mechanism tests skipped as CI skips them);
+`cargo test -p zipp-vm --features instrument --test audit_20260911_native`;
+`cargo test -p zipp-vm --test global_fingerprint --test audit_20260911_host_work`;
+`cargo test --locked` in `crates/zipp-wasm` (eight unit tests, three new);
+the production wasm32 build under the release RUSTFLAGS, wasm-bindgen
+0.2.126 (Node target) and `tests/node/run-boundary-suite.cjs` — all twelve
+checks, including the new `audit-2026-09-11.cjs` (113 assertions) and the
+audit's own `run-wasm-audit.cjs` (13 of 15, the two UTF-16 cases red by
+B300's decision). Not run: test262, the ARM64 matrix, browser Workers, the
+GC-stress/forced-tier sweeps beyond what the touched test binaries run
+themselves, and the release workflow end to end.
+
 ## 2026-09-06 (B280-B289, from the ZIPP engineering audit)
 
 The audit reviewed `40993c4d` (v0.0.14). Its two P0 findings and six of the

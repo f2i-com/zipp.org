@@ -2,9 +2,15 @@
 # suite in its default configuration, the isolated host workspace, the
 # advertised feature combinations, and the production WebAssembly host
 # boundary under Node. The expensive lanes — test262 conformance, the ARM64
-# native matrix, the hostile-input runs — stay on their manual and release
-# triggers (security.yml, arm64-native.yml, release.yml); this one exists so a
-# change that breaks a default-semantics regression cannot merge quietly.
+# native matrix, the hostile-input runs — stay on their scheduled, manual and
+# release triggers (security.yml, arm64-native.yml, release.yml); this one
+# exists so a change that breaks a default-semantics regression cannot merge
+# quietly.
+#
+# Also a REUSABLE workflow: release.yml calls it with the exact tagged
+# revision, so publishing depends on this same gate at that revision rather
+# than on whatever `main` build last happened to be green (the 11 September
+# 2026 audit's ZIPP-09). One definition, so CI and release cannot drift.
 #
 # Pull requests from forks get a read-only token and no secrets; nothing here
 # needs more.
@@ -17,13 +23,20 @@ on:
   # A manual run of any branch: the control runs that attribute a runner-
   # specific failure to the audited commit are dispatched this way.
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: The exact revision to check out (release.yml passes the tagged commit)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -34,13 +47,14 @@ jobs:
   engine:
     name: Engine tests (default features)
     runs-on: ubuntu-latest
-    # The suite is 228 binaries, several of which sweep every execution mode
+    # The suite is 230 binaries, several of which sweep every execution mode
     # in child processes and a few of which run sustained-garbage loops for
     # minutes; 45 minutes cut the first run off at 144 binaries.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ inputs.ref || '' }}
           persist-credentials: false
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.92.0 --profile minimal --no-self-update
@@ -57,30 +71,34 @@ jobs:
             ~/.cargo/git
             target
           key: ci-engine-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      # Quarantined tests are named EXACTLY in .github/ci-quarantine.json —
+      # binary, test, owner, reason, observation, review date — and the
+      # manifest is checked before use: an expired entry fails the run, a
+      # stale one (its test no longer exists) fails the run, and a new test
+      # that merely resembles a quarantined one is never skipped. The skipped
+      # inventory is printed so a green run never passes for full coverage.
+      - name: Validate and print the test quarantine
+        run: |
+          python3 tools/ci_quarantine.py --check --print
+          echo "::notice title=Quarantined::$(python3 tools/ci_quarantine.py --print | head -1) — the x86-64 register-tier mechanism assertions listed in the log are skipped on this runner (pre-existing at 40993c4d, control runs 34034702340 and 34042369088); see .github/ci-quarantine.json."
       # The semantic regressions run their own mode matrix (interpreter,
       # forced JIT, GC stress, both call-order switches) in child processes.
       # Every binary runs even after one fails, so a red run names all of
       # its failures rather than the first.
-      #
-      # Quarantined, and said so in the log rather than treated as passing:
-      # the x86-64 register-tier mechanism assertions below fail on this
-      # runner at the audited commit 40993c4d as well — control runs of that
-      # commit with only this workflow added: 34034702340 (the first binary,
-      # bool_home_clobber's denseint-4 one-slot split spill and two-spill
-      # cap) and 34042369088 (every binary: multi_split's four split-receiver
-      # mechanism tests, gpr_deopt_shadow's census, split_recv_writethrough's
-      # three write-through mechanism tests, of which dv_oob_int_gpr passes
-      # on some runs, and sroa_objref_slot's four SROA mechanism tests) — on
-      # bytecode identical to the developer machine's (the mechanism children
-      # of multi_split and gpr_deopt_shadow run under the relaxed call order,
-      # which reproduces 40993c4d's bytecode exactly). They describe the
-      # planner's behaviour on the developer's machine rather than a
-      # regression; the parity tests in the same binaries run and pass here.
-      # Remove a skip once its planner expectation is machine-independent.
       - name: Test the engine
         run: |
-          echo "::notice title=Quarantined::bool_home_clobber (3), multi_split (msplit_mechanism_*), gpr_deopt_shadow (shadow_mechanism_*), split_recv_writethrough (splitwt_mechanism_*) and sroa_objref_slot (sroa_mechanism_*) planner assertions are skipped on this runner (pre-existing at 40993c4d, control runs 34034702340 and 34042369088; see the comment in ci.yml)."
-          cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast --             --skip boolhome_denseint_four_engages_one_bounded_split_spill             --skip boolhome_denseint_four_no_spill_switch_refuses_split_spill             --skip boolhome_split_spill_bridge_stays_capped_at_one             --skip msplit_mechanism_             --skip shadow_mechanism_             --skip splitwt_mechanism_             --skip sroa_mechanism_
+          set -euo pipefail
+          skips="$(python3 tools/ci_quarantine.py --emit-skips)"
+          # shellcheck disable=SC2086
+          cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast -- $skips
+      # The embedding contracts the 11 September 2026 audit pinned that need
+      # the metering recorder (compile-free name calls under a one-compile
+      # allowance); the default-feature run above cannot see them.
+      - name: Test the instrumented embedding contracts
+        run: >-
+          cargo +1.92.0 test --locked -p zipp-vm --features instrument
+          --test audit_20260911_native --test audit_20260911_host_work
+          --test global_fingerprint --test instrument
 
   wasm:
     name: WebAssembly host boundary
@@ -92,6 +110,7 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
+          ref: ${{ inputs.ref || '' }}
           persist-credentials: false
       - name: Install the pinned Rust toolchain and wasm32 target
         run: |
@@ -128,20 +147,15 @@ jobs:
             -Dwarnings
             -C link-arg=--max-memory=1073741824
             -C link-arg=-zstack-size=1048576
+          # Stamped into zippProfile().source.sha so a loaded artifact can
+          # name the revision it was built from.
+          ZIPP_SOURCE_SHA: ${{ github.sha }}
         run: cargo +1.92.0 build --locked --release --target wasm32-unknown-unknown
+      # One list of checks, shared with release.yml and security.yml, so the
+      # lanes cannot drift apart again.
       - name: Exercise the production host boundary under Node
         run: |
           set -euo pipefail
           wasm-bindgen --target nodejs --out-dir tests/node/pkg \
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
-          node tests/node/check-wasm-memory.cjs tests/node/pkg/zipp_wasm_bg.wasm
-          node tests/node/host-contract.cjs
-          node tests/node/buffer-ceiling.cjs
-          node tests/node/budget-and-seed.cjs
-          node tests/node/large-alloc-gc.cjs
-          node tests/node/output-budget.cjs
-          node tests/node/host-writeback-identity.cjs
-          node tests/node/worker-deadline.cjs
-          node tests/node/audit-defaults.cjs
-          node tests/node/profile-matches-readme.cjs
-          node tests/node/syntax-corpus.cjs
+          node tests/node/run-boundary-suite.cjs
