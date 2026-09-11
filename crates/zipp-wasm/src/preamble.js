@@ -18,9 +18,14 @@ var __zHostCbs = Object.create(null);
 var __zHostPending = 0;
 var __zHostId = 0;
 // Bounds on what a guest may leave waiting for the host: requests queued
-// between drains, and callbacks awaiting a completion.
+// between drains, callbacks awaiting a completion, and the size of one
+// request (kind plus arguments, in UTF-16 code units) so that any request
+// this accepts can cross the engine's per-drain conversion budget. These are
+// guest-visible bookkeeping, not the host's authority: the engine bounds the
+// drain again on its own side and settles a request that still cannot cross.
 var __zHostQueueMax = 4096;
 var __zHostPendingMax = 65536;
+var __zHostRequestMaxUnits = 4194304;
 
 var window = {
   addEventListener: function (type, fn) {
@@ -35,7 +40,20 @@ var window = {
       if (a[i] === fn) { a.splice(i, 1); return; }
     }
   },
-  dispatchEvent: function () { return true; },
+  // A deliberately limited facade, and the limit is the contract: the event
+  // is delivered to the listeners registered on THIS object for
+  // `String(evt.type)`, synchronously, and the call always reports the
+  // event as not cancelled. There is no DOM here — no `Event` class, no
+  // bubbling or capture, no default actions — so a script must not treat
+  // `window` as a document. It used to return true without dispatching at
+  // all (the 11 September 2026 audit's ZIPP-17).
+  dispatchEvent: function (evt) {
+    if (evt === null || typeof evt !== "object" || typeof evt.type !== "string") {
+      throw new TypeError("dispatchEvent: expected an event object with a string type");
+    }
+    __zDispatchEvent(evt.type, evt);
+    return true;
+  },
 };
 
 var navigator = {
@@ -88,7 +106,9 @@ var host = {
     // 2026 audit's Z09). Nothing is retained until the request is whole.
     var k = String(kind);
     var flat = [];
-    if (args) for (var i = 0; i < args.length; i++) flat.push(String(args[i]));
+    var units = k.length;
+    if (args) for (var i = 0; i < args.length; i++) { var s = String(args[i]); units += s.length; flat.push(s); }
+    if (units > __zHostRequestMaxUnits) throw new RangeError("host.call: request exceeds the " + __zHostRequestMaxUnits + "-code-unit transport limit");
     if (__zHostQueue.length >= __zHostQueueMax) throw new RangeError("host.call: too many requests queued");
     var wantsCb = typeof cb === "function";
     if (wantsCb && __zHostPending >= __zHostPendingMax) throw new RangeError("host.call: too many requests awaiting a reply");
@@ -150,10 +170,39 @@ function __zDispatchEvent(type, evt) {
   return n;
 }
 
-function __zDrainHostCalls() {
-  var q = __zHostQueue;
-  __zHostQueue = [];
-  return q;
+// The drain is a two-phase transfer. The engine PEEKS a bounded prefix,
+// converts it to host values, and only then COMMITS that many off the queue;
+// a conversion that fails leaves the queue exactly as it was and the engine
+// retries with less. The old single-step drain emptied the queue before its
+// return value crossed the converter, so a conversion failure lost every
+// queued request while their callbacks stayed registered forever (the
+// 11 September 2026 audit's ZIPP-02). No guest code runs between a peek and
+// its commit, so the committed prefix is the peeked one.
+function __zPeekHostCalls(limit) {
+  return __zHostQueue.slice(0, limit);
+}
+
+function __zCommitHostCalls(count) {
+  __zHostQueue.splice(0, count);
+  return __zHostQueue.length;
+}
+
+// A request that cannot cross even on its own is settled here rather than
+// left queued forever or dropped silently: it leaves the queue and its
+// callback receives a RangeError. A throw from that callback is reported to
+// the console, as an uncaught exception in any asynchronous callback would
+// be, so that it cannot abort the drain that other requests are part of.
+function __zRejectHostCall(reason) {
+  var req = __zHostQueue.shift();
+  if (!req) return 0;
+  var cb = __zHostCbs[req.id];
+  if (cb) {
+    delete __zHostCbs[req.id];
+    __zHostPending--;
+    try { cb(new RangeError(String(reason))); }
+    catch (e) { console.error("host.call: callback for rejected request " + req.id + " threw: " + e); }
+  }
+  return 1;
 }
 
 function __zResolveHostCall(id, result) {
@@ -162,5 +211,16 @@ function __zResolveHostCall(id, result) {
   delete __zHostCbs[id];
   __zHostPending--;
   cb(result);
+  return 1;
+}
+
+// Release a pending callback WITHOUT invoking it: the host cancelled or
+// timed out the request. A later completion for the same id is then a
+// no-op, exactly like a completion for an unknown id.
+function __zCancelHostCall(id) {
+  var cb = __zHostCbs[id];
+  if (!cb) return 0;
+  delete __zHostCbs[id];
+  __zHostPending--;
   return 1;
 }

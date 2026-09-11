@@ -201,6 +201,17 @@ split is not stylistic:
   `host.call(kind, args, cb)`, whose callback the host resolves later with
   `resolveHostCallback(id, result)`. An asynchronous bridge cannot be read inline.
 
+  The drain is transactional: a request leaves the guest queue only once its
+  host representation exists, so every accepted request is delivered exactly
+  once, or stays queued for the next drain (when the per-drain request or byte
+  allowance is used up — drain until an empty array comes back), or, for a
+  single request too large to cross even on its own, is rejected: removed, its
+  callback invoked with a `RangeError`, never left pending for a request the
+  host will not see. Ids are JavaScript Numbers end to end (no 32-bit
+  truncation); `resolveHostCallback` returns whether a callback ran, so a late
+  or duplicate completion is a visible no-op; `cancelHostCallback(id)` releases
+  a pending callback without invoking it.
+
 The synchronous channel is default-deny per `Engine`. Installing a bridge object
 does **not** grant authority. Before `initScript`, the host must explicitly set the
 exact operations that tenant needs:
@@ -268,6 +279,23 @@ accessors as an authority boundary.
 `JSON.stringify` can express none of the three: it *drops* function-valued
 properties and *throws* on a cycle.
 
+**Strings cross as Unicode scalar values.** The engine's strings are UTF-16 and
+may hold a lone surrogate; the boundary's Rust `String` cannot. A lone surrogate
+is replaced with U+FFFD in either direction — property keys, source input,
+callback payloads and ordinary values alike — and the profile says so
+(`semantics.stringTransport: "unicode-scalar"`). Valid pairs, mixed text and
+embedded NUL round-trip exactly. This is the documented contract, decided at the
+11 September 2026 audit's ZIPP-11 rather than left implicit; a lossless
+code-unit transport would be an additive, separately versioned API.
+
+`evalInContext` is a **JSON projection**, not a rich-value read: the result goes
+through the guest's `JSON.stringify` and is parsed on the host side. `undefined`,
+a function or a symbol result is `undefined`; `NaN` and the infinities are
+`null`; `-0` is `0`; a BigInt or a cycle is the guest's own `TypeError`;
+`toJSON` and getters run; only own enumerable data crosses. A guest that has
+replaced `JSON.stringify` gets a `SyntaxError` rather than a silent `undefined`.
+Poll state through the slot/batch APIs, which neither compile nor project.
+
 ## Resource limits
 
 Every `Engine` has fixed fail-closed ceilings. Cumulative counters are lifetime
@@ -304,8 +332,9 @@ cover that way (string, regex, BigInt, array and nesting ceilings) come from
 | JSON replacer/object-key snapshots | 8,388,608 private allocation bytes per stringify, including key and container capacities |
 | Lifetime console output | 8,388,608 UTF-8 bytes total, including newlines, each line charged the cost of its own entry |
 | Synchronous host bridge | 64-byte kind, exact operation-specific arity (and never more than 16 arguments), 33,554,432 combined kind/argument bytes, and a 33,554,432-byte serialized reply |
-| Asynchronous `host.call` | 4,096 requests queued between drains and 65,536 callbacks awaiting a reply; a request registers nothing until its arguments have converted |
-| `accel.make` binding spec | the public grammar only — `NAME=g:GLOBAL`, `NAME=c:GLOBAL`, `NAME=a:ID`, `NAME=n:NUMBER`, `NAME=t` — with identifier names bound once; the engine's own `r:` region form is refused from guest text before the adapter sees the spec |
+| Host value conversion | 2,000,000 nodes and 16,777,216 string bytes per boundary crossing (`getGlobalsBatch`, `setGlobalsBatch`, `callFunction`, `dispatchEvent`, `evalInContext`); a fingerprint batch walks under the same 2,000,000-node, 16,777,216-byte budget — every element, hole, key and string byte charged, duplicate indices included — and answers `NaN` for what it cannot walk |
+| Asynchronous `host.call` | 4,096 requests queued between drains, 65,536 callbacks awaiting a reply, and 4,194,304 UTF-16 code units per request (kind plus arguments), all checked before anything registers; one drain delivers at most 4,096 requests and 33,554,432 string bytes, leaves the rest queued, and rejects (with explicit settlement) a single request that does not fit that allowance on its own |
+| `accel.make` binding spec | the public grammar only — `NAME=g:GLOBAL`, `NAME=c:GLOBAL`, `NAME=a:ID`, `NAME=n:NUMBER`, `NAME=t` — at most 8,192 bytes, 64 entries and 64-byte identifiers, names bound once (a set, not a scan), ids finite non-negative safe integers; the whole spec is validated before any region is resolved, regions are pinned as one transaction, and the engine's own `r:` region form is refused from guest text before the adapter sees the spec |
 
 The instruction, dynamic-compilation and output counters are not credited when
 an entry returns or when `takeOutput()` drains buffered lines. Dynamic source and
@@ -326,9 +355,18 @@ the final allocator backstop. The retained-source limits are conservative
 source-size proxies for compilations the VM must keep alive, not exact
 measurements of compiler allocations.
 
-Initialization performs one preamble-plus-guest compilation. Preamble binding
-names come from a compiler-checked static manifest, so filtering host-visible
-slots does not retain a second preamble-only `ScriptState` allocation.
+Initialization performs one preamble-plus-guest compilation, under the
+CommonJS-shaped compatibility grammar (sloppy unless directed, top-level
+`return` legal) stated in `zippProfile().semantics.parseGoal` rather than
+inherited from process state. The guest's own directive prologue stays in
+force: the parser reads `"use strict"` off the guest text before the two are
+combined, so a strict guest gets strict assignment, receiver and early-error
+semantics even though preamble statements precede it, a sloppy guest stays
+sloppy, and an escaped or expression-position string is not a directive. A
+guest hashbang and BOM are honoured; source positions are those of the
+concatenation, so `preambleLines` still corrects them. Preamble binding names
+come from a compiler-checked static manifest, so filtering host-visible slots
+does not retain a second preamble-only `ScriptState` allocation.
 
 An initialization failure, an initial/eval source-growth violation, or any VM
 instruction/abort/heap/output/dynamic-compilation limit violation disposes the
@@ -342,10 +380,32 @@ remain recoverable.
 
 ## Notes
 
-- `zippProfile()` returns the artifact's own record — engine, version, isolated
-  features, semantics (`callOrder: "strict"`) and every limit above that the
-  module owns — as JSON. Read it from the loaded module for a diagnostic panel
-  or a compatibility check instead of copying figures from this page.
+- `zippProfile()` returns the artifact's own record — engine, version,
+  `profileVersion`, provenance (`source.sha`, the revision the release pipeline
+  built from, `null` in an unlabelled local build; artifact hashes stay external
+  in `SHA256SUMS`), isolated features, semantics (`callOrder`, `parseGoal`,
+  `topLevelReturn`, `guestStrictMode`, `stringTransport`, `batchWriteArity`,
+  `hostCallIdBits`, `consoleOutput`, `hostCallDrain`) and every limit above that
+  the module owns — as JSON. Read it from the loaded module for a diagnostic
+  panel or a compatibility check instead of copying figures from this page.
+  Fields are only ever added.
+- `takeOutput()` drains every console line — `log`/`info`/`debug` and
+  `warn`/`error` — in the order it was written; `takeConsole()` returns the same
+  lines as `{ stream: "stdout" | "stderr", text }` records. Either drains both
+  buffers. (The two streams used to be concatenated, stdout first.)
+- `setFingerprintSeed(lo, hi)` may be called before or after `initScript`; a
+  seed set before is applied at initialization. Re-keying changes every digest,
+  so a host that caches digests must discard them when it re-keys. Equal digests
+  are probabilistic evidence of an equal marshalled value; `NaN` is never
+  evidence of anything.
+- `setGlobalsBatch(indices, values)` is strict: the two arrays must have the
+  same length and an index may appear once, checked before any value is
+  converted or any slot written. A hole in `values` is an explicit `undefined`.
+- `window.dispatchEvent(event)` is a deliberately limited facade: it delivers
+  `event` synchronously to the listeners registered on `window` for
+  `String(event.type)` and always reports the event as not cancelled. There is
+  no `Event` class, no bubbling or capture, no default actions and no DOM; a
+  non-object argument is a `TypeError`.
 - `setInstructionBudget(steps)` may be called before `initScript`, in which case
   the allowance governs top-level execution and `_init`; called after, it
   resizes the running budget, and `renewInstructionBudget` then restores the

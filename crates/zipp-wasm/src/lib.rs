@@ -24,7 +24,9 @@ use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 use zipp_vm::embed::{
-    compile_script, HostCtx, HostValue, HostValueBudget, ScriptState, SymbolScope,
+    compile_script_with_preamble, CompileOptions, ConsoleStream, FingerprintBudget, HostCallError,
+    HostCtx, HostValue, HostValueBudget, ScriptGoal, ScriptState, SymbolScope,
+    DEFAULT_HOST_VALUE_MAX_NODES, DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
 };
 
 // js-sys's stable Array::is_array/Object::keys/Array indexing bindings do not
@@ -107,6 +109,48 @@ const MAX_SYNC_BRIDGE_KIND_BYTES: usize = 64;
 const MAX_SYNC_BRIDGE_ARGS: usize = 16;
 const MAX_SYNC_BRIDGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SYNC_CAPABILITY_ENTRIES: u32 = 32;
+// The asynchronous queue, on the engine's side of the boundary (the preamble
+// keeps guest-visible copies of the queue and pending counts, which are
+// bookkeeping, not authority). One drain hands over at most
+// MAX_HOST_CALL_DRAIN_REQUESTS requests and MAX_HOST_CALL_DRAIN_STRING_BYTES
+// of string payload; what does not fit stays queued for the next drain. A
+// single request that does not fit that allowance even on its own can never
+// cross and is rejected with explicit settlement instead. The drain moves in
+// chunks of MAX_HOST_CALL_DRAIN_CHUNK, halving on a conversion failure, so a
+// bad request costs a bounded number of retries rather than a fresh walk of
+// the whole queue.
+const MAX_HOST_CALL_DRAIN_REQUESTS: u32 = 4096;
+/// The preamble's guest-side queue bounds, repeated here so the profile can
+/// report them; a unit test holds them to `preamble.js`.
+const PREAMBLE_HOST_CALL_QUEUE_MAX: u32 = 4096;
+const PREAMBLE_HOST_CALL_PENDING_MAX: u32 = 65536;
+const PREAMBLE_HOST_CALL_REQUEST_MAX_UNITS: u32 = 4_194_304;
+const MAX_HOST_CALL_DRAIN_CHUNK: u32 = 256;
+const MAX_HOST_CALL_DRAIN_STRING_BYTES: usize = 32 * 1024 * 1024;
+/// The largest request id the guest's counter can hand over exactly (the
+/// largest safe integer). Ids are
+/// JavaScript Numbers on both sides now; they used to cross as `u32`, so the
+/// 2^32nd request could never be completed (the 11 September 2026 audit's
+/// ZIPP-13).
+const MAX_HOST_CALL_ID: f64 = 9_007_199_254_740_991.0;
+// The `accel.make` binding spec is guest text: bound its size, its entry
+// count and its identifier lengths before any of it is parsed or resolved.
+const MAX_ACCEL_SPEC_BYTES: usize = 8 * 1024;
+const MAX_ACCEL_SPEC_ENTRIES: usize = 64;
+const MAX_ACCEL_SPEC_NAME_BYTES: usize = 64;
+/// Compiled-function and trace-slot identifiers the accelerator exchanges
+/// are non-negative safe integers; a parse that merely yields some `f64` is
+/// not an identifier.
+const MAX_ACCEL_ID: f64 = 9_007_199_254_740_991.0;
+
+/// The grammar every guest is compiled under. Stated here rather than
+/// inherited from the process (the 11 September 2026 audit's ZIPP-24): a
+/// guest is a CommonJS-shaped script — sloppy unless its own prologue says
+/// otherwise, top-level `return` legal — and `zippProfile()` reports exactly
+/// that.
+const GUEST_COMPILE_OPTIONS: CompileOptions = CompileOptions {
+    goal: ScriptGoal::Compat,
+};
 
 /// Preamble bindings the host may address by slot even though it did not
 /// declare them. `window` in particular is a two-way channel: hosts stash keys
@@ -127,6 +171,7 @@ const PREAMBLE_BINDINGS: &[&str] = &[
     "__zHostId",
     "__zHostQueueMax",
     "__zHostPendingMax",
+    "__zHostRequestMaxUnits",
     "window",
     "navigator",
     "localStorage",
@@ -135,8 +180,11 @@ const PREAMBLE_BINDINGS: &[&str] = &[
     "accel",
     "__zListenerTypes",
     "__zDispatchEvent",
-    "__zDrainHostCalls",
+    "__zPeekHostCalls",
+    "__zCommitHostCalls",
+    "__zRejectHostCall",
     "__zResolveHostCall",
+    "__zCancelHostCall",
 ];
 
 /// Route Rust panics to `console.error` with a message instead of a bare
@@ -202,8 +250,11 @@ struct Bridges {
 struct Helpers {
     listener_types: Option<u32>,
     dispatch_event: Option<u32>,
-    drain_host_calls: Option<u32>,
+    peek_host_calls: Option<u32>,
+    commit_host_calls: Option<u32>,
+    reject_host_call: Option<u32>,
     resolve_host_call: Option<u32>,
+    cancel_host_call: Option<u32>,
 }
 
 /// A compiled script plus the live VM running it.
@@ -236,6 +287,11 @@ pub struct Engine {
     /// top-level execution, and so a renewal restores the size the host chose
     /// rather than the default.
     instruction_budget: u64,
+    /// The fingerprint key the host asked for, kept here so a request made
+    /// BEFORE `initScript` — the natural place, next to the other host
+    /// configuration — is applied when the state exists rather than silently
+    /// dropped (the 11 September 2026 audit's ZIPP-07).
+    fingerprint_seed: Option<u64>,
 }
 
 #[wasm_bindgen]
@@ -253,6 +309,7 @@ impl Engine {
             disposed: false,
             host_configuration_frozen: false,
             instruction_budget: MAX_LIFETIME_STEPS,
+            fingerprint_seed: None,
         }
     }
 
@@ -377,11 +434,15 @@ impl Engine {
         self.helpers = Helpers::default();
 
         let result: Result<JsValue, JsValue> = (|| {
-            let mut full = String::with_capacity(PREAMBLE.len() + 1 + source.len());
-            full.push_str(PREAMBLE);
-            full.push('\n');
-            full.push_str(source);
-            let mut st = compile_script(&full).map_err(|e| JsValue::from_str(&e))?;
+            // One program, two sources: the preamble's bindings are globals
+            // the guest reaches by name, and the guest's OWN directive
+            // prologue stays in force even though preamble statements now
+            // precede it (the 11 September 2026 audit's ZIPP-01).
+            let mut st = compile_script_with_preamble(PREAMBLE, source, &GUEST_COMPILE_OPTIONS)
+                .map_err(|e| JsValue::from_str(&e))?;
+            if let Some(seed) = self.fingerprint_seed {
+                st.set_fingerprint_seed(seed);
+            }
 
             // Attach all execution limits before the first guest instruction.
             // The Cargo dependency disables native JIT features; the explicit
@@ -447,8 +508,11 @@ impl Engine {
             let helpers = Helpers {
                 listener_types: find("__zListenerTypes"),
                 dispatch_event: find("__zDispatchEvent"),
-                drain_host_calls: find("__zDrainHostCalls"),
+                peek_host_calls: find("__zPeekHostCalls"),
+                commit_host_calls: find("__zCommitHostCalls"),
+                reject_host_call: find("__zRejectHostCall"),
                 resolve_host_call: find("__zResolveHostCall"),
+                cancel_host_call: find("__zCancelHostCall"),
             };
             let out = to_js(&HostValue::Object(exposed)).map_err(to_js_error)?;
             self.slots = slots;
@@ -580,10 +644,17 @@ impl Engine {
     /// stale state while the guest moved on. The key is never exposed to guest
     /// code and never needs to be stable, since digests are only compared with
     /// earlier digests from the same engine.
+    ///
+    /// May be called before or after `initScript`; a seed set before is
+    /// applied at initialization, and the same seed gives the same digests
+    /// either way. Changing the seed changes every digest, so a host that
+    /// caches digests must discard them when it re-keys.
     #[wasm_bindgen(js_name = setFingerprintSeed)]
     pub fn set_fingerprint_seed(&mut self, lo: u32, hi: u32) {
+        let seed = ((hi as u64) << 32) | lo as u64;
+        self.fingerprint_seed = Some(seed);
         if let Some(st) = self.state.as_mut() {
-            st.set_fingerprint_seed(((hi as u64) << 32) | lo as u64);
+            st.set_fingerprint_seed(seed);
         }
     }
 
@@ -593,6 +664,10 @@ impl Engine {
     /// return an equal value, so a host can skip reading the ones that have not
     /// moved. `NaN` means "unknown, read it", which is what a value too large
     /// to walk reports — the fallback is always the old always-read behaviour.
+    /// The whole batch, duplicate indices included, walks under one work
+    /// budget with the same node and string-byte ceilings as a batched read,
+    /// so the digest never does more work than the read it stands in for
+    /// could, and every element, hole, key and string byte counts.
     ///
     /// Digests are 53-bit so they land exactly in a JS number. At that width a
     /// collision across a UI's worth of state is not a practical concern, and the
@@ -612,8 +687,9 @@ impl Engine {
         let indices = index_list(&indices, &mut budget).map_err(to_js_error)?;
         let out = js_sys::Array::new();
         if let Some(st) = self.state.as_mut() {
+            let mut work = FingerprintBudget::default();
             for i in indices {
-                let cell = match st.fingerprint_slot(i) {
+                let cell = match st.fingerprint_slot_bounded(i, &mut work) {
                     Some(h) => (h & ((1u64 << 53) - 1)) as f64,
                     None => f64::NAN,
                 };
@@ -624,12 +700,37 @@ impl Engine {
     }
 
     /// Write many globals in one boundary crossing.
+    ///
+    /// Strict arity: `indices` and `values` must have the same length, and an
+    /// index may appear only once. Both are checked before any value is
+    /// converted or any slot written, so a host-side construction mistake is
+    /// a `TypeError` rather than a partial write (a short `values` used to
+    /// write `undefined` into the remaining slots, and extra values were
+    /// silently ignored — the 11 September 2026 audit's ZIPP-10). A hole in
+    /// `values` is an explicit `undefined`. All values are converted before
+    /// the first slot is written, as before.
     #[wasm_bindgen(js_name = setGlobalsBatch)]
     pub fn set_globals_batch(&mut self, indices: JsValue, values: JsValue) -> Result<(), JsValue> {
         self.ensure_live()?;
         let mut budget = HostValueBudget::default();
         let idx = index_list(&indices, &mut budget).map_err(to_js_error)?;
         require_array(&values, "values").map_err(to_js_error)?;
+        let values_len = checked_array_length(&values, "values").map_err(to_js_error)?;
+        if values_len as usize != idx.len() {
+            return Err(JsValue::from_str(&format!(
+                "TypeError: setGlobalsBatch: indices and values must have the same length ({} indices, {} values)",
+                idx.len(),
+                values_len
+            )));
+        }
+        let mut distinct = HashSet::with_capacity(idx.len());
+        for i in &idx {
+            if !distinct.insert(*i) {
+                return Err(JsValue::from_str(&format!(
+                    "TypeError: setGlobalsBatch: index {i} appears more than once"
+                )));
+            }
+        }
         budget.charge_node().map_err(to_js_error)?;
         budget.ensure_nodes(idx.len()).map_err(to_js_error)?;
         let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
@@ -676,7 +777,18 @@ impl Engine {
         to_js(&value).map_err(to_js_error)
     }
 
-    /// Evaluate `expr` in the script's global context and return its value.
+    /// Evaluate `expr` in the script's global context and return its value
+    /// as a JSON PROJECTION: the result is passed through the guest's
+    /// `JSON.stringify` and parsed on the host side. That contract differs
+    /// from the rich-value one `callFunction` and the slot APIs use, and the
+    /// differences are the ones `JSON.stringify` makes — `undefined`, a
+    /// function or a symbol result is `undefined`; `NaN` and the infinities
+    /// become `null`; `-0` becomes `0`; a BigInt throws; `toJSON` and
+    /// getters run; own enumerable data properties cross and accessors are
+    /// evaluated; a cycle throws — and a guest that replaced its `JSON`
+    /// facilities changes the answer, which is reported as an error rather
+    /// than as `undefined`. Polling state should use the slot/batch APIs,
+    /// which neither compile nor project.
     ///
     /// Each call compiles fresh and installs stable-address definitions, so this
     /// is for one-off host queries — never a per-frame path. Use
@@ -736,7 +848,15 @@ impl Engine {
                 let mut budget = HostValueBudget::default();
                 budget.charge_node().map_err(to_js_error)?;
                 budget.charge_string(s).map_err(to_js_error)?;
-                let parsed = js_sys::JSON::parse(s).unwrap_or(JsValue::UNDEFINED);
+                // The projection is the guest's `JSON.stringify` output. Text
+                // that does not parse means the guest replaced that facility;
+                // report it instead of answering `undefined` as if the
+                // expression had produced nothing.
+                let parsed = js_sys::JSON::parse(s).map_err(|_| {
+                    JsValue::from_str(
+                        "SyntaxError: evalInContext result is not valid JSON (has the guest replaced JSON.stringify?)",
+                    )
+                })?;
                 let value = from_js(&parsed).map_err(to_js_error)?;
                 to_js(&value).map_err(to_js_error)
             }
@@ -788,33 +908,173 @@ impl Engine {
         }
     }
 
-    /// Take the `host.call(...)` requests the script queued during the last
-    /// re-entry, as `[{ id, kind, args }]`.
+    /// Take the `host.call(...)` requests the script has queued, as
+    /// `[{ id, kind, args }]`, oldest first.
+    ///
+    /// The transfer is transactional. A request leaves the guest queue only
+    /// once its host representation exists: the engine reads a bounded
+    /// prefix, converts it, and commits exactly that prefix, so a conversion
+    /// failure leaves the queue intact and is retried with a smaller prefix.
+    /// Every accepted request therefore ends in one of three states —
+    /// delivered here exactly once, still queued for the next drain (when the
+    /// per-drain request or byte allowance is used up), or, for a single
+    /// request too large to cross even on its own, rejected: it is removed and its
+    /// callback is invoked with a `RangeError`, so no callback is left
+    /// pending for a request the host will never see. A host that wants an
+    /// empty queue keeps draining until this returns an empty array.
+    ///
+    /// Until the 11 September 2026 audit's ZIPP-02 the guest helper emptied
+    /// the queue before its return value crossed the converter, so a
+    /// conversion failure discarded every queued request while their
+    /// callbacks stayed registered forever.
     #[wasm_bindgen(js_name = drainPendingHostCalls)]
     pub fn drain_pending_host_calls(&mut self) -> Result<JsValue, JsValue> {
         self.ensure_live()?;
-        let (Some(slot), Some(st)) = (self.helpers.drain_host_calls, self.state.as_mut()) else {
-            return Ok(js_sys::Array::new().into());
+        let out = js_sys::Array::new();
+        let (Some(peek), Some(commit), Some(reject)) = (
+            self.helpers.peek_host_calls,
+            self.helpers.commit_host_calls,
+            self.helpers.reject_host_call,
+        ) else {
+            return Ok(out.into());
         };
-        let result = st.call_slot(slot, &[]);
-        let value = self.finish_execution(result)?;
-        to_js(&value).map_err(to_js_error)
+        if self.state.is_none() {
+            return Ok(out.into());
+        }
+        // Two aggregate budgets for the whole drain, one per conversion stage
+        // (VM graph to host values, host values to JS), each charged only by
+        // committed prefixes.
+        let mut walk_budget = HostValueBudget::new(
+            DEFAULT_HOST_VALUE_MAX_NODES,
+            MAX_HOST_CALL_DRAIN_STRING_BYTES,
+        );
+        let mut js_budget = HostValueBudget::new(
+            DEFAULT_HOST_VALUE_MAX_NODES,
+            MAX_HOST_CALL_DRAIN_STRING_BYTES,
+        );
+        let mut chunk = MAX_HOST_CALL_DRAIN_CHUNK;
+        let mut delivered: u32 = 0;
+        loop {
+            if delivered >= MAX_HOST_CALL_DRAIN_REQUESTS {
+                break;
+            }
+            let want = chunk.min(MAX_HOST_CALL_DRAIN_REQUESTS - delivered);
+            let mut attempt_walk = walk_budget.clone();
+            let mut attempt_js = js_budget.clone();
+            match self.peek_host_calls(peek, want, &mut attempt_walk, &mut attempt_js)? {
+                Ok(items) => {
+                    // Engine-built, so the audited Reflect bindings suffice
+                    // (no new host import for the artifact's pinned surface).
+                    let count =
+                        checked_array_length(&items, "host call batch").map_err(to_js_error)?;
+                    if count == 0 {
+                        break;
+                    }
+                    // Commit BEFORE appending: the guest queue is the source of
+                    // truth until the prefix is off it.
+                    self.call_helper(commit, &[HostValue::Number(count as f64)])?;
+                    for i in 0..count {
+                        out.push(
+                            &checked_array_get(&items, i, "host call batch")
+                                .map_err(to_js_error)?,
+                        );
+                    }
+                    walk_budget = attempt_walk;
+                    js_budget = attempt_js;
+                    delivered += count;
+                    if count < want {
+                        break;
+                    }
+                    chunk = (chunk * 2).min(MAX_HOST_CALL_DRAIN_CHUNK);
+                }
+                Err(_) if want > 1 => {
+                    chunk = (want / 2).max(1);
+                }
+                Err(reason) => {
+                    // One request did not fit under the drain's remaining
+                    // allowance. Alone, under a fresh full allowance, it
+                    // either fits — then the AGGREGATE is what ran out and
+                    // the request stays queued for the next drain — or it
+                    // does not, and it can never cross: settle it.
+                    let mut solo_walk = HostValueBudget::new(
+                        DEFAULT_HOST_VALUE_MAX_NODES,
+                        MAX_HOST_CALL_DRAIN_STRING_BYTES,
+                    );
+                    let mut solo_js = HostValueBudget::new(
+                        DEFAULT_HOST_VALUE_MAX_NODES,
+                        MAX_HOST_CALL_DRAIN_STRING_BYTES,
+                    );
+                    if delivered > 0
+                        && self
+                            .peek_host_calls(peek, 1, &mut solo_walk, &mut solo_js)?
+                            .is_ok()
+                    {
+                        break;
+                    }
+                    let message = format!(
+                        "host.call: request exceeds the {MAX_HOST_CALL_DRAIN_STRING_BYTES}-byte transport limit ({reason})"
+                    );
+                    let removed = self.call_helper(reject, &[HostValue::String(message)])?;
+                    if !matches!(removed, HostValue::Number(n) if n == 1.0) {
+                        break;
+                    }
+                    chunk = MAX_HOST_CALL_DRAIN_CHUNK;
+                }
+            }
+        }
+        Ok(out.into())
     }
 
-    /// Invoke the callback the script passed to `host.call` for `call_id`.
+    /// Invoke the callback the script passed to `host.call` for `call_id`,
+    /// returning whether one was pending. `false` means the id is unknown:
+    /// never issued, already completed, or cancelled — a late or duplicate
+    /// completion is a no-op, not an error.
+    ///
+    /// The id is the JavaScript Number the guest's counter produced; it is
+    /// validated as a finite positive integer up to 2^53 rather than
+    /// truncated to 32 bits, so the 2^32nd request can be completed like any
+    /// other (the 11 September 2026 audit's ZIPP-13). Guest-issued ids are
+    /// bookkeeping, not authorization: a host must still bind each completion
+    /// to the Worker/tenant generation that issued the request.
     #[wasm_bindgen(js_name = resolveHostCallback)]
-    pub fn resolve_host_callback(&mut self, call_id: u32, result: JsValue) -> Result<(), JsValue> {
+    pub fn resolve_host_callback(
+        &mut self,
+        call_id: f64,
+        result: JsValue,
+    ) -> Result<bool, JsValue> {
         self.ensure_live()?;
+        let call_id = host_call_id(call_id)?;
         let (Some(slot), Some(st)) = (self.helpers.resolve_host_call, self.state.as_mut()) else {
-            return Ok(());
+            return Ok(false);
         };
         let mut budget = HostValueBudget::default();
         budget.charge_node().map_err(to_js_error)?;
         let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
         let result = from_js_bounded(&result, 0, &seen, &mut budget).map_err(to_js_error)?;
-        let args = [HostValue::Number(call_id as f64), result];
-        let result = st.call_slot(slot, &args).map(|_| ());
-        self.finish_execution(result)
+        let args = [HostValue::Number(call_id), result];
+        let result = st.call_slot(slot, &args);
+        Ok(matches!(
+            self.finish_execution(result)?,
+            HostValue::Number(n) if n == 1.0
+        ))
+    }
+
+    /// Release the callback pending for `call_id` WITHOUT invoking it — the
+    /// host cancelled or timed the request out. Returns whether one was
+    /// pending; a later `resolveHostCallback` for the same id then reports
+    /// `false` and runs nothing.
+    #[wasm_bindgen(js_name = cancelHostCallback)]
+    pub fn cancel_host_callback(&mut self, call_id: f64) -> Result<bool, JsValue> {
+        self.ensure_live()?;
+        let call_id = host_call_id(call_id)?;
+        let (Some(slot), Some(st)) = (self.helpers.cancel_host_call, self.state.as_mut()) else {
+            return Ok(false);
+        };
+        let result = st.call_slot(slot, &[HostValue::Number(call_id)]);
+        Ok(matches!(
+            self.finish_execution(result)?,
+            HostValue::Number(n) if n == 1.0
+        ))
     }
 
     /// Run pending microtasks without calling into the script.
@@ -827,20 +1087,43 @@ impl Engine {
         self.finish_execution(Ok(()))
     }
 
-    /// Drain `console.log`/`info`/`debug` output produced so far.
+    /// Drain every console line produced so far — `log`/`info`/`debug` and
+    /// `warn`/`error` alike — in the order they were written. (The two
+    /// streams used to be concatenated, stdout first, so interleaved
+    /// messages lost their order: the 11 September 2026 audit's ZIPP-14.)
+    /// `takeConsole` returns the same lines tagged with their stream.
     #[wasm_bindgen(js_name = takeOutput)]
     pub fn take_output(&mut self) -> Result<JsValue, JsValue> {
         self.ensure_live()?;
         let mut lines = Vec::new();
         if let Some(st) = self.state.as_mut() {
-            for line in st.take_output() {
-                lines.push(HostValue::String(line));
-            }
-            for line in st.take_errput() {
+            for (_, line) in st.take_console() {
                 lines.push(HostValue::String(line));
             }
         }
         to_js(&HostValue::Array(lines)).map_err(to_js_error)
+    }
+
+    /// Drain every console line produced so far, in order, as
+    /// `[{ stream: "stdout" | "stderr", text }]`. Draining here empties the
+    /// same buffers `takeOutput` drains.
+    #[wasm_bindgen(js_name = takeConsole)]
+    pub fn take_console(&mut self) -> Result<JsValue, JsValue> {
+        self.ensure_live()?;
+        let mut records = Vec::new();
+        if let Some(st) = self.state.as_mut() {
+            for (stream, line) in st.take_console() {
+                let stream = match stream {
+                    ConsoleStream::Stdout => "stdout",
+                    ConsoleStream::Stderr => "stderr",
+                };
+                records.push(HostValue::Object(vec![
+                    ("stream".into(), HostValue::String(stream.into())),
+                    ("text".into(), HostValue::String(line)),
+                ]));
+            }
+        }
+        to_js(&HostValue::Array(records)).map_err(to_js_error)
     }
 
     /// Tear the VM down. The engine is unusable afterwards.
@@ -891,6 +1174,50 @@ impl Engine {
             return Err(error);
         }
         result.map_err(|error| JsValue::from_str(&error))
+    }
+
+    /// Read the first `want` queued requests through the preamble's peek
+    /// helper and convert them to a JS array, charging `walk` and `js`. The
+    /// outer `Err` is terminal (a resource ceiling, or a guest throw from a
+    /// tampered helper); the inner `Err` is a conversion failure carrying the
+    /// limit that was crossed, which the drain answers by trying less.
+    fn peek_host_calls(
+        &mut self,
+        peek: u32,
+        want: u32,
+        walk: &mut HostValueBudget,
+        js: &mut HostValueBudget,
+    ) -> Result<Result<JsValue, String>, JsValue> {
+        let st = self
+            .state
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
+        let peeked = st.call_slot_bounded(peek, &[HostValue::Number(want as f64)], walk);
+        if let Some(error) = st.resource_limit_error() {
+            let error = JsValue::from_str(error);
+            self.terminate();
+            return Err(error);
+        }
+        let value = match peeked {
+            Ok(value) => value,
+            Err(HostCallError::Conversion(limit)) => return Ok(Err(limit)),
+            Err(HostCallError::Thrown(message)) => return Err(JsValue::from_str(&message)),
+        };
+        if !matches!(value, HostValue::Array(_)) {
+            return Err(JsValue::from_str("zipp: host call queue is not an array"));
+        }
+        Ok(to_js_bounded(&value, js))
+    }
+
+    /// Call a preamble helper by slot, with the usual terminal handling of a
+    /// resource ceiling.
+    fn call_helper(&mut self, slot: u32, args: &[HostValue]) -> Result<HostValue, JsValue> {
+        let st = self
+            .state
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
+        let result = st.call_slot(slot, args);
+        self.finish_execution(result)
     }
 
     fn terminate(&mut self) {
@@ -962,24 +1289,47 @@ pub fn accel_guest_call(name: &str, args: &[f64]) -> Result<f64, JsValue> {
 /// above all — is refused here, before the adapter sees the spec, rather than
 /// forwarded for the adapter to trust (the 6 September 2026 audit's Z02).
 /// Names must be identifiers and unique; a `c:` target is an identifier; an
-/// `a:` id is a non-negative integer; an `n:` operand is a finite number.
+/// `a:` id is a non-negative safe integer; an `n:` operand is a finite number.
+///
+/// Two phases, and the order is the point: the WHOLE spec is parsed into a
+/// validated form — size, entry count and name lengths bounded, duplicates
+/// found through a set — before a single region is resolved, and the regions
+/// are then resolved as one transaction. A spec whose later entry is invalid
+/// therefore pins nothing and never reaches the adapter; it used to pin the
+/// earlier entries' buffers first and check duplicates by scanning a growing
+/// list (the 11 September 2026 audit's ZIPP-08).
 fn resolve_accel_spec(ctx: &mut dyn HostCtx, spec: &str) -> Result<String, String> {
     fn is_identifier(s: &str) -> bool {
         let mut chars = s.chars();
-        matches!(chars.next(), Some(c) if c == '_' || c == '$' || c.is_ascii_alphabetic())
+        s.len() <= MAX_ACCEL_SPEC_NAME_BYTES
+            && matches!(chars.next(), Some(c) if c == '_' || c == '$' || c.is_ascii_alphabetic())
             && chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
     }
     fn refuse(entry: &str, why: &str) -> String {
         format!("TypeError: accel.make: {entry:?} {why}")
     }
+    enum Binding<'a> {
+        /// `g:GLOBAL` — resolved to a region in phase two.
+        Region(&'a str),
+        /// Forwarded exactly as written.
+        Verbatim,
+    }
     if spec.is_empty() {
         return Ok(String::new());
     }
-    let mut out = String::with_capacity(spec.len() + 64);
-    let mut names: Vec<&str> = Vec::new();
-    for (i, entry) in spec.split(',').enumerate() {
-        if i > 0 {
-            out.push(',');
+    if spec.len() > MAX_ACCEL_SPEC_BYTES {
+        return Err(format!(
+            "RangeError: accel.make: spec exceeds the {MAX_ACCEL_SPEC_BYTES}-byte limit"
+        ));
+    }
+    // Phase one: parse and validate everything; touch nothing.
+    let mut entries: Vec<(&str, Binding)> = Vec::new();
+    let mut names: HashSet<&str> = HashSet::new();
+    for entry in spec.split(',') {
+        if entries.len() >= MAX_ACCEL_SPEC_ENTRIES {
+            return Err(format!(
+                "RangeError: accel.make: spec exceeds the {MAX_ACCEL_SPEC_ENTRIES}-entry limit"
+            ));
         }
         let Some((name, binding)) = entry.split_once('=') else {
             return Err(refuse(entry, "is not NAME=BINDING"));
@@ -987,17 +1337,50 @@ fn resolve_accel_spec(ctx: &mut dyn HostCtx, spec: &str) -> Result<String, Strin
         if !is_identifier(name) {
             return Err(refuse(entry, "does not name a binding"));
         }
-        if names.contains(&name) {
+        if !names.insert(name) {
             return Err(refuse(entry, "binds a name twice"));
         }
-        names.push(name);
         let (tag, value) = match binding.split_once(':') {
             Some((tag, value)) => (tag, Some(value)),
             None => (binding, None),
         };
-        match (tag, value) {
-            ("g", Some(global)) if is_identifier(global) => {
-                let (ptr, len, kind) = ctx.typed_array_region(global)?;
+        let binding = match (tag, value) {
+            ("g", Some(global)) if is_identifier(global) => Binding::Region(global),
+            ("c", Some(global)) if is_identifier(global) => Binding::Verbatim,
+            ("a", Some(id)) if is_accel_id_text(id) => Binding::Verbatim,
+            ("n", Some(number)) if number.parse::<f64>().is_ok_and(f64::is_finite) => {
+                Binding::Verbatim
+            }
+            ("t", None) => Binding::Verbatim,
+            _ => {
+                return Err(refuse(
+                    entry,
+                    "is not a public binding (NAME=g:GLOBAL, NAME=c:GLOBAL, NAME=a:ID, NAME=n:NUMBER or NAME=t)",
+                ))
+            }
+        };
+        entries.push((entry, binding));
+    }
+    // Phase two: every region at once — all pinned, or none.
+    let globals: Vec<&str> = entries
+        .iter()
+        .filter_map(|(_, binding)| match binding {
+            Binding::Region(global) => Some(*global),
+            Binding::Verbatim => None,
+        })
+        .collect();
+    let mut regions = ctx.typed_array_regions(&globals)?.into_iter();
+    let mut out = String::with_capacity(spec.len() + 64);
+    for (i, (entry, binding)) in entries.into_iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        match binding {
+            Binding::Region(_) => {
+                let (ptr, len, kind) = regions
+                    .next()
+                    .ok_or_else(|| "Error: accel.make: region count mismatch".to_owned())?;
+                let name = entry.split_once('=').map(|(n, _)| n).unwrap_or(entry);
                 out.push_str(name);
                 out.push_str("=r:");
                 out.push_str(&ptr.to_string());
@@ -1006,23 +1389,38 @@ fn resolve_accel_spec(ctx: &mut dyn HostCtx, spec: &str) -> Result<String, Strin
                 out.push(':');
                 out.push_str(&kind.to_string());
             }
-            ("c", Some(global)) if is_identifier(global) => out.push_str(entry),
-            ("a", Some(id)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => {
-                out.push_str(entry)
-            }
-            ("n", Some(number)) if number.parse::<f64>().is_ok_and(f64::is_finite) => {
-                out.push_str(entry)
-            }
-            ("t", None) => out.push_str(entry),
-            _ => {
-                return Err(refuse(
-                    entry,
-                    "is not a public binding (NAME=g:GLOBAL, NAME=c:GLOBAL, NAME=a:ID, NAME=n:NUMBER or NAME=t)",
-                ))
-            }
+            Binding::Verbatim => out.push_str(entry),
         }
     }
     Ok(out)
+}
+
+/// An `a:ID` operand: decimal digits naming a non-negative safe integer.
+fn is_accel_id_text(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 16
+        && id.bytes().all(|b| b.is_ascii_digit())
+        && id.parse::<f64>().is_ok_and(|n| n <= MAX_ACCEL_ID)
+}
+
+/// A function or trace-slot identifier as the guest passes it to the
+/// synchronous accelerator bridge: a finite, integral, non-negative number in
+/// the safe range. A successful generic `f64` parse is not sufficient for an
+/// identifier.
+fn accel_identifier(kind: &str, text: &str) -> Result<JsValue, String> {
+    parse_accel_identifier(kind, text).map(JsValue::from_f64)
+}
+
+fn parse_accel_identifier(kind: &str, text: &str) -> Result<f64, String> {
+    text.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|n| n.is_finite() && *n >= 0.0 && n.fract() == 0.0 && *n <= MAX_ACCEL_ID)
+        .ok_or_else(|| {
+            format!(
+                "TypeError: host bridge call '{kind}' expects a non-negative integer identifier"
+            )
+        })
 }
 
 /// Linked WebAssembly linear-memory maximum, in bytes. Set by the linker from
@@ -1037,15 +1435,43 @@ const LINKED_MEMORY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// of its rows described an older build (the 6 September 2026 audit's Z04).
 /// This is read from the same constants the engine enforces, so it cannot
 /// drift; `tests/node/profile-matches-readme.cjs` holds the README to it.
+///
+/// `profileVersion` 2 adds provenance and policy (the 11 September 2026
+/// audit's ZIPP-18): the source revision the release pipeline built from
+/// (`source.sha`, `null` in an unlabelled local build), the grammar goal and
+/// strict-mode policy guests are compiled under, the string-transport
+/// contract, the batch-write arity, the host-call id width, and the
+/// host-boundary work limits — value nodes and bytes, the asynchronous
+/// queue's drain and per-request ceilings, the fingerprint budget and the
+/// accelerator spec bounds. Fields are only ever added; a host should read
+/// the ones it knows.
 #[wasm_bindgen(js_name = zippProfile)]
 pub fn zipp_profile() -> String {
+    let source_sha = match option_env!("ZIPP_SOURCE_SHA") {
+        Some(sha) if !sha.is_empty() && sha.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            format!("\"{sha}\"")
+        }
+        _ => "null".to_owned(),
+    };
     format!(
         concat!(
             "{{",
             "\"engine\":\"zipp-wasm\",",
             "\"version\":\"{version}\",",
+            "\"profileVersion\":2,",
+            "\"source\":{{\"sha\":{source_sha},\"target\":\"wasm32-unknown-unknown\"}},",
             "\"features\":[\"safe-sandbox\",\"meter-only\",\"wasm-no-fs-loader\",\"wasm-single-agent\"],",
-            "\"semantics\":{{\"callOrder\":\"strict\"}},",
+            "\"semantics\":{{",
+            "\"callOrder\":\"strict\",",
+            "\"parseGoal\":\"script-compat\",",
+            "\"topLevelReturn\":true,",
+            "\"guestStrictMode\":\"directive-prologue\",",
+            "\"stringTransport\":\"unicode-scalar\",",
+            "\"batchWriteArity\":\"strict\",",
+            "\"hostCallIdBits\":53,",
+            "\"consoleOutput\":\"chronological\",",
+            "\"hostCallDrain\":\"transactional\"",
+            "}},",
             "\"limits\":{{",
             "\"initialSourceBytes\":{initial_source},",
             "\"evalExpressionBytes\":{eval_expression},",
@@ -1064,10 +1490,23 @@ pub fn zipp_profile() -> String {
             "\"syncBridgeKindBytes\":{bridge_kind},",
             "\"syncBridgeArgs\":{bridge_args},",
             "\"syncBridgeBytes\":{bridge_bytes},",
-            "\"syncCapabilityEntries\":{capability_entries}",
+            "\"syncCapabilityEntries\":{capability_entries},",
+            "\"hostValueNodes\":{host_value_nodes},",
+            "\"hostValueStringBytes\":{host_value_string_bytes},",
+            "\"fingerprintNodes\":{host_value_nodes},",
+            "\"fingerprintStringBytes\":{host_value_string_bytes},",
+            "\"hostCallQueue\":{host_call_queue},",
+            "\"hostCallPending\":{host_call_pending},",
+            "\"hostCallRequestUnits\":{host_call_request_units},",
+            "\"hostCallDrainRequests\":{host_call_drain_requests},",
+            "\"hostCallDrainStringBytes\":{host_call_drain_string_bytes},",
+            "\"accelSpecBytes\":{accel_spec_bytes},",
+            "\"accelSpecEntries\":{accel_spec_entries},",
+            "\"accelSpecNameBytes\":{accel_spec_name_bytes}",
             "}}}}"
         ),
         version = env!("CARGO_PKG_VERSION"),
+        source_sha = source_sha,
         initial_source = MAX_INITIAL_SOURCE_BYTES,
         eval_expression = MAX_EVAL_SOURCE_BYTES,
         eval_retained = MAX_EVAL_RETAINED_SOURCE_BYTES,
@@ -1086,6 +1525,16 @@ pub fn zipp_profile() -> String {
         bridge_args = MAX_SYNC_BRIDGE_ARGS,
         bridge_bytes = MAX_SYNC_BRIDGE_BYTES,
         capability_entries = MAX_SYNC_CAPABILITY_ENTRIES,
+        host_value_nodes = DEFAULT_HOST_VALUE_MAX_NODES,
+        host_value_string_bytes = DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
+        host_call_queue = PREAMBLE_HOST_CALL_QUEUE_MAX,
+        host_call_pending = PREAMBLE_HOST_CALL_PENDING_MAX,
+        host_call_request_units = PREAMBLE_HOST_CALL_REQUEST_MAX_UNITS,
+        host_call_drain_requests = MAX_HOST_CALL_DRAIN_REQUESTS,
+        host_call_drain_string_bytes = MAX_HOST_CALL_DRAIN_STRING_BYTES,
+        accel_spec_bytes = MAX_ACCEL_SPEC_BYTES,
+        accel_spec_entries = MAX_ACCEL_SPEC_ENTRIES,
+        accel_spec_name_bytes = MAX_ACCEL_SPEC_NAME_BYTES,
     )
 }
 
@@ -1146,8 +1595,10 @@ fn host_dispatch_ctx(
             &JsValue::from_str(&args[1]),
         ),
         "make" => {
+            // Validate the identifier BEFORE the spec resolves and pins.
+            let id = accel_identifier(kind, &args[0])?;
             let spec = resolve_accel_spec(ctx, &args[1])?;
-            f.call2(&target, &number(&args[0])?, &JsValue::from_str(&spec))
+            f.call2(&target, &id, &JsValue::from_str(&spec))
         }
         "state" => {
             let (ptr, len, kind) = ctx.typed_array_region(&args[0])?;
@@ -1158,9 +1609,13 @@ fn host_dispatch_ctx(
                 &JsValue::from_f64(kind as f64),
             )
         }
-        "install" => f.call2(&target, &number(&args[0])?, &number(&args[1])?),
+        "install" => f.call2(
+            &target,
+            &accel_identifier(kind, &args[0])?,
+            &accel_identifier(kind, &args[1])?,
+        ),
         "run" => {
-            let id = number(&args[0])?;
+            let id = accel_identifier(kind, &args[0])?;
             let hops = number(&args[1])?;
             let raw: *mut (dyn HostCtx + '_) = ctx;
             // SAFETY: the lifetime is erased only for storage; the pointer is
@@ -1318,6 +1773,18 @@ fn host_dispatch(
         ));
     }
     Ok(reply)
+}
+
+/// A `host.call` request id as the host hands it back: the exact Number the
+/// guest's counter produced, or a TypeError.
+fn host_call_id(call_id: f64) -> Result<f64, JsValue> {
+    if !call_id.is_finite() || call_id < 0.0 || call_id > MAX_HOST_CALL_ID || call_id.fract() != 0.0
+    {
+        return Err(JsValue::from_str(
+            "TypeError: host call id must be a non-negative safe integer",
+        ));
+    }
+    Ok(call_id)
 }
 
 fn require_bridge(bridge: JsValue, label: &str) -> Result<js_sys::Object, JsValue> {
@@ -1565,12 +2032,17 @@ fn from_js_bounded(
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_script, host_dispatch, is_allowed_sync_host_call, sync_host_call_arity, Bridges,
-        MAX_SYNC_BRIDGE_ARGS, MAX_SYNC_BRIDGE_BYTES, PREAMBLE, PREAMBLE_BINDINGS,
+        compile_script_with_preamble, host_dispatch, is_allowed_sync_host_call,
+        parse_accel_identifier, resolve_accel_spec, sync_host_call_arity, Bridges, HostCtx,
+        HostValue, GUEST_COMPILE_OPTIONS, MAX_ACCEL_SPEC_BYTES, MAX_ACCEL_SPEC_ENTRIES,
+        MAX_ACCEL_SPEC_NAME_BYTES, MAX_SYNC_BRIDGE_ARGS, MAX_SYNC_BRIDGE_BYTES, PREAMBLE,
+        PREAMBLE_BINDINGS, PREAMBLE_HOST_CALL_PENDING_MAX, PREAMBLE_HOST_CALL_QUEUE_MAX,
+        PREAMBLE_HOST_CALL_REQUEST_MAX_UNITS,
     };
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;
+    use zipp_vm::embed::compile_script;
 
     #[test]
     fn preamble_binding_manifest_matches_the_compiler() {
@@ -1593,6 +2065,238 @@ mod tests {
             actual, expected,
             "update PREAMBLE_BINDINGS with preamble.js"
         );
+    }
+
+    /// The guest's `"use strict"` must survive being placed after the
+    /// preamble, and the preamble must run identically under it.
+    #[test]
+    fn guest_directive_prologue_survives_the_preamble() {
+        let strict_undeclared = compile_script_with_preamble(
+            PREAMBLE,
+            "\"use strict\"; auditUndeclared = 1;",
+            &GUEST_COMPILE_OPTIONS,
+        )
+        .expect("compiles")
+        .run_init()
+        .expect_err("strict code may not assign an undeclared name");
+        assert!(
+            strict_undeclared.contains("ReferenceError"),
+            "{strict_undeclared}"
+        );
+
+        let mut sloppy =
+            compile_script_with_preamble(PREAMBLE, "auditUndeclared = 1;", &GUEST_COMPILE_OPTIONS)
+                .expect("compiles");
+        sloppy
+            .run_init()
+            .expect("sloppy code still creates the global");
+
+        let early = match compile_script_with_preamble(
+            PREAMBLE,
+            "\"use strict\"; function auditDuplicate(a, a) { return a; }",
+            &GUEST_COMPILE_OPTIONS,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("duplicate parameters are a strict early error"),
+        };
+        assert!(early.contains("SyntaxError"), "{early}");
+
+        for (source, expected) in [
+            (
+                "\"use strict\"; function auditThis() { return this === undefined; }",
+                true,
+            ),
+            ("function auditThis() { return this === undefined; }", false),
+            // Escaped text is not a Use Strict Directive.
+            (
+                "\"use\\x20strict\"; function auditThis() { return this === undefined; }",
+                false,
+            ),
+            // A string followed by an operator is an expression, not a directive.
+            (
+                "\"use strict\" + 1; function auditThis() { return this === undefined; }",
+                false,
+            ),
+            // Comments, a BOM and a hashbang ahead of the prologue are skipped.
+            (
+                "// leading comment\n/* block */ \"use strict\"; function auditThis() { return this === undefined; }",
+                true,
+            ),
+            (
+                "\u{feff}\"use strict\"; function auditThis() { return this === undefined; }",
+                true,
+            ),
+            (
+                "#!/usr/bin/env zipp\n\"use strict\"; function auditThis() { return this === undefined; }",
+                true,
+            ),
+        ] {
+            let mut st = compile_script_with_preamble(PREAMBLE, source, &GUEST_COMPILE_OPTIONS)
+                .expect("compiles");
+            st.run_init().expect("initializes");
+            let slot = st
+                .symbols()
+                .into_iter()
+                .find(|s| s.name == "auditThis")
+                .expect("guest function has a slot")
+                .index;
+            assert_eq!(
+                st.call_slot(slot, &[]),
+                Ok(HostValue::Bool(expected)),
+                "{source:?}"
+            );
+            // Preamble helpers keep working under either mode.
+            let peek = st
+                .symbols()
+                .into_iter()
+                .find(|s| s.name == "__zPeekHostCalls")
+                .expect("preamble helper has a slot")
+                .index;
+            assert_eq!(
+                st.call_slot(peek, &[HostValue::Number(16.0)]),
+                Ok(HostValue::Array(Vec::new()))
+            );
+        }
+    }
+
+    #[test]
+    fn preamble_queue_bounds_match_the_profile_constants() {
+        for (name, value) in [
+            ("__zHostQueueMax", PREAMBLE_HOST_CALL_QUEUE_MAX),
+            ("__zHostPendingMax", PREAMBLE_HOST_CALL_PENDING_MAX),
+            (
+                "__zHostRequestMaxUnits",
+                PREAMBLE_HOST_CALL_REQUEST_MAX_UNITS,
+            ),
+        ] {
+            let needle = format!("var {name} = {value};");
+            assert!(
+                PREAMBLE.contains(&needle),
+                "preamble.js does not declare `{needle}`"
+            );
+        }
+    }
+
+    /// A mock accelerator context that records every region request. The
+    /// engine's own implementation pins as a transaction; what this pins is
+    /// what `resolve_accel_spec` asked for, which must be nothing for a spec
+    /// with any invalid entry.
+    struct MockCtx {
+        regions: Vec<String>,
+        calls: usize,
+        bad: &'static str,
+    }
+    impl HostCtx for MockCtx {
+        fn typed_array_region(&mut self, name: &str) -> Result<(usize, usize, u8), String> {
+            self.typed_array_regions(&[name]).map(|r| r[0])
+        }
+        fn typed_array_regions(
+            &mut self,
+            names: &[&str],
+        ) -> Result<Vec<(usize, usize, u8)>, String> {
+            self.calls += 1;
+            if names.iter().any(|n| *n == self.bad) {
+                return Err(format!("TypeError: {} is not a typed array", self.bad));
+            }
+            self.regions.extend(names.iter().map(|n| (*n).to_owned()));
+            Ok(names
+                .iter()
+                .enumerate()
+                .map(|(i, _)| (4096 + i * 64, 16, 5))
+                .collect())
+        }
+        fn call_global_numbers(&mut self, _name: &str, _args: &[f64]) -> Result<f64, String> {
+            unreachable!("not used by spec resolution")
+        }
+    }
+    fn mock() -> MockCtx {
+        MockCtx {
+            regions: Vec::new(),
+            calls: 0,
+            bad: "notAnArray",
+        }
+    }
+
+    #[test]
+    fn accel_spec_is_validated_completely_before_any_region_is_resolved() {
+        // A valid region ahead of an invalid entry: nothing is resolved.
+        for spec in [
+            "a=g:buf,b=r:1:2:3",
+            "a=g:buf,b=nope",
+            "a=g:buf,a=g:buf",
+            "a=g:buf,b=a:1.5",
+            "a=g:buf,b=a:99999999999999999999",
+            "a=g:buf,b=n:NaN",
+            "a=g:buf,b=n:Infinity",
+            "a=g:buf,1b=t",
+            "a=g:buf,b=g:not an identifier",
+            "a=g:buf,b",
+        ] {
+            let mut ctx = mock();
+            assert!(
+                resolve_accel_spec(&mut ctx, spec).is_err(),
+                "{spec} accepted"
+            );
+            assert_eq!(ctx.calls, 0, "{spec} reached the region resolver");
+            assert!(ctx.regions.is_empty(), "{spec} pinned {:?}", ctx.regions);
+        }
+        // A later region that fails to resolve pins nothing either: the
+        // batch is one transaction.
+        let mut ctx = mock();
+        assert!(resolve_accel_spec(&mut ctx, "a=g:buf,b=g:notAnArray").is_err());
+        assert_eq!(ctx.calls, 1);
+        assert!(ctx.regions.is_empty());
+
+        // Too many entries, too long a name, too long a spec: refused before
+        // parsing gets far, and the duplicate check is a set rather than a
+        // scan.
+        let many: Vec<String> = (0..=MAX_ACCEL_SPEC_ENTRIES)
+            .map(|i| format!("n{i}=t"))
+            .collect();
+        let mut ctx = mock();
+        assert!(resolve_accel_spec(&mut ctx, &many.join(","))
+            .unwrap_err()
+            .contains("entry limit"));
+        let long_name = format!("{}=t", "x".repeat(MAX_ACCEL_SPEC_NAME_BYTES + 1));
+        assert!(resolve_accel_spec(&mut ctx, &long_name).is_err());
+        let huge = format!("a=n:{}", "1".repeat(MAX_ACCEL_SPEC_BYTES));
+        assert!(resolve_accel_spec(&mut ctx, &huge)
+            .unwrap_err()
+            .contains("byte limit"));
+        assert_eq!(ctx.calls, 0);
+
+        // The valid grammar still resolves, every region in one call, in
+        // entry order, with the verbatim entries forwarded exactly.
+        let mut ctx = mock();
+        let out = resolve_accel_spec(&mut ctx, "a=g:buf,f=c:step,k=a:7,x=n:-2.5e3,tr=t,b=g:other")
+            .expect("valid spec");
+        assert_eq!(
+            out,
+            "a=r:4096:16:5,f=c:step,k=a:7,x=n:-2.5e3,tr=t,b=r:4160:16:5"
+        );
+        assert_eq!(ctx.calls, 1);
+        assert_eq!(ctx.regions, ["buf", "other"]);
+        assert_eq!(resolve_accel_spec(&mut mock(), "").expect("empty"), "");
+    }
+
+    #[test]
+    fn accel_identifiers_are_integral_and_in_range() {
+        for ok in ["0", "7", " 42 ", "9007199254740991"] {
+            assert!(parse_accel_identifier("accel.run", ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "1.5",
+            "-1",
+            "NaN",
+            "Infinity",
+            "1e400",
+            "9007199254740992",
+            "9007199254740993",
+            "",
+            "x",
+        ] {
+            assert!(parse_accel_identifier("accel.run", bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

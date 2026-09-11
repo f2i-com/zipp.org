@@ -10,12 +10,13 @@ RUSTFLAGS='-Dwarnings -C link-arg=--max-memory=1073741824 -C link-arg=-zstack-si
   cargo +1.92.0 build --locked --release --target wasm32-unknown-unknown
 wasm-bindgen --target nodejs --out-dir tests/node/pkg \
   target/wasm32-unknown-unknown/release/zipp_wasm.wasm
-node tests/node/check-wasm-memory.cjs tests/node/pkg/zipp_wasm_bg.wasm
-node tests/node/host-contract.cjs
-node tests/node/worker-deadline.cjs
-node tests/node/syntax-corpus.cjs
+node tests/node/run-boundary-suite.cjs          # every required check, in order
+node tests/node/host-contract.cjs                # or any one of them
 SOFTN_REPO=../softn.com node tests/node/softn-snakegame.cjs
 ```
+
+`run-boundary-suite.cjs` is the one list CI, the release workflow and the
+security workflow all run, so the lanes cannot drift apart; `--list` prints it.
 
 They all expect the generated glue at `tests/node/pkg/` (adjust the `require` at the
 top of each file if you put it elsewhere).
@@ -37,6 +38,20 @@ top of each file if you put it elsewhere).
   with the instance still usable, never as a linear-memory trap). v0.0.1 shipped
   limits that rejected two working applications; the only browser check in the
   release workflow at the time parsed a three-token source.
+- **audit-defaults.cjs** — the host-boundary defaults the 6 September 2026
+  audit found wanting (accelerator spec grammar, the profile, pre-init
+  instruction budgets, the clock receiver, prototype-named events, request
+  normalization before registration).
+- **audit-2026-09-11.cjs** — the 11 September 2026 audit's contracts against the
+  artifact: the guest's `"use strict"` surviving the preamble, the transactional
+  `host.call` drain with rejection-and-settlement, the fingerprint work budget,
+  pre-init fingerprint seeds, accelerator spec validation before any pin,
+  strict batch-write arity, the `evalInContext` JSON projection, Number-width
+  callback ids with cancellation, chronological console output,
+  `window.dispatchEvent`, and the profile's provenance and policy fields. The
+  audit's own 15-case probe bundle ran red on v0.0.15 for 13 of them.
+- **profile-matches-readme.cjs** — holds the README's resource table to the
+  figures `zippProfile()` reports.
 - **softn-snakegame.cjs** — a real SoftN bundle's `.logic`, unmodified, driven the
   way its runtime drives it: `_init`, listener registration, arrow keys through
   `window.__snakeNextDir`, the tick loop, eating, game over, and a high score
