@@ -2617,6 +2617,14 @@ pub struct Vm<'p> {
     #[cfg(feature = "safe-sandbox")]
     gc_lock: std::rc::Rc<std::cell::Cell<u32>>,
     gc_stress: bool,
+    /// Completion values a host entry point is holding across a microtask
+    /// drain, before marshalling them (`host_call_slot_bounded`,
+    /// `host_eval_rich`). The callee's frame is gone by then, so nothing but
+    /// the Rust local referenced the value, and the drain collects between
+    /// jobs; the collector traces this stack as roots (the 11 September 2026
+    /// close audit's ZA-05). A stack, not a slot: a job can re-enter a host
+    /// entry that drains again.
+    host_result_roots: Vec<Value>,
 }
 
 /// B191 memo widths (hot names; anything else takes the full per-call proof).

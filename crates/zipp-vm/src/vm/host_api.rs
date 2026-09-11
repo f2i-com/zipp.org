@@ -1062,16 +1062,74 @@ impl<'p> Vm<'p> {
         let res = self.call_value(callee, Value::UNDEFINED, &argv);
         // Drain regardless of outcome: a throw can still have queued jobs, and
         // leaving them parked would surface them at an arbitrary later call.
+        // The completion value is rooted across the drain (ZA-05).
+        self.marshal_after_drain(res, budget)
+    }
+
+    /// Root `res`'s value, drain the microtask queue, then marshal the value
+    /// under `budget`; the root is released on every exit.
+    ///
+    /// The callee's frame has already been popped, so between the call and
+    /// the marshal the value is reachable from nothing the collector traces
+    /// except `host_result_roots` — and the drain runs guest code and polls
+    /// the collector after every job (the 11 September 2026 close audit's
+    /// ZA-05). Rooting exactly this value keeps collection ON during the
+    /// jobs: a long job still reclaims its own garbage.
+    fn marshal_after_drain(
+        &mut self,
+        res: Result<Value, crate::vm::Thrown>,
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, HostCallError> {
+        let res = match res {
+            Ok(v) => {
+                if v.is_heap() {
+                    self.host_result_roots.push(v);
+                }
+                Ok(v)
+            }
+            // The throw has reached the host: it is delivered as the message
+            // below, and nothing outside the VM can catch the value. Clear it
+            // BEFORE the drain, so neither a job nor the next entry sees it.
+            Err(t) => Err(self.take_host_throw(t)),
+        };
         self.drain_microtasks();
         match res {
             Ok(v) => {
-                let _g = self.gc_lock_guard();
-                let mut seen: Vec<u32> = Vec::new();
-                self.host_out(v, 0, &mut seen, budget)
-                    .map_err(HostCallError::Conversion)
+                let out = {
+                    let _g = self.gc_lock_guard();
+                    let mut seen: Vec<u32> = Vec::new();
+                    self.host_out(v, 0, &mut seen, budget)
+                        .map_err(HostCallError::Conversion)
+                };
+                if v.is_heap() {
+                    self.host_result_roots.pop();
+                }
+                out
             }
-            Err(t) => Err(HostCallError::Thrown(t.0)),
+            Err(message) => Err(HostCallError::Thrown(message)),
         }
+    }
+
+    /// A throw that has propagated to the host boundary, as its message.
+    ///
+    /// `run_loop` leaves `pending_throw` set when a throw escapes it, so an
+    /// ENCLOSING interpreter loop (a builtin's callback, a nested eval) can
+    /// still catch the value. At the host boundary there is no enclosing
+    /// loop: the host receives the message and the value is done. Leaving it
+    /// set was a defect the ZA-05 regression surfaced — the next entry that
+    /// reached a compiled-code exit or deopt check read the stale value as a
+    /// throw in flight and failed with the PREVIOUS call's error (native JIT
+    /// profiles; the WASM build runs no compiled tier). Every host entry
+    /// that turns a `Thrown` into a `String` goes through here.
+    pub(crate) fn take_host_throw(&mut self, t: crate::vm::Thrown) -> String {
+        self.pending_throw = None;
+        t.0
+    }
+
+    /// How many host completion values are currently rooted — zero between
+    /// host entries. Test-only: pins that every exit releases its root.
+    pub(crate) fn host_result_roots_len(&self) -> usize {
+        self.host_result_roots.len()
     }
 
     /// Run any pending microtasks. A host that resumed the script by writing
@@ -1110,16 +1168,8 @@ impl<'p> Vm<'p> {
             None,             // eval_scope_idx
             None,             // exact_src
         );
-        self.drain_microtasks();
-        match res {
-            Ok(v) => {
-                let _g = self.gc_lock_guard();
-                let mut seen: Vec<u32> = Vec::new();
-                self.host_out(v, 0, &mut seen, budget)
-                    .map_err(HostCallError::Conversion)
-            }
-            Err(t) => Err(HostCallError::Thrown(t.0)),
-        }
+        // Rooted across the drain, as a slot call's result is (ZA-05).
+        self.marshal_after_drain(res, budget)
     }
 
     /// A snapshot of what this VM currently retains and has spent — see
@@ -1615,9 +1665,11 @@ impl<'p> Vm<'p> {
                 // only when it throws, and a host-side lookup has no enclosing
                 // function to name.
                 return self.load_global_slow(idx, 0).map_err(|t| {
-                    t.0.strip_suffix(" (in <anonymous>)")
+                    let message = self.take_host_throw(t);
+                    message
+                        .strip_suffix(" (in <anonymous>)")
                         .map(str::to_owned)
-                        .unwrap_or(t.0)
+                        .unwrap_or(message)
                 });
             }
         }
@@ -1628,11 +1680,20 @@ impl<'p> Vm<'p> {
             );
             let gobj = Value::heap(self.global_this);
             if has_own {
-                return self.get_prop(gobj, name).map_err(|t| t.0);
+                return self
+                    .get_prop(gobj, name)
+                    .map_err(|t| self.take_host_throw(t));
             }
             let proto = self.object_get_prototype_of(gobj);
-            if proto.is_heap() && self.has_property_str_dyn(proto, name).map_err(|t| t.0)? {
-                return self.get_prop(gobj, name).map_err(|t| t.0);
+            if proto.is_heap() {
+                let inherited = self
+                    .has_property_str_dyn(proto, name)
+                    .map_err(|t| self.take_host_throw(t))?;
+                if inherited {
+                    return self
+                        .get_prop(gobj, name)
+                        .map_err(|t| self.take_host_throw(t));
+                }
             }
         }
         if let Some(v) = self.global_by_name(name) {

@@ -502,6 +502,7 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "safe-sandbox")]
             gc_lock: std::rc::Rc::new(std::cell::Cell::new(0)),
             gc_stress: std::env::var_os("ZIPP_GC_STRESS").is_some(),
+            host_result_roots: Vec::new(),
         }
     }
 

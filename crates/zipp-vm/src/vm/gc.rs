@@ -316,6 +316,11 @@ impl Vm<'_> {
         for &i in &self.pinned_buffers {
             root_idx!(i);
         }
+        // A host entry's completion value, held across the microtask drain
+        // that runs before it is marshalled (ZA-05).
+        for &v in &self.host_result_roots {
+            root_val!(v);
+        }
         // Short interpreter string constants memoized by immutable
         // (function, constant-slot). The cache is bounded and its Values are
         // roots just like the region-embedded constant strings below.

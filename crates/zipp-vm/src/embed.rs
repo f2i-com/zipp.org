@@ -355,7 +355,7 @@ impl ScriptState {
     pub fn run_init(&mut self) -> Result<JsValue, String> {
         self.with_vm(|vm| match vm.run() {
             Ok(v) => Ok(marshal(vm, v)),
-            Err(thrown) => Err(thrown.0),
+            Err(thrown) => Err(vm.take_host_throw(thrown)),
         })
         .unwrap_or_else(torn_down)
     }
@@ -384,7 +384,7 @@ impl ScriptState {
     pub fn eval_in_context(&mut self, src: &str) -> Result<JsValue, String> {
         self.with_vm(|vm| match eval_indirect(vm, src) {
             Ok(v) => Ok(marshal(vm, v)),
-            Err(thrown) => Err(thrown.0),
+            Err(thrown) => Err(vm.take_host_throw(thrown)),
         })
         .unwrap_or_else(torn_down)
     }
@@ -421,7 +421,7 @@ impl ScriptState {
             let argv: Vec<Value> = args.iter().map(|a| unmarshal(vm, a)).collect();
             match vm.call_value(callee, Value::UNDEFINED, &argv) {
                 Ok(v) => Ok(marshal(vm, v)),
-                Err(thrown) => Err(thrown.0),
+                Err(thrown) => Err(vm.take_host_throw(thrown)),
             }
         })
         .unwrap_or_else(torn_down)
@@ -910,6 +910,14 @@ impl ScriptState {
     #[cfg(feature = "instrument")]
     pub fn resource_limit_error(&mut self) -> Option<&'static str> {
         self.with_vm(|vm| vm.instrument_resource_limit_error())?
+    }
+
+    /// How many host completion values the VM is holding rooted right now —
+    /// always zero between calls. A test hook for the ZA-05 invariant that
+    /// every host entry releases its root on every exit; not an API.
+    #[doc(hidden)]
+    pub fn host_result_roots_for_test(&self) -> usize {
+        self.vm().map(Vm::host_result_roots_len).unwrap_or(0)
     }
 }
 
