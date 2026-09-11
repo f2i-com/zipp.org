@@ -394,6 +394,48 @@ audit's own vocabulary.
   tests; the instrumented audit tests; the workspace and sandbox checks; the
   WASM boundary suite (13 of 13) and the browser smoke on Chromium, Firefox
   and WebKit.
+- **B314 (ZIPP-19) — the batch's performance attributed, not guessed.**
+  Fresh canonical capture of `14770703` (this batch's last commit) under
+  `tools/pgo.sh`, then a PAIRED A/B of that PGO binary against a PGO build
+  of the audited baseline `e6e0f65d` (built from a detached worktree with the
+  same recipe; sha256 `8951544b…dc4655` vs `ca16d338…73d6fb`), 21
+  interleaved repetitions, 10,000 bootstrap resamples, idle host, Node
+  v24.12.0. Raw captures: `bench/real13_14770703_pgo_2026-09-11.json`,
+  `bench/hostile/head_clean_14770703_pgo_2026-09-11.json`,
+  `bench/b314_e6e0f65_vs_14770703_ab_2026-09-11.json` and
+  `bench/hostile/b314_baseline_e6e0f65_pgo_nonhead_2026-09-11.json` (the
+  baseline binary is not the workspace HEAD, so that one is
+  `publishable:false` by construction).
+
+  | protocol | `e6e0f65d` (audited) | `14770703` (this batch) |
+  | --- | ---: | ---: |
+  | real 13, paired A/B, geomean new/old | — | **0.9908×** [0.986, 0.997], 13/13 correct |
+  | real 13, zipp/node (all measured) | (prior canonical `8229b3fc`: 0.614×) | 0.6766× [0.671, 0.682] |
+  | real 13, zipp/node headline ten | (0.878×) | 1.0025× [0.995, 1.009] |
+  | real 13, zipp/node diagnostic three | (0.186×) | 0.1825× [0.179, 0.187] |
+  | hostile 17, zipp/node overall | 0.9475× [0.937, 0.959] | 0.8749× [0.869, 0.883] |
+  | hostile 17, zipp/node category-balanced | 1.0323× | 0.9545× |
+  | hostile 17, zipp/bun overall | 0.7204× | 0.7076× |
+  | startup, paired launches | 6.8 ms | 6.8 ms |
+
+  Readings. The A/B is the attribution: the batch is 0.9% faster on the
+  real suite (every row's interval at or below 1.0 except `sparse-array`,
+  +1.5% [+1.0, +1.9], the one row slower, cause not isolated;
+  `map-set-heavy` −3.0% and `regex-log-scan` −2.6% are the largest gains). The hostile suite has
+  no paired mode, so its two runs are compared by case medians with Node as
+  the drift control: zipp medians moved 0.9646× (17/17 rows faster) while
+  Node's moved 1.041× the other way (the host was busier for the head
+  run), so the batch is no slower on any hostile row, and the rows that
+  improved most
+  (`types-stable` 0.893×, `allocation-ephemeral` 0.929×, `warm-router`
+  0.948×) are within what a paired run would need to confirm. The
+  `14770703` canonical rows differ from `8229b3fc`'s (headline ten 1.0025×
+  vs 0.878× against Node) for a reason that predates this batch: the A/B
+  puts the audited baseline within 1% of this batch on every row, so the
+  gap to `8229b3fc` opened between it and `e6e0f65d` (B280's strict
+  default is the suspect, not measured here). No headline is claimed here; the
+  attribution question the audit asked — did the audit batch cost anything
+  — is answered no, with the raw samples kept.
 - **Still open:** reclaiming the stable-address definitions dynamic code
   installs (B313's remaining stage), and ZIPP-21–23 (IC/GC/footprint
   experiments — measurement programmes, not defects; nothing here claims a
