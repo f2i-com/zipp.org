@@ -18,7 +18,7 @@
 //!   is a SyntaxError here, as the spec requires.
 
 use crate::parse::ast::{Goal, Program};
-use crate::parse::parser::ParseOptions;
+use crate::parse::parser::{ParseOptions, Parser};
 use crate::parse::stmt::{parse, parse_exact};
 
 fn err_str(e: crate::parse::parser::SyntaxError) -> String {
@@ -49,15 +49,59 @@ pub(crate) fn pure_script_goal() -> bool {
 }
 
 pub(crate) fn parse_script(src: &str) -> Result<Program, String> {
-    let allow_return = !pure_script_goal();
+    parse_script_with(src, !pure_script_goal(), false)
+}
+
+/// [`parse_script`] with the two policies an embedder may need to decide for
+/// itself rather than inherit: whether top-level `return` is legal (the
+/// CommonJS-shaped compatibility grammar) and whether the program is strict
+/// code regardless of its own prologue.
+///
+/// `force_strict` exists for [`crate::embed::compile_script_with_preamble`]:
+/// when engine plumbing is prepended to a guest, the guest's `"use strict"`
+/// is no longer the program's directive prologue, so its strictness has to be
+/// decided by [`script_prologue_is_strict`] on the guest text alone and then
+/// applied here. It is not a way to make every script strict.
+pub(crate) fn parse_script_with(
+    src: &str,
+    allow_return: bool,
+    force_strict: bool,
+) -> Result<Program, String> {
     parse(
         src,
         ParseOptions {
             allow_return,
+            force_strict,
             ..ParseOptions::script()
         },
     )
     .map_err(err_str)
+}
+
+/// Whether `src`'s OWN directive prologue turns strict mode on, decided by the
+/// parser's directive-prologue production rather than by a text search: the
+/// raw-text rule applies (`"use strict"` is an ordinary string), a string
+/// followed by an operator is an expression, and a comment, BOM or hashbang
+/// ahead of the prologue is skipped exactly as a full parse would skip it.
+///
+/// A prologue the parser cannot even read reports `true`. The only way the
+/// probe fails on text a full sloppy parse would accept is a legacy octal
+/// escape inside a prologue that also carries `"use strict"` — a strict-mode
+/// early error — and treating it as strict is what lets the full parse
+/// report that error at its real position. A genuine lexing failure fails
+/// the full parse identically under either mode.
+pub(crate) fn script_prologue_is_strict(src: &str, allow_return: bool) -> bool {
+    let opts = ParseOptions {
+        allow_return,
+        ..ParseOptions::script()
+    };
+    let Ok(mut parser) = Parser::new_exact(src, None, opts) else {
+        return true;
+    };
+    match parser.directive_prologue() {
+        Ok((_, strict)) => strict,
+        Err(_) => true,
+    }
 }
 
 pub(crate) fn parse_module(src: &str) -> Result<Program, String> {

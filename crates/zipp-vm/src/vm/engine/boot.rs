@@ -179,6 +179,7 @@ impl<'p> Vm<'p> {
             jit_steps: 0,
             output: Vec::new(),
             errput: Vec::new(),
+            console_order: Vec::new(),
             host: None,
             host_ctx: None,
             start_mono_ms: crate::vm::clock::now_mono_ms(),

@@ -3431,7 +3431,7 @@ impl<'p> Vm<'p> {
                 #[cfg(feature = "instrument")]
                 self.instrument_output_line(&line)
                     .map_err(|msg| Thrown(msg.into()))?;
-                self.output.push(line);
+                self.push_console_line(line, false);
                 Value::UNDEFINED
             }
             CONSOLE_LOG | CONSOLE_INFO | CONSOLE_DEBUG => {
@@ -3439,7 +3439,7 @@ impl<'p> Vm<'p> {
                 #[cfg(feature = "instrument")]
                 self.instrument_output_line(&line)
                     .map_err(|msg| Thrown(msg.into()))?;
-                self.output.push(line);
+                self.push_console_line(line, false);
                 Value::UNDEFINED
             }
             CONSOLE_WARN | CONSOLE_ERROR => {
@@ -3447,7 +3447,7 @@ impl<'p> Vm<'p> {
                 #[cfg(feature = "instrument")]
                 self.instrument_output_line(&line)
                     .map_err(|msg| Thrown(msg.into()))?;
-                self.errput.push(line);
+                self.push_console_line(line, true);
                 Value::UNDEFINED
             }
             AGENT_SLEEP => {

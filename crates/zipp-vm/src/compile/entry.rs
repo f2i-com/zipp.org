@@ -49,6 +49,13 @@ pub(crate) fn compile_program_inner(
     let mut c = Compiler::new(source.to_string());
     c.module_mode = module_mode;
     c.main_goal = main_goal;
+    // The parser has already folded the directive prologue, the Module goal
+    // and any caller-imposed strictness into `prog.strict`; honour it rather
+    // than re-deriving strictness from the directives alone, which would
+    // ignore a strictness the parser was told to apply
+    // (`front::parse_script_with(.., force_strict)`, used when a preamble
+    // precedes a guest whose own prologue said `"use strict"`).
+    c.force_strict = prog.strict;
     c.compile(prog)?;
     for (i, f) in c.functions.iter_mut().enumerate() {
         rewrite_string_accumulators(f, i == 0);

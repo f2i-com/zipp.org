@@ -248,10 +248,18 @@ classes, maps, dates, proxies, cycles, and other non-data shapes cross as
 or properties, preventing a host read/modify/write cycle from deleting methods
 it could not represent.
 
-Prefer `call_slot` in repeated host loops. `call_global` resolves by compiling a
-name expression and is suitable for occasional lookup, but dynamic function
-definitions retain stable VM-lifetime addresses for JIT references; compiling a
-fresh lookup at display-frame frequency is unnecessary lifetime growth.
+Prefer `call_slot` in repeated host loops: a slot is a direct index. `call_global`
+and `has_global_function` resolve the name the way a bare identifier read does —
+program and eval-created bindings, the global object and its prototype chain,
+then the builtins — on every call, reading the current binding rather than a
+cached function value, and compile nothing (until the 11 September 2026 audit's
+ZIPP-03 the name was evaluated as a fresh program per call, which spent the
+dynamic-code allowance and interned a program for the VM's lifetime). Neither
+name call drains microtasks; `call_slot` does. `compile_script_with_options`
+states the grammar goal per compilation (`ScriptGoal::Compat` or `Pure`) instead
+of inheriting the process-wide switch, and `compile_script_with_preamble`
+compiles engine plumbing ahead of a guest while keeping the guest's own
+`"use strict"` directive in force.
 
 `crates/zipp-wasm` exposes this API through wasm-bindgen and installs host
 bridges. wasm32 has no usable `std::time::Instant` implementation, so

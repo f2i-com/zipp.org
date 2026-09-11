@@ -32,16 +32,17 @@ use crate::bytecode::Program;
 use crate::value::Value;
 use crate::vm::Vm;
 
-pub use crate::vm::host_api::{HostCallCtx, HostCtx};
 pub use crate::vm::host_api::{
-    HostValue, HostValueBudget, Symbol, SymbolScope, DEFAULT_HOST_VALUE_MAX_NODES,
-    DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
+    FingerprintBudget, HostCallError, HostValue, HostValueBudget, Symbol, SymbolScope,
+    DEFAULT_HOST_VALUE_MAX_NODES, DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
 };
+pub use crate::vm::host_api::{HostCallCtx, HostCtx};
 /// The execution-trace row and its opcode contract. Full `instrument` builds
 /// expose the `ScriptState::start_trace` control API; the artifact-internal
 /// `meter-only` profile deliberately does not.
 #[cfg(feature = "instrument")]
 pub use crate::vm::instrument::{op, TraceStep};
+pub use crate::vm::ConsoleStream;
 
 /// The embedder's side of `__zippHostCall(kind, ...args)`. Arguments arrive
 /// already stringified and the reply is a string, so anything structured
@@ -124,47 +125,131 @@ pub struct ScriptState {
 /// whole program strict and silently disable Annex B.3.3 hoisting, sloppy-mode
 /// semantics and HTML-comment syntax — all of which real page scripts rely on.
 pub fn compile_script(src: &str) -> Result<ScriptState, String> {
-    let program = compile_program_source(src)?;
-    // Leak, hand the `&'static` to the VM, and keep the raw pointer so `Drop`
-    // can reclaim it. See the invariant on `ScriptState`.
-    let leaked: &'static mut Program = Box::leak(Box::new(program));
-    #[cfg(feature = "safe-sandbox")]
-    let mut vm = Vm::new(&*leaked);
-    #[cfg(not(feature = "safe-sandbox"))]
-    let program = leaked as *mut Program;
-    // SAFETY: `leaked` is a live, uniquely-owned allocation; reborrowing it as
-    // shared for the VM is fine because `program` is only dereferenced again in
-    // `Drop`, after the VM (the sole holder of the shared borrow) is gone.
-    #[cfg(not(feature = "safe-sandbox"))]
-    let mut vm = Vm::new(unsafe { &*program });
-    // No test262 host object for embedded code. `$262.agent.start()` spawns a
-    // detached OS thread running its own VM — outside any budget, abort flag,
-    // trace or timeout the embedder set — and `createRealm`/`evalScript`/
-    // `detachArrayBuffer` are equally not things a page script or a sandboxed
-    // job should reach. This API is the untrusted-code path; it does not get
-    // the harness. `zipp js` and the test262 runner still do.
-    vm.host_262 = false;
-    Ok(ScriptState {
-        vm: Some(vm),
-        #[cfg(not(feature = "safe-sandbox"))]
-        program,
-        // Unkeyed until a host supplies randomness. Documented on
-        // set_fingerprint_seed: a fixed start is solvable.
-        fp_seed: 0,
-    })
+    compile_script_with_options(src, &CompileOptions::default())
 }
 
-/// Parse + compile, applying the same Annex B call-assignment-target parse
-/// retry as [`crate::run`]: in sloppy code `f() = 1` and friends must parse and
-/// throw a ReferenceError at runtime, but oxc's AST cannot represent a call as
-/// an assignment target and fatal-errors instead. A page script that trips this
-/// should behave the same whether it is run through `run` or embedded.
-fn compile_program_source(src: &str) -> Result<Program, String> {
-    // The parser handles Annex B call assignment targets natively
-    // (`Target::Call`), so the old rewrite-and-reparse retry is gone.
-    // Main-goal: this program is the embedded VM's root activation.
-    let ast = crate::front::parse_script(src)?;
-    crate::compile::compile_main_program(&ast, src)
+/// Which grammar a script is compiled under. The engine's parser has two
+/// script goals, and which one applies used to be decided only by a
+/// process-wide switch ([`crate::set_pure_script_goal`]) that every embedder
+/// in the process shared (the 11 September 2026 audit's ZIPP-24). An
+/// embedder now states its goal per compilation; the process switch remains
+/// the default for callers that do not, which keeps the CLI and the
+/// conformance runner exactly as they were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScriptGoal {
+    /// Whatever the process-wide switch says: the compatibility grammar
+    /// unless [`crate::set_pure_script_goal`] turned the pure goal on.
+    #[default]
+    Inherit,
+    /// The CommonJS-shaped compatibility grammar: sloppy unless directed, and
+    /// top-level `return` is legal, as it is in a Node-wrapped file.
+    Compat,
+    /// The pure ECMAScript Script goal: top-level `return` is a SyntaxError.
+    Pure,
+}
+
+impl ScriptGoal {
+    fn allow_return(self) -> bool {
+        match self {
+            ScriptGoal::Inherit => !crate::front::pure_script_goal(),
+            ScriptGoal::Compat => true,
+            ScriptGoal::Pure => false,
+        }
+    }
+}
+
+/// Per-compilation policy for [`compile_script_with_options`] and
+/// [`compile_script_with_preamble`]. JavaScript strict mode is not an option
+/// here: it is the guest's own decision, made by its directive prologue.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompileOptions {
+    pub goal: ScriptGoal,
+}
+
+/// [`compile_script`] under an explicit grammar goal.
+pub fn compile_script_with_options(
+    src: &str,
+    options: &CompileOptions,
+) -> Result<ScriptState, String> {
+    let ast = crate::front::parse_script_with(src, options.goal.allow_return(), false)?;
+    let program = crate::compile::compile_main_program(&ast, src)?;
+    Ok(ScriptState::from_program(program))
+}
+
+/// Compile `preamble` followed by `source` as ONE program — the two share a
+/// global environment, so the preamble's bindings are ordinary globals the
+/// guest reaches by name and the host reaches by slot — while keeping the
+/// guest's own directive prologue in force.
+///
+/// Plain text concatenation loses that prologue: executable preamble
+/// statements precede the guest's `"use strict"`, so it is no longer a
+/// directive and an intended strict program silently runs sloppy (undeclared
+/// assignments succeed, a strict function's `this` becomes the global object,
+/// duplicate-parameter early errors vanish — the 11 September 2026 audit's
+/// ZIPP-01). Here the guest's prologue is read by the parser's own
+/// directive-prologue production on the guest text alone and the combined
+/// program is then parsed under that strictness. The preamble is written to
+/// be strict-clean, so it runs the same either way; the guest is exactly as
+/// strict as it asked to be, and only then.
+///
+/// Source positions are those of the concatenation, exactly as before: a
+/// host still corrects a compile error's line by the number of preamble
+/// lines. A guest hashbang is honoured even though it is no longer the first
+/// bytes of the program (it is turned into a line comment of the same
+/// length), and a guest BOM is whitespace.
+pub fn compile_script_with_preamble(
+    preamble: &str,
+    source: &str,
+    options: &CompileOptions,
+) -> Result<ScriptState, String> {
+    let allow_return = options.goal.allow_return();
+    let strict = crate::front::script_prologue_is_strict(source, allow_return);
+    let mut full = String::with_capacity(preamble.len() + 1 + source.len());
+    full.push_str(preamble);
+    full.push('\n');
+    let guest_start = full.len();
+    full.push_str(source);
+    if source.starts_with("#!") {
+        // Same byte length, same line count: positions stay those of the
+        // concatenation.
+        full.replace_range(guest_start..guest_start + 2, "//");
+    }
+    let ast = crate::front::parse_script_with(&full, allow_return, strict)?;
+    let program = crate::compile::compile_main_program(&ast, &full)?;
+    Ok(ScriptState::from_program(program))
+}
+
+impl ScriptState {
+    /// Take ownership of a compiled program and boot a VM over it.
+    fn from_program(program: Program) -> ScriptState {
+        // Leak, hand the `&'static` to the VM, and keep the raw pointer so `Drop`
+        // can reclaim it. See the invariant on `ScriptState`.
+        let leaked: &'static mut Program = Box::leak(Box::new(program));
+        #[cfg(feature = "safe-sandbox")]
+        let mut vm = Vm::new(&*leaked);
+        #[cfg(not(feature = "safe-sandbox"))]
+        let program = leaked as *mut Program;
+        // SAFETY: `leaked` is a live, uniquely-owned allocation; reborrowing it as
+        // shared for the VM is fine because `program` is only dereferenced again in
+        // `Drop`, after the VM (the sole holder of the shared borrow) is gone.
+        #[cfg(not(feature = "safe-sandbox"))]
+        let mut vm = Vm::new(unsafe { &*program });
+        // No test262 host object for embedded code. `$262.agent.start()` spawns a
+        // detached OS thread running its own VM — outside any budget, abort flag,
+        // trace or timeout the embedder set — and `createRealm`/`evalScript`/
+        // `detachArrayBuffer` are equally not things a page script or a sandboxed
+        // job should reach. This API is the untrusted-code path; it does not get
+        // the harness. `zipp js` and the test262 runner still do.
+        vm.host_262 = false;
+        ScriptState {
+            vm: Some(vm),
+            #[cfg(not(feature = "safe-sandbox"))]
+            program,
+            // Unkeyed until a host supplies randomness. Documented on
+            // set_fingerprint_seed: a fixed start is solvable.
+            fp_seed: 0,
+        }
+    }
 }
 
 impl ScriptState {
@@ -285,21 +370,33 @@ impl ScriptState {
 
     /// Call the global function `name` with `args`, returning its result.
     ///
-    /// The preferred way to re-enter a live script: unlike
+    /// The preferred way to re-enter a live script by name: unlike
     /// [`Self::eval_in_context`] it compiles nothing and splices no values into
     /// source text, so an argument that happens to contain a quote or a
-    /// `);` cannot alter the code that runs.
+    /// `);` cannot alter the code that runs. The callee is resolved the way a
+    /// bare identifier read is — program and eval-created bindings, the
+    /// global object and its prototype chain, then the builtins — on every
+    /// call, so a reassigned binding is seen, and the dynamic-compilation
+    /// allowance is untouched. (Until the 11 September 2026 audit's ZIPP-03
+    /// the name was evaluated as a fresh program per call.)
     ///
     /// `name` must be a plain global identifier. Arguments cross as primitives;
     /// pass anything structured as a JSON string and parse it on the JS side.
+    /// A name that does not resolve is a `ReferenceError`; one that resolves
+    /// to a non-callable is a `TypeError`; a throw inside the call is that
+    /// throw's message.
+    ///
+    /// Microtasks the call schedules are NOT drained here — see
+    /// [`Self::run_microtasks`]; [`Self::call_slot`] drains them itself.
     pub fn call_global(&mut self, name: &str, args: &[JsValue]) -> Result<JsValue, String> {
         if !is_identifier(name) {
             return Err(format!("zipp: {name:?} is not a global identifier"));
         }
         let vm = self.vm.as_mut().ok_or("zipp: VM has been torn down")?;
-        // Resolve the callee by name through the eval pipeline (which knows how
-        // to reach both program slots and builtins), then call it directly.
-        let callee = eval_indirect(vm, name).map_err(|t| t.0)?;
+        let callee = vm.host_resolve_global_by_name(name)?;
+        if !vm.is_callable(callee) {
+            return Err(format!("TypeError: {name} is not a function"));
+        }
         let argv: Vec<Value> = args.iter().map(|a| unmarshal(vm, a)).collect();
         match vm.call_value(callee, Value::UNDEFINED, &argv) {
             Ok(v) => Ok(marshal(vm, v)),
@@ -308,15 +405,24 @@ impl ScriptState {
     }
 
     /// Whether `name` resolves to a callable global — lets a host probe for an
-    /// optional entry point without paying for a throw.
+    /// optional entry point without paying for a throw, and without
+    /// compiling anything: the same lookup [`Self::call_global`] performs.
+    ///
+    /// `false` covers every way the probe can miss — an unbound name, a
+    /// binding in its temporal dead zone, a non-callable value, a prototype
+    /// trap that threw. A resource ceiling crossed by such a trap is reported
+    /// through [`Self::resource_limit_error`], not through this bool.
     pub fn has_global_function(&mut self, name: &str) -> bool {
         if !is_identifier(name) {
             return false;
         }
-        matches!(
-            self.eval_in_context(&format!("typeof {name} === \"function\"")),
-            Ok(JsValue::Bool(true))
-        )
+        let Some(vm) = self.vm.as_mut() else {
+            return false;
+        };
+        match vm.host_resolve_global_by_name(name) {
+            Ok(v) => vm.is_callable(v),
+            Err(_) => false,
+        }
     }
 
     /// Run queued microtasks (promise reactions, `queueMicrotask`) to
@@ -343,7 +449,11 @@ impl ScriptState {
     pub fn take_output(&mut self) -> Vec<String> {
         self.vm
             .as_mut()
-            .map(|vm| std::mem::take(&mut vm.output))
+            .map(|vm| {
+                vm.console_order
+                    .retain(|stream| *stream == ConsoleStream::Stderr);
+                std::mem::take(&mut vm.output)
+            })
             .unwrap_or_default()
     }
 
@@ -351,8 +461,42 @@ impl ScriptState {
     pub fn take_errput(&mut self) -> Vec<String> {
         self.vm
             .as_mut()
-            .map(|vm| std::mem::take(&mut vm.errput))
+            .map(|vm| {
+                vm.console_order
+                    .retain(|stream| *stream == ConsoleStream::Stdout);
+                std::mem::take(&mut vm.errput)
+            })
             .unwrap_or_default()
+    }
+
+    /// Take BOTH console streams in the order the lines were produced, each
+    /// tagged with its stream. The separate takes above lose that
+    /// chronology by construction (the 11 September 2026 audit's ZIPP-14);
+    /// this is the view for a host that shows one combined log. Draining
+    /// here empties both buffers; the per-stream takes remain available for
+    /// hosts that keep separate consumers.
+    pub fn take_console(&mut self) -> Vec<(ConsoleStream, String)> {
+        let Some(vm) = self.vm.as_mut() else {
+            return Vec::new();
+        };
+        let order = std::mem::take(&mut vm.console_order);
+        let mut out = std::mem::take(&mut vm.output).into_iter();
+        let mut err = std::mem::take(&mut vm.errput).into_iter();
+        let mut lines = Vec::with_capacity(order.len());
+        for stream in order {
+            let line = match stream {
+                ConsoleStream::Stdout => out.next(),
+                ConsoleStream::Stderr => err.next(),
+            };
+            if let Some(line) = line {
+                lines.push((stream, line));
+            }
+        }
+        // Lines the order vector does not account for (none in practice; a
+        // buffer written by a path that bypassed the recorder) still drain.
+        lines.extend(out.map(|line| (ConsoleStream::Stdout, line)));
+        lines.extend(err.map(|line| (ConsoleStream::Stderr, line)));
+        lines
     }
 
     // ---- Rich-value API (see `crate::vm::host_api`) -----------------------
@@ -434,9 +578,25 @@ impl ScriptState {
 
     /// Fingerprint the global in `index` — see
     /// [`Vm::host_fingerprint_slot`]. `None` means "treat it as changed".
+    /// Walks under a fresh default [`FingerprintBudget`]; a host digesting
+    /// several slots at once should share one through
+    /// [`Self::fingerprint_slot_bounded`].
     pub fn fingerprint_slot(&mut self, index: u32) -> Option<u64> {
+        let mut budget = FingerprintBudget::default();
+        self.fingerprint_slot_bounded(index, &mut budget)
+    }
+
+    /// [`Self::fingerprint_slot`] charging the caller's budget, which is what
+    /// bounds a batch as a whole: every slot in the batch, duplicates
+    /// included, draws on the same allowance, exactly as the batched read
+    /// does. The budget's counters report the work done.
+    pub fn fingerprint_slot_bounded(
+        &mut self,
+        index: u32,
+        budget: &mut FingerprintBudget,
+    ) -> Option<u64> {
         let seed = self.fp_seed;
-        self.vm.as_mut()?.host_fingerprint_slot(index, seed)
+        self.vm.as_mut()?.host_fingerprint_slot(index, seed, budget)
     }
 
     /// Write the global in `index`. `false` means the write was declined
@@ -451,13 +611,30 @@ impl ScriptState {
 
     /// Call the function in global slot `index` and drain the microtask queue.
     ///
-    /// Prefer this to [`Self::call_global`] on any hot path: `call_global`
-    /// resolves its callee by compiling the name as a fresh program, and those
-    /// compilations are interned for the VM's lifetime.
+    /// Prefer this to [`Self::call_global`] on a hot path: a slot is a direct
+    /// index, while a name is looked up through the global environment on
+    /// every call (no compilation either way).
     pub fn call_slot(&mut self, index: u32, args: &[HostValue]) -> Result<HostValue, String> {
         match self.vm.as_mut() {
             Some(vm) => vm.host_call_slot(index, args),
             None => Err("zipp: VM has been torn down".into()),
+        }
+    }
+
+    /// [`Self::call_slot`] with the caller's own conversion budget for the
+    /// result and a typed error, so a host staging a transfer across a
+    /// boundary can tell "the guest threw" from "the result is too large for
+    /// what I can accept" and retry with less. The budget is charged as the
+    /// result is walked; clone it first when a failed attempt must not count.
+    pub fn call_slot_bounded(
+        &mut self,
+        index: u32,
+        args: &[HostValue],
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, HostCallError> {
+        match self.vm.as_mut() {
+            Some(vm) => vm.host_call_slot_bounded(index, args, budget),
+            None => Err(HostCallError::Thrown("zipp: VM has been torn down".into())),
         }
     }
 
@@ -1019,6 +1196,109 @@ mod tests {
         );
     }
 
+    /// The name path resolves like a bare identifier read: program slots,
+    /// eval-created globals, global-object properties, builtins — reading the
+    /// CURRENT binding each time, with TDZ and non-callables reported.
+    #[test]
+    fn call_global_resolves_every_binding_kind_without_compiling() {
+        let mut st = compile_script(
+            "var count = 0; function bump() { return ++count; } let lexical = function () { return 'lex'; }; \
+             globalThis.own = function () { return 'own'; }; \
+             Object.setPrototypeOf(globalThis, { inherited: function () { return 'proto'; } }); \
+             function thrower() { throw new Error('boom'); }",
+        )
+        .expect("compiles");
+        st.run_init().expect("runs");
+        assert_eq!(st.call_global("bump", &[]), Ok(JsValue::Number(1.0)));
+        assert_eq!(
+            st.call_global("lexical", &[]),
+            Ok(JsValue::String("lex".into()))
+        );
+        assert_eq!(
+            st.call_global("own", &[]),
+            Ok(JsValue::String("own".into()))
+        );
+        assert_eq!(
+            st.call_global("inherited", &[]),
+            Ok(JsValue::String("proto".into()))
+        );
+        assert_eq!(
+            st.call_global("isNaN", &[JsValue::Number(f64::NAN)]),
+            Ok(JsValue::Bool(true))
+        );
+        assert!(st.has_global_function("bump"));
+        assert!(st.has_global_function("lexical"));
+        assert!(st.has_global_function("own"));
+        assert!(st.has_global_function("inherited"));
+        assert!(st.has_global_function("isNaN"));
+        assert!(!st.has_global_function("count"), "a number is not callable");
+        assert!(!st.has_global_function("absent"));
+        assert!(!st.has_global_function("not an identifier"));
+
+        // A reassignment is seen on the next call: nothing caches the value.
+        st.eval_in_context("bump = function () { return 99; }; count = 5;")
+            .expect("reassigns");
+        assert_eq!(st.call_global("bump", &[]), Ok(JsValue::Number(99.0)));
+        st.eval_in_context("var later = function () { return 'later'; };")
+            .expect("declares through eval");
+        assert_eq!(
+            st.call_global("later", &[]),
+            Ok(JsValue::String("later".into()))
+        );
+
+        let missing = st.call_global("absent", &[]).expect_err("unbound name");
+        assert_eq!(missing, "ReferenceError: absent is not defined");
+        let not_callable = st.call_global("count", &[]).expect_err("a number");
+        assert_eq!(not_callable, "TypeError: count is not a function");
+        let thrown = st
+            .call_global("thrower", &[])
+            .expect_err("the callee throws");
+        assert!(thrown.contains("boom"), "{thrown}");
+        // Still usable afterwards.
+        assert_eq!(st.call_global("bump", &[]), Ok(JsValue::Number(99.0)));
+
+        // A deleted builtin is gone by name too.
+        st.eval_in_context("delete globalThis.isNaN")
+            .expect("deletes");
+        assert!(!st.has_global_function("isNaN"));
+    }
+
+    /// Two embedders in one process can hold different grammar goals at the
+    /// same time; neither the other's option nor the process switch leaks.
+    #[test]
+    fn grammar_goal_is_per_compilation() {
+        let pure = CompileOptions {
+            goal: ScriptGoal::Pure,
+        };
+        let compat = CompileOptions {
+            goal: ScriptGoal::Compat,
+        };
+        let top_level_return = "var x = 1; return x;";
+        assert!(compile_script_with_options(top_level_return, &pure).is_err());
+        assert!(compile_script_with_options(top_level_return, &compat).is_ok());
+        // Interleaved, and again after a pure compile, the compat one still
+        // accepts what the pure one refused.
+        assert!(compile_script_with_options(top_level_return, &pure).is_err());
+        assert!(compile_script_with_options(top_level_return, &compat).is_ok());
+        assert!(
+            compile_script_with_preamble("var preamble = 1;", top_level_return, &pure).is_err()
+        );
+        assert!(
+            compile_script_with_preamble("var preamble = 1;", top_level_return, &compat).is_ok()
+        );
+        // Strictness stays the guest's own decision under either goal.
+        for options in [&pure, &compat] {
+            let err = compile_script_with_preamble(
+                "var preamble = 1;",
+                "\"use strict\"; function f(a, a) {}",
+                options,
+            )
+            .err()
+            .expect("duplicate parameters are a strict early error");
+            assert!(err.contains("SyntaxError"), "{err}");
+        }
+    }
+
     #[test]
     fn eval_declarations_persist_across_calls() {
         let mut st = compile_script("var x = 1;").expect("compiles");
@@ -1451,6 +1731,59 @@ mod tests {
         assert_eq!(st.take_output(), vec!["a".to_string()]);
         assert_eq!(st.take_errput(), vec!["b".to_string()]);
         assert!(st.take_output().is_empty(), "draining clears the buffer");
+    }
+
+    #[test]
+    fn combined_console_view_keeps_chronology() {
+        let mut st = compile_script(
+            "console.log('first'); console.error('second'); console.log('third'); \
+             Promise.resolve().then(function () { console.warn('fourth'); console.info('fifth'); }); \
+             function later() { console.log('sixth'); console.error('seventh'); throw new Error('x'); }",
+        )
+        .expect("compiles");
+        st.run_init().expect("runs");
+        let tag = |s: ConsoleStream| {
+            if s == ConsoleStream::Stderr {
+                "err"
+            } else {
+                "out"
+            }
+        };
+        let got: Vec<String> = st
+            .take_console()
+            .into_iter()
+            .map(|(s, l)| format!("{}:{l}", tag(s)))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                "out:first",
+                "err:second",
+                "out:third",
+                "err:fourth",
+                "out:fifth"
+            ]
+        );
+        assert!(st.take_console().is_empty(), "draining clears both buffers");
+
+        // Output written before a throw is kept, in order.
+        assert!(st.call_global("later", &[]).is_err());
+        let got: Vec<String> = st
+            .take_console()
+            .into_iter()
+            .map(|(s, l)| format!("{}:{l}", tag(s)))
+            .collect();
+        assert_eq!(got, ["out:sixth", "err:seventh"]);
+
+        // A per-stream take removes only its own entries from the order.
+        st.call_global("later", &[]).ok();
+        assert_eq!(st.take_output(), vec!["sixth".to_string()]);
+        let got: Vec<String> = st
+            .take_console()
+            .into_iter()
+            .map(|(s, l)| format!("{}:{l}", tag(s)))
+            .collect();
+        assert_eq!(got, ["err:seventh"]);
     }
 
     #[cfg(feature = "instrument")]

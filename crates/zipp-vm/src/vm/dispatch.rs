@@ -4625,11 +4625,7 @@ impl<'p> Vm<'p> {
                         #[cfg(feature = "instrument")]
                         self.instrument_output_line(&line)
                             .map_err(|msg| Thrown(msg.into()))?;
-                        if to_stderr {
-                            self.errput.push(line);
-                        } else {
-                            self.output.push(line);
-                        }
+                        self.push_console_line(line, to_stderr);
                         ip += 1;
                     }
 

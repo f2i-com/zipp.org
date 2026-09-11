@@ -31,6 +31,30 @@ use crate::bytecode::Program;
 use crate::heap::{HeapObj, ObjMap, PropAttr};
 use crate::value::Value;
 use crate::vm::Vm;
+use rustc_hash::FxHashMap;
+
+/// Old-object size above which a write-back merge indexes the old keys
+/// instead of scanning them. Below it a scan over a handful of short keys is
+/// cheaper than building a table.
+const MERGE_INDEX_THRESHOLD: usize = 8;
+
+#[cfg(test)]
+mod merge_tests;
+
+#[cfg(test)]
+thread_local! {
+    /// Key probes made by `host_in_over` merges on this thread — one per
+    /// hash lookup or per compared key in the small-object scan. A test
+    /// bound on this is what proves the merge is linear, independently of
+    /// the machine's clock.
+    pub(crate) static MERGE_KEY_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn merge_probe() {
+    #[cfg(test)]
+    MERGE_KEY_PROBES.with(|c| c.set(c.get() + 1));
+}
 
 /// Byte offset of `Vm::jit_call_depth`, for Tier C's `TailCall` depth guard —
 /// the emitted code reads the counter as `[vm + off]` before the tail site's
@@ -168,8 +192,8 @@ pub(crate) const JIT_ARRAY_SNAPSHOT_EPOCH_OFFSET: usize = core::mem::offset_of!(
     + core::mem::offset_of!(crate::heap::Heap, array_snapshot_epoch);
 /// VM-relative offset of `Heap::gen_raw` (B264 inline dense store lane).
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
-pub(crate) const JIT_GEN_RAW_OFFSET: usize = core::mem::offset_of!(Vm<'static>, heap)
-    + core::mem::offset_of!(crate::heap::Heap, gen_raw);
+pub(crate) const JIT_GEN_RAW_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, heap) + core::mem::offset_of!(crate::heap::Heap, gen_raw);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 const _: () = assert!(JIT_GEN_RAW_OFFSET % core::mem::align_of::<u64>() == 0);
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
@@ -320,16 +344,102 @@ const FP_ABSENT: u64 = 0x9e37_79b9_7f4a_7c15;
 /// than making it merely unlikely — see `ScriptState::set_fingerprint_seed`.
 /// graph into a change in the digest; it is not a cryptographic commitment.
 const FP_SEED: u64 = 0xcbf2_9ce4_8422_2325;
-/// Nodes one fingerprint will walk before giving up and reporting "unknown".
-/// Well above any real UI state, and far below anything that would make the
-/// walk cost more than the copy it exists to avoid.
-const FP_MAX_NODES: usize = 2_000_000;
+/// Work a fingerprint walk may do before answering "unknown" instead.
+///
+/// A node ceiling alone did not bound the walk: holes were free, strings
+/// were hashed whole however long, an array's element vector was cloned
+/// before its size was checked, and every slot in a batch started a fresh
+/// allowance (the 11 September 2026 audit's ZIPP-04). This charges every
+/// visited element — holes included — every property, and every key and
+/// string byte, and a batch threads one budget through all of its slots so
+/// the digest walk can never do more work than the read it stands in for
+/// would be allowed to. The counters are exact and deterministic, so a test
+/// can pin them.
+#[derive(Debug, Clone)]
+pub struct FingerprintBudget {
+    max_nodes: usize,
+    used_nodes: usize,
+    max_string_bytes: usize,
+    used_string_bytes: usize,
+}
+
+impl FingerprintBudget {
+    pub fn new(max_nodes: usize, max_string_bytes: usize) -> Self {
+        Self {
+            max_nodes,
+            used_nodes: 0,
+            max_string_bytes,
+            used_string_bytes: 0,
+        }
+    }
+
+    /// Nodes (values, elements, holes, properties) visited so far.
+    pub fn nodes_used(&self) -> usize {
+        self.used_nodes
+    }
+
+    /// Key and string bytes hashed so far.
+    pub fn string_bytes_used(&self) -> usize {
+        self.used_string_bytes
+    }
+
+    /// Charge `n` nodes; `false` when that would cross the ceiling. Used
+    /// both per visit and as a container's up-front size check, so an array
+    /// larger than the remaining allowance is refused before it is walked.
+    fn charge_nodes(&mut self, n: usize) -> bool {
+        match self.used_nodes.checked_add(n) {
+            Some(total) if total <= self.max_nodes => {
+                self.used_nodes = total;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `n` more nodes would fit, without charging them.
+    fn nodes_fit(&self, n: usize) -> bool {
+        n <= self.max_nodes - self.used_nodes
+    }
+
+    fn charge_string_bytes(&mut self, n: usize) -> bool {
+        match self.used_string_bytes.checked_add(n) {
+            Some(total) if total <= self.max_string_bytes => {
+                self.used_string_bytes = total;
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Default for FingerprintBudget {
+    /// The read's own limits, so digest and read agree by construction: a
+    /// value the read could not marshal is one the digest reports unknown.
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_HOST_VALUE_MAX_NODES,
+            DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
+        )
+    }
+}
 
 #[inline]
 fn fp_mix(h: &mut u64, x: u64) {
     *h ^= x;
     *h = h.wrapping_mul(0x100_0000_01b3);
     *h ^= *h >> 29;
+}
+
+/// Mix `bytes` eight at a time, little-endian, the last word zero-padded.
+#[inline]
+fn fp_mix_bytes(h: &mut u64, bytes: &[u8]) {
+    for chunk in bytes.chunks(8) {
+        let mut word = 0u64;
+        for (n, b) in chunk.iter().enumerate() {
+            word |= (*b as u64) << (n * 8);
+        }
+        fp_mix(h, word);
+    }
 }
 
 /// Default structural-conversion limits used at every host boundary.
@@ -344,6 +454,27 @@ fn fp_mix(h: &mut u64, x: u64) {
 // fetch. Equal budgets make the two agree by construction.
 pub const DEFAULT_HOST_VALUE_MAX_NODES: usize = 2_000_000;
 pub const DEFAULT_HOST_VALUE_MAX_STRING_BYTES: usize = 16 * 1024 * 1024;
+
+/// Why a slot call did not produce a host value: the guest threw, or the
+/// result exists but exceeds the conversion budget the caller supplied. A
+/// caller that stages work across a boundary needs the distinction — a
+/// conversion failure means "try less", a throw means "stop".
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostCallError {
+    /// The callee (or a microtask it scheduled) threw; the message.
+    Thrown(String),
+    /// The call succeeded but its result could not be represented within the
+    /// budget; the limit that was crossed.
+    Conversion(String),
+}
+
+impl HostCallError {
+    pub fn into_message(self) -> String {
+        match self {
+            HostCallError::Thrown(m) | HostCallError::Conversion(m) => m,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct HostValueBudget {
@@ -563,10 +694,17 @@ impl<'p> Vm<'p> {
     /// the slot, so a generation would report "unchanged" for a value that did
     /// change. A content digest cannot miss that, because it reads the content.
     ///
-    /// `None` means "assume it changed" — returned when the graph is larger
-    /// than this walk will traverse, so a pathological value degrades to the old
-    /// always-copy behaviour rather than to a wrong answer.
-    pub(crate) fn host_fingerprint_slot(&mut self, index: u32, seed: u64) -> Option<u64> {
+    /// `None` means "assume it changed" — returned when the graph needs more
+    /// work than `budget` allows, so a pathological value degrades to the old
+    /// always-copy behaviour rather than to a wrong answer. Equal digests are
+    /// probabilistic evidence of equality, not structural proof; an unknown
+    /// digest is never evidence of anything.
+    pub(crate) fn host_fingerprint_slot(
+        &mut self,
+        index: u32,
+        seed: u64,
+        budget: &mut FingerprintBudget,
+    ) -> Option<u64> {
         let v = match self.globals.get(index as usize) {
             Some(v) => *v,
             None => return Some(FP_ABSENT),
@@ -577,27 +715,31 @@ impl<'p> Vm<'p> {
         let _g = self.gc_lock_guard();
         let mut seen: Vec<u32> = Vec::new();
         let mut h: u64 = FP_SEED ^ seed;
-        let mut nodes: usize = 0;
-        if self.host_fp(v, 0, &mut seen, &mut h, &mut nodes) {
+        if self.host_fp(v, 0, &mut seen, &mut h, budget) {
             Some(h)
         } else {
             None
         }
     }
 
-    /// Hash `v` into `h`. False means the node budget ran out, which makes
-    /// the whole fingerprint unusable rather than partial — a partial digest
+    /// Hash `v` into `h`. False means the budget ran out, which makes the
+    /// whole fingerprint unusable rather than partial — a partial digest
     /// would be stable across a change in the part it never reached.
+    ///
+    /// Nothing is cloned out of the heap: containers are re-borrowed per
+    /// element, so the walk's memory is its recursion and `seen`, and a
+    /// container is refused before it is entered when it alone exceeds what
+    /// the budget has left. No guest code runs (accessors are skipped, as
+    /// `host_out` skips them), so the graph cannot change under the walk.
     fn host_fp(
         &mut self,
         v: Value,
         depth: usize,
         seen: &mut Vec<u32>,
         h: &mut u64,
-        nodes: &mut usize,
+        budget: &mut FingerprintBudget,
     ) -> bool {
-        *nodes += 1;
-        if *nodes > FP_MAX_NODES {
+        if !budget.charge_nodes(1) {
             return false;
         }
         if v.is_undefined() || v.is_uninitialized() {
@@ -635,28 +777,27 @@ impl<'p> Vm<'p> {
         }
 
         enum Shape {
-            Str,
-            Array(Vec<Value>),
-            Object(Vec<(String, Value)>),
+            Str { units: usize },
+            Array { len: usize },
+            Object { keys: usize, visible: usize },
             Opaque,
         }
         let shape = match self.heap.get(idx) {
-            HeapObj::Str(_) | HeapObj::Cons { .. } => Shape::Str,
-            HeapObj::Array(items) => Shape::Array(items.clone()),
-            HeapObj::Object(m) => {
-                let mut pairs = Vec::new();
-                for i in 0..m.keys.len() {
-                    let a = &m.attr_at(i);
-                    // The same exclusion host_out makes: an accessor is never
-                    // invoked, so it contributes nothing to the marshalled value
-                    // and must contribute nothing to the digest either.
-                    if !a.enumerable || a.accessor {
-                        continue;
-                    }
-                    pairs.push((m.keys[i].clone(), m.val_at(i)));
-                }
-                Shape::Object(pairs)
-            }
+            HeapObj::Str(s) => Shape::Str { units: s.units() },
+            HeapObj::Cons { len, .. } => Shape::Str { units: *len },
+            HeapObj::Array(items) => Shape::Array { len: items.len() },
+            HeapObj::Object(m) => Shape::Object {
+                keys: m.keys.len(),
+                // The same exclusion host_out makes: an accessor is never
+                // invoked, so it contributes nothing to the marshalled value
+                // and must contribute nothing to the digest either.
+                visible: (0..m.keys.len())
+                    .filter(|&i| {
+                        let a = m.attr_at(i);
+                        a.enumerable && !a.accessor
+                    })
+                    .count(),
+            },
             _ => Shape::Opaque,
         };
 
@@ -665,58 +806,89 @@ impl<'p> Vm<'p> {
                 fp_mix(h, 9);
                 true
             }
-            Shape::Str => {
+            Shape::Str { units } => {
+                // UTF-8 needs at least one byte per UTF-16 unit, so this
+                // refuses without materializing; the exact byte count is
+                // charged once the text exists.
+                if !budget.charge_string_bytes(units) {
+                    return false;
+                }
                 fp_mix(h, 10);
                 let s = self.to_js_string(v).unwrap_or_default();
+                if s.len() > units && !budget.charge_string_bytes(s.len() - units) {
+                    return false;
+                }
                 fp_mix(h, s.len() as u64);
-                for chunk in s.as_bytes().chunks(8) {
-                    let mut word = 0u64;
-                    for (n, b) in chunk.iter().enumerate() {
-                        word |= (*b as u64) << (n * 8);
-                    }
-                    fp_mix(h, word);
-                }
+                fp_mix_bytes(h, s.as_bytes());
                 true
             }
-            Shape::Array(items) => {
+            Shape::Array { len } => {
+                // Every element, hole or not, is a node: refuse the whole
+                // array before walking it when it cannot fit.
+                if !budget.nodes_fit(len) {
+                    return false;
+                }
                 fp_mix(h, 11);
-                fp_mix(h, items.len() as u64);
+                fp_mix(h, len as u64);
                 seen.push(idx);
-                for it in items {
-                    let ok = if it.is_hole() {
-                        fp_mix(h, 12);
-                        true
-                    } else {
-                        self.host_fp(it, depth + 1, seen, h, nodes)
+                let mut ok = true;
+                for i in 0..len {
+                    let it = match self.heap.get(idx) {
+                        HeapObj::Array(items) => match items.get(i) {
+                            Some(it) => *it,
+                            None => break,
+                        },
+                        _ => break,
                     };
-                    if !ok {
-                        seen.pop();
-                        return false;
-                    }
-                }
-                seen.pop();
-                true
-            }
-            Shape::Object(pairs) => {
-                fp_mix(h, 13);
-                fp_mix(h, pairs.len() as u64);
-                seen.push(idx);
-                for (k, val) in pairs {
-                    fp_mix(h, k.len() as u64);
-                    for chunk in k.as_bytes().chunks(8) {
-                        let mut word = 0u64;
-                        for (n, b) in chunk.iter().enumerate() {
-                            word |= (*b as u64) << (n * 8);
+                    if it.is_hole() {
+                        if !budget.charge_nodes(1) {
+                            ok = false;
+                            break;
                         }
-                        fp_mix(h, word);
-                    }
-                    if !self.host_fp(val, depth + 1, seen, h, nodes) {
-                        seen.pop();
-                        return false;
+                        fp_mix(h, 12);
+                    } else if !self.host_fp(it, depth + 1, seen, h, budget) {
+                        ok = false;
+                        break;
                     }
                 }
                 seen.pop();
-                true
+                ok
+            }
+            Shape::Object { keys, visible } => {
+                if !budget.nodes_fit(visible) {
+                    return false;
+                }
+                fp_mix(h, 13);
+                fp_mix(h, visible as u64);
+                seen.push(idx);
+                let mut ok = true;
+                for i in 0..keys {
+                    // Hash the key inside the borrow — no clone — and carry
+                    // only the value out for the recursive step.
+                    let val = match self.heap.get(idx) {
+                        HeapObj::Object(m) if i < m.keys.len() => {
+                            let a = m.attr_at(i);
+                            if !a.enumerable || a.accessor {
+                                continue;
+                            }
+                            let key = m.keys[i].as_bytes();
+                            if !budget.charge_string_bytes(key.len()) {
+                                ok = false;
+                                break;
+                            }
+                            fp_mix(h, key.len() as u64);
+                            fp_mix_bytes(h, key);
+                            m.val_at(i)
+                        }
+                        _ => break,
+                    };
+                    if !self.host_fp(val, depth + 1, seen, h, budget) {
+                        ok = false;
+                        break;
+                    }
+                }
+                seen.pop();
+                ok
             }
         }
     }
@@ -752,12 +924,34 @@ impl<'p> Vm<'p> {
         index: u32,
         args: &[HostValue],
     ) -> Result<HostValue, String> {
+        let mut budget = HostValueBudget::default();
+        self.host_call_slot_bounded(index, args, &mut budget)
+            .map_err(HostCallError::into_message)
+    }
+
+    /// [`Self::host_call_slot`] with the caller's own conversion budget for
+    /// the RESULT, and a typed error so a throw and an over-budget result are
+    /// distinguishable. The budget is charged only for what the result
+    /// consumed; on a conversion failure the caller's copy is partially
+    /// charged, so stage on a clone when a retry is intended.
+    pub(crate) fn host_call_slot_bounded(
+        &mut self,
+        index: u32,
+        args: &[HostValue],
+        budget: &mut HostValueBudget,
+    ) -> Result<HostValue, HostCallError> {
         let callee = match self.globals.get(index as usize) {
             Some(v) => *v,
-            None => return Err(format!("zipp: no global in slot {index}")),
+            None => {
+                return Err(HostCallError::Thrown(format!(
+                    "zipp: no global in slot {index}"
+                )))
+            }
         };
         if !self.is_callable(callee) {
-            return Err(format!("TypeError: global slot {index} is not a function"));
+            return Err(HostCallError::Thrown(format!(
+                "TypeError: global slot {index} is not a function"
+            )));
         }
         let argv: Vec<Value> = {
             let _g = self.gc_lock_guard();
@@ -771,10 +965,10 @@ impl<'p> Vm<'p> {
             Ok(v) => {
                 let _g = self.gc_lock_guard();
                 let mut seen: Vec<u32> = Vec::new();
-                let mut budget = HostValueBudget::default();
-                self.host_out(v, 0, &mut seen, &mut budget)
+                self.host_out(v, 0, &mut seen, budget)
+                    .map_err(HostCallError::Conversion)
             }
-            Err(t) => Err(t.0),
+            Err(t) => Err(HostCallError::Thrown(t.0)),
         }
     }
 
@@ -976,16 +1170,42 @@ impl<'p> Vm<'p> {
                 ),
                 _ => return self.host_in(hv, depth),
             };
-        let find_old = |k: &str| {
-            old_props
-                .iter()
-                .find(|(ok, _, _)| ok == k)
-                .map(|(_, v, a)| (*v, *a))
+        // Matching each incoming key against the old properties by linear
+        // scan, and then each old property against the incoming keys the same
+        // way, made a merge of two similar N-key objects cost N² comparisons
+        // (the 11 September 2026 audit's ZIPP-05). Index the old keys once —
+        // a hash map past a small size, a scan below it where the map costs
+        // more than it saves — and remember which old positions the host
+        // sent, so the preservation pass below is a single walk.
+        let old_index: Option<FxHashMap<&str, usize>> = if old_props.len() > MERGE_INDEX_THRESHOLD {
+            let mut index =
+                FxHashMap::with_capacity_and_hasher(old_props.len(), Default::default());
+            for (i, (k, _, _)) in old_props.iter().enumerate() {
+                // First occurrence wins, as the linear scan found the first.
+                index.entry(k.as_str()).or_insert(i);
+            }
+            Some(index)
+        } else {
+            None
         };
+        let find_old = |k: &str| -> Option<usize> {
+            merge_probe();
+            match &old_index {
+                Some(index) => index.get(k).copied(),
+                None => old_props.iter().position(|(ok, _, _)| {
+                    merge_probe();
+                    ok == k
+                }),
+            }
+        };
+        let mut sent = vec![false; old_props.len()];
 
         let mut m = ObjMap::with_capacity(pairs.len().max(old_props.len()));
         for (k, val) in pairs {
-            let prev = find_old(k);
+            let prev = find_old(k).map(|i| {
+                sent[i] = true;
+                (old_props[i].1, old_props[i].2)
+            });
             // An accessor of the same name is handled by the preserve pass
             // below. What the host echoed back for this key is the GETTER'S
             // RESULT, and writing that in as a data property would replace the
@@ -1029,8 +1249,8 @@ impl<'p> Vm<'p> {
         //
         //     new Error("boom").message  ->  undefined
         //     a get-only property        ->  undefined
-        for (k, p, a) in &old_props {
-            let host_sent_it = pairs.iter().any(|(pk, _)| pk == k);
+        for (i, (k, p, a)) in old_props.iter().enumerate() {
+            let host_sent_it = sent[i];
             let host_could_see_it = a.enumerable && !a.accessor;
             if host_sent_it && host_could_see_it {
                 continue;
@@ -1105,6 +1325,17 @@ pub trait HostCtx {
     /// region stays over those bytes. BigInt and length-tracking views are
     /// refused, as is a detached buffer.
     fn typed_array_region(&mut self, name: &str) -> Result<(usize, usize, u8), String>;
+    /// [`Self::typed_array_region`] for several globals at once, as a single
+    /// transaction: either every name resolves and every buffer is pinned, or
+    /// nothing is pinned and the first failure is returned. A default
+    /// implementation resolves one at a time and is NOT transactional; the
+    /// engine's implementation is.
+    fn typed_array_regions(&mut self, names: &[&str]) -> Result<Vec<(usize, usize, u8)>, String> {
+        names
+            .iter()
+            .map(|name| self.typed_array_region(name))
+            .collect()
+    }
     /// Call the guest function a global names, with numbers, for a number.
     /// Runs the guest re-entrantly inside the host call; the guest cannot make
     /// a nested host call while it does.
@@ -1113,8 +1344,7 @@ pub trait HostCtx {
 
 /// The context-taking twin of [`crate::embed::HostCall`]: the same string
 /// contract, plus the VM as [`HostCtx`] for the duration of the call.
-pub type HostCallCtx =
-    Box<dyn FnMut(&mut dyn HostCtx, &str, &[String]) -> Result<String, String>>;
+pub type HostCallCtx = Box<dyn FnMut(&mut dyn HostCtx, &str, &[String]) -> Result<String, String>>;
 
 impl<'p> Vm<'p> {
     /// The slot of a top-level binding, by name.
@@ -1136,10 +1366,82 @@ impl<'p> Vm<'p> {
             .copied()
             .unwrap_or(Value::UNDEFINED))
     }
+
+    /// Resolve the global binding `name` names, exactly as a bare identifier
+    /// read at the top level would — and without compiling anything.
+    ///
+    /// `ScriptState::call_global` used to reach its callee by evaluating the
+    /// name as a fresh program, so every name-based re-entry and every
+    /// `has_global_function` probe went through the dynamic compiler: it
+    /// spent the dynamic-code allowance, interned a program for the VM's
+    /// lifetime, and contradicted the method's own "compiles nothing"
+    /// contract (the 11 September 2026 audit's ZIPP-03). This is the lookup
+    /// the `LoadGlobal` family performs, minus the activation-specific
+    /// EvalScope (a host has no activation), in the same order:
+    ///
+    /// 1. a slot the main program or a later eval assigned the name, read
+    ///    directly when live and unshadowed, otherwise through the same slow
+    ///    path the interpreter takes (TDZ, a real own property of the global
+    ///    object shadowing the slot, a deleted builtin);
+    /// 2. an own property of the global object (eval-created vars,
+    ///    `globalThis.x = v`), then its prototype chain (`HasBinding` is
+    ///    `HasProperty` on the binding object, chain included);
+    /// 3. the builtin table, which also serves the virtual value-properties
+    ///    and respects `delete globalThis.X`.
+    ///
+    /// Nothing is cached: a binding may be reassigned between calls, so the
+    /// current value is read every time. A prototype `has` trap can run guest
+    /// code here, exactly as it can for a bare identifier read.
+    pub(crate) fn host_resolve_global_by_name(&mut self, name: &str) -> Result<Value, String> {
+        let slot = self
+            .global_slot_by_name(name)
+            .or_else(|| self.eval_global_map.get(name).copied());
+        if let Some(idx) = slot {
+            if let Some(v) = self.globals.get(idx as usize).copied() {
+                if !v.is_uninitialized()
+                    && !(self.global_route_epoch != 0 && self.global_real_own_route(idx))
+                {
+                    return Ok(v);
+                }
+                // Function 0 is the top-level script: the slow path names it
+                // only when it throws, and a host-side lookup has no enclosing
+                // function to name.
+                return self.load_global_slow(idx, 0).map_err(|t| {
+                    t.0.strip_suffix(" (in <anonymous>)")
+                        .map(str::to_owned)
+                        .unwrap_or(t.0)
+                });
+            }
+        }
+        if self.global_this != 0 {
+            let has_own = matches!(
+                self.heap.get(self.global_this),
+                HeapObj::Object(m) if m.pos(name).is_some()
+            );
+            let gobj = Value::heap(self.global_this);
+            if has_own {
+                return self.get_prop(gobj, name).map_err(|t| t.0);
+            }
+            let proto = self.object_get_prototype_of(gobj);
+            if proto.is_heap() && self.has_property_str_dyn(proto, name).map_err(|t| t.0)? {
+                return self.get_prop(gobj, name).map_err(|t| t.0);
+            }
+        }
+        if let Some(v) = self.global_by_name(name) {
+            return Ok(v);
+        }
+        Err(format!("ReferenceError: {name} is not defined"))
+    }
 }
 
-impl<'p> HostCtx for Vm<'p> {
-    fn typed_array_region(&mut self, name: &str) -> Result<(usize, usize, u8), String> {
+impl<'p> Vm<'p> {
+    /// Resolve a typed-array global to its region WITHOUT pinning: the buffer
+    /// index to pin, then the region. Splitting the pin off lets a batch
+    /// validate every entry before it mutates pin state.
+    fn resolve_typed_array_region(
+        &mut self,
+        name: &str,
+    ) -> Result<(u32, (usize, usize, u8)), String> {
         let v = self.named_global(name)?;
         if !v.is_heap() {
             return Err(format!("TypeError: {name} is not a typed array"));
@@ -1177,8 +1479,34 @@ impl<'p> HostCtx for Vm<'p> {
         {
             return Err(format!("RangeError: {name} is out of its buffer's bounds"));
         }
+        Ok((buffer, (ptr + byte_offset, length, kind)))
+    }
+}
+
+impl<'p> HostCtx for Vm<'p> {
+    fn typed_array_region(&mut self, name: &str) -> Result<(usize, usize, u8), String> {
+        let (buffer, region) = self.resolve_typed_array_region(name)?;
         self.pinned_buffers.insert(buffer);
-        Ok((ptr + byte_offset, length, kind))
+        Ok(region)
+    }
+
+    /// Every name is resolved before any buffer is pinned, so a request whose
+    /// later entry is invalid leaves pin state exactly as it was (the
+    /// 11 September 2026 audit's ZIPP-08). A buffer already pinned by an
+    /// earlier request stays pinned either way: pins are for the VM's
+    /// lifetime and shared, never counted.
+    fn typed_array_regions(&mut self, names: &[&str]) -> Result<Vec<(usize, usize, u8)>, String> {
+        let mut resolved = Vec::with_capacity(names.len());
+        for name in names {
+            resolved.push(self.resolve_typed_array_region(name)?);
+        }
+        Ok(resolved
+            .into_iter()
+            .map(|(buffer, region)| {
+                self.pinned_buffers.insert(buffer);
+                region
+            })
+            .collect())
     }
 
     fn call_global_numbers(&mut self, name: &str, args: &[f64]) -> Result<f64, String> {

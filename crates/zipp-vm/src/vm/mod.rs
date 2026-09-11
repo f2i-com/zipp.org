@@ -1156,6 +1156,15 @@ mod register_file_tests {
     }
 }
 
+/// The console stream a line was written to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsoleStream {
+    /// `console.log`/`info`/`debug` and `print`.
+    Stdout,
+    /// `console.error`/`warn`.
+    Stderr,
+}
+
 pub struct Vm<'p> {
     program: &'p Program,
     /// Functions compiled at runtime by `eval` / `new Function`. Each is a leaked
@@ -1305,6 +1314,10 @@ pub struct Vm<'p> {
     pub output: Vec<String>,
     /// Lines produced by `console.error`/`console.warn` (→ stderr in node).
     pub errput: Vec<String>,
+    /// Which stream each console line went to, in production order, so the
+    /// two buffers can be merged back into one chronological log. One byte
+    /// per line; the lines themselves are stored once, above.
+    pub console_order: Vec<ConsoleStream>,
     /// Embedder host hook, backing the `HOST_CALL` native. `None` in every
     /// engine-internal path (`run`, `run_module_file`, the CLI, test262), so a
     /// stock build has no host surface at all; only `crate::embed` installs one.
@@ -2784,3 +2797,19 @@ pub(crate) use ic::{GetAct, SetAct, RET_DISCARD};
 pub(crate) use iter_jit::*;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) use object_literal_jit::*;
+
+impl<'p> Vm<'p> {
+    /// Append one console line to its stream, recording the order so
+    /// `ScriptState::take_console` can merge the streams chronologically.
+    /// Every console emission goes through here.
+    #[inline]
+    pub(crate) fn push_console_line(&mut self, line: String, to_stderr: bool) {
+        if to_stderr {
+            self.console_order.push(ConsoleStream::Stderr);
+            self.errput.push(line);
+        } else {
+            self.console_order.push(ConsoleStream::Stdout);
+            self.output.push(line);
+        }
+    }
+}
