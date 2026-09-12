@@ -1237,11 +1237,41 @@ impl<'p> Vm<'p> {
             let _g = self.gc_lock_guard();
             args.iter().map(|a| self.host_in(a, 0)).collect()
         };
-        let res = self.call_value(callee, Value::UNDEFINED, &argv);
+        let res = self.host_invoke(callee, &argv);
         // Drain regardless of outcome: a throw can still have queued jobs, and
         // leaving them parked would surface them at an arbitrary later call.
         // The completion value is rooted across the drain (ZA-05).
         self.marshal_after_drain(res, budget, drain_microtasks)
+    }
+
+    /// Keep temporary call and embedding values alive before a call frame
+    /// exists (a Proxy's apply getter), or after it is gone (result rendering
+    /// and job draining). Nested entries restore their own stack prefix.
+    pub(crate) fn with_host_roots<R>(
+        &mut self,
+        roots: &[Value],
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let base = self.host_result_roots.len();
+        self.host_result_roots
+            .extend(roots.iter().copied().filter(|value| value.is_heap()));
+        let result = f(self);
+        debug_assert!(self.host_result_roots.len() >= base);
+        self.host_result_roots.truncate(base);
+        result
+    }
+
+    /// Host-created arguments are Rust locals until the target's frame is
+    /// pushed. An exotic callee can run an allocating getter before then, so
+    /// root both the callee and its arguments across the entire invocation.
+    pub(crate) fn host_invoke(
+        &mut self,
+        callee: Value,
+        args: &[Value],
+    ) -> Result<Value, crate::vm::Thrown> {
+        self.with_host_roots(&[callee], |vm| {
+            vm.with_host_roots(args, |vm| vm.call_value(callee, Value::UNDEFINED, args))
+        })
     }
 
     /// Root `res`'s value, drain the microtask queue, then marshal the value
@@ -1975,8 +2005,8 @@ impl<'p> HostCtx for Vm<'p> {
         }
         let argv: Vec<Value> = args.iter().map(|&a| Value::num(a)).collect();
         let v = self
-            .call_value(callee, Value::UNDEFINED, &argv)
-            .map_err(|t| t.0)?;
-        self.to_number(v).map_err(|t| t.0)
+            .host_invoke(callee, &argv)
+            .map_err(|t| self.take_host_throw(t))?;
+        self.to_number(v).map_err(|t| self.take_host_throw(t))
     }
 }

@@ -378,7 +378,7 @@ impl<'s> Parser<'s> {
             // this is shorthand the token that carried the keyword-ness is gone.
             let key_pos = self.cur().span.start;
             let key_bindable = self.is_binding_ident();
-            let key = self.parse_prop_key()?;
+            let key = self.parse_public_prop_key()?;
             // Shorthand is "no colon", not "the key is an identifier" —
             // `{a: b}` has an identifier key and is NOT shorthand.
             let value = if self.eat(Punct::Colon, true)? {

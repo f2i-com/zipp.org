@@ -2617,13 +2617,11 @@ pub struct Vm<'p> {
     #[cfg(feature = "safe-sandbox")]
     gc_lock: std::rc::Rc<std::cell::Cell<u32>>,
     gc_stress: bool,
-    /// Completion values a host entry point is holding across a microtask
-    /// drain, before marshalling them (`host_call_slot_bounded`,
-    /// `host_eval_rich`). The callee's frame is gone by then, so nothing but
-    /// the Rust local referenced the value, and the drain collects between
-    /// jobs; the collector traces this stack as roots (the 11 September 2026
-    /// close audit's ZA-05). A stack, not a slot: a job can re-enter a host
-    /// entry that drains again.
+    /// Values a call or embedding entry owns only in Rust locals: arguments before
+    /// the callee's frame exists, and results across rendering or a microtask
+    /// drain after it is gone. The collector traces this stack while guest
+    /// getters and queued jobs run (ZA-05 and the 12 September input-root
+    /// regression). Nested entries preserve their caller's stack prefix.
     host_result_roots: Vec<Value>,
 }
 

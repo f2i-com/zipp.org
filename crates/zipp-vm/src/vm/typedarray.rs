@@ -688,7 +688,7 @@ impl<'p> Vm<'p> {
     /// 64-bit BigInt kinds). Out-of-bounds → undefined.
     /// Copy `count` elements from `src[src_start..]` into `dst[0..]` as RAW
     /// BYTES. Returns false when that is not possible — different element
-    /// kinds, a detached or non-plain buffer, an out-of-range range — and the
+    /// kinds, a detached buffer, an out-of-range range — and the
     /// caller falls back to the per-element path.
     ///
     /// %TypedArray%.prototype.slice with a same-type destination is specified as
@@ -723,14 +723,30 @@ impl<'p> Vm<'p> {
             } => (*buffer, *kind, *byte_offset),
             _ => return false,
         };
-        if skind != dkind || sbuf == dbuf {
-            return false; // different types, or overlapping storage
+        if skind != dkind {
+            return false;
         }
         let size = native::TA_KINDS[skind as usize].1;
         let n = count * size;
+        let a = soff + src_start * size;
+        if sbuf == dbuf {
+            // Slice's same-type branch reads and writes one byte at a time in
+            // ascending order, including when @@species aliases the source.
+            // A snapshot / memmove would hide earlier writes from later reads;
+            // the per-element fallback would canonicalise floating NaN bits.
+            if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(sbuf) {
+                if *detached || a + n > data.len() || doff + n > data.len() {
+                    return false;
+                }
+                for i in 0..n {
+                    data[doff + i] = data[a + i];
+                }
+                return true;
+            }
+            return false;
+        }
         let bytes: Vec<u8> = match self.heap.get(sbuf) {
             HeapObj::ArrayBuffer { data, detached } if !*detached => {
-                let a = soff + src_start * size;
                 if a + n > data.len() {
                     return false;
                 }

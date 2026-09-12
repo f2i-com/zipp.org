@@ -15,8 +15,12 @@ A test is a .js file with a `/*--- … ---*/` YAML frontmatter:
   includes: harness files to prepend (from <t262>/harness/)
   negative: { phase: parse|resolution|runtime, type: <ErrorName> } — must fail
 Positive tests pass on clean exit; async tests pass when the harness prints
-`Test262:AsyncTestComplete`; negative tests pass when the run errors (matching the
-error type when we can read it from stderr).
+`Test262:AsyncTestComplete`; negative tests require a normal language-error exit
+and the expected error type in the CLI diagnostic.
+
+The process exits nonzero on failures or skips. --expected-failures accepts an
+exact failure manifest for the selected run: both unexpected failures and stale
+entries fail the gate. --json saves counts, build/corpus identity and that diff.
 
 Security: this is a trusted-developer conformance harness, not an untrusted-code
 sandbox. Test262 needs the engine's privileged `$262` host surface and exercises
@@ -24,7 +28,7 @@ the JIT deliberately, so use only a reviewed/pinned checkout. Run a checkout you
 do not trust inside an external OS sandbox with filesystem/network/resource
 limits; use `zipp sandbox` for ordinary untrusted application scripts.
 """
-import argparse, os, re, shutil, subprocess, sys, tempfile, threading, concurrent.futures, collections
+import argparse, os, re, shutil, subprocess, sys, tempfile, threading, concurrent.futures, collections, json
 
 FM = re.compile(r"/\*---(.*?)---\*/", re.S)
 
@@ -148,14 +152,34 @@ def load_harness(h):
 DONOTEVALUATE = "should not be evaluated"
 TEST262ERROR = "Test262Error"
 
+# The parser reports typed SyntaxErrors. These older compiler rejections are
+# the only untyped diagnostics accepted as an early SyntaxError; an I/O error,
+# panic or arbitrary failure is never evidence that parsing rejected the test.
+LEGACY_SYNTAX_ERRORS = {
+    "`break` target not found (outside a loop / unknown label)",
+    "`continue` target not found (outside a loop / unknown label)",
+    "`await` is only valid inside an async function",
+}
+
+
+def reported_error(err):
+    """The CLI's final error diagnostic, excluding messages printed by tests."""
+    lines = [line[len("zipp: "):] for line in err.splitlines()
+             if line.startswith("zipp: ")]
+    return lines[-1] if lines else ""
+
 
 def classify(meta, code, out, err):
     blob = (out or "") + (err or "")
     neg = meta["negative"]
     if neg:
-        # Should fail. Pass if it errored; tighten by matching the error type name.
+        # Require a language error of the expected type, not just a failed process.
         if code == 0:
             return ("FAIL", "negative-but-passed")
+        # zipp uses 1 for a reported language error. Rust panics, POSIX signals
+        # and Windows exception statuses must not become negative-test passes.
+        if code != 1:
+            return ("FAIL", f"abnormal-exit={code}")
         want = neg["type"]
         # The body ran, so whatever the exit code says, the required early error
         # was NOT raised. This check must precede the type match: a test whose
@@ -167,13 +191,11 @@ def classify(meta, code, out, err):
         # so that half of the proof stays active for them.
         if DONOTEVALUATE in blob or (want != TEST262ERROR and TEST262ERROR in blob):
             return ("FAIL", f"early-error-not-raised want={want}")
-        if want and (want in err or want.lower() in err.lower()):
+        diagnostic = reported_error(err)
+        if want and re.match(re.escape(want) + r"(?:$|:)", diagnostic):
             return ("PASS", None)
-        # Errored, but the engine did not name a type. zipp's parse rejections
-        # are not all typed (e.g. "`break` target not found"), and the check
-        # above already excludes the "body ran" case, so accept it for the parse
-        # phase only — a runtime-phase mismatch stays a failure.
-        if neg["phase"] == "parse":
+        if (neg["phase"] == "parse" and want == "SyntaxError"
+                and diagnostic in LEGACY_SYNTAX_ERRORS):
             return ("PASS", None)
         return ("FAIL", f"wrong-error want={want}")
     if "async" in meta["flags"]:
@@ -339,8 +361,45 @@ def report_engine_identity(zipp):
         if d.get("dirty"):
             print("engine: tree is DIRTY -- the commit above is the parent it was "
                   "built on, not the code that runs", flush=True)
+        return d
     except Exception as exc:
         print(f"engine: could not read {zipp} --version --json ({exc})", flush=True)
+        return {"identity_error": str(exc)}
+
+
+def report_corpus_identity(root):
+    """Name the test revision independently of the engine revision."""
+    identity = {"path": root, "commit": None, "tracked_dirty": None}
+    try:
+        commit = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
+                                capture_output=True, text=True, timeout=10,
+                                check=True).stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", root, "status", "--porcelain", "--untracked-files=no"],
+            capture_output=True, text=True, timeout=30, check=True).stdout
+        identity.update(commit=commit, tracked_dirty=bool(status.strip()))
+        print(f"corpus: {commit}" + (" (tracked files DIRTY)" if status.strip() else ""),
+              flush=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        identity["identity_error"] = str(exc)
+        print("corpus: revision unavailable (non-git tree or git error)", flush=True)
+    return identity
+
+
+def read_expected_failures(path):
+    """Read the same portable IDs emitted by --dump-fails; reject typos."""
+    expected = set()
+    with open(path, encoding="utf-8") as source:
+        for line_no, line in enumerate(source, 1):
+            entry = line.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            if not re.fullmatch(r"[^\\]+\.js \[(?:sloppy|strict)\]", entry):
+                raise ValueError(f"{path}:{line_no}: invalid failure ID: {entry!r}")
+            if entry in expected:
+                raise ValueError(f"{path}:{line_no}: duplicate failure ID: {entry!r}")
+            expected.add(entry)
+    return expected
 
 
 def main():
@@ -353,6 +412,9 @@ def main():
     ap.add_argument("--timeout", type=int, default=20)
     ap.add_argument("--show-fails", type=int, default=25)
     ap.add_argument("--dump-fails", default="", help="write sorted FAIL ids ('relpath [mode]') to this file (exact regression diffs)")
+    ap.add_argument("--expected-failures", default="",
+                    help="require this exact failure manifest for the selected run; failures, stale entries and skips exit nonzero")
+    ap.add_argument("--json", default="", help="write machine-readable results and build/corpus identity")
     ap.add_argument("--include-intl402", action="store_true",
                     help="also run test/intl402 (ECMA-402). Excluded by default: it has its own baseline")
     ap.add_argument("--no-staging", action="store_true",
@@ -366,6 +428,10 @@ def main():
         ap.error("--limit must be non-negative")
     if a.show_fails < 0:
         ap.error("--show-fails must be non-negative")
+    try:
+        expected = read_expected_failures(a.expected_failures) if a.expected_failures else set()
+    except (OSError, ValueError) as exc:
+        ap.error(str(exc))
     zipp = os.path.realpath(a.zipp) if os.path.isfile(a.zipp) else shutil.which(a.zipp)
     if not zipp:
         ap.error(f"--zipp executable was not found: {a.zipp}")
@@ -373,7 +439,6 @@ def main():
     a.t262 = os.path.realpath(a.t262)
     if not os.path.isdir(a.t262):
         ap.error(f"test262 root does not exist: {a.t262}")
-    report_engine_identity(a.zipp)
     root = os.path.realpath(os.path.join(a.t262, a.sub))
     try:
         inside_checkout = os.path.commonpath((a.t262, root)) == a.t262
@@ -381,10 +446,12 @@ def main():
         inside_checkout = False
     if not inside_checkout:
         ap.error(f"--sub must stay within the test262 checkout: {a.sub}")
-    if not os.path.isdir(root):
+    if not os.path.isdir(root) and not os.path.isfile(root):
         ap.error(f"test262 subtree does not exist: {root}")
     files = []
-    for dp, _, fns in os.walk(root):
+    entries = ([(os.path.dirname(root), [], [os.path.basename(root)])]
+               if os.path.isfile(root) else os.walk(root))
+    for dp, _, fns in entries:
         norm = dp.replace(os.sep, "/")
         if "/intl402" in norm and not a.include_intl402:
             continue
@@ -393,7 +460,7 @@ def main():
         for fn in fns:
             if fn.startswith(TMP_PREFIX):
                 continue
-            if fn.endswith(".js") and not fn.endswith("_FIXTURE.js"):
+            if fn.endswith(".js") and "_FIXTURE" not in fn:
                 path = os.path.realpath(os.path.join(dp, fn))
                 try:
                     inside_checkout = os.path.commonpath((a.t262, path)) == a.t262
@@ -405,6 +472,10 @@ def main():
     files.sort()
     if a.limit:
         files = files[: a.limit]
+    if not files:
+        ap.error("no runnable tests selected (check --sub and suite filters)")
+    engine_identity = report_engine_identity(a.zipp)
+    corpus_identity = report_corpus_identity(a.t262)
     # One JOB per required execution: an unflagged test contributes both a
     # sloppy and a strict run (INTERPRETING.md), so the totals below count
     # executions, not files.
@@ -423,6 +494,7 @@ def main():
     n = len(jobs)
     print(f"running {n} executions ({len(files)} files) with {a.jobs} workers …", flush=True)
     fail_paths = []
+    skipped = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=a.jobs) as ex:
         for i, (verdict, sig, job) in enumerate(
             ex.map(lambda j: run_one(a, get_harness, j), jobs)
@@ -435,18 +507,20 @@ def main():
             if verdict == "FAIL":
                 fail_sigs[sig] += 1
                 fail_paths.append(f"{rel.replace(os.sep, '/')} [{mode}]")
+            elif verdict == "SKIP":
+                skipped.append({"id": f"{rel.replace(os.sep, '/')} [{mode}]", "reason": sig})
             if (i + 1) % 2000 == 0:
                 print(f"  … {i+1}/{n}", flush=True)
     if a.dump_fails:
-        with open(a.dump_fails, "w", newline="\n") as fh:
-            fh.write("\n".join(sorted(fail_paths)) + "\n")
+        with open(a.dump_fails, "w", encoding="utf-8", newline="\n") as fh:
+            fh.writelines(path + "\n" for path in sorted(fail_paths))
         print(f"wrote {len(fail_paths)} FAIL relpaths to {a.dump_fails}")
     p, f, s = totals["PASS"], totals["FAIL"], totals["SKIP"]
     # SKIPs stay in the denominator: a change that made 500 tests unreadable
     # must not be able to RAISE the reported pass rate.
     ran = p + f + s
     print(f"\n==== test262 ({a.sub}) ====")
-    print(f"PASS {p}  FAIL {f}  SKIP {s}   pass-rate {100*p/ran:.1f}% of {ran} executions\n")
+    print(f"PASS {p}  FAIL {f}  SKIP {s}   pass-rate {100*p/ran:.3f}% of {ran} executions\n")
     print("worst categories (by FAIL count):")
     for cat, c in sorted(by_cat.items(), key=lambda kv: -kv[1]["FAIL"])[:20]:
         r = c["PASS"] + c["FAIL"]
@@ -455,6 +529,37 @@ def main():
     print(f"\ntop {a.show_fails} failure signatures:")
     for sig, cnt in fail_sigs.most_common(a.show_fails):
         print(f"  {cnt:5d}  {sig}")
+    actual = set(fail_paths)
+    unexpected = sorted(actual - expected)
+    stale = sorted(expected - actual)
+    success = not unexpected and not stale and not s
+    print(f"\ngate: {'PASS' if success else 'FAIL'} "
+          f"({len(unexpected)} unexpected failures, {len(stale)} stale expectations, {s} skips)")
+    for label, paths in (("unexpected", unexpected), ("stale", stale)):
+        for path in paths[:a.show_fails]:
+            print(f"  {label}: {path}")
+    if a.json:
+        result = {
+            "schema_version": 1,
+            "engine": engine_identity,
+            "corpus": corpus_identity,
+            "selection": {"sub": a.sub, "limit": a.limit,
+                          "include_intl402": a.include_intl402,
+                          "no_staging": a.no_staging},
+            "files": len(files), "executions": ran,
+            "counts": {"pass": p, "fail": f, "skip": s},
+            "failures": sorted(fail_paths),
+            "skipped": sorted(skipped, key=lambda item: item["id"]),
+            "expected_failures": sorted(expected),
+            "unexpected_failures": unexpected,
+            "stale_expectations": stale,
+            "gate_passed": success,
+        }
+        with open(a.json, "w", encoding="utf-8", newline="\n") as output:
+            json.dump(result, output, indent=2)
+            output.write("\n")
+        print(f"wrote results to {a.json}")
+    return 0 if success else 1
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

@@ -225,7 +225,11 @@ impl<'p> Vm<'p> {
         // resumes) to empty. Drains even on a main throw (matches node ordering),
         // then returns the original result.
         let main = self.run_loop(0);
-        self.run_event_loop();
+        // Compatibility scripts can return a heap value from the top level.
+        // Its frame is gone; queued jobs must not collect the return value
+        // before the embedding caller has a chance to marshal it.
+        let root = main.as_ref().copied().unwrap_or(Value::UNDEFINED);
+        self.with_host_roots(&[root], Self::run_event_loop);
         main
     }
 
@@ -535,15 +539,23 @@ impl<'p> Vm<'p> {
                         "TypeError: Cannot perform 'apply' on a revoked proxy".into(),
                     ));
                 }
-                return match self.proxy_trap(handler, "apply")? {
-                    Some(trap) => {
-                        let arr = Value::heap(self.heap.alloc(HeapObj::Array(args.to_vec())));
-                        self.call_value(trap, handler, &[target, this, arr])
-                    }
-                    None => {
-                        self.with_native_recursion_guard(|vm| vm.call_value(target, this, args))
-                    }
-                };
+                // A getter may return a fresh callable Proxy as the trap. On
+                // its recursive entry neither that callee nor the generated
+                // arguments Array lives in a JS register yet. Keep the entire
+                // invocation rooted while apply lookup can run guest code.
+                // Target/handler need their own roots: the getter can revoke
+                // this Proxy, removing both edges from the callee object.
+                return self.with_host_roots(&[callee, this, target, handler], |vm| {
+                    vm.with_host_roots(args, |vm| match vm.proxy_trap(handler, "apply")? {
+                        Some(trap) => {
+                            let arr = Value::heap(vm.heap.alloc(HeapObj::Array(args.to_vec())));
+                            vm.call_value(trap, handler, &[target, this, arr])
+                        }
+                        None => {
+                            vm.with_native_recursion_guard(|vm| vm.call_value(target, this, args))
+                        }
+                    })
+                });
             }
         }
         // A ShadowRealm WrappedFunction: wrap each argument across the

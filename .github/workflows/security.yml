@@ -112,6 +112,11 @@ jobs:
             --test json_plain_stringify \
             --test audit_20260911_native \
             --test audit_20260911_host_work \
+            --test audit_20260912_host_exceptions \
+            --test audit_20260912_host_input_roots \
+            --test audit_20260912_nested_proxy_roots \
+            --test audit_20260912_parser_early_errors \
+            --test audit_20260912_typedarray_species \
             --test global_fingerprint
 
   native-sandbox:

@@ -115,7 +115,13 @@ impl<'s> Parser<'s> {
             for it in items {
                 params.push(self.expr_to_pattern(it)?);
             }
-            if let Some((r, _)) = rest {
+            if let Some((r, pos)) = rest {
+                if matches!(&r, Expr::Assign { .. }) {
+                    return Err(SyntaxError::new(
+                        "SyntaxError: rest parameter may not have an initializer",
+                        pos,
+                    ));
+                }
                 params.push(Pattern::Rest(Box::new(self.expr_to_pattern(r)?)));
             }
             let simple = params.iter().all(|p| matches!(p, Pattern::Ident(_)));

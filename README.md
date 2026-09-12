@@ -453,6 +453,13 @@ Zipp currently passes **95,939 of 95,942** required test262 executions. The
 three blessed failures are one Annex B test carrying a superseded ES2017
 expectation and two rows that require German CLDR data; the exact list is
 [`tools/test262-expected-failures.txt`](tools/test262-expected-failures.txt).
+
+The [12 September 2026 correctness audit](docs/audits/2026-09-12-correctness.md)
+verified this result against Test262 `defaaf1571`, including staging and excluding
+the separate ECMA-402 suite. It tightened negative-test scoring and fixed 42
+executions previously counted as passes despite reporting the wrong error type.
+The runner's `--expected-failures` option now rejects unexpected failures, stale
+expectations and skips; `--json` records the engine and corpus identities.
 The former errored-module-cycle and deferred top-level-await failures are fixed.
 
 The standing correctness strategy compares default JIT, interpreter-only,

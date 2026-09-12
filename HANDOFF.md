@@ -7,6 +7,19 @@ and the B001–B252 experiment ledger is preserved in
 
 ## Current engine baseline
 
+### 12 September correctness follow-up
+
+The [correctness audit of `ee107d4b`](docs/audits/2026-09-12-correctness.md)
+fixes host argument/result and nested-Proxy rooting, consumed host exceptions, TypedArray
+species/aliasing behavior, and four parser early-error gaps. The corrected
+Test262 scorer exposed 42 false passes; all 42 now pass properly. Full core
+conformance is **95,939 / 95,942**, three expected failures, zero skips, on
+Test262 `defaaf1571`. Eight stale failure-manifest entries were removed because
+the current upstream corpus already corrected or removed those tests.
+The audit records executable hashes, verification results and remaining
+German locale-data / runtime-code-lifetime work. No performance claim or
+release artifact update accompanies these changes.
+
 Main is v0.0.16 (`0de9f375`): the two audits of 11 September, B290-B324,
 with the `14770703` canonical capture (all-13 0.6766× Node, hostile 0.8749×
 Node; B314). The tracked production WebAssembly module
@@ -1055,7 +1068,7 @@ node tests/node/run-boundary-suite.cjs
 wasm-bindgen --target web --out-dir tests/browser/pkg --remove-name-section --remove-producers-section target/wasm32-unknown-unknown/release/zipp_wasm.wasm
 node tests/browser/worker-smoke.mjs --browsers chromium,firefox,webkit
 # conformance (the failures must equal tools/test262-expected-failures.txt)
-python tools/run_test262.py --t262 <checkout> --dump-fails fails.txt
+python tools/run_test262.py --t262 <checkout> --expected-failures tools/test262-expected-failures.txt --dump-fails fails.txt --json test262-results.json
 # density (idle host)
 node tests/node/bench-density.cjs
 ```

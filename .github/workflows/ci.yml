@@ -73,6 +73,8 @@ jobs:
       # rot unnoticed until the weekly full run.
       - name: Validate the test quarantine manifest
         run: python3 tools/ci_quarantine.py --check --print
+      - name: Test Test262 scoring and failure gate
+        run: python3 -B -m unittest tools.test_run_test262
       - name: Unit tests and the audit-day regressions (default profile)
         run: >-
           cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast
@@ -81,6 +83,11 @@ jobs:
           --test global_fingerprint
           --test audit_20260911_host_work
           --test audit_20260911_test262_gaps
+          --test audit_20260912_host_exceptions
+          --test audit_20260912_host_input_roots
+          --test audit_20260912_nested_proxy_roots
+          --test audit_20260912_parser_early_errors
+          --test audit_20260912_typedarray_species
           --test captured_intrinsic_lane
       - name: Build zipp-vm in the configurations its manifest advertises
         run: |

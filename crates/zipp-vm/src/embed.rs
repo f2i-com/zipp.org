@@ -420,7 +420,7 @@ impl ScriptState {
                 return Err(format!("TypeError: {name} is not a function"));
             }
             let argv: Vec<Value> = args.iter().map(|a| unmarshal(vm, a)).collect();
-            match vm.call_value(callee, Value::UNDEFINED, &argv) {
+            match vm.host_invoke(callee, &argv) {
                 Ok(v) => Ok(marshal(vm, v)),
                 Err(thrown) => Err(vm.take_host_throw(thrown)),
             }
@@ -1010,10 +1010,16 @@ fn marshal(vm: &mut Vm<'_>, v: Value) -> JsValue {
     // `ToString`. A `toString` that throws yields `Object("")` rather than
     // propagating — marshalling a result must not manufacture a new throw.
     let is_string = vm.type_of(v) == "string";
-    let s = vm
-        .to_js_string(v)
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+    let s = vm.with_host_roots(&[v], |vm| match vm.to_js_string(v) {
+        Ok(s) => s,
+        Err(thrown) => {
+            // This conversion failure is deliberately swallowed, so the
+            // pending guest exception must be consumed here as well. Leaving
+            // it set makes a later native/JIT entry throw the rendering error.
+            vm.take_host_throw(thrown);
+            String::new()
+        }
+    });
     if is_string {
         JsValue::String(s)
     } else {

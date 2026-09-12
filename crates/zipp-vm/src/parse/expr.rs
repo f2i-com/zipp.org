@@ -221,6 +221,13 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_yield(&mut self) -> PResult<Expr> {
+        // A YieldExpression is legal in this generator context, but may sit
+        // inside an as-yet unresolved arrow head. Like AwaitExpression, record
+        // its presence until cover-grammar resolution chooses that reading.
+        self.cover.yield_await.push(SyntaxError::new(
+            "SyntaxError: 'yield' in formal parameters",
+            self.cur().span.start,
+        ));
         self.bump_before_operand()?; // `yield`
                                      // `yield` and `yield *` are restricted productions: a LineTerminator
                                      // ends the expression, so `yield \n x` yields undefined.
@@ -711,6 +718,9 @@ impl<'s> Parser<'s> {
                 links += 1;
                 self.bump_after_operand()?;
                 let prop = self.member_prop()?;
+                if matches!(&e, Expr::Super) && matches!(&prop, MemberProp::Private(_)) {
+                    return Err(self.err_here("SyntaxError: a private name cannot follow 'super'"));
+                }
                 e = Expr::Member(Box::new(Member {
                     object: e,
                     prop,
@@ -887,6 +897,9 @@ impl<'s> Parser<'s> {
                 links += 1;
                 self.bump_after_operand()?;
                 let prop = self.member_prop()?;
+                if matches!(&callee, Expr::Super) && matches!(&prop, MemberProp::Private(_)) {
+                    return Err(self.err_here("SyntaxError: a private name cannot follow 'super'"));
+                }
                 callee = Expr::Member(Box::new(Member {
                     object: callee,
                     prop,
@@ -1502,7 +1515,7 @@ impl<'s> Parser<'s> {
                 let save = self.save();
                 self.bump_after_operand()?;
                 if self.at_property_name_start() {
-                    let key = self.parse_prop_key()?;
+                    let key = self.parse_public_prop_key()?;
                     let func = self.parse_method_rest(false, false, start)?;
                     self.check_accessor_arity(is_get, &func.params)?;
                     let m = if is_get {
@@ -1529,7 +1542,7 @@ impl<'s> Parser<'s> {
             if !self.cur().newline_before && (self.at_property_name_start() || self.at(Punct::Star))
             {
                 let gen = self.eat(Punct::Star, false)?;
-                let key = self.parse_prop_key()?;
+                let key = self.parse_public_prop_key()?;
                 let func = self.parse_method_rest(true, gen, start)?;
                 return Ok((
                     ObjectMember::Method {
@@ -1545,7 +1558,7 @@ impl<'s> Parser<'s> {
         // `*gen() {}`
         if self.at(Punct::Star) {
             self.bump_after_operand()?;
-            let key = self.parse_prop_key()?;
+            let key = self.parse_public_prop_key()?;
             let func = self.parse_method_rest(false, true, start)?;
             return Ok((
                 ObjectMember::Method {
@@ -1565,7 +1578,7 @@ impl<'s> Parser<'s> {
         // settle the question here, before the token is gone.
         let key_is_ident_ref = self.is_binding_ident();
         let key_pos = self.cur().span.start;
-        let key = self.parse_prop_key()?;
+        let key = self.parse_public_prop_key()?;
         // `m() {}`
         if self.at(Punct::LParen) {
             let func = self.parse_method_rest(false, false, start)?;
@@ -1648,6 +1661,17 @@ impl<'s> Parser<'s> {
             // re-reading `get` as a shorthand property.
             TokenKind::Ident { .. } | TokenKind::Str(_) | TokenKind::Num(_) | TokenKind::BigInt(_)
         ) || self.at(Punct::LBracket)
+    }
+
+    /// Object literals and destructuring use PropertyName, which excludes
+    /// PrivateIdentifier. Only class element names admit the private form.
+    pub(crate) fn parse_public_prop_key(&mut self) -> PResult<PropKey> {
+        if matches!(&self.cur().kind, TokenKind::Ident { private: true, .. }) {
+            return Err(
+                self.err_here("SyntaxError: private names are only valid as class element names")
+            );
+        }
+        self.parse_prop_key()
     }
 
     pub(crate) fn parse_prop_key(&mut self) -> PResult<PropKey> {

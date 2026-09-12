@@ -1580,6 +1580,15 @@ impl<'p> Vm<'p> {
             }
             _ => {}
         }
+        // TypedArraySpeciesCreate checks [[ContentType]] even when there are
+        // no elements to copy. Leaving this to element conversion also lets
+        // map callbacks run before the required TypeError.
+        let (_, result_kind) = self.ta_len_kind(ridx);
+        if native::TA_KINDS[result_kind as usize].2 != native::TA_KINDS[kind as usize].2 {
+            return Err(Thrown(
+                "TypeError: TypedArray species has a different content type".into(),
+            ));
+        }
         Ok(result)
     }
 
@@ -2154,11 +2163,23 @@ impl<'p> Vm<'p> {
                                 .into(),
                         ));
                     }
+                    let tracking = a1 == Value::UNDEFINED && self.ta_tracking.contains(&idx);
+                    // The argument coercions and species lookup may shrink the
+                    // source after start/end were calculated. The default
+                    // constructor must reject the now-invalid buffer window.
+                    let byte_len = self.array_buffer_len(buffer);
+                    if new_offset > byte_len
+                        || (!tracking && new_len > (byte_len - new_offset) / size)
+                    {
+                        return Err(Thrown(
+                            "RangeError: subarray view exceeds the ArrayBuffer bounds".into(),
+                        ));
+                    }
                     let result = self.alloc_typed_array(buffer, kind, new_offset, new_len);
                     // A subarray of a length-tracking view with no explicit `end` is
                     // itself length-tracking (newLength stays auto), so it grows/shrinks
                     // with the resizable buffer rather than snapshotting the length.
-                    if a1 == Value::UNDEFINED && self.ta_tracking.contains(&idx) {
+                    if tracking {
                         self.ta_tracking.insert(result.heap_index());
                     }
                     return Ok(Some(result));
@@ -2186,12 +2207,24 @@ impl<'p> Vm<'p> {
                         ],
                     )?
                 };
-                if !matches!(
-                    self.heap.get(result.heap_index()),
-                    HeapObj::TypedArray { .. }
-                ) {
+                let Some(result_idx) = self.as_typed_array(result) else {
                     return Err(Thrown(
                         "TypeError: TypedArray [Symbol.species] did not return a TypedArray".into(),
+                    ));
+                };
+                // TypedArrayCreateFromConstructor validates a species result
+                // in read mode: immutable buffers are fine for a subarray, but
+                // detached and out-of-bounds views are not. Its argument list
+                // starts with a buffer, so there is no minimum-length check.
+                if self.ta_effective_len(result_idx).is_none() {
+                    return Err(Thrown(
+                        "TypeError: species-created TypedArray is detached or out of bounds".into(),
+                    ));
+                }
+                let (_, result_kind) = self.ta_len_kind(result_idx);
+                if native::TA_KINDS[result_kind as usize].2 != native::TA_KINDS[kind as usize].2 {
+                    return Err(Thrown(
+                        "TypeError: TypedArray species has a different content type".into(),
                     ));
                 }
                 Ok(Some(result))
