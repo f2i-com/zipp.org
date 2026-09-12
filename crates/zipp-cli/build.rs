@@ -374,7 +374,7 @@ pub(crate) fn hash_dirty_material(
     for path in untracked {
         hash_untracked_entry(&mut digest, repo_root, &path)?;
     }
-    Some(format!("{:x}", digest.finalize()))
+    Some(lowercase_hex(digest.finalize()))
 }
 
 fn nul_records(mut bytes: Vec<u8>) -> Option<Vec<Vec<u8>>> {
@@ -672,7 +672,19 @@ fn sha256_file(path: &Path) -> Option<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Some(format!("{:x}", digest.finalize()))
+    Some(lowercase_hex(digest.finalize()))
+}
+
+fn lowercase_hex(bytes: impl AsRef<[u8]>) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    let bytes = bytes.as_ref();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 fn emit(key: &str, val: &str) {
