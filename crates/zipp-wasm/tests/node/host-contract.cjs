@@ -316,6 +316,7 @@ eq("unknown type dispatches to nobody", e.dispatchEvent("mousemove", { type: "mo
 
 console.log("— host.call queue —");
 eq("queue starts empty", e.drainPendingHostCalls(), []);
+eq("status drain distinguishes an empty queue", e.drainPendingHostCallsStatus(), { calls: [], hasMore: false, stopReason: "empty" });
 e.callFunction("fetchIt", []);
 const q = e.drainPendingHostCalls();
 eq("one queued call", q.length, 1);

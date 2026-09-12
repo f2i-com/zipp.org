@@ -23,6 +23,8 @@ const engineModule = moduleUrl(`
       if (name === "symbol") throw Symbol("guest error");
       return "healthy";
     }
+    drainPendingHostCalls() { return []; }
+    drainPendingHostCallsStatus() { return { calls: [], hasMore: false, stopReason: "empty" }; }
   }
 `);
 

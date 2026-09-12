@@ -37,6 +37,7 @@ const CHECKS = [
   ["audit-defaults.cjs"],
   ["audit-2026-09-11.cjs"],
   ["audit-2026-09-11-close.cjs"],
+  ["audit-2026-09-13.cjs"],
   // The reference host adapter's main-thread contract under a mocked Worker
   // (no engine needed; ZA-01/02/03). Cheap, so it rides in the minimum gate.
   ["sdk-contract.mjs"],

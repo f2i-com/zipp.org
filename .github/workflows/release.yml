@@ -4,12 +4,12 @@ name: Release
 # The manual entry point is useful for retrying infrastructure failures, but it
 # deliberately does not create a tag or release an arbitrary branch/SHA.
 #
-# Publishing is gated on the complete CI workflow (ci.yml, called as a
-# reusable workflow) at the EXACT tagged revision — the engine suite, the
-# instrumented embedding contracts, the isolated host workspace and the
-# production WebAssembly boundary suite — in addition to this workflow's own
-# validation, native and WASM jobs. A green `main` at some other revision is
-# not a release gate (the 11 September 2026 audit's ZIPP-09). The Node
+# Publishing is gated on both reusable CI and the broad security workflow at
+# the EXACT tagged revision. That includes the full native suite, safe profile,
+# native and WASM sandboxes, production boundary suite, real browser Workers,
+# dependency audit, and pinned Test262 corpus with exact expected failures, in
+# addition to this workflow's validation and release builds. A green `main` at
+# some other revision is not a release gate. The Node
 # boundary checks the WASM job runs come from the one shared list
 # (tests/node/run-boundary-suite.cjs) so this lane cannot drift from CI.
 on:
@@ -132,6 +132,13 @@ jobs:
     name: CI at the tagged revision
     needs: validate
     uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.validate.outputs.commit }}
+
+  security:
+    name: Full release gate at the tagged revision
+    needs: validate
+    uses: ./.github/workflows/security.yml
     with:
       ref: ${{ needs.validate.outputs.commit }}
 
@@ -535,9 +542,9 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    # `ci` is the exact-revision gate: a tagged revision that fails a required
-    # semantic, profile or boundary test does not publish.
-    needs: [validate, ci, native, wasm]
+    # Both reusable gates run at the validated tag commit. Publishing waits
+    # for the full native, safe-profile, sandbox, Worker and Test262 matrix.
+    needs: [validate, ci, security, native, wasm]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

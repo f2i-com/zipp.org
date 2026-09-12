@@ -204,13 +204,26 @@ split is not stylistic:
   The drain is transactional: a request leaves the guest queue only once its
   host representation exists, so every accepted request is delivered exactly
   once, or stays queued for the next drain (when the per-drain request or byte
-  allowance is used up — drain until an empty array comes back), or, for a
+  allowance is used up), or, for a
   single request too large to cross even on its own, is rejected: removed, its
   callback invoked with a `RangeError`, never left pending for a request the
   host will not see. Ids are JavaScript Numbers end to end (no 32-bit
   truncation); `resolveHostCallback` returns whether a callback ran, so a late
   or duplicate completion is a visible no-op; `cancelHostCallback(id)` releases
   a pending callback without invoking it.
+
+  Existing consumers can keep using the array-returning
+  `drainPendingHostCalls()`. New hosts should use
+  `drainPendingHostCallsStatus()`, which returns
+  `{ calls, hasMore, stopReason }`; `stopReason` is `empty`, `request-limit`,
+  `work-limit`, or `interrupted` when a recoverable helper failure is deferred.
+  This distinguishes an empty queue from a bounded pass that made
+  no deliveries while rejecting untransportable requests.
+
+Console reads are transactional too. `takeOutput()` and `takeConsole()` convert
+the largest prefix that fits, then consume exactly that prefix. A maximum-sized
+backlog is therefore paginated across calls, and a conversion failure leaves it
+available for retry.
 
 The synchronous channel is default-deny per `Engine`. Installing a bridge object
 does **not** grant authority. Before `initScript`, the host must explicitly set the

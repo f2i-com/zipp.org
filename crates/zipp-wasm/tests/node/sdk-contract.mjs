@@ -215,6 +215,23 @@ await test("initialization cannot resurrect a terminated host", async (ctx) => {
   assert.equal(r.error.category, "terminated");
   assert.equal(worker.terminated, true);
 });
+await test("a locally rejected initialization reports the dead generation", async (ctx) => {
+  for (const [source, options] of [
+    ["", { deadlineMs: 0 }],
+    [() => 1, {}],
+  ]) {
+    const { host, worker } = ctx.make();
+    const r = await settled(host.init(source, options));
+    assert.equal(r.ok, false);
+    assert.equal(r.error.category, "usage");
+    assert.equal(r.error.terminal, true);
+    assert.equal(host.state, "dead");
+    assert.equal(host.deathCause.terminal, true);
+    assert.equal(worker.terminated, true);
+    assert.equal(host.pendingRequests, 0);
+    assert.equal(ctx.timers.size, 0);
+  }
+});
 await test("a late reply for a dead host settles nothing", async (ctx) => {
   const { host, worker } = await ctx.ready();
   const p = settled(host.call("f"));

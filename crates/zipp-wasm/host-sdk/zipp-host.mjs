@@ -1,5 +1,5 @@
 // zipp-host: a small reference host adapter for the zipp-wasm engine in a
-// browser, version 1.1.1. The 11 September 2026 audit's ZIPP-17 asked for one
+// browser, version 1.2.0. The 11 September 2026 audit's ZIPP-17 asked for one
 // consistent lifecycle/error/capability contract for embedders; this is it,
 // kept deliberately small so an application can read it in one sitting.
 //
@@ -62,7 +62,7 @@
 // afterwards — the engine enforces that, this adapter merely never asks
 // twice. Nothing here widens the engine's authority.
 
-export const ZIPP_HOST_SDK_VERSION = "1.1.1";
+export const ZIPP_HOST_SDK_VERSION = "1.2.0";
 
 /** The longest deadline a timer can hold exactly (2^31 − 1 ms). */
 export const MAX_DEADLINE_MS = 2147483647;
@@ -252,11 +252,25 @@ export function createZippHost(config) {
         state = "ready";
         return symbols;
       } catch (error) {
+        const failure = describeThrownError(error);
+        let category = "source";
+        try {
+          if (typeof error?.category === "string" && error.category) category = error.category;
+        } catch {}
         if (state !== "dead") {
           // Any initialization failure disposes the engine: the host is dead.
-          die(error.category || "source", error.message);
+          die(category, failure.message);
         }
-        throw error;
+        if (error instanceof ZippHostError && error.terminal) throw error;
+        // Local validation and structured-clone failures begin as recoverable
+        // request errors. Initialization nevertheless killed this generation,
+        // so the error returned to the caller must report that terminal state.
+        throw new ZippHostError(
+          deathCause?.category || category,
+          failure.message,
+          undefined,
+          true,
+        );
       }
     },
     call: (name, args = [], options) => request("call", { name, args }, options),
@@ -266,6 +280,7 @@ export function createZippHost(config) {
     evalRich: (expr, options) => request("eval", { expr }, options),
     dispatchEvent: (type, event, options) => request("dispatch", { type, event }, options),
     drainHostCalls: (options) => request("drain", {}, options),
+    drainHostCallsStatus: (options) => request("drainStatus", {}, options),
     resolveHostCall: (callId, result, options) => request("resolve", { callId, result }, options),
     cancelHostCall: (callId, options) => request("cancel", { callId }, options),
     takeConsole: (options) => request("console", {}, options),

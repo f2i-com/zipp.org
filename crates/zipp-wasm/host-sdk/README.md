@@ -1,4 +1,4 @@
-# zipp-host: the reference host adapter (v1.1.1)
+# zipp-host: the reference host adapter (v1.2.0)
 
 Two ES modules a browser application copies next to the released web package:
 
@@ -25,9 +25,13 @@ const host = createZippHost({
 const symbols = await host.init(source);        // compile + run the top level
 await host.call("render", [state]);
 const [snapshot] = await host.readGlobals([symbols.state.index]);
-for (const req of await host.drainHostCalls()) {
-  // dispatch by an exact allowlist of your own, then:
-  await host.resolveHostCall(req.id, result);   // true if a callback ran
+for (;;) {
+  const batch = await host.drainHostCallsStatus();
+  for (const req of batch.calls) {
+    // dispatch by an exact allowlist of your own, then:
+    await host.resolveHostCall(req.id, result); // true if a callback ran
+  }
+  if (!batch.hasMore) break;
 }
 host.terminate();                               // the Worker and its WASM instance end
 ```
@@ -48,6 +52,9 @@ terminated cannot make it `ready`, and a message from a dead generation
 settles nothing. Ordinary operations require `ready`; called earlier they
 reject locally with `usage` and nothing is posted to a Worker that may still
 be loading — there is no initialization queue.
+Any initialization failure ends that generation. This includes a locally
+rejected deadline or payload: the returned error is normalized to
+`terminal: true` after the Worker is terminated.
 
 **Generations.** Every message carries the host's generation. A reply from a
 Worker that has since been terminated is dropped, and every request pending
@@ -103,7 +110,8 @@ the engine's README lists the recognized operation names.
 
 **Methods.** `init(source)`, `call(name, args)`, `readGlobals(indices)`,
 `writeGlobals(indices, values)`, `fingerprint(indices)`, `evalRich(expr)`,
-`dispatchEvent(type, event)`, `drainHostCalls()`, `resolveHostCall(id, result)`,
+`dispatchEvent(type, event)`, `drainHostCalls()`, `drainHostCallsStatus()`,
+`resolveHostCall(id, result)`,
 `cancelHostCall(id)`, `takeConsole()`, `resourceUsage()`, `terminate()`. Each
 returns a promise (except `terminate`) and accepts an optional trailing
 `{ deadlineMs }`. `host.pendingRequests` counts requests awaiting a reply.

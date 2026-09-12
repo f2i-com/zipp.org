@@ -7,6 +7,27 @@ and the B001–B252 experiment ledger is preserved in
 
 ## Current engine baseline
 
+### 13 September external-review follow-up
+
+The v0.0.17 host-boundary review's reproducible findings are closed. Console
+reads now snapshot, convert a bounded prefix, and commit only after conversion,
+so `takeOutput()` and `takeConsole()` paginate a maximum backlog without losing
+records. The additive `drainPendingHostCallsStatus()` API reports
+`{ calls, hasMore, stopReason }`, including a rejection-only pass that stops at
+its work ceiling with zero deliveries; the array API remains compatible. Error
+classification is stored per Engine, and SDK 1.2.0 normalizes every failed
+initialization as terminal after its Worker is killed.
+
+Release publishing now consumes the complete reusable security workflow at the
+validated tag commit. Its gate includes the full native and safe-profile suites,
+both sandboxes, the production Node and three-browser Worker boundaries,
+dependency audit, and Test262 checkout `4249661388e5d3f92a85186213da140a6481490f`
+with the exact three-entry
+failure manifest and zero skips. The known dynamic-definition retention remains
+bounded and reported by `resourceUsage()` / `zippInstanceUsage()`; the reference
+SDK's one-tenant-per-Worker lifecycle and the 200-engine soak test remain the
+reclamation boundary.
+
 ### 12 September deep follow-up audit
 
 The [follow-up audit](docs/audits/2026-09-12-follow-up.md) hardens the edges
@@ -40,7 +61,9 @@ The audit records executable hashes, verification results and remaining
 German locale-data / runtime-code-lifetime work. No performance claim or
 release artifact update accompanies these changes.
 
-Main is v0.0.16 (`0de9f375`): the two audits of 11 September, B290-B324,
+The latest published release is v0.0.17 (`127477bd`). The tracked landing-page
+WebAssembly module described below remains the v0.0.16 artifact:
+the two audits of 11 September, B290-B324,
 with the `14770703` canonical capture (all-13 0.6766× Node, hostile 0.8749×
 Node; B314). The tracked production WebAssembly module
 (`landing/public/wasm/`) is the v0.0.16 engine built from `0de9f375` with

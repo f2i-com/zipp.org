@@ -88,6 +88,7 @@ async function handle(msg) {
     case "eval": return engineCall("eval", () => engine.evalInContextRich(msg.expr));
     case "dispatch": return engineCall("dispatch", () => engine.dispatchEvent(msg.type, msg.event));
     case "drain": return engineCall("drain", () => engine.drainPendingHostCalls());
+    case "drainStatus": return engineCall("drainStatus", () => engine.drainPendingHostCallsStatus());
     case "resolve": return engineCall("resolve", () => engine.resolveHostCallback(msg.callId, msg.result));
     case "cancel": return engineCall("cancel", () => engine.cancelHostCallback(msg.callId));
     case "console": return engineCall("console", () => engine.takeConsole());

@@ -10,13 +10,23 @@ name: Security
 # restored when automatic checks resume. CI (ci.yml) is the minimum gate, and the
 # broad lanes — the full engine suite, the safe profile, the sandboxes, the
 # browser Workers — are run locally before a push (HANDOFF.md, "Local
-# verification") and here on demand. Release publishing does
-# not consume these results directly — release.yml requires the
-# exact-revision CI gate.
+# verification") and here on demand. Release publishing calls this workflow
+# at the validated tag commit and consumes every result.
 #
 # No job here publishes anything.
 on:
   workflow_dispatch:
+    inputs:
+      ref:
+        description: Git revision to test (defaults to the dispatched revision)
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact validated release commit
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -38,6 +48,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Select the Node.js harness-test runtime
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -57,6 +68,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       # A deliberately labelled stable-toolchain canary: the pinned 1.92.0
       # toolchain is what CI and release use, so a failure here that CI does
@@ -85,6 +97,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Select stable Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
@@ -135,6 +148,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Select stable Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
@@ -160,6 +174,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Select stable Rust
         run: rustup toolchain install stable --profile minimal --no-self-update
@@ -177,6 +192,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Select stable Rust and wasm32 target
         run: |
@@ -202,7 +218,7 @@ jobs:
             -Dwarnings
             -C link-arg=--max-memory=1073741824
             -C link-arg=-zstack-size=1048576
-          ZIPP_SOURCE_SHA: ${{ github.sha }}
+          ZIPP_SOURCE_SHA: ${{ inputs.ref || github.sha }}
         run: cargo +stable build --locked --release --target wasm32-unknown-unknown
       # The same list CI and release run; see tests/node/run-boundary-suite.cjs.
       - name: Test the production host boundary under Node
@@ -222,6 +238,46 @@ jobs:
           npx playwright install --with-deps chromium firefox webkit
           node tests/browser/worker-smoke.mjs --browsers chromium,firefox,webkit
 
+  test262:
+    name: Pinned Test262 conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+      - name: Check out the pinned Test262 corpus
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tc39/test262
+          ref: 4249661388e5d3f92a85186213da140a6481490f
+          path: .test262
+          persist-credentials: false
+      - name: Select the pinned release Rust toolchain
+        run: rustup toolchain install 1.92.0 --profile minimal --no-self-update
+      - name: Build the locked release CLI
+        run: cargo +1.92.0 build --locked --release --package zipp-cli --bin zipp
+      - name: Require the exact expected-failure identities and zero skips
+        run: >-
+          python3 tools/run_test262.py
+          --t262 .test262
+          --zipp target/release/zipp
+          --expected-failures tools/test262-expected-failures.txt
+          --dump-fails test262-failures.txt
+          --json test262-results.json
+      - name: Upload the conformance evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test262-evidence
+          path: |
+            test262-failures.txt
+            test262-results.json
+          if-no-files-found: warn
+          retention-days: 30
+
   dependency-audit:
     name: Dependency vulnerability audit
     runs-on: ubuntu-24.04
@@ -230,6 +286,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref || github.sha }}
           persist-credentials: false
       - name: Select stable Rust
         run: rustup toolchain install stable --profile minimal --no-self-update

@@ -318,6 +318,10 @@ pub struct Engine {
     /// configuration — is applied when the state exists rather than silently
     /// dropped (the 11 September 2026 audit's ZIPP-07).
     fingerprint_seed: Option<u64>,
+    /// Classification of the most recent error thrown by this engine. Kept
+    /// on the instance so another Engine on the same WASM thread cannot
+    /// overwrite it.
+    last_error_kind: std::cell::Cell<&'static str>,
 }
 
 #[wasm_bindgen]
@@ -342,6 +346,7 @@ impl Engine {
             host_configuration_frozen: false,
             instruction_budget: MAX_LIFETIME_STEPS,
             fingerprint_seed: None,
+            last_error_kind: std::cell::Cell::new("usage"),
         }
     }
 
@@ -402,13 +407,13 @@ impl Engine {
     #[wasm_bindgen(js_name = setSyncHostCapabilities)]
     pub fn set_sync_host_capabilities(&mut self, operations: JsValue) -> Result<(), JsValue> {
         self.ensure_host_configuration_open()?;
-        if !checked_is_array(&operations, "synchronous host capabilities").map_err(to_js_error)? {
+        if !checked_is_array(&operations, "synchronous host capabilities").map_err(|error| self.to_js_error(error))? {
             return Err(JsValue::from_str(
                 "TypeError: synchronous host capabilities must be an array",
             ));
         }
         let len = checked_array_length(&operations, "synchronous host capabilities")
-            .map_err(to_js_error)?;
+            .map_err(|error| self.to_js_error(error))?;
         if len > MAX_SYNC_CAPABILITY_ENTRIES {
             return Err(JsValue::from_str(
                 "RangeError: too many synchronous host capability entries",
@@ -417,7 +422,7 @@ impl Engine {
         let mut allowed = HashSet::with_capacity(len as usize);
         for index in 0..len {
             let operation = checked_array_get(&operations, index, "synchronous host capabilities")
-                .map_err(to_js_error)?;
+                .map_err(|error| self.to_js_error(error))?;
             let Some(operation) = operation.as_string() else {
                 return Err(JsValue::from_str(
                     "TypeError: synchronous host capability names must be strings",
@@ -472,7 +477,7 @@ impl Engine {
             // precede it (the 11 September 2026 audit's ZIPP-01).
             let mut st = compile_script_with_preamble(PREAMBLE, source, &GUEST_COMPILE_OPTIONS)
                 .map_err(|e| {
-                    note_error_kind("source");
+                    self.note_error_kind("source");
                     JsValue::from_str(&e)
                 })?;
             if let Some(seed) = self.fingerprint_seed {
@@ -504,11 +509,11 @@ impl Engine {
 
             let init = st.run_init();
             if let Some(error) = st.resource_limit_error() {
-                note_error_kind("resource");
+                self.note_error_kind("resource");
                 return Err(JsValue::from_str(error));
             }
             init.map_err(|e| {
-                note_error_kind("source");
+                self.note_error_kind("source");
                 JsValue::from_str(&e)
             })?;
 
@@ -553,7 +558,7 @@ impl Engine {
                 resolve_host_call: find("__zResolveHostCall"),
                 cancel_host_call: find("__zCancelHostCall"),
             };
-            let out = to_js(&HostValue::Object(exposed)).map_err(to_js_error)?;
+            let out = to_js(&HostValue::Object(exposed)).map_err(|error| self.to_js_error(error))?;
             self.slots = slots;
             self.helpers = helpers;
             self.state = Some(st);
@@ -573,8 +578,8 @@ impl Engine {
         let Some(st) = self.state.as_mut() else {
             return Ok(JsValue::UNDEFINED);
         };
-        let value = st.try_get_slot(index).map_err(to_js_error)?;
-        to_js(&value).map_err(to_js_error)
+        let value = st.try_get_slot(index).map_err(|error| self.to_js_error(error))?;
+        to_js(&value).map_err(|error| self.to_js_error(error))
     }
 
     /// Write the global in `index`. A slot currently holding a function or
@@ -583,7 +588,7 @@ impl Engine {
     #[wasm_bindgen(js_name = setGlobalByIndex)]
     pub fn set_global_by_index(&mut self, index: u32, value: JsValue) -> Result<(), JsValue> {
         self.ensure_live()?;
-        let value = from_js(&value).map_err(to_js_error)?;
+        let value = from_js(&value).map_err(|error| self.to_js_error(error))?;
         if let Some(st) = self.state.as_mut() {
             st.set_slot(index, &value);
         }
@@ -597,18 +602,24 @@ impl Engine {
     pub fn get_globals_batch(&mut self, indices: JsValue) -> Result<JsValue, JsValue> {
         self.ensure_live()?;
         let mut budget = HostValueBudget::default();
-        let indices = index_list(&indices, &mut budget).map_err(to_js_error)?;
+        let indices = index_list(&indices, &mut budget).map_err(|error| self.to_js_error(error))?;
         let out = js_sys::Array::new();
+        budget.charge_node().map_err(|error| self.to_js_error(error))?;
+        budget.ensure_nodes(indices.len()).map_err(|error| self.to_js_error(error))?;
+        let last_error_kind = &self.last_error_kind;
         if let Some(st) = self.state.as_mut() {
-            budget.charge_node().map_err(to_js_error)?;
-            budget.ensure_nodes(indices.len()).map_err(to_js_error)?;
             // One VM-side allowance for the whole batch, repeated slots
             // included: nodes, bytes and inspected work (ZA-07), beside the
             // JS-side one the loop below already shared.
             let mut walk = HostValueBudget::default();
             for i in indices {
-                let value = st.try_get_slot_bounded(i, &mut walk).map_err(to_js_error)?;
-                out.push(&to_js_bounded(&value, &mut budget).map_err(to_js_error)?);
+                let value = st
+                    .try_get_slot_bounded(i, &mut walk)
+                    .map_err(|error| engine_js_error(last_error_kind, error))?;
+                out.push(
+                    &to_js_bounded(&value, &mut budget)
+                        .map_err(|error| engine_js_error(last_error_kind, error))?,
+                );
             }
         }
         Ok(out.into())
@@ -727,7 +738,7 @@ impl Engine {
     pub fn get_globals_fingerprint(&mut self, indices: JsValue) -> Result<JsValue, JsValue> {
         self.ensure_live()?;
         let mut budget = HostValueBudget::default();
-        let indices = index_list(&indices, &mut budget).map_err(to_js_error)?;
+        let indices = index_list(&indices, &mut budget).map_err(|error| self.to_js_error(error))?;
         let out = js_sys::Array::new();
         if let Some(st) = self.state.as_mut() {
             let mut work = FingerprintBudget::default();
@@ -756,9 +767,9 @@ impl Engine {
     pub fn set_globals_batch(&mut self, indices: JsValue, values: JsValue) -> Result<(), JsValue> {
         self.ensure_live()?;
         let mut budget = HostValueBudget::default();
-        let idx = index_list(&indices, &mut budget).map_err(to_js_error)?;
-        require_array(&values, "values").map_err(to_js_error)?;
-        let values_len = checked_array_length(&values, "values").map_err(to_js_error)?;
+        let idx = index_list(&indices, &mut budget).map_err(|error| self.to_js_error(error))?;
+        require_array(&values, "values").map_err(|error| self.to_js_error(error))?;
+        let values_len = checked_array_length(&values, "values").map_err(|error| self.to_js_error(error))?;
         if values_len as usize != idx.len() {
             return Err(JsValue::from_str(&format!(
                 "TypeError: setGlobalsBatch: indices and values must have the same length ({} indices, {} values)",
@@ -774,13 +785,13 @@ impl Engine {
                 )));
             }
         }
-        budget.charge_node().map_err(to_js_error)?;
-        budget.ensure_nodes(idx.len()).map_err(to_js_error)?;
+        budget.charge_node().map_err(|error| self.to_js_error(error))?;
+        budget.ensure_nodes(idx.len()).map_err(|error| self.to_js_error(error))?;
         let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
         let mut converted = Vec::with_capacity(idx.len());
         for (n, i) in idx.into_iter().enumerate() {
-            let raw = checked_array_get(&values, n as u32, "values").map_err(to_js_error)?;
-            let value = from_js_bounded(&raw, 0, &seen, &mut budget).map_err(to_js_error)?;
+            let raw = checked_array_get(&values, n as u32, "values").map_err(|error| self.to_js_error(error))?;
+            let value = from_js_bounded(&raw, 0, &seen, &mut budget).map_err(|error| self.to_js_error(error))?;
             converted.push((i, value));
         }
         if let Some(st) = self.state.as_mut() {
@@ -796,16 +807,22 @@ impl Engine {
     #[wasm_bindgen(js_name = callFunction)]
     pub fn call_function(&mut self, name: &str, args: JsValue) -> Result<JsValue, JsValue> {
         self.ensure_live()?;
-        let slot = self
+        let Some(slot) = self
             .slots
             .iter()
             .find(|(n, _, _)| n == name)
             .map(|(_, i, _)| *i)
-            .ok_or_else(|| JsValue::from_str(&format!("zipp: no such function '{name}'")))?;
-        let argv = match from_js(&args).map_err(to_js_error)? {
+        else {
+            self.note_error_kind("usage");
+            return Err(JsValue::from_str(&format!(
+                "zipp: no such function '{name}'"
+            )));
+        };
+        let argv = match from_js(&args).map_err(|error| self.to_js_error(error))? {
             HostValue::Undefined | HostValue::Null => Vec::new(),
             HostValue::Array(items) => items,
             _ => {
+                self.note_error_kind("usage");
                 return Err(JsValue::from_str(
                     "TypeError: call arguments must be an array",
                 ))
@@ -815,9 +832,9 @@ impl Engine {
             .state
             .as_mut()
             .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
-        let result = classified_call(st, slot, &argv);
-        let value = self.finish_execution(result)?;
-        to_js(&value).map_err(to_js_error)
+        let (result, kind) = classified_call(st, slot, &argv);
+        let value = self.finish_classified_execution(result, kind)?;
+        to_js(&value).map_err(|error| self.to_js_error(error))
     }
 
     /// Evaluate `expr` in the script's global context and return its value
@@ -851,8 +868,8 @@ impl Engine {
         match value.as_str() {
             Some(s) => {
                 let mut budget = HostValueBudget::default();
-                budget.charge_node().map_err(to_js_error)?;
-                budget.charge_string(s).map_err(to_js_error)?;
+                budget.charge_node().map_err(|error| self.to_js_error(error))?;
+                budget.charge_string(s).map_err(|error| self.to_js_error(error))?;
                 // The projection is the guest's `JSON.stringify` output. Text
                 // that does not parse means the guest replaced that facility;
                 // report it instead of answering `undefined` as if the
@@ -862,8 +879,8 @@ impl Engine {
                         "SyntaxError: evalInContext result is not valid JSON (has the guest replaced JSON.stringify?)",
                     )
                 })?;
-                let value = from_js(&parsed).map_err(to_js_error)?;
-                to_js(&value).map_err(to_js_error)
+                let value = from_js(&parsed).map_err(|error| self.to_js_error(error))?;
+                to_js(&value).map_err(|error| self.to_js_error(error))
             }
             // `JSON.stringify` yields undefined for a function or undefined.
             None => Ok(JsValue::UNDEFINED),
@@ -898,17 +915,11 @@ impl Engine {
             .expect("initialization checked by account_eval")
             .eval_in_context_rich(&wrapped, &mut budget);
         // A resource ceiling is terminal whatever the typed error says.
-        let result = result.map_err(|error| match error {
-            HostCallError::Conversion(message) => {
-                note_error_kind("conversion");
-                message
-            }
-            HostCallError::Thrown(message) => message,
-        });
-        let value = self.finish_execution(result)?;
+        let (result, kind) = classify_host_call_result(result);
+        let value = self.finish_classified_execution(result, kind)?;
         // The JS-side conversion has its own copy of the same budget shape.
         let mut js_budget = HostValueBudget::default();
-        to_js_bounded(&value, &mut js_budget).map_err(to_js_error)
+        to_js_bounded(&value, &mut js_budget).map_err(|error| self.to_js_error(error))
     }
 
     /// What this engine currently retains and has spent, as a plain object a
@@ -995,7 +1006,7 @@ impl Engine {
             ),
             ("programSourceBytes".into(), n(usage.program_source_bytes)),
         ]))
-        .map_err(to_js_error)
+        .map_err(|error| self.to_js_error(error))
     }
 
     /// Event types the script has registered listeners for, e.g. `["keydown"]`.
@@ -1005,8 +1016,8 @@ impl Engine {
         let (Some(slot), Some(st)) = (self.helpers.listener_types, self.state.as_mut()) else {
             return Ok(js_sys::Array::new().into());
         };
-        let result = classified_call(st, slot, &[]);
-        let value = self.finish_execution(result)?;
+        let (result, kind) = classified_call(st, slot, &[]);
+        let value = self.finish_classified_execution(result, kind)?;
         let value = match value {
             HostValue::Array(items) => HostValue::Array(
                 items
@@ -1016,7 +1027,7 @@ impl Engine {
             ),
             _ => HostValue::Array(Vec::new()),
         };
-        to_js(&value).map_err(to_js_error)
+        to_js(&value).map_err(|error| self.to_js_error(error))
     }
 
     /// Deliver `event` to every listener registered for `type`, returning how
@@ -1025,17 +1036,17 @@ impl Engine {
     #[wasm_bindgen(js_name = dispatchEvent)]
     pub fn dispatch_event(&mut self, event_type: &str, event: JsValue) -> Result<u32, JsValue> {
         self.ensure_live()?;
+        let mut budget = HostValueBudget::default();
+        budget.charge_node().map_err(|error| self.to_js_error(error))?;
+        budget.charge_string(event_type).map_err(|error| self.to_js_error(error))?;
+        let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
+        let event = from_js_bounded(&event, 0, &seen, &mut budget).map_err(|error| self.to_js_error(error))?;
+        let args = [HostValue::String(event_type.to_string()), event];
         let (Some(slot), Some(st)) = (self.helpers.dispatch_event, self.state.as_mut()) else {
             return Ok(0);
         };
-        let mut budget = HostValueBudget::default();
-        budget.charge_node().map_err(to_js_error)?;
-        budget.charge_string(event_type).map_err(to_js_error)?;
-        let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
-        let event = from_js_bounded(&event, 0, &seen, &mut budget).map_err(to_js_error)?;
-        let args = [HostValue::String(event_type.to_string()), event];
-        let result = classified_call(st, slot, &args);
-        match self.finish_execution(result)? {
+        let (result, kind) = classified_call(st, slot, &args);
+        match self.finish_classified_execution(result, kind)? {
             HostValue::Number(n) => Ok(n as u32),
             _ => Ok(0),
         }
@@ -1053,8 +1064,8 @@ impl Engine {
     /// per-drain request or byte allowance is used up), or, for a single
     /// request too large to cross even on its own, rejected: it is removed and its
     /// callback is invoked with a `RangeError`, so no callback is left
-    /// pending for a request the host will never see. A host that wants an
-    /// empty queue keeps draining until this returns an empty array.
+    /// pending for a request the host will never see. Use the status-bearing
+    /// form below when completion must be distinguished from a bounded pass.
     ///
     /// Until the 11 September 2026 audit's ZIPP-02 the guest helper emptied
     /// the queue before its return value crossed the converter, so a
@@ -1084,13 +1095,39 @@ impl Engine {
     /// [`MAX_HOST_CALL_DRAIN_WORK_BYTES`] string bytes attempted across them,
     /// counted monotonically — a failed attempt's work is not rolled back
     /// with its representation budget. Whatever remains waits for the next
-    /// drain; a host that wants an empty queue keeps draining until this
-    /// returns an empty array with nothing deferred.
+    /// drain. This legacy array form cannot signal that distinction;
+    /// `drainPendingHostCallsStatus` can.
     #[wasm_bindgen(js_name = drainPendingHostCalls)]
     pub fn drain_pending_host_calls(&mut self) -> Result<JsValue, JsValue> {
+        let (calls, _) = self.drain_pending_host_calls_inner()?;
+        Ok(calls.into())
+    }
+
+    /// Status-bearing form of `drainPendingHostCalls`. `hasMore` is true
+    /// when a ceiling or recoverable interruption stopped this pass; callers
+    /// can schedule another pass even when no deliverable request crossed.
+    #[wasm_bindgen(js_name = drainPendingHostCallsStatus)]
+    pub fn drain_pending_host_calls_status(&mut self) -> Result<JsValue, JsValue> {
+        let (calls, stop) = self.drain_pending_host_calls_inner()?;
+        let status = js_sys::Object::new();
+        define_own(&status, "calls", &calls.into()).map_err(|error| self.to_js_error(error))?;
+        define_own(
+            &status,
+            "hasMore",
+            &JsValue::from_bool(stop != DrainStop::Empty),
+        )
+        .map_err(|error| self.to_js_error(error))?;
+        define_own(&status, "stopReason", &JsValue::from_str(stop.as_str()))
+            .map_err(|error| self.to_js_error(error))?;
+        Ok(status.into())
+    }
+
+    fn drain_pending_host_calls_inner(
+        &mut self,
+    ) -> Result<(js_sys::Array, DrainStop), JsValue> {
         self.ensure_live()?;
         if let Some(message) = self.deferred_drain_error.take() {
-            note_error_kind("guest");
+            self.note_error_kind("guest");
             return Err(JsValue::from_str(&message));
         }
         let out = js_sys::Array::new();
@@ -1099,15 +1136,15 @@ impl Engine {
             self.helpers.commit_host_calls,
             self.helpers.reject_host_call,
         ) else {
-            return Ok(out.into());
+            return Ok((out, DrainStop::Empty));
         };
         if self.state.is_none() {
-            return Ok(out.into());
+            return Ok((out, DrainStop::Empty));
         }
         let mut delivered: u32 = 0;
         let outcome = self.drain_loop(peek, commit, reject, &out, &mut delivered);
         match outcome {
-            Ok(()) => Ok(out.into()),
+            Ok(stop) => Ok((out, stop)),
             Err(error) if delivered == 0 || self.disposed => Err(error),
             Err(error) => {
                 // Requests already off the guest queue reach the host now;
@@ -1117,7 +1154,7 @@ impl Engine {
                         .as_string()
                         .unwrap_or_else(|| "zipp: host call drain failed".to_string()),
                 );
-                Ok(out.into())
+                Ok((out, DrainStop::Interrupted))
             }
         }
     }
@@ -1141,17 +1178,17 @@ impl Engine {
     ) -> Result<bool, JsValue> {
         self.ensure_live()?;
         let call_id = host_call_id(call_id)?;
+        let mut budget = HostValueBudget::default();
+        budget.charge_node().map_err(|error| self.to_js_error(error))?;
+        let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
+        let result = from_js_bounded(&result, 0, &seen, &mut budget).map_err(|error| self.to_js_error(error))?;
+        let args = [HostValue::Number(call_id), result];
         let (Some(slot), Some(st)) = (self.helpers.resolve_host_call, self.state.as_mut()) else {
             return Ok(false);
         };
-        let mut budget = HostValueBudget::default();
-        budget.charge_node().map_err(to_js_error)?;
-        let seen = js_sys::WeakSet::<js_sys::Object>::new_typed();
-        let result = from_js_bounded(&result, 0, &seen, &mut budget).map_err(to_js_error)?;
-        let args = [HostValue::Number(call_id), result];
-        let result = classified_call(st, slot, &args);
+        let (result, kind) = classified_call(st, slot, &args);
         Ok(matches!(
-            self.finish_execution(result)?,
+            self.finish_classified_execution(result, kind)?,
             HostValue::Number(n) if n == 1.0
         ))
     }
@@ -1167,9 +1204,9 @@ impl Engine {
         let (Some(slot), Some(st)) = (self.helpers.cancel_host_call, self.state.as_mut()) else {
             return Ok(false);
         };
-        let result = classified_call(st, slot, &[HostValue::Number(call_id)]);
+        let (result, kind) = classified_call(st, slot, &[HostValue::Number(call_id)]);
         Ok(matches!(
-            self.finish_execution(result)?,
+            self.finish_classified_execution(result, kind)?,
             HostValue::Number(n) if n == 1.0
         ))
     }
@@ -1184,7 +1221,8 @@ impl Engine {
         self.finish_execution(Ok(()))
     }
 
-    /// Drain every console line produced so far — `log`/`info`/`debug` and
+    /// Drain a bounded prefix of the console lines produced so far —
+    /// `log`/`info`/`debug` and
     /// `warn`/`error` alike — in the order they were written. (The two
     /// streams used to be concatenated, stdout first, so interleaved
     /// messages lost their order: the 11 September 2026 audit's ZIPP-14.)
@@ -1192,35 +1230,38 @@ impl Engine {
     #[wasm_bindgen(js_name = takeOutput)]
     pub fn take_output(&mut self) -> Result<JsValue, JsValue> {
         self.ensure_live()?;
-        let mut lines = Vec::new();
+        let snapshot = self
+            .state
+            .as_ref()
+            .map(ScriptState::console_snapshot)
+            .unwrap_or_default();
+        let (value, count) = console_output_prefix(&snapshot, false)
+            .map_err(|error| self.to_js_error(error))?;
+        let result = to_js(&value).map_err(|error| self.to_js_error(error))?;
         if let Some(st) = self.state.as_mut() {
-            for (_, line) in st.take_console() {
-                lines.push(HostValue::String(line));
-            }
+            st.discard_console_prefix(count);
         }
-        to_js(&HostValue::Array(lines)).map_err(to_js_error)
+        Ok(result)
     }
 
-    /// Drain every console line produced so far, in order, as
+    /// Drain a bounded prefix of the console lines produced so far, in order, as
     /// `[{ stream: "stdout" | "stderr", text }]`. Draining here empties the
     /// same buffers `takeOutput` drains.
     #[wasm_bindgen(js_name = takeConsole)]
     pub fn take_console(&mut self) -> Result<JsValue, JsValue> {
         self.ensure_live()?;
-        let mut records = Vec::new();
+        let snapshot = self
+            .state
+            .as_ref()
+            .map(ScriptState::console_snapshot)
+            .unwrap_or_default();
+        let (value, count) = console_output_prefix(&snapshot, true)
+            .map_err(|error| self.to_js_error(error))?;
+        let result = to_js(&value).map_err(|error| self.to_js_error(error))?;
         if let Some(st) = self.state.as_mut() {
-            for (stream, line) in st.take_console() {
-                let stream = match stream {
-                    ConsoleStream::Stdout => "stdout",
-                    ConsoleStream::Stderr => "stderr",
-                };
-                records.push(HostValue::Object(vec![
-                    ("stream".into(), HostValue::String(stream.into())),
-                    ("text".into(), HostValue::String(line)),
-                ]));
-            }
+            st.discard_console_prefix(count);
         }
-        to_js(&HostValue::Array(records)).map_err(to_js_error)
+        Ok(result)
     }
 
     /// Tear the VM down. The engine is unusable afterwards.
@@ -1257,8 +1298,7 @@ impl Engine {
     /// only for the most recent throw; a successful call leaves it stale.
     #[wasm_bindgen(js_name = lastErrorKind)]
     pub fn last_error_kind(&self) -> String {
-        let kind = LAST_ERROR_KIND.with(|k| k.get());
-        if kind.is_empty() { "usage" } else { kind }.to_string()
+        self.last_error_kind.get().to_string()
     }
 }
 
@@ -1270,13 +1310,20 @@ impl Default for Engine {
 
 impl Engine {
     fn ensure_live(&self) -> Result<(), JsValue> {
-        LAST_ERROR_KIND.with(|k| k.set(""));
         if self.disposed {
-            note_error_kind("usage");
+            self.note_error_kind("usage");
             Err(JsValue::from_str("zipp: engine is disposed"))
         } else {
             Ok(())
         }
+    }
+
+    fn note_error_kind(&self, kind: &'static str) {
+        self.last_error_kind.set(kind);
+    }
+
+    fn to_js_error(&self, error: String) -> JsValue {
+        engine_js_error(&self.last_error_kind, error)
     }
 
     fn ensure_host_configuration_open(&self) -> Result<(), JsValue> {
@@ -1295,22 +1342,26 @@ impl Engine {
     /// microtask converted the failure into a rejected promise. Ordinary guest
     /// throws remain recoverable and preserve the existing API contract.
     fn finish_execution<T>(&mut self, result: Result<T, String>) -> Result<T, JsValue> {
+        self.finish_classified_execution(result, None)
+    }
+
+    fn finish_classified_execution<T>(
+        &mut self,
+        result: Result<T, String>,
+        error_kind: Option<&'static str>,
+    ) -> Result<T, JsValue> {
         let resource_error = self
             .state
             .as_mut()
             .and_then(ScriptState::resource_limit_error);
         if let Some(error) = resource_error {
-            note_error_kind("resource");
+            self.note_error_kind("resource");
             let error = JsValue::from_str(error);
             self.terminate();
             return Err(error);
         }
         result.map_err(|error| {
-            // A kind already recorded on this entry (a conversion failure
-            // routed through here) stands; anything else the guest threw.
-            if LAST_ERROR_KIND.with(|k| k.get().is_empty()) {
-                note_error_kind("guest");
-            }
+            self.note_error_kind(error_kind.unwrap_or("guest"));
             JsValue::from_str(&error)
         })
     }
@@ -1325,7 +1376,7 @@ impl Engine {
         reject: u32,
         out: &js_sys::Array,
         delivered: &mut u32,
-    ) -> Result<(), JsValue> {
+    ) -> Result<DrainStop, JsValue> {
         // Two aggregate budgets for the whole drain, one per conversion stage
         // (VM graph to host values, host values to JS), each charged only by
         // committed prefixes — and one monotonic account of everything
@@ -1342,11 +1393,11 @@ impl Engine {
         let mut chunk = MAX_HOST_CALL_DRAIN_CHUNK;
         let mut attempts: u32 = 0;
         loop {
-            if *delivered >= MAX_HOST_CALL_DRAIN_REQUESTS
-                || attempts >= MAX_HOST_CALL_DRAIN_ATTEMPTS
-                || work.exhausted()
-            {
-                return Ok(());
+            if *delivered >= MAX_HOST_CALL_DRAIN_REQUESTS {
+                return Ok(DrainStop::RequestLimit);
+            }
+            if attempts >= MAX_HOST_CALL_DRAIN_ATTEMPTS || work.exhausted() {
+                return Ok(DrainStop::WorkLimit);
             }
             attempts += 1;
             let want = chunk.min(MAX_HOST_CALL_DRAIN_REQUESTS - *delivered);
@@ -1358,7 +1409,7 @@ impl Engine {
             match peeked? {
                 Ok(batch) => {
                     if batch.count == 0 {
-                        return Ok(());
+                        return Ok(DrainStop::Empty);
                     }
                     // Commit BEFORE appending: the guest queue is the source of
                     // truth until the prefix is off it — and the commit names
@@ -1382,14 +1433,14 @@ impl Engine {
                     for i in 0..batch.count {
                         out.push(
                             &checked_array_get(&batch.items, i, "host call batch")
-                                .map_err(to_js_error)?,
+                                .map_err(|error| self.to_js_error(error))?,
                         );
                     }
                     walk_budget = attempt_walk;
                     js_budget = attempt_js;
                     *delivered += batch.count;
                     if batch.count < want {
-                        return Ok(());
+                        return Ok(DrainStop::Empty);
                     }
                     chunk = (chunk * 2).min(MAX_HOST_CALL_DRAIN_CHUNK);
                 }
@@ -1421,7 +1472,7 @@ impl Engine {
                         work.charge(&HostValueBudget::new(0, 0), &solo_walk);
                         work.charge(&HostValueBudget::new(0, 0), &solo_js);
                         if solo?.is_ok() {
-                            return Ok(());
+                            return Ok(DrainStop::WorkLimit);
                         }
                     }
                     let message = format!(
@@ -1433,7 +1484,7 @@ impl Engine {
                     // nothing ran in between.
                     let removed = self.call_helper(reject, &[HostValue::String(message)])?;
                     if !matches!(removed, HostValue::Number(n) if n == 1.0) {
-                        return Ok(());
+                        return Ok(DrainStop::WorkLimit);
                     }
                     chunk = MAX_HOST_CALL_DRAIN_CHUNK;
                 }
@@ -1461,7 +1512,7 @@ impl Engine {
             .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
         let peeked = st.call_slot_bounded_no_drain(peek, &[HostValue::Number(want as f64)], walk);
         if let Some(error) = st.resource_limit_error() {
-            note_error_kind("resource");
+            self.note_error_kind("resource");
             let error = JsValue::from_str(error);
             self.terminate();
             return Err(error);
@@ -1470,12 +1521,12 @@ impl Engine {
             Ok(value) => value,
             Err(HostCallError::Conversion(limit)) => return Ok(Err(limit)),
             Err(HostCallError::Thrown(message)) => {
-                note_error_kind("guest");
+                self.note_error_kind("guest");
                 return Err(JsValue::from_str(&message));
             }
         };
         let HostValue::Array(items) = &value else {
-            note_error_kind("guest");
+            self.note_error_kind("guest");
             return Err(JsValue::from_str("zipp: host call queue is not an array"));
         };
         // The identities the commit will name. A tampered entry without a
@@ -1516,10 +1567,10 @@ impl Engine {
             .as_mut()
             .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
         let mut budget = HostValueBudget::default();
-        let result = st
-            .call_slot_bounded_no_drain(slot, args, &mut budget)
-            .map_err(HostCallError::into_message);
-        self.finish_execution(result)
+        let (result, kind) = classify_host_call_result(
+            st.call_slot_bounded_no_drain(slot, args, &mut budget),
+        );
+        self.finish_classified_execution(result, kind)
     }
 
     /// Call a preamble helper by slot, with the usual terminal handling of a
@@ -1529,8 +1580,8 @@ impl Engine {
             .state
             .as_mut()
             .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
-        let result = classified_call(st, slot, args);
-        self.finish_execution(result)
+        let (result, kind) = classified_call(st, slot, args);
+        self.finish_classified_execution(result, kind)
     }
 
     /// The lifetime accounting both eval entry points share: the
@@ -1624,6 +1675,25 @@ struct PeekedBatch {
     last_id: f64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainStop {
+    Empty,
+    RequestLimit,
+    WorkLimit,
+    Interrupted,
+}
+
+impl DrainStop {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::RequestLimit => "request-limit",
+            Self::WorkLimit => "work-limit",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 /// What one drain has ATTEMPTED so far, across every peek, successful or
 /// not: charged from the difference between an attempt's budget and the
 /// committed budget it was cloned from, so a failed attempt's partial charge
@@ -1671,12 +1741,6 @@ fn sync_host_call_arity(kind: &str) -> Option<usize> {
 }
 
 thread_local! {
-    /// The engine's own account of the LAST error it threw — `usage`,
-    /// `conversion`, `guest`, `source` or `resource` — recorded where the
-    /// error is built, so a host can classify a failure without reading its
-    /// message (which a guest can write: the 11 September 2026 close audit's
-    /// ZA-01). Reset at every entry; `Engine::last_error_kind` reads it.
-    static LAST_ERROR_KIND: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
     /// What this WASM instance has accumulated across the engines it has
     /// disposed: the definitions `dispose()` cannot give back, and the
     /// compilation work that produced them. Live engines report their own
@@ -2308,18 +2372,18 @@ fn parse_bridge_json(text: &str) -> Result<JsValue, String> {
 /// which is the host's own misuse of the API. The message is the engine's,
 /// so classifying by it is safe here — a guest never writes these strings.
 fn to_js_error(error: String) -> JsValue {
-    if error.starts_with("RangeError: host value exceeds")
-        || error.ends_with("could not be inspected safely")
-    {
-        note_error_kind("conversion");
-    } else {
-        note_error_kind("usage");
-    }
     JsValue::from_str(&error)
 }
 
-fn note_error_kind(kind: &'static str) {
-    LAST_ERROR_KIND.with(|k| k.set(kind));
+fn engine_js_error(kind: &std::cell::Cell<&'static str>, error: String) -> JsValue {
+    kind.set(if error.starts_with("RangeError: host value exceeds")
+        || error.ends_with("could not be inspected safely")
+    {
+        "conversion"
+    } else {
+        "usage"
+    });
+    JsValue::from_str(&error)
 }
 
 /// A slot call under the default result budget whose failure keeps its
@@ -2329,16 +2393,19 @@ fn classified_call(
     st: &mut ScriptState,
     slot: u32,
     args: &[HostValue],
-) -> Result<HostValue, String> {
+) -> (Result<HostValue, String>, Option<&'static str>) {
     let mut budget = HostValueBudget::default();
-    st.call_slot_bounded(slot, args, &mut budget)
-        .map_err(|error| match error {
-            HostCallError::Conversion(message) => {
-                note_error_kind("conversion");
-                message
-            }
-            HostCallError::Thrown(message) => message,
-        })
+    classify_host_call_result(st.call_slot_bounded(slot, args, &mut budget))
+}
+
+fn classify_host_call_result(
+    result: Result<HostValue, HostCallError>,
+) -> (Result<HostValue, String>, Option<&'static str>) {
+    match result {
+        Ok(value) => (Ok(value), None),
+        Err(HostCallError::Conversion(message)) => (Err(message), Some("conversion")),
+        Err(HostCallError::Thrown(message)) => (Err(message), Some("guest")),
+    }
 }
 
 fn inspection_error(label: &str) -> String {
@@ -2407,6 +2474,92 @@ const MAX_DEPTH: usize = 64;
 fn to_js(v: &HostValue) -> Result<JsValue, String> {
     let mut budget = HostValueBudget::default();
     to_js_bounded(v, &mut budget)
+}
+
+/// Build the largest console prefix that fits one host-value conversion.
+/// The returned count is committed only after `to_js` succeeds, so a failed
+/// conversion cannot erase output. A large backlog is paginated across calls.
+fn console_output_prefix(
+    snapshot: &[(ConsoleStream, String)],
+    tagged: bool,
+) -> Result<(HostValue, usize), String> {
+    console_output_prefix_with_budget(snapshot, tagged, HostValueBudget::default())
+}
+
+fn console_output_prefix_with_budget(
+    snapshot: &[(ConsoleStream, String)],
+    tagged: bool,
+    mut budget: HostValueBudget,
+) -> Result<(HostValue, usize), String> {
+    budget.charge_node()?; // outer array
+    let mut values = Vec::new();
+    for (stream, line) in snapshot {
+        let mut next = budget.clone();
+        let candidate = (|| -> Result<HostValue, String> {
+            if !tagged {
+                next.charge_node()?;
+                next.charge_string(line)?;
+                return Ok(HostValue::String(line.clone()));
+            }
+            let stream = match stream {
+                ConsoleStream::Stdout => "stdout",
+                ConsoleStream::Stderr => "stderr",
+            };
+            next.charge_node()?; // record object
+            next.charge_string("stream")?;
+            next.charge_node()?;
+            next.charge_string(stream)?;
+            next.charge_string("text")?;
+            next.charge_node()?;
+            next.charge_string(line)?;
+            Ok(HostValue::Object(vec![
+                ("stream".into(), HostValue::String(stream.into())),
+                ("text".into(), HostValue::String(line.clone())),
+            ]))
+        })();
+        let value = match candidate {
+            Ok(value) => value,
+            Err(_) if !values.is_empty() => break,
+            Err(error) => return Err(error),
+        };
+        budget = next;
+        values.push(value);
+    }
+    let count = values.len();
+    Ok((HostValue::Array(values), count))
+}
+
+#[cfg(test)]
+mod console_transport_tests {
+    use super::*;
+
+    #[test]
+    fn tagged_console_is_split_at_the_conversion_budget() {
+        let records = vec![
+            (ConsoleStream::Stdout, "one".to_string()),
+            (ConsoleStream::Stderr, "two".to_string()),
+            (ConsoleStream::Stdout, "three".to_string()),
+        ];
+        // Outer array + two (object, stream string, text string) records.
+        let (_, count) = console_output_prefix_with_budget(
+            &records,
+            true,
+            HostValueBudget::new(7, 1024),
+        )
+        .expect("a bounded prefix fits");
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn a_first_record_that_cannot_cross_is_an_error() {
+        let records = vec![(ConsoleStream::Stdout, "one".to_string())];
+        assert!(console_output_prefix_with_budget(
+            &records,
+            true,
+            HostValueBudget::new(3, 1024),
+        )
+        .is_err());
+    }
 }
 
 fn to_js_bounded(v: &HostValue, budget: &mut HostValueBudget) -> Result<JsValue, String> {

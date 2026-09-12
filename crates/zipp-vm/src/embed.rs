@@ -528,6 +528,52 @@ impl ScriptState {
         .unwrap_or_default()
     }
 
+    /// Copy the combined console without consuming it. This lets an embedder
+    /// finish fallible transport conversion before it commits the drain.
+    pub fn console_snapshot(&self) -> Vec<(ConsoleStream, String)> {
+        let Some(vm) = self.vm() else {
+            return Vec::new();
+        };
+        let mut out = vm.output.iter();
+        let mut err = vm.errput.iter();
+        let mut lines = Vec::with_capacity(vm.console_order.len());
+        for stream in &vm.console_order {
+            let line = match stream {
+                ConsoleStream::Stdout => out.next(),
+                ConsoleStream::Stderr => err.next(),
+            };
+            if let Some(line) = line {
+                lines.push((*stream, line.clone()));
+            }
+        }
+        lines.extend(out.cloned().map(|line| (ConsoleStream::Stdout, line)));
+        lines.extend(err.cloned().map(|line| (ConsoleStream::Stderr, line)));
+        lines
+    }
+
+    /// Consume at most `count` combined console records, preserving the rest.
+    /// Call only after a snapshot prefix has crossed the host boundary.
+    pub fn discard_console_prefix(&mut self, count: usize) {
+        self.with_vm(|vm| {
+            let ordered = count.min(vm.console_order.len());
+            let mut stdout = 0;
+            let mut stderr = 0;
+            for stream in vm.console_order.drain(..ordered) {
+                match stream {
+                    ConsoleStream::Stdout => stdout += 1,
+                    ConsoleStream::Stderr => stderr += 1,
+                }
+            }
+            let mut extra = count - ordered;
+            let extra_stdout = extra.min(vm.output.len().saturating_sub(stdout));
+            stdout += extra_stdout;
+            extra -= extra_stdout;
+            stderr += extra.min(vm.errput.len().saturating_sub(stderr));
+            vm.output.drain(..stdout);
+            vm.errput.drain(..stderr);
+        });
+    }
+
     // ---- Rich-value API (see `crate::vm::host_api`) -----------------------
     //
     // The methods above address the script by NAME and marshal shallowly, which
@@ -1947,6 +1993,22 @@ mod tests {
             .map(|(s, l)| format!("{}:{l}", tag(s)))
             .collect();
         assert_eq!(got, ["err:seventh"]);
+    }
+
+    #[test]
+    fn console_snapshot_and_prefix_commit_are_transactional() {
+        let mut st = compile_script(
+            "console.log('first'); console.error('second'); console.log('third');",
+        )
+        .expect("compiles");
+        st.run_init().expect("runs");
+        let first = st.console_snapshot();
+        assert_eq!(first, st.console_snapshot(), "a snapshot consumes nothing");
+        st.discard_console_prefix(2);
+        assert_eq!(
+            st.console_snapshot(),
+            vec![(ConsoleStream::Stdout, "third".to_string())]
+        );
     }
 
     #[cfg(feature = "instrument")]
