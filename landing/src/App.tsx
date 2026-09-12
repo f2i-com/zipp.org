@@ -69,6 +69,40 @@ function useReveal() {
   }, [])
 }
 
+/**
+ * Browsers resolve an initial URL fragment before React has mounted the target.
+ * Re-run that one fragment alignment after the committed layout exists so a
+ * direct `https://zipp.org/#playground` visit lands on the playground reliably.
+ * Later in-page links keep the browser's native hash and smooth-scroll behavior.
+ */
+function useInitialHashNavigation() {
+  useEffect(() => {
+    const hash = window.location.hash
+    if (hash.length < 2) return
+
+    let targetId: string
+    try {
+      targetId = decodeURIComponent(hash.slice(1))
+    } catch {
+      return
+    }
+
+    let firstFrame = 0
+    let secondFrame = 0
+    firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        if (window.location.hash !== hash) return
+        document.getElementById(targetId)?.scrollIntoView({ block: 'start', behavior: 'instant' })
+      })
+    })
+
+    return () => {
+      window.cancelAnimationFrame(firstFrame)
+      window.cancelAnimationFrame(secondFrame)
+    }
+  }, [])
+}
+
 /** Count from 0 to `value` the first time the element scrolls into view. */
 function CountUp({ value, format, duration = 1100 }: { value: number; format: (v: number) => string; duration?: number }) {
   const ref = useRef<HTMLElement | null>(null)
@@ -801,6 +835,7 @@ function App() {
   const { stats, status: repoStatus, refreshing, refresh } = useRepoStats()
   useReveal()
   useSpotlight()
+  useInitialHashNavigation()
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 12)

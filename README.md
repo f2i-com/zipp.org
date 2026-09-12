@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://softn.com/app/soft-dos"><strong>Try the live demo</strong></a> ·
+  <a href="https://zipp.org/#playground"><strong>Try the live demo</strong></a> ·
   <a href="https://github.com/f2i-com/zipp.org/releases"><strong>Download Zipp</strong></a> ·
   <a href="DOC.md"><strong>Read the docs</strong></a>
 </p>
