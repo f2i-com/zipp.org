@@ -274,18 +274,9 @@ impl<'p> Vm<'p> {
         self.require_object_coercible(locales)?;
         let obj = self.to_object(locales)?;
         let len_v = self.get_prop(obj, "length")?;
-        // ToLength: NaN/negative clamp to 0, and the loop caps at a length no
-        // array-like can actually reach so a bogus 2^53 does not hang.
-        // ToPrimitive FIRST for an OBJECT length — the infallible `to_number`
-        // cannot run a user `valueOf`/`toString`, so `{length: {valueOf(){throw}}}`
-        // silently read as an empty list instead of propagating. (Primitives skip
-        // it: `to_primitive_number(undefined)` would try to read its `valueOf`.)
-        let len_v = if self.is_object_value(len_v) {
-            self.to_primitive_number(len_v)?
-        } else {
-            len_v
-        };
-        let len_f = self.to_number(len_v)?;
+        // ToLength: strict ToNumber performs the observable ToPrimitive step,
+        // rejects a BigInt result, and NaN/negative values clamp to 0.
+        let len_f = self.to_number_strict(len_v)?;
         let len = if len_f.is_nan() || len_f <= 0.0 {
             0u64
         } else {
@@ -477,7 +468,7 @@ impl<'p> Vm<'p> {
         // {valueOf(){return 5}}}`), and an abrupt from it must propagate. The
         // infallible form cannot call back into JS, so every object option read
         // as NaN and became a bogus RangeError.
-        let n = self.to_number_coerce(v)?;
+        let n = self.to_number_strict(v)?;
         if n.is_nan() || n < min as f64 || n > max as f64 {
             return Err(Thrown(format!("RangeError: {key} value is out of range")));
         }
@@ -501,7 +492,7 @@ impl<'p> Vm<'p> {
             return Ok(default);
         }
         // ToNumber (see `default_number_option`): an object value's valueOf runs.
-        let n = self.to_number_coerce(v)?;
+        let n = self.to_number_strict(v)?;
         if n.is_nan() || n < min as f64 || n > max as f64 {
             return Err(Thrown(format!("RangeError: {key} value is out of range")));
         }

@@ -347,6 +347,10 @@ impl<'p> Vm<'p> {
     /// each iterable lazily — only when iteration reaches it — and yields all of
     /// its values before moving to the next.
     pub(crate) fn iterator_concat(&mut self, args: &[Value]) -> Result<Value, Thrown> {
+        self.with_host_roots(args, |vm| vm.iterator_concat_inner(args))
+    }
+
+    fn iterator_concat_inner(&mut self, args: &[Value]) -> Result<Value, Thrown> {
         self.preflight_native_iteration_work(args.len() as u64)?;
         let mut pairs: Vec<Value> = Vec::with_capacity(args.len());
         for &item in args {
@@ -362,9 +366,11 @@ impl<'p> Vm<'p> {
                     "TypeError: Iterator.concat argument is not iterable".into(),
                 ));
             }
-            pairs.push(Value::heap(
-                self.heap.alloc(HeapObj::Array(vec![item, method])),
-            ));
+            let pair = Value::heap(self.heap.alloc(HeapObj::Array(vec![item, method])));
+            // A later @@iterator getter can collect before `pairs` is installed
+            // in the helper. The enclosing concat scope releases these roots.
+            self.host_result_roots.push(pair);
+            pairs.push(pair);
         }
         let src = Value::heap(self.heap.alloc(HeapObj::Array(pairs)));
         self.make_iter_helper(src, 6, Value::UNDEFINED, 0)
@@ -1018,12 +1024,20 @@ impl<'p> Vm<'p> {
     /// read `iter.next` ONCE (propagating a throwing getter) so the loop steps via the
     /// cached method. A generator uses the internal step path (UNDEFINED).
     fn iter_direct_next(&mut self, iter: Value) -> Result<Value, Thrown> {
-        if iter.is_heap() && !matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. })
+        let next = if iter.is_heap()
+            && !matches!(self.heap.get(iter.heap_index()), HeapObj::Generator { .. })
         {
-            self.get_prop(iter, "next")
+            self.get_prop(iter, "next")?
         } else {
-            Ok(Value::UNDEFINED)
+            Value::UNDEFINED
+        };
+        // Only called inside iter_helper_method's root scope. A getter may
+        // return a fresh method that no longer has another owner while a
+        // consuming helper's callback runs between successive steps.
+        if next.is_heap() {
+            self.host_result_roots.push(next);
         }
+        Ok(next)
     }
 
     /// Step a single-source helper: use the cached `next` (GetIteratorDirect) when set,
@@ -1080,6 +1094,20 @@ impl<'p> Vm<'p> {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Thrown> {
+        // Keep the receiver/arguments and any roots added by the consuming
+        // helper alive through re-entrant callbacks. Restore the root prefix
+        // on both success and error without suspending collection for a drain.
+        self.with_host_roots(&[this], |vm| {
+            vm.with_host_roots(args, |vm| vm.iter_helper_method_inner(id, this, args))
+        })
+    }
+
+    fn iter_helper_method_inner(
+        &mut self,
+        id: u16,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Thrown> {
         use native::*;
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         if !self.iter_receiver_ok(this) {
@@ -1128,6 +1156,11 @@ impl<'p> Vm<'p> {
                         self.iterator_close_quiet(this);
                         Thrown("RangeError: iterator result allocation failed".into())
                     })?;
+                    // `out` is a Rust Vec until the final Array allocation.
+                    // Its earlier elements must survive the next guest step.
+                    if v.is_heap() {
+                        self.host_result_roots.push(v);
+                    }
                     out.push(v);
                 }
                 Ok(self.alloc_array_current_realm(out))
@@ -1218,9 +1251,16 @@ impl<'p> Vm<'p> {
                 let mut work = 0;
                 while let Some(v) = self.ih_step(this, next)? {
                     self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
-                    let r = self.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
-                    if self.truthy(r) {
-                        self.iterator_close(this)?;
+                    let found = self.with_host_roots(&[v], |vm| {
+                        let r = vm.iter_call_close(a0, this, &[v, Value::num(i as f64)])?;
+                        if vm.truthy(r) {
+                            vm.iterator_close(this)?;
+                            Ok(true)
+                        } else {
+                            Ok(false)
+                        }
+                    })?;
+                    if found {
                         return Ok(v);
                     }
                     i += 1;
@@ -1251,7 +1291,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                 }
-                while let Some(v) = self.ih_step(this, next)? {
+                while let Some(v) = self.with_host_roots(&[acc], |vm| vm.ih_step(this, next))? {
                     self.iter_native_work_or_close(this, Value::UNDEFINED, &mut work)?;
                     acc = self.iter_call_close(a0, this, &[acc, v, Value::num(i as f64)])?;
                     i += 1;
@@ -1334,8 +1374,9 @@ impl<'p> Vm<'p> {
                         }
                         Some(v) => {
                             self.iter_native_work_or_close(source, Value::UNDEFINED, &mut work)?;
-                            let keep =
-                                self.iter_call_close(arg, source, &[v, Value::num(cidx as f64)])?;
+                            let keep = self.with_host_roots(&[v], |vm| {
+                                vm.iter_call_close(arg, source, &[v, Value::num(cidx as f64)])
+                            })?;
                             self.ih_inc_idx(idx);
                             if self.truthy(keep) {
                                 return Ok(self.iter_result(v, false));

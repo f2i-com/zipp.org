@@ -222,6 +222,9 @@ impl<'a> FnCompiler<'a> {
     /// `alloc_reg`'s saturation would hand the same register to several live
     /// values.
     pub(crate) fn check_regs(&mut self) -> R<()> {
+        if self.upvalues.borrow().len() > u16::MAX as usize + 1 {
+            return Err("function captures more than 65536 upvalues".into());
+        }
         let total = self.max_reg as usize + self.bool_regs as usize + self.recv_regs as usize;
         if self.reg_overflow || total > BOOL_BASE as usize {
             return Err(format!(
@@ -330,14 +333,38 @@ impl<'a> FnCompiler<'a> {
         self.alloc_reg()
     }
 
+    /// Check a guest-sized contiguous register reservation before narrowing
+    /// offsets to `Reg`. This is also the earliest point to reject a block whose
+    /// base is already saturated by earlier source in the same function.
+    pub(crate) fn ensure_reg_capacity(&mut self, additional: usize) -> R<()> {
+        let fits = (self.next_reg as usize)
+            .checked_add(additional)
+            .is_some_and(|end| end <= BOOL_BASE as usize);
+        if fits {
+            return Ok(());
+        }
+        self.reg_overflow = true;
+        Err(format!(
+            "function needs more than {} registers (too many locals, \
+             temporaries or literal elements in one function body)",
+            BOOL_BASE
+        ))
+    }
+
     /// Reserve `kinds.len()` contiguous registers for an argument window,
     /// starting at the first base at or above `next_reg` where no slot would
     /// take a boolean argument (`kinds[i]`) over a numeric history or a
     /// non-boolean one over a boolean history. Registers at or above
     /// `max_reg` have no history, so the search always terminates.
-    pub(crate) fn alloc_block(&mut self, kinds: &[bool]) -> Reg {
-        let n = kinds.len() as Reg;
+    pub(crate) fn alloc_block(&mut self, kinds: &[bool]) -> R<Reg> {
         let mut base = self.next_reg;
+        // Do this arithmetic at usize width before either narrowing the count or
+        // forming `base + i as Reg`. A 65,536-argument call used to narrow its
+        // block length to zero, then panic while emitting out-of-frame operands.
+        // The ordinary-register ceiling is tighter than u16::MAX because the
+        // upper half of the encoding is reserved for provisional class registers.
+        self.ensure_reg_capacity(kinds.len())?;
+        let n = kinds.len() as Reg;
         if reg_classes_enabled() {
             'search: while base < self.max_reg {
                 for (i, &is_bool) in kinds.iter().enumerate() {
@@ -352,15 +379,18 @@ impl<'a> FnCompiler<'a> {
             }
         }
         self.next_reg = base;
+        // Avoiding mixed numeric/boolean histories may have shifted the block
+        // upward after the first check.
+        self.ensure_reg_capacity(kinds.len())?;
         for _ in 0..n {
             self.alloc_reg();
         }
-        base
+        Ok(base)
     }
 
     /// Every scratch reclaim goes through here. A class register (a
     /// provisional number at or above `BOOL_BASE`) is never a reclaim
-    /// boundary: a reset computed from one (`save.max(dst + 1)` with a
+    /// boundary: a reset computed from one (`save.max(dst.saturating_add(1))` with a
     /// boolean `dst`) leaves the ordinary stack where it is.
     pub(crate) fn set_next_reg(&mut self, r: Reg) {
         if r < BOOL_BASE {

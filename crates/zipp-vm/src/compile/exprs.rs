@@ -418,7 +418,7 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                     self.emit(Instr::Move { dst, src: acc });
-                    self.set_next_reg(acc.max(dst + 1));
+                    self.set_next_reg(acc.max(dst.saturating_add(1)));
                     return Ok(dst);
                 }
                 self.emit(Instr::LoadConst { dst, idx });
@@ -584,7 +584,7 @@ impl<'a> FnCompiler<'a> {
                         argc,
                         is_construct: true,
                     });
-                    self.set_next_reg(save.max(dst + 1));
+                    self.set_next_reg(save.max(dst.saturating_add(1)));
                     return Ok(dst);
                 }
                 // General `new C(args)`: evaluate the constructor value, then the
@@ -603,7 +603,7 @@ impl<'a> FnCompiler<'a> {
                         callee: callee_reg,
                         args: args_arr,
                     });
-                    self.set_next_reg(save.max(dst + 1)); // reclaim callee + arg scratch
+                    self.set_next_reg(save.max(dst.saturating_add(1))); // reclaim callee + arg scratch
                     return Ok(dst);
                 }
                 let (arg_base, argc) = self.eval_args_contiguous(args)?;
@@ -613,7 +613,7 @@ impl<'a> FnCompiler<'a> {
                     arg_base,
                     argc,
                 });
-                self.set_next_reg(save.max(dst + 1)); // reclaim callee + args
+                self.set_next_reg(save.max(dst.saturating_add(1))); // reclaim callee + args
                 Ok(dst)
             }
             E::Function(f) => {
@@ -1029,8 +1029,12 @@ impl<'a> FnCompiler<'a> {
         let after = self.here();
         self.patch_jump(skip, after);
         // Contiguous argument block: [strings, e0, e1, …].
+        let argc = n
+            .checked_add(1)
+            .ok_or_else(|| "tagged-template argument window is too large".to_string())?;
+        self.ensure_reg_capacity(argc)?;
         let arg_base = self.next_reg;
-        for _ in 0..=n {
+        for _ in 0..argc {
             self.alloc_reg();
         }
         let block_top = self.next_reg;
@@ -1046,7 +1050,7 @@ impl<'a> FnCompiler<'a> {
             }
             self.set_next_reg(block_top);
         }
-        let argc = (n + 1) as u16;
+        let argc = argc as u16;
         match tag {
             Tag::Plain(callee) => {
                 if tail {
@@ -1090,6 +1094,13 @@ impl<'a> FnCompiler<'a> {
     /// Build the tagged-template strings array `[q0,q1,…]` (cooked) into `dst`,
     /// with its `.raw` property set to the array of raw (un-escaped) parts.
     pub(crate) fn build_template_strings(&mut self, quasi: &ast::TemplateLit, dst: Reg) -> R<()> {
+        self.ensure_reg_capacity(
+            quasi
+                .quasis
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| "tagged-template strings window is too large".to_string())?,
+        )?;
         let nq = quasi.quasis.len() as u16;
         let save = self.next_reg;
         // Cooked array → dst. A quasi with an ILLEGAL escape sequence has no cooked
@@ -1426,6 +1437,7 @@ impl<'a> FnCompiler<'a> {
         dst: Reg,
         static_keys: usize,
     ) -> R<Reg> {
+        self.ensure_reg_capacity(static_keys)?;
         let base = self.next_reg;
         for _ in 0..static_keys {
             self.alloc_reg();
@@ -1945,8 +1957,8 @@ impl<'a> FnCompiler<'a> {
         }
         self.emit(Instr::Move { dst, src: acc });
         // `acc` is dead after the Move; reclaim it (guarding a high `dst`,
-        // following the `calls.rs` `save.max(dst + 1)` precedent).
-        self.set_next_reg(acc.max(dst + 1));
+        // following the `calls.rs` saturating reclaim precedent).
+        self.set_next_reg(acc.max(dst.saturating_add(1)));
         Ok(dst)
     }
 

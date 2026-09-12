@@ -766,6 +766,86 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Copy same-kind TypedArray elements as an overlap-safe raw-byte snapshot.
+    /// `TypedArray.prototype.set` and `copyWithin` use this path so floating NaN
+    /// payloads and signed-zero bits never pass through the engine's f64 Value
+    /// representation. Taking the source snapshot first also gives `set` its
+    /// required memmove behavior when the source and target views overlap.
+    pub(crate) fn ta_raw_memmove(
+        &mut self,
+        src: u32,
+        src_start: usize,
+        dst: u32,
+        dst_start: usize,
+        count: usize,
+    ) -> bool {
+        if count == 0 {
+            return true;
+        }
+        let (sbuf, skind, soff) = match self.heap.get(src) {
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => (*buffer, *kind, *byte_offset),
+            _ => return false,
+        };
+        let (dbuf, dkind, doff) = match self.heap.get(dst) {
+            HeapObj::TypedArray {
+                buffer,
+                kind,
+                byte_offset,
+                ..
+            } => (*buffer, *kind, *byte_offset),
+            _ => return false,
+        };
+        if skind != dkind {
+            return false;
+        }
+        let size = native::TA_KINDS[skind as usize].1;
+        let Some(n) = count.checked_mul(size) else {
+            return false;
+        };
+        let Some(a) = src_start
+            .checked_mul(size)
+            .and_then(|n| soff.checked_add(n))
+        else {
+            return false;
+        };
+        let Some(b) = dst_start
+            .checked_mul(size)
+            .and_then(|n| doff.checked_add(n))
+        else {
+            return false;
+        };
+        let bytes: Vec<u8> = match self.heap.get(sbuf) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                let Some(end) = a.checked_add(n) else {
+                    return false;
+                };
+                if end > data.len() {
+                    return false;
+                }
+                data[a..end].to_vec()
+            }
+            _ => return false,
+        };
+        match self.heap.get_mut(dbuf) {
+            HeapObj::ArrayBuffer { data, detached } if !*detached => {
+                let Some(end) = b.checked_add(n) else {
+                    return false;
+                };
+                if end > data.len() {
+                    return false;
+                }
+                data[b..end].copy_from_slice(&bytes);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn ta_element_get(&mut self, ta_idx: u32, i: usize) -> Value {
         let (kind, bytes) = {
             let (buffer, kind, byte_offset) = match self.heap.get(ta_idx) {
@@ -1001,7 +1081,7 @@ impl<'p> Vm<'p> {
                     "TypeError: cannot convert a BigInt to a number".into(),
                 ));
             }
-            self.to_number_coerce(v)?;
+            self.to_number_strict(v)?;
         }
         Ok(())
     }
@@ -1049,7 +1129,7 @@ impl<'p> Vm<'p> {
             // ToNumber(value) per SetTypedArrayElement: an object element runs
             // valueOf/@@toPrimitive (which a test may use to resize/detach the buffer
             // — re-checked below) and a Symbol/abrupt completion propagates.
-            let f = self.to_number_coerce(v)?;
+            let f = self.to_number_strict(v)?;
             ta_encode(kind, f)
         };
         // Re-check bounds after coercion (a valueOf could have resized the buffer).
@@ -1289,7 +1369,7 @@ impl<'p> Vm<'p> {
                 (e, e == (cur.as_f64() as i64) as i128)
             };
             // ToNumber(timeout): NaN/absent -> +Infinity; clamp to >= 0.
-            let t_raw = self.to_number_coerce(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
+            let t_raw = self.to_number_strict(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
             let timeout = if t_raw.is_nan() {
                 f64::INFINITY
             } else {
@@ -1371,7 +1451,7 @@ impl<'p> Vm<'p> {
                 // ToNumber(timeout) runs next (DoWait step 6) — a Symbol is a
                 // TypeError, a poisoned valueOf throws.
                 let t_raw =
-                    self.to_number_coerce(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
+                    self.to_number_strict(args.get(3).copied().unwrap_or(Value::UNDEFINED))?;
                 // DoWait step: a sync wait in an agent that cannot suspend is a
                 // TypeError — AFTER the value/timeout coercions, per spec order.
                 if !self.can_block {
@@ -1748,7 +1828,7 @@ impl<'p> Vm<'p> {
                     self.iterate_to_vec(a0)?
                 } else {
                     let lenv = self.get_prop(a0, "length")?;
-                    let nf = self.to_number(lenv)?;
+                    let nf = self.to_number_strict(lenv)?;
                     let n = if nf.is_nan() || nf <= 0.0 {
                         0
                     } else if nf > (MAX_ARRAY_BUFFER_LEN / size as i64) as f64 {

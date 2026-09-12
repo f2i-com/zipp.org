@@ -1225,13 +1225,13 @@ impl<'p> Vm<'p> {
         // (double coercion, RangeError on non-uint32, truncation deletes its
         // own integer-index properties >= n).
         if key == "length" && obj.heap_index() == self.arr_proto && self.arr_proto != 0 {
-            let nu = self.to_number_coerce(val)?;
+            let nu = self.to_number_strict(val)?;
             let u = if nu.is_finite() {
                 (nu.trunc() as i64 as u32) as f64
             } else {
                 0.0
             };
-            let number_len = self.to_number_coerce(val)?;
+            let number_len = self.to_number_strict(val)?;
             if u != number_len {
                 return Err(Thrown("RangeError: Invalid array length".into()));
             }
@@ -1490,13 +1490,13 @@ impl<'p> Vm<'p> {
             // TWICE), and newLen != numberLen (a non-uint32 length like -1 /
             // NaN / 1.5 / 2^32) is a RangeError — same model as the
             // defineProperty path in props.rs.
-            let nu = self.to_number_coerce(val)?; // ToNumber inside ToUint32
+            let nu = self.to_number_strict(val)?; // ToNumber inside ToUint32
             let u = if nu.is_finite() {
                 (nu.trunc() as i64 as u32) as f64
             } else {
                 0.0
             };
-            let number_len = self.to_number_coerce(val)?; // numberLen
+            let number_len = self.to_number_strict(val)?; // numberLen
             if u != number_len {
                 return Err(Thrown("RangeError: Invalid array length".into()));
             }

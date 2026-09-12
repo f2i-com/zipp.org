@@ -97,7 +97,7 @@ impl<'p> Vm<'p> {
         }
         let lenv = self.get_prop(src, "length")?;
         // ToLength runs the OBSERVABLE ToNumber (a poisoned valueOf throws).
-        let nf = self.to_number_coerce(lenv)?;
+        let nf = self.to_number_strict(lenv)?;
         let n = if nf.is_nan() || nf <= 0.0 {
             0
         } else if nf > super::typedarray::MAX_ARRAY_BUFFER_LEN as f64 {
@@ -193,13 +193,13 @@ impl<'p> Vm<'p> {
             && matches!(self.heap.get(a0.heap_index()), HeapObj::Array(_))
             && self.same_value(a0, receiver)
         {
-            let nu = self.to_number_coerce(value)?;
+            let nu = self.to_number_strict(value)?;
             let u = if nu.is_finite() {
                 (nu.trunc() as i64 as u32) as f64
             } else {
                 0.0
             };
-            let number_len = self.to_number_coerce(value)?;
+            let number_len = self.to_number_strict(value)?;
             if u != number_len {
                 return Err(Thrown("RangeError: Invalid array length".into()));
             }
@@ -1709,7 +1709,7 @@ impl<'p> Vm<'p> {
                 HeapObj::Array(_) => self.js_array_len(coll),
                 _ => {
                     let lv = self.get_prop(Value::heap(coll), "length")?;
-                    let lf = self.to_number_coerce(lv)?;
+                    let lf = self.to_number_strict(lv)?;
                     if lf.is_nan() || lf <= 0.0 {
                         0
                     } else {
@@ -4517,7 +4517,7 @@ impl<'p> Vm<'p> {
             // `Math.f16round(x)`: round ToNumber(x) to the nearest binary16 value.
             MATH_F16ROUND => {
                 let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
-                let x = self.to_number_coerce(a0)?;
+                let x = self.to_number_strict(a0)?;
                 Value::num(super::helpers_num2::f16_round(x))
             }
             // WeakMap/WeakSet methods (brand-checked + object-key validated inside).
@@ -4532,9 +4532,7 @@ impl<'p> Vm<'p> {
                 // iterators keep their cursor, so the count is the non-hole
                 // count — which the property fast path in `props/member.rs`
                 // already did and this, the extracted-getter path, did not.
-                Some(HeapObj::Set(items)) => {
-                    Value::num(items.iter().filter(|v| !v.is_hole()).count() as f64)
-                }
+                Some(HeapObj::Set(_)) => Value::num(self.coll_live_len(this.heap_index()) as f64),
                 _ => {
                     return Err(Thrown(
                         "TypeError: get Set.prototype.size called on incompatible receiver".into(),
@@ -4542,8 +4540,8 @@ impl<'p> Vm<'p> {
                 }
             },
             MAP_SIZE_GET => match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                Some(HeapObj::Map { keys, .. }) => {
-                    Value::num(keys.iter().filter(|k| !k.is_hole()).count() as f64)
+                Some(HeapObj::Map { .. }) => {
+                    Value::num(self.coll_live_len(this.heap_index()) as f64)
                 }
                 _ => {
                     return Err(Thrown(
@@ -4575,15 +4573,19 @@ impl<'p> Vm<'p> {
             WS_HAS => self.weakset_method(this, "has", args)?,
             WS_DELETE => self.weakset_method(this, "delete", args)?,
             WR_DEREF => {
-                match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                    Some(HeapObj::WeakRef(t)) => *t, // no GC → target always live
+                let target = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                    Some(HeapObj::WeakRef(t)) => *t,
                     _ => {
                         return Err(Thrown(
                             "TypeError: WeakRef.prototype.deref called on incompatible receiver"
                                 .into(),
                         ))
                     }
+                };
+                if target != Value::UNDEFINED {
+                    self.keep_during_job(target);
                 }
+                target
             }
             FR_REGISTER => self.finreg_method(this, "register", args)?,
             FR_UNREGISTER => self.finreg_method(this, "unregister", args)?,
@@ -5141,7 +5143,7 @@ impl<'p> Vm<'p> {
                 // became radix -1 (an out-of-range NaN) where ToInt32 gives 0,
                 // i.e. the default base.
                 let radix = if args.len() >= 2 {
-                    let r = self.to_number_coerce(a1)?;
+                    let r = self.to_number_strict(a1)?;
                     crate::vm::helpers_num2::to_int32(r)
                 } else {
                     0
@@ -5411,8 +5413,8 @@ impl<'p> Vm<'p> {
             }
             // ? ToNumber(x): coerce objects (@@toPrimitive/valueOf/toString) and
             // propagate abrupt completions (throwing valueOf, Symbol → TypeError).
-            GLOBAL_IS_NAN => Value::bool(self.to_number_coerce(a0)?.is_nan()),
-            GLOBAL_IS_FINITE => Value::bool(self.to_number_coerce(a0)?.is_finite()),
+            GLOBAL_IS_NAN => Value::bool(self.to_number_strict(a0)?.is_nan()),
+            GLOBAL_IS_FINITE => Value::bool(self.to_number_strict(a0)?.is_finite()),
             GLOBAL_EVAL => {
                 // eval(x): if x is not a String, return it unchanged (spec 19.2.1).
                 let is_str = a0.is_heap()
@@ -5497,7 +5499,7 @@ impl<'p> Vm<'p> {
                 self.require_object_coercible(raw0)?; // ToObject(template.raw)
                 let raw = self.to_object(raw0)?;
                 let len_v = self.get_prop(raw, "length")?;
-                let n = self.to_number(len_v)?;
+                let n = self.to_number_strict(len_v)?;
                 let raw_len = if n.is_finite() && n > 0.0 {
                     n as usize
                 } else {
@@ -6346,8 +6348,8 @@ impl<'p> Vm<'p> {
             }
             INTL_NF_FORMAT_TO_PARTS => {
                 let resolved = self.intl_this(this, INTL_NUMBERFORMAT, "formatToParts")?;
-                // ? ToNumber(value) — the coercing one, so an object argument's
-                // valueOf/@@toPrimitive runs (see `intl_number_format`).
+                // ToIntlMathematicalValue-like coercion observes an object's
+                // valueOf/@@toPrimitive and intentionally accepts BigInt.
                 let n = self.to_number_coerce(a0)?;
                 let parts = self.nf_parts(resolved, n)?;
                 let parts: Vec<(String, String, &str)> =
@@ -6436,7 +6438,7 @@ impl<'p> Vm<'p> {
                 let mut a1 = a1;
                 for v in [&mut a0, &mut a1] {
                     if self.dt_arg_kind(*v).is_none() {
-                        *v = Value::num(self.to_number_coerce(*v)?);
+                        *v = Value::num(self.to_number_strict(*v)?);
                     }
                 }
                 // The endpoints must be the same kind of value: a Date/number
@@ -6467,7 +6469,7 @@ impl<'p> Vm<'p> {
             }
             INTL_PLURAL_SELECT => {
                 let _ = self.intl_this(this, INTL_PLURALRULES, "select")?;
-                let n = self.to_number_coerce(a0)?;
+                let n = self.to_number_strict(a0)?;
                 let cat = if n == 1.0 { "one" } else { "other" };
                 self.alloc_str(cat.to_string())
             }
@@ -6481,8 +6483,8 @@ impl<'p> Vm<'p> {
                         "TypeError: selectRange requires both a start and an end".into(),
                     ));
                 }
-                let x = self.to_number_coerce(a0)?;
-                let y = self.to_number_coerce(a1)?;
+                let x = self.to_number_strict(a0)?;
+                let y = self.to_number_strict(a1)?;
                 if x.is_nan() || y.is_nan() {
                     return Err(Thrown(
                         "RangeError: selectRange endpoints must not be NaN".into(),
@@ -6527,7 +6529,7 @@ impl<'p> Vm<'p> {
                 let to_parts = id == INTL_RTF_FORMAT_TO_PARTS;
                 let name = if to_parts { "formatToParts" } else { "format" };
                 let rtf_resolved = self.intl_this(this, INTL_RELATIVETIMEFORMAT, name)?;
-                let v = self.to_number_coerce(a0)?;
+                let v = self.to_number_strict(a0)?;
                 // PartitionRelativeTimePattern step 2: a non-finite value is a
                 // RangeError (it was formatted as "in NaN days" before).
                 if !v.is_finite() {

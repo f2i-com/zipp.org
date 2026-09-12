@@ -1,5 +1,5 @@
 // zipp-host: a small reference host adapter for the zipp-wasm engine in a
-// browser, version 1.1. The 11 September 2026 audit's ZIPP-17 asked for one
+// browser, version 1.1.1. The 11 September 2026 audit's ZIPP-17 asked for one
 // consistent lifecycle/error/capability contract for embedders; this is it,
 // kept deliberately small so an application can read it in one sitting.
 //
@@ -62,7 +62,7 @@
 // afterwards — the engine enforces that, this adapter merely never asks
 // twice. Nothing here widens the engine's authority.
 
-export const ZIPP_HOST_SDK_VERSION = "1.1.0";
+export const ZIPP_HOST_SDK_VERSION = "1.1.1";
 
 /** The longest deadline a timer can hold exactly (2^31 − 1 ms). */
 export const MAX_DEADLINE_MS = 2147483647;
@@ -75,6 +75,23 @@ export class ZippHostError extends Error {
     this.terminal = terminal;
     if (detail !== undefined) this.detail = detail;
   }
+}
+
+/** Render an arbitrary thrown value without letting its getters throw again.
+ * Shared by the two adapter halves so error reporting cannot bypass request
+ * settlement or leave a Worker reply waiting for its deadline. The returned
+ * fields are strings, never host objects that structured clone could refuse.
+ */
+export function describeThrownError(error) {
+  let message;
+  try { message = String(error?.message ?? error); }
+  catch { message = "<unprintable error>"; }
+  let name;
+  try {
+    const candidate = error?.name;
+    if (typeof candidate === "string") name = candidate;
+  } catch {}
+  return { message, name };
 }
 
 /**
@@ -205,7 +222,8 @@ export function createZippHost(config) {
         // that threw during structured clone, a fake transport): this
         // request's mistake, nobody else's. Nothing was sent, so the host
         // stays usable and no timer or entry outlives the rejection (ZA-02).
-        settle(req, new ZippHostError("usage", `${op} could not be sent: ${error && error.message ? error.message : String(error)}`, { name: error && error.name }));
+        const failure = describeThrownError(error);
+        settle(req, new ZippHostError("usage", `${op} could not be sent: ${failure.message}`, { name: failure.name }));
       }
     });
   }

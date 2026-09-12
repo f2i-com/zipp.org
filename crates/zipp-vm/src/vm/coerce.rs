@@ -812,7 +812,7 @@ impl<'p> Vm<'p> {
         // TypeError before any element/predicate work. The full ToPrimitive path
         // also honours an array-like whose `length` is an object with valueOf.
         let lv = self.get_prop(this, "length")?;
-        let len = self.to_number_coerce(lv)?;
+        let len = self.to_number_strict(lv)?;
         // ToLength: a positive `len` (including +Infinity / "Infinity" / a huge
         // finite) clamps to MAX_DENSE_ARRAY_LEN; NaN and ≤0 (incl. -Infinity) → 0.
         // `len as usize` saturates for +Infinity, so the `.min` bounds it.
@@ -2495,15 +2495,15 @@ impl<'p> Vm<'p> {
 
     /// `ToNumber(v)` that honours a user `valueOf`/`toString` when `v` is an
     /// object (ToPrimitive with the number hint) — unlike the immutable
-    /// `to_number`, which returns NaN for an un-handled object. Primitives and the
-    /// already-handled heap types (Date/Boxed/Symbol/BigInt/String) defer straight
-    /// to `to_number`; a plain object is reduced to a primitive first.
+    /// `to_number`, which returns NaN for an un-handled object. Primitive heap
+    /// values (Symbol/BigInt/String) defer straight to `to_number`; every object,
+    /// including Date and boxed primitives, is reduced to a primitive first.
     /// `ToIntegerOrInfinity(v)` clamped to `i64` — ToNumber then NaN→0, truncate
     /// toward zero (±Infinity saturate to i64::MAX/MIN). Backs string index/
     /// position args (`charAt`/`charCodeAt`/`at`/…), which use ToInteger, not a
     /// plain number cast (so `"42".charAt(true)` is index 1, `"1"` is 1, etc).
     pub(crate) fn to_integer_or_zero(&mut self, v: Value) -> Result<i64, Thrown> {
-        let n = self.to_number_coerce(v)?;
+        let n = self.to_number_strict(v)?;
         if n.is_nan() {
             return Ok(0);
         }
@@ -2561,8 +2561,7 @@ impl<'p> Vm<'p> {
         }
         if matches!(
             self.heap.get(v.heap_index()),
-            HeapObj::Date(_)
-                | HeapObj::Symbol { .. }
+            HeapObj::Symbol { .. }
                 | HeapObj::BigInt(_)
                 | HeapObj::BigIntBig(_)
                 | HeapObj::Str(_)
@@ -2621,7 +2620,8 @@ impl<'p> Vm<'p> {
     /// it with the hint ("number" / "string" / "default") and require a primitive
     /// result (else TypeError). Returns `None` when there is no such method, so the
     /// caller falls back to OrdinaryToPrimitive (valueOf/toString). Already-primitive
-    /// heap values (str/bigint/symbol) and boxed wrappers are left to the caller.
+    /// heap values (str/bigint/symbol) are left to the caller; boxed primitives are
+    /// objects, so their own or inherited hook must still be observed.
     pub(crate) fn symbol_to_primitive(
         &mut self,
         v: Value,
@@ -2638,16 +2638,6 @@ impl<'p> Vm<'p> {
             )
         {
             return Ok(None);
-        }
-        // A Boxed SYMBOL falls through to the real GetMethod lookup: it finds
-        // Symbol.prototype[@@toPrimitive] (returning the wrapped symbol, so
-        // ToString(Object(sym)) THROWS) — unless user code deleted/redefined
-        // the hook, in which case ordinary toString/valueOf semantics apply.
-        // Other Boxed kinds have no @@toPrimitive on their chains - no hook.
-        if let HeapObj::Boxed { kind, .. } = self.heap.get(v.heap_index()) {
-            if *kind != 3 {
-                return Ok(None);
-            }
         }
         // GetMethod(v, @@toPrimitive): undefined/null → no hook (None); a
         // present-but-not-callable @@toPrimitive is a TypeError, not a fallthrough.

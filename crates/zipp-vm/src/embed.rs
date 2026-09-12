@@ -383,9 +383,13 @@ impl ScriptState {
     /// memory without bound. Prefer defining a function once and calling it
     /// with [`Self::call_global`].
     pub fn eval_in_context(&mut self, src: &str) -> Result<JsValue, String> {
-        self.with_vm(|vm| match eval_indirect(vm, src) {
-            Ok(v) => Ok(marshal(vm, v)),
-            Err(thrown) => Err(vm.take_host_throw(thrown)),
+        self.with_vm(|vm| {
+            let result = match eval_indirect(vm, src) {
+                Ok(v) => Ok(marshal(vm, v)),
+                Err(thrown) => Err(vm.take_host_throw(thrown)),
+            };
+            vm.finish_weak_job();
+            result
         })
         .unwrap_or_else(torn_down)
     }
@@ -415,15 +419,19 @@ impl ScriptState {
             return Err(format!("zipp: {name:?} is not a global identifier"));
         }
         self.with_vm(|vm| {
-            let callee = vm.host_resolve_global_by_name(name)?;
-            if !vm.is_callable(callee) {
-                return Err(format!("TypeError: {name} is not a function"));
-            }
-            let argv: Vec<Value> = args.iter().map(|a| unmarshal(vm, a)).collect();
-            match vm.host_invoke(callee, &argv) {
-                Ok(v) => Ok(marshal(vm, v)),
-                Err(thrown) => Err(vm.take_host_throw(thrown)),
-            }
+            let result = match vm.host_resolve_global_by_name(name) {
+                Ok(callee) if vm.is_callable(callee) => {
+                    let argv: Vec<Value> = args.iter().map(|a| unmarshal(vm, a)).collect();
+                    match vm.host_invoke(callee, &argv) {
+                        Ok(v) => Ok(marshal(vm, v)),
+                        Err(thrown) => Err(vm.take_host_throw(thrown)),
+                    }
+                }
+                Ok(_) => Err(format!("TypeError: {name} is not a function")),
+                Err(message) => Err(message),
+            };
+            vm.finish_weak_job();
+            result
         })
         .unwrap_or_else(torn_down)
     }
@@ -440,9 +448,13 @@ impl ScriptState {
         if !is_identifier(name) {
             return false;
         }
-        self.with_vm(|vm| match vm.host_resolve_global_by_name(name) {
-            Ok(v) => vm.is_callable(v),
-            Err(_) => false,
+        self.with_vm(|vm| {
+            let result = match vm.host_resolve_global_by_name(name) {
+                Ok(v) => vm.is_callable(v),
+                Err(_) => false,
+            };
+            vm.finish_weak_job();
+            result
         })
         .unwrap_or(false)
     }

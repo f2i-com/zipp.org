@@ -1298,6 +1298,9 @@ impl<'a> FnCompiler<'a> {
                 {
                     let block_save = self.next_reg;
                     let keys_base = self.next_reg;
+                    self.ensure_reg_capacity(props.len().checked_add(1).ok_or_else(|| {
+                        "object pattern register window is too large".to_string()
+                    })?)?;
                     let n = props.len() as u16;
                     for _ in 0..props.len() {
                         self.alloc_reg();

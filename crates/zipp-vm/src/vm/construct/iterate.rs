@@ -1068,8 +1068,12 @@ impl<'p> Vm<'p> {
     /// clobber the identity of the error being propagated.
     pub(crate) fn iterator_close_quiet(&mut self, iter: Value) {
         let saved = self.pending_throw.take();
-        let _ = self.iterator_close(iter);
-        self.pending_throw = saved;
+        // Once removed from pending_throw the original exception may have no
+        // traced owner. A return getter/callback can allocate before we restore it.
+        self.with_host_roots(&[iter, saved.unwrap_or(Value::UNDEFINED)], |vm| {
+            let _ = vm.iterator_close(iter);
+            vm.pending_throw = saved;
+        });
     }
 
     /// `Object.fromEntries(iterable)` = AddEntriesFromIterable: RequireObjectCoercible,

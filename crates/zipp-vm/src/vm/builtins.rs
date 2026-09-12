@@ -1602,7 +1602,7 @@ impl<'p> Vm<'p> {
         if v == Value::UNDEFINED {
             return Ok(def);
         }
-        let n = self.to_integer_or_zero(v)?;
+        let n = self.to_integer_strict(v)?;
         Ok(if n < 0 {
             ((len as i64) + n).max(0) as usize
         } else {
@@ -1661,7 +1661,7 @@ impl<'p> Vm<'p> {
         match name {
             "at" => {
                 // ToInteger(index): throws on a Symbol, honours a valueOf.
-                let n = self.to_integer_or_zero(a0)?;
+                let n = self.to_integer_strict(a0)?;
                 let i = if n < 0 { len as i64 + n } else { n };
                 Ok(Some(if i >= 0 && (i as usize) < len {
                     self.ta_element_get(idx, i as usize)
@@ -1750,7 +1750,7 @@ impl<'p> Vm<'p> {
                 // fromIndex (ToInteger) may run a valueOf that detaches the buffer.
                 // lastIndexOf defaults to len-1; indexOf/includes default to 0.
                 let from = if args.len() >= 2 {
-                    self.to_integer_or_zero(a1)?
+                    self.to_integer_strict(a1)?
                 } else if name == "lastIndexOf" {
                     entry_len - 1
                 } else {
@@ -1952,7 +1952,7 @@ impl<'p> Vm<'p> {
                 let num = if is_big {
                     0.0
                 } else {
-                    self.to_number_coerce(a0)?
+                    self.to_number_strict(a0)?
                 };
                 let start = self.ta_rel_index(a1, 0, len)?;
                 let end =
@@ -2013,7 +2013,7 @@ impl<'p> Vm<'p> {
                                 self.call_value(cmp, Value::UNDEFINED, &[snap[j - 1], snap[j]])?;
                             // ToNumber on the comparator result (observable on
                             // objects; abrupt propagates; NaN acts as +0).
-                            if self.to_number_coerce(r)? > 0.0 {
+                            if self.to_number_strict(r)? > 0.0 {
                                 snap.swap(j - 1, j);
                                 j -= 1;
                             } else {
@@ -2043,7 +2043,7 @@ impl<'p> Vm<'p> {
                 // (2) ToNumber/ToBigInt(value) — its valueOf, and it THROWS (so a
                 // throwing value surfaces before a RangeError). (Previously the index
                 // used the non-coercing value_num and the range check ran first.)
-                let relative = self.to_number_coerce(a0)?;
+                let relative = self.to_number_strict(a0)?;
                 let relative = if relative.is_nan() {
                     0.0
                 } else {
@@ -2067,7 +2067,7 @@ impl<'p> Vm<'p> {
                     let big = self.to_bigint(a1)?;
                     self.make_bigint_val(big)
                 } else {
-                    let num = self.to_number_coerce(a1)?;
+                    let num = self.to_number_strict(a1)?;
                     Value::num(num)
                 };
                 // The range check runs AFTER both coercions and against the
@@ -2251,7 +2251,7 @@ impl<'p> Vm<'p> {
                                 self.call_value(cmp, Value::UNDEFINED, &[snap[j - 1], snap[j]])?;
                             // ToNumber on the comparator result (observable on
                             // objects; abrupt propagates; NaN acts as +0).
-                            if self.to_number_coerce(r)? > 0.0 {
+                            if self.to_number_strict(r)? > 0.0 {
                                 snap.swap(j - 1, j);
                                 j -= 1;
                             } else {
@@ -2282,6 +2282,13 @@ impl<'p> Vm<'p> {
                 let start = self.ta_rel_index(a1, 0, len)?;
                 let end =
                     self.ta_rel_index(args.get(2).copied().unwrap_or(Value::UNDEFINED), len, len)?;
+                // The copy count is fixed from the entry length. When it is zero,
+                // the algorithm returns before re-validating a buffer detached by
+                // one of the argument coercions.
+                let count = end.saturating_sub(start).min(len.saturating_sub(target));
+                if count == 0 {
+                    return Ok(Some(recv));
+                }
                 // The target/start/end coercions above may have run user code that
                 // detached the buffer — re-check before copying (a detached buffer
                 // here is a TypeError, not a silent no-op).
@@ -2295,16 +2302,12 @@ impl<'p> Vm<'p> {
                 // where the higher one falls off the current length (the spec's
                 // byte loop ends at the live boundary).
                 let cur = self.ta_effective_len(idx).unwrap_or(0);
-                let count = end.max(start) - start;
                 let bound = count.min(cur.saturating_sub(start.max(target)));
                 self.preflight_native_iteration_work(bound as u64)?;
-                let src: Vec<Value> = (0..bound)
-                    .map(|k| self.ta_element_get(idx, start + k))
-                    .collect();
-                for (k, v) in src.into_iter().enumerate() {
-                    if target + k < len {
-                        self.ta_element_set(idx, target + k, v)?;
-                    }
+                if !self.ta_raw_memmove(idx, start, idx, target, bound) {
+                    return Err(Thrown(
+                        "TypeError: TypedArray buffer changed during copyWithin".into(),
+                    ));
                 }
                 Ok(Some(recv))
             }
@@ -2314,7 +2317,7 @@ impl<'p> Vm<'p> {
                 let offset = if a1 == Value::UNDEFINED {
                     0
                 } else {
-                    let n = self.to_integer_or_zero(a1)?;
+                    let n = self.to_integer_strict(a1)?;
                     if n < 0 {
                         return Err(Thrown("RangeError: offset is out of bounds".into()));
                     }
@@ -2322,47 +2325,55 @@ impl<'p> Vm<'p> {
                 };
                 // ToInteger(offset)'s valueOf may have detached the TARGET buffer:
                 // re-check (SetTypedArrayFromArrayLike / FromTypedArray step).
-                if self.ta_effective_len(idx).is_none() {
-                    return Err(Thrown(
+                let target_len = self.ta_effective_len(idx).ok_or_else(|| {
+                    Thrown(
                         "TypeError: Cannot set values on a detached/out-of-bounds TypedArray"
                             .into(),
-                    ));
-                }
+                    )
+                })?;
                 // A BigInt typed array only mixes with a BigInt source (checked up
                 // front when the source is itself a TypedArray); a TypedArray source
                 // must also not be detached.
                 let target_big = native::TA_KINDS[kind as usize].2;
-                if a0.is_heap() {
-                    if let HeapObj::TypedArray { kind: sk, .. } = self.heap.get(a0.heap_index()) {
-                        if native::TA_KINDS[*sk as usize].2 != target_big {
-                            return Err(Thrown(
-                                "TypeError: cannot mix BigInt and other types when setting a TypedArray"
-                                    .into(),
-                            ));
-                        }
-                        if self.ta_effective_len(a0.heap_index()).is_none() {
-                            return Err(Thrown(
-                                "TypeError: source TypedArray has a detached buffer".into(),
-                            ));
-                        }
-                    }
-                }
-                // SetTypedArrayFromTypedArray: a TypedArray source is snapshotted
-                // up front (the source buffer may overlap the target's), then
-                // written with element-type conversion.
                 if a0.is_heap()
                     && matches!(self.heap.get(a0.heap_index()), HeapObj::TypedArray { .. })
                 {
-                    let src = self.ta_snapshot(a0.heap_index());
-                    let end = offset.checked_add(src.len()).ok_or_else(|| {
+                    let source_idx = a0.heap_index();
+                    let source_kind = match self.heap.get(source_idx) {
+                        HeapObj::TypedArray { kind, .. } => *kind,
+                        _ => unreachable!(),
+                    };
+                    if native::TA_KINDS[source_kind as usize].2 != target_big {
+                        return Err(Thrown(
+                            "TypeError: cannot mix BigInt and other types when setting a TypedArray"
+                                .into(),
+                        ));
+                    }
+                    let source_len = self.ta_effective_len(source_idx).ok_or_else(|| {
+                        Thrown("TypeError: source TypedArray has a detached buffer".into())
+                    })?;
+                    let end = offset.checked_add(source_len).ok_or_else(|| {
                         Thrown("RangeError: source array is too long for the target offset".into())
                     })?;
-                    if end > len {
+                    if end > target_len {
                         return Err(Thrown(
                             "RangeError: source array is too long for the target offset".into(),
                         ));
                     }
-                    self.preflight_native_iteration_work(src.len() as u64)?;
+                    self.preflight_native_iteration_work(source_len as u64)?;
+                    // Same-kind copies are specified in terms of source bytes.
+                    // Snapshotting those bytes also gives overlapping views their
+                    // required memmove behavior without canonicalising NaNs.
+                    if source_kind == kind {
+                        if !self.ta_raw_memmove(source_idx, 0, idx, offset, source_len) {
+                            return Err(Thrown(
+                                "TypeError: TypedArray buffer changed during set".into(),
+                            ));
+                        }
+                        return Ok(Some(Value::UNDEFINED));
+                    }
+                    // Different element kinds convert each snapshotted value.
+                    let src = self.ta_snapshot(source_idx);
                     for (k, v) in src.into_iter().enumerate() {
                         self.ta_element_set(idx, offset + k, v)?;
                     }
@@ -2378,7 +2389,7 @@ impl<'p> Vm<'p> {
                 // the spec, which never invokes the source's @@iterator.
                 let len_val = self.get_prop(a0, "length")?;
                 let src_len_u64 =
-                    self.to_integer_or_zero(len_val)?.clamp(0, (1i64 << 53) - 1) as u64;
+                    self.to_integer_strict(len_val)?.clamp(0, (1i64 << 53) - 1) as u64;
                 // Keep ToLength in its 53-bit domain until the hostile-code
                 // work check has run. Casting first makes 2^32 become zero on
                 // wasm32, bypassing both the bounds check and the native-loop
@@ -2390,7 +2401,7 @@ impl<'p> Vm<'p> {
                 let end = offset.checked_add(src_len).ok_or_else(|| {
                     Thrown("RangeError: source array is too long for the target offset".into())
                 })?;
-                if end > len {
+                if end > target_len {
                     return Err(Thrown(
                         "RangeError: source array is too long for the target offset".into(),
                     ));
@@ -2534,7 +2545,7 @@ impl<'p> Vm<'p> {
             let v = args.get(1).copied().unwrap_or(Value::UNDEFINED);
             let mut bytes = if kind == 16 {
                 // Float16: ToNumber → nearest binary16 bits → 2 bytes (in [0..2]).
-                let f = self.to_number_coerce(v)?;
+                let f = self.to_number_strict(v)?;
                 let mut a = [0u8; 8];
                 a[..2].copy_from_slice(&crate::vm::helpers_num2::f64_to_f16_bits(f).to_le_bytes());
                 a
@@ -2544,7 +2555,7 @@ impl<'p> Vm<'p> {
                 // magnitude, incl. the Big tier).
                 self.to_bigint(v)?.to_u64_wrap().to_le_bytes()
             } else {
-                let f = self.to_number_coerce(v)?;
+                let f = self.to_number_strict(v)?;
                 ta_encode(kind, f)
             };
             // SetViewValue converts the VALUE before checking the bounds — so a
@@ -2603,7 +2614,7 @@ impl<'p> Vm<'p> {
                     None => return Err(Thrown("TypeError: ArrayBuffer is not resizable".into())),
                 };
                 let n =
-                    self.to_integer_or_zero(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                    self.to_integer_strict(args.first().copied().unwrap_or(Value::UNDEFINED))?;
                 if n < 0 {
                     return Err(Thrown(
                         "RangeError: ArrayBuffer resize length out of range".into(),
@@ -2642,17 +2653,21 @@ impl<'p> Vm<'p> {
                     }
                 };
                 let n =
-                    self.to_integer_or_zero(args.first().copied().unwrap_or(Value::UNDEFINED))?;
-                if n < len as i64 || n as usize > max {
+                    self.to_integer_strict(args.first().copied().unwrap_or(Value::UNDEFINED))?;
+                if n < 0 || n as usize > max {
                     return Err(Thrown(
                         "RangeError: SharedArrayBuffer grow length out of range".into(),
                     ));
                 }
-                // A Shared store grows by an atomic length store (the bytes are
-                // preallocated to maxByteLength, zeroed); Local falls back to a
-                // Vec resize.
+                // The shared store re-checks the live length inside a SeqCst CAS
+                // retry. A re-entrant or concurrent larger growth therefore makes
+                // this request a RangeError instead of moving the length backwards.
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(idx) {
-                    data.resize_bytes(n as usize);
+                    if !data.grow_bytes(n as usize) {
+                        return Err(Thrown(
+                            "RangeError: SharedArrayBuffer grow length out of range".into(),
+                        ));
+                    }
                 }
                 Ok(Some(Value::UNDEFINED))
             }
@@ -2670,22 +2685,12 @@ impl<'p> Vm<'p> {
                     self.ta_rel_index(args.first().copied().unwrap_or(Value::UNDEFINED), 0, len)?;
                 let end =
                     self.ta_rel_index(args.get(1).copied().unwrap_or(Value::UNDEFINED), len, len)?;
-                // A coercing index argument may have detached the buffer — re-check
-                // and throw (rather than clamping the now-empty data to a 0 slice).
-                if matches!(
-                    self.heap.get(idx),
-                    HeapObj::ArrayBuffer { detached: true, .. }
-                ) {
-                    return Err(Thrown(
-                        "TypeError: Cannot slice a detached ArrayBuffer".into(),
-                    ));
-                }
-                let dl = match self.heap.get(idx) {
-                    HeapObj::ArrayBuffer { data, .. } => data.len(),
-                    _ => 0,
-                };
-                let s = start.min(dl);
-                let e = end.max(start).min(dl);
+                // The requested result length is resolved against the ENTRY byte
+                // length. Argument coercion may shrink or detach the source, but
+                // SpeciesConstructor still runs with this original request before
+                // detachment is re-checked below.
+                let s = start;
+                let e = end.max(start);
                 let new_len = e - s;
                 let is_shared = self.shared_buffers.contains(&idx);
                 // SpeciesConstructor(O, %ArrayBuffer%): a user constructor[@@species]
@@ -2729,9 +2734,9 @@ impl<'p> Vm<'p> {
                                 .into(),
                         )),
                     };
-                    if !is_shared && self.shared_buffers.contains(&ridx) {
+                    if self.shared_buffers.contains(&ridx) != is_shared {
                         return Err(Thrown(
-                            "TypeError: ArrayBuffer.prototype.slice species returned a SharedArrayBuffer".into(),
+                            "TypeError: ArrayBuffer.prototype.slice species returned the wrong buffer brand".into(),
                         ));
                     }
                     if matches!(
@@ -2769,9 +2774,18 @@ impl<'p> Vm<'p> {
                         "TypeError: source ArrayBuffer detached during species construction".into(),
                     ));
                 }
-                let slice: Vec<u8> = match self.heap.get(idx) {
-                    HeapObj::ArrayBuffer { data, .. } => data[s..e].to_vec(),
-                    _ => Vec::new(),
+                // A resizable source may now be shorter. Copy only the live prefix
+                // of the originally requested range; the rest of a species-created
+                // destination is left untouched.
+                let live_len = self.array_buffer_len(idx);
+                let copy_len = new_len.min(live_len.saturating_sub(s));
+                let slice: Vec<u8> = if copy_len == 0 {
+                    Vec::new()
+                } else {
+                    match self.heap.get(idx) {
+                        HeapObj::ArrayBuffer { data, .. } => data[s..s + copy_len].to_vec(),
+                        _ => Vec::new(),
+                    }
                 };
                 if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(new_idx) {
                     data[..slice.len()].copy_from_slice(&slice);
@@ -2978,8 +2992,8 @@ impl<'p> Vm<'p> {
     }
 
     /// `Map.prototype.*`. `idx` is the Map's heap index. Returns `Ok(None)` for an
-    /// unknown method (→ TypeError at the call site). `forEach` snapshots the
-    /// entries before invoking the callback (which may mutate the map).
+    /// unknown method (→ TypeError at the call site). `forEach` walks the live
+    /// entries list, including entries appended by a callback.
     pub(crate) fn map_method(
         &mut self,
         idx: u32,
@@ -3100,12 +3114,19 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool(false)))
             }
             "clear" => {
-                if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
-                    keys.clear();
-                    vals.clear();
-                }
-                // Every slot position died: drop the index (rebuilds lazily).
-                self.coll_index_invalidate(idx);
+                let backing_len = if let HeapObj::Map { keys, vals } = self.heap.get_mut(idx) {
+                    // Preserve positions for active iterators / forEach cursors.
+                    // A later set appends after these empty records and must be seen.
+                    keys.fill(Value::HOLE);
+                    vals.fill(Value::UNDEFINED);
+                    keys.len()
+                } else {
+                    0
+                };
+                // Reset to an empty index once the tombstoned backing is large;
+                // rebuilding it after every clear/add cycle would repeatedly scan
+                // dead slots and make that pattern quadratic.
+                self.coll_index_clear(idx, backing_len);
                 Ok(Some(Value::UNDEFINED))
             }
             "forEach" => {
@@ -3155,7 +3176,7 @@ impl<'p> Vm<'p> {
 
     /// `WeakMap.prototype.{get,set,has,delete}`. Brand-checked (the receiver must be
     /// a WeakMap, so `WeakMap.prototype.set.call(aMap)` throws) and keys must be
-    /// objects. No GC, so entries are held strongly (unobservable without GC).
+    /// objects. The collector treats each key/value pair as an ephemeron.
     /// CanBeHeldWeakly(v) (ES 7.3.X): a value usable as a WeakMap/WeakSet/WeakRef
     /// key/target — any Object, or a Symbol that is NOT in the global Symbol
     /// registry (a `Symbol.for` result cannot be held weakly).
@@ -3213,7 +3234,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if let Some(p) = pushed {
-                    self.coll_index_insert(idx, a0, p);
+                    self.weak_coll_index_insert(idx, a0, p);
                 }
                 Ok(this) // chainable
             }
@@ -3258,7 +3279,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 if let Some(p) = pushed {
-                    self.coll_index_insert(idx, a0, p);
+                    self.weak_coll_index_insert(idx, a0, p);
                 }
                 Ok(val)
             }
@@ -3306,7 +3327,7 @@ impl<'p> Vm<'p> {
                         items.push(a0);
                     }
                     if let Some(p) = pushed {
-                        self.coll_index_insert(idx, a0, p);
+                        self.weak_coll_index_insert(idx, a0, p);
                     }
                 }
                 Ok(this) // chainable
@@ -3327,9 +3348,9 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// `FinalizationRegistry.prototype.{register,unregister}`. No GC, so cleanup
-    /// never fires; only the register/unregister bookkeeping (+ arg validation) is
-    /// observable. `tokens` tracks live unregister tokens for `unregister`.
+    /// `FinalizationRegistry.prototype.{register,unregister}`. Targets and
+    /// unregister tokens are weak; holdings remain strong until cleanup consumes
+    /// the cell or unregister removes it.
     pub(crate) fn finreg_method(
         &mut self,
         this: Value,
@@ -3369,12 +3390,15 @@ impl<'p> Vm<'p> {
                         "TypeError: FinalizationRegistry.register: unregister token cannot be held weakly".into(),
                     ));
                 }
-                if token != Value::UNDEFINED {
-                    // Nursery barrier: a young token pushed into an old registry.
-                    self.heap.write_barrier_val(idx, token);
-                    if let HeapObj::FinalizationRegistry { tokens, .. } = self.heap.get_mut(idx) {
-                        tokens.push(token);
-                    }
+                // Only the holding is a strong old-to-young edge. Recording the
+                // target or token in the remset would accidentally keep it live.
+                self.heap.write_barrier_val(idx, held);
+                if let HeapObj::FinalizationRegistry { cells, .. } = self.heap.get_mut(idx) {
+                    cells.push(crate::heap::FinalizationCell {
+                        target: a0,
+                        held,
+                        token,
+                    });
                 }
                 Ok(Value::UNDEFINED)
             }
@@ -3386,10 +3410,13 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let mut removed = false;
-                if let HeapObj::FinalizationRegistry { tokens, .. } = self.heap.get_mut(idx) {
-                    let before = tokens.len();
-                    tokens.retain(|t| *t != a0); // object identity = Value bit-equality
-                    removed = tokens.len() != before;
+                if let HeapObj::FinalizationRegistry { cells, cleared, .. } = self.heap.get_mut(idx) {
+                    let before = cells.len().saturating_add(cleared.len());
+                    // Also removes cleared cells awaiting delivery: unregister is
+                    // allowed to cancel after target collection but before cleanup.
+                    cells.retain(|cell| cell.token != a0);
+                    cleared.retain(|cell| cell.token != a0);
+                    removed = cells.len().saturating_add(cleared.len()) != before;
                 }
                 Ok(Value::bool(removed))
             }
@@ -3398,7 +3425,7 @@ impl<'p> Vm<'p> {
     }
 
     /// `Set.prototype.*`. `idx` is the Set's heap index. `keys`/`values`/`entries`
-    /// return arrays (the iterator approximation).
+    /// return live iterators over its insertion-ordered backing store.
     pub(crate) fn set_method(
         &mut self,
         idx: u32,
@@ -3444,11 +3471,17 @@ impl<'p> Vm<'p> {
                 Ok(Some(Value::bool(false)))
             }
             "clear" => {
-                if let HeapObj::Set(items) = self.heap.get_mut(idx) {
-                    items.clear();
-                }
-                // Every slot position died: drop the index (rebuilds lazily).
-                self.coll_index_invalidate(idx);
+                let backing_len = if let HeapObj::Set(items) = self.heap.get_mut(idx) {
+                    // Preserve positions for active iterators / forEach cursors.
+                    // A later add appends after these empty records and must be seen.
+                    items.fill(Value::HOLE);
+                    items.len()
+                } else {
+                    0
+                };
+                // Keep later lookups on the empty index instead of repeatedly
+                // rescanning all old tombstones after clear/add cycles.
+                self.coll_index_clear(idx, backing_len);
                 Ok(Some(Value::UNDEFINED))
             }
             "forEach" => {
@@ -3536,7 +3569,7 @@ impl<'p> Vm<'p> {
                                 "TypeError: Set-like 'size' cannot be a BigInt".into(),
                             ));
                         }
-                        let num_size = self.to_number_coerce(raw_size)?;
+                        let num_size = self.to_number_strict(raw_size)?;
                         if num_size.is_nan() {
                             return Err(Thrown("TypeError: Set-like 'size' is NaN".into()));
                         }

@@ -2570,8 +2570,8 @@ impl<'p> Vm<'p> {
         // NewPromiseCapability(C) — the result is a C-typed promise (a subclass
         // instance when `this` is a Promise subclass). A throwing/invalid capability
         // (executor not called / called twice / non-callable resolve-reject) throws
-        // synchronously per ReturnIfAbrupt. The instance is a HeapObj::Promise, so
-        // the existing self.resolve/reject(result) settle it directly.
+        // synchronously per ReturnIfAbrupt. A custom constructor may return any
+        // object, so settlement must call its captured capability functions.
         let (cap_promise, cap_resolve, cap_reject) = self.new_promise_capability(ctor)?;
         let result = cap_promise.heap_index();
         // GetPromiseResolve(C): `promiseResolve = Get(C, "resolve")`, which must be
@@ -2587,7 +2587,7 @@ impl<'p> Vm<'p> {
                         Some(v) => v,
                         None => self.alloc_error_from_message(&msg),
                     };
-                    self.reject(result, err);
+                    self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
                     return Ok(Value::heap(result));
                 }
             }
@@ -2598,7 +2598,7 @@ impl<'p> Vm<'p> {
             if !self.is_callable(pr) {
                 let err =
                     self.alloc_error_from_message("TypeError: Promise.resolve is not a function");
-                self.reject(result, err);
+                self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
                 return Ok(Value::heap(result));
             }
         }
@@ -2613,7 +2613,7 @@ impl<'p> Vm<'p> {
                 let e = self.alloc_error_from_message(
                     "TypeError: Promise.allKeyed argument is not an object",
                 );
-                self.reject(result, e);
+                self.call_value(cap_reject, Value::UNDEFINED, &[e])?;
                 return Ok(Value::heap(result));
             }
             // OwnPropertyKeys (incl. Symbols), filtered to enumerable own props —
@@ -2624,13 +2624,13 @@ impl<'p> Vm<'p> {
             let karr = match self.object_own_keys(iterable) {
                 Ok(a) => a,
                 Err(Thrown(msg)) => {
-                    self.reject_with_thrown(result, &msg);
+                    self.reject_capability_with_thrown(cap_reject, &msg)?;
                     return Ok(Value::heap(result));
                 }
             };
             let kvals = self.array_snapshot(karr.heap_index());
             if let Err(Thrown(msg)) = self.preflight_native_iteration_work(kvals.len() as u64) {
-                self.reject_with_thrown(result, &msg);
+                self.reject_capability_with_thrown(cap_reject, &msg)?;
                 return Ok(Value::heap(result));
             }
             let mut vals = Vec::with_capacity(kvals.len());
@@ -2645,14 +2645,14 @@ impl<'p> Vm<'p> {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(Thrown(msg)) => {
-                        self.reject_with_thrown(result, &msg);
+                        self.reject_capability_with_thrown(cap_reject, &msg)?;
                         return Ok(Value::heap(result));
                     }
                 }
                 let v = match self.get_member(iterable, &ks, iterable) {
                     Ok(v) => v,
                     Err(Thrown(msg)) => {
-                        self.reject_with_thrown(result, &msg);
+                        self.reject_capability_with_thrown(cap_reject, &msg)?;
                         return Ok(Value::heap(result));
                     }
                 };
@@ -2673,11 +2673,11 @@ impl<'p> Vm<'p> {
                 let disp = self.display(iterable);
                 let e =
                     self.alloc_error_from_message(&format!("TypeError: {disp} is not iterable"));
-                self.reject(result, e);
+                self.call_value(cap_reject, Value::UNDEFINED, &[e])?;
                 return Ok(Value::heap(result));
             }
             Err(Thrown(msg)) => {
-                self.reject_with_thrown(result, &msg);
+                self.reject_capability_with_thrown(cap_reject, &msg)?;
                 return Ok(Value::heap(result));
             }
         };
@@ -2715,7 +2715,7 @@ impl<'p> Vm<'p> {
             iter = match self.call_value(iter_method, iterable, &[]) {
                 Ok(it) => it,
                 Err(Thrown(msg)) => {
-                    self.reject_with_thrown(result, &msg);
+                    self.reject_capability_with_thrown(cap_reject, &msg)?;
                     return Ok(Value::heap(result));
                 }
             };
@@ -2794,7 +2794,7 @@ impl<'p> Vm<'p> {
                     Ok(Some(v)) => v,
                     Ok(None) => break,
                     Err(Thrown(msg)) => {
-                        self.reject_with_thrown(result, &msg);
+                        self.reject_capability_with_thrown(cap_reject, &msg)?;
                         return Ok(Value::heap(result));
                     }
                 }
@@ -2803,9 +2803,7 @@ impl<'p> Vm<'p> {
             if let Err(Thrown(msg)) = self.preflight_native_iteration_work(native_work) {
                 let err = self.alloc_error_from_message(&msg);
                 if fast_pos.is_none() {
-                    let saved = self.pending_throw;
-                    let _ = self.iterator_close(iter);
-                    self.pending_throw = saved;
+                    self.iterator_close_quiet(iter);
                 }
                 self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
                 return Ok(Value::heap(result));
@@ -2870,7 +2868,7 @@ impl<'p> Vm<'p> {
                         Ok(v) => v,
                         Err(Thrown(msg)) => {
                             let err = self.take_thrown(&msg);
-                            let _ = self.iterator_close(iter);
+                            self.iterator_close_quiet(iter);
                             // IfAbruptRejectPromise: settle through the capability's
                             // observable [[Reject]] (a custom constructor's reject is
                             // visibly invoked), not the internal reject.
@@ -2945,8 +2943,8 @@ impl<'p> Vm<'p> {
             };
             if let Err(Thrown(msg)) = outcome {
                 let err = self.take_thrown(&msg);
-                let _ = self.iterator_close(iter);
-                self.reject(result, err);
+                self.iterator_close_quiet(iter);
+                self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
                 return Ok(Value::heap(result));
             }
         }
@@ -2979,11 +2977,12 @@ impl<'p> Vm<'p> {
         Ok(Value::heap(result))
     }
 
-    /// Reject promise `p` with the live thrown value (`pending_throw`), falling
-    /// back to reconstructing an error from the message.
-    fn reject_with_thrown(&mut self, p: u32, msg: &str) {
+    /// IfAbruptRejectPromise: consume the original thrown value, call the
+    /// observable capability's reject function, and propagate a throw from it.
+    fn reject_capability_with_thrown(&mut self, reject: Value, msg: &str) -> Result<(), Thrown> {
         let e = self.take_thrown(msg);
-        self.reject(p, e);
+        self.call_value(reject, Value::UNDEFINED, &[e])?;
+        Ok(())
     }
 
     /// The live thrown value (`pending_throw`), or a fresh error from the message.
@@ -3488,6 +3487,9 @@ impl<'p> Vm<'p> {
             // `eager_combinator_enabled`): all element jobs already ran at
             // subscription; this job carries only the observable settle.
             Microtask::CombinatorFinish { combinator } => self.combinator_finish(combinator),
+            Microtask::FinalizationCleanup { registry } => {
+                self.run_finalization_cleanup(registry)
+            }
             // PromiseResolveThenableJob: run then.call(thenable, resolveFn, rejectFn).
             // The resolving functions settle `promise` (one-shot via settle's Pending
             // guard, so a thenable that calls both / twice is handled). A throwing
@@ -3537,10 +3539,58 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// CleanupFinalizationRegistry: consume cleared cells one at a time so a
+    /// callback can unregister other cleared cells or register new targets.
+    /// An abrupt callback is a job-level error; this embedding has no
+    /// HostReportErrors hook, so consume it and schedule the remaining cells as
+    /// a later cleanup job rather than poisoning the Promise queue.
+    fn run_finalization_cleanup(&mut self, registry: u32) {
+        loop {
+            let next = match self.heap.get_mut(registry) {
+                HeapObj::FinalizationRegistry {
+                    cleanup, cleared, ..
+                } => cleared.pop().map(|cell| (*cleanup, cell.held)),
+                _ => None,
+            };
+            let Some((cleanup, held)) = next else {
+                break;
+            };
+            let result = self.with_host_roots(&[cleanup, held], |vm| {
+                vm.call_value(cleanup, Value::UNDEFINED, &[held])
+            });
+            if result.is_err() {
+                self.pending_throw.take();
+                break;
+            }
+        }
+
+        let mut reschedule = false;
+        if let HeapObj::FinalizationRegistry {
+            cleared,
+            cleanup_queued,
+            ..
+        } = self.heap.get_mut(registry)
+        {
+            *cleanup_queued = false;
+            if !cleared.is_empty() {
+                *cleanup_queued = true;
+                reschedule = true;
+            }
+        }
+        if reschedule {
+            self.microtasks
+                .push_back(Microtask::FinalizationCleanup { registry });
+        }
+    }
+
     /// Drain the microtask queue to empty (FIFO; tasks enqueued during the drain
     /// run in the same drain). The whole event loop.
     pub fn drain_microtasks(&mut self) {
         let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Microtask);
+        // The embedding/main-script call that reached this checkpoint was one
+        // job. WeakRef targets kept during it may now be cleared before the
+        // first queued job starts.
+        self.finish_weak_job();
         while let Some(t) = self.microtasks.pop_front() {
             // B214: the popped task's Values are kept reachable by ROOTING a
             // copy in `current_microtask` (traced by mark_roots) instead of
@@ -3562,7 +3612,7 @@ impl<'p> Vm<'p> {
                 self.run_microtask(t);
             }
             // Between microtasks no un-rooted local survives, so reclaim now.
-            self.maybe_gc();
+            self.finish_weak_job();
         }
     }
 

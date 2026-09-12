@@ -171,6 +171,35 @@ await test("a throwing transport does not disturb an unrelated pending request",
   assert.equal(ctx.timers.size, 0);
   host.terminate();
 });
+await test("unprintable clone errors still release their request and deadline", async (ctx) => {
+  const { host, worker } = await ctx.ready();
+  const errors = [
+    { get message() { throw new Error("message getter failed"); } },
+    { message: { toString() { throw new Error("message conversion failed"); } } },
+    { get name() { throw new Error("name getter failed"); }, message: "clone refused" },
+    { toString() { throw new Error("string conversion failed"); } },
+    Proxy.revocable({}, {}).proxy,
+  ];
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+  errors.push(revoked.proxy);
+  for (const error of errors) {
+    const before = worker.sent.length;
+    const value = { get payload() { throw error; } };
+    const result = await settled(host.call("f", [value]));
+    assert.equal(result.ok, false);
+    assert.equal(result.error.category, "usage");
+    assert.equal(host.pendingRequests, 0);
+    assert.equal(ctx.timers.size, 0);
+    assert.equal(worker.sent.length, before);
+    ctx.fireAll();
+    assert.equal(host.state, "ready");
+  }
+  const good = settled(host.call("f"));
+  worker.reply(worker.sent.at(-1), { value: "still usable" });
+  assert.deepEqual(await good, { ok: true, value: "still usable" });
+  host.terminate();
+});
 
 // ── ZA-03 ──────────────────────────────────────────────────────────────────
 await test("initialization cannot resurrect a terminated host", async (ctx) => {

@@ -92,7 +92,7 @@ pub(crate) fn reg_value_is_observable_after_def(
 /// of the own slot is a no-op marker (its value is only the call target, which
 /// the helper resolves), and the `Call` becomes a depth-guarded native recurse.
 pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u32>) -> bool {
-    if proto.code.is_empty() {
+    if proto.code.is_empty() || proto.reg_count == 0 || proto.param_count >= proto.reg_count {
         return false;
     }
     // Rest and `arguments` are materialized by the interpreter's call setup,
@@ -110,6 +110,14 @@ pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u32>) -> bool {
         return false;
     }
     for (ip, instr) in code.iter().enumerate() {
+        // The compiler normally guarantees every operand is inside the
+        // function's register window and every branch names an instruction.
+        // Keep that invariant at the unsafe native-code boundary too: a
+        // malformed internal FuncProto must decline rather than emit an
+        // unchecked [rbx + reg*8] access or index the label table out of range.
+        if !tier_a_operands_in_bounds(instr, proto.reg_count, code.len()) {
+            return false;
+        }
         match instr {
             Instr::LoadInt { .. }
             | Instr::Move { .. }
@@ -147,6 +155,47 @@ pub(crate) fn can_compile(proto: &FuncProto, self_slot: Option<u32>) -> bool {
         }
     }
     true
+}
+
+/// Validate every operand used by Tier A before it becomes a native memory
+/// displacement or label-table index. This duplicates the compiler's ordinary
+/// FuncProto invariant deliberately: code generation is the last safe place to
+/// reject malformed bytecode before its register indices become raw accesses.
+fn tier_a_operands_in_bounds(instr: &Instr, reg_count: u16, code_len: usize) -> bool {
+    let reg = |r: u16| r < reg_count;
+    let target = |ip: u32| (ip as usize) < code_len;
+    let args = |base: u16, count: u16| base.checked_add(count).is_some_and(|end| end <= reg_count);
+    match *instr {
+        Instr::LoadInt { dst, .. } | Instr::LoadGlobal { dst, .. } => reg(dst),
+        Instr::Move { dst, src } => reg(dst) && reg(src),
+        Instr::AddInt { dst, a, .. } => reg(dst) && reg(a),
+        Instr::Add { dst, a, b }
+        | Instr::Sub { dst, a, b }
+        | Instr::Mul { dst, a, b }
+        | Instr::Mod { dst, a, b }
+        | Instr::Lt { dst, a, b }
+        | Instr::Le { dst, a, b }
+        | Instr::Gt { dst, a, b }
+        | Instr::Ge { dst, a, b }
+        | Instr::Eq { dst, a, b }
+        | Instr::Ne { dst, a, b } => reg(dst) && reg(a) && reg(b),
+        Instr::Jump { target: ip } => target(ip),
+        Instr::JumpIfFalse { cond, target: ip } | Instr::JumpIfTrue { cond, target: ip } => {
+            reg(cond) && target(ip)
+        }
+        Instr::JumpIfNotLt { a, b, target: ip } | Instr::JumpIfNotLe { a, b, target: ip } => {
+            reg(a) && reg(b) && target(ip)
+        }
+        Instr::Call {
+            dst,
+            callee,
+            arg_base,
+            argc,
+        } => reg(dst) && reg(callee) && args(arg_base, argc),
+        Instr::Return { src } => reg(src),
+        Instr::ReturnUndefined => true,
+        _ => false,
+    }
 }
 
 /// Does an instruction accepted by Tier A read `reg`? This is intentionally
@@ -1047,6 +1096,23 @@ pub(crate) fn jump_if_not_cmp(
 mod control_target_tests {
     use super::*;
 
+    fn tier_a_proto() -> FuncProto {
+        let source = r#"
+            function fib(n) {
+                if (n < 2) return n;
+                return fib(n - 1) + fib(n - 2);
+            }
+            fib(6);
+        "#;
+        let ast = crate::front::parse_script(source).expect("parse tier-a fixture");
+        crate::compile::compile_program(&ast, source)
+            .expect("compile tier-a fixture")
+            .functions
+            .into_iter()
+            .find(|proto| proto.name == "fib")
+            .expect("fib proto")
+    }
+
     #[test]
     fn includes_exceptional_handler_and_finally_edges() {
         assert_eq!(
@@ -1072,5 +1138,71 @@ mod control_target_tests {
             Some(13)
         );
         assert_eq!(bytecode_control_target(&Instr::PopFinally), None);
+    }
+
+    #[test]
+    fn audit_20260912_malformed_tier_a_registers_decline() {
+        let proto = tier_a_proto();
+        assert!(can_compile(&proto, proto.name_global));
+
+        let mut zero_window = proto.clone();
+        zero_window.reg_count = 0;
+        assert!(!can_compile(&zero_window, zero_window.name_global));
+
+        let mut bad_dst = proto.clone();
+        let out = bad_dst.reg_count;
+        let load = bad_dst
+            .code
+            .iter_mut()
+            .find(|instr| matches!(instr, Instr::LoadInt { .. }))
+            .expect("fixture load");
+        let Instr::LoadInt { dst, .. } = load else {
+            unreachable!()
+        };
+        *dst = out;
+        assert!(!can_compile(&bad_dst, bad_dst.name_global));
+
+        let mut bad_args = proto.clone();
+        let out = bad_args.reg_count;
+        let call = bad_args
+            .code
+            .iter_mut()
+            .find(|instr| matches!(instr, Instr::Call { .. }))
+            .expect("fixture recursive call");
+        let Instr::Call { arg_base, .. } = call else {
+            unreachable!()
+        };
+        *arg_base = out;
+        assert!(!can_compile(&bad_args, bad_args.name_global));
+    }
+
+    #[test]
+    fn audit_20260912_malformed_tier_a_target_declines() {
+        let mut proto = tier_a_proto();
+        assert!(can_compile(&proto, proto.name_global));
+        let out = proto.code.len() as u32;
+        let branch = proto
+            .code
+            .iter_mut()
+            .find(|instr| {
+                matches!(
+                    instr,
+                    Instr::Jump { .. }
+                        | Instr::JumpIfFalse { .. }
+                        | Instr::JumpIfTrue { .. }
+                        | Instr::JumpIfNotLt { .. }
+                        | Instr::JumpIfNotLe { .. }
+                )
+            })
+            .expect("fixture branch");
+        match branch {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. } => *target = out,
+            _ => unreachable!(),
+        };
+        assert!(!can_compile(&proto, proto.name_global));
     }
 }

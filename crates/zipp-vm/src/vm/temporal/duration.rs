@@ -54,7 +54,7 @@ impl<'p> Vm<'p> {
                 "TypeError: Cannot convert a BigInt value to a number".into(),
             ));
         }
-        let n = self.to_number_coerce(v)?;
+        let n = self.to_number_strict(v)?;
         if !n.is_finite() || n.fract() != 0.0 {
             return Err(Thrown(
                 "RangeError: Temporal.Duration fields must be integers".into(),

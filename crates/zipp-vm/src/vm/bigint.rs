@@ -259,14 +259,12 @@ impl<'p> Vm<'p> {
 
     /// ToNumeric's ToPrimitive(number) step for an operand of a numeric
     /// operator: a true object (incl. a boxed wrapper) runs the observable
-    /// protocol; primitives and the engine's unobservable shortcut types
-    /// (Date / strings) pass through unchanged.
+    /// protocol; primitive strings, Symbols and BigInts pass through unchanged.
     pub(crate) fn numeric_prim(&mut self, v: Value) -> Result<Value, Thrown> {
         if v.is_heap()
             && !matches!(
                 self.heap.get(v.heap_index()),
-                HeapObj::Date(_)
-                    | HeapObj::Str(_)
+                HeapObj::Str(_)
                     | HeapObj::Cons { .. }
                     | HeapObj::Symbol { .. }
                     | HeapObj::BigInt(_)

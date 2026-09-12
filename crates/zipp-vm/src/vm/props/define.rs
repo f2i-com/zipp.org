@@ -462,13 +462,13 @@ impl<'p> Vm<'p> {
                 // TWICE), and `newLen != numberLen` (a non-uint32 length like -1 / NaN
                 // / >=2^32) is a RangeError — BEFORE the attribute / writability checks.
                 let new_len: Option<usize> = if let Some(v) = value {
-                    let nu = self.to_number_coerce(v)?; // ToNumber inside ToUint32
+                    let nu = self.to_number_strict(v)?; // ToNumber inside ToUint32
                     let u = if nu.is_finite() {
                         (nu.trunc() as i64 as u32) as f64
                     } else {
                         0.0
                     };
-                    let number_len = self.to_number_coerce(v)?; // numberLen = ToNumber(value)
+                    let number_len = self.to_number_strict(v)?; // numberLen = ToNumber(value)
                     if u != number_len {
                         return Err(Thrown("RangeError: Invalid array length".into()));
                     }

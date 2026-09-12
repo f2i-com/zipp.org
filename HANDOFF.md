@@ -7,6 +7,26 @@ and the B001–B252 experiment ledger is preserved in
 
 ## Current engine baseline
 
+### 12 September deep follow-up audit
+
+The [follow-up audit](docs/audits/2026-09-12-follow-up.md) hardens the edges
+where guest code can re-enter the VM during coercion, species construction,
+iteration and callbacks. It fixes ArrayBuffer/TypedArray/DataView ordering and
+raw-bit copying, constructor-provided Promise rejection, iterator/decorator/
+collection GC roots, live Map/Set iteration after `clear()`, and strict
+`ToNumber` handling for BigInt-producing objects. WeakMap/WeakSet ephemerons,
+WeakRef kept objects and FinalizationRegistry cleanup now participate in GC and
+job boundaries with their required strengths. Compiler register/metadata
+windows and native JIT plan inputs are checked before narrowing or indexing.
+
+The browser host SDK is now 1.1.1 and reports even hostile thrown values without
+stranding requests or deadlines; its real Worker adapter has a Node contract
+test. Eight focused audit binaries are wired into the retained manual workflows.
+Automatic workflow triggers remain paused, and this pass does not change the
+published performance claims or checked-in WebAssembly release. The final
+locked release CLI passed **95,939 / 95,942** core Test262 executions, with the
+same three expected failures and zero skips.
+
 ### 12 September correctness follow-up
 
 The [correctness audit of `ee107d4b`](docs/audits/2026-09-12-correctness.md)

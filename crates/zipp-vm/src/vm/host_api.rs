@@ -1303,6 +1303,12 @@ impl<'p> Vm<'p> {
         };
         if drain_microtasks {
             self.drain_microtasks();
+        } else {
+            // This host entry is still a complete ECMAScript job even though
+            // its queued jobs are intentionally left pending. The completion
+            // value above is rooted before clearing kept WeakRef targets, so a
+            // stress collection cannot reclaim it before marshaling.
+            self.finish_weak_job();
         }
         match res {
             Ok(v) => {
@@ -2007,6 +2013,7 @@ impl<'p> HostCtx for Vm<'p> {
         let v = self
             .host_invoke(callee, &argv)
             .map_err(|t| self.take_host_throw(t))?;
-        self.to_number(v).map_err(|t| self.take_host_throw(t))
+        self.to_number_strict(v)
+            .map_err(|t| self.take_host_throw(t))
     }
 }

@@ -511,6 +511,21 @@ impl LocalFinder {
 }
 
 impl<'p> Vm<'p> {
+    /// Number of live entries in an ordinary Map/Set. Indexed collections
+    /// already maintain this count, which keeps `.size` and LenOf constant-time
+    /// after delete-heavy or repeated clear/add workloads. Small unindexed
+    /// collections scan at most the lazy-index threshold in normal operation.
+    pub(crate) fn coll_live_len(&self, idx: u32) -> usize {
+        if let Some(index) = self.collection_index.get(&idx) {
+            return index.live;
+        }
+        match self.heap.get(idx) {
+            HeapObj::Map { keys, .. } => keys.iter().filter(|key| !key.is_hole()).count(),
+            HeapObj::Set(items) => items.iter().filter(|value| !value.is_hole()).count(),
+            _ => 0,
+        }
+    }
+
     /// Position of the live entry whose key/value is SameValueZero-equal to
     /// `key` in collection `idx` (Map/WeakMap keys; Set/WeakSet items):
     /// linear below the threshold, through the lazy hash index at/past it
@@ -570,6 +585,23 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Index maintenance for WeakMap/WeakSet. The key is deliberately not sent
+    /// through the ordinary collection insert barrier: recording it as a young
+    /// value would turn the weak edge into a strong nursery root for the epoch.
+    pub(crate) fn weak_coll_index_insert(&mut self, idx: u32, key: Value, pos: usize) {
+        if key.is_heap() {
+            self.heap.flatten(key.heap_index());
+        }
+        let Vm {
+            heap,
+            collection_index,
+            ..
+        } = self;
+        if let Some(ix) = collection_index.get_mut(&idx) {
+            ix.insert(heap, key, pos as u32);
+        }
+    }
+
     /// Drop `key`'s entry (slot `pos`, just tombstoned) from `idx`'s index.
     /// Tombstoning shifts no positions, so the rest of the index stays valid.
     pub(crate) fn coll_index_remove(&mut self, idx: u32, key: Value, pos: usize) {
@@ -586,11 +618,22 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// Reset a Map/Set index after `clear()`. The backing slots stay as
+    /// tombstones for live iterator cursors, but none can match a later lookup.
+    /// Keeping an empty index once the backing is large avoids rebuilding over
+    /// every old tombstone after each clear/add cycle.
+    pub(crate) fn coll_index_clear(&mut self, idx: u32, backing_len: usize) {
+        if backing_len >= INDEX_THRESHOLD || self.collection_index.contains_key(&idx) {
+            self.collection_index.insert(idx, CollIndex::with_capacity(0));
+        } else {
+            self.collection_index.remove(&idx);
+        }
+    }
+
     /// Drop collection `idx`'s index entirely. The correct-by-default escape
-    /// hatch for any mutation the insert/remove helpers can't describe:
-    /// clear() (positions reset), a WeakMap/WeakSet delete (Vec::remove
-    /// SHIFTS positions), re-branding an instance slot. Absent = linear; the
-    /// index rebuilds lazily on the next indexed lookup.
+    /// hatch for mutations that shift positions (WeakMap/WeakSet delete) or
+    /// replace a collection instance slot. Absent = linear; the index rebuilds
+    /// lazily on the next indexed lookup.
     pub(crate) fn coll_index_invalidate(&mut self, idx: u32) {
         self.collection_index.remove(&idx);
     }

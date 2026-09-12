@@ -112,11 +112,19 @@ jobs:
             --test json_plain_stringify \
             --test audit_20260911_native \
             --test audit_20260911_host_work \
+            --test audit_20260912_buffer_reentrancy \
+            --test audit_20260912_bytecode_metadata_width \
+            --test audit_20260912_collection_clear_live \
+            --test audit_20260912_decorator_gc_roots \
             --test audit_20260912_host_exceptions \
             --test audit_20260912_host_input_roots \
+            --test audit_20260912_iterator_roots \
             --test audit_20260912_nested_proxy_roots \
             --test audit_20260912_parser_early_errors \
+            --test audit_20260912_promise_capabilities \
+            --test audit_20260912_strict_tonumber_bigint \
             --test audit_20260912_typedarray_species \
+            --test audit_20260912_weak_gc \
             --test global_fingerprint
 
   native-sandbox:

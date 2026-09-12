@@ -355,10 +355,12 @@ impl<'p> Vm<'p> {
         }
         if ci == self.weakmap_ctor && ci != 0 {
             let over = self.newtarget_proto_override(new_target, cv, self.weakmap_proto)?;
-            let wm = Value::heap(self.heap.alloc(HeapObj::WeakMap {
+            let wm_idx = self.heap.alloc(HeapObj::WeakMap {
                 keys: Vec::new(),
                 vals: Vec::new(),
-            }));
+            });
+            self.register_weak_container(wm_idx);
+            let wm = Value::heap(wm_idx);
             let wm = self.set_ctor_proto(wm, over);
             let it = args.first().copied().unwrap_or(Value::UNDEFINED);
             if !it.is_nullish() {
@@ -368,7 +370,9 @@ impl<'p> Vm<'p> {
         }
         if ci == self.weakset_ctor && ci != 0 {
             let over = self.newtarget_proto_override(new_target, cv, self.weakset_proto)?;
-            let ws = Value::heap(self.heap.alloc(HeapObj::WeakSet(Vec::new())));
+            let ws_idx = self.heap.alloc(HeapObj::WeakSet(Vec::new()));
+            self.register_weak_container(ws_idx);
+            let ws = Value::heap(ws_idx);
             let ws = self.set_ctor_proto(ws, over);
             let it = args.first().copied().unwrap_or(Value::UNDEFINED);
             if !it.is_nullish() {
@@ -384,8 +388,11 @@ impl<'p> Vm<'p> {
                     "TypeError: WeakRef: target cannot be held weakly".into(),
                 ));
             }
+            self.keep_during_job(t);
             let over = self.newtarget_proto_override(new_target, cv, self.weakref_proto)?;
-            let wr = Value::heap(self.heap.alloc(HeapObj::WeakRef(t)));
+            let wr_idx = self.heap.alloc(HeapObj::WeakRef(t));
+            self.register_weak_container(wr_idx);
+            let wr = Value::heap(wr_idx);
             return Ok(self.set_ctor_proto(wr, over));
         }
         if ci == self.finreg_ctor && ci != 0 {
@@ -396,10 +403,14 @@ impl<'p> Vm<'p> {
                 ));
             }
             let over = self.newtarget_proto_override(new_target, cv, self.finreg_proto)?;
-            let fr = Value::heap(self.heap.alloc(HeapObj::FinalizationRegistry {
+            let fr_idx = self.heap.alloc(HeapObj::FinalizationRegistry {
                 cleanup: cb,
-                tokens: Vec::new(),
-            }));
+                cells: Vec::new(),
+                cleared: Vec::new(),
+                cleanup_queued: false,
+            });
+            self.register_weak_container(fr_idx);
+            let fr = Value::heap(fr_idx);
             return Ok(self.set_ctor_proto(fr, over));
         }
         if ci == self.abstractmodulesource_ctor && ci != 0 {
@@ -1388,6 +1399,7 @@ impl<'p> Vm<'p> {
             );
             // Re-branded in place: no stale collection index may key this slot.
             self.coll_index_invalidate(oidx);
+            self.register_weak_container(oidx);
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }
@@ -1401,6 +1413,7 @@ impl<'p> Vm<'p> {
             self.heap.replace(oidx, HeapObj::WeakSet(Vec::new()));
             // Re-branded in place: no stale collection index may key this slot.
             self.coll_index_invalidate(oidx);
+            self.register_weak_container(oidx);
             if sub_proto.is_heap() {
                 self.proto_of.insert(oidx, sub_proto);
             }

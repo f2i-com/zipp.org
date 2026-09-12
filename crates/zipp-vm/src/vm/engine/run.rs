@@ -167,10 +167,22 @@ impl<'p> Vm<'p> {
         // prototypes) into their reserved slots BEFORE hoisting, so a user
         // declaration of the same name shadows the builtin.
         self.setup_globals();
+        let has_prelude = prelude.is_some();
+        if has_prelude {
+            // Pin only the intrinsic boot graph before running a separate
+            // harness Script. Harness-created values remain ordinary traced
+            // objects, so dead WeakRef targets can be reclaimed at the job
+            // boundary below instead of being trapped beneath the GC floor.
+            self.set_gc_floor();
+        }
         if let Some(src) = prelude {
             self.eval_prelude_mode = true;
             let r = self.eval_script(src);
             self.eval_prelude_mode = false;
+            // Harness and test are distinct Script jobs. Release WeakRef's
+            // AddToKeptObjects set at the boundary, while preserving the
+            // existing contract that queued jobs drain only after the test.
+            self.finish_weak_job();
             r?;
         }
         // Materialise function objects for every top-level function into the
@@ -217,9 +229,12 @@ impl<'p> Vm<'p> {
             new_target: Value::UNDEFINED,
             callee: Value::UNDEFINED,
         });
-        // Everything allocated so far (interned strings, all built-ins, hoisted
-        // top-level functions) is pinned: the GC never collects below this floor.
-        self.set_gc_floor();
+        // Without a separate harness, pin everything allocated during setup and
+        // hoisting. The harness path established its smaller boot-only floor
+        // above; its globals and the test's functions are traced normally.
+        if !has_prelude {
+            self.set_gc_floor();
+        }
         // Run until the top-level frame returns (frames drains back to 0), then
         // run the event loop: drain queued microtasks (promise reactions, async
         // resumes) to empty. Drains even on a main throw (matches node ordering),

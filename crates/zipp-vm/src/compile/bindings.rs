@@ -445,7 +445,7 @@ impl<'a> FnCompiler<'a> {
                         };
                         let (arg_base, argc) = self.eval_args_contiguous(&c.args)?;
                         let dst = self.alloc_reg();
-                        self.emit_direct_eval(callee, this_v, arg_base, argc, false, dst, true);
+                        self.emit_direct_eval(callee, this_v, arg_base, argc, false, dst, true)?;
                         self.emit(Instr::Return { src: dst });
                         self.set_next_reg(save);
                         return Ok(());

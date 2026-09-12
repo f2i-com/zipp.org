@@ -15,6 +15,7 @@ const SOURCE: &str = r#"
     }
     function throws() { throw new Error('callback failure'); }
     function numeric() { return Symbol('not a number'); }
+    function numericBigInt() { return 1n; }
     function go() { return __zippHostCall('probe'); }
 "#;
 
@@ -87,6 +88,10 @@ fn host_can_handle_a_callback_number_conversion_throw_and_call_again() {
             .call_global_numbers("numeric", &[])
             .expect_err("Symbol is not numeric");
         assert!(error.contains("Symbol"), "{error}");
+        let error = ctx
+            .call_global_numbers("numericBigInt", &[])
+            .expect_err("BigInt is not a Number result");
+        assert!(error.contains("BigInt"), "{error}");
         let value = ctx.call_global_numbers("loops", &[])?;
         Ok(value.to_string())
     }));

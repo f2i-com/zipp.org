@@ -548,6 +548,13 @@ The runner's `--expected-failures` option now rejects unexpected failures, stale
 expectations and skips; `--json` records the engine and corpus identities.
 The former errored-module-cycle and deferred top-level-await failures are fixed.
 
+The [deep follow-up audit](docs/audits/2026-09-12-follow-up.md) then exercises
+re-entrant buffer operations, strict numeric coercion, Promise capabilities,
+temporary GC roots, live collection iteration, weak references/finalization,
+compiler metadata boundaries and hostile browser-host exceptions. Its focused
+regressions run in both the ordinary and safe-sandbox profiles, and its weak
+reference/finalization Test262 shards pass 603 of 603 executions.
+
 The standing correctness strategy compares default JIT, interpreter-only,
 forced-JIT, and majors-only-GC modes. A tier-differential fuzzer also generates
 self-checking programs and compares Node, the interpreter, and tier-forcing

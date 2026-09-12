@@ -3353,10 +3353,12 @@ impl<'p> Vm<'p> {
                         // `set` adder (so non-registered symbol keys validate via
                         // CanBeHeldWeakly, the adder is observably called, and an
                         // abrupt closes the iterator).
-                        let wm = Value::heap(self.heap.alloc(HeapObj::WeakMap {
+                        let wm_idx = self.heap.alloc(HeapObj::WeakMap {
                             keys: Vec::new(),
                             vals: Vec::new(),
-                        }));
+                        });
+                        self.register_weak_container(wm_idx);
+                        let wm = Value::heap(wm_idx);
                         if let Some(s) = src {
                             let sv = self.get(base, s);
                             if !sv.is_nullish() {
@@ -3367,7 +3369,9 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::NewWeakSet { dst, src } => {
-                        let ws = Value::heap(self.heap.alloc(HeapObj::WeakSet(Vec::new())));
+                        let ws_idx = self.heap.alloc(HeapObj::WeakSet(Vec::new()));
+                        self.register_weak_container(ws_idx);
+                        let ws = Value::heap(ws_idx);
                         if let Some(s) = src {
                             let sv = self.get(base, s);
                             if !sv.is_nullish() {
@@ -3385,7 +3389,10 @@ impl<'p> Vm<'p> {
                                 "TypeError: WeakRef: target cannot be held weakly".into(),
                             ));
                         }
-                        let wr = Value::heap(self.heap.alloc(HeapObj::WeakRef(t)));
+                        self.keep_during_job(t);
+                        let wr_idx = self.heap.alloc(HeapObj::WeakRef(t));
+                        self.register_weak_container(wr_idx);
+                        let wr = Value::heap(wr_idx);
                         self.set(base, dst, wr);
                         ip += 1;
                     }
@@ -3430,10 +3437,14 @@ impl<'p> Vm<'p> {
                                 "TypeError: FinalizationRegistry: cleanup callback must be callable".into(),
                             ));
                         }
-                        let fr = Value::heap(self.heap.alloc(HeapObj::FinalizationRegistry {
+                        let fr_idx = self.heap.alloc(HeapObj::FinalizationRegistry {
                             cleanup: cb,
-                            tokens: Vec::new(),
-                        }));
+                            cells: Vec::new(),
+                            cleared: Vec::new(),
+                            cleanup_queued: false,
+                        });
+                        self.register_weak_container(fr_idx);
+                        let fr = Value::heap(fr_idx);
                         self.set(base, dst, fr);
                         ip += 1;
                     }
@@ -3679,7 +3690,7 @@ impl<'p> Vm<'p> {
                                 // out-of-range radix (NaN) instead of 0.
                                 let radix = if argc >= 2 {
                                     let rv = self.get(base, arg_base + 1);
-                                    let r = self.to_number_coerce(rv)?;
+                                    let r = self.to_number_strict(rv)?;
                                     crate::vm::helpers_num2::to_int32(r)
                                 } else {
                                     0
@@ -3692,10 +3703,10 @@ impl<'p> Vm<'p> {
                             }
                             // isNaN/isFinite are `Number::isNaN/isFinite(? ToNumber(x))`:
                             // ToNumber coerces objects (@@toPrimitive/valueOf/toString)
-                            // and propagates abrupt completions (a throwing valueOf, a
-                            // Symbol arg â†’ TypeError), so route through to_number_coerce.
-                            G::IsNaN => Value::bool(self.to_number_coerce(a0)?.is_nan()),
-                            G::IsFinite => Value::bool(self.to_number_coerce(a0)?.is_finite()),
+                            // and propagates abrupt completions (a throwing valueOf or
+                            // a Symbol/BigInt argument → TypeError), so use strict ToNumber.
+                            G::IsNaN => Value::bool(self.to_number_strict(a0)?.is_nan()),
+                            G::IsFinite => Value::bool(self.to_number_strict(a0)?.is_finite()),
                         };
                         self.set(base, dst, v);
                         ip += 1;
@@ -4123,7 +4134,7 @@ impl<'p> Vm<'p> {
                         }
                         let nums: Vec<f64> = elems
                             .iter()
-                            .map(|&v| self.to_number(v))
+                            .map(|&v| self.to_number_strict(v))
                             .collect::<Result<_, _>>()?;
                         let r = match op {
                             M::Max => nums.iter().fold(f64::NEG_INFINITY, |a, &b| {
@@ -4771,11 +4782,8 @@ impl<'p> Vm<'p> {
                                 HeapObj::Cons { len, .. } => len_value(*len),
                                 // for-of over a Map/Set iterates `size` slots (a
                                 // tombstoned/deleted entry doesn't count).
-                                HeapObj::Map { keys, .. } => {
-                                    len_value(keys.iter().filter(|k| !k.is_hole()).count())
-                                }
-                                HeapObj::Set(items) => {
-                                    len_value(items.iter().filter(|v| !v.is_hole()).count())
+                                HeapObj::Map { .. } | HeapObj::Set(_) => {
+                                    len_value(self.coll_live_len(o.heap_index()))
                                 }
                                 _ => Value::int(0),
                             }

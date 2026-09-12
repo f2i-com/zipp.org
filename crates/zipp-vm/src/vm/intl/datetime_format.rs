@@ -283,7 +283,7 @@ impl<'p> Vm<'p> {
         // ToNumber then TimeClip. The full ToNumber: a plain object argument
         // ToPrimitive's first, so a throwing `valueOf` wins over the RangeError
         // that a NaN would otherwise produce (`argument-tonumber-throws`).
-        let n = self.to_number_coerce(v)?;
+        let n = self.to_number_strict(v)?;
         if !n.is_finite() || n.abs() > 8.64e15 {
             return Err(Thrown("RangeError: date value is not finite".into()));
         }

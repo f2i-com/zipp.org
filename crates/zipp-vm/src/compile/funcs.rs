@@ -857,8 +857,17 @@ impl<'a> FnCompiler<'a> {
         if list.is_empty() {
             return Ok((0, 0));
         }
+        let slots = list
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| "decorator register window is too large".to_string())?;
+        self.ensure_reg_capacity(
+            slots
+                .checked_add(1)
+                .ok_or_else(|| "decorator register window is too large".to_string())?,
+        )?;
         let base = self.next_reg;
-        for _ in 0..list.len() * 2 {
+        for _ in 0..slots {
             self.temp();
         }
         let floor = self.next_reg;
@@ -1078,6 +1087,9 @@ impl<'a> FnCompiler<'a> {
                         Ok(n) if computed_key($key).is_none() => (n, false),
                         _ => (String::new(), true),
                     };
+                    let elem = u16::try_from(plan.elements.len()).map_err(|_| {
+                        "class has too many decorated elements for bytecode metadata".to_string()
+                    })?;
                     plan.elements.push(crate::bytecode::DecElemDef {
                         kind: $kind,
                         is_static: $is_static,
@@ -1087,7 +1099,7 @@ impl<'a> FnCompiler<'a> {
                         sym_key: false,
                         storage: $storage,
                     });
-                    Some((plan.elements.len() - 1) as u16)
+                    Some(elem)
                 }
             }};
         }
@@ -1423,6 +1435,12 @@ impl<'a> FnCompiler<'a> {
                     static_order.push((2, static_blocks.len() - 1));
                 }
             }
+        }
+        // `FieldInit::key_index` is u16 and addresses this positional list.
+        // Preserve all 65,536 representable indices, then reject the next field
+        // instead of wrapping it to key zero in the constructor bytecode.
+        if instance_computed_inits.len() > u16::MAX as usize + 1 {
+            return Err("class has too many computed class fields for bytecode metadata".into());
         }
         // The class's private names are lexically visible to everything
         // compiled within its body (heritage, methods, field inits, static

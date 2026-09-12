@@ -1872,11 +1872,11 @@ impl<'p> Vm<'p> {
             // `map.size` / `set.size` — an accessor property, not a method.
             // Deleted entries are tombstoned (Value::HOLE) without shifting indices
             // (so live iterators/forEach stay valid), so size counts only live slots.
-            HeapObj::Map { keys, .. } if key == "size" => {
-                Ok(len_value(keys.iter().filter(|k| !k.is_hole()).count()))
+            HeapObj::Map { .. } if key == "size" => {
+                Ok(len_value(self.coll_live_len(obj.heap_index())))
             }
-            HeapObj::Set(items) if key == "size" => {
-                Ok(len_value(items.iter().filter(|v| !v.is_hole()).count()))
+            HeapObj::Set(_) if key == "size" => {
+                Ok(len_value(self.coll_live_len(obj.heap_index())))
             }
             // A method as a VALUE on a Map/Set/Date/Promise instance
             // (`new Map().set`, `d.getHours`) → the corresponding prototype.

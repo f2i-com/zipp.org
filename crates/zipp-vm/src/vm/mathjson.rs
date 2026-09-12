@@ -960,7 +960,7 @@ impl<'p> Vm<'p> {
                 // before reducing.
                 let mut nums = Vec::with_capacity(args.len());
                 for &v in args {
-                    nums.push(self.to_number_coerce(v)?);
+                    nums.push(self.to_number_strict(v)?);
                 }
                 let mut acc = match op {
                     M::Min => f64::INFINITY,
@@ -1020,8 +1020,8 @@ impl<'p> Vm<'p> {
             }
             // The two-arg ops coerce arg0 then arg1 (ToNumber, left-to-right).
             M::Pow => {
-                let a = self.to_number_coerce(at(args, 0))?;
-                let b = self.to_number_coerce(at(args, 1))?;
+                let a = self.to_number_strict(at(args, 0))?;
+                let b = self.to_number_strict(at(args, 1))?;
                 // Spec: base of magnitude 1 with a NaN/±Infinity exponent is NaN
                 // (C/Rust powf returns 1 for these — a deliberate deviation).
                 if (a == 1.0 || a == -1.0) && (b.is_nan() || b.is_infinite()) {
@@ -1031,17 +1031,17 @@ impl<'p> Vm<'p> {
                 }
             }
             M::Atan2 => {
-                let a = self.to_number_coerce(at(args, 0))?;
-                let b = self.to_number_coerce(at(args, 1))?;
+                let a = self.to_number_strict(at(args, 0))?;
+                let b = self.to_number_strict(at(args, 1))?;
                 a.atan2(b)
             }
             M::Imul => {
-                let a = self.to_number_coerce(at(args, 0))?;
-                let b = self.to_number_coerce(at(args, 1))?;
+                let a = self.to_number_strict(at(args, 0))?;
+                let b = self.to_number_strict(at(args, 1))?;
                 (to_uint32(a).wrapping_mul(to_uint32(b)) as i32) as f64
             }
             _ => {
-                let x = self.to_number_coerce(at(args, 0))?;
+                let x = self.to_number_strict(at(args, 0))?;
                 math_unary(op, x)
             }
         })
@@ -1080,7 +1080,7 @@ impl<'p> Vm<'p> {
                         Thrown("TypeError: Cannot convert object to primitive value".into())
                     })?
                 };
-                Ok(Value::num(self.to_number(prim)?))
+                Ok(Value::num(self.to_number_strict(prim)?))
             }
             HeapObj::Boxed { kind: 0, .. } => {
                 let s = self.to_js_string(space)?;
@@ -1135,7 +1135,7 @@ impl<'p> Vm<'p> {
         // order. A non-array object replacer is ignored (no filter).
         if replacer.is_heap() && self.value_is_array(replacer) {
             let lenv = self.get_prop(replacer, "length")?;
-            let lenf = self.to_number_coerce(lenv)?;
+            let lenf = self.to_number_strict(lenv)?;
             let len: u64 = if lenf.is_nan() || lenf <= 0.0 {
                 0
             } else {
@@ -1607,9 +1607,9 @@ impl<'p> Vm<'p> {
             }
             HeapObj::Boxed { kind: 1, .. } => {
                 // ToNumber(wrapper): ToPrimitive(number) so an overridden
-                // valueOf/@@toPrimitive fires (to_number_coerce reads [[NumberData]]).
+                // valueOf/@@toPrimitive fires, and a BigInt result is rejected.
                 let prim = self.to_primitive_number(v)?;
-                let n = self.to_number(prim)?;
+                let n = self.to_number_strict(prim)?;
                 self.json_push_number_output(out, n)?;
                 return Ok(true);
             }
@@ -1674,7 +1674,7 @@ impl<'p> Vm<'p> {
         if self.value_is_array(v) {
             // len = ToLength(Get(val, "length"))
             let lenv = self.get_prop(v, "length")?;
-            let lenf = self.to_number_coerce(lenv)?;
+            let lenf = self.to_number_strict(lenv)?;
             let len: u64 = if lenf.is_nan() || lenf <= 0.0 {
                 0
             } else {
@@ -2291,7 +2291,7 @@ impl<'p> Vm<'p> {
                 if self.value_is_array(val) {
                     // 2.b.ii  len = ? ToLength(? Get(val, "length"))
                     let lenv = self.get_prop(val, "length")?;
-                    let lenf = self.to_number_coerce(lenv)?;
+                    let lenf = self.to_number_strict(lenv)?;
                     let len: u64 = if lenf.is_nan() || lenf <= 0.0 {
                         0
                     } else {

@@ -970,7 +970,7 @@ fn emit_tierc_xorshift_registers(
 /// code), and any op the emitter below doesn't implement.
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64>) -> bool {
-    if proto.code.is_empty() {
+    if proto.code.is_empty() || proto.reg_count == 0 || proto.param_count >= proto.reg_count {
         return false;
     }
     if proto.is_generator || proto.is_async {
@@ -1023,6 +1023,14 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         }};
     }
     for (ip, instr) in proto.code.iter().enumerate() {
+        // Tier C turns register operands into unchecked native displacements
+        // and branch targets into label-table indices. Compiler-produced
+        // FuncProtos already obey these bounds; revalidate them here so a
+        // malformed internal proto declines at the final native-code boundary.
+        if !tierc_operands_in_bounds(instr, proto.reg_count, proto.code.len()) {
+            reject!("[tierC-reject] malformed operands at ip {ip}");
+            continue;
+        }
         match *instr {
             Instr::LoadInt { .. }
             | Instr::LoadBool { .. }
@@ -1335,6 +1343,40 @@ pub(crate) fn mem_can_compile(proto: &FuncProto, const_strs: &FxHashMap<u32, u64
         }
     }
     ok
+}
+
+fn tierc_operands_in_bounds(instr: &Instr, reg_count: u16, code_len: usize) -> bool {
+    let reg = |r: u16| r < reg_count;
+    if bytecode_control_target(instr).is_some_and(|target| target as usize >= code_len) {
+        return false;
+    }
+    match *instr {
+        Instr::PushFinally {
+            kind_reg, val_reg, ..
+        } => reg(kind_reg) && reg(val_reg),
+        Instr::IterNext {
+            value_dst,
+            done_dst,
+            iter,
+            idx,
+            next,
+        } => {
+            reg(value_dst)
+                && reg(done_dst)
+                && reg(iter)
+                && reg(idx)
+                && (next == crate::bytecode::NO_REG || reg(next))
+        }
+        _ => {
+            let Some((uses, dst)) = cross_ud(instr) else {
+                return false;
+            };
+            if !uses.all_below(reg_count) {
+                return false;
+            }
+            dst.is_none_or(reg)
+        }
+    }
 }
 
 /// W7: the callee-window registers a Tier-C body may READ BEFORE WRITING, as a
@@ -1730,6 +1772,20 @@ mod smallvec {
         pub(super) fn count(&self) -> usize {
             self.len as usize + self.range.1 as usize
         }
+        /// Validate named registers and the complete half-open range. For an
+        /// empty range the base may equal the register count, but it may not
+        /// point beyond the activation merely because `for_each` visits no
+        /// elements.
+        pub(super) fn all_below(&self, limit: u16) -> bool {
+            self.regs[..self.len as usize]
+                .iter()
+                .all(|&reg| reg < limit)
+                && self
+                    .range
+                    .0
+                    .checked_add(self.range.1)
+                    .is_some_and(|end| end <= limit)
+        }
         /// Visit every referenced register. A malformed internal range that
         /// overflows `u16` is rejected instead of wrapping or panicking.
         pub(super) fn for_each(&self, mut f: impl FnMut(u16)) -> bool {
@@ -2114,6 +2170,90 @@ mod tierc_block_sroa_tests {
             .into_iter()
             .find(|proto| proto.name == "project")
             .expect("project proto")
+    }
+
+    #[test]
+    fn audit_20260912_malformed_tierc_register_windows_decline() {
+        let proto = project_proto();
+        let const_strs = FxHashMap::default();
+        assert!(mem_can_compile(&proto, &const_strs));
+
+        let mut bad_dst = proto.clone();
+        let out = bad_dst.reg_count;
+        let load = bad_dst
+            .code
+            .iter_mut()
+            .find(|instr| matches!(instr, Instr::LoadInt { .. }))
+            .expect("fixture load");
+        let Instr::LoadInt { dst, .. } = load else {
+            unreachable!()
+        };
+        *dst = out;
+        assert!(!mem_can_compile(&bad_dst, &const_strs));
+
+        let mut bad_range = proto;
+        let new_array = bad_range
+            .code
+            .iter_mut()
+            .find(|instr| matches!(instr, Instr::NewArray { .. }))
+            .expect("fixture array");
+        let Instr::NewArray { argc, .. } = new_array else {
+            unreachable!()
+        };
+        *argc = u16::MAX;
+        assert!(!mem_can_compile(&bad_range, &const_strs));
+
+        let mut bad_empty_range = project_proto();
+        let new_array = bad_empty_range
+            .code
+            .iter_mut()
+            .find(|instr| matches!(instr, Instr::NewArray { .. }))
+            .expect("fixture array");
+        let Instr::NewArray { arg_base, argc, .. } = new_array else {
+            unreachable!()
+        };
+        *arg_base = u16::MAX;
+        *argc = 0;
+        assert!(!mem_can_compile(&bad_empty_range, &const_strs));
+    }
+
+    #[test]
+    fn audit_20260912_malformed_tierc_target_declines() {
+        let source = r#"
+            function sum(n) {
+                let total = 0;
+                for (let i = 0; i < n; i++) total = (total + i) | 0;
+                return total;
+            }
+            sum(20);
+        "#;
+        let ast = crate::front::parse_script(source).expect("parse tier-c branch fixture");
+        let mut proto = crate::compile::compile_program(&ast, source)
+            .expect("compile tier-c branch fixture")
+            .functions
+            .into_iter()
+            .find(|proto| proto.name == "sum")
+            .expect("sum proto");
+        let const_strs = FxHashMap::default();
+        assert!(mem_can_compile(&proto, &const_strs));
+        let out = proto.code.len() as u32;
+        let branch = proto
+            .code
+            .iter_mut()
+            .find(|instr| bytecode_control_target(instr).is_some())
+            .expect("fixture branch");
+        match branch {
+            Instr::Jump { target }
+            | Instr::JumpIfFalse { target, .. }
+            | Instr::JumpIfTrue { target, .. }
+            | Instr::JumpIfNotLt { target, .. }
+            | Instr::JumpIfNotLe { target, .. }
+            | Instr::PushFinally { target, .. }
+            | Instr::JumpFinally { target, .. } => *target = out,
+            Instr::PushHandler { catch_target, .. } => *catch_target = out,
+            _ => unreachable!(),
+        }
+        assert!(!mem_can_compile(&proto, &const_strs));
     }
 
     fn targets(proto: &FuncProto) -> Vec<bool> {

@@ -977,7 +977,7 @@ impl<'p> Vm<'p> {
                     let s = self.heap.str_cow(prim.heap_index()).unwrap().into_owned();
                     return Ok(parse_date(&s));
                 }
-                Ok(time_clip(self.to_number(prim)?))
+                Ok(time_clip(self.to_number_strict(prim)?))
             }
             _ => {
                 let comp = self.date_components(args)?;
@@ -1002,7 +1002,7 @@ impl<'p> Vm<'p> {
         let mut comp = [0.0f64, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0];
         let mut any_non_finite = false;
         for (i, &v) in args.iter().enumerate().take(7) {
-            let n = self.to_number_coerce(v)?;
+            let n = self.to_number_strict(v)?;
             // MakeDay/MakeTime/MakeDate require every component to be finite — an
             // Infinity / -Infinity / NaN field (e.g. `new Date(Infinity, 1, 70)`)
             // makes the whole time value NaN (an Invalid Date), not a clamped 0.
@@ -1133,7 +1133,7 @@ impl<'p> Vm<'p> {
             "getYear" => field(p.0 - 1900),
             "setYear" => {
                 let y = match args.first() {
-                    Some(&v) => self.to_number_coerce(v)?,
+                    Some(&v) => self.to_number_strict(v)?,
                     None => f64::NAN,
                 };
                 if y.is_nan() {
@@ -1153,7 +1153,7 @@ impl<'p> Vm<'p> {
             }
             "setTime" => {
                 let n = match args.first() {
-                    Some(&v) => time_clip(self.to_number_coerce(v)?),
+                    Some(&v) => time_clip(self.to_number_strict(v)?),
                     None => f64::NAN,
                 };
                 if let HeapObj::Date(m) = self.heap.get_mut(idx) {
@@ -1198,7 +1198,7 @@ impl<'p> Vm<'p> {
             if start + i >= 7 {
                 break;
             }
-            let n = self.to_number_coerce(v)?;
+            let n = self.to_number_strict(v)?;
             if n.is_nan() {
                 any_nan = true;
             }

@@ -2702,7 +2702,7 @@ impl<'p> Vm<'p> {
         let lim: u64 = if limit == Value::UNDEFINED {
             u32::MAX as u64
         } else {
-            to_uint32(self.to_number_coerce(limit)?) as u64
+            to_uint32(self.to_number_strict(limit)?) as u64
         };
         let mut a: Vec<Value> = Vec::new();
         #[cfg(feature = "safe-sandbox")]
@@ -3899,9 +3899,7 @@ impl<'p> Vm<'p> {
             };
             #[cfg(not(feature = "safe-sandbox"))]
             let value = match *r {
-                Some((s, e)) if ascii => {
-                    self.ascii_slice_value(subj_idx, s as usize..e as usize)
-                }
+                Some((s, e)) if ascii => self.ascii_slice_value(subj_idx, s as usize..e as usize),
                 Some((s, e)) => self.units_value(&units[s as usize..e as usize]),
                 None => self.alloc_str(String::new()),
             };

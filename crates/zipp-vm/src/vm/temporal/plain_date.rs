@@ -850,7 +850,7 @@ impl<'p> Vm<'p> {
         }
         // ToIntegerWithTruncation: a non-integer is truncated toward zero (2.5 -> 2),
         // not rejected; only non-finite or < 1 is out of range.
-        let n = self.to_number_coerce(v)?;
+        let n = self.to_number_strict(v)?;
         if !n.is_finite() {
             return Err(Thrown("RangeError: roundingIncrement out of range".into()));
         }
@@ -939,7 +939,7 @@ impl<'p> Vm<'p> {
         }
         // ToNumber honours a user valueOf/toString (ToPrimitive) on objects; a
         // non-finite field (Infinity/NaN) is rejected per the spec.
-        let n = self.to_number_coerce(v)?;
+        let n = self.to_number_strict(v)?;
         if !n.is_finite() {
             return Err(Thrown(format!(
                 "RangeError: {key} property must be a finite number"

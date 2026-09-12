@@ -924,7 +924,7 @@ impl<'p> Vm<'p> {
             };
             if depth > 0 && self.value_is_array_throwing(v)? {
                 let lv = self.get_prop(v, "length")?;
-                let lf = self.to_number_coerce(lv)?;
+                let lf = self.to_number_strict(lv)?;
                 let n = if lf.is_nan() || lf <= 0.0 {
                     0usize
                 } else {
@@ -1095,7 +1095,7 @@ impl<'p> Vm<'p> {
         // (`obj instanceof String`), per every method's step 1.
         let this = self.to_object(this)?;
         let lv = self.get_prop(this, "length")?;
-        let lenf = self.to_number_coerce(lv)?;
+        let lenf = self.to_number_strict(lv)?;
         // ToLength. The ascending probe loops MUST use the full length: this is
         // the path every hole-sensitive callback method takes for an array with
         // a sparse overlay (elements past `MAX_DENSE_ARRAY_LEN` are stored in
@@ -1347,7 +1347,7 @@ impl<'p> Vm<'p> {
         let _gc = self.gc_lock_guard();
         let search = args.first().copied().unwrap_or(Value::UNDEFINED);
         let lv = self.get_prop(this, "length")?;
-        let lenf = self.to_number_coerce(lv)?;
+        let lenf = self.to_number_strict(lv)?;
         // ToLength: clamp to 2^53-1 (NOT the dense-array ceiling) — search is per-index
         // via Get/HasProperty, so a fromIndex near a huge `length` reads only the few
         // indices in range (indexOf/lastIndexOf/includes on `{length: 2**53, ...}`).
@@ -1447,7 +1447,7 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         let _gc = self.gc_lock_guard();
         let lv = self.get_prop(this, "length")?;
-        let lenf = self.to_number_coerce(lv)?;
+        let lenf = self.to_number_strict(lv)?;
         // ToLength: clamp to [0, 2^53-1].
         let len: i64 = if lenf.is_nan() || lenf <= 0.0 {
             0
@@ -1515,7 +1515,7 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         let _gc = self.gc_lock_guard();
         let lv = self.get_prop(this, "length")?;
-        let lenf = self.to_number_coerce(lv)?;
+        let lenf = self.to_number_strict(lv)?;
         let len: i64 = if lenf.is_nan() || lenf <= 0.0 {
             0
         } else {
@@ -1561,7 +1561,7 @@ impl<'p> Vm<'p> {
     /// ToLength(Get(O, "length")) — clamped to [0, 2^53-1].
     fn al_len(&mut self, this: Value) -> Result<i64, Thrown> {
         let lv = self.get_prop(this, "length")?;
-        let lenf = self.to_number_coerce(lv)?;
+        let lenf = self.to_number_strict(lv)?;
         Ok(if lenf.is_nan() || lenf <= 0.0 {
             0
         } else {
@@ -1947,7 +1947,7 @@ impl<'p> Vm<'p> {
                 // ascending, which is the wrong observable order here).
                 if name == "toReversed" {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
-                    let lenf = self.to_number_coerce(lv)?;
+                    let lenf = self.to_number_strict(lv)?;
                     let len = if lenf.is_nan() || lenf <= 0.0 {
                         0usize
                     } else {
@@ -1970,14 +1970,14 @@ impl<'p> Vm<'p> {
                 // then a single LIVE Get — never a snapshot of stale elements.
                 if name == "at" {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
-                    let lenf = self.to_number_coerce(lv)?;
+                    let lenf = self.to_number_strict(lv)?;
                     let len = if lenf.is_nan() || lenf <= 0.0 {
                         0.0
                     } else {
                         lenf.trunc().min(9_007_199_254_740_991.0)
                     };
                     let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
-                    let rel = self.to_number_coerce(a0)?;
+                    let rel = self.to_number_strict(a0)?;
                     let rel = if rel.is_nan() { 0.0 } else { rel.trunc() };
                     let k = if rel >= 0.0 { rel } else { len + rel };
                     if k < 0.0 || k >= len {
@@ -1994,7 +1994,7 @@ impl<'p> Vm<'p> {
                 // a hole).
                 if matches!(name, "flat" | "flatMap") {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
-                    let lf = self.to_number_coerce(lv)?;
+                    let lf = self.to_number_strict(lv)?;
                     let source_len = if lf.is_nan() || lf <= 0.0 {
                         0usize
                     } else {
@@ -2037,7 +2037,7 @@ impl<'p> Vm<'p> {
                 if matches!(name, "join" | "toString" | "toLocaleString") {
                     return self.with_array_stringify_guard(idx, |vm| {
                         let lv = vm.get_prop(Value::heap(idx), "length")?;
-                        let lenf = vm.to_number_coerce(lv)?;
+                        let lenf = vm.to_number_strict(lv)?;
                         let len = if lenf.is_nan() || lenf <= 0.0 {
                             0usize
                         } else {
@@ -2084,7 +2084,7 @@ impl<'p> Vm<'p> {
                 // snapshot path would invoke its getter.
                 if name == "toSpliced" {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
-                    let lenf = self.to_number_coerce(lv)?;
+                    let lenf = self.to_number_strict(lv)?;
                     let len = if lenf.is_nan() || lenf <= 0.0 {
                         0i64
                     } else {
@@ -2094,7 +2094,7 @@ impl<'p> Vm<'p> {
                     let (start, del) = if args.is_empty() {
                         (0i64, 0i64)
                     } else {
-                        let s_raw = toii(self.to_number_coerce(args[0])?);
+                        let s_raw = toii(self.to_number_strict(args[0])?);
                         let s = if s_raw < 0.0 {
                             ((len as f64) + s_raw).max(0.0)
                         } else {
@@ -2103,7 +2103,7 @@ impl<'p> Vm<'p> {
                         let d = if args.len() < 2 {
                             len - s
                         } else {
-                            let d_raw = toii(self.to_number_coerce(args[1])?);
+                            let d_raw = toii(self.to_number_strict(args[1])?);
                             (d_raw.max(0.0) as i64).min(len - s)
                         };
                         (s, d)
@@ -2136,7 +2136,7 @@ impl<'p> Vm<'p> {
                 // reading any element (a throwing index getter must not run first).
                 if matches!(name, "with" | "toSorted") {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
-                    let n = self.to_number_coerce(lv)?;
+                    let n = self.to_number_strict(lv)?;
                     // ArrayCreate(len) requires len <= 2^32-1; a larger finite length OR
                     // a non-finite one (Infinity, via ToLength → 2^53-1) is a RangeError.
                     if n > 4_294_967_295.0 {
@@ -2149,7 +2149,7 @@ impl<'p> Vm<'p> {
                 // then live per-index HasProperty+Get (proxy/TA-correct).
                 if name == "slice" {
                     let lv = self.get_prop(Value::heap(idx), "length")?;
-                    let lenf = self.to_number_coerce(lv)?;
+                    let lenf = self.to_number_strict(lv)?;
                     // ToLength(lenf) → clamp to [0, 2^53-1].
                     let len = if lenf.is_nan() || lenf <= 0.0 {
                         0.0
@@ -2159,7 +2159,7 @@ impl<'p> Vm<'p> {
                     // relativeStart/relativeEnd = ToIntegerOrInfinity(arg) (Infinity-aware).
                     let toii = |raw: f64| if raw.is_nan() { 0.0 } else { raw.trunc() };
                     let s_arg = args.first().copied().unwrap_or(Value::UNDEFINED);
-                    let rel_start = toii(self.to_number_coerce(s_arg)?);
+                    let rel_start = toii(self.to_number_strict(s_arg)?);
                     let k0 = if rel_start < 0.0 {
                         (len + rel_start).max(0.0)
                     } else {
@@ -2169,7 +2169,7 @@ impl<'p> Vm<'p> {
                     let rel_end = if e_arg == Value::UNDEFINED {
                         len
                     } else {
-                        toii(self.to_number_coerce(e_arg)?)
+                        toii(self.to_number_strict(e_arg)?)
                     };
                     let fin = if rel_end < 0.0 {
                         (len + rel_end).max(0.0)
@@ -3057,7 +3057,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Array(items) => items.len(),
                     _ => {
                         let lv = self.get_prop(receiver, "length")?;
-                        let n = self.to_number_coerce(lv)?;
+                        let n = self.to_number_strict(lv)?;
                         if n.is_nan() || n <= 0.0 {
                             0
                         } else {
@@ -3127,7 +3127,7 @@ impl<'p> Vm<'p> {
                 let receiver = Value::heap(idx);
                 // LengthOfArrayLike precedes the IsCallable check (step 2, then 3).
                 let lv = self.get_prop(receiver, "length")?;
-                let lf = self.to_number_coerce(lv)?;
+                let lf = self.to_number_strict(lv)?;
                 let source_len = if lf.is_nan() || lf <= 0.0 {
                     0usize
                 } else {
@@ -3349,7 +3349,7 @@ impl<'p> Vm<'p> {
                     HeapObj::Array(items) => items.len(),
                     _ => 0,
                 } as i64;
-                let n = self.to_number_coerce(arg0)?;
+                let n = self.to_number_strict(arg0)?;
                 let rel = if n.is_nan() { 0 } else { n.trunc() as i64 };
                 let actual = if rel >= 0 { rel } else { len + rel };
                 if actual < 0 || actual >= len {

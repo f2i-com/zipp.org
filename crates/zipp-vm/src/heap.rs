@@ -3918,6 +3918,31 @@ impl SharedMem {
             }
         }
     }
+    /// Grow the visible byte length without ever moving it backwards. A
+    /// concurrent agent may win the race with a larger growth between the
+    /// caller's validation and this update, so retry against the newly observed
+    /// length and reject the request if it has become a shrink.
+    pub fn grow_byte_len(&self, n: usize) -> bool {
+        if n > self.cap {
+            return false;
+        }
+        let mut current = self.len.load(Ordering::SeqCst);
+        loop {
+            if n < current {
+                return false;
+            }
+            if n == current {
+                return true;
+            }
+            match self
+                .len
+                .compare_exchange(current, n, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
     /// Raw base pointer (8-byte aligned) — for the Atomics element accesses.
     #[cfg(not(feature = "safe-sandbox"))]
     #[inline]
@@ -3998,6 +4023,22 @@ impl AbData {
         match self {
             AbData::Local(v) => v.resize(n, 0u8),
             AbData::Shared(m) => m.set_byte_len(n),
+        }
+    }
+    /// Monotonic counterpart to [`AbData::resize_bytes`], used by
+    /// `SharedArrayBuffer.prototype.grow`. Returns false when `n` is below the
+    /// live length (including a concurrent growth observed by SharedMem's CAS).
+    pub fn grow_bytes(&mut self, n: usize) -> bool {
+        match self {
+            AbData::Local(v) => {
+                if n < v.len() {
+                    false
+                } else {
+                    v.resize(n, 0u8);
+                    true
+                }
+            }
+            AbData::Shared(m) => m.grow_byte_len(n),
         }
     }
 }
@@ -4499,6 +4540,17 @@ fn object_hot_mirror(map: &ObjMap, shape: u32) -> HotMirrorHint {
 #[inline(always)]
 fn object_hot_mirror(_map: &ObjMap, _shape: u32) -> HotMirrorHint {}
 
+#[derive(Clone, Debug)]
+/// One registration in a `FinalizationRegistry`. `target` and `token` are weak
+/// edges; `held` is strong while the registry remains reachable. A cleared
+/// target is represented by `undefined` until its cleanup job consumes the
+/// record, which lets `unregister` cancel an already-cleared registration.
+pub(crate) struct FinalizationCell {
+    pub(crate) target: Value,
+    pub(crate) held: Value,
+    pub(crate) token: Value,
+}
+
 /// A heap-allocated object.
 #[derive(Clone, Debug)]
 pub enum HeapObj {
@@ -4661,19 +4713,28 @@ pub enum HeapObj {
     Map { keys: Vec<Value>, vals: Vec<Value> },
     /// A JS `Set`: insertion-ordered unique values (SameValueZero equality).
     Set(Vec<Value>),
-    /// A JS `WeakMap`: like `Map` but keys must be objects and there is no
-    /// iteration/size (a distinct type so the [[WeakMapData]] brand check works —
-    /// `WeakMap.prototype.set.call(aMap)` must throw). No GC, so refs stay strong.
+    /// A JS `WeakMap`: keys are weak and values are ephemeron edges, marked only
+    /// when their corresponding key is otherwise live. There is no iteration or
+    /// size (and the distinct type provides the [[WeakMapData]] brand).
     WeakMap { keys: Vec<Value>, vals: Vec<Value> },
-    /// A JS `WeakSet`: like `Set` but values must be objects, no iteration/size.
+    /// A JS `WeakSet`: weakly-held values, with no iteration or size.
     WeakSet(Vec<Value>),
-    /// A JS `WeakRef`: a weak reference to an object. No GC, so `deref()` always
-    /// returns the (still-live) target.
+    /// A JS `WeakRef`. `undefined` records a target cleared by GC.
     WeakRef(Value),
-    /// A JS `FinalizationRegistry`: holds a cleanup callback and the live
-    /// unregister tokens. No GC, so cleanup never fires (spec-permitted); only
-    /// `register`/`unregister` are observable. `tokens` tracks unregister tokens.
-    FinalizationRegistry { cleanup: Value, tokens: Vec<Value> },
+    /// A JS `FinalizationRegistry`: the callback and holdings are strong; each
+    /// cell's target and optional unregister token are weak. `cleanup_queued`
+    /// prevents a collection during a callback from scheduling the same cells
+    /// twice.
+    FinalizationRegistry {
+        cleanup: Value,
+        /// Registrations whose targets have not been cleared.
+        cells: Vec<FinalizationCell>,
+        /// Cleared registrations awaiting callback delivery. Keeping these in
+        /// a separate stack makes cleanup linear even when many live cells
+        /// remain registered.
+        cleared: Vec<FinalizationCell>,
+        cleanup_queued: bool,
+    },
     /// A boxed primitive wrapper (`new String(x)`/`new Number(x)`/`new Boolean(x)`,
     /// or `Object(primitive)`). `kind` 0=String/1=Number/2=Boolean; `value` is the
     /// wrapped primitive ([[PrimitiveValue]]). `typeof` is "object"; valueOf returns
@@ -4875,9 +4936,10 @@ impl HeapObj {
             HeapObj::Map { keys, vals } | HeapObj::WeakMap { keys, vals } => {
                 vec_capacity_bytes(keys).saturating_add(vec_capacity_bytes(vals))
             }
-            HeapObj::Set(values)
-            | HeapObj::WeakSet(values)
-            | HeapObj::FinalizationRegistry { tokens: values, .. } => vec_capacity_bytes(values),
+            HeapObj::Set(values) | HeapObj::WeakSet(values) => vec_capacity_bytes(values),
+            HeapObj::FinalizationRegistry { cells, cleared, .. } => {
+                vec_capacity_bytes(cells).saturating_add(vec_capacity_bytes(cleared))
+            }
             HeapObj::RegExp { source, flags, .. } => {
                 // Compiled programs (including the ASCII twin) are measured
                 // through Regex::resident_bytes and Arc-deduplicated by the

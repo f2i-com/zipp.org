@@ -726,7 +726,7 @@ impl<'p> Vm<'p> {
                 // ToIntegerOrInfinity(count): a NEGATIVE or +Infinity count is a
                 // RangeError — checked on the coerced number BEFORE the empty-string
                 // fast path (`"".repeat(Infinity)` must still throw, not yield "").
-                let nf = self.to_number_coerce(arg0)?;
+                let nf = self.to_number_strict(arg0)?;
                 let n_int = if nf.is_nan() { 0.0 } else { nf.trunc() };
                 if n_int < 0.0 || n_int == f64::INFINITY {
                     return Err(Thrown("RangeError: Invalid count value".into()));
@@ -922,7 +922,7 @@ impl<'p> Vm<'p> {
                 // propagates a throw; `undefined` → no cap.
                 let lim = match args.get(1).copied() {
                     Some(v) if v != Value::UNDEFINED => {
-                        crate::vm::helpers_num2::to_uint32(self.to_number_coerce(v)?) as usize
+                        crate::vm::helpers_num2::to_uint32(self.to_number_strict(v)?) as usize
                     }
                     _ => usize::MAX,
                 };
@@ -1287,7 +1287,7 @@ impl<'p> Vm<'p> {
                 // position: ToNumber, then NaN -> search the whole string (per
                 // lastIndexOf), else ToInteger clamped to [0, len]. A unit cap.
                 let cap = if args.len() >= 2 && args[1] != Value::UNDEFINED {
-                    let np = self.to_number_coerce(args[1])?;
+                    let np = self.to_number_strict(args[1])?;
                     if np.is_nan() {
                         len
                     } else {

@@ -16,7 +16,7 @@
 // classified as resource exhaustion and cost the application its Worker
 // (the 11 September 2026 close audit's ZA-01).
 
-import { categorizeEngineError } from "./zipp-host.mjs";
+import { categorizeEngineError, describeThrownError } from "./zipp-host.mjs";
 
 let engine = null;
 let zipp = null;
@@ -33,7 +33,7 @@ function engineCall(phase, fn) {
   } catch (error) {
     const failure = { kind: engine.lastErrorKind(), terminal: engine.disposed };
     const category = categorizeEngineError(failure, phase);
-    const envelope = fail(category, error?.message ?? error, undefined, failure.terminal);
+    const envelope = fail(category, describeThrownError(error).message, undefined, failure.terminal);
     if (failure.terminal) dead = envelope;
     return { error: envelope };
   }
@@ -49,7 +49,7 @@ async function handle(msg) {
         zipp = await import(msg.moduleUrl);
         await zipp.default({ module_or_path: msg.wasmUrl });
       } catch (error) {
-        dead = fail("host", `engine module failed to load: ${error?.message ?? error}`, undefined, true);
+        dead = fail("host", `engine module failed to load: ${describeThrownError(error).message}`, undefined, true);
         return { error: dead };
       }
       engine = new zipp.Engine();
@@ -73,7 +73,7 @@ async function handle(msg) {
           if (bridges.localStorage) engine.setLocalStorageBridge(bridges.localStorage);
           if (bridges.clipboard) engine.setClipboardBridge(bridges.clipboard);
         } catch (error) {
-          dead = fail("host", `bridge module failed: ${error?.message ?? error}`, undefined, true);
+          dead = fail("host", `bridge module failed: ${describeThrownError(error).message}`, undefined, true);
           return { error: dead };
         }
       }
@@ -108,7 +108,7 @@ self.addEventListener("message", async (event) => {
   } catch (error) {
     // Not an engine throw (those are caught in engineCall): the adapter's
     // own failure. Recoverable unless the engine is gone.
-    reply = { error: fail("host", error?.message ?? error, undefined, Boolean(engine?.disposed)) };
+    reply = { error: fail("host", describeThrownError(error).message, undefined, Boolean(engine?.disposed)) };
   }
   if (reply.error) {
     self.postMessage({ gen: msg.gen, id: msg.id, ok: false, error: reply.error });
@@ -121,7 +121,7 @@ self.addEventListener("message", async (event) => {
       // A value the engine produced that structured clone refuses cannot
       // happen for its data-only results; report it rather than leave the
       // request pending until its deadline.
-      if (!posted) self.postMessage({ gen: msg.gen, id: msg.id, ok: false, error: fail("host", `reply could not be sent: ${error?.message ?? error}`) });
+      if (!posted) self.postMessage({ gen: msg.gen, id: msg.id, ok: false, error: fail("host", `reply could not be sent: ${describeThrownError(error).message}`) });
     }
   }
 });

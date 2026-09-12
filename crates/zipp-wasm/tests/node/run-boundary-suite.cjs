@@ -40,6 +40,7 @@ const CHECKS = [
   // The reference host adapter's main-thread contract under a mocked Worker
   // (no engine needed; ZA-01/02/03). Cheap, so it rides in the minimum gate.
   ["sdk-contract.mjs"],
+  ["sdk-worker-contract.mjs"],
   // The density harness's aggregation against exact pooled references
   // (ZA-11); no engine involved, so it is cheap enough for the gate.
   ["density-stats.cjs"],

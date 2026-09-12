@@ -117,6 +117,11 @@ impl<'p> Vm<'p> {
                         "TypeError: addInitializer expects a function".into(),
                     ));
                 }
+                // The class can already be old after the decorator call while
+                // its callback is young. `DecState` is traced as part of the
+                // class, so this store needs the same nursery barrier as any
+                // other old-holder -> young-value edge.
+                self.heap.write_barrier_val(class.heap_index(), a0);
                 if let Some(d) = self.dec_of_mut(class) {
                     match which {
                         0 => d.instance_extra.push(a0),
@@ -346,6 +351,8 @@ impl<'p> Vm<'p> {
             accessor: false,
             setter: Value::UNDEFINED,
         };
+        // Replacement methods/accessors become ordinary ClassData edges.
+        self.heap.write_barrier_val(class.heap_index(), v);
         let HeapObj::Class(c) = self.heap.get_mut(class.heap_index()) else {
             return;
         };
@@ -469,6 +476,7 @@ impl<'p> Vm<'p> {
         );
         let mut st = DecState::new(n_elems);
         st.metadata = Value::heap(meta_idx);
+        self.heap.write_barrier_val(class.heap_index(), st.metadata);
         if let HeapObj::Class(c) = self.heap.get_mut(class.heap_index()) {
             c.dec = Some(Box::new(st));
         }
@@ -488,6 +496,7 @@ impl<'p> Vm<'p> {
             let s = self.key_of(key);
             self.alloc_str(s)
         };
+        self.heap.write_barrier_val(class.heap_index(), key);
         if let Some(d) = self.dec_of_mut(class) {
             if elem < d.keys.len() {
                 d.keys[elem] = key;
@@ -712,6 +721,7 @@ impl<'p> Vm<'p> {
                 // onto the field's initial value at construction time.
                 DK_FIELD => {
                     if self.is_callable(out) {
+                        self.heap.write_barrier_val(class.heap_index(), out);
                         if let Some(d) = self.dec_of_mut(class) {
                             // "PREPEND newValue to [[Initializers]]": decorators
                             // apply innermost-first but their initializers RUN
@@ -753,6 +763,7 @@ impl<'p> Vm<'p> {
                         }
                     }
                     if self.is_callable(init) {
+                        self.heap.write_barrier_val(class.heap_index(), init);
                         if let Some(d) = self.dec_of_mut(class) {
                             d.field_inits[elem].insert(0, init);
                         }
@@ -848,6 +859,7 @@ impl<'p> Vm<'p> {
         // at the original (that is how the runtime finds this `DecState` and the
         // computed field keys); `LoadClassValue` is the one reader that hops.
         if cur != class {
+            self.heap.write_barrier_val(class.heap_index(), cur);
             if let Some(d) = self.dec_of_mut(class) {
                 d.replacement = cur;
             }

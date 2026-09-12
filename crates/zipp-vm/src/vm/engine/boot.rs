@@ -502,6 +502,8 @@ impl<'p> Vm<'p> {
             #[cfg(feature = "safe-sandbox")]
             gc_lock: std::rc::Rc::new(std::cell::Cell::new(0)),
             gc_stress: std::env::var_os("ZIPP_GC_STRESS").is_some(),
+            weak_containers: std::collections::HashSet::new(),
+            kept_alive: std::collections::HashSet::new(),
             host_result_roots: Vec::new(),
         }
     }
@@ -565,6 +567,8 @@ impl<'p> Vm<'p> {
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Microtask>()),
             )
+            .saturating_add(Self::hash_set_resident_bytes(&self.weak_containers))
+            .saturating_add(Self::hash_set_resident_bytes(&self.kept_alive))
             .saturating_add(
                 self.pending_yield_handlers
                     .capacity()

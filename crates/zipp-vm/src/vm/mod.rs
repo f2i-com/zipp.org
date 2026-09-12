@@ -497,6 +497,11 @@ pub(crate) enum Microtask {
     CombinatorFinish {
         combinator: u32,
     },
+    /// CleanupFinalizationRegistry job. The registry owns the callback and
+    /// cleared cells; the job roots only the registry identity.
+    FinalizationCleanup {
+        registry: u32,
+    },
 }
 
 /// Native (built-in) function ids — the discriminant carried by `HeapObj::Native`.
@@ -2617,6 +2622,14 @@ pub struct Vm<'p> {
     #[cfg(feature = "safe-sandbox")]
     gc_lock: std::rc::Rc<std::cell::Cell<u32>>,
     gc_stress: bool,
+    /// Heap slots currently occupied by WeakMap/WeakSet/WeakRef/registry
+    /// objects. This is an index only, never a root; the weak phase validates
+    /// each slot's current variant and prunes dead/reused entries.
+    weak_containers: std::collections::HashSet<u32>,
+    /// WeakRef targets kept through the current ECMAScript job by
+    /// AddToKeptObjects (constructor and successful deref). Cleared only at a
+    /// main-script or microtask boundary.
+    kept_alive: std::collections::HashSet<u64>,
     /// Values a call or embedding entry owns only in Rust locals: arguments before
     /// the callee's frame exists, and results across rendering or a microtask
     /// drain after it is gone. The collector traces this stack while guest

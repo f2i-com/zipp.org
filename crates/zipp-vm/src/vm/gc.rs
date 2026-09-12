@@ -205,6 +205,27 @@ impl Vm<'_> {
         }
     }
 
+    /// AddToKeptObjects for WeakRef construction and successful dereference.
+    #[inline]
+    pub(crate) fn keep_during_job(&mut self, value: Value) {
+        self.kept_alive.insert(value.bits());
+    }
+
+    /// Register a newly allocated or re-branded weak container for the weak
+    /// phase's proportional scan. The entry carries no liveness.
+    #[inline]
+    pub(crate) fn register_weak_container(&mut self, idx: u32) {
+        self.weak_containers.insert(idx);
+    }
+
+    /// End an ECMAScript job, release its kept weak targets, and expose the
+    /// boundary to stress collection before the next queued job starts.
+    #[inline]
+    pub(crate) fn finish_weak_job(&mut self) {
+        self.kept_alive.clear();
+        self.maybe_gc();
+    }
+
     /// Record the internal `[[HomeObject]]` edge owned by an object-literal
     /// function. The side table is storage only: liveness flows from a reachable
     /// function KEY to its home VALUE, exactly as if the value were a field on
@@ -311,6 +332,9 @@ impl Vm<'_> {
         }
         for &v in &self.globals {
             root_val!(v);
+        }
+        for &bits in &self.kept_alive {
+            root_val!(Value::from_bits(bits));
         }
         // A host's view over a pinned buffer outlives every guest reference.
         for &i in &self.pinned_buffers {
@@ -461,6 +485,9 @@ impl Vm<'_> {
                 // owns the element values recorded eagerly.
                 Microtask::CombinatorFinish { combinator } => {
                     root_idx!(*combinator);
+                }
+                Microtask::FinalizationCleanup { registry } => {
+                    root_idx!(*registry);
                 }
             }
         }
@@ -718,7 +745,9 @@ impl Vm<'_> {
                 self.trace_edges(idx, &mut marks, &mut stack, n);
             }
         }
+        self.trace_ephemeron_fixpoint(&mut marks, &mut stack, n);
         let t_trace = gcstats::now(stats);
+        self.process_weak_references(&marks, n);
 
         // --- Sweep + prune -------------------------------------------------
         // B196a: the major's dead walk restocks the recycle pool too (the
@@ -951,11 +980,13 @@ impl Vm<'_> {
         while let Some(idx) = stack.pop() {
             self.trace_edges(idx, &mut marks, &mut stack, n);
         }
+        self.trace_ephemeron_fixpoint(&mut marks, &mut stack, n);
         let t_trace = gcstats::now(stats);
         if nursery_verify::enabled() {
             // Before the sweep, while the young log is intact.
             self.verify_minor_marks(&marks, n);
         }
+        self.process_weak_references(&marks, n);
         let log_len = self.heap.young_log().len();
         // `free_slot` appends every reclaimed young slot to `Heap::free`.
         // No heap slot can be allocated or reused during this collector-only
@@ -1024,6 +1055,7 @@ impl Vm<'_> {
         while let Some(idx) = stack.pop() {
             self.trace_edges(idx, &mut marks, &mut stack, n);
         }
+        self.trace_ephemeron_fixpoint(&mut marks, &mut stack, n);
         for &y in self.heap.young_log() {
             if marks[y as usize] && !minor_marks[y as usize] {
                 panic!(
@@ -1221,6 +1253,212 @@ impl Vm<'_> {
         }
     }
 
+    /// Mark reachable WeakMap values whose keys are already live. Pending
+    /// ephemeron edges are indexed by key, so each edge is activated once when
+    /// its key becomes marked. A repeated whole-registry scan is correct but
+    /// quadratic for a reverse-ordered chain of weak maps.
+    fn trace_ephemeron_fixpoint(
+        &self,
+        marks: &mut [bool],
+        stack: &mut Vec<u32>,
+        n: usize,
+    ) {
+        let mut pending: std::collections::HashMap<u32, Vec<Value>> =
+            std::collections::HashMap::new();
+        let mut scanned_maps = std::collections::HashSet::new();
+
+        // Ordinary tracing has already drained `stack`, so every map marked at
+        // entry has had its strong edges visited and can seed the ephemeron
+        // worklist immediately.
+        for &map in &self.weak_containers {
+            let idx = map as usize;
+            if idx < n
+                && marks[idx]
+                && matches!(self.heap.get(map), HeapObj::WeakMap { .. })
+            {
+                scanned_maps.insert(map);
+                self.queue_weak_map_edges(map, marks, stack, n, &mut pending);
+            }
+        }
+
+        while let Some(idx) = stack.pop() {
+            // `idx` has just transitioned to marked. Activate every reachable
+            // map entry waiting on it before tracing the object's ordinary
+            // outgoing edges.
+            if let Some(values) = pending.remove(&idx) {
+                for value in values {
+                    Self::mark_weak_value(value, marks, stack, n);
+                }
+            }
+            self.trace_edges(idx, marks, stack, n);
+
+            // A WeakMap can itself become reachable as an ephemeron value.
+            // Scan its entries once at that point; already-live keys activate
+            // immediately and the rest join the key-indexed pending table.
+            if self.weak_containers.contains(&idx)
+                && scanned_maps.insert(idx)
+                && matches!(self.heap.get(idx), HeapObj::WeakMap { .. })
+            {
+                self.queue_weak_map_edges(idx, marks, stack, n, &mut pending);
+            }
+        }
+    }
+
+    #[inline]
+    fn mark_weak_value(value: Value, marks: &mut [bool], stack: &mut Vec<u32>, n: usize) {
+        if value.is_heap() {
+            let idx = value.heap_index() as usize;
+            if idx < n && !marks[idx] {
+                marks[idx] = true;
+                stack.push(value.heap_index());
+            }
+        }
+    }
+
+    fn queue_weak_map_edges(
+        &self,
+        map: u32,
+        marks: &mut [bool],
+        stack: &mut Vec<u32>,
+        n: usize,
+        pending: &mut std::collections::HashMap<u32, Vec<Value>>,
+    ) {
+        let HeapObj::WeakMap { keys, vals } = self.heap.get(map) else {
+            return;
+        };
+        for (&key, &value) in keys.iter().zip(vals.iter()) {
+            if !key.is_heap() {
+                continue;
+            }
+            let key_idx = key.heap_index() as usize;
+            if key_idx >= n {
+                continue;
+            }
+            if marks[key_idx] {
+                Self::mark_weak_value(value, marks, stack, n);
+            } else {
+                pending.entry(key.heap_index()).or_default().push(value);
+            }
+        }
+    }
+
+    /// Clear dead weak edges before their slots enter the free list. This
+    /// prevents an old WeakRef/token from observing a later occupant of the
+    /// recycled index and turns dead finalization targets into cleanup cells.
+    fn process_weak_references(&mut self, marks: &[bool], n: usize) {
+        let mut weak_containers = std::mem::take(&mut self.weak_containers);
+        let mut invalidated_collections = Vec::new();
+        let mut cleanup_jobs = Vec::new();
+        weak_containers.retain(|&raw_idx| {
+            let idx = raw_idx as usize;
+            idx < n
+                && marks[idx]
+                && matches!(
+                    self.heap.get(raw_idx),
+                    HeapObj::WeakMap { .. }
+                        | HeapObj::WeakSet(_)
+                        | HeapObj::WeakRef(_)
+                        | HeapObj::FinalizationRegistry { .. }
+                )
+        });
+        for &raw_idx in &weak_containers {
+            let idx = raw_idx as usize;
+            if idx >= n || !marks[idx] {
+                continue;
+            }
+            match self.heap.get_mut(raw_idx) {
+                HeapObj::WeakMap { keys, vals } => {
+                    let before = keys.len();
+                    let mut write = 0usize;
+                    for read in 0..before {
+                        let key = keys[read];
+                        let live = key.is_heap()
+                            && (key.heap_index() as usize) < n
+                            && marks[key.heap_index() as usize];
+                        if live {
+                            if write != read {
+                                keys[write] = key;
+                                vals[write] = vals[read];
+                            }
+                            write += 1;
+                        }
+                    }
+                    keys.truncate(write);
+                    vals.truncate(write);
+                    if keys.len() != before {
+                        invalidated_collections.push(raw_idx);
+                    }
+                }
+                HeapObj::WeakSet(items) => {
+                    let before = items.len();
+                    items.retain(|value| {
+                        value.is_heap()
+                            && (value.heap_index() as usize) < n
+                            && marks[value.heap_index() as usize]
+                    });
+                    if items.len() != before {
+                        invalidated_collections.push(raw_idx);
+                    }
+                }
+                HeapObj::WeakRef(target) => {
+                    if target.is_heap()
+                        && ((target.heap_index() as usize) >= n
+                            || !marks[target.heap_index() as usize])
+                    {
+                        *target = Value::UNDEFINED;
+                    }
+                }
+                HeapObj::FinalizationRegistry {
+                    cells,
+                    cleared,
+                    cleanup_queued,
+                    ..
+                } => {
+                    let token_is_dead = |token: Value| {
+                        token.is_heap()
+                            && ((token.heap_index() as usize) >= n
+                                || !marks[token.heap_index() as usize])
+                    };
+                    for cell in cleared.iter_mut() {
+                        if token_is_dead(cell.token) {
+                            cell.token = Value::UNDEFINED;
+                        }
+                    }
+                    let mut pos = cells.len();
+                    while pos != 0 {
+                        pos -= 1;
+                        let target_is_dead = cells[pos].target.is_heap()
+                            && ((cells[pos].target.heap_index() as usize) >= n
+                                || !marks[cells[pos].target.heap_index() as usize]);
+                        if token_is_dead(cells[pos].token) {
+                            // A dead unregister token must not alias a future
+                            // occupant of the recycled heap slot.
+                            cells[pos].token = Value::UNDEFINED;
+                        }
+                        if target_is_dead {
+                            let mut cell = cells.swap_remove(pos);
+                            cell.target = Value::UNDEFINED;
+                            cleared.push(cell);
+                        }
+                    }
+                    if !cleared.is_empty() && !*cleanup_queued {
+                        *cleanup_queued = true;
+                        cleanup_jobs.push(raw_idx);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for idx in invalidated_collections {
+            self.collection_index.remove(&idx);
+        }
+        for registry in cleanup_jobs {
+            self.microtasks
+                .push_back(Microtask::FinalizationCleanup { registry });
+        }
+        self.weak_containers = weak_containers;
+    }
+
     /// Push every heap reference held by object `idx` onto the mark stack.
     fn trace_edges(&self, idx: u32, marks: &mut [bool], stack: &mut Vec<u32>, n: usize) {
         macro_rules! m_val {
@@ -1354,21 +1592,31 @@ impl Vm<'_> {
                 }
                 m_idx!(s.result);
             }
-            HeapObj::Map { keys, vals } | HeapObj::WeakMap { keys, vals } => {
+            HeapObj::Map { keys, vals } => {
                 for &v in keys.iter().chain(vals.iter()) {
                     m_val!(v);
                 }
             }
-            HeapObj::Set(items) | HeapObj::WeakSet(items) => {
+            HeapObj::Set(items) => {
                 for &v in items {
                     m_val!(v);
                 }
             }
-            HeapObj::WeakRef(v) => m_val!(*v),
-            HeapObj::FinalizationRegistry { cleanup, tokens } => {
+            // Weak collection keys and WeakRef targets are processed only after
+            // the ordinary trace. WeakMap values are ephemerons, not ordinary
+            // outgoing edges.
+            HeapObj::WeakMap { .. } | HeapObj::WeakSet(_) | HeapObj::WeakRef(_) => {}
+            HeapObj::FinalizationRegistry {
+                cleanup,
+                cells,
+                cleared,
+                ..
+            } => {
                 m_val!(*cleanup);
-                for &t in tokens {
-                    m_val!(t);
+                for cell in cells.iter().chain(cleared.iter()) {
+                    // The holding remains strong until cleanup or unregister.
+                    // target and token are weak and deliberately omitted.
+                    m_val!(cell.held);
                 }
             }
             HeapObj::Boxed { value, .. } => m_val!(*value),
@@ -1498,6 +1746,60 @@ mod closure_side_table_gc_tests {
             ("dense", ClosureHomeTable::dense_for_test()),
             ("map", ClosureHomeTable::map_for_test()),
         ]
+    }
+
+    #[test]
+    fn weakref_kept_objects_are_idempotent_and_clear_at_job_end() {
+        let program = program_with_keep_global();
+        let mut vm = Vm::new(&program);
+        vm.run().expect("program runs");
+        let target = Value::heap(vm.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))));
+        for _ in 0..100_000 {
+            vm.keep_during_job(target);
+        }
+        assert_eq!(vm.kept_alive.len(), 1);
+        vm.finish_weak_job();
+        assert!(vm.kept_alive.is_empty());
+    }
+
+    #[test]
+    fn ephemeron_chain_uses_keyed_worklist_and_reaches_the_tail() {
+        const LINKS: usize = 4_096;
+
+        let program = program_with_keep_global();
+        let mut vm = Vm::new(&program);
+        vm.run().expect("program runs");
+
+        let keys: Vec<u32> = (0..=LINKS)
+            .map(|_| vm.heap.alloc(HeapObj::Object(Box::new(ObjMap::new()))))
+            .collect();
+        let mut maps = Vec::with_capacity(LINKS);
+        for link in 0..LINKS {
+            maps.push(vm.heap.alloc(HeapObj::WeakMap {
+                keys: vec![Value::heap(keys[link])],
+                vals: vec![Value::heap(keys[link + 1])],
+            }));
+        }
+        // Reverse registration was the quadratic order for the former
+        // repeated whole-registry fixpoint scan.
+        for &map in maps.iter().rev() {
+            vm.register_weak_container(map);
+        }
+        let tail_ref = vm.heap.alloc(HeapObj::WeakRef(Value::heap(keys[LINKS])));
+        vm.register_weak_container(tail_ref);
+
+        let mut roots = Vec::with_capacity(LINKS + 2);
+        roots.push(Value::heap(keys[0]));
+        roots.extend(maps.into_iter().map(Value::heap));
+        roots.push(Value::heap(tail_ref));
+        let root_array = vm.heap.alloc(HeapObj::Array(roots));
+        vm.globals[keep_slot(&program)] = Value::heap(root_array);
+
+        vm.gc();
+        assert!(matches!(
+            vm.heap.get(tail_ref),
+            HeapObj::WeakRef(target) if *target == Value::heap(keys[LINKS])
+        ));
     }
 
     #[test]
@@ -1665,8 +1967,11 @@ mod closure_side_table_gc_tests {
             let cleanup = vm.heap.alloc(HeapObj::Func(0));
             let registry = vm.heap.alloc(HeapObj::FinalizationRegistry {
                 cleanup: Value::heap(cleanup),
-                tokens: Vec::new(),
+                cells: Vec::new(),
+                cleared: Vec::new(),
+                cleanup_queued: false,
             });
+            vm.register_weak_container(registry);
             vm.globals[slot("registry")] = Value::heap(registry);
             vm.finreg_method(
                 Value::heap(registry),
@@ -1683,11 +1988,8 @@ mod closure_side_table_gc_tests {
                 "{label}"
             );
 
-            // The current WeakRef implementation conservatively keeps its
-            // target strong. This second phase still pins the future contract:
-            // once WeakRef becomes truly weak, the already-rooted method edge
-            // above must continue to make deref observe `home` after a major.
             let observer = vm.heap.alloc(HeapObj::WeakRef(Value::heap(home)));
+            vm.register_weak_container(observer);
             vm.globals[slot("observer")] = Value::heap(observer);
             vm.gc();
             assert!(

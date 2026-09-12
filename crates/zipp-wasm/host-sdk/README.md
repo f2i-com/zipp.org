@@ -1,4 +1,4 @@
-# zipp-host: the reference host adapter (v1.1.0)
+# zipp-host: the reference host adapter (v1.1.1)
 
 Two ES modules a browser application copies next to the released web package:
 
@@ -111,4 +111,8 @@ returns a promise (except `terminate`) and accepts an optional trailing
 Proven in real Workers by `tests/browser/worker-smoke.mjs` on Chromium,
 Firefox and WebKit; the main-thread state handling is pinned by
 `tests/node/sdk-contract.mjs` under a mocked Worker, which the boundary
-suite runs without an engine build.
+suite runs without an engine build. `tests/node/sdk-worker-contract.mjs` runs
+the actual Worker adapter with small test modules to verify error envelopes
+and recovery. Thrown values whose `message`, `name`, or string conversion
+also throws are reported safely; they cannot leave a request or its deadline
+pending merely because the error could not be printed.

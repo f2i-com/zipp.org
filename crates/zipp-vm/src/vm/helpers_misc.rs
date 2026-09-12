@@ -6732,8 +6732,7 @@ pub(crate) extern "win64" fn jit_len_of(vm: *mut core::ffi::c_void, obj_bits: u6
             ),
             HeapObj::Str(s) => len_value(s.units()),
             HeapObj::Cons { len, .. } => len_value(*len),
-            HeapObj::Map { keys, .. } => len_value(keys.iter().filter(|k| !k.is_hole()).count()),
-            HeapObj::Set(items) => len_value(items.iter().filter(|v| !v.is_hole()).count()),
+            HeapObj::Map { .. } | HeapObj::Set(_) => len_value(vm.coll_live_len(o.heap_index())),
             _ => Value::int(0),
         }
     } else {
