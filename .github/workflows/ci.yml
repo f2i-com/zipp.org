@@ -1,4 +1,6 @@
-# The MINIMUM gate every push and pull request pays — deliberately small, so
+# Manual verification gate while automatic CI is paused (2026-09-12).
+# Restore push/main and pull_request triggers when automatic checks resume.
+# The retained verification jobs are deliberately small, so
 # a change that breaks a default-semantics regression cannot merge quietly
 # while the runner stays cheap:
 #
@@ -10,7 +12,7 @@
 # Everything heavier is a LOCAL command (see HANDOFF.md "Local verification"):
 # the full 230-binary engine suite, the safe-profile and instrumented lanes,
 # test262, the three-browser Worker smoke, the density and benchmark
-# harnesses. security.yml runs the broader matrix weekly and on demand.
+# harnesses. security.yml runs the broader matrix on demand.
 #
 # Also a REUSABLE workflow: release.yml calls it with the exact tagged
 # revision, so publishing depends on this same gate at that revision rather
@@ -21,9 +23,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
   workflow_call:
     inputs:

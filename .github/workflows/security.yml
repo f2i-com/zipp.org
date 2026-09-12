@@ -5,24 +5,18 @@ name: Security
 # regressions, the separately resolved native sandbox, and the WebAssembly
 # sandbox boundary.
 #
-# It used to be manual-trigger only, so none of it ran unless someone
-# remembered to (the 11 September 2026 audit's ZIPP-16). Now it runs every
-# week against `main`, and on demand (`gh workflow run security.yml`). It is
-# deliberately NOT on pull requests: CI (ci.yml) is the minimum gate, and the
+# Automatic CI is paused as of 2026-09-12. Run on demand with
+# `gh workflow run security.yml`; the former Monday 03:17 UTC schedule can be
+# restored when automatic checks resume. CI (ci.yml) is the minimum gate, and the
 # broad lanes — the full engine suite, the safe profile, the sandboxes, the
 # browser Workers — are run locally before a push (HANDOFF.md, "Local
-# verification") and here weekly as the safety net. Release publishing does
+# verification") and here on demand. Release publishing does
 # not consume these results directly — release.yml requires the
-# exact-revision CI gate — but a scheduled failure is visible on the Actions
-# tab and blocks the next release review by policy.
+# exact-revision CI gate.
 #
 # No job here publishes anything.
 on:
   workflow_dispatch:
-  schedule:
-    # Mondays 03:17 UTC: off the hour, so it does not queue behind everyone
-    # else's on-the-hour jobs.
-    - cron: "17 3 * * 1"
 
 permissions:
   contents: read
