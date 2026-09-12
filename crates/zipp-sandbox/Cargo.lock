@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-vm"
-version = "0.0.16"
+version = "0.0.17"
 dependencies = [
  "num-bigint",
  "num-traits",

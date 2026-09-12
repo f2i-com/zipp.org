@@ -54,7 +54,7 @@ and their scope.
 
 ## Quick start
 
-The [`v0.0.16` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.16)
+The [`v0.0.17` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.17)
 includes ready-to-run x86-64 binaries and a browser WebAssembly package.
 
 Save this as `app.js`, then choose your platform below:
@@ -76,7 +76,7 @@ the [browser example](#embed-zipp-webassembly-in-a-web-app), or the
 Download, extract, and run the native Windows executable from PowerShell:
 
 ```powershell
-$version = '0.0.16'
+$version = '0.0.17'
 $archive = "zipp-$version-x86_64-pc-windows-msvc.zip"
 Invoke-WebRequest "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive" -OutFile $archive
 Expand-Archive -LiteralPath $archive -DestinationPath .
@@ -96,7 +96,7 @@ Use `mjs` instead of `js` for an ES module entry, including top-level `await`.
 Download, extract, and run the native Linux binary:
 
 ```sh
-version=0.0.16
+version=0.0.17
 archive="zipp-$version-x86_64-unknown-linux-gnu.tar.gz"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 tar -xzf "$archive"
@@ -105,7 +105,7 @@ tar -xzf "$archive"
 ```
 
 The archive preserves the executable bit. If another tool removes it, restore it
-with `chmod +x zipp-0.0.16-x86_64-unknown-linux-gnu/zipp`.
+with `chmod +x zipp-0.0.17-x86_64-unknown-linux-gnu/zipp`.
 
 </details>
 
@@ -154,7 +154,7 @@ Download the browser bundle, then serve its JavaScript and WebAssembly files
 from the same origin as your app:
 
 ```sh
-version=0.0.16
+version=0.0.17
 archive="zipp-wasm-$version-web.zip"
 curl -fLO "https://github.com/f2i-com/zipp.org/releases/download/v$version/$archive"
 unzip "$archive"

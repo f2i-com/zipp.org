@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-cli"
-version = "0.0.16"
+version = "0.0.17"
 dependencies = [
  "mimalloc",
  "sha2",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "zipp-vm"
-version = "0.0.16"
+version = "0.0.17"
 dependencies = [
  "dynasm",
  "dynasmrt",
