@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" role="img" aria-labelledby="title desc">
   <title id="title">Zipp JavaScript engine</title>
-  <desc id="desc">A dark violet banner with a lightning mark, the Zipp name, and the words Rust, JavaScript, and native JIT.</desc>
+  <desc id="desc">A dark violet banner with a lightning mark, the Zipp name, and the words Rust, native JIT, and WebAssembly.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0b1020"/>
@@ -17,7 +17,8 @@
       <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
     </filter>
   </defs>
-  <rect width="1200" height="360" rx="30" fill="url(#bg)"/>
+  <rect width="1200" height="300" rx="30" fill="url(#bg)"/>
+  <g transform="translate(0 -30)">
   <g opacity="0.18" stroke="#a78bfa" stroke-width="2">
     <path d="M0 67h270M0 105h215M0 143h160"/>
     <path d="M930 217h270M985 255h215M1040 293h160"/>
@@ -30,9 +31,10 @@
   <g font-family="Inter,Segoe UI,Arial,sans-serif" font-size="19" font-weight="600">
     <rect x="376" y="260" width="98" height="42" rx="21" fill="#ffffff" opacity="0.10"/>
     <text x="401" y="287" fill="#ede9fe">Rust</text>
-    <rect x="488" y="260" width="150" height="42" rx="21" fill="#ffffff" opacity="0.10"/>
-    <text x="514" y="287" fill="#ede9fe">JavaScript</text>
-    <rect x="652" y="260" width="145" height="42" rx="21" fill="#ffffff" opacity="0.10"/>
-    <text x="680" y="287" fill="#cffafe">Native JIT</text>
+    <rect x="488" y="260" width="145" height="42" rx="21" fill="#ffffff" opacity="0.10"/>
+    <text x="510" y="287" fill="#ede9fe">Native JIT</text>
+    <rect x="647" y="260" width="182" height="42" rx="21" fill="#ffffff" opacity="0.10"/>
+    <text x="668" y="287" fill="#cffafe">WebAssembly</text>
+  </g>
   </g>
 </svg>
