@@ -70,6 +70,7 @@ leaves the model unchanged by that submission. Changes to captured gradients,
 shape, dtype or `requires_grad` also invalidate a pending step. SGD parameter
 identities, group membership/order and all supported SGD options are snapshotted
 when `step()` is captured; changing them before completion rejects that step.
+SGD options must be numeric or boolean scalars; mutable option values are rejected.
 Gradient cleanup uses the captured parameter set, so newly added parameters
 cannot have their gradients cleared by an older request. Each training result is single-use.
 Wait for completion before preparing the next step: overlapping captures generally

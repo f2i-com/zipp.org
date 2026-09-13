@@ -103,6 +103,20 @@ def record():
 def submit():
     pending.submit(lambda loss: print('loss', loss.item()), lambda error: print('FAILED', str(error)))
 `;
+  for (const option of ['lr','weight_decay','maximize','momentum','dampening','nesterov']) {
+    const e = new Engine();
+    e.initPythonProject({main:edgeProgram + `
+optimizer.param_groups[0]["${option}"] = []
+try:
+    record()
+    print('NOT REJECTED')
+except NotImplementedError as error:
+    print(str(error))
+`}, 'main');
+    assert.deepEqual(e.takeOutput(), ['GPU SGD options must be numeric or boolean scalars']);
+    assert.deepEqual(e.pythonCall('values', []), [2, 3, 11, 7]);
+    assert.deepEqual(e.takeHostRequests(), []); e.dispose();
+  }
   for (const backend of ['cpu-js', 'wasm']) {
     const runtime = await createRuntime({backend, wasmBytes});
     // A leaf first seen under no_grad still contributes to later recorded ops.

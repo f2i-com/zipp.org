@@ -16,10 +16,13 @@ def active_capture():
 def _sgd_configuration(optimizer):
     # Keep values and parameter identities, never aliases to mutable groups/lists.
     options = ("lr", "weight_decay", "maximize", "momentum", "dampening", "nesterov")
-    return (id(optimizer), tuple(
-        (tuple(id(p) for p in group["params"]), tuple(group[name] for name in options))
-        for group in optimizer.param_groups
-    ))
+    groups = []
+    for group in optimizer.param_groups:
+        values = tuple(group[name] for name in options)
+        if any(type(value) not in (int, float, bool) for value in values):
+            raise NotImplementedError("GPU SGD options must be numeric or boolean scalars")
+        groups.append((tuple(id(p) for p in group["params"]), values))
+    return (id(optimizer), tuple(groups))
 
 
 class _Capture:
