@@ -213,17 +213,15 @@ function failedConsole() {
   }
 }
 
-// Files the Python program wrote since the last call: [{path, base64}], an
-// empty base64 for a removed file.
+// Explicit VFS changes: {path, base64} (including empty files) or {path, deleted:true}.
 function takeWrittenFiles() {
   if (!live() || language !== "python") return [];
   try {
     const text = engine.pythonCall("__zipp_py_vfs_changed", []);
     if (typeof text !== "string" || !text) return [];
-    return text.split("\n").filter(Boolean).map((line) => {
-      const tab = line.indexOf("\t");
-      return { path: line.slice(0, tab), base64: line.slice(tab + 1) };
-    });
+    const result = JSON.parse(text);
+    if (result.version !== 1 || !Array.isArray(result.changes)) throw Error('Unsupported VFS change protocol');
+    return result.changes;
   } catch {
     return [];
   }

@@ -3,7 +3,7 @@ import { useState } from 'react'
 const layers = [
   { name: 'Python or JavaScript', label: '01 / YOUR SOURCE', symbol: '{ }', copy: 'Write JavaScript or use the experimental Python frontend. In the Python-enabled build, both languages compile into ZIPP’s own VM bytecode.' },
   { name: 'ZIPP WASM', label: '02 / THE ENGINE', symbol: 'ϟ', copy: 'ZIPP’s Rust engine is compiled to WebAssembly. Playground Python runs inside this VM in a browser Worker. It is not translated into JavaScript or run by a second Python interpreter.' },
-  { name: 'Browser GPU host', label: '03 / COMPUTE & OUTPUT', symbol: '</>', copy: 'Python zipp_gpu requests are handled by JavaScript and executed through WebGL2 or WebGPU. The separate native NCA lab uses full PyTorch/CUDA; its snapshots are rendered in WebGL2.' },
+  { name: 'Browser GPU host', label: '03 / COMPUTE & OUTPUT', symbol: '</>', copy: 'Python zipp_gpu requests are handled by JavaScript and executed through WebGL2 or WebGPU. The host returns named graph outputs for the program to inspect and draw.' },
 ]
 
 export function SandboxStack() {

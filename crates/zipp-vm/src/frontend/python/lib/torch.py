@@ -44,6 +44,8 @@ _default_dtype = float32
 
 class device:
     def __init__(self, kind="cpu"):
+        if not (_isinstance(kind, device) or kind in ("cpu", "cpu:0")):
+            raise RuntimeError("Eager Zipp torch supports CPU only; use torch.compile(..., backend='zipp_gpu') for GPU inference")
         self.type = "cpu"
 
     def __repr__(self):
@@ -57,6 +59,17 @@ class device:
 
 
 _cpu = device("cpu")
+
+
+def _check_cpu_device(value):
+    if value is not None:
+        device(value)
+
+
+def compile(model=None, *, backend="zipp_gpu"):
+    """Record supported float32 inference; submit(callback) executes on the host."""
+    from torch._gpu import compile as compile_gpu
+    return compile_gpu(model, backend=backend)
 
 
 class _TensorIter:
@@ -706,8 +719,11 @@ class Tensor:
         return self.to(dt)
 
     def to(self, *args, **kwargs):
+        _check_cpu_device(kwargs.get("device"))
         target = kwargs.get("dtype")
         for a in args:
+            if _isinstance(a, (_b.str, device)):
+                _check_cpu_device(a)
             if _isinstance(a, dtype):
                 target = a
             elif _isinstance(a, Tensor):
@@ -875,6 +891,7 @@ def _infer_dtype(flat, hint):
 
 
 def tensor(data, dtype=None, device=None, requires_grad=False):
+    _check_cpu_device(device)
     flat, shape, hint = _flatten_data(data)
     if _isinstance(data, Tensor) and dtype is None:
         dt = data.dtype
@@ -885,6 +902,7 @@ def tensor(data, dtype=None, device=None, requires_grad=False):
 
 
 def as_tensor(data, dtype=None, device=None):
+    _check_cpu_device(device)
     if _isinstance(data, Tensor) and (dtype is None or _dtype_of(dtype) == data.dtype):
         return data
     return tensor(data, dtype=dtype)
@@ -908,40 +926,48 @@ def _shape_args(shape):
 
 
 def zeros(*shape, dtype=None, device=None, requires_grad=False):
+    _check_cpu_device(device)
     shape = _shape_args(shape)
     dt = _dtype_of(dtype) or _default_dtype
     return Tensor(_k.zeros(dt.name, _numel(shape)), shape, dt, requires_grad)
 
 
 def ones(*shape, dtype=None, device=None, requires_grad=False):
+    _check_cpu_device(device)
     shape = _shape_args(shape)
     dt = _dtype_of(dtype) or _default_dtype
     return Tensor(_k.full(dt.name, _numel(shape), 1), shape, dt, requires_grad)
 
 
 def full(shape, fill_value, dtype=None, device=None, requires_grad=False):
+    _check_cpu_device(device)
     shape = _shape_args((shape,))
     dt = _dtype_of(dtype) or (_default_dtype if _isinstance(fill_value, _float) else (_bool_dtype if _isinstance(fill_value, _b.bool) else int64))
     return Tensor(_k.full(dt.name, _numel(shape), fill_value), shape, dt, requires_grad)
 
 
 def empty(*shape, dtype=None, device=None, requires_grad=False):
+    _check_cpu_device(device)
     return zeros(*shape, dtype=dtype, requires_grad=requires_grad)
 
 
 def zeros_like(t, dtype=None, device=None, requires_grad=False):
+    _check_cpu_device(device)
     return zeros(*t.shape, dtype=dtype or t.dtype, requires_grad=requires_grad)
 
 
 def ones_like(t, dtype=None, device=None):
+    _check_cpu_device(device)
     return ones(*t.shape, dtype=dtype or t.dtype)
 
 
 def full_like(t, value, dtype=None, device=None):
+    _check_cpu_device(device)
     return full(t.shape, value, dtype=dtype or t.dtype)
 
 
 def empty_like(t, dtype=None, device=None):
+    _check_cpu_device(device)
     return zeros_like(t, dtype=dtype)
 
 
@@ -954,6 +980,7 @@ def randn_like(t, generator=None):
 
 
 def arange(start, end=None, step=1, dtype=None, device=None, requires_grad=False):
+    _check_cpu_device(device)
     if end is None:
         start, end = 0, start
     values = []
@@ -989,6 +1016,7 @@ def one_hot_(idx, n):
 # ---- random ------------------------------------------------------------------------------
 class Generator:
     def __init__(self, device="cpu"):
+        _check_cpu_device(device)
         self._g = _k.gen(0)
         self.device = _cpu
 
@@ -1030,6 +1058,7 @@ def _gen(generator):
 
 
 def rand(*shape, generator=None, dtype=None, device=None, requires_grad=False):
+    _check_cpu_device(device)
     shape = _shape_args(shape)
     dt = _dtype_of(dtype) or float32
     storage = _k.rand(_gen(generator), _numel(shape)) if dt is float32 else _k.rand_double(_gen(generator), _numel(shape))
@@ -1037,12 +1066,14 @@ def rand(*shape, generator=None, dtype=None, device=None, requires_grad=False):
 
 
 def randn(*shape, generator=None, dtype=None, device=None, requires_grad=False):
+    _check_cpu_device(device)
     shape = _shape_args(shape)
     dt = _dtype_of(dtype) or float32
     return Tensor(_k.randn(_gen(generator), _numel(shape), dt.name), shape, dt, requires_grad)
 
 
 def randint(low, high=None, size=None, generator=None, dtype=None, device=None):
+    _check_cpu_device(device)
     if size is None:
         # randint(high, size) form
         low, high, size = 0, low, high
@@ -1094,18 +1125,30 @@ def _binary(op, a, b, name, backward):
 
 
 def add(a, b, alpha=1):
+    if hasattr(a, "_zipp_graph"):
+        return a.__add__((b * alpha))
+    if hasattr(b, "_zipp_graph"):
+        return (b * alpha).__radd__(a)
     if alpha != 1:
         b = mul(b, alpha)
     return _binary("add", a, b, "Add", lambda g, x, y, o: (_unbroadcast(g, x.shape), _unbroadcast(g, y.shape)))
 
 
 def sub(a, b, alpha=1):
+    if hasattr(a, "_zipp_graph"):
+        return a.__sub__((b * alpha))
+    if hasattr(b, "_zipp_graph"):
+        return (b * alpha).__rsub__(a)
     if alpha != 1:
         b = mul(b, alpha)
     return _binary("sub", a, b, "Sub", lambda g, x, y, o: (_unbroadcast(g, x.shape), _unbroadcast(neg(g), y.shape)))
 
 
 def mul(a, b):
+    if hasattr(a, "_zipp_graph"):
+        return a.__mul__(b)
+    if hasattr(b, "_zipp_graph"):
+        return b.__rmul__(a)
     return _binary("mul", a, b, "Mul", lambda g, x, y, o: (_unbroadcast(mul(g, y), x.shape), _unbroadcast(mul(g, x), y.shape)))
 
 
@@ -1168,6 +1211,8 @@ def _silu_grad(x):
 
 
 def relu(a):
+    if getattr(a, "_zipp_graph", False):
+        return a.relu()
     return _unary("relu", a, "Relu", lambda g, x, o: mul(g, (x > 0).to(g.dtype)))
 
 
@@ -1273,6 +1318,8 @@ def _expand_back(g, a_shape, dims, keepdim):
 
 
 def sum(a, dim=None, keepdim=False, dtype=None):
+    if hasattr(a, "_zipp_graph"):
+        return a.sum(dim, keepdim, dtype)
     if dtype is not None:
         a = a.to(dtype)
     dims = _dims_arg(dim, _len(a.shape))
@@ -1285,6 +1332,8 @@ def sum(a, dim=None, keepdim=False, dtype=None):
 
 
 def mean(a, dim=None, keepdim=False, dtype=None):
+    if hasattr(a, "_zipp_graph"):
+        return a.mean(dim, keepdim, dtype)
     if dtype is not None:
         a = a.to(dtype)
     if not a.dtype.is_floating_point:
@@ -1868,6 +1917,10 @@ def nonzero(a):
 
 # ---- linear algebra ----------------------------------------------------------------------
 def matmul(a, b):
+    if getattr(a, "_zipp_graph", False):
+        return a @ b
+    if getattr(b, "_zipp_graph", False):
+        return b.__rmatmul__(a)
     ta, tb = _as_tensor(a), _as_tensor(b)
     storage, shape = _k.matmul(ta._s, ta.shape, tb._s, tb.shape)
     out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])

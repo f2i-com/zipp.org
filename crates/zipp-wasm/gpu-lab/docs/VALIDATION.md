@@ -1,95 +1,56 @@
-# Validation record: 13 September 2026
+# Validation and reproduction
 
-## Executed successfully
+The runtime is integrated into the Python-enabled Zipp WASM playground. The
+original standalone report is preserved in [the historical archive](validation-archive-20260913.md),
+along with its raw reports. Those old environment restrictions do not describe
+current source integration.
 
-| Check | Actual result | Evidence |
-|---|---|---|
-| Node test runner | 57 passed, 0 failed | node-tests.tap |
-| Python unittest | 12 passed | python-tests.txt |
-| Native Python -> host Node -> compiled WASM | Vector output `[14,44,94,164]`, sum `316` | native-python-wasm.txt |
-| Native Python -> host JavaScript reference | Same expected output | native-python-js.txt |
-| Chromium: actual WASM runtime | 15 numerical checks passed | browser-validation.json |
-| Chromium: JavaScript reference | 15 numerical checks passed | browser-validation.json |
-| JavaScript syntax checks | All `.mjs` / `.js` files passed `node --check` | command below |
-| Demo visual inspection | Desktop layout inspected; no horizontal overflow at 390px | demo-layout.png and browser-validation.json |
+Current checks are separated by what they establish:
 
-Node was v22.16.0. Python was 3.13.5. Chromium was 144.0.7559.96.
-The included 3,521-byte WASM module was built with Clang 17.0.0 and wasm-ld from
-`wasm/kernels.c`, using `scripts/build_wasm.sh`. It has no WebAssembly imports.
+| Check | Coverage |
+|---|---|
+| `npm test` in gpu-lab | JS/WASM numerical behavior, validators, adapter contracts, WebGPU lifecycle mocks, WebGL texture-budget bookkeeping |
+| `python tests/test_python.py` | Native Python graph construction/export |
+| `node ../tests/node/python-frontend.cjs` | Actual Python-enabled WASM ABI, projects, VFS mutations and dictionary conversion |
+| `node ../tests/node/python-gpu.cjs` | Actual Python-to-host graph requests and JS/WASM evaluation |
+| `landing/scripts/smoke-browser.py`, `REQUIRE_GPU=1` | Served playground, folder loading, examples, real hardware WebGL2/WebGPU and animation |
+| `tests/browser-cases.mjs` in the diagnostic demo | 15 numerical cases per selected browser backend |
 
-The 57 Node tests include seven WebGPU **API/lifecycle mock** tests. Those verify
-host-side contracts such as bounds-guard generation, reduction scratch cleanup,
-readback mapping failure cleanup, compilation rejection cleanup and device-loss
-handling. They do not compile shaders, emulate shader execution, or establish GPU
-numerical correctness. The remaining Node tests exercise real JS/WASM computation,
-graph validation, and mock ZIPP callback/queue contracts.
+The Python CI lane in `.github/workflows/ci.yml` builds the Python feature explicitly,
+checks the artifact profile before running its boundary tests, and runs the native
+VM/CLI Python tests. Existing workflow triggers remain manual/reusable while the
+repository's automatic CI pause is in effect.
 
-The small MLP example's expected values were also independently checked with NumPy
-in the development environment. NumPy is not a project dependency and is not bundled.
+GPU correctness has been checked locally with RTX 5090 hardware; the browser
+reports WebGL2 through ANGLE/D3D11 and WebGPU through the Blackwell adapter.
+Portable mocks do not compile shaders. Unavailable GPU checks must be reported
+as unavailable, never silently replaced by a CPU pass.
 
-## Not verified
+For repeatable browser checks, build the landing page, start its preview, and run
+`python landing/scripts/smoke-browser.py http://127.0.0.1:4173` from the repository
+root with `REQUIRE_GPU=1`. This requires Chrome and Python Playwright.
+The diagnostic demo provides **Check all backends** for the full numerical matrix.
 
-**WebGPU shader execution:** unavailable here. The local-source Chromium test had
-no `navigator.gpu` on its about:blank execution origin. No real GPU adapter result,
-hardware throughput, WGSL compilation pass, or WebGPU device test is claimed.
+Timings and GIFs are functional demonstrations, not performance benchmarks.
+Shader compilation, transfers, driver memory and thermal/load differences affect
+results. `maxLogicalBytes` and WebGL's explicit texture-byte ceiling are different
+budgets; neither measures the entire browser's memory usage.
 
-**WebGL2 shader execution:** the environment could not create a WebGL2 context,
-including an attempted local software-renderer probe. No GLSL compilation pass or
-WebGL2 numerical result is claimed. Its source backend needs the demo's checks on
-an actual available context with floating-point render targets.
+## Local acceptance — 13 September 2026
 
-**Actual ZIPP WASM / private zipp-python integration:** not run. Private source and
-an authenticated repository connection were unavailable, and no current upstream
-runtime binary was obtained. The adapter tests use mock Engine/queue objects, not
-an actual ZIPP Engine. The Python library was executed in native CPython only.
+Windows / Chrome 152 / NVIDIA GeForce RTX 5090:
 
-**Real-origin demo Worker/HTTP integration:** not run inside Chromium. Browser
-navigation to the local server was blocked by the environment's managed policy.
-The policy was not changed or bypassed. The local smoke harness executes bundled
-project code directly in a page with `set_content` / `evaluate`, with the actual
-included WASM bytes supplied in memory. This validates browser runtime maths but
-not native ES-module loading, the served origin, or Worker startup.
+- 60 Node GPU contract tests and 12 native Python graph tests passed.
+- Rebuilt default Python WASM: 57 frontend and 27 GPU boundary checks passed,
+  including compiled Torch models and functional operations with CPU constants.
+- 15 numerical cases each passed on actual WebGL2 and WebGPU hardware.
+- Production landing build, 9 landing tests, folder/reload/arguments, browser VFS
+  mutations, embedded Python, mobile layout, animation controls, Life and Torch
+  inference passed. Torch predictions matched eager inference on WASM/WebGL2/WebGPU.
+- 26 native Python VM tests passed; CLI tests and the new project regressions passed.
+- Opt-in language interoperability passed 2 native tests and the WASM instance
+  checks. The ordinary Python WASM build correctly rejects that optional module.
+- All edited Rust files pass rustfmt. Repository-wide `cargo fmt --all -- --check`
+  still reports pre-existing formatting differences in unrelated engine files.
 
-The visual screenshot is a layout-only rendering of local HTML/CSS. It is not a
-screenshot of a successful GPU run or a proof of browser UI interaction coverage.
-
-## Reproduction
-
-From the project directory:
-
-```sh
-python examples/build_examples.py
-node --test tests/*.test.mjs
-python -m unittest discover -s tests -p 'test_python.py'
-python examples/run_native.py
-python examples/run_native.py cpu-js
-```
-
-Optional local-source browser checks:
-
-```sh
-python scripts/browser_smoke.py
-```
-
-That command requires Playwright and an installed Chromium executable. It may mark
-WebGPU unavailable because its test page has no secure HTTP origin. Do not use that
-absence as proof that WebGPU is unavailable in an ordinary localhost/HTTPS browser.
-
-For the missing acceptance step, serve the actual project:
-
-```sh
-python scripts/serve.py
-```
-
-Open `http://localhost:8765/demo/` in the target browser, select WebGPU explicitly,
-run examples and **Check all backends**, then save the report. Repeat on WebGL2.
-A supported backend must pass numerical checks; an unavailable backend is a skip,
-not success. A shader/numerical failure must remain a failure and never fall back
-silently to CPU to make the test green.
-
-## Performance interpretation
-
-The recorded wall times are smoke-test measurements, not benchmarks or speedup
-claims. Browser-local tests ran in a shared environment. Shader compilation,
-GPU timestamps, real hardware execution, CPU-to-GPU bandwidth, steady-state GPU
-residency, and comparisons against optimized tensor libraries were not measured.
+These are local results. The updated manual/reusable CI lane has not been run on GitHub.

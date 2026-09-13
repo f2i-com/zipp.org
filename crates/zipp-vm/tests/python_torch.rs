@@ -73,3 +73,40 @@ print(h.shape, F.softmax(torch.tensor([1.0, 2.0, 3.0]), 0).sum().item())
         ]
     );
 }
+
+#[test]
+fn compiled_inference_records_graphs_and_preserves_cpu_torch() {
+    let output = run(r#"
+import torch
+import torch.nn as nn
+model = nn.Sequential(nn.Linear(2, 3), nn.ReLU(), nn.Linear(3, 1))
+with torch.no_grad():
+    for parameter in model.parameters():
+        parameter.fill_(0.5)
+x = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+expected = model(x).tolist()
+pending = torch.compile(model)(x)
+print(pending.shape)
+def done(value):
+    print(value.tolist() == expected, pending.backend)
+pending.submit(done)
+@torch.compile
+def square_sum(a):
+    return (a * a + 1.0).sum()
+square_sum(x).submit(lambda value: print(value.item()))
+for action in [lambda: torch.tensor([1.0], device='cuda'), lambda: x.to('gpu'), lambda: model.to('cuda'), lambda: torch.device('cuda')]:
+    try:
+        action()
+    except RuntimeError:
+        print('unsupported device rejected')
+try:
+    pending.backward()
+except NotImplementedError:
+    print('inference only')
+"#).unwrap();
+    assert_eq!(output[0], "torch.Size([2, 1])");
+    assert!(output[1].starts_with("True "));
+    assert_eq!(output[2], "34.0");
+    assert_eq!(&output[3..7], ["unsupported device rejected"; 4]);
+    assert_eq!(output[7], "inference only");
+}

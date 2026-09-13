@@ -14,5 +14,5 @@
 <g fill="none" stroke="#a3a5d6" stroke-width="2" marker-end="url(#arrow)"><path d="M334 212h43"/><path d="M676 212h43"/><path d="M1018 212h43"/><path d="M1210 292v31H870v-30"/></g>
 <text x="48" y="337" fill="#e5e0fe" font-size="17">Python control flow executes in ZIPP. Supported graph operations execute on the GPU.</text>
 <text x="918" y="352" fill="#92ddc4" font-size="14">Named outputs → Python callback</text>
-<text x="48" y="382" fill="#8f9daf" font-size="15">The full NCA lab is a separate path: native CPython + PyTorch/CUDA → browser WebGL2 visualization.</text>
+<text x="48" y="382" fill="#8f9daf" font-size="15">Game of Life: one toroidal grid, GPU-computed generations, and Python callbacks for each new state.</text>
 </g></svg>

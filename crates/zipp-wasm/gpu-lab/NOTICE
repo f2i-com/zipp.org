@@ -1,7 +1,6 @@
-ZIPP Python GPU Lab 0.1.0
-Standalone integration experiment prepared for Lance Baker, September 2026.
+Zipp browser GPU Lab 0.1.0
 
-This archive contains original experiment code and its compiled C/WASM kernels.
-It does not contain source from the private zipp-python repository or a ZIPP/Python
-runtime binary. Referencing the public ZIPP host API does not claim upstream
-integration or endorsement.
+The GPU graph runtime and Python adapter are integrated into the Zipp repository.
+The compiled float32 kernel module comes from wasm/kernels.c under Apache-2.0.
+The diagnostic demo uses pre-exported graphs; the project playground executes
+Python inside the Zipp WASM engine and submits graphs through its JavaScript host.

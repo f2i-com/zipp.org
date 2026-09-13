@@ -85,7 +85,9 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         return run_project(Path::new(&filename), None, &program_args);
     }
-    if !stdin && !bytecode && Path::new(&filename).extension().and_then(|s| s.to_str()) == Some("py")
+    if !stdin
+        && !bytecode
+        && is_python_path(Path::new(&filename))
         && explicit.is_none_or(|language| language == LanguageId::Python)
     {
         let path = Path::new(&filename);
@@ -186,9 +188,122 @@ fn project_root_of(script: &Path) -> std::path::PathBuf {
     own
 }
 
+/// Apply the same extension rules as language detection.
+fn is_python_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("py") || s.eq_ignore_ascii_case("pyw"))
+}
+
+// Windows junctions and other reparse points must not bypass the symlink policy.
+fn is_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+/// Refuse links in every existing component, including the final file.
+/// The trusted CLI assumes another process is not replacing this tree mid-run.
+fn checked_project_path(
+    root: &Path,
+    relative: &str,
+    create_parents: bool,
+) -> Result<std::path::PathBuf, String> {
+    if relative.is_empty()
+        || relative.contains(['\\', ':', '\0'])
+        || relative
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || Path::new(relative)
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(format!("invalid project path: {relative:?}"));
+    }
+    let parts: Vec<_> = relative.split('/').collect();
+    let mut target = root.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        target.push(part);
+        let parent = i + 1 < parts.len();
+        match std::fs::symlink_metadata(&target) {
+            Ok(metadata) => {
+                if is_link(&metadata) {
+                    return Err(format!(
+                        "project path contains a symlink or reparse point: {}",
+                        target.display()
+                    ));
+                }
+                if parent && !metadata.is_dir() {
+                    return Err(format!("not a project directory: {}", target.display()));
+                }
+                if !parent && !metadata.is_file() {
+                    return Err(format!("not a regular project file: {}", target.display()));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if parent && create_parents {
+                    std::fs::create_dir(&target)
+                        .map_err(|e| format!("{}: {e}", target.display()))?;
+                }
+            }
+            Err(error) => return Err(format!("{}: {error}", target.display())),
+        }
+    }
+    Ok(target)
+}
+
+fn write_project_changes(root: &Path, listing: &str) -> Result<(), String> {
+    let envelope: serde_json::Value =
+        serde_json::from_str(listing).map_err(|e| format!("invalid VFS changes: {e}"))?;
+    if envelope.get("version").and_then(|v| v.as_u64()) != Some(1) {
+        return Err("unsupported VFS change version".into());
+    }
+    let changes = envelope
+        .get("changes")
+        .and_then(|v| v.as_array())
+        .ok_or("missing VFS changes")?;
+    for change in changes {
+        let relative = change
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("missing VFS path")?;
+        let deleted = change.get("deleted").and_then(|v| v.as_bool()) == Some(true);
+        let data = change.get("base64").and_then(|v| v.as_str());
+        if deleted == data.is_some() {
+            return Err("VFS change needs exactly one of deletion or data".into());
+        }
+        let target = checked_project_path(root, relative, !deleted)?;
+        if deleted {
+            match std::fs::remove_file(&target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("{}: {error}", target.display())),
+            }
+        } else {
+            let bytes = decode_base64(data.unwrap()).ok_or("invalid VFS base64")?;
+            std::fs::write(&target, bytes).map_err(|e| format!("{}: {e}", target.display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Folders never read into a project's virtual filesystem.
 const SKIPPED_DIRS: &[&str] = &[
-    ".git", "__pycache__", "node_modules", "target", ".venv", "venv", ".idea", ".vscode", "dist",
+    ".git",
+    "__pycache__",
+    "node_modules",
+    "target",
+    ".venv",
+    "venv",
+    ".idea",
+    ".vscode",
+    "dist",
 ];
 /// Per-file and total ceilings of the virtual filesystem (larger files are
 /// left out with a note, not an error).
@@ -198,7 +313,11 @@ const MODULE_LIMIT: u64 = 1024 * 1024;
 
 /// Every file under `root` (recursively, skipping tool folders), as
 /// root-relative `/`-separated paths.
-fn collect_tree(root: &Path, dir: &Path, out: &mut Vec<(String, std::path::PathBuf)>) -> Result<(), String> {
+fn collect_tree(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, std::path::PathBuf)>,
+) -> Result<(), String> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .filter_map(|e| e.ok())
@@ -206,13 +325,21 @@ fn collect_tree(root: &Path, dir: &Path, out: &mut Vec<(String, std::path::PathB
         .collect();
     entries.sort();
     for path in entries {
-        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("").to_owned();
-        if path.is_dir() {
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_owned();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if is_link(&metadata) {
+            continue;
+        }
+        if metadata.is_dir() {
             if SKIPPED_DIRS.contains(&name.as_str()) || name.starts_with('.') {
                 continue;
             }
             collect_tree(root, &path, out)?;
-        } else if path.is_file() {
+        } else if metadata.is_file() {
             let relative = path
                 .strip_prefix(root)
                 .map_err(|e| e.to_string())?
@@ -228,7 +355,12 @@ fn collect_tree(root: &Path, dir: &Path, out: &mut Vec<(String, std::path::PathB
 
 /// The dotted module name of a root-relative `.py` path.
 fn module_name_of(relative: &str) -> Option<String> {
-    let stem = relative.strip_suffix(".py")?;
+    let path = Path::new(relative);
+    if !is_python_path(path) {
+        return None;
+    }
+    let extension = path.extension()?.to_str()?;
+    let stem = &relative[..relative.len() - extension.len() - 1];
     let stem = stem.strip_suffix("/__init__").unwrap_or(stem);
     let name = stem.replace('/', ".");
     let valid = !name.is_empty()
@@ -245,12 +377,15 @@ fn module_name_of(relative: &str) -> Option<String> {
 /// filesystem, `script` (or `main.py`) is the entry, and files the program
 /// writes are written back under `root` when it finishes.
 fn run_project(root: &Path, script: Option<&Path>, argv: &[String]) -> Result<(), String> {
+    let canonical_root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+    let root = canonical_root.as_path();
     let mut tree = Vec::new();
     collect_tree(root, root, &mut tree)?;
     let entry = match script {
         Some(script) => {
             let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            let canonical_script = std::fs::canonicalize(script).unwrap_or_else(|_| script.to_path_buf());
+            let canonical_script =
+                std::fs::canonicalize(script).unwrap_or_else(|_| script.to_path_buf());
             let relative = canonical_script
                 .strip_prefix(&canonical_root)
                 .map_err(|_| format!("{}: not under {}", script.display(), root.display()))?
@@ -277,13 +412,26 @@ fn run_project(root: &Path, script: Option<&Path>, argv: &[String]) -> Result<()
             .join("/");
         (!rel.is_empty()).then(|| rel + "/")
     });
+    // Load source before unrelated data, and the entry folder first. A large
+    // checkout must not exhaust the VFS budget before its requested script.
+    tree.sort_by_key(|(relative, _)| {
+        let in_entry_folder = script_dir_prefix
+            .as_ref()
+            .map_or(!relative.contains('/'), |prefix| {
+                relative.starts_with(prefix)
+            });
+        (!in_entry_folder, !is_python_path(Path::new(relative)))
+    });
     let mut modules = Vec::new();
     let mut files = Vec::new();
     let mut total = 0u64;
     let mut skipped = Vec::new();
     for (relative, path) in tree {
-        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let is_py = relative.ends_with(".py");
+        checked_project_path(root, &relative, false)?;
+        let size = std::fs::symlink_metadata(&path)
+            .map_err(|e| e.to_string())?
+            .len();
+        let is_py = is_python_path(Path::new(&relative));
         if size > VFS_FILE_LIMIT || (is_py && size > MODULE_LIMIT) {
             skipped.push(relative);
             continue;
@@ -295,23 +443,34 @@ fn run_project(root: &Path, script: Option<&Path>, argv: &[String]) -> Result<()
         // A file that cannot be read (gone, locked, unreadable) is left out.
         let mut bytes = Vec::new();
         let readable = std::fs::File::open(&path)
-            .and_then(|mut f| f.read_to_end(&mut bytes))
+            .and_then(|f| f.take(VFS_FILE_LIMIT + 1).read_to_end(&mut bytes))
             .is_ok();
         if !readable {
-            if relative.ends_with(".py") {
+            if is_py {
                 skipped.push(relative);
             }
             continue;
         }
+        if bytes.len() as u64 > VFS_FILE_LIMIT
+            || total + bytes.len() as u64 > VFS_TOTAL_LIMIT
+            || (is_py && bytes.len() as u64 > MODULE_LIMIT)
+        {
+            skipped.push(relative);
+            continue;
+        }
         total += bytes.len() as u64;
         if is_py {
-            if let (Some(name), Ok(source)) = (module_name_of(&relative), std::str::from_utf8(&bytes)) {
+            if let (Some(name), Ok(source)) =
+                (module_name_of(&relative), std::str::from_utf8(&bytes))
+            {
                 modules.push((name, source.to_owned()));
                 if let Some(prefix) = &script_dir_prefix {
-                    if let Some(bare) = relative.strip_prefix(prefix.as_str()).and_then(module_name_of) {
-                        if !bare.contains('.') || true {
-                            modules.push((bare, source.to_owned()));
-                        }
+                    if let Some(bare) = relative
+                        .strip_prefix(prefix.as_str())
+                        .and_then(module_name_of)
+                    {
+                        // Nested package aliases are intentional: the script folder is first.
+                        modules.push((bare, source.to_owned()));
                     }
                 }
             }
@@ -328,7 +487,12 @@ fn run_project(root: &Path, script: Option<&Path>, argv: &[String]) -> Result<()
         eprintln!(
             "zipp: {} file(s) left out of the project (over the size limits): {}",
             skipped.len(),
-            skipped.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            skipped
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     let mut compiled = compile_python_program(&entry, &modules, &files, argv, false)?;
@@ -344,29 +508,7 @@ fn run_project(root: &Path, script: Option<&Path>, argv: &[String]) -> Result<()
     if let Ok(zipp_vm::embed::JsValue::String(listing)) =
         state.call_global("__zipp_py_vfs_changed", &[])
     {
-        for line in listing.lines() {
-            let Some((relative, data)) = line.split_once('\t') else {
-                continue;
-            };
-            if relative.is_empty()
-                || relative.starts_with('/')
-                || relative.split('/').any(|part| part == ".." || part.is_empty())
-            {
-                eprintln!("zipp: not writing {relative:?}: outside the project");
-                continue;
-            }
-            let bytes = match decode_base64(data) {
-                Some(b) => b,
-                None => continue,
-            };
-            let target = root.join(relative);
-            if let Some(parent) = target.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(e) = std::fs::write(&target, bytes) {
-                eprintln!("zipp: could not write {}: {e}", target.display());
-            }
-        }
+        write_project_changes(root, &listing)?;
     }
     outcome.map(|_| ())
 }
@@ -392,4 +534,41 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+#[cfg(all(test, unix))]
+mod containment_tests {
+    use super::*;
+    #[test]
+    fn links_are_omitted_and_write_targets_are_refused() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!(
+            "zipp-link-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = base.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(base.join("fixture-target")).unwrap();
+        std::fs::write(root.join("main.py"), "print(1)").unwrap();
+        std::fs::write(base.join("fixture-target/data"), "fixture").unwrap();
+        symlink(base.join("fixture-target"), root.join("linked-dir")).unwrap();
+        symlink(base.join("fixture-target/data"), root.join("linked-file")).unwrap();
+        symlink(&root, root.join("cycle")).unwrap();
+        let mut tree = Vec::new();
+        collect_tree(&root, &root, &mut tree).unwrap();
+        assert_eq!(tree.len(), 1);
+        for path in ["linked-dir/data", "linked-file", "cycle/new.txt"] {
+            assert!(checked_project_path(&root, path, true).is_err());
+            assert!(checked_project_path(&root, path, false).is_err());
+        }
+        assert_eq!(
+            std::fs::read_to_string(base.join("fixture-target/data")).unwrap(),
+            "fixture"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
 }

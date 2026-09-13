@@ -1,7 +1,7 @@
 """Capture actual local runs for the README and landing page.
 
 Requires Python Playwright, installed Chrome, ffmpeg on PATH, the Python-enabled
-WASM build and the sibling NCA lab with CUDA PyTorch. No synthetic model frames.
+WASM build and hardware WebGL2. No synthetic model frames.
 Run from repository root: python crates/zipp-wasm/playground/capture-demos.py
 """
 import hashlib
@@ -62,7 +62,7 @@ def main():
             for _ in range(100):
                 if server.poll() is not None:
                     raise RuntimeError('Capture server failed to start')
-                if f'native GPU lab: {base}/' in (frames / 'server.log').read_text():
+                if f'zipp playground: {base}/' in (frames / 'server.log').read_text():
                     owned = True
                     break
                 time.sleep(.1)
@@ -92,49 +92,16 @@ def main():
                 clips = {'python-life': capture(page, 'python-life', frames)}
                 page.locator('#stop').click()
 
-                page.set_viewport_size(dict(width=1400, height=1200))
-                page.goto(base + '/crates/zipp-wasm/playground/nca.html')
-                page.wait_for_function("!document.querySelector('#run').disabled", timeout=75000)
-                status = page.request.get(base + '/api/nca/status').json()
-                devices = [d['id'] for d in status['devices'] if d['usable']]
-                if not devices:
-                    raise RuntimeError('Need at least one verified CUDA device for NCA recordings')
-                headers = {'content-type': 'application/json', 'x-nca-token': status['token']}
-                for d in devices[:2]:
-                    page.locator(f'#devices input[value="{d}"]').check()
-                run = page.request.post(base + '/api/nca/run', headers=headers, data=dict(mode='memory', devices=devices[:2], frameMs=500))
-                assert run.status == 202
-                page.wait_for_function("document.querySelector('#frame-status').textContent.includes('write 1')", timeout=60000)
-                clips['nca-memory'] = capture(page, 'nca-memory', frames, seconds=10)
-                page.wait_for_function("!document.querySelector('#run').disabled", timeout=60000)
-                memory_results = page.request.get(base + '/api/nca/status').json()['jobs']
-                assert all(j['state'] == 'complete' and j['result']['sharedWeightsUnchanged'] for j in memory_results)
-
-                page.locator('#mode').select_option('language')
-                page.locator('#bytes').fill('100')
-                page.locator('#run').click()
-                page.wait_for_function("document.querySelector('#frame-status').textContent.includes('generation')", timeout=60000)
-                clips['nca-language'] = capture(page, 'nca-language', frames, seconds=12)
-                page.wait_for_function("!document.querySelector('#run').disabled", timeout=60000)
-                assert all(j['state'] == 'complete' for j in page.request.get(base + '/api/nca/status').json()['jobs'])
                 if errors:
                     raise RuntimeError(str(errors))
-                tracked_sources = ['crates/zipp-wasm/playground/native_lab.py', 'crates/zipp-wasm/playground/nca-renderer.mjs', 'examples/python/gpu/main.py']
+                tracked_sources = ['examples/python/gpu/main.py', 'crates/zipp-wasm/playground/engine.worker.js']
                 provenance = dict(capturedAtUtc=stamp, browser=browser.version, wasmProfile=profile,
-                    torch=status['torch'], cuda=status['cuda'],
-                    devices=[{key: value for key, value in device.items() if key != 'uuid'} for device in status['devices']], clips=clips,
+                    backend=gpu_log, clips=clips,
                     sourceSha256={name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in tracked_sources},
-                    note='Actual local browser captures. Python Life runs in Zipp WASM and submits WebGL2 graphs; NCA runs in native CPython/PyTorch CUDA. GIFs are demonstrations, not benchmarks.')
+                    note='Actual local browser captures. Python Life runs in Zipp WASM and submits WebGL2 graphs. GIFs are demonstrations, not benchmarks.')
                 (OUT / 'provenance.json').write_text(json.dumps(provenance, indent=2), encoding='utf-8')
                 browser.close()
         finally:
-            if owned and server.poll() is None:
-                try:
-                    status = json.load(urllib.request.urlopen(base + '/api/nca/status', timeout=5))
-                    req = urllib.request.Request(base + '/api/nca/stop', data=b'{}', headers={'Content-Type': 'application/json', 'X-Nca-Token': status['token']})
-                    urllib.request.urlopen(req, timeout=3).close()
-                except OSError:
-                    pass
             server.terminate()
             server.wait(timeout=10)
 

@@ -942,8 +942,8 @@ function App() {
 
             <p className="hero-intro">
               A Rust engine with JavaScript and experimental Python, a WebAssembly
-              playground, and a local GPU lab.
-              <strong> Write code, run it, and watch actual model state change.</strong>
+              playground, and browser GPU compute.
+              <strong> Write code, run it, and watch your simulations come alive.</strong>
             </p>
 
             <div className="hero-actions">
@@ -1343,7 +1343,7 @@ function App() {
       <footer className="site-footer section-wrap">
         <a className="brand" href="#top" aria-label="Back to top"><Brand /></a>
         <p>
-          Python, JavaScript, WebAssembly &amp; GPU experiments · part of{' '}
+          Python + JavaScript · one VM · browser GPU compute · part of{' '}
           <a href={F2I_URL} target="_blank" rel="noreferrer">f2i.com</a>
         </p>
         <div>

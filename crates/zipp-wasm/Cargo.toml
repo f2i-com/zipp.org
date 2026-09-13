@@ -57,3 +57,4 @@ default = []
 # `Engine.initSource(source, "python")`: the experimental Python-subset
 # frontend (docs/PYTHON_FRONTEND_EXPERIMENT.md).
 python = ["zipp-vm/python"]
+python-js-interop = ["python", "zipp-vm/python-js-interop"]

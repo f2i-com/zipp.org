@@ -16,6 +16,7 @@ const SKIP_DIRS = new Set([".git", "__pycache__", "node_modules", "target", ".ve
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_PROJECT_BYTES = 64 * 1024 * 1024;
 const SAMPLES = {
+  torch: { name: "torch-inference", entry: "main.py", base: "../../../examples/python/torch_gpu/", files: ["main.py"] },
   python: { name: "python-balls", entry: "main.py", base: "../../../examples/python/project/", files: ["main.py", "physics.py"] },
   javascript: { name: "js-balls", entry: "main.js", base: "../../../examples/js/project/", files: ["physics.js", "main.js"] },
   ant: { name: "langtons-ant", entry: "main.py", base: "../../../examples/python/langtons_ant/", files: ["main.py", "rules.py"] },
@@ -578,9 +579,10 @@ function programArgs() {
 // Files the program wrote: shown in the tree (tagged) and openable.
 function applyWrittenFiles(list) {
   if (!Array.isArray(list) || list.length === 0) return;
-  for (const { path, base64 } of list) {
+  for (const { path, base64, deleted } of list) {
     if (typeof path !== "string" || !path) continue;
-    if (base64 === "") { project.files.delete(path); project.written.delete(path); continue; }
+    if (deleted === true) { project.files.delete(path); project.written.delete(path); continue; }
+    if (typeof base64 !== 'string') continue;
     const bytes = base64ToBytes(base64);
     const text = decodeUtf8(bytes);
     project.files.set(path, text === null ? { bytes } : text);

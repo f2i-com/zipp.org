@@ -1,4 +1,4 @@
-import {check, ComputeError} from '../graph.mjs';
+import {check, ComputeError, DEFAULT_LIMITS} from '../graph.mjs';
 
 /** Fragment-shader compute using RGBA32F textures. One scalar occupies the red channel. */
 export class WebGL2Backend {
@@ -23,6 +23,7 @@ export class WebGL2Backend {
   constructor(gl,canvas) {
     this.name='webgl2';this.description='WebGL2 fragment shaders on RGBA32F textures';
     this.gl=gl;this.canvas=canvas;this.programs=new Map();this.lost=false;
+    this.textureBytes=0;this.peakTextureBytes=0;this.maxTextureBytes=DEFAULT_LIMITS.maxWebGLTextureBytes;
     const debug=gl.getExtension('WEBGL_debug_renderer_info');
     this.info={description:String(gl.getParameter(debug?debug.UNMASKED_RENDERER_WEBGL:gl.RENDERER)),
       vendor:String(gl.getParameter(debug?debug.UNMASKED_VENDOR_WEBGL:gl.VENDOR)),powerPreference:gl.getContextAttributes()?.powerPreference};
@@ -34,11 +35,14 @@ export class WebGL2Backend {
     gl.disable(gl.DEPTH_TEST);gl.disable(gl.BLEND);gl.disable(gl.DITHER);gl.bindVertexArray(this.vao);
   }
   live(){check(!this.lost&&!this.gl.isContextLost(),'DEVICE_LOST','WebGL context is lost');}
-  async begin(){this.live();}
+  async begin(plan){this.live();this.maxTextureBytes=plan?.limits.maxWebGLTextureBytes??DEFAULT_LIMITS.maxWebGLTextureBytes;this.peakTextureBytes=this.textureBytes;}
+  allocationStats(){return {webglTexturePeakBytes:this.peakTextureBytes};}
   alloc(size,data) {
     this.live();const gl=this.gl;
     const width=Math.min(size,1024,this.maxWidth),height=Math.ceil(size/width);
     check(height<=this.maxHeight,'LIMIT','Tensor exceeds WebGL texture/viewport limits');
+    const bytes=width*height*16;
+    check(this.textureBytes+bytes<=this.maxTextureBytes,'LIMIT','WebGL texture allocation budget exceeded (RGBA32F, padding and scratch included)');
     const texture=gl.createTexture();check(texture,'GPU','WebGL texture allocation failed');
     gl.bindTexture(gl.TEXTURE_2D,texture);
     gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
@@ -50,7 +54,8 @@ export class WebGL2Backend {
     gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,width,height,0,gl.RGBA,gl.FLOAT,rgba);
     const error=gl.getError();
     if(error!==gl.NO_ERROR){gl.deleteTexture(texture);throw new ComputeError('GPU',`Texture allocation error ${error}`);}
-    return {texture,width,height,size};
+    this.textureBytes+=bytes;this.peakTextureBytes=Math.max(this.peakTextureBytes,this.textureBytes);
+    return {texture,width,height,size,bytes,freed:false};
   }
   shader(type,code) {
     const gl=this.gl,s=gl.createShader(type);check(s,'GPU','Shader allocation failed');
@@ -136,7 +141,7 @@ export class WebGL2Backend {
     check(gl.getError()===gl.NO_ERROR,'GPU','WebGL float readback failed');
     const result=new Float32Array(h.size);for(let i=0;i<h.size;i++)result[i]=rgba[i*4];return result;
   }
-  free(h){this.gl.deleteTexture(h.texture);}
+  free(h){if(!h.freed){this.gl.deleteTexture(h.texture);this.textureBytes-=h.bytes;h.freed=true;}}
   async finish(){this.live();}
   dispose(){const gl=this.gl;for(const p of this.programs.values())gl.deleteProgram(p);this.programs.clear();gl.deleteFramebuffer(this.framebuffer);gl.deleteVertexArray(this.vao);gl.getExtension('WEBGL_lose_context')?.loseContext();}
 }

@@ -177,15 +177,15 @@ if (languages.includes("python")) {
       "['run.py', '--steps', '7'] 21 fast 42 extra",
       "300 b'\\x00\\x01\\x02' 43 ['config.json', 'model.bin']",
     ]);
-    const written = String(lab.pythonCall("__zipp_py_vfs_changed", [])).split("\n").filter(Boolean).map((l) => l.split("\t"));
-    eq("written files come back as path and base64", written.map(([p]) => p).sort(), ["out/copy.bin", "out/result.json"]);
-    const result = Object.fromEntries(written);
+    const written = JSON.parse(lab.pythonCall("__zipp_py_vfs_changed", [])).changes;
+    eq("written files come back as path and base64", written.map(f => f.path).sort(), ["out/copy.bin", "out/result.json"]);
+    const result = Object.fromEntries(written.map(f => [f.path, f.base64]));
     eq("a written text file decodes", JSON.parse(Buffer.from(result["out/result.json"], "base64").toString()), { argv: ["--steps", "7"], total: 300 });
     eq("a written binary file keeps its bytes", [...Buffer.from(result["out/copy.bin"], "base64")], [0, 1, 2, 3]);
-    eq("reporting clears the change set", lab.pythonCall("__zipp_py_vfs_changed", []), "");
+    eq("reporting clears the change set", JSON.parse(lab.pythonCall("__zipp_py_vfs_changed", [])), {version: 1, changes: []});
     lab.pythonCall("draw", []);
-    const again = String(lab.pythonCall("__zipp_py_vfs_changed", [])).split("\n").filter(Boolean);
-    ok("a frame's writes are reported on the next call", again.length === 1 && again[0].startsWith("out/frame.txt\t"), again.join("|"));
+    const again = JSON.parse(lab.pythonCall("__zipp_py_vfs_changed", [])).changes;
+    ok("a frame's writes are reported on the next call", again.length === 1 && again[0].path === "out/frame.txt", again.join("|"));
     lab.dispose();
 
     const badBinary = new Engine();
@@ -199,6 +199,28 @@ if (languages.includes("python")) {
     const testOut = tests.takeFailedConsole().map((e) => e.text).join("\n");
     ok("the test report survives the failed initialization through takeFailedConsole", /test_math PASSED/.test(testOut) && /1 failed, 1 passed/.test(testOut), testOut);
     eq("takeFailedConsole drains", tests.takeFailedConsole(), []);
+  }
+
+  {
+    const fs = new Engine();
+    fs.initPythonProject({"main.py": 'import os\nopen("empty.txt", "w").close()\nopen("truncate.txt", "w").close()\nos.remove("delete.txt")\nos.rename("rename.txt", "renamed.txt")\n',
+      "truncate.txt": "old", "delete.txt": "old", "rename.txt": "moved"}, "main.py", []);
+    const changes = JSON.parse(fs.pythonCall("__zipp_py_vfs_changed", []));
+    eq("explicit versioned VFS changes", changes.version, 1);
+    const byPath = Object.fromEntries(changes.changes.map(f => [f.path, f]));
+    eq("create an empty file", byPath['empty.txt'], {path:'empty.txt',base64:''});
+    eq("truncate to empty", byPath['truncate.txt'], {path:'truncate.txt',base64:''});
+    eq("remove file", byPath['delete.txt'], {path:'delete.txt',deleted:true});
+    eq("rename removes old path", byPath['rename.txt'], {path:'rename.txt',deleted:true});
+    eq("rename retains contents", byPath['renamed.txt'], {path:'renamed.txt',base64:'bW92ZWQ='});
+    fs.dispose();
+    const dict = new Engine();
+    dict.initPythonProject({"main.py": 'def payload():\n    return {"__proto__": {"tag": 42}, "constructor": 7}\n'}, "main.py", []);
+    const value = dict.pythonCall('payload', []);
+    ok("Python dict keeps an own __proto__ key", Object.hasOwn(value, '__proto__'));
+    eq("Python dict preserves special-name values", [value.__proto__.tag, value.constructor], [42, 7]);
+    ok("Python dict values do not become inherited properties", !('tag' in value));
+    dict.dispose();
   }
 
   const badProject = new Engine();

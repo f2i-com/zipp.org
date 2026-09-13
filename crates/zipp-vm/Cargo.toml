@@ -36,6 +36,8 @@ self_cell = "1.3.0"
 # Pulls in the RustPython parser and `instrument` (Python states run with the
 # VM JIT disabled). Off by default so the JavaScript engine is unchanged.
 python = ["dep:rustpython-parser", "instrument"]
+# Trusted mixed-language programs sharing one VM scope; deliberately opt-in.
+python-js-interop = ["python"]
 # Native x86-64 and ARM64 JIT tiers (dynasm). On by default on supported targets; the
 # `codegen` module is `#[cfg(feature = "jit")]` so a `--no-default-features`
 # build is a pure interpreter with no unsafe codegen.

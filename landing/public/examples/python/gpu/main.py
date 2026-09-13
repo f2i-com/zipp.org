@@ -7,8 +7,8 @@
 import ui
 from zipp_gpu import Graph
 
-SIZE = 64
-CELL = 6
+SIZE = 96
+CELL = 4
 ui.canvas(SIZE * CELL, SIZE * CELL + 40)
 
 
@@ -47,11 +47,41 @@ n.submit(show("mlp"), result=hidden @ w2)
 class Life:
     def __init__(self):
         self.cells = [0.0] * (SIZE * SIZE)
-        for yy, xx in [(1, 2), (2, 3), (3, 1), (3, 2), (3, 3), (30, 30), (30, 31), (30, 32), (31, 30), (31, 31), (31, 32)]:
-            self.cells[yy * SIZE + xx] = 1.0
-        for i in range(SIZE * 20, SIZE * 24):
-            if (i * 7) % 5 == 0:
-                self.cells[i] = 1.0
+        # A persistent glider gun, pulsar, acorns and a busy central patch.
+        # Patterns share one toroidal world, so their debris and gliders meet.
+        def stamp(x, y, rows):
+            for dy, row in enumerate(rows):
+                for dx, cell in enumerate(row):
+                    if cell == "O":
+                        self.cells[((y + dy) % SIZE) * SIZE + (x + dx) % SIZE] = 1.0
+
+        stamp(3, 3, [
+            "........................O...........",
+            "......................O.O...........",
+            "............OO......OO............OO",
+            "...........O...O....OO............OO",
+            "OO........O.....O...OO..............",
+            "OO........O...O.OO....O.O...........",
+            "..........O.....O.......O...........",
+            "...........O...O....................",
+            "............OO......................",
+        ])
+        stamp(67, 7, [
+            "..OOO...OOO..", ".............", "O....O.O....O",
+            "O....O.O....O", "O....O.O....O", "..OOO...OOO..",
+            ".............", "..OOO...OOO..", "O....O.O....O",
+            "O....O.O....O", "O....O.O....O", ".............", "..OOO...OOO..",
+        ])
+        for x, y in [(12, 55), (58, 65), (76, 45)]:
+            stamp(x, y, [".O.....", "...O...", "OO..OOO"])
+        for x, y in [(28, 29), (62, 32), (30, 72)]:
+            stamp(x, y, [".OO", "OO.", ".O."])
+        seed = 19
+        for y in range(34, 52):
+            for x in range(34, 60):
+                seed = (seed * 1103515245 + 12345) % 2147483648
+                if seed % 100 < 28:
+                    self.cells[y * SIZE + x] = 1.0
         self.generation = 0
         self.pending = False
         self.backend = "?"

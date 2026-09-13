@@ -59,7 +59,7 @@ function __zipp_py_set_input(json) {
         if (v === null || typeof v === "boolean" || typeof v === "string" || typeof v === "number") return v;
         if (typeof v === "bigint") return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v.toString();
         if (v.cls === T.list || v.cls === T.tuple) { const out = []; for (let i = 0; i < v.items.length; i++) out.push(toHost(v.items[i], depth + 1)); return out; }
-        if (v.cls === T.dict) { const o = {}; const entries = rt.dictEntryList(v); for (let i = 0; i < entries.length; i++) o[rt.str(entries[i][0])] = toHost(entries[i][1], depth + 1); return o; }
+        if (v.cls === T.dict) { const o = Object.create(null); const entries = rt.dictEntryList(v); for (let i = 0; i < entries.length; i++) o[rt.str(entries[i][0])] = toHost(entries[i][1], depth + 1); return o; }
         if (v.cls === T.set || v.cls === T.frozenset) { const items = rt.setList(v), out = []; for (let i = 0; i < items.length; i++) out.push(toHost(items[i], depth + 1)); return out; }
         return rt.str(v);
     }
@@ -85,19 +85,18 @@ function __zipp_py_set_input(json) {
             return rt.deliverHost(n, reply);
         }],
         ["__zipp_py_pending_host", function () { return BigInt(rt.pendingHostRequests()); }],
-        // Files the program wrote or removed, one per line: `path<TAB>base64`
-        // (an empty base64 for a removed file). Text or binary alike; the
-        // host decides how to show them.
+        // Versioned JSON distinguishes deletion from an empty file, and escapes
+        // path delimiters. Each change has either deleted:true or base64:string.
         ["__zipp_py_vfs_changed", function () { return rt.vfsChangedText(); }],
         ["__zipp_py_vfs_list", function () { return rt.vfs.list(); }],
     ]);
     rt.vfsChangedText = function () {
-            const lines = [];
+            const changes = [];
             for (const path of rt.vfs.changed()) {
                 const bytes = rt.vfs.get(path);
-                lines.push(path + "\t" + (bytes === undefined ? "" : base64(bytes)));
+                changes.push(bytes === undefined ? { path: path, deleted: true } : { path: path, base64: base64(bytes) });
             }
-            return lines.join("\n");
+            return JSON.stringify({ version: 1, changes: changes });
     };
     const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     function base64(bytes) {

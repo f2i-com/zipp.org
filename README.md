@@ -1,11 +1,11 @@
 <p align="center">
-  <img src="docs/assets/zipp-hero.svg" alt="Zipp — Python, JavaScript, WebAssembly and GPU experiments" width="100%">
+  <img src="docs/assets/zipp-hero.svg" alt="Zipp — two languages, one VM, your GPU" width="100%">
 </p>
 
-<h1 align="center">Zipp: Python, JavaScript &amp; GPU experiments</h1>
+<h1 align="center">Zipp: two languages. One VM. Your GPU.</h1>
 
 <p align="center">
-  <strong>A Rust engine, a browser playground, and a local GPU research lab.</strong>
+  <strong>Write Python or JavaScript. Run natively or in WebAssembly. Give supported compute to the GPU.</strong>
 </p>
 
 <p align="center">
@@ -17,23 +17,34 @@
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#what-runs-where">What runs where</a> ·
-  <a href="#what-the-nca-lab-is-showing">Live model state</a> ·
   <a href="#performance-measured-honestly">Performance</a> ·
   <a href="#correctness-and-language-coverage">Language support</a> ·
   <a href="#choose-the-right-execution-profile">Security</a> ·
   <a href="#reproduce-and-contribute">Contribute</a>
 </p>
 
-This repository brings together **Zipp's Rust JavaScript engine**, an
-**experimental Python frontend**, a **WebAssembly playground**, and GPU compute
-examples for the browser and native PyTorch. Write programs, inspect their
-outputs, and watch real model state change while experiments run on your hardware.
+**Zipp brings Python and JavaScript into the same Rust register-bytecode VM.**
+Build an embedded scripting runtime, run a folder of code in a browser Worker,
+or turn a familiar Torch model into a browser GPU compute graph.
 
-The Python frontend compiles into Zipp's own VM. The browser GPU runtime is
-JavaScript that executes float32 graphs through WebGPU or WebGL2. The native
-NCA lab loads the sibling research project's models into ordinary CPython and
-PyTorch/CUDA, then streams their state into a JavaScript/WebGL2 visualization.
-These execution paths have different capabilities, described below.
+The experimental Python frontend compiles directly to Zipp bytecode. It does not
+ship CPython or translate your Python program into browser JavaScript. Both
+frontends use the same engine, with native and WebAssembly builds.
+
+- **Bring a project, not just a snippet.** The playground loads folders, modules
+  and data, with an editor, virtual files, console and graphics in one place.
+- **Start with familiar ML code.** The bundled Torch subset supports eager CPU
+  tensors, autograd and training. Experimental `torch.compile(model)` records
+  supported inference for WebGPU, WebGL2 or an explicit CPU fallback.
+- **Keep the host in control.** Execution budgets and explicit host capabilities
+  let embedders decide which resources a program can use.
+- **Explore one engine across languages.** An optional trusted-code build adds
+  Python-to-JavaScript evaluation inside the very same VM instance.
+
+Python support and Torch compatibility are experimental. The
+[Torch compatibility guide](docs/TORCH_COMPATIBILITY.md) and
+[Python frontend guide](docs/PYTHON_FRONTEND_EXPERIMENT.md) explain the supported
+surface and remaining differences.
 
 ## What runs where
 
@@ -41,16 +52,56 @@ These execution paths have different capabilities, described below.
 |---|---|---|
 | Run JavaScript scripts or embed Zipp | Native Rust VM/JIT, or Zipp's WebAssembly build | CPU; host APIs are supplied by the embedding application |
 | Run Python projects in Zipp | Experimental Python frontend on the same VM | CPU, including the bundled `torch` subset |
-| Submit a Python `zipp_gpu` graph from the playground | Python in the WASM Worker; JavaScript handles the graph | WebGPU compute shaders or WebGL2 fragment shaders; visible CPU fallback in `auto` mode |
+| Compile a supported Torch model or submit a Python `zipp_gpu` graph from the playground | Python in the WASM Worker; JavaScript handles the graph | WebGPU compute shaders or WebGL2 fragment shaders; visible CPU fallback in `auto` mode |
 | Use GPU graphs from browser JavaScript | An ordinary browser ES module or Worker | The same GPU runtime, without requiring Python or the Zipp VM |
 | Draw a custom browser visualization | Browser JavaScript with a canvas | WebGL/WebGL2 through the browser-selected adapter |
-| Train/replay the native NCA models | Local CPython with full PyTorch | Selected CUDA device(s), or explicitly selected CPU; WebGL2 renders tensor snapshots in the browser |
 
 **GPU support does not automatically move all Python or JavaScript onto a GPU.**
-The graph API executes its supported operations on the selected backend. Native
-NCA examples explicitly place models and tensors on their selected CUDA device.
-The ordinary playground's `ui` drawing API uses a 2D canvas; the NCA heatmap and
-ring use a separate WebGL2 renderer.
+The graph API executes its supported operations on the selected backend.
+The playground's `ui` drawing API uses a 2D canvas; the Life computation runs
+on the selected graph backend.
+
+## Familiar Torch code, browser GPU execution
+
+```python
+import torch
+from torch import nn
+
+model = nn.Sequential(nn.Linear(2, 4), nn.ReLU(), nn.Linear(4, 1))
+x = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+inference = torch.compile(model)(x)  # no zipp_gpu import or backend name
+inference.submit(lambda y: print(y.tolist()))
+```
+
+Your model, tensor creation and forward pass use the supported Torch API.
+Zipp records the inference graph and the host executes it on the selected
+backend. **`submit(callback)` is a Zipp extension:** browser GPU completion is
+asynchronous; this is not a drop-in implementation of PyTorch's `torch.compile`.
+It currently supports float32 inference, not GPU autograd or CUDA scripts.
+The callback receives a regular CPU Torch-compatible tensor.
+
+Try **Samples → Python: Torch ML inference (GPU)** in the playground. The
+[complete example](examples/python/torch_gpu/main.py) draws its predictions and
+checks them against eager inference with the same weights. Explicit GPU selection
+fails visibly if unavailable; automatic selection reports the backend it used.
+
+[![Torch model predictions computed on WebGL2 from Python in Zipp WASM](landing/public/demos/torch-inference.png)](examples/python/torch_gpu/main.py)
+
+## Python and JavaScript inside one VM
+
+Build with `python-js-interop` for trusted mixed-language projects:
+
+```python
+import javascript
+print(javascript.eval("[1, 2, 3].map(x => x * 2)"))  # [2, 4, 6]
+```
+
+This uses Zipp's own JavaScript evaluator in the **same VM instance**, with copied
+lists, dictionaries and scalar results. `from js import eval` is also available.
+It is opt-in because JavaScript shares VM globals with the Python runtime.
+There are no live cross-language object proxies or JavaScript `.py` imports yet.
+See the [build instructions and contract](docs/LANGUAGE_INTEROP.md).
 
 ## See Zipp in action
 
@@ -74,24 +125,12 @@ WebGL2 host; its named outputs return to Python for drawing.
 
 </details>
 
-**Native NCA recordings: real PyTorch/CUDA models, rendered through WebGL2.**
-These use the separate local runner, rather than executing full PyTorch inside
-WASM. Two RTX 5090s run independent experiments; the browser displays one run at
-a time. The full [NCA explanation](#what-the-nca-lab-is-showing) covers the state,
-model limits, device selection and saved outputs.
-
-| Acquiring and querying private memory | Generating text from recurrent byte state |
-|---|---|
-| [![Actual NCA memory replay with live memory heatmaps and ring query](landing/public/demos/nca-memory.gif)](landing/public/demos/nca-memory.gif) | [![Actual NCA language generation with changing recurrent cache and generated text](landing/public/demos/nca-language.gif)](landing/public/demos/nca-language.gif) |
-| [Static memory view](landing/public/demos/nca-memory.png) | [Static language view](landing/public/demos/nca-language.png) |
-
-These are actual local captures, not simulated output or GPU benchmarks. Click a
-GIF for the full view; they autoplay and loop continuously. Still images are
-available for readers who prefer less motion. The landing page includes a pause control and honors reduced-motion
-preferences. [Capture provenance](landing/public/demos/provenance.json) records
-the engine, devices, source hashes and recording durations. Reproduce the media
-with `python crates/zipp-wasm/playground/capture-demos.py` (Chrome, Python
-Playwright, ffmpeg, the WASM build and local CUDA lab required).
+The recording shows a glider gun, pulsar, growing patterns and interacting
+debris in one toroidal Life grid. GIFs autoplay and loop; the landing page offers
+a pause button and honors reduced-motion settings. [Capture provenance](landing/public/demos/provenance.json)
+records the engine, adapter, source hashes and duration. Regenerate with
+`python crates/zipp-wasm/playground/capture-demos.py` (Chrome, Python Playwright,
+ffmpeg and the Python WASM build required).
 
 ## Why Zipp
 
@@ -105,8 +144,8 @@ Playwright, ffmpeg, the WASM build and local CUDA lab required).
   Worker for WebAssembly, or the separately built hardened native runner.
 - **Use Python and JavaScript.** Explore the experimental Python frontend or
   call the browser's GPU graph runtime directly from JavaScript.
-- **Watch actual model state.** Train and replay the NCA examples on selected
-  local GPUs, with live memory matrices, recurrent activations, loss and text.
+- **Watch code at work.** Explore Game of Life, Langton's ant, bouncing balls,
+  and GPU graph examples with visible source, canvas and console output.
 - **See the evidence.** Benchmarks include exact-output checks, raw results,
   confidence intervals and the workloads that still need work.
 
@@ -118,55 +157,33 @@ and their scope.
 
 ### Start the local GPU lab
 
-For browser-only experiments, the landing page embeds the complete project
-playground and also exposes it at **[`/playground`](https://zipp.org/playground/)**.
-It supports folders, loose files, Python/JavaScript samples, entry files,
-arguments, editing, console/canvas output and the GPU selector. Selected files
-are read locally into the browser's virtual filesystem; they are not uploaded
-to an execution server. Full native PyTorch/CUDA runs use the local setup below.
+The landing page embeds the complete project playground and exposes it at
+**[`/playground`](https://zipp.org/playground/)**. It supports folders, loose files,
+Python/JavaScript samples, entry files, arguments, editing, console/canvas output
+and GPU selection. Files stay in the browser's virtual filesystem.
 
-Use this checkout alongside the separate research project:
+For a local source checkout:
 
-```text
-parent-folder/
-  zipp.org/                       # this repository; its folder name can differ
-  nca_fast_memory_language_lab/    # source, toy text and trained checkpoints
+```sh
+cd crates/zipp-wasm
+./build-variants.sh all
+node playground/serve.cjs
 ```
 
-You need Node.js and Python with a suitable PyTorch installation. For CUDA,
-install the build recommended by the [PyTorch installer](https://pytorch.org/get-started/locally/)
-for your hardware. The research folder is a separate local dependency; cloning
-this repository does not download its model files.
+Open the printed playground URL, choose **Samples → Python: GPU compute**, select
+WebGL2 or WebGPU, and press Run. The console identifies the actual backend.
+`auto` visibly falls back to CPU/WASM when hardware is unavailable; explicit GPU
+selection reports an error instead. Browser settings decide which adapter is used.
 
-From this repository's root:
-
-```powershell
-node crates/zipp-wasm/playground/serve.cjs
-```
-
-On Windows you can instead double-click **[`START-GPU-LAB.cmd`](START-GPU-LAB.cmd)**.
-Open the printed **native GPU lab** URL (normally
-`http://127.0.0.1:8765/crates/zipp-wasm/playground/nca.html`). If that port is
-occupied, the launcher tries another and prints the actual address.
-
-Choose **Memory · replay learned associations**, select a CUDA device, and
-press **Run experiment**. Select both GPUs for independent concurrent runs;
-use the view selector to inspect each one. **Stop** ends the active run group.
-The native lab does not require compiling Zipp or building its WASM package.
-See [configuration and prerequisites](crates/zipp-wasm/playground/README.md#native-nca-lab-your-gpus-and-live-model-state)
-for `NCA_PYTHON`, `NCA_LAB_DIR`, device checks and troubleshooting.
-
-To explore browser GPU graphs without the separate NCA project, start the same
-server and open `http://127.0.0.1:8765/crates/zipp-wasm/gpu-lab/demo/` (adjust the
-port to the printed address). That standalone graph demo needs no PyTorch or
-Zipp build. The Python/JavaScript **VM playground** additionally needs the
-[Python-enabled WASM build](crates/zipp-wasm/playground/README.md).
+The native NCA research project now lives independently at
+[neuralautomata.com](https://github.com/f2i-com/neuralautomata.com).
+Zipp does not include its PyTorch runner, models, checkpoints or native endpoints.
 
 ### Run the JavaScript engine
 
 The published [`v0.0.17` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.17)
 provides x86-64 binaries and a browser WebAssembly package for the JavaScript
-engine. Those release downloads predate this checkout's Python and native GPU
+engine. Those release downloads predate this checkout's Python and browser GPU
 lab additions; build this repository for its current engine features.
 
 Save this as `app.js`, then choose your platform below:
@@ -330,19 +347,12 @@ on the compute backend every frame:
 cd crates/zipp-wasm && ./build-variants.sh all && node playground/serve.cjs
 ```
 
-The playground's **NCA lab · native GPUs** page also runs the sibling
-`nca_fast_memory_language_lab` models using local PyTorch/CUDA. Choose one or
-multiple GPUs for independent memory / language experiments, with live WebGL2
-tensor views, loss curves, generated text and NVIDIA telemetry. From the repository
-root, `START-GPU-LAB.cmd` starts the local server; the native lab needs no WASM build.
-See [GPU lab setup and examples](crates/zipp-wasm/playground/README.md#native-nca-lab-your-gpus-and-live-model-state).
-
 ## GPU computing from JavaScript and Python
 
 **Yes: JavaScript can use WebGL directly.** [WebGL is a browser JavaScript API](https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API),
 and this project's [WebGL2 graph backend](crates/zipp-wasm/gpu-lab/src/backends/webgl2.mjs),
 [WebGPU graph backend](crates/zipp-wasm/gpu-lab/src/backends/webgpu.mjs), and
-[NCA renderer](crates/zipp-wasm/playground/nca-renderer.mjs) are written in
+[WebGL2 backend](crates/zipp-wasm/gpu-lab/src/backends/webgl2.mjs) are written in
 JavaScript. Python is one way to author work for that runtime.
 
 ### Browser JavaScript: run a GPU graph
@@ -395,8 +405,8 @@ another to the same runtime. Only named outputs are read back to JavaScript.
 For your own graphics, browser JavaScript can create a separate canvas and call
 `canvas.getContext("webgl2", { powerPreference: "high-performance" })` to work
 with WebGL directly. The graph API supplies a bounded set of float32 operations;
-it does not turn arbitrary JavaScript into shaders. The existing NCA renderer
-is a complete example of uploading real tensor values and drawing them with GLSL.
+it does not turn arbitrary JavaScript into shaders. The WebGL2 backend shows
+how float tensors are uploaded and processed with GLSL.
 
 ### Python: author the same graph in the playground
 
@@ -438,62 +448,6 @@ custom Zipp embedder, the repository supplies
 the host must install the guest shim, grant `gpu.execute`, drain and dispatch
 the host-call queue, and deliver callbacks. The adapter tests cover that contract;
 they are not a claim that the stock JavaScript playground exposes it already.
-
-## What the NCA lab is showing
-
-The native lab runs the **actual models and supplied checkpoints** from
-`nca_fast_memory_language_lab`. Its two models are separate experiments:
-
-| Example | What the model does | What appears in the UI |
-|---|---|---|
-| Memory replay | Freeze learned shared weights, write new symbol/value associations into private cell memory, then relay a query around an eight-cell ring | Memory matrix heatmap, active write/query cell, observed and predicted bits, and a shared-weight fingerprint check |
-| Memory training | Optimize shared key/value encoders and decoder through fresh memory episodes, then replay the resulting model | Training loss, live private memory and the final write/query demonstration |
-| Language generation | Load the supplied byte-language checkpoint and incrementally predict new bytes from the starting text | Generated text and real per-stage recurrent-cache activations |
-| Language training | Initialize the causal model, train on the lab's toy training text, evaluate on its separate validation text, then generate | Cross-entropy loss, recurrent activations during training, generated text and validation metrics in run details |
-
-```mermaid
-flowchart LR
-  UI[Browser controls] -->|Selected example and devices| Host[Local Node server]
-  Host -->|One Python process per selected device| Model[Lab models in PyTorch]
-  Model --> CUDA[Selected CUDA GPU or explicit CPU]
-  CUDA -->|Tensor snapshots and metrics| Host
-  Host -->|Live state| View[JavaScript + WebGL2 visualization]
-```
-
-During memory replay, each row of the heatmap is a cell's private memory and
-each column is a memory channel. Blue/green encode negative/positive values,
-normalized by the current frame's RMS. Ring brightness represents memory RMS;
-the highlighted cell is the current writer or query location. Cells are numbered
-clockwise from zero at the top. The query uses the stored memory; evaluator-only
-target bits are used to check the answer, not supplied to the query.
-
-The language view shows channels over byte positions during training, then cache
-stages over channels during generation. These are sampled model tensors, not a
-decorative animation. Reading them back and pacing visual updates adds overhead.
-The current supplied language checkpoint was trained on template-generated text
-and has a **17-byte context**; a short fresh training run can produce unreadable
-text. The ring relay is fixed communication, not learned routing, and the two
-models do not form a combined online-learning chatbot.
-
-With two CUDA devices selected, the server launches **two independent runs with
-different seeds**. Each model stays on one device; one model is not split across
-GPUs and their VRAM is not pooled. The browser chooses one adapter for drawing.
-Device activity cards show system-wide NVIDIA utilization, VRAM, temperature and
-power, including other applications. Small examples need not saturate a 5090,
-and these functional checks do not establish a performance advantage over CPU.
-
-New checkpoints, full training logs and metrics are saved to unique
-`target/nca-runs/` folders. Original source/checkpoints stay unchanged. Training
-starts from initialization, not an optimizer-resume checkpoint. The tab can be
-closed and reopened while a run continues; **Stop** terminates the active group,
-and stopping the server terminates its workers. A run has a 30-minute deadline.
-
-Verified locally on two RTX 5090s with PyTorch 2.11.0+cu128: all four examples,
-concurrent devices, explicit CPU, stop/reload and UI checks passed; the browser
-WebGL2 and WebGPU backends each passed 15 numerical cases. The 57 portable runtime
-tests also passed. See [the reproducible acceptance checks](crates/zipp-wasm/playground/README.md#native-nca-lab-your-gpus-and-live-model-state).
-The engine benchmarks below describe their own historical CPU/VM captures, not
-GPU training throughput.
 
 ## Embed Zipp WebAssembly in a web app
 

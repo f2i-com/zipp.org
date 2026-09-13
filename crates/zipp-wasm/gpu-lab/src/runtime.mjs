@@ -47,7 +47,7 @@ export class ComputeRuntime {
       value={version:1,backend:this.backend,outputs,stats:{nodes:plan.nodes.length,estimatedWork:plan.work,
         logicalAllocationBytes:plan.logicalBytes,uploadElements:plan.inputElements,
         readbackElements:plan.outputElements,submitWallMs:submitted-start,
-        readbackWallMs:clock()-submitted,totalWallMs:0}};
+        readbackWallMs:clock()-submitted,totalWallMs:0,...this.impl.allocationStats?.()}};
     }catch(e){error=e;}
     finally {
       for(const id of [...handles.keys()]){try{free(id);}catch(e){error??=e;}}

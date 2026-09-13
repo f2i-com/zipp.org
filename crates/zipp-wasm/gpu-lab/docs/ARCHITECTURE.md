@@ -37,7 +37,7 @@ Three mechanisms should remain separate:
 
 The CPU/WASM fallback is a small freestanding C module. It is not the ZIPP VM and
 not a Python runtime. Keeping it independent makes the host numerical API testable
-without waiting for the private Python frontend's integration.
+independently of the integrated Python frontend.
 
 ## Graph v1
 
@@ -133,7 +133,7 @@ review and actual-device testing. Raw custom shaders are not exposed in v1.
 
 ## What to optimize next, in order
 
-**First: real integration and correctness.** Load the Python module in the private
+**First: real integration and correctness.** Exercise the Python module in the integrated
 runtime, implement exactly one transport function, pass the numerical checks on
 actual WebGPU and WebGL2 devices, and verify teardown with the real ZIPP WASM
 artifact. Record its version/profile/hash, browser, adapter and failures.
@@ -170,19 +170,6 @@ ordinary Python loop variables. This feature is not implemented by decorators in
 this package; pretending a decorator is already a shader compiler would hide the
 hard part.
 
-## NCA and small learning experiments
-
-The included cellular automaton is a fixed rule and has no trainable parameters.
-A practical next NCA inference experiment would keep `[H,W,C]` state in flat device
-storage, run neighborhood perception, apply small learned channel transforms and
-nonlinearity, then add a residual update. Rank-three tensor support and convolution/
-channel-mixing kernels would need to be implemented and verified first.
-
-Training requires an explicit backward pass or automatic differentiation, loss
-reduction, parameter updates, and optimizer state. None is supplied by the tiny MLP
-inference demo. Begin with a supervised tiny network and finite-difference gradient
-checks before making claims about an online-learning NCA. Separate persistent cell
-state, adaptive memory and trainable parameters in its API and tests.
 
 ## Measurement plan
 
@@ -196,3 +183,12 @@ Current demo statistics are wall-clock segments, not timestamp-query GPU executi
 times. `submitWallMs` includes host work, pipeline creation and awaiting host API
 operations; `readbackWallMs` includes transfers and waits; `totalWallMs` includes
 cleanup/finish. No speedup is claimed by the validation artifacts.
+
+
+## WebGL physical texture budget
+
+`maxWebGLTextureBytes` (128 MiB by default) is checked before each texture allocation.
+It charges padded width × height × 16 bytes for RGBA32F, including intermediate
+reduction textures; frees return those bytes to the live budget. The result's
+`webglTexturePeakBytes` reports peak requested texture storage. Driver overhead,
+program objects and CPU-side staging/readback allocations are outside this counter.

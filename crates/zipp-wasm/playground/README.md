@@ -12,108 +12,10 @@ cd crates/zipp-wasm
 node playground/serve.cjs        # then open http://127.0.0.1:8765/crates/zipp-wasm/playground/
 ```
 
-The server serves the repository root on loopback and provides the optional
-native NCA runner described below. A static server supports the WASM playground
-and GPU graph examples; native NCA execution requires `serve.cjs`.
-`dist/` is build output and is not committed, so the first step is required.
-
-## Native NCA lab: your GPUs and live model state
-
-From the repository root, double-click `START-GPU-LAB.cmd`, or run:
-
-```powershell
-node crates/zipp-wasm/playground/serve.cjs
-```
-
-Open **http://127.0.0.1:8765/crates/zipp-wasm/playground/nca.html**, or choose
-**NCA lab · native GPUs** from the playground toolbar / Samples menu. Restart
-an already-running older playground server to enable its new native endpoints.
-If the default port is occupied, the launcher tries the next local port and
-prints the actual **native GPU lab** URL. An explicitly set `PORT` is respected.
-The NCA page itself does not require a WASM build or npm install.
-
-The default source is the sibling `nca_fast_memory_language_lab` directory.
-The runner imports its real `CellularMemory`, `CausalNCALM`, task generator,
-batch sampler and evaluation functions. Four runnable examples are supplied:
-
-- **Memory replay:** loads `results/fast_seed0/model.pt`, writes fresh observations,
-  displays the private matrices and query packet's ring position, and checks that
-  shared parameters stayed frozen. The observed answer is used only for evaluation.
-- **Memory training:** trains shared weights on fresh episodes, displays actual
-  loss / bit accuracy and memory tensors, then replays the trained model.
-- **Language generation:** loads `language_toy_longer/model.pt`, streams generated
-  bytes and displays actual per-stage incremental cache activations.
-- **Language training:** trains from scratch on `toy_text/train.txt`, evaluates on
-  `toy_text/validation.txt`, and displays loss, final recurrent activations and a
-  generated sample. Short smoke runs produce untrained, mostly unreadable text.
-
-Choose one or more CUDA devices. Each selected device runs an **independent
-experiment in its own Python process**, with a distinct seed. This uses both
-GPUs concurrently; it does not shard one model or combine their VRAM. The view
-selector switches between their live states. CPU is an explicit alternative.
-The capability probe runs a small matrix multiplication on each CUDA device
-before marking it usable; a CUDA failure never silently becomes a CPU run.
-
-Native numerical work runs in PyTorch/CUDA. The browser draws the tensor heatmap
-and ring using hardware WebGL2, requesting `high-performance` and rejecting
-recognizable software renderers. WebGL / WebGPU choose one browser adapter;
-JavaScript cannot force a numbered CUDA device or combine browser GPUs.
-The graph backends also request hardware acceleration and report adapter identity.
-The existing `auto` graph mode still visibly falls back to WASM / JavaScript when
-hardware is unavailable; explicit WebGL2 / WebGPU selections fail instead.
-
-Colors represent signed tensor values, normalized by that frame's RMS; ring
-brightness represents each cell's memory RMS. Cells run clockwise from 0 at the
-top, with the current writer / query cell highlighted. NVIDIA utilization, VRAM,
-temperature and power are **system-wide** readings, not per-job measurements.
-These tiny research models and paced replays may use only a small percentage of
-a large GPU; this is not a speedup benchmark.
-
-New outputs, checkpoints and full training logs go into unique
-`target/nca-runs/<run>-<device>/` directories. The original lab and its checkpoints
-are not modified. Training starts from initialization; this UI does not resume
-optimizer state or execute arbitrary edited Python. Stop terminates all workers
-in the active run; completed checkpoints survive. Closing the tab lets the run
-continue; reopening recovers the active state. Ctrl+C in the server stops workers.
-Only one run group is accepted at once, with a 30-minute per-process deadline.
-
-Optional configuration, before starting the server:
-
-```powershell
-$env:NCA_PYTHON = 'C:\Python311\python.exe'
-$env:NCA_LAB_DIR = 'C:\path\to\nca_fast_memory_language_lab'
-$env:PORT = '8771' # if the default port is occupied
-node crates/zipp-wasm/playground/serve.cjs
-```
-
-Use a [CUDA-enabled PyTorch build](https://pytorch.org/get-started/locally/) that
-supports your GPU. The UI reports missing Python, PyTorch, checkpoints and source
-paths. If WebGL is unavailable, enable browser graphics acceleration and restart
-the browser. Native compute can still run while the visualization is unavailable.
-The runner is local only: fixed workloads, bounded options, loopback binding,
-Host / Origin checks and a same-origin token on run / stop requests. No shell or
-browser-submitted source is executed.
-
-Acceptance checks (Python Playwright plus installed Chrome required):
-
-```powershell
-python crates/zipp-wasm/playground/nca-smoke.py
-node --test --test-isolation=none crates/zipp-wasm/gpu-lab/tests/*.test.mjs
-node --test --test-isolation=none crates/zipp-wasm/playground/native-lab.test.cjs
-```
-
-The smoke script tests all four examples, concurrent CUDA devices, explicit CPU,
-stop / reload, API validation, responsive layout, and 15 numerical cases on each
-real WebGL2 / WebGPU backend. Missing GPU hardware is an acceptance failure.
-Reports and screenshots are written under `target/nca-smoke/`.
-Verified on Windows with two RTX 5090s, PyTorch 2.11.0+cu128 and Chrome:
-both CUDA devices passed, and both browser GPU backends passed all 15 cases.
-The bridge regression tests cover split UTF-8 requests, option-like prompts,
-CUDA/NVIDIA UUID mapping, launch failures, and input validation. Browser acceptance
-also checks that a lost WebGL context does not prevent native run/stop controls.
-
-The memory and language models remain separate research examples. Supplied
-language weights use template text and a 17-byte context, as documented by the lab.
+The server serves browser assets on loopback. No native Python process or
+CUDA endpoint is part of Zipp's playground. `dist/` is build output, so the first
+step is required. The independently maintained native research lab is at
+[neuralautomata.com](https://github.com/f2i-com/neuralautomata.com).
 
 ## Using it
 
@@ -224,3 +126,11 @@ Python 3 implementation described in `docs/PYTHON_FRONTEND_EXPERIMENT.md`
 standard modules; no `async` or real files). GPU graphs are validated and
 bounded again by the host runtime (node count, tensor sizes, work and
 allocation budgets) and served one at a time, at most 16 pending.
+
+## Torch inference
+
+Choose **Samples → Python: Torch ML inference (GPU)** to run a supported
+`torch.nn` model through `torch.compile(model)` on the selected backend.
+No `zipp_gpu` import is needed. `.submit(callback)` delivers a CPU tensor after
+the GPU completes; this is an experimental inference extension, not full
+PyTorch or GPU autograd. See the [compatibility guide](../../../docs/TORCH_COMPATIBILITY.md).

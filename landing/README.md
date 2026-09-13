@@ -1,9 +1,9 @@
 # ZIPP landing page
 
 React + TypeScript, with Vite and a Cloudflare Worker. The landing page introduces
-Python, JavaScript, browser GPU compute and the separate native CUDA lab. It embeds
+Python, JavaScript and browser GPU compute. It embeds
 the full folder playground, provides a dedicated `/playground/` route, and includes
-recorded Python Game of Life, NCA memory and language GIFs. Existing Softn/Outerstead
+a recorded Python Game of Life GIF. Existing Softn/Outerstead
 showcases, repository activity, dated native benchmarks and the optional JavaScript
 story scratchpad remain available.
 
@@ -28,9 +28,8 @@ node scripts/sync-playground.mjs --refresh-engine
 ```
 
 The landing's iframe and dedicated route load the same public files. The old
-JavaScript-only story scratchpad loads only when expanded. Native CUDA training
-requires the local Node/Python server; hosted navigation links to its setup
-instructions instead of offering an unavailable remote CUDA endpoint.
+JavaScript-only story scratchpad loads only when expanded. The native NCA research
+project is maintained separately at https://github.com/f2i-com/neuralautomata.com.
 
 ## Recorded examples
 
@@ -45,8 +44,7 @@ python crates/zipp-wasm/playground/capture-demos.py
 ```
 
 This needs Chrome, Python Playwright, ffmpeg on PATH, the Python-enabled WASM
-build and the sibling lab with working CUDA PyTorch. Python Life executes in
-Zipp WASM; the NCA recordings show native CPython/PyTorch/CUDA. They are not
+build and working browser WebGL2 hardware. Python Life executes in Zipp WASM. They are not
 performance measurements or claims that full PyTorch runs in browser WASM.
 
 ## Develop and check

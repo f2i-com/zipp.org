@@ -7,6 +7,7 @@ export const DEFAULT_LIMITS = Object.freeze({
   maxNodes: 512, maxElements: 1048576, maxInputElements: 1048576,
   maxOutputElements: 1048576, maxLogicalBytes: 32 * 1024 * 1024,
   maxWork: 100000000, maxDimension: 4096, maxOutputs: 16,
+  maxWebGLTextureBytes: 128 * 1024 * 1024,
 });
 export function sizeOf(shape) { return shape.reduce((a, b) => a * b, 1); }
 function plain(obj) {

@@ -45,14 +45,14 @@ def main():
         page.goto(BASE + '/')
         page.locator('#recorded-demos').scroll_into_view_if_needed()
         page.get_by_role('button', name='Play animations', exact=True).wait_for()
-        assert page.locator('.recorded-card img[src$=".png"]').count() == 3
+        assert page.locator('.recorded-card img[src$=".png"]').count() == 1
         page.locator('#recorded-demos').screenshot(path=str(OUT / 'recorded-demos.png'))
         page.get_by_role('button', name='Play animations', exact=True).click()
-        assert page.locator('.recorded-card img[src$=".gif"]').count() == 3
+        assert page.locator('.recorded-card img[src$=".gif"]').count() == 1
         page.get_by_role('button', name='Pause animations', exact=True).click()
         page.emulate_media(reduced_motion='no-preference')
         expect(page.get_by_role('button', name='Pause animations', exact=True)).to_be_visible()
-        assert page.locator('.recorded-card img[src$=".gif"]').count() == 3
+        assert page.locator('.recorded-card img[src$=".gif"]').count() == 1
         page.locator('#playground').scroll_into_view_if_needed()
         frame = page.locator('iframe.project-playground-frame').content_frame
         frame.locator('#status').filter(has_text='languages: javascript, python').wait_for(timeout=60000)
@@ -97,6 +97,21 @@ def main():
         assert not posts, f'Unexpected upload requests: {posts}'
         print('Clean route, JavaScript, nested Python folder/data/imports/arguments and reload passed.', flush=True)
 
+        # A real browser writeback must preserve empty files and explicit deletion.
+        vfs = OUT / 'vfs-project'
+        vfs.mkdir(exist_ok=True)
+        (vfs / 'main.py').write_text('import os\nopen("created.txt", "w").close()\nopen("truncate.txt", "w").close()\nos.remove("delete.txt")\nos.rename("old.txt", "new.txt")\nprint("vfs-done")\n', encoding='utf-8')
+        for name in ['truncate.txt', 'delete.txt', 'old.txt']:
+            (vfs / name).write_text('fixture', encoding='utf-8')
+        page.locator('#folder-input').set_input_files(str(vfs))
+        expect(page.locator('#project-name')).to_have_text('vfs-project')
+        run(page, 'vfs-done')
+        expect(page.locator('#file-list')).to_contain_text('created.txt')
+        listing = page.locator('#file-list').inner_text()
+        assert 'new.txt' in listing and 'truncate.txt' in listing, listing
+        assert 'delete.txt' not in listing and 'old.txt' not in listing, listing
+        print('Browser VFS create-empty, truncate, delete and rename passed.', flush=True)
+
         sample(page, 'gpu', 'gpu-compute')
         backends = ['wasm', 'webgl2', 'webgpu'] if os.environ.get('REQUIRE_GPU') == '1' else ['wasm']
         for backend in backends:
@@ -109,6 +124,15 @@ def main():
             assert not page.locator('#console .error').count(), console
             print(f'{backend}: {console}', flush=True)
             page.screenshot(path=str(OUT / f'playground-{backend}.png'))
+            page.locator('#stop').click()
+        page.locator('#program-args').fill('')
+        sample(page, 'torch', 'torch-inference')
+        for backend in backends:
+            page.locator('#gpu-backend').select_option(backend)
+            run(page, f'Torch inference: {backend}')
+            expect(page.locator('#console')).to_contain_text('matches eager: True', timeout=30000)
+            assert not page.locator('#console .error').count(), page.locator('#console').inner_text()
+            page.screenshot(path=str(OUT / f'torch-{backend}.png'))
             page.locator('#stop').click()
         assert not errors, errors
         assert not failed, failed

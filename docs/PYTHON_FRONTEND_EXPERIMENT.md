@@ -182,3 +182,21 @@ cargo run -p zipp-cli -- py path/to/lab/tests/test_lab.py      # a folder's test
 cd crates/zipp-wasm && ./build-variants.sh all && node tests/node/python-frontend.cjs && node tests/node/python-gpu.cjs
 cd crates/zipp-wasm && node playground/smoke.cjs               # includes a lab-like folder: subfolders, a binary, arguments, written files
 ```
+
+## Project file changes and native containment
+
+`__zipp_py_vfs_changed` returns JSON with `version: 1` and a `changes` array.
+Each entry is either `{ "path": "file", "base64": "..." }` (including an empty
+base64 string for a zero-byte file), or `{ "path": "file", "deleted": true }`.
+Rename reports deletion of the old path and a write to the new one. Reading the
+hook drains the change set. Hosts must update their parser with the engine;
+the old tab-separated protocol is no longer supported.
+
+The native CLI accepts `.py`/`.pyw` case-insensitively for project entry files and
+module discovery. It skips symlinks and Windows reparse points while collecting
+files and refuses write/delete targets containing them. Every existing path
+component is checked; lexical parent traversal, absolute paths and Windows stream
+syntax are rejected. Reads are bounded even if a file grows during ingestion.
+This is the trusted CLI, not a filesystem sandbox against another process changing
+links concurrently. Use process/OS isolation for adversarial filesystem writers.
+The browser receives only files supplied by its host and never writes to native disk.

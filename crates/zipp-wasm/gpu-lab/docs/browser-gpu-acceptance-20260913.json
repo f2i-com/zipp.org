@@ -1,0 +1,187 @@
+[
+  {
+    "backend": "webgl2",
+    "status": "passed",
+    "passed": 15,
+    "info": {
+      "backend": "webgl2",
+      "description": "WebGL2 fragment shaders on RGBA32F textures",
+      "adapter": {
+        "description": "ANGLE (NVIDIA, NVIDIA GeForce RTX 5090 (0x00002B85) Direct3D11 vs_5_0 ps_5_0, D3D11)",
+        "vendor": "Google Inc. (NVIDIA)",
+        "powerPreference": "high-performance"
+      },
+      "fallbackAttempts": []
+    },
+    "checks": [
+      {
+        "name": "multiply/add/relu/sum length 1",
+        "status": "passed",
+        "totalWallMs": 26.87999999523163
+      },
+      {
+        "name": "multiply/add/relu/sum length 3",
+        "status": "passed",
+        "totalWallMs": 26.52999997138977
+      },
+      {
+        "name": "multiply/add/relu/sum length 63",
+        "status": "passed",
+        "totalWallMs": 38.94999998807907
+      },
+      {
+        "name": "multiply/add/relu/sum length 64",
+        "status": "passed",
+        "totalWallMs": 19.32499998807907
+      },
+      {
+        "name": "multiply/add/relu/sum length 65",
+        "status": "passed",
+        "totalWallMs": 36.875
+      },
+      {
+        "name": "multiply/add/relu/sum length 129",
+        "status": "passed",
+        "totalWallMs": 20.259999990463257
+      },
+      {
+        "name": "multiply/add/relu/sum length 1025",
+        "status": "passed",
+        "totalWallMs": 34.014999985694885
+      },
+      {
+        "name": "scalar-left subtraction",
+        "status": "passed",
+        "totalWallMs": 5.040000021457672
+      },
+      {
+        "name": "constant fill",
+        "status": "passed",
+        "totalWallMs": 4.540000021457672
+      },
+      {
+        "name": "matmul 1x1x1",
+        "status": "passed",
+        "totalWallMs": 6.269999980926514
+      },
+      {
+        "name": "matmul 2x3x7",
+        "status": "passed",
+        "totalWallMs": 6.379999995231628
+      },
+      {
+        "name": "matmul 17x13x9",
+        "status": "passed",
+        "totalWallMs": 7.6700000166893005
+      },
+      {
+        "name": "Life torus 1x1, eight steps",
+        "status": "passed",
+        "totalWallMs": 12.745000004768372
+      },
+      {
+        "name": "Life torus 3x5, eight steps",
+        "status": "passed",
+        "totalWallMs": 13.230000019073486
+      },
+      {
+        "name": "Life torus 32x32, eight steps",
+        "status": "passed",
+        "totalWallMs": 14.199999988079071
+      }
+    ]
+  },
+  {
+    "backend": "webgpu",
+    "status": "passed",
+    "passed": 15,
+    "info": {
+      "backend": "webgpu",
+      "description": "WebGPU compute shaders (WGSL)",
+      "adapter": {
+        "vendor": "nvidia",
+        "architecture": "blackwell",
+        "description": "",
+        "isFallbackAdapter": false
+      },
+      "fallbackAttempts": []
+    },
+    "checks": [
+      {
+        "name": "multiply/add/relu/sum length 1",
+        "status": "passed",
+        "totalWallMs": 27.62999999523163
+      },
+      {
+        "name": "multiply/add/relu/sum length 3",
+        "status": "passed",
+        "totalWallMs": 28.935000002384186
+      },
+      {
+        "name": "multiply/add/relu/sum length 63",
+        "status": "passed",
+        "totalWallMs": 40.769999980926514
+      },
+      {
+        "name": "multiply/add/relu/sum length 64",
+        "status": "passed",
+        "totalWallMs": 20.819999992847443
+      },
+      {
+        "name": "multiply/add/relu/sum length 65",
+        "status": "passed",
+        "totalWallMs": 41.55000001192093
+      },
+      {
+        "name": "multiply/add/relu/sum length 129",
+        "status": "passed",
+        "totalWallMs": 23.290000021457672
+      },
+      {
+        "name": "multiply/add/relu/sum length 1025",
+        "status": "passed",
+        "totalWallMs": 33.12000000476837
+      },
+      {
+        "name": "scalar-left subtraction",
+        "status": "passed",
+        "totalWallMs": 5.75
+      },
+      {
+        "name": "constant fill",
+        "status": "passed",
+        "totalWallMs": 6.389999985694885
+      },
+      {
+        "name": "matmul 1x1x1",
+        "status": "passed",
+        "totalWallMs": 10.035000026226044
+      },
+      {
+        "name": "matmul 2x3x7",
+        "status": "passed",
+        "totalWallMs": 6.855000019073486
+      },
+      {
+        "name": "matmul 17x13x9",
+        "status": "passed",
+        "totalWallMs": 10.64000004529953
+      },
+      {
+        "name": "Life torus 1x1, eight steps",
+        "status": "passed",
+        "totalWallMs": 14.884999990463257
+      },
+      {
+        "name": "Life torus 3x5, eight steps",
+        "status": "passed",
+        "totalWallMs": 12.605000019073486
+      },
+      {
+        "name": "Life torus 32x32, eight steps",
+        "status": "passed",
+        "totalWallMs": 14.570000052452087
+      }
+    ]
+  }
+]

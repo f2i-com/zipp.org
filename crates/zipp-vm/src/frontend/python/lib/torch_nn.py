@@ -146,8 +146,11 @@ class Module:
                 p.grad.zero_()
 
     def to(self, *args, **kwargs):
+        torch._check_cpu_device(kwargs.get("device"))
         target = kwargs.get("dtype")
         for a in args:
+            if isinstance(a, (str, torch.device)):
+                torch._check_cpu_device(a)
             if isinstance(a, torch.dtype):
                 target = a
         if target is not None:
@@ -303,6 +306,7 @@ class Identity(Module):
 
 class Linear(Module):
     def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
+        torch._check_cpu_device(device)
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -325,6 +329,7 @@ class Linear(Module):
 
 class Embedding(Module):
     def __init__(self, num_embeddings, embedding_dim, padding_idx=None, device=None, dtype=None):
+        torch._check_cpu_device(device)
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -344,6 +349,7 @@ class Embedding(Module):
 
 class Conv1d(Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, device=None, dtype=None):
+        torch._check_cpu_device(device)
         super().__init__()
         if stride != 1 or dilation != 1 or groups != 1:
             raise NotImplementedError("Conv1d on Zipp supports stride=1, dilation=1, groups=1")
@@ -372,6 +378,7 @@ class Conv1d(Module):
 
 class GRUCell(Module):
     def __init__(self, input_size, hidden_size, bias=True, device=None, dtype=None):
+        torch._check_cpu_device(device)
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size

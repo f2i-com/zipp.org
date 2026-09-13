@@ -21,7 +21,7 @@ mod symtable;
 use emitter::{Emitter, Unit, MAX_FUNCTIONS};
 
 type R<T> = Result<T, String>;
-const RUNTIME: &str = concat!(
+const RUNTIME_BASE: &str = concat!(
     include_str!("runtime/core.js"),
     "\n",
     include_str!("runtime/types.js"),
@@ -31,15 +31,22 @@ const RUNTIME: &str = concat!(
     include_str!("runtime/stdlib.js"),
     "\n",
     include_str!("runtime/tensor.js"),
-    "\n",
-    include_str!("runtime/entry.js"),
 );
+const RUNTIME_ENTRY: &str = include_str!("runtime/entry.js");
+#[cfg(feature = "python-js-interop")]
+const INTEROP_RUNTIME: &str = include_str!("runtime/javascript.js");
+#[cfg(not(feature = "python-js-interop"))]
+const INTEROP_RUNTIME: &str = "";
 const MAX_SOURCE: usize = 1024 * 1024;
 const MAX_TOKENS: usize = 1 << 20;
 const MAX_MODULES: usize = 256;
 /// Modules the runtime provides itself; a project module of the same name
 /// shadows it, as a script-directory module shadows the stdlib in CPython.
 pub(super) const BUILTIN_MODULES: &[&str] = &[
+    #[cfg(feature = "python-js-interop")]
+    "javascript",
+    #[cfg(feature = "python-js-interop")]
+    "js",
     "ui",
     "math",
     "random",
@@ -82,8 +89,12 @@ pub(super) const BUILTIN_MODULES: &[&str] = &[
 pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[
     ("zipp_gpu", include_str!("lib/shared/zipp_gpu.py")),
     ("torch", include_str!("lib/torch.py")),
+    ("torch._gpu", include_str!("lib/torch_gpu.py")),
     ("torch.nn", include_str!("lib/torch_nn.py")),
-    ("torch.nn.functional", include_str!("lib/torch_nn_functional.py")),
+    (
+        "torch.nn.functional",
+        include_str!("lib/torch_nn_functional.py"),
+    ),
     ("torch.nn.init", include_str!("lib/torch_nn_init.py")),
     ("torch.nn.utils", include_str!("lib/torch_nn_utils.py")),
     ("torch.optim", include_str!("lib/torch_optim.py")),
@@ -99,7 +110,13 @@ pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[
 
 /// A single-file program: the source is the `main` module.
 pub(super) fn compile(source: &str) -> R<Program> {
-    compile_project("main", &[("main".to_owned(), source.to_owned())], &[], &[], false)
+    compile_project(
+        "main",
+        &[("main".to_owned(), source.to_owned())],
+        &[],
+        &[],
+        false,
+    )
 }
 
 /// Bounds on the virtual filesystem a program is compiled with.
@@ -301,7 +318,8 @@ pub(super) fn compile_project(
     // Compile a fixed seed program. Its root initializes the private runtime and
     // then calls __zipp_py_entry. Replace only that empty function's prototype;
     // retain all seed globals and function IDs. Never relocate JS bytecode.
-    let program = crate::compile_only(RUNTIME, false)?;
+    let runtime = format!("{RUNTIME_BASE}\n{INTEROP_RUNTIME}\n{RUNTIME_ENTRY}");
+    let program = crate::compile_only(&runtime, false)?;
     let entry_fn = program
         .functions
         .iter()
@@ -349,7 +367,9 @@ pub(super) fn compile_project(
         )?;
         out.future_annotations = suite.iter().any(|s| match s {
             ast::Stmt::ImportFrom(i) => {
-                i.module.as_ref().is_some_and(|m| m.as_str() == "__future__")
+                i.module
+                    .as_ref()
+                    .is_some_and(|m| m.as_str() == "__future__")
                     && i.names.iter().any(|a| a.name.as_str() == "annotations")
             }
             _ => false,

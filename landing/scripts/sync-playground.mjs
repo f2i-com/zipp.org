@@ -22,10 +22,7 @@ for (const name of ['index.html', 'playground.css', 'playground.js', 'engine.wor
   let text = await readFile(path.join(root, 'crates/zipp-wasm/playground', name), 'utf8')
   if (name === 'engine.worker.js') text = text.replace('../dist/all/zipp_wasm.js', '../playground-runtime/zipp_wasm.js')
   if (name === 'index.html') {
-    text = text.replaceAll('href="nca.html"', 'href="https://github.com/f2i-com/zipp.org/blob/main/README.md#start-the-local-gpu-lab" target="_blank" rel="noreferrer"')
-      .replace('NCA lab · native GPUs', 'Native CUDA setup ↗')
-      .replace('NCA: live memory &amp; language lab (local GPUs)', 'Native NCA lab · local setup ↗')
-      .replace('<title>Zipp Playground</title>', '<title>Zipp Playground · Python, JavaScript &amp; GPU</title>')
+    text = text.replace('<title>Zipp Playground</title>', '<title>Zipp Playground · Python, JavaScript &amp; GPU</title>')
       .replace('<strong>Zipp playground</strong>', '<a href="/" target="_top" class="playground-home">Zipp playground ↗</a>')
       .replace('Open a folder of .py or .js files (top level only)', 'Load a local project folder, including subfolders and data; files stay in your browser')
       .replace('</head>', '<meta http-equiv="Content-Security-Policy" content="default-src \'self\'; script-src \'self\' \'wasm-unsafe-eval\'; style-src \'self\'; img-src \'self\' data:; worker-src \'self\'; connect-src \'self\'; object-src \'none\'; base-uri \'none\'">\n</head>')
@@ -36,7 +33,7 @@ for (const name of ['index.html', 'playground.css', 'playground.js', 'engine.wor
 await copyTree(path.join(root, 'crates/zipp-wasm/gpu-lab/src'), path.join(output, 'gpu-lab/src'))
 await mkdir(path.join(output, 'gpu-lab/wasm'), { recursive: true })
 await copyFile(path.join(root, 'crates/zipp-wasm/gpu-lab/wasm/kernels.wasm'), path.join(output, 'gpu-lab/wasm/kernels.wasm'))
-for (const folder of ['python/project', 'python/langtons_ant', 'python/gpu', 'js/project']) {
+for (const folder of ['python/project', 'python/langtons_ant', 'python/gpu', 'python/torch_gpu', 'js/project']) {
   await copyTree(path.join(root, 'examples', folder), path.join(output, 'examples', folder), name => /\.(py|js)$/.test(name))
 }
 

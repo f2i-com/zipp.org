@@ -5,7 +5,7 @@
 #
 #   cd crates/zipp-wasm
 #   ./build-variants.sh              # both, into dist/<variant>/
-#   ./build-variants.sh javascript   # one of: javascript | all
+#   ./build-variants.sh javascript   # one of: javascript | all | interop
 #
 # Each variant is built in its own target directory so the feature switch does
 # not thrash one incremental cache, and each `dist/<variant>/` is a complete
@@ -21,12 +21,13 @@ export RUSTFLAGS="${RUSTFLAGS:--C link-arg=--max-memory=1073741824 -C link-arg=-
 declare -A FEATURES=(
   [javascript]=""
   [all]="--features python"
+  [interop]="--features python-js-interop"
 )
 variants=("$@")
 [ ${#variants[@]} -eq 0 ] && variants=(javascript all)
 
 for v in "${variants[@]}"; do
-  [ -n "${FEATURES[$v]+x}" ] || { echo "unknown variant '$v' (javascript | all)" >&2; exit 2; }
+  [ -n "${FEATURES[$v]+x}" ] || { echo "unknown variant '$v' (javascript | all | interop)" >&2; exit 2; }
 done
 
 sizes=()

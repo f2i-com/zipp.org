@@ -93,6 +93,41 @@ async function main() {
     e.dispose();
   }
 
+  // Ordinary Torch models record a real graph and receive a regular tensor.
+  for (const backend of ["cpu-js", "wasm"]) {
+    const e = new Engine();
+    const runtime = await createRuntime({ backend, wasmBytes });
+    const adapter = createPythonGPUAdapter(e, runtime, { allowExecute: true });
+    e.initPythonProject({ main: `import torch
+from torch import nn
+model = nn.Sequential(nn.Linear(2, 3), nn.ReLU(), nn.Linear(3, 1))
+with torch.no_grad():
+    for p in model.parameters():
+        p.fill_(0.5)
+x = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+expected = model(x)
+pending = torch.compile(model)(x)
+def ready(y):
+    print("torch", pending.backend, torch.allclose(y, expected), y.tolist())
+pending.submit(ready)
+@torch.compile
+def reduce(x):
+    return torch.mean(torch.add(torch.mul(x, x), 1.0))
+reduce(x).submit(lambda y: print("mean", y.item()))
+@torch.compile
+def reverse(x):
+    constants = torch.tensor([[2.0, 2.0], [2.0, 2.0]])
+    return torch.matmul(constants, torch.sub(constants, torch.mul(constants, torch.add(constants, x))))
+reverse(x).submit(lambda y: print("reverse", y.tolist()))
+print("recorded")
+` }, "main");
+    eq(`${backend}: Torch inference waits for graph delivery`, e.takeOutput(), ["recorded"]);
+    adapter.drain();
+    await adapter.idle();
+    eq(`${backend}: Torch model and functional operations match eager`, e.takeOutput(), [`torch ${backend} True [[3.5], [6.5]]`, "mean 8.5", "reverse [[-24.0, -32.0], [-24.0, -32.0]]"]);
+    adapter.invalidate(); runtime.dispose(); e.dispose();
+  }
+
   // ---- denial, disposal, and a callback that raises ---------------------------------
   {
     const e = new Engine();

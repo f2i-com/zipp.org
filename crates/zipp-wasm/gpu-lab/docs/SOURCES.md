@@ -17,6 +17,6 @@ they do not establish that this package's GPU implementations passed device test
   targets and RGBA/FLOAT readback:
   https://registry.khronos.org/webgl/extensions/EXT_color_buffer_float/
 
-The actual private f2i-com/zipp-python repository was not inspected. No upstream
-compiled Python or ZIPP engine is included. Prior conversational descriptions of
-that private repository were not used as evidence of its implemented internals.
+Current integration contracts are implemented in this checkout's Python runtime,
+WASM Engine boundary and playground Worker. The references below document the
+browser APIs; original standalone observations are retained as historical context.
