@@ -144,10 +144,10 @@ runtime data-file dependency.
 
 ### Run Python (experimental)
 
-The CLI also carries an experimental Python-subset frontend: Python source is
-parsed and lowered straight to the engine's register bytecode (no
-transpilation to JavaScript), so a `.py` file runs on the same VM. Save this
-as `fib.py`:
+The CLI also runs Python: Zipp's own Python 3 implementation, with the
+source lowered straight to the engine's register bytecode (no transpilation
+to JavaScript and no second interpreter), so a `.py` file runs on the same VM.
+Save this as `fib.py`:
 
 ```python
 def fib(n):
@@ -166,10 +166,12 @@ zipp run fib.py                # frontend chosen by extension, shebang or direct
 zipp run --lang=python -       # from standard input
 ```
 
-It is a deliberately small integer-centric subset (functions, loops, lists,
-tuples, ranges, strings, and modules that import each other within a project;
-no floats, classes or exceptions yet) and every unsupported construct is a
-compile error rather than a guess. A folder runs as a project:
+Classes, exceptions, generators, closures, comprehensions, f-strings, the
+builtin types and a set of standard-library modules (`math`, `json`, `re`,
+`collections`, `itertools`, `functools`, `dataclasses`, `enum`, ...) all
+work; `async`, `match` and real files do not yet. Semantics are checked
+differentially against CPython: `tests/python_corpus/*.py` must print
+exactly what CPython prints. A folder runs as a project:
 `zipp py examples/python/project`. The scope
 matrix, limits and the bytecode design are in
 [docs/PYTHON_FRONTEND_EXPERIMENT.md](docs/PYTHON_FRONTEND_EXPERIMENT.md). The

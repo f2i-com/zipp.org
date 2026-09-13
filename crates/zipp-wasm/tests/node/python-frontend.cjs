@@ -83,8 +83,8 @@ if (languages.includes("python")) {
   // A compile error is reported as a source error and disposes the engine,
   // like a JavaScript SyntaxError does.
   const bad = new Engine();
-  const compileErr = thrown(() => bad.initSource("x = 1 / 2\n", "python"));
-  ok("unsupported Python syntax is a compile error", compileErr !== null && /unsupported operator/.test(compileErr), compileErr);
+  const compileErr = thrown(() => bad.initSource("x = = 2\n", "python"));
+  ok("a Python syntax error is a compile error", compileErr !== null && /SyntaxError/.test(compileErr), compileErr);
   ok("a failed Python initialization disposes the engine", bad.disposed);
 
   // A runtime error keeps the output produced before it.

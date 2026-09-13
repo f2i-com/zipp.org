@@ -12,12 +12,30 @@ fn project(entry: &str, files: &[(&str, &str)]) -> Result<CompiledSource, String
     compile_python_project(entry, &modules)
 }
 
+/// Runs on the CLI's stack size: dunder dispatch re-enters the interpreter
+/// natively, and debug frames are large.
+fn big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(256 << 20)
+        .spawn(f)
+        .expect("spawn")
+        .join()
+        .expect("test thread")
+}
+
 fn run_project(entry: &str, files: &[(&str, &str)]) -> Result<Vec<String>, String> {
-    let mut compiled = project(entry, files)?;
-    let state = compiled.state_mut();
-    state.set_limits(20_000_000, None);
-    state.run_init()?;
-    Ok(state.take_output())
+    let entry = entry.to_owned();
+    let files: Vec<(String, String)> = files
+        .iter()
+        .map(|(n, s)| (n.to_string(), s.to_string()))
+        .collect();
+    big_stack(move || {
+        let mut compiled = compile_python_project(&entry, &files)?;
+        let state = compiled.state_mut();
+        state.set_limits(20_000_000, None);
+        state.run_init()?;
+        Ok(state.take_output())
+    })
 }
 
 fn slot(state: &ScriptState, name: &str) -> u32 {
@@ -53,7 +71,7 @@ fn modules_import_each_other_with_separate_namespaces() {
             "util loaded",
             "40 8 util-name 99 1",
             "0 0",
-            "<module 'util'>"
+            "<module 'util' from 'util.py'>"
         ]
     );
 }
@@ -89,12 +107,14 @@ fn a_module_runs_once_and_cycles_resolve_partially_like_cpython() {
 #[test]
 fn unknown_and_unsupported_imports_are_compile_errors() {
     for (source, needle) in [
-        ("import os\n", "No module named 'os'"),
-        ("from math import sqrt\n", "No module named 'math'"),
-        ("import a.b\n", "dotted"),
-        ("from util import *\n", "import *"),
+        ("import nowhere\n", "No module named 'nowhere'"),
+        ("from nowhere import x\n", "No module named 'nowhere'"),
+        ("import a.b\n", "No module named 'a.b'"),
+        (
+            "def f():\n    from util import *\n",
+            "import * only allowed at module level",
+        ),
         ("from . import util\n", "relative"),
-        ("def f():\n    import util\n", "inside functions"),
     ] {
         let err = project("main", &[("main", source), ("util", "x = 1\n")])
             .err()
@@ -112,14 +132,33 @@ fn unknown_and_unsupported_imports_are_compile_errors() {
         .unwrap();
     assert!(err.contains("duplicate"), "{err}");
     // Diagnostics name the file.
-    let err = project("main", &[("main", "x = 1\n"), ("util", "x = 1 / 2\n")])
+    let err = project("main", &[("main", "x = 1\n"), ("util", "x = = 2\n")])
         .err()
         .unwrap();
     assert!(err.contains("util.py:1:5"), "{err}");
+    // A module may import from another and from the stdlib inside a function.
+    assert_eq!(
+        run_project(
+            "main",
+            &[
+                (
+                    "main",
+                    "def f():\n    import util\n    from math import sqrt\n    return util.x + sqrt(16)\nprint(f())\n"
+                ),
+                ("util", "x = 1\n")
+            ]
+        )
+        .unwrap(),
+        vec!["5.0"]
+    );
 }
 
 #[test]
 fn ui_module_records_commands_and_host_hooks_call_the_entry() {
+    big_stack(ui_module_body);
+}
+
+fn ui_module_body() {
     let source = "import ui\nfrom ui import rect\n\nhits = [0]\n\n\
                   def draw():\n    ui.clear('#000')\n    rect(1, 2, 3, 4, 'red')\n    \
                   ui.text(5, 6, 'hi ' + str(len(hits)), 'white')\n    return len(hits)\n\n\
@@ -210,16 +249,23 @@ fn ui_module_records_commands_and_host_hooks_call_the_entry() {
         .err()
         .unwrap();
     assert!(err.contains("NameError"), "{err}");
-    let err = state
-        .call_slot(call, &[s("add"), HostValue::Array(vec![n(1.5), n(1.0)])])
-        .err()
-        .unwrap();
-    assert!(err.contains("integer"), "{err}");
+    // Host floats arrive as Python floats.
+    assert_eq!(
+        state
+            .call_slot(call, &[s("add"), HostValue::Array(vec![n(1.5), n(1.0)])])
+            .unwrap(),
+        HostValue::Array(vec![
+            n(2.5),
+            s("ok"),
+            HostValue::Bool(true),
+            HostValue::Null
+        ])
+    );
     let err = state
         .call_slot(call, &[s("add"), HostValue::Array(vec![n(1.0)])])
         .err()
         .unwrap();
-    assert!(err.contains("positional arguments"), "{err}");
+    assert!(err.contains("positional argument"), "{err}");
 }
 
 #[test]

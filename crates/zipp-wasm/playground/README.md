@@ -20,7 +20,8 @@ loopback; any static server that serves the repository root works the same.
 
 - **Open folder** (or drop a folder on the page) loads every `.py` / `.js` file
   at the folder's top level. **Open files** loads loose files. **Samples** has
-  two bouncing-ball projects and two hello-world programs.
+  two bouncing-ball projects, a Langton's ant written with classes,
+  dataclasses and enums, and two hello-world programs.
 - The **entry** file runs first: `main.py` or `main.js` by default, or any file
   through *Set as entry*. The entry's extension decides the project language;
   files of the other language are listed but not run.
@@ -64,10 +65,9 @@ Optional top-level hooks in the entry file:
 | `on_click(x, y)` | for each click on the canvas since the last frame |
 | `on_key(key)` | for each key press since the last frame |
 
-Colors are CSS color strings. In Python every coordinate is an integer (the
-subset has no floats); in JavaScript any finite number works. A program that
-defines neither `draw` nor `update` just runs its top level: `print` and any
-`ui` calls it makes are shown once.
+Colors are CSS color strings and coordinates are numbers (ints or floats).
+A program that defines neither `draw` nor `update` just runs its top level:
+`print` and any `ui` calls it makes are shown once.
 
 ## What is behind it
 
@@ -85,7 +85,7 @@ defines neither `draw` nor `update` just runs its top level: `print` and any
 
 Limits are the engine's: a 2,000,000,000-instruction lifetime budget per
 run (the maximum the engine allows), the engine's heap and output ceilings,
-and the Python frontend's compile-time caps. The Python side is the
-experimental subset described in `docs/PYTHON_FRONTEND_EXPERIMENT.md`
-(integers, strings, lists, tuples, ranges, functions, modules; no floats,
-classes or exceptions yet).
+and the Python frontend's compile-time caps. The Python side is Zipp's own
+Python 3 implementation described in `docs/PYTHON_FRONTEND_EXPERIMENT.md`
+(classes, exceptions, generators, the builtin types and a set of standard
+modules; no `async`, `match` or real files).

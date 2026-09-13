@@ -106,10 +106,10 @@ async function main() {
 
     // ---- editing: a Python error names the file and line ----------------------
     await page.locator("#file-list li", { hasText: "physics.py" }).click();
-    await page.locator("#editor").fill("def step_ball(b, w, h):\n    return 1 / 2\n");
+    await page.locator("#editor").fill("def step_ball(b, w, h):\n    return 1 +\n");
     await page.locator("#run").click();
-    await page.waitForFunction(() => /physics\.py:2:12/.test(document.querySelector("#console").innerText), null, { timeout: 20000 });
-    ok("a compile error in a module names physics.py and the line", true);
+    await page.waitForFunction(() => /SyntaxError.*physics\.py:2:\d+/.test(document.querySelector("#console").innerText), null, { timeout: 20000 });
+    ok("a syntax error in a module names physics.py and the line", true);
 
     // ---- a runaway program is cut off by the deadline -----------------------------
     await page.locator("#editor").fill("def step_ball(b, w, h):\n    return None\ndef inside(px, py, x, y, w, h):\n    return False\n");
@@ -139,6 +139,27 @@ async function main() {
       return blue;
     });
     ok("the javascript paddle was drawn", jsPixel > 100, `blue pixels: ${jsPixel}`);
+    await page.locator("#stop").click();
+
+    // ---- Langton's ant: classes, dataclasses and enums in the browser ------------
+    await page.locator("#sample-button").click();
+    await page.locator('[data-sample="ant"]').click();
+    await page.waitForFunction(() => document.querySelector("#project-name").textContent === "langtons-ant" && document.querySelectorAll("#file-list li").length === 2);
+    await page.locator("#run").click();
+    await page.waitForFunction(() => /Langton's ant on a 100x100 grid with 3 rules/.test(document.querySelector("#console").innerText), null, { timeout: 30000 });
+    await page.waitForFunction(() => /frame \d+/.test(document.querySelector("#frame-stats").textContent), null, { timeout: 20000 });
+    ok("the ant project runs with frames", true);
+    await page.locator("#canvas").click({ position: { x: 250, y: 250 } });
+    await page.keyboard.press("Space");
+    await page.waitForTimeout(1500);
+    const dark = await page.evaluate(() => {
+      const c = document.querySelector("#canvas");
+      const d = c.getContext("2d").getImageData(0, 0, c.width, 500).data;
+      let n = 0;
+      for (let i = 0; i < d.length; i += 4) if (d[i] < 60 && d[i + 1] < 60 && d[i + 2] < 60) n++;
+      return n;
+    });
+    ok("the ant painted cells after space started it", dark > 200, `dark pixels: ${dark}`);
     await page.locator("#stop").click();
 
     // ---- hello samples: no hooks, just output and a static drawing --------------
