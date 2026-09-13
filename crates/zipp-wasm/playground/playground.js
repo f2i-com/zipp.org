@@ -630,7 +630,8 @@ async function run() {
 function hostEvent(m) {
   if (m.gpu) {
     const why = m.gpu.attempts && m.gpu.attempts.length ? ` (after: ${m.gpu.attempts.join("; ")})` : "";
-    log(`GPU compute: ${m.gpu.backend} — ${m.gpu.description}${why}`, "note");
+    const device = m.gpu.adapter?.description || m.gpu.adapter?.architecture || m.gpu.adapter?.vendor;
+    log(`GPU compute: ${m.gpu.backend} — ${m.gpu.description}${device ? ` (${device})` : ""}${why}`, "note");
     return;
   }
   logConsole(m.console);

@@ -1,5 +1,14 @@
 # ZIPP Python GPU Lab 0.1.0
 
+The integrated playground now includes a **native NCA lab** with CUDA device
+selection, concurrent independent experiments on multiple GPUs, and hardware
+WebGL2 visualization of actual model state. Start `node ../playground/serve.cjs`
+from this directory, then use the playground's **NCA lab** link. See
+[the playground instructions](../playground/README.md#native-nca-lab-your-gpus-and-live-model-state).
+The graph backends request high-performance hardware and expose adapter identity.
+The original standalone README below retains its historical validation notes;
+the integrated NCA smoke test has since verified WebGL2 and WebGPU on RTX 5090 hardware.
+
 > **In this repository** (`crates/zipp-wasm/gpu-lab/`): this is the GPU Lab
 > package vendored and wired into Zipp. What changed relative to the standalone
 > kit:

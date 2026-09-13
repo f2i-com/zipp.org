@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// A dependency-free static server for the playground. It serves the
+// A dependency-free playground server with a fixed local PyTorch runner. It serves the
 // REPOSITORY ROOT (so the page can reach ../dist/all/ for the engine and
 // ../../../examples/ for the sample projects) on loopback only.
 //
@@ -12,7 +12,8 @@ const http = require("node:http");
 const path = require("node:path");
 
 const ROOT = path.resolve(__dirname, "..", "..", "..");
-const PORT = Number(process.env.PORT) || 8765;
+let PORT = Number(process.env.PORT) || 8765;
+let lab = require('./native-lab.cjs').createLab({ root: ROOT, port: PORT });
 const TYPES = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
@@ -28,14 +29,16 @@ const TYPES = {
   ".png": "image/png",
 };
 
-const server = http.createServer((request, response) => {
-  let pathname;
+const server = http.createServer(async (request, response) => {
+  let pathname, url;
   try {
-    pathname = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
+    url = new URL(request.url, 'http://localhost');
+    pathname = decodeURIComponent(url.pathname);
   } catch {
     response.writeHead(400).end("bad request");
     return;
   }
+  if (await lab.handle(request, response, url)) return;
   if (pathname.endsWith("/")) pathname += "index.html";
   const file = path.resolve(ROOT, "." + pathname);
   if (!file.startsWith(ROOT + path.sep) && file !== ROOT) {
@@ -57,10 +60,26 @@ const server = http.createServer((request, response) => {
   });
 });
 
-server.listen(PORT, "127.0.0.1", () => {
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { lab.close(); server.close(); process.exit(0); });
+process.on('exit', () => lab.close());
+
+server.on('error', error => {
+  if (error.code === 'EADDRINUSE' && !process.env.PORT && PORT < 8775) {
+    console.log(`Port ${PORT} is occupied; trying ${PORT + 1}.`);
+    PORT++;
+    lab = require('./native-lab.cjs').createLab({ root: ROOT, port: PORT });
+    server.listen(PORT, '127.0.0.1');
+  } else {
+    console.error(`Cannot start playground: ${error.message}. Set PORT to an available local port.`);
+    process.exitCode = 1;
+  }
+});
+server.on('listening', () => {
   const engine = path.join(ROOT, "crates", "zipp-wasm", "dist", "all", "zipp_wasm_bg.wasm");
   if (!fs.existsSync(engine)) {
     console.log("note: no Python-enabled engine at crates/zipp-wasm/dist/all/ yet; run ./build-variants.sh all first");
   }
   console.log(`zipp playground: http://127.0.0.1:${PORT}/crates/zipp-wasm/playground/`);
+  console.log(`native GPU lab: http://127.0.0.1:${PORT}/crates/zipp-wasm/playground/nca.html`);
 });
+server.listen(PORT, '127.0.0.1');

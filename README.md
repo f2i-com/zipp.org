@@ -218,6 +218,13 @@ on the compute backend every frame:
 cd crates/zipp-wasm && ./build-variants.sh all && node playground/serve.cjs
 ```
 
+The playground's **NCA lab · native GPUs** page also runs the sibling
+`nca_fast_memory_language_lab` models using local PyTorch/CUDA. Choose one or
+multiple GPUs for independent memory / language experiments, with live WebGL2
+tensor views, loss curves, generated text and NVIDIA telemetry. From the repository
+root, `START-GPU-LAB.cmd` starts the local server; the native lab needs no WASM build.
+See [GPU lab setup and examples](crates/zipp-wasm/playground/README.md#native-nca-lab-your-gpus-and-live-model-state).
+
 ### Embed Zipp WebAssembly in a web app
 
 Run the browser build in a dedicated Worker, with a deadline controlled by

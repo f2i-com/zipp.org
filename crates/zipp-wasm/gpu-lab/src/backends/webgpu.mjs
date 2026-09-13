@@ -5,6 +5,7 @@ export class WebGPUBackend {
     check(globalThis.navigator?.gpu, 'UNAVAILABLE', 'WebGPU is unavailable (use HTTPS or localhost)');
     const adapter = await navigator.gpu.requestAdapter({powerPreference: 'high-performance'});
     check(adapter, 'UNAVAILABLE', 'No WebGPU adapter is available');
+    check(!(adapter.info?.isFallbackAdapter ?? adapter.isFallbackAdapter), 'UNAVAILABLE', 'Hardware WebGPU required; browser returned a fallback adapter');
     const device = await adapter.requestDevice();
     return new WebGPUBackend(device, adapter.info);
   }

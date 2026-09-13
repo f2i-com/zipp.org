@@ -5,8 +5,15 @@ export class WebGL2Backend {
   static async create() {
     const canvas=typeof OffscreenCanvas!=='undefined'?new OffscreenCanvas(1,1):globalThis.document?.createElement('canvas');
     check(canvas, 'UNAVAILABLE', 'No canvas implementation is available');
-    const gl=canvas.getContext('webgl2',{antialias:false,depth:false,stencil:false,preserveDrawingBuffer:false});
+    const gl=canvas.getContext('webgl2',{powerPreference:'high-performance',failIfMajorPerformanceCaveat:true,
+      antialias:false,depth:false,stencil:false,preserveDrawingBuffer:false});
     check(gl,'UNAVAILABLE','WebGL2 is unavailable');
+    const debug=gl.getExtension('WEBGL_debug_renderer_info');
+    const renderer=String(gl.getParameter(debug?debug.UNMASKED_RENDERER_WEBGL:gl.RENDERER));
+    if(/swiftshader|llvmpipe|softpipe|software|microsoft basic render/i.test(renderer)) {
+      gl.getExtension('WEBGL_lose_context')?.loseContext();
+      throw new ComputeError('UNAVAILABLE',`Hardware WebGL2 required; browser reported ${renderer}`);
+    }
     if(!gl.getExtension('EXT_color_buffer_float')) {
       gl.getExtension('WEBGL_lose_context')?.loseContext();
       throw new ComputeError('UNAVAILABLE','WebGL2 floating-point render targets are unavailable');
@@ -16,6 +23,9 @@ export class WebGL2Backend {
   constructor(gl,canvas) {
     this.name='webgl2';this.description='WebGL2 fragment shaders on RGBA32F textures';
     this.gl=gl;this.canvas=canvas;this.programs=new Map();this.lost=false;
+    const debug=gl.getExtension('WEBGL_debug_renderer_info');
+    this.info={description:String(gl.getParameter(debug?debug.UNMASKED_RENDERER_WEBGL:gl.RENDERER)),
+      vendor:String(gl.getParameter(debug?debug.UNMASKED_VENDOR_WEBGL:gl.VENDOR)),powerPreference:gl.getContextAttributes()?.powerPreference};
     this.maxTexture=gl.getParameter(gl.MAX_TEXTURE_SIZE);
     const viewport=gl.getParameter(gl.MAX_VIEWPORT_DIMS);
     this.maxWidth=Math.min(this.maxTexture,viewport[0]);this.maxHeight=Math.min(this.maxTexture,viewport[1]);
