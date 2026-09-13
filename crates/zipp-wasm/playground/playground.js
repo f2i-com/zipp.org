@@ -9,6 +9,12 @@ const INSTRUCTION_BUDGET = 2e9;    // the engine's maximum lifetime budget
 const STORAGE_KEY = "zipp-playground-project";
 const MAX_CONSOLE_LINES = 2000;
 const SOURCE_EXTENSIONS = { py: "python", js: "javascript", mjs: "javascript" };
+// Files a project folder brings along besides sources: shown as text when
+// they decode as UTF-8, otherwise kept as bytes (checkpoints, images) that
+// the program can open(). Tool folders are skipped, as are big files.
+const SKIP_DIRS = new Set([".git", "__pycache__", "node_modules", "target", ".venv", "venv", ".idea", ".vscode", "dist"]);
+const MAX_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_PROJECT_BYTES = 64 * 1024 * 1024;
 const SAMPLES = {
   python: { name: "python-balls", entry: "main.py", base: "../../../examples/python/project/", files: ["main.py", "physics.py"] },
   javascript: { name: "js-balls", entry: "main.js", base: "../../../examples/js/project/", files: ["physics.js", "main.js"] },
@@ -25,12 +31,38 @@ const el = {
   highlight: $("#highlight"), highlightCode: $("#highlight-code"),
   canvas: $("#canvas"), canvasHint: $("#canvas-hint"), consoleOut: $("#console"),
   status: $("#status"), frameStats: $("#frame-stats"), run: $("#run"), stop: $("#stop"),
-  dropOverlay: $("#drop-overlay"), sampleMenu: $("#sample-menu"), gpuBackend: $("#gpu-backend"),
+  dropOverlay: $("#drop-overlay"), sampleMenu: $("#sample-menu"), gpuBackend: $("#gpu-backend"), args: $("#program-args"),
 };
 const ctx = el.canvas.getContext("2d");
 
 // ---- project state ---------------------------------------------------------
-const project = { name: "untitled", files: new Map(), entry: null, current: null };
+// `files` maps root-relative paths to a string (text) or {bytes: Uint8Array}
+// (binary). `written` marks files the last run produced.
+const project = { name: "untitled", files: new Map(), entry: null, current: null, written: new Set() };
+function isBinary(value) {
+  return value !== null && typeof value === "object" && value.bytes instanceof Uint8Array;
+}
+function baseName(path) {
+  return path.slice(path.lastIndexOf("/") + 1);
+}
+function bytesToBase64(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function base64ToBytes(text) {
+  const s = atob(text);
+  const out = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+  return out;
+}
+function decodeUtf8(bytes) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
 
 function extensionOf(name) {
   const dot = name.lastIndexOf(".");
@@ -47,16 +79,27 @@ function projectLanguage() {
   return languageOf(project.entry);
 }
 function pickEntry() {
-  const names = [...project.files.keys()];
+  const names = [...project.files.keys()].sort();
   if (project.entry && project.files.has(project.entry)) return;
-  project.entry = names.find((n) => n === "main.py") || names.find((n) => n === "main.js")
-    || names.find((n) => languageOf(n)) || names[0] || null;
+  const top = names.filter((n) => !n.includes("/"));
+  project.entry = top.find((n) => n === "main.py") || top.find((n) => n === "main.js")
+    || top.find((n) => languageOf(n)) || names.find((n) => languageOf(n)) || names[0] || null;
 }
 function save() {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      name: project.name, entry: project.entry, current: project.current, files: [...project.files],
-    }));
+    // Text is stored as is; binaries as base64 while the total stays small.
+    let budget = 3 * 1024 * 1024;
+    const files = [];
+    for (const [name, value] of project.files) {
+      if (isBinary(value)) {
+        if (value.bytes.length > budget) continue;
+        budget -= value.bytes.length;
+        files.push([name, { base64: bytesToBase64(value.bytes) }]);
+      } else {
+        files.push([name, value]);
+      }
+    }
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ name: project.name, entry: project.entry, current: project.current, files }));
   } catch { /* storage unavailable: edits live for the session only */ }
 }
 function restore() {
@@ -65,7 +108,8 @@ function restore() {
     if (!raw) return false;
     const saved = JSON.parse(raw);
     if (!Array.isArray(saved.files) || saved.files.length === 0) return false;
-    setProject(saved.name || "untitled", saved.files, saved.entry, saved.current);
+    const files = saved.files.map(([name, value]) => [name, value && typeof value === "object" && typeof value.base64 === "string" ? { bytes: base64ToBytes(value.base64) } : value]);
+    setProject(saved.name || "untitled", files, saved.entry, saved.current);
     return true;
   } catch {
     return false;
@@ -74,6 +118,7 @@ function restore() {
 function setProject(name, entries, entry, current) {
   project.name = name;
   project.files = new Map(entries);
+  project.written = new Set();
   project.entry = entry && project.files.has(entry) ? entry : null;
   pickEntry();
   project.current = current && project.files.has(current) ? current : project.entry;
@@ -83,31 +128,67 @@ function setProject(name, entries, entry, current) {
 }
 
 // ---- sidebar + editor ------------------------------------------------------
+// The sidebar is a tree: folders first at each level, then files, each row
+// indented by depth. Folders are labels; files open in the editor.
 function renderFiles() {
   const language = projectLanguage();
   el.projectName.textContent = project.name;
   el.projectName.title = project.name;
   el.projectLanguage.textContent = language || "";
   el.fileList.replaceChildren();
-  for (const name of [...project.files.keys()].sort()) {
-    const li = document.createElement("li");
-    li.dataset.name = name;
-    li.textContent = name;
-    if (name === project.current) li.classList.add("active");
-    const fileLanguage = languageOf(name);
-    if (language && fileLanguage !== language) {
-      li.classList.add("ignored");
-      li.title = `not run: the project language is ${language}`;
+  const tree = new Map();
+  for (const name of project.files.keys()) {
+    const parts = name.split("/");
+    let node = tree;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!node.has(parts[i] + "/")) node.set(parts[i] + "/", new Map());
+      node = node.get(parts[i] + "/");
     }
-    if (name === project.entry) {
-      const tag = document.createElement("span");
-      tag.className = "entry";
-      tag.textContent = "entry";
-      li.append(" ", tag);
-    }
-    li.addEventListener("click", () => openFile(name));
-    el.fileList.append(li);
+    node.set(parts[parts.length - 1], name);
   }
+  const tag = (li, cls, text, title) => {
+    const span = document.createElement("span");
+    span.className = cls;
+    span.textContent = text;
+    if (title) span.title = title;
+    li.append(" ", span);
+  };
+  const walk = (node, depth) => {
+    const keys = [...node.keys()].sort((a, b) => {
+      const fa = a.endsWith("/"), fb = b.endsWith("/");
+      return fa === fb ? a.localeCompare(b) : fa ? -1 : 1;
+    });
+    for (const key of keys) {
+      const li = document.createElement("li");
+      li.style.paddingLeft = `${8 + depth * 14}px`;
+      if (key.endsWith("/")) {
+        li.className = "folder";
+        li.textContent = "▾ " + key.slice(0, -1);
+        el.fileList.append(li);
+        walk(node.get(key), depth + 1);
+        continue;
+      }
+      const name = node.get(key);
+      const value = project.files.get(name);
+      li.dataset.name = name;
+      li.textContent = key;
+      if (name === project.current) li.classList.add("active");
+      const fileLanguage = languageOf(name);
+      if (language && fileLanguage && fileLanguage !== language) {
+        li.classList.add("ignored");
+        li.title = `not run: the project language is ${language}`;
+      } else if (!fileLanguage) {
+        li.classList.add("data");
+        li.title = isBinary(value) ? `binary file, ${value.bytes.length} bytes: the program can open() it` : "a data file the program can open()";
+      }
+      if (isBinary(value)) tag(li, "bin", "bin");
+      if (project.written.has(name)) tag(li, "written", "written", "written by the last run");
+      if (name === project.entry) tag(li, "entry", "entry");
+      li.addEventListener("click", () => openFile(name));
+      el.fileList.append(li);
+    }
+  };
+  walk(tree, 0);
   $("#set-entry").disabled = !project.current || project.current === project.entry || !languageOf(project.current);
   $("#rename-file").disabled = !project.current;
   $("#delete-file").disabled = !project.current;
@@ -115,8 +196,14 @@ function renderFiles() {
 function openFile(name) {
   project.current = name;
   el.currentFile.textContent = name || "no file";
-  el.editor.value = name ? project.files.get(name) : "";
-  el.editor.disabled = !name;
+  const value = name ? project.files.get(name) : "";
+  if (isBinary(value)) {
+    el.editor.value = `(binary file, ${value.bytes.length} bytes)`;
+    el.editor.disabled = true;
+  } else {
+    el.editor.value = value || "";
+    el.editor.disabled = !name;
+  }
   updateGutter();
   for (const li of el.fileList.children) li.classList.toggle("active", li.dataset.name === name);
   renderFiles();
@@ -134,7 +221,7 @@ function syncScroll() {
   el.highlight.scrollLeft = el.editor.scrollLeft;
 }
 el.editor.addEventListener("input", () => {
-  if (project.current) project.files.set(project.current, el.editor.value);
+  if (project.current && !isBinary(project.files.get(project.current))) project.files.set(project.current, el.editor.value);
   updateGutter();
   save();
 });
@@ -216,13 +303,14 @@ el.editor.addEventListener("keydown", (event) => {
 });
 
 function validFileName(name) {
-  return /^[A-Za-z_][A-Za-z0-9_-]*\.(py|js|mjs)$/.test(name);
+  // A relative path of simple segments: `main.py`, `pkg/module.py`, `data/x.json`.
+  return /^[A-Za-z0-9_][A-Za-z0-9_.-]*(\/[A-Za-z0-9_][A-Za-z0-9_.-]*)*$/.test(name) && !name.includes("..");
 }
 $("#new-file").addEventListener("click", () => {
   const language = projectLanguage() || "python";
   const name = prompt("New file name:", language === "python" ? "module.py" : "module.js");
   if (!name) return;
-  if (!validFileName(name)) { alert("Use a simple name ending in .py or .js (letters, digits, _)."); return; }
+  if (!validFileName(name)) { alert("Use a simple relative path such as module.py or pkg/module.py."); return; }
   if (project.files.has(name)) { alert(`${name} already exists.`); return; }
   project.files.set(name, "");
   pickEntry();
@@ -234,7 +322,7 @@ $("#rename-file").addEventListener("click", () => {
   if (!from) return;
   const to = prompt("Rename file:", from);
   if (!to || to === from) return;
-  if (!validFileName(to)) { alert("Use a simple name ending in .py or .js (letters, digits, _)."); return; }
+  if (!validFileName(to)) { alert("Use a simple relative path such as module.py or pkg/module.py."); return; }
   if (project.files.has(to)) { alert(`${to} already exists.`); return; }
   project.files.set(to, project.files.get(from));
   project.files.delete(from);
@@ -259,24 +347,51 @@ $("#set-entry").addEventListener("click", () => {
 });
 
 // ---- loading folders, files and samples -----------------------------------
+// `files` are File objects, or {file, relative} pairs from a dropped folder.
+// The first path segment (the folder itself) is dropped; every file below is
+// kept: sources, data files and binaries alike, minus tool folders.
 async function loadFileObjects(files, folderName) {
   const entries = [];
   const skipped = [];
-  for (const file of files) {
-    const relative = file.webkitRelativePath || file.name;
-    const parts = relative.split("/");
-    if (parts.length > 2) { skipped.push(relative); continue; }
-    if (!languageOf(file.name)) continue;
-    entries.push([file.name, await file.text()]);
+  let total = 0;
+  for (const item of files) {
+    const file = item instanceof File ? item : item.file;
+    const relative = (item instanceof File ? file.webkitRelativePath : item.relative) || file.name;
+    let parts = relative.split("/").filter(Boolean);
+    if (parts.length > 1 && folderName !== "files") parts = parts.slice(1);
+    if (parts.some((p) => SKIP_DIRS.has(p) || (p.startsWith(".") && p !== "."))) continue;
+    const path = parts.join("/");
+    if (!path) continue;
+    if (file.size > MAX_FILE_BYTES || total + file.size > MAX_PROJECT_BYTES) { skipped.push(path); continue; }
+    total += file.size;
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const text = languageOf(path) || /\.(txt|md|json|jsonl|csv|tsv|html|css|yaml|yml|toml|ini|cfg|xml|svg|sh|bat|ps1|rst|log)$/i.test(path) ? decodeUtf8(bytes) : (bytes.length < 512 * 1024 ? decodeUtf8(bytes) : null);
+    entries.push([path, text === null ? { bytes } : text]);
   }
-  if (entries.length === 0) {
-    log("No .py or .js files found at the top level of that selection.", "error");
+  if (!entries.some(([path]) => languageOf(path))) {
+    log("No .py or .js files found in that selection.", "error");
     return;
   }
-  const name = folderName || (files[0].webkitRelativePath || "").split("/")[0] || "files";
+  const name = folderName || (files[0] instanceof File ? (files[0].webkitRelativePath || "").split("/")[0] : "") || "files";
   stopRun();
   setProject(name, entries, null, null);
-  log(`Opened ${entries.length} file(s) from ${name}.` + (skipped.length ? ` Skipped ${skipped.length} nested file(s); only the top level is used.` : ""), "note");
+  const folders = new Set(entries.map(([p]) => p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "").values());
+  log(`Opened ${entries.length} file(s) from ${name}` + (folders.size > 1 ? ` in ${folders.size} folders` : "") + "." + (skipped.length ? ` Skipped ${skipped.length} file(s) over the size limits.` : ""), "note");
+}
+// Every file below a dropped directory entry, with paths relative to the drop.
+async function readEntryTree(entry, prefix, out) {
+  if (entry.isFile) {
+    const file = await new Promise((resolve) => entry.file(resolve, () => resolve(null)));
+    if (file) out.push({ file, relative: prefix + entry.name });
+    return;
+  }
+  if (!entry.isDirectory || SKIP_DIRS.has(entry.name)) return;
+  const reader = entry.createReader();
+  for (;;) {
+    const batch = await new Promise((resolve) => reader.readEntries(resolve, () => resolve([])));
+    if (!batch.length) break;
+    for (const child of batch) await readEntryTree(child, prefix + entry.name + "/", out);
+  }
 }
 $("#folder-input").addEventListener("change", (event) => {
   loadFileObjects([...event.target.files]);
@@ -303,15 +418,13 @@ document.addEventListener("drop", async (event) => {
     const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
     if (entry && entry.isDirectory) {
       folderName = folderName || entry.name;
-      const children = await new Promise((resolve) => entry.createReader().readEntries(resolve, () => resolve([])));
-      for (const child of children) {
-        if (child.isFile) files.push(await new Promise((resolve) => child.file(resolve, () => resolve(null))));
-      }
+      await readEntryTree(entry, "", files);
     } else if (item.kind === "file") {
-      files.push(item.getAsFile());
+      const file = item.getAsFile();
+      if (file) files.push({ file, relative: (folderName || "files") + "/" + file.name });
     }
   }
-  await loadFileObjects(files.filter(Boolean), folderName);
+  await loadFileObjects(files.filter(Boolean), folderName || "files");
 });
 
 async function loadSample(key) {
@@ -434,17 +547,48 @@ function hookSummary() {
 function projectSources(language) {
   const files = {};
   const order = [];
-  for (const name of [...project.files.keys()].sort()) {
-    if (languageOf(name) !== language) continue;
-    const key = language === "python" ? stemOf(name) : name;
-    if (name === project.entry) continue;
-    files[key] = project.files.get(name);
-    order.push(key);
+  if (language === "python") {
+    // Every file goes along by path: `.py` files are modules (packages by
+    // folder), the rest is the program's filesystem; binaries as base64.
+    for (const [name, value] of [...project.files].sort((a, b) => a[0].localeCompare(b[0]))) {
+      if (project.written.has(name)) continue;
+      files[name] = isBinary(value) ? { base64: bytesToBase64(value.bytes) } : value;
+    }
+    return { files, order, entry: project.entry };
   }
-  const entryKey = language === "python" ? stemOf(project.entry) : project.entry;
-  files[entryKey] = project.files.get(project.entry);
-  order.push(entryKey);
-  return { files, order, entry: entryKey };
+  for (const name of [...project.files.keys()].sort()) {
+    if (languageOf(name) !== language || isBinary(project.files.get(name))) continue;
+    if (name === project.entry) continue;
+    files[name] = project.files.get(name);
+    order.push(name);
+  }
+  files[project.entry] = project.files.get(project.entry);
+  order.push(project.entry);
+  return { files, order, entry: project.entry };
+}
+function programArgs() {
+  const text = el.args.value.trim();
+  if (!text) return [];
+  const out = [];
+  const re = /"([^"]*)"|'([^']*)'|(\S+)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) out.push(m[1] ?? m[2] ?? m[3]);
+  return out;
+}
+// Files the program wrote: shown in the tree (tagged) and openable.
+function applyWrittenFiles(list) {
+  if (!Array.isArray(list) || list.length === 0) return;
+  for (const { path, base64 } of list) {
+    if (typeof path !== "string" || !path) continue;
+    if (base64 === "") { project.files.delete(path); project.written.delete(path); continue; }
+    const bytes = base64ToBytes(base64);
+    const text = decodeUtf8(bytes);
+    project.files.set(path, text === null ? { bytes } : text);
+    project.written.add(path);
+  }
+  renderFiles();
+  if (project.current && list.some((f) => f.path === project.current)) openFile(project.current);
+  save();
 }
 async function run() {
   if (!project.entry) { log("Nothing to run: open a folder or a sample first.", "error"); return; }
@@ -454,11 +598,13 @@ async function run() {
   el.consoleOut.replaceChildren();
   clearCanvas();
   const { files, order, entry } = projectSources(language);
-  log(`▶ ${project.name} (${language}, entry ${project.entry})`, "note");
+  const argv = programArgs();
+  log(`▶ ${project.name} (${language}, entry ${project.entry}${argv.length ? ", args " + argv.join(" ") : ""})`, "note");
   el.run.disabled = true;
   try {
-    const reply = await request({ type: "run", language, files, order, entry, budget: INSTRUCTION_BUDGET, gpuBackend: el.gpuBackend.value }, DEADLINE_MS);
+    const reply = await request({ type: "run", language, files, order, entry, argv: programArgs(), budget: INSTRUCTION_BUDGET, gpuBackend: el.gpuBackend.value }, DEADLINE_MS);
     logConsole(reply.console);
+    applyWrittenFiles(reply.files);
     if (reply.type === "error") {
       reportError(reply);
       return;
@@ -489,6 +635,7 @@ function hostEvent(m) {
   }
   logConsole(m.console);
   render(m.ui);
+  applyWrittenFiles(m.files);
   if (m.error) reportError(m);
 }
 function reportError(reply) {
@@ -543,6 +690,7 @@ async function tick(now) {
   try {
     const reply = await request({ type: "frame", input: snapshot, events }, DEADLINE_MS);
     logConsole(reply.console);
+    applyWrittenFiles(reply.files);
     if (reply.type === "error") { render(reply.ui); reportError(reply); return; }
     render(reply.ui);
     loop.frames++;

@@ -129,6 +129,7 @@ var __zipp_py = (function () {
     defExc("UnboundLocalError", E.NameError); defExc("NotImplementedError", E.RuntimeError); defExc("RecursionError", E.RuntimeError);
     defExc("OverflowError", E.ArithmeticError); defExc("ZeroDivisionError", E.ArithmeticError); defExc("FloatingPointError", E.ArithmeticError);
     defExc("FileNotFoundError", E.OSError); defExc("PermissionError", E.OSError); defExc("TimeoutError", E.OSError);
+    defExc("FileExistsError", E.OSError); defExc("IsADirectoryError", E.OSError); defExc("NotADirectoryError", E.OSError);
     defExc("UnicodeError", E.ValueError); defExc("UnicodeDecodeError", E.UnicodeError); defExc("UnicodeEncodeError", E.UnicodeError);
     defExc("IndentationError", E.SyntaxError); defExc("DeprecationWarning", E.Warning); defExc("UserWarning", E.Warning);
     defExc("StopAsyncIteration"); defExc("JSONDecodeError", E.ValueError);
@@ -158,6 +159,15 @@ var __zipp_py = (function () {
         e.message = excMessage(e) + (e.traceback || "");
     }
     rt.makeExc = makeExc; rt.refreshExc = refreshExc;
+    // Loop forms of map/filter/findIndex/every for callbacks that may run
+    // guest code: a native array builtin would run each callback in a nested
+    // interpreter loop, and the hardened wasm profile caps that nesting.
+    function amap(arr, fn) { const out = new Array(arr.length); for (let i = 0; i < arr.length; i++) out[i] = fn(arr[i], i); return out; }
+    function afilter(arr, fn) { const out = []; for (let i = 0; i < arr.length; i++) if (fn(arr[i], i)) out.push(arr[i]); return out; }
+    function aindex(arr, fn) { for (let i = 0; i < arr.length; i++) if (fn(arr[i], i)) return i; return -1; }
+    function aevery(arr, fn) { for (let i = 0; i < arr.length; i++) if (!fn(arr[i], i)) return false; return true; }
+    function acount(arr, fn) { let n = 0; for (let i = 0; i < arr.length; i++) if (fn(arr[i], i)) n++; return n; }
+    rt.amap = amap; rt.afilter = afilter; rt.aindex = aindex; rt.aevery = aevery; rt.acount = acount;
     function fail(cls, message) { throw makeExc(cls, message === undefined ? [] : [message]); }
     rt.fail = fail;
     const TypeError = E.TypeError, ValueError = E.ValueError;
@@ -670,6 +680,21 @@ var __zipp_py = (function () {
         }
         const ctor = rt.constructors.get(cls);
         if (ctor !== undefined) return ctor(args, kwargs, cls);
+        // A subclass of an immutable builtin container takes its items from
+        // the builtin's constructor (its __new__); a user __init__ then runs.
+        const userNew = lookupType(cls, "__new__");
+        if (userNew === undefined || userNew === ObjectType.dict.get("__new__")) {
+            for (const c of cls.mro) {
+                if (c === T.tuple || c === T.frozenset || c === T.bytes) {
+                    const obj = rt.constructors.get(c)(args, kwargs, cls);
+                    if (obj.cls !== cls) obj.cls = cls;
+                    if (obj.dict === undefined || obj.dict === null) obj.dict = new Map();
+                    const init = lookupType(cls, "__init__");
+                    if (init !== undefined && init !== ObjectType.dict.get("__init__") && !init.isBase) call(descrGet(init, obj, cls), args, kwargs);
+                    return obj;
+                }
+            }
+        }
         const newf = lookupType(cls, "__new__");
         let obj;
         if (newf !== undefined && newf !== ObjectType.dict.get("__new__")) {
@@ -1088,21 +1113,78 @@ var __zipp_py = (function () {
         fail(E.AttributeError, "module '" + m.name + "' has no attribute '" + name + "'");
     };
     R.module = function (name, code, file) { inits.set(name, { code: code, file: file }); files.push(file); return null; };
+    rt.moduleInits = inits;
     R.entry = function (name) { entryName = name; return null; };
+    // Dotted names are packages: `a.b.c` imports `a`, then `a.b`, then `a.b.c`
+    // (each from the project or the bundled library), and each submodule
+    // becomes an attribute of its parent. A folder without `__init__.py` is a
+    // namespace package. Builtin modules with dotted names (`os.path`) are
+    // attributes of their parent.
+    function hasSubmodules(name) {
+        const prefix = name + ".";
+        for (const k of inits.keys()) if (k.startsWith(prefix)) return true;
+        return false;
+    }
     R.import = function (name, importerGlobals) {
         if (modules.has(name)) return modules.get(name);
-        const dot = name.indexOf(".");
+        const dot = name.lastIndexOf(".");
+        let parent = null, leaf = name;
         if (dot >= 0) {
-            const head = R.import(name.slice(0, dot), importerGlobals);
-            const sub = rt.moduleAttr(head, name.slice(dot + 1));
-            return sub;
+            parent = R.import(name.slice(0, dot), importerGlobals);
+            leaf = name.slice(dot + 1);
+            if (modules.has(name)) return modules.get(name);
         }
+        let m;
         const init = inits.get(name);
-        if (init !== undefined) return runModule(name, init, name === entryName ? "__main__" : name);
-        const b = builtinModules.get(name);
-        if (b !== undefined) { const m = typeof b === "function" ? b() : b; modules.set(name, m); return m; }
-        fail(E.ModuleNotFoundError, "No module named '" + name + "'");
+        if (init !== undefined) m = runModule(name, init, name === entryName ? "__main__" : name);
+        else {
+            const b = builtinModules.get(name);
+            if (b !== undefined) { m = typeof b === "function" ? b() : b; modules.set(name, m); }
+            else if (hasSubmodules(name)) { m = newModule(name, null); m.globals.set("__name__", name); m.globals.set("__path__", rt.list([name.replace(/\./g, "/")])); modules.set(name, m); }
+            else if (parent !== null && parent.submodules !== undefined && parent.submodules.has(leaf)) { m = parent.submodules.get(leaf); modules.set(name, m); }
+            else fail(E.ModuleNotFoundError, "No module named '" + name + "'");
+        }
+        if (parent !== null && parent.globals.get(leaf) === undefined) parent.globals.set(leaf, m);
+        return m;
     };
+    // ---- the virtual filesystem ------------------------------------------------------------
+    // Files the host gave the program (root-relative paths, bytes) plus
+    // whatever it writes. Nothing here touches a real disk; the host reads
+    // the changes back through `__zipp_py_vfs_changed`.
+    const vfs = new Map(), vfsChanged = new Set();
+    const vfsNorm = function (p) {
+        p = String(p).replace(/\\/g, "/");
+        const parts = [], segs = p.split("/");
+        for (const s of segs) { if (s === "" || s === ".") continue; if (s === "..") { parts.pop(); continue; } parts.push(s); }
+        return parts.join("/");
+    };
+    rt.vfs = {
+        norm: vfsNorm,
+        has: (p) => vfs.has(vfsNorm(p)),
+        get: (p) => vfs.get(vfsNorm(p)),
+        set: (p, bytes) => { const n = vfsNorm(p); vfs.set(n, bytes); vfsChanged.add(n); return n; },
+        remove: (p) => { const n = vfsNorm(p); const had = vfs.delete(n); if (had) vfsChanged.add(n); return had; },
+        isDir: (p) => { const n = vfsNorm(p); if (n === "") return true; const prefix = n + "/"; for (const k of vfs.keys()) if (k.startsWith(prefix)) return true; return dirs.has(n); },
+        list: () => Array.from(vfs.keys()),
+        listDir: (p) => {
+            const n = vfsNorm(p), prefix = n === "" ? "" : n + "/", out = new Set();
+            for (const k of vfs.keys()) if (k.startsWith(prefix)) { const rest = k.slice(prefix.length); const i = rest.indexOf("/"); out.add(i < 0 ? rest : rest.slice(0, i)); }
+            for (const d of dirs) if (d.startsWith(prefix) && d !== n) { const rest = d.slice(prefix.length); const i = rest.indexOf("/"); out.add(i < 0 ? rest : rest.slice(0, i)); }
+            return Array.from(out).sort();
+        },
+        mkdir: (p) => { dirs.add(vfsNorm(p)); },
+        changed: () => { const out = Array.from(vfsChanged); vfsChanged.clear(); return out; },
+    };
+    const dirs = new Set();
+    R.vfs = function (path, latin1) {
+        const bytes = new Uint8Array(latin1.length);
+        for (let i = 0; i < latin1.length; i++) bytes[i] = latin1.charCodeAt(i) & 255;
+        vfs.set(vfsNorm(path), bytes);
+        return null;
+    };
+    rt.argv = [];
+    rt.version = "0.0.17";
+    R.argv = function (items) { rt.argv = items.slice(); return null; };
     function runModule(name, init, dunderName) {
         const m = newModule(name, init.file);
         m.globals.set("__name__", dunderName);
@@ -1147,13 +1229,29 @@ var __zipp_py = (function () {
     R.runmain = function (name) {
         const init = inits.get(name);
         if (init === undefined) fail(E.ModuleNotFoundError, name);
-        return runModule(name, init, "__main__");
+        const m = runModule(name, init, "__main__");
+        // A test file as the entry runs its tests, as `pytest file.py` would.
+        const base = String(init.file || "").split("/").pop();
+        if ((/^test_.*\.py$/.test(base) || /_test\.py$/.test(base)) && inits.has("pytest")) {
+            const pytest = R.import("pytest", null);
+            const run = pytest.globals.get("run_module");
+            if (run !== undefined) {
+                const status = call(run, [rt.dictFromMap(m.globals), base], null);
+                if (rt.truth(status)) throw makeExc(E.SystemExit, [status]);
+            }
+        }
+        return m;
     };
     R.importfrom = function (m, name) {
         try { return getattr(m, name); }
         catch (e) {
-            if (e && e.cls === E.AttributeError) fail(E.ImportError, "cannot import name '" + name + "' from '" + m.name + "'");
-            throw e;
+            if (!(e && e.cls === E.AttributeError)) throw e;
+            // `from pkg import sub`: a submodule that is not an attribute yet.
+            if (m !== null && typeof m === "object" && m.globals !== undefined && typeof m.name === "string") {
+                const full = m.name + "." + name;
+                if (inits.has(full) || builtinModules.has(full) || hasSubmodules(full)) return R.import(full, null);
+            }
+            fail(E.ImportError, "cannot import name '" + name + "' from '" + m.name + "'");
         }
     };
     R.importstar = function (m, g) {

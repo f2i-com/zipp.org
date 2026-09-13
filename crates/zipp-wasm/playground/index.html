@@ -34,6 +34,7 @@
       </div>
     </div>
     <button class="button" id="new-file" type="button">New file</button>
+    <input id="program-args" class="args" type="text" placeholder="program arguments (sys.argv)" title="Arguments for the program, as on a command line: sys.argv[1:]" spellcheck="false">
     <label class="button" title="Where Python zipp_gpu graphs run: auto tries WebGPU, then WebGL2, then compiled WASM, then a JavaScript reference">
       GPU
       <select id="gpu-backend">
@@ -63,11 +64,13 @@
       <button class="link danger" id="delete-file" type="button">Delete</button>
     </div>
     <p class="hint">
-      Drop a folder anywhere on the page. The entry file (<code>main.py</code> /
-      <code>main.js</code>) runs first; Python modules import each other by name,
-      JavaScript files share one global scope. Define <code>draw()</code> and
-      <code>update()</code> to animate, <code>on_click(x, y)</code> and
-      <code>on_key(key)</code> for input.
+      Drop a folder anywhere on the page: every file comes along, subfolders
+      included. The entry file (<code>main.py</code> / <code>main.js</code>, or
+      any file you set) runs first; Python modules import each other by name
+      and by package, and the program can <code>open()</code> the folder's
+      files (files it writes appear here). JavaScript files share one global
+      scope. Define <code>draw()</code> and <code>update()</code> to animate,
+      <code>on_click(x, y)</code> and <code>on_key(key)</code> for input.
     </p>
   </aside>
 

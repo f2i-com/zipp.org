@@ -71,6 +71,8 @@ pub(super) struct Emitter<'a> {
     /// right side of `and`/`or`, a conditional expression's arms): a walrus
     /// there must not count as a definite binding.
     pub speculative: usize,
+    /// `from __future__ import annotations`: annotations stay strings.
+    pub future_annotations: bool,
     pub control_depth: usize,
     pub loops: Vec<LoopCtx>,
     pub handler_depth: usize,
@@ -120,6 +122,7 @@ impl<'a> Emitter<'a> {
             cells: BTreeMap::new(),
             definite: BTreeSet::new(),
             speculative: 0,
+            future_annotations: false,
             control_depth: 0,
             loops: Vec::new(),
             handler_depth: 0,
@@ -445,6 +448,20 @@ impl<'a> Emitter<'a> {
         })?;
         Ok(dst)
     }
+    /// An annotation's value: the expression, or its source text when the
+    /// module imports `annotations` from `__future__` (PEP 563), so forward
+    /// references and `X | None` never evaluate at definition time.
+    pub fn annotation_value(&mut self, expr: &ast::Expr, depth: usize) -> R<Reg> {
+        if self.future_annotations {
+            let range = expr.range();
+            let start = u32::from(range.start()) as usize;
+            let end = u32::from(range.end()) as usize;
+            let text = self.unit.source.get(start..end).unwrap_or("").to_owned();
+            return self.string(&text);
+        }
+        self.expr(expr, depth)
+    }
+
     /// A function or module body under a catch-all handler that records
     /// this frame (file, line, name) on any exception passing through, then
     /// rethrows: the traceback CPython prints, at the cost of one handler
@@ -763,6 +780,7 @@ impl<'a> Emitter<'a> {
             self.program,
             qualname,
         )?;
+        child.future_annotations = self.future_annotations;
         body(&mut child)?;
         let mut program = self.program.borrow_mut();
         let func_id = program.functions.len() as u32;
@@ -891,7 +909,13 @@ impl<'a> Emitter<'a> {
         let head = name.split('.').next().unwrap_or(name);
         BUILTIN_MODULES.contains(&head)
     }
+    /// A project module, a namespace package (a folder holding project
+    /// modules but no `__init__.py`), or a built-in module.
     pub fn module_exists(&self, name: &str) -> bool {
-        self.project.modules.contains(name) || Self::is_builtin_module(name)
+        if self.project.modules.contains(name) || Self::is_builtin_module(name) {
+            return true;
+        }
+        let prefix = format!("{name}.");
+        self.project.modules.iter().any(|m| m.starts_with(&prefix))
     }
 }

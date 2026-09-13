@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 TARGET=wasm32-unknown-unknown
-export RUSTFLAGS="${RUSTFLAGS:--C link-arg=--max-memory=1073741824 -C link-arg=-zstack-size=1048576}"
+export RUSTFLAGS="${RUSTFLAGS:--C link-arg=--max-memory=1073741824 -C link-arg=-zstack-size=16777216}"
 
 declare -A FEATURES=(
   [javascript]=""

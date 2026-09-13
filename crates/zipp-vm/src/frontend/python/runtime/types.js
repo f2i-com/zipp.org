@@ -305,6 +305,25 @@
         fail(E.TypeError, "'" + sym + "' not supported between instances of '" + typeOf(a).name + "' and '" + typeOf(b).name + "'");
     }
     R.cmp = cmp; rt.cmp = cmp;
+    // The comparison OPERATORS: a user-defined dunder's result is returned as
+    // is (a tensor, a symbolic expression, ...); everything else is a bool.
+    const RICH = { eq: ["__eq__", "__eq__"], ne: ["__ne__", "__ne__"], lt: ["__lt__", "__gt__"], le: ["__le__", "__ge__"], gt: ["__gt__", "__lt__"], ge: ["__ge__", "__le__"] };
+    function userDunder(v, name) {
+        if (v === null || typeof v !== "object" || v.cls === undefined) return undefined;
+        const m = typeMethod(v, name);
+        if (m === undefined || m === null || m.isBase || m === rt.ObjectType.dict.get(name)) return undefined;
+        return m;
+    }
+    R.richcmp = function (op, a, b) {
+        const names = RICH[op];
+        if (names !== undefined) {
+            const m = userDunder(a, names[0]);
+            if (m !== undefined) { const r = call(descrGet(m, a, a.cls), [b], null); if (r !== NOTIMPL) return r; }
+            const rm = userDunder(b, names[1]);
+            if (rm !== undefined) { const r = call(descrGet(rm, b, b.cls), [a], null); if (r !== NOTIMPL) return r; }
+        }
+        return cmp(op, a, b);
+    };
     function compareStrings(a, b) {
         // Code-point order (JS compares UTF-16 units, which differs for astral characters).
         if (a === b) return 0;
@@ -512,7 +531,7 @@
     }
     function setDel(s, v) {
         const k = keyOf(v); const b = s.map.get(k); if (b === undefined) return false;
-        const i = b.findIndex((x) => eq(x, v)); if (i < 0) return false;
+        const i = rt.aindex(b, (x) => eq(x, v)); if (i < 0) return false;
         b.splice(i, 1); s.size--; if (b.length === 0) s.map.delete(k); return true;
     }
     function* setValues(s) { for (const x of setList(s)) yield x; }

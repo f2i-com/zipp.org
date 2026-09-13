@@ -277,6 +277,68 @@ struct Helpers {
     cancel_host_call: Option<u32>,
 }
 
+/// The dotted module name of a root-relative `.py` path, or None for any
+/// other path: `legacy/fast_memory.py` → `legacy.fast_memory`,
+/// `pkg/__init__.py` → `pkg`, `main.py` → `main`.
+#[cfg(feature = "python")]
+fn module_name_of_path(path: &str) -> Option<String> {
+    let stem = path.strip_suffix(".py")?;
+    let stem = stem.strip_suffix("/__init__").unwrap_or(stem);
+    if stem.is_empty() || stem.starts_with('/') || stem.contains("..") {
+        return None;
+    }
+    let name = stem.replace('/', ".");
+    let valid = name.split('.').all(|segment| {
+        let mut chars = segment.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    valid.then_some(name)
+}
+
+/// A host value rendered as an argument string.
+#[cfg(feature = "python")]
+fn host_value_text(value: &HostValue) -> String {
+    match value {
+        HostValue::String(s) => s.clone(),
+        HostValue::Number(n) => {
+            if n.fract() == 0.0 && n.abs() < 1e15 {
+                format!("{}", *n as i64)
+            } else {
+                format!("{n}")
+            }
+        }
+        HostValue::Bool(b) => format!("{b}"),
+        _ => String::new(),
+    }
+}
+
+/// Standard base64 (with or without padding) to bytes.
+#[cfg(feature = "python")]
+fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\n' | b'\r' | b' ' => continue,
+            _ => return Err("invalid base64".into()),
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Ok(out)
+}
+
 /// Global slots of the Python runtime's host hooks (see `runtime.js`).
 #[cfg(feature = "python")]
 #[derive(Clone, Copy)]
@@ -308,6 +370,9 @@ pub struct Engine {
     slots: Vec<(String, u32, SymbolScope)>,
     helpers: Helpers,
     bridges: Rc<RefCell<Bridges>>,
+    /// What a failed initialization printed before its error, kept for
+    /// `takeFailedConsole` after the engine is disposed.
+    failed_init_console: Vec<(ConsoleStream, String)>,
     /// Number of lines the preamble adds, so a host can correct the line
     /// numbers in a compile error back to its own source.
     preamble_lines: u32,
@@ -361,6 +426,7 @@ impl Engine {
             source_language: zipp_vm::frontend::LanguageId::JavaScript,
             #[cfg(feature = "python")]
             python_hooks: None,
+            failed_init_console: Vec::new(),
             slots: Vec::new(),
             helpers: Helpers::default(),
             bridges: Rc::new(RefCell::new(Bridges::default())),
@@ -507,33 +573,94 @@ impl Engine {
     /// initial-source ceiling charged against the total of every file.
     #[cfg(feature = "python")]
     #[wasm_bindgen(js_name = initPythonProject)]
-    pub fn init_python_project(&mut self, files: JsValue, entry: &str) -> Result<JsValue, JsValue> {
+    pub fn init_python_project(&mut self, files: JsValue, entry: &str, argv: JsValue) -> Result<JsValue, JsValue> {
+        // `files` maps either module names to source (the original form:
+        // `{main: "..."}`) or root-relative paths to contents: a `.py` path
+        // is a module (`legacy/fast_memory.py` → `legacy.fast_memory`,
+        // `pkg/__init__.py` → `pkg`) and every path is also a file of the
+        // program's virtual filesystem; a text file is a string, a binary
+        // one `{base64: "..."}`. `entry` is a module name or a `.py` path.
         let files = match from_js(&files).map_err(|error| self.to_js_error(error))? {
             HostValue::Object(entries) => entries,
             _ => {
                 self.note_error_kind("usage");
                 return Err(JsValue::from_str(
-                    "TypeError: files must be a plain object of module name to source",
+                    "TypeError: files must be a plain object of path (or module name) to contents",
                 ));
             }
         };
-        let mut modules = Vec::with_capacity(files.len());
-        let mut total = 0usize;
-        for (name, source) in files {
-            let HostValue::String(source) = source else {
+        let argv = match from_js(&argv).map_err(|error| self.to_js_error(error))? {
+            HostValue::Undefined | HostValue::Null => Vec::new(),
+            HostValue::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        HostValue::String(s) => out.push(s),
+                        other => out.push(host_value_text(&other)),
+                    }
+                }
+                out
+            }
+            _ => {
                 self.note_error_kind("usage");
-                return Err(JsValue::from_str(&format!(
-                    "TypeError: module {name:?} source must be a string"
-                )));
+                return Err(JsValue::from_str("TypeError: argv must be an array of strings"));
+            }
+        };
+        let mut modules = Vec::with_capacity(files.len());
+        let mut vfs = Vec::with_capacity(files.len());
+        let mut total = 0usize;
+        for (name, contents) in files {
+            let bytes: Vec<u8> = match contents {
+                HostValue::String(source) => {
+                    total = total.saturating_add(source.len());
+                    if let Some(module) = module_name_of_path(&name) {
+                        modules.push((module, source.clone()));
+                    } else if !name.contains('/') && !name.contains('.') {
+                        // The original form: a bare module name.
+                        modules.push((name.clone(), source.clone()));
+                        continue;
+                    }
+                    source.into_bytes()
+                }
+                HostValue::Object(fields) => {
+                    let mut decoded = None;
+                    for (key, value) in fields {
+                        if key == "base64" {
+                            if let HostValue::String(text) = value {
+                                decoded = Some(base64_decode(&text).map_err(|e| {
+                                    self.note_error_kind("usage");
+                                    JsValue::from_str(&format!("TypeError: file {name:?}: {e}"))
+                                })?);
+                            }
+                        }
+                    }
+                    match decoded {
+                        Some(bytes) => {
+                            total = total.saturating_add(bytes.len());
+                            bytes
+                        }
+                        None => {
+                            self.note_error_kind("usage");
+                            return Err(JsValue::from_str(&format!(
+                                "TypeError: file {name:?} must be a string or {{base64: ...}}"
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    self.note_error_kind("usage");
+                    return Err(JsValue::from_str(&format!(
+                        "TypeError: file {name:?} must be a string or {{base64: ...}}"
+                    )));
+                }
             };
-            total = total.saturating_add(source.len());
-            modules.push((name, source));
+            vfs.push((name, bytes));
         }
-        let entry = entry.to_owned();
+        let entry = module_name_of_path(entry).unwrap_or_else(|| entry.to_owned());
         self.initialize(zipp_vm::frontend::LanguageId::Python, total, move || {
             // Hosted: the embedder drains `takeHostRequests` and answers
             // through `pythonCall("__zipp_py_deliver", ...)`.
-            zipp_vm::frontend::compile_python_project_hosted(&entry, &modules, true)
+            zipp_vm::frontend::compile_python_program(&entry, &modules, &vfs, &argv, true)
                 .map(|compiled| compiled.into_state())
         })
     }
@@ -616,12 +743,14 @@ impl Engine {
             let init = st.run_init();
             if let Some(error) = st.resource_limit_error() {
                 self.note_error_kind("resource");
+                self.failed_init_console = st.console_snapshot();
                 return Err(JsValue::from_str(error));
             }
-            init.map_err(|e| {
+            if let Err(e) = init {
                 self.note_error_kind("source");
-                JsValue::from_str(&e)
-            })?;
+                self.failed_init_console = st.console_snapshot();
+                return Err(JsValue::from_str(&e));
+            }
 
             let mut slots = Vec::new();
             let mut exposed = Vec::new();
@@ -1548,6 +1677,19 @@ impl Engine {
             st.discard_console_prefix(count);
         }
         Ok(result)
+    }
+
+    /// The console entries a failed initialization produced before its
+    /// error (a program's own output ahead of the raise, a test report
+    /// ahead of its non-zero exit), in `takeConsole`'s tagged form. The one
+    /// method that answers on a disposed engine; it drains, and an engine
+    /// that initialized returns an empty array.
+    #[wasm_bindgen(js_name = takeFailedConsole)]
+    pub fn take_failed_console(&mut self) -> Result<JsValue, JsValue> {
+        let snapshot = std::mem::take(&mut self.failed_init_console);
+        let (value, _) =
+            console_output_prefix(&snapshot, true).map_err(|error| self.to_js_error(error))?;
+        to_js(&value).map_err(|error| self.to_js_error(error))
     }
 
     /// Tear the VM down. The engine is unusable afterwards.

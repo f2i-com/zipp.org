@@ -50,6 +50,7 @@ const CHECKS = [
   ["syntax-corpus.cjs"],
   // The experimental Python frontend's boundary contract; adapts to the
   // artifact's `languages`, so the JavaScript-only build proves the refusal.
+  ["native-depth.cjs"],
   ["python-frontend.cjs"],
   ["python-gpu.cjs"],
 ];

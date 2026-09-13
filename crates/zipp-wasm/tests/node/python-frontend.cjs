@@ -134,10 +134,80 @@ if (languages.includes("python")) {
   eq("lastErrorKind classifies the failed call as guest", p.lastErrorKind(), "guest");
   p.dispose();
 
+  // A folder as the playground and CLI hand it over: paths as keys, packages
+  // by folder, data files and a binary (base64), program arguments, and the
+  // files the program writes read back through __zipp_py_vfs_changed.
+  {
+    const lab = new Engine();
+    const blob = Buffer.from(Array.from({ length: 300 }, (_, i) => i % 256));
+    const files = {
+      "run.py": [
+        "import sys, os, json",
+        "from legacy.fast_memory import Memory",
+        "import pkg.tools as tools",
+        "from pkg import extra",
+        "with open('data/config.json') as f:",
+        "    cfg = json.load(f)",
+        "with open('data/model.bin', 'rb') as f:",
+        "    raw = f.read()",
+        "print(sys.argv, cfg['steps'], Memory().name, tools.twice(cfg['steps']), extra.TAG)",
+        "print(len(raw), raw[:3], raw[-1], sorted(os.listdir('data')))",
+        "os.makedirs('out', exist_ok=True)",
+        "with open('out/result.json', 'w') as f:",
+        "    json.dump({'argv': sys.argv[1:], 'total': len(raw)}, f)",
+        "with open('out/copy.bin', 'wb') as f:",
+        "    f.write(raw[:4])",
+        "def draw():",
+        "    with open('out/frame.txt', 'a') as f:",
+        "        f.write('tick\\n')",
+        "",
+      ].join("\n"),
+      "legacy/fast_memory.py": "class Memory:\n    name = 'fast'\n",
+      "pkg/__init__.py": "print('pkg ready')\n",
+      "pkg/tools.py": "def twice(n):\n    return n * 2\n",
+      "pkg/extra.py": "TAG = 'extra'\n",
+      "data/config.json": JSON.stringify({ steps: 21 }),
+      "data/model.bin": { base64: blob.toString("base64") },
+      "README.md": "# not a module\n",
+    };
+    const labErr = thrown(() => lab.initPythonProject(files, "run.py", ["--steps", "7"]));
+    ok("a path-keyed project with packages, data and a binary runs", labErr === null, labErr);
+    eq("argv, packages and files reach the program", lab.takeOutput(), [
+      "pkg ready",
+      "['run.py', '--steps', '7'] 21 fast 42 extra",
+      "300 b'\\x00\\x01\\x02' 43 ['config.json', 'model.bin']",
+    ]);
+    const written = String(lab.pythonCall("__zipp_py_vfs_changed", [])).split("\n").filter(Boolean).map((l) => l.split("\t"));
+    eq("written files come back as path and base64", written.map(([p]) => p).sort(), ["out/copy.bin", "out/result.json"]);
+    const result = Object.fromEntries(written);
+    eq("a written text file decodes", JSON.parse(Buffer.from(result["out/result.json"], "base64").toString()), { argv: ["--steps", "7"], total: 300 });
+    eq("a written binary file keeps its bytes", [...Buffer.from(result["out/copy.bin"], "base64")], [0, 1, 2, 3]);
+    eq("reporting clears the change set", lab.pythonCall("__zipp_py_vfs_changed", []), "");
+    lab.pythonCall("draw", []);
+    const again = String(lab.pythonCall("__zipp_py_vfs_changed", [])).split("\n").filter(Boolean);
+    ok("a frame's writes are reported on the next call", again.length === 1 && again[0].startsWith("out/frame.txt\t"), again.join("|"));
+    lab.dispose();
+
+    const badBinary = new Engine();
+    const b64Err = thrown(() => badBinary.initPythonProject({ "main.py": "print(1)\n", "x.bin": { base64: "***" } }, "main.py", []));
+    ok("a malformed base64 file is a usage error", b64Err !== null && /base64|x\.bin/.test(b64Err), b64Err);
+
+    const tests = new Engine();
+    const testErr = thrown(() => tests.initPythonProject({ "tests/test_thing.py": "def test_math():\n    assert 2 + 2 == 4\n\ndef test_bad():\n    assert 1 == 2\n" }, "tests/test_thing.py", []));
+    ok("a test_*.py entry runs its tests and a failure is a SystemExit", testErr !== null && /SystemExit/.test(testErr), testErr);
+    ok("a failed initialization disposes the engine", tests.disposed);
+    const testOut = tests.takeFailedConsole().map((e) => e.text).join("\n");
+    ok("the test report survives the failed initialization through takeFailedConsole", /test_math PASSED/.test(testOut) && /1 failed, 1 passed/.test(testOut), testOut);
+    eq("takeFailedConsole drains", tests.takeFailedConsole(), []);
+  }
+
   const badProject = new Engine();
   const badErr = thrown(() => badProject.initPythonProject({ main: "import missing\n" }, "main"));
   ok("an unknown import is a compile error", badErr !== null && /No module named 'missing'/.test(badErr), badErr);
   ok("a failed project initialization disposes the engine", badProject.disposed);
+  const raising = new Engine();
+  thrown(() => raising.initPythonProject({ main: "print('before')\nraise ValueError('boom')\n" }, "main"));
+  eq("output printed before a top-level raise is kept for the host", raising.takeFailedConsole().map((e) => [e.stream, e.text]), [["stdout", "before"]]);
 
   const js = new Engine();
   js.initSource("var x = 1;", "javascript");

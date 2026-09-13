@@ -11,7 +11,7 @@
 use crate::bytecode::{Instr, Program};
 use rustpython_parser::{ast, lexer, Mode, Parse, Tok};
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 mod emitter;
 mod exprs;
@@ -29,6 +29,8 @@ const RUNTIME: &str = concat!(
     include_str!("runtime/builtins.js"),
     "\n",
     include_str!("runtime/stdlib.js"),
+    "\n",
+    include_str!("runtime/tensor.js"),
     "\n",
     include_str!("runtime/entry.js"),
 );
@@ -66,18 +68,47 @@ pub(super) const BUILTIN_MODULES: &[&str] = &[
     "fractions",
     "struct",
     "contextlib",
+    "hashlib",
+    "platform",
+    "importlib",
     "_zipp_gpu",
+    "_zipp_tensor",
 ];
 
 /// Library modules written in Python and bundled with the frontend. One is
 /// compiled into a program only when a module of the program imports it
 /// (directly or through another bundled module), so a program that never
 /// mentions it pays nothing.
-pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[("zipp_gpu", include_str!("lib/zipp_gpu.py"))];
+pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[
+    ("zipp_gpu", include_str!("lib/shared/zipp_gpu.py")),
+    ("torch", include_str!("lib/torch.py")),
+    ("torch.nn", include_str!("lib/torch_nn.py")),
+    ("torch.nn.functional", include_str!("lib/torch_nn_functional.py")),
+    ("torch.nn.init", include_str!("lib/torch_nn_init.py")),
+    ("torch.nn.utils", include_str!("lib/torch_nn_utils.py")),
+    ("torch.optim", include_str!("lib/torch_optim.py")),
+    ("torch.autograd", include_str!("lib/torch_autograd.py")),
+    ("torch._utils", include_str!("lib/torch__utils.py")),
+    ("pickle", include_str!("lib/pickle.py")),
+    ("zipfile", include_str!("lib/zipfile.py")),
+    ("pathlib", include_str!("lib/pathlib.py")),
+    ("argparse", include_str!("lib/argparse.py")),
+    ("inspect", include_str!("lib/inspect.py")),
+    ("pytest", include_str!("lib/pytest.py")),
+];
 
 /// A single-file program: the source is the `main` module.
 pub(super) fn compile(source: &str) -> R<Program> {
-    compile_project("main", &[("main".to_owned(), source.to_owned())], false)
+    compile_project("main", &[("main".to_owned(), source.to_owned())], &[], &[], false)
+}
+
+/// Bounds on the virtual filesystem a program is compiled with.
+const MAX_VFS_FILE: usize = 8 * 1024 * 1024;
+const MAX_VFS_TOTAL: usize = 64 * 1024 * 1024;
+
+/// The head (first segment) of a dotted module name.
+fn module_head(name: &str) -> &str {
+    name.split('.').next().unwrap_or(name)
 }
 
 /// What the emitter knows about the whole project.
@@ -94,14 +125,16 @@ fn imported_modules(suite: &[ast::Stmt], out: &mut BTreeSet<String>) {
         match stmt {
             ast::Stmt::Import(i) => {
                 for alias in &i.names {
-                    let head = alias.name.as_str().split('.').next().unwrap_or("");
-                    out.insert(head.to_owned());
+                    out.insert(alias.name.as_str().to_owned());
                 }
             }
             ast::Stmt::ImportFrom(i) => {
                 if let Some(module) = &i.module {
-                    let head = module.as_str().split('.').next().unwrap_or("");
-                    out.insert(head.to_owned());
+                    out.insert(module.as_str().to_owned());
+                    // `from pkg import sub` may name a submodule.
+                    for alias in &i.names {
+                        out.insert(format!("{}.{}", module.as_str(), alias.name.as_str()));
+                    }
                 }
             }
             ast::Stmt::If(s) => {
@@ -138,11 +171,19 @@ fn imported_modules(suite: &[ast::Stmt], out: &mut BTreeSet<String>) {
     }
 }
 
-/// `hosted` tells the runtime that an embedder will drain and answer host
-/// requests (the wasm engine does); otherwise requests are settled locally.
+/// A project: `modules` are the candidate `.py` files by dotted module name
+/// (`legacy.fast_memory` for `legacy/fast_memory.py`, `pkg` for
+/// `pkg/__init__.py`); only the ones reachable from `entry` through imports
+/// are compiled, plus the bundled library modules those import. `files` is
+/// the virtual filesystem the program sees (paths relative to its root),
+/// `argv` becomes `sys.argv[1:]`, and `hosted` tells the runtime that an
+/// embedder will drain and answer host requests (the wasm engine does);
+/// otherwise requests are settled locally.
 pub(super) fn compile_project(
     entry: &str,
     modules: &[(String, String)],
+    files: &[(String, Vec<u8>)],
+    argv: &[String],
     hosted: bool,
 ) -> R<Program> {
     if modules.is_empty() {
@@ -151,59 +192,104 @@ pub(super) fn compile_project(
     if modules.len() > MAX_MODULES {
         return Err(format!("Python project: more than {MAX_MODULES} modules"));
     }
-    let mut names = BTreeSet::new();
-    let mut module_names = Vec::new();
-    for (name, _) in modules {
+    let mut candidates: BTreeMap<&str, &str> = BTreeMap::new();
+    for (name, source) in modules {
         if !is_module_name(name) {
             return Err(format!(
-                "Python project: {name:?} is not a valid module name (letters, digits and _ only)"
+                "Python project: {name:?} is not a valid module name (dotted identifiers only)"
             ));
         }
-        if !names.insert(name.as_str()) {
+        if candidates.insert(name.as_str(), source.as_str()).is_some() {
             return Err(format!("Python project: duplicate module {name:?}"));
         }
-        module_names.push(name.as_str());
     }
-    if !names.contains(entry) {
+    if !candidates.contains_key(entry) {
         return Err(format!(
             "Python project: entry module {entry:?} is not in the project"
         ));
     }
-    // Project modules first, then any bundled library module they import
-    // (a project module of the same name shadows the bundled one).
-    let mut sources: Vec<(String, String)> = modules.to_vec();
-    let mut parsed = Vec::with_capacity(modules.len());
-    let mut wanted = BTreeSet::new();
-    let mut index = 0;
-    while index < sources.len() {
-        let (name, source) = &sources[index];
-        let file = format!("{name}.py");
-        preflight(&file, source)?;
-        let source: &str = source.strip_prefix('\u{feff}').unwrap_or(source);
-        let suite = ast::Suite::parse(source, &file).map_err(|e| {
+    let mut total = 0usize;
+    for (path, bytes) in files {
+        if bytes.len() > MAX_VFS_FILE {
+            return Err(format!("Python project: file {path:?} exceeds 8 MiB"));
+        }
+        total += bytes.len();
+        if total > MAX_VFS_TOTAL {
+            return Err("Python project: files exceed 64 MiB in total".into());
+        }
+    }
+    // Breadth-first from the entry: a module is compiled only when something
+    // imports it, so an unrelated file with a syntax error costs nothing.
+    // Bundled library modules come in by head name (`import torch.nn` brings
+    // every `torch.*` module); a project module of the same name shadows them.
+    let mut sources: Vec<(String, String)> = Vec::new();
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    let mut parsed = Vec::new();
+    let mut queue: Vec<String> = vec![entry.to_owned()];
+    let mut queued: BTreeSet<String> = BTreeSet::new();
+    queued.insert(entry.to_owned());
+    // A `test_*.py` entry runs its tests through the bundled pytest, so that
+    // module comes along even when the file never imports it.
+    let entry_base = entry.rsplit('.').next().unwrap_or(entry);
+    if entry_base.starts_with("test_") || entry_base.ends_with("_test") {
+        queued.insert("pytest".to_owned());
+        queue.push("pytest".to_owned());
+    }
+    while let Some(name) = queue.first().cloned() {
+        queue.remove(0);
+        let source = match candidates.get(name.as_str()) {
+            Some(s) => (*s).to_owned(),
+            None => match BUNDLED_MODULES.iter().find(|(n, _)| *n == name) {
+                Some((_, text)) => (*text).to_owned(),
+                None => continue,
+            },
+        };
+        let file = format!("{}.py", name.replace('.', "/"));
+        preflight(&file, &source)?;
+        let text: &str = source.strip_prefix('\u{feff}').unwrap_or(&source);
+        let suite = ast::Suite::parse(text, &file).map_err(|e| {
             format!(
                 "SyntaxError: {} ({})",
                 e.error,
-                position(&file, source, e.offset)
+                position(&file, text, e.offset)
             )
         })?;
-        let table = symtable::analyse(&suite, name).map_err(|e| format!("{file}: {e}"))?;
+        let table = symtable::analyse(&suite, &name).map_err(|e| format!("{file}: {e}"))?;
+        let mut wanted = BTreeSet::new();
         imported_modules(&suite, &mut wanted);
+        let index = sources.len();
+        names.insert(name.clone());
+        sources.push((name.clone(), source));
         parsed.push((index, file, suite, table));
-        for (bundled, text) in BUNDLED_MODULES {
-            if wanted.contains(*bundled) && !sources.iter().any(|(n, _)| n == bundled) {
-                sources.push(((*bundled).to_owned(), (*text).to_owned()));
+        if sources.len() > MAX_MODULES {
+            return Err(format!("Python project: more than {MAX_MODULES} modules"));
+        }
+        for imported in wanted {
+            // `a.b.c` also needs the packages `a` and `a.b` when they exist.
+            let mut prefix = String::new();
+            for segment in imported.split('.') {
+                if !prefix.is_empty() {
+                    prefix.push('.');
+                }
+                prefix.push_str(segment);
+                if candidates.contains_key(prefix.as_str()) && queued.insert(prefix.clone()) {
+                    queue.push(prefix.clone());
+                }
+            }
+            let head = module_head(&imported);
+            if candidates.contains_key(head) {
+                continue;
+            }
+            for (bundled, _) in BUNDLED_MODULES {
+                if module_head(bundled) == head && queued.insert((*bundled).to_owned()) {
+                    queue.push((*bundled).to_owned());
+                }
             }
         }
-        index += 1;
     }
     let sources = &sources;
-    let mut names = names;
-    let mut module_names = module_names;
-    for (name, _) in sources.iter().skip(modules.len()) {
-        names.insert(name.as_str());
-        module_names.push(name.as_str());
-    }
+    let names: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+    let module_names: Vec<&str> = sources.iter().map(|(n, _)| n.as_str()).collect();
     let parsed: Vec<_> = parsed
         .into_iter()
         .map(|(index, file, suite, table)| {
@@ -261,6 +347,13 @@ pub(super) fn compile_project(
             &program,
             "<module>".to_owned(),
         )?;
+        out.future_annotations = suite.iter().any(|s| match s {
+            ast::Stmt::ImportFrom(i) => {
+                i.module.as_ref().is_some_and(|m| m.as_str() == "__future__")
+                    && i.names.iter().any(|a| a.name.as_str() == "annotations")
+            }
+            _ => false,
+        });
         out.frame_guard(1, |out| {
             out.suite(suite, 0)?;
             let value = out.none()?;
@@ -301,6 +394,19 @@ pub(super) fn compile_project(
     out.helper("entry", &[name])?;
     let hosted_r = out.boolean(hosted)?;
     out.helper("hosted", &[hosted_r])?;
+    // The virtual filesystem: each file's bytes as a Latin-1 string constant.
+    for (path, bytes) in files {
+        let path_r = out.string(path)?;
+        let data: String = bytes.iter().map(|b| *b as char).collect();
+        let data_r = out.string(&data)?;
+        out.helper("vfs", &[path_r, data_r])?;
+    }
+    let mut argv_regs = Vec::with_capacity(argv.len());
+    for arg in argv {
+        argv_regs.push(out.string(arg)?);
+    }
+    let argv_r = out.array(&argv_regs)?;
+    out.helper("argv", &[argv_r])?;
     let name = out.string(entry)?;
     out.helper("runmain", &[name])?;
     let value = out.none()?;
@@ -313,12 +419,14 @@ pub(super) fn compile_project(
 }
 
 fn is_module_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
+    if name.is_empty() || name.len() > 200 {
+        return false;
     }
-    name.len() <= 64 && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    name.split('.').all(|segment| {
+        let mut chars = segment.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// Conservative compiler limits, additional to host execution limits.

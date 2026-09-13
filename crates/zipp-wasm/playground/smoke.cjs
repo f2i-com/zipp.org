@@ -11,6 +11,8 @@
 //   node playground/smoke.cjs                 # PLAYWRIGHT_CHANNEL=chrome|msedge
 "use strict";
 const path = require("node:path");
+const os = require("node:os");
+const fs = require("node:fs");
 const { spawn } = require("node:child_process");
 
 let playwright;
@@ -206,6 +208,58 @@ async function main() {
     }
     await page.locator("#stop").click();
     await page.selectOption("#gpu-backend", "auto");
+
+    // ---- a project folder like a research lab: subfolders, a package, data,
+    // a binary checkpoint, program arguments, and files the program writes.
+    const labDir = fs.mkdtempSync(path.join(os.tmpdir(), "zipp-lab-"));
+    const labFiles = {
+      "run.py": [
+        "import sys, os, json",
+        "from legacy.fast_memory import Memory",
+        "import pkg.tools as tools",
+        "with open('data/config.json') as f:",
+        "    cfg = json.load(f)",
+        "with open('data/model.bin', 'rb') as f:",
+        "    raw = f.read()",
+        "print('argv', sys.argv[1:], 'steps', cfg['steps'], Memory().name, tools.twice(cfg['steps']), len(raw), raw[-1])",
+        "os.makedirs('out', exist_ok=True)",
+        "with open('out/result.json', 'w') as f:",
+        "    json.dump({'argv': sys.argv[1:], 'bytes': len(raw)}, f)",
+        "",
+      ].join("\n"),
+      "legacy/fast_memory.py": "class Memory:\n    name = 'fast'\n",
+      "pkg/__init__.py": "",
+      "pkg/tools.py": "def twice(n):\n    return n * 2\n",
+      "data/config.json": JSON.stringify({ steps: 21 }),
+      "notes.md": "# lab notes\n",
+      "__pycache__/run.cpython-312.pyc": "junk",
+    };
+    for (const [rel, text] of Object.entries(labFiles)) {
+      fs.mkdirSync(path.dirname(path.join(labDir, rel)), { recursive: true });
+      fs.writeFileSync(path.join(labDir, rel), text);
+    }
+    fs.writeFileSync(path.join(labDir, "data/model.bin"), Buffer.from(Array.from({ length: 1000 }, (_, i) => i % 256)));
+    await page.locator("#folder-input").setInputFiles(labDir);
+    await page.waitForFunction(() => document.querySelector("#project-name").textContent.startsWith("zipp-lab-"));
+    const labRows = await page.locator("#file-list li").allInnerTexts();
+    ok("the folder tree lists subfolders and every file", labRows.some((r) => /legacy/.test(r)) && labRows.some((r) => /fast_memory\.py/.test(r)) && labRows.some((r) => /model\.bin/.test(r)) && labRows.some((r) => /notes\.md/.test(r)), labRows.join("|"));
+    ok("tool folders are skipped", !labRows.some((r) => /pycache|\.pyc/.test(r)), labRows.join("|"));
+    ok("the binary is tagged and run.py is the entry", labRows.some((r) => /model\.bin\s+bin/.test(r)) && labRows.some((r) => /run\.py\s+entry/.test(r)), labRows.join("|"));
+    await page.locator('#file-list li[data-name="data/model.bin"]').click();
+    ok("a binary file shows a placeholder in a read-only editor", /binary file, 1000 bytes/.test(await page.locator("#editor").inputValue()) && await page.locator("#editor").isDisabled());
+    await page.locator('#file-list li[data-name="run.py"]').click();
+    ok("a source file is editable again", !(await page.locator("#editor").isDisabled()));
+    await page.locator("#program-args").fill("--steps 7 'two words'");
+    await page.locator("#run").click();
+    await page.waitForFunction(() => /Program finished/.test(document.querySelector("#console").innerText), null, { timeout: 30000 });
+    const labConsole = await consoleText();
+    ok("the program saw its arguments, packages, data file and binary", /argv \['--steps', '7', 'two words'\] steps 21 fast 42 1000 231/.test(labConsole), labConsole.split("\n").slice(-3).join(" | "));
+    const afterRows = await page.locator("#file-list li").allInnerTexts();
+    ok("a file the program wrote appears in the tree tagged as written", afterRows.some((r) => /result\.json\s+written/.test(r)), afterRows.join("|"));
+    await page.locator('#file-list li[data-name="out/result.json"]').click();
+    ok("the written file opens with the program's content", /"bytes": 1000/.test(await page.locator("#editor").inputValue()) || /"bytes":1000/.test(await page.locator("#editor").inputValue()), await page.locator("#editor").inputValue());
+    await page.locator("#program-args").fill("");
+    fs.rmSync(labDir, { recursive: true, force: true });
 
     // ---- hello samples: no hooks, just output and a static drawing --------------
     for (const [key, name, needle] of [["python-hello", "python-hello", /fib\(30\) = 832040/], ["javascript-hello", "js-hello", /fib\(20\) = 6765/]]) {

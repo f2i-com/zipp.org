@@ -50,7 +50,7 @@ impl<'a> Emitter<'a> {
                 }
                 // Module and class bodies record `__annotations__`.
                 if let (ast::Expr::Name(n), false) = (s.target.as_ref(), self.in_function()) {
-                    let annotation = self.expr(&s.annotation, depth + 1)?;
+                    let annotation = self.annotation_value(&s.annotation, depth + 1)?;
                     let container = match self.r_ns {
                         Some(ns) => ns,
                         None => self.r_globals,
@@ -931,18 +931,18 @@ impl<'a> Emitter<'a> {
         {
             if let Some(ann) = &a.def.annotation {
                 ann_names.push(self.string(a.def.arg.as_str())?);
-                ann_values.push(self.expr(ann, depth)?);
+                ann_values.push(self.annotation_value(ann, depth)?);
             }
         }
         for a in [&args.vararg, &args.kwarg].into_iter().flatten() {
             if let Some(ann) = &a.annotation {
                 ann_names.push(self.string(a.arg.as_str())?);
-                ann_values.push(self.expr(ann, depth)?);
+                ann_values.push(self.annotation_value(ann, depth)?);
             }
         }
         if let Some(ret) = returns {
             ann_names.push(self.string("return")?);
-            ann_values.push(self.expr(ret, depth)?);
+            ann_values.push(self.annotation_value(ret, depth)?);
         }
         if !ann_names.is_empty() {
             let names = self.array(&ann_names)?;

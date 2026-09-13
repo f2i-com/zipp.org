@@ -18,13 +18,27 @@ loopback; any static server that serves the repository root works the same.
 
 ## Using it
 
-- **Open folder** (or drop a folder on the page) loads every `.py` / `.js` file
-  at the folder's top level. **Open files** loads loose files. **Samples** has
-  two bouncing-ball projects, a Langton's ant written with classes,
-  dataclasses and enums, and two hello-world programs.
-- The **entry** file runs first: `main.py` or `main.js` by default, or any file
-  through *Set as entry*. The entry's extension decides the project language;
-  files of the other language are listed but not run.
+- **Open folder** (or drop a folder on the page) loads the whole folder:
+  subfolders, data files (`.json`, `.txt`, `.md`, ...) and binaries such as
+  model checkpoints, shown as a tree in the sidebar. Tool folders (`.git`,
+  `__pycache__`, `node_modules`, `target`, virtual environments) are skipped,
+  as are files over 8 MiB or beyond 64 MiB in total. **Open files** loads
+  loose files. **Samples** has two bouncing-ball projects, a Langton's ant
+  written with classes, dataclasses and enums, a GPU compute demo, and two
+  hello-world programs.
+- The **entry** file runs first: `main.py` or `main.js` by default, or any
+  `.py`/`.js` file in the tree through *Set as entry* (a `tests/test_x.py`
+  entry runs its tests). The entry's extension decides the project language;
+  files of the other language are listed but not run. The **arguments** box
+  in the toolbar is the command line: `run.py --steps 20 "two words"` gives
+  the program `sys.argv[1:] == ["--steps", "20", "two words"]`.
+- A Python program sees the folder as its filesystem: `open()`, `os`,
+  `os.path`, `pathlib` and `json.load` read the loaded files (packages by
+  folder import as `legacy.fast_memory`), and files it writes appear in the
+  tree tagged *written*, openable like any other. Binary files show a
+  placeholder in the editor and cannot be edited; text files can. Nothing is
+  written back to disk: the browser holds the project, and the written
+  files live in its `localStorage` copy with the rest.
 - Edit in place; `Tab` indents, `Ctrl+Enter` runs. The project is autosaved
   in the browser's `localStorage` and restored on the next visit.
 - **Run** compiles and runs the top level. If the program defines `draw` or
@@ -40,7 +54,9 @@ loopback; any static server that serves the repository root works the same.
 ## The program contract
 
 Python modules `import` each other by file stem (`from physics import step`)
-and can import the built-in `ui` module. JavaScript files share one global
+or by folder (`from pkg.tools import twice`), can import the built-in
+modules and the bundled libraries (`zipp_gpu`, the `torch` subset,
+`pytest`, ...), and the built-in `ui` module. JavaScript files share one global
 scope in sidebar order with the entry last, like successive `<script>` tags,
 and `ui` is a global. Both languages see the same API:
 

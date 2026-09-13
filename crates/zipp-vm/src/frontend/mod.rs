@@ -107,9 +107,23 @@ pub fn compile_python_project_hosted(
     modules: &[(String, String)],
     hosted: bool,
 ) -> Result<CompiledSource, String> {
+    compile_python_program(entry, modules, &[], &[], hosted)
+}
+/// The general form: `modules` are candidate `.py` files by dotted module
+/// name (only those reachable from `entry` through imports are compiled),
+/// `files` is the program's virtual filesystem (root-relative paths and
+/// bytes; 8 MiB per file, 64 MiB in total), and `argv` becomes
+/// `sys.argv[1:]`.
+pub fn compile_python_program(
+    entry: &str,
+    modules: &[(String, String)],
+    files: &[(String, Vec<u8>)],
+    argv: &[String],
+    hosted: bool,
+) -> Result<CompiledSource, String> {
     #[cfg(feature = "python")]
     {
-        let program = python::compile_project(entry, modules, hosted)?;
+        let program = python::compile_project(entry, modules, files, argv, hosted)?;
         let mut state = ScriptState::from_program(program);
         state.disable_vm_jit();
         Ok(CompiledSource {
@@ -119,7 +133,7 @@ pub fn compile_python_project_hosted(
     }
     #[cfg(not(feature = "python"))]
     {
-        let _ = (entry, modules, hosted);
+        let _ = (entry, modules, files, argv, hosted);
         Err("Python support is not built; enable the `python` Cargo feature".into())
     }
 }

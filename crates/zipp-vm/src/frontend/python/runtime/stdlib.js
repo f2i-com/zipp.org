@@ -202,6 +202,7 @@
             return m;
         });
     }
+    rt.defineModule = mod;
     function fn(g, name, arity, code, minArity) { g.set(name, builtin(name, arity, code, minArity)); }
     function fnkw(g, name, code) { const f = builtin(name, -1, code); f.kwnames = true; g.set(name, f); }
     function pyClass(name, module, methods) {
@@ -345,7 +346,7 @@
         g.set("gmtime", g.get("localtime"));
     });
     mod("sys", (g) => {
-        g.set("argv", list([rt.entryModule() ? rt.entryModule().file || "main.py" : "main.py"]));
+        g.set("argv", list([rt.entryModule() ? rt.entryModule().file || "main.py" : "main.py"].concat(rt.argv)));
         g.set("version", "3.12.0 (zipp)"); g.set("version_info", tuple([3n, 12n, 0n, "final", 0n]));
         g.set("platform", "zipp"); g.set("maxsize", 9223372036854775807n); g.set("byteorder", "little");
         g.set("path", list([])); g.set("modules", dict()); g.set("executable", "zipp");
@@ -368,7 +369,11 @@
         fn(pg, "dirname", 1, (a) => { const s = needStr(a[0]); const i = s.lastIndexOf("/"); return i < 0 ? "" : i === 0 ? "/" : s.slice(0, i); });
         fn(pg, "splitext", 1, (a) => { const s = needStr(a[0]); const b = s.slice(s.lastIndexOf("/") + 1); const i = b.lastIndexOf("."); if (i <= 0) return tuple([s, ""]); return tuple([s.slice(0, s.length - b.length + i), b.slice(i)]); });
         fn(pg, "split", 1, (a) => { const s = needStr(a[0]); const i = s.lastIndexOf("/"); return tuple([i < 0 ? "" : i === 0 ? "/" : s.slice(0, i), s.slice(i + 1)]); });
-        fn(pg, "exists", 1, () => false); fn(pg, "isfile", 1, () => false); fn(pg, "isdir", 1, () => false);
+        fn(pg, "exists", 1, (a) => rt.vfs.has(needStr(a[0])) || rt.vfs.isDir(needStr(a[0])));
+        fn(pg, "isfile", 1, (a) => rt.vfs.has(needStr(a[0])));
+        fn(pg, "isdir", 1, (a) => !rt.vfs.has(needStr(a[0])) && rt.vfs.isDir(needStr(a[0])));
+        fn(pg, "getsize", 1, (a) => { const f = rt.vfs.get(needStr(a[0])); if (f === undefined) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + a[0] + "'"); return BigInt(f.length); });
+        fn(pg, "realpath", 1, (a) => "/" + rt.vfs.norm(needStr(a[0])));
         fn(pg, "abspath", 1, (a) => { const s = needStr(a[0]); return s.startsWith("/") ? s : "/" + s; });
         fn(pg, "normpath", 1, (a) => needStr(a[0]).replace(/\/+/g, "/"));
         fn(pg, "isabs", 1, (a) => needStr(a[0]).startsWith("/"));
@@ -379,10 +384,15 @@
         g.set("path", path); g.set("sep", "/"); g.set("linesep", "\n"); g.set("name", "posix");
         g.set("environ", dict());
         fn(g, "getcwd", 0, () => "/");
-        fn(g, "listdir", 1, () => list([]), 0);
+        fn(g, "listdir", 1, (a) => { const p = a[0] === undefined ? "" : needStr(a[0]); if (p !== "" && !rt.vfs.isDir(p)) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + p + "'"); return list(rt.vfs.listDir(p)); }, 0);
         fn(g, "getenv", 2, (a) => a[1] === undefined ? null : a[1], 1);
         fn(g, "getpid", 0, () => 1n);
-        for (const n of ["mkdir", "makedirs", "remove", "rename", "unlink", "chdir", "rmdir", "system"]) fn(g, n, -1, () => fail(E.OSError, "os." + n + " is not available: the Python sandbox has no filesystem"));
+        fnkw(g, "mkdir", (a) => { const p = needStr(a[0]); if (rt.vfs.has(p) || (rt.vfs.isDir(p) && rt.vfs.norm(p) !== "")) fail(E.FileExistsError, "[Errno 17] File exists: '" + p + "'"); rt.vfs.mkdir(p); return null; });
+        fnkw(g, "makedirs", (a) => { const kw = kwOf(a, ["exist_ok"]); const p = needStr(a[0]); if (rt.vfs.has(p)) fail(E.FileExistsError, "[Errno 17] File exists: '" + p + "'"); if (rt.vfs.isDir(p) && rt.vfs.norm(p) !== "" && !truth(kwget(kw, "exist_ok", false)) && a[1] === undefined) fail(E.FileExistsError, "[Errno 17] File exists: '" + p + "'"); rt.vfs.mkdir(p); return null; });
+        for (const n of ["remove", "unlink"]) fn(g, n, 1, (a) => { if (!rt.vfs.remove(needStr(a[0]))) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + a[0] + "'"); return null; });
+        fn(g, "rename", 2, (a) => { const f = rt.vfs.get(needStr(a[0])); if (f === undefined) fail(E.FileNotFoundError, "[Errno 2] No such file or directory: '" + a[0] + "'"); rt.vfs.set(needStr(a[1]), f); rt.vfs.remove(needStr(a[0])); return null; });
+        fn(g, "rmdir", 1, () => null);
+        for (const n of ["chdir", "system"]) fn(g, n, -1, () => fail(E.OSError, "os." + n + " is not available in the Python sandbox"));
         fn(g, "urandom", 1, (a) => rt.bytes(Array.from({ length: Number(needInt(a[0])) }, () => Math.floor(Math.random() * 256))));
     });
     mod("io", (g) => {
@@ -400,7 +410,19 @@
             __iter__: (a) => iter(list(a[0].dict.get("_buf").split(/(?<=\n)/).filter((x) => x.length))),
         });
         g.set("StringIO", StringIO);
-        g.set("BytesIO", StringIO);
+        const BytesIO = pyClass("BytesIO", "io", {
+            __init__: (a) => { const init = a.length > 1 && a[1] !== null ? a[1] : null; if (init !== null && (typeof init !== "object" || init.cls !== T.bytes)) fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(init).name + "'"); a[0].dict.set("_buf", init === null ? [] : init.items.slice()); a[0].dict.set("_pos", 0); return null; },
+            write: (a) => { const b = a[1]; if (b === null || typeof b !== "object" || b.cls !== T.bytes) fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(b).name + "'"); const buf = a[0].dict.get("_buf"); let pos = a[0].dict.get("_pos"); for (const x of b.items) buf[pos++] = x; a[0].dict.set("_pos", pos); return BigInt(b.items.length); },
+            getvalue: (a) => rt.bytes(a[0].dict.get("_buf").slice()),
+            read: (a) => { const buf = a[0].dict.get("_buf"), p = a[0].dict.get("_pos"); const n = a[1] === undefined || a[1] === null ? -1 : Number(needInt(a[1])); const end = n < 0 ? buf.length : Math.min(buf.length, p + n); a[0].dict.set("_pos", end); return rt.bytes(buf.slice(p, end)); },
+            readline: (a) => { const buf = a[0].dict.get("_buf"), p = a[0].dict.get("_pos"); let i = buf.indexOf(10, p); i = i < 0 ? buf.length : i + 1; a[0].dict.set("_pos", i); return rt.bytes(buf.slice(p, i)); },
+            seek: (a) => { const whence = a[2] === undefined ? 0 : Number(needInt(a[2])); const off = Number(needInt(a[1])); const buf = a[0].dict.get("_buf"); const pos = whence === 0 ? off : whence === 1 ? a[0].dict.get("_pos") + off : buf.length + off; a[0].dict.set("_pos", Math.max(0, pos)); return BigInt(Math.max(0, pos)); },
+            tell: (a) => BigInt(a[0].dict.get("_pos")),
+            truncate: (a) => { const buf = a[0].dict.get("_buf"); const n = a[1] === undefined ? a[0].dict.get("_pos") : Number(needInt(a[1])); buf.length = n; return BigInt(n); },
+            close: () => null, flush: () => null, readable: () => true, writable: () => true, seekable: () => true,
+            __enter__: (a) => a[0], __exit__: () => false,
+        });
+        g.set("BytesIO", BytesIO);
     });
 
     // ---- json ------------------------------------------------------------------------------------------------------------------------
@@ -740,6 +762,110 @@
         Struct.dict.set("unpack_from", builtin("unpack_from", 3, (a) => unpack(a[0].dict.get("format"), a[1], a[2]), 2));
         g.set("Struct", Struct);
     });
+    // ---- hashlib: SHA-256, SHA-1 and MD5 in JavaScript -------------------------------------------------------
+    mod("hashlib", (g) => {
+        function toBytes(v) {
+            if (v === undefined) return [];
+            if (v !== null && typeof v === "object" && v.cls === T.bytes) return v.items;
+            if (typeof v === "string") fail(E.TypeError, "Strings must be encoded before hashing");
+            fail(E.TypeError, "object supporting the buffer API required");
+        }
+        const rotr = (x, n) => (x >>> n) | (x << (32 - n));
+        function sha256(bytes) {
+            const K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
+            let H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+            const n = bytes.length, padded = new Uint8Array(((n + 9 + 63) >> 6) << 6);
+            padded.set(bytes); padded[n] = 0x80;
+            const bits = n * 8; padded[padded.length - 4] = (bits >>> 24) & 255; padded[padded.length - 3] = (bits >>> 16) & 255; padded[padded.length - 2] = (bits >>> 8) & 255; padded[padded.length - 1] = bits & 255;
+            padded[padded.length - 5] = Math.floor(bits / 4294967296) & 255;
+            const W = new Int32Array(64);
+            for (let off = 0; off < padded.length; off += 64) {
+                for (let i = 0; i < 16; i++) W[i] = (padded[off + 4 * i] << 24) | (padded[off + 4 * i + 1] << 16) | (padded[off + 4 * i + 2] << 8) | padded[off + 4 * i + 3];
+                for (let i = 16; i < 64; i++) { const s0 = rotr(W[i - 15], 7) ^ rotr(W[i - 15], 18) ^ (W[i - 15] >>> 3); const s1 = rotr(W[i - 2], 17) ^ rotr(W[i - 2], 19) ^ (W[i - 2] >>> 10); W[i] = (W[i - 16] + s0 + W[i - 7] + s1) | 0; }
+                let [a, b, c, d, e, f, gg, h] = H;
+                for (let i = 0; i < 64; i++) {
+                    const S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25), ch = (e & f) ^ (~e & gg), t1 = (h + S1 + ch + K[i] + W[i]) | 0;
+                    const S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22), maj = (a & b) ^ (a & c) ^ (b & c), t2 = (S0 + maj) | 0;
+                    h = gg; gg = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+                }
+                H = [(H[0] + a) | 0, (H[1] + b) | 0, (H[2] + c) | 0, (H[3] + d) | 0, (H[4] + e) | 0, (H[5] + f) | 0, (H[6] + gg) | 0, (H[7] + h) | 0];
+            }
+            const out = [];
+            for (const w of H) out.push((w >>> 24) & 255, (w >>> 16) & 255, (w >>> 8) & 255, w & 255);
+            return out;
+        }
+        function sha1(bytes) {
+            let H = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+            const n = bytes.length, padded = new Uint8Array(((n + 9 + 63) >> 6) << 6);
+            padded.set(bytes); padded[n] = 0x80;
+            const bits = n * 8; padded[padded.length - 4] = (bits >>> 24) & 255; padded[padded.length - 3] = (bits >>> 16) & 255; padded[padded.length - 2] = (bits >>> 8) & 255; padded[padded.length - 1] = bits & 255;
+            padded[padded.length - 5] = Math.floor(bits / 4294967296) & 255;
+            const W = new Int32Array(80);
+            const rotl = (x, k) => (x << k) | (x >>> (32 - k));
+            for (let off = 0; off < padded.length; off += 64) {
+                for (let i = 0; i < 16; i++) W[i] = (padded[off + 4 * i] << 24) | (padded[off + 4 * i + 1] << 16) | (padded[off + 4 * i + 2] << 8) | padded[off + 4 * i + 3];
+                for (let i = 16; i < 80; i++) W[i] = rotl(W[i - 3] ^ W[i - 8] ^ W[i - 14] ^ W[i - 16], 1);
+                let [a, b, c, d, e] = H;
+                for (let i = 0; i < 80; i++) {
+                    let f, k;
+                    if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999; } else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; } else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; } else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+                    const t = (rotl(a, 5) + f + e + k + W[i]) | 0; e = d; d = c; c = rotl(b, 30); b = a; a = t;
+                }
+                H = [(H[0] + a) | 0, (H[1] + b) | 0, (H[2] + c) | 0, (H[3] + d) | 0, (H[4] + e) | 0];
+            }
+            const out = [];
+            for (const w of H) out.push((w >>> 24) & 255, (w >>> 16) & 255, (w >>> 8) & 255, w & 255);
+            return out;
+        }
+        function md5(bytes) {
+            const S = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+            const K = []; for (let i = 0; i < 64; i++) K.push(Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) | 0);
+            let a0 = 0x67452301, b0 = 0xefcdab89 | 0, c0 = 0x98badcfe | 0, d0 = 0x10325476;
+            const n = bytes.length, padded = new Uint8Array(((n + 9 + 63) >> 6) << 6);
+            padded.set(bytes); padded[n] = 0x80;
+            const bits = n * 8; padded[padded.length - 8] = bits & 255; padded[padded.length - 7] = (bits >>> 8) & 255; padded[padded.length - 6] = (bits >>> 16) & 255; padded[padded.length - 5] = (bits >>> 24) & 255; padded[padded.length - 4] = Math.floor(bits / 4294967296) & 255;
+            const rotl = (x, k) => (x << k) | (x >>> (32 - k));
+            for (let off = 0; off < padded.length; off += 64) {
+                const M = new Int32Array(16);
+                for (let i = 0; i < 16; i++) M[i] = padded[off + 4 * i] | (padded[off + 4 * i + 1] << 8) | (padded[off + 4 * i + 2] << 16) | (padded[off + 4 * i + 3] << 24);
+                let A = a0, B = b0, C = c0, D = d0;
+                for (let i = 0; i < 64; i++) {
+                    let F, g;
+                    if (i < 16) { F = (B & C) | (~B & D); g = i; } else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; } else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; } else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+                    F = (F + A + K[i] + M[g]) | 0; A = D; D = C; C = B; B = (B + rotl(F, S[i])) | 0;
+                }
+                a0 = (a0 + A) | 0; b0 = (b0 + B) | 0; c0 = (c0 + C) | 0; d0 = (d0 + D) | 0;
+            }
+            const out = [];
+            for (const w of [a0, b0, c0, d0]) out.push(w & 255, (w >>> 8) & 255, (w >>> 16) & 255, (w >>> 24) & 255);
+            return out;
+        }
+        const ALGOS = { sha256: [sha256, 32], sha1: [sha1, 20], md5: [md5, 16] };
+        const Hash = rt.newType("HASH", [rt.ObjectType], new Map(), "hashlib");
+        const state = (self) => self.dict.get("_data");
+        Hash.dict.set("update", builtin("update", 2, (a) => { const d = state(a[0]); for (const b of toBytes(a[1])) d.push(b); return null; }));
+        Hash.dict.set("digest", builtin("digest", 1, (a) => rt.bytes(ALGOS[a[0].dict.get("name")][0](state(a[0])))));
+        Hash.dict.set("hexdigest", builtin("hexdigest", 1, (a) => ALGOS[a[0].dict.get("name")][0](state(a[0])).map((b) => b.toString(16).padStart(2, "0")).join("")));
+        Hash.dict.set("copy", builtin("copy", 1, (a) => ({ cls: Hash, dict: new Map([["name", a[0].dict.get("name")], ["_data", state(a[0]).slice()], ["digest_size", a[0].dict.get("digest_size")]]) })));
+        const make = (name) => (a) => ({ cls: Hash, dict: new Map([["name", name], ["_data", toBytes(a[0]).slice()], ["digest_size", BigInt(ALGOS[name][1])]]) });
+        for (const name of Object.keys(ALGOS)) fn(g, name, 1, make(name), 0);
+        fn(g, "new", 2, (a) => { const name = needStr(a[0]).toLowerCase(); if (!ALGOS[name]) fail(E.ValueError, "unsupported hash type " + name); return make(name)(a.slice(1)); }, 1);
+        g.set("algorithms_available", rt.set());
+        for (const name of Object.keys(ALGOS)) rt.setAdd(g.get("algorithms_available"), name);
+        g.set("algorithms_guaranteed", g.get("algorithms_available"));
+    });
+    mod("importlib", (g) => {
+        fn(g, "import_module", 2, (a) => R.import(needStr(a[0]), null), 1);
+        fn(g, "reload", 1, (a) => a[0]);
+        fn(g, "invalidate_caches", 0, () => null);
+    });
+    mod("platform", (g) => {
+        fn(g, "platform", 0, () => "Zipp-" + rt.version);
+        fn(g, "system", 0, () => "Zipp"); fn(g, "machine", 0, () => "wasm32"); fn(g, "processor", 0, () => "");
+        fn(g, "python_version", 0, () => "3.12.0"); fn(g, "python_implementation", 0, () => "Zipp");
+        fn(g, "node", 0, () => "sandbox"); fn(g, "release", 0, () => rt.version); fn(g, "version", 0, () => rt.version);
+        fn(g, "architecture", 0, () => tuple(["32bit", "wasm"]));
+    });
     mod("contextlib", (g) => {
         // A generator-backed context manager: __enter__ runs to the first
         // yield, __exit__ resumes it (throwing the block's exception in).
@@ -896,9 +1022,9 @@
             __bool__: (a) => a[0].items.length > 0,
             __repr__: (a) => "deque(" + repr(list(a[0].items)) + (a[0].maxlen !== null ? ", maxlen=" + a[0].maxlen : "") + ")",
             __eq__: (a) => a[1] !== null && typeof a[1] === "object" && a[1].items !== undefined ? eq(list(a[0].items), list(a[1].items)) : NOTIMPL,
-            count: (a) => BigInt(a[0].items.filter((x) => eq(x, a[1])).length),
-            index: (a) => { const i = a[0].items.findIndex((x) => eq(x, a[1])); if (i < 0) fail(E.ValueError, "not in deque"); return BigInt(i); },
-            remove: (a) => { const i = a[0].items.findIndex((x) => eq(x, a[1])); if (i < 0) fail(E.ValueError, "deque.remove(x): x not in deque"); a[0].items.splice(i, 1); return null; },
+            count: (a) => BigInt(rt.acount(a[0].items, (x) => eq(x, a[1]))),
+            index: (a) => { const i = rt.aindex(a[0].items, (x) => eq(x, a[1])); if (i < 0) fail(E.ValueError, "not in deque"); return BigInt(i); },
+            remove: (a) => { const i = rt.aindex(a[0].items, (x) => eq(x, a[1])); if (i < 0) fail(E.ValueError, "deque.remove(x): x not in deque"); a[0].items.splice(i, 1); return null; },
             reverse: (a) => { a[0].items.reverse(); return null; },
             copy: (a) => { const o = rt.construct(a[0].cls, [list(a[0].items)], null); o.maxlen = a[0].maxlen; return o; },
         });
@@ -919,7 +1045,7 @@
             cls.dict.set("__init__", builtin("__init__", -1, () => null));
             cls.dict.get("__init__").kwnames = true;
             fields.forEach((f, i) => cls.dict.set(f, { cls: T.property, fget: builtin(f, 1, (b) => b[0].items[i]), fset: null, fdel: null, doc: null }));
-            cls.dict.set("__repr__", builtin("__repr__", 1, (b) => name + "(" + fields.map((f, i) => f + "=" + repr(b[0].items[i])).join(", ") + ")"));
+            cls.dict.set("__repr__", builtin("__repr__", 1, (b) => name + "(" + rt.amap(fields, (f, i) => f + "=" + repr(b[0].items[i])).join(", ") + ")"));
             cls.dict.set("_asdict", builtin("_asdict", 1, (b) => { const d = dict(); fields.forEach((f, i) => dictSet(d, f, b[0].items[i])); return d; }));
             cls.dict.set("_replace", (() => { const f = builtin("_replace", -1, (b) => { const kwm = b[b.length - 1] instanceof Map ? b.pop() : null; const items = b[0].items.slice(); if (kwm) for (const [k, v] of kwm) items[fields.indexOf(k)] = v; return { cls: b[0].cls, items: items, dict: new Map() }; }); f.kwnames = true; return f; })());
             cls.dict.set("_make", { cls: T.classmethod, func: builtin("_make", 2, (b) => ({ cls: b[0], items: drain(b[1]), dict: new Map() })) });
@@ -933,7 +1059,7 @@
             __setitem__: (a) => { rt.setitem(a[0].dict.get("maps").items[0], a[1], a[2]); return null; },
             __delitem__: (a) => { rt.delitem(a[0].dict.get("maps").items[0], a[1]); return null; },
             new_child: (a) => rt.construct(a[0].cls, [a[1] === undefined ? dict() : a[1]].concat(a[0].dict.get("maps").items), null),
-            __repr__: (a) => "ChainMap(" + a[0].dict.get("maps").items.map(repr).join(", ") + ")", __getitem__: (a) => { for (const m of a[0].dict.get("maps").items) { const v = dictGet(m, a[1]); if (v !== undefined) return v; } throw rt.makeExc(E.KeyError, [a[1]]); }, get: (a) => { for (const m of a[0].dict.get("maps").items) { const v = dictGet(m, a[1]); if (v !== undefined) return v; } return a[2] === undefined ? null : a[2]; }, __contains__: (a) => a[0].dict.get("maps").items.some((m) => rt.dictHas(m, a[1])) });
+            __repr__: (a) => "ChainMap(" + rt.amap(a[0].dict.get("maps").items, repr).join(", ") + ")", __getitem__: (a) => { for (const m of a[0].dict.get("maps").items) { const v = dictGet(m, a[1]); if (v !== undefined) return v; } throw rt.makeExc(E.KeyError, [a[1]]); }, get: (a) => { for (const m of a[0].dict.get("maps").items) { const v = dictGet(m, a[1]); if (v !== undefined) return v; } return a[2] === undefined ? null : a[2]; }, __contains__: (a) => a[0].dict.get("maps").items.some((m) => rt.dictHas(m, a[1])) });
         g.set("ChainMap", ChainMap);
         g.set("abc", rt.newModule("collections.abc", null));
         for (const n of ["Iterable", "Iterator", "Mapping", "MutableMapping", "Sequence", "MutableSequence", "Set", "MutableSet", "Callable", "Hashable", "Sized", "Container", "Collection", "Generator"]) g.get("abc").globals.set(n, rt.newType(n, [], new Map(), "collections.abc"));
@@ -1091,8 +1217,8 @@
                 });
                 init.kwnames = true; cls.dict.set("__init__", init);
             }
-            if (truth(kwget(kw, "repr", true)) && !cls.dict.has("__repr__")) cls.dict.set("__repr__", builtin("__repr__", 1, (a) => cls.qualname + "(" + fields.filter((f) => f.repr).map((f) => f.name + "=" + repr(a[0].dict.get(f.name))).join(", ") + ")"));
-            if (truth(kwget(kw, "eq", true)) && !cls.dict.has("__eq__")) cls.dict.set("__eq__", builtin("__eq__", 2, (a) => { if (typeOf(a[1]) !== typeOf(a[0])) return NOTIMPL; return fields.filter((f) => f.compare).every((f) => eq(a[0].dict.get(f.name), a[1].dict.get(f.name))); }));
+            if (truth(kwget(kw, "repr", true)) && !cls.dict.has("__repr__")) cls.dict.set("__repr__", builtin("__repr__", 1, (a) => cls.qualname + "(" + rt.amap(rt.afilter(fields, (f) => f.repr), (f) => f.name + "=" + repr(a[0].dict.get(f.name))).join(", ") + ")"));
+            if (truth(kwget(kw, "eq", true)) && !cls.dict.has("__eq__")) cls.dict.set("__eq__", builtin("__eq__", 2, (a) => { if (typeOf(a[1]) !== typeOf(a[0])) return NOTIMPL; return rt.aevery(rt.afilter(fields, (f) => f.compare), (f) => eq(a[0].dict.get(f.name), a[1].dict.get(f.name))); }));
             if (truth(kwget(kw, "order", false))) for (const [n, op] of [["__lt__", "lt"], ["__le__", "le"], ["__gt__", "gt"], ["__ge__", "ge"]]) cls.dict.set(n, builtin(n, 2, (a) => { if (typeOf(a[1]) !== typeOf(a[0])) return NOTIMPL; return cmp(op, tuple(fields.map((f) => a[0].dict.get(f.name))), tuple(fields.map((f) => a[1].dict.get(f.name)))); }));
             if (frozen) { cls.dict.set("__setattr__", builtin("__setattr__", 3, (a) => { if (a[0].dict.has(a[1]) || fields.some((f) => f.name === a[1])) fail(FrozenInstanceError, "cannot assign to field '" + a[1] + "'"); a[0].dict.set(a[1], a[2]); return null; })); cls.dict.set("__hash__", builtin("__hash__", 1, (a) => rt.hashInt(tuple(fields.filter((f) => f.compare).map((f) => a[0].dict.get(f.name)))))); }
             else if (truth(kwget(kw, "eq", true)) && !cls.dict.has("__hash__")) cls.dict.set("__hash__", null);

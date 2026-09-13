@@ -97,7 +97,7 @@ function attachGpu() {
       // The callback ran (or failed) outside any page request: report what
       // it printed and drew as an unsolicited event, then look for the
       // requests it may have submitted in turn.
-      const event = { type: "event", console: drainConsole(), ui: takeUi() };
+      const event = { type: "event", console: drainConsole(), ui: takeUi(), files: takeWrittenFiles() };
       if (error) {
         let kind = "guest", disposed = true;
         try { kind = engine ? engine.lastErrorKind() : "usage"; disposed = !live(); } catch { /* engine gone */ }
@@ -142,7 +142,7 @@ function live() {
 // Every console line the program has produced since the last drain, in
 // order, tagged with its stream.
 function drainConsole() {
-  if (!live()) return [];
+  if (!live()) return failedConsole();
   try {
     return engine.takeConsole().map((entry) => ({
       stream: String(entry.stream),
@@ -180,7 +180,7 @@ function run(m) {
   let prelude = 0;
   if (language === "python") {
     attachGpu();
-    engine.initPythonProject(m.files, m.entry);
+    engine.initPythonProject(m.files, m.entry, Array.isArray(m.argv) ? m.argv.map(String) : []);
     hooks = Object.fromEntries(HOOK_NAMES.map((name) => [name, engine.pythonHas(name)]));
     drainHost();
   } else {
@@ -199,7 +199,34 @@ function run(m) {
     }
     hooks = Object.fromEntries(HOOK_NAMES.map((name) => [name, functions.has(name)]));
   }
-  return { hooks, prelude, console: drainConsole(), ui: takeUi() };
+  return { hooks, prelude, console: drainConsole(), ui: takeUi(), files: takeWrittenFiles() };
+}
+
+// What a program printed before its top level failed: the engine keeps it
+// past its disposal so the console shows the output ahead of the error.
+function failedConsole() {
+  try {
+    if (!engine || typeof engine.takeFailedConsole !== "function") return [];
+    return engine.takeFailedConsole().map((entry) => ({ stream: String(entry.stream), text: String(entry.text) }));
+  } catch {
+    return [];
+  }
+}
+
+// Files the Python program wrote since the last call: [{path, base64}], an
+// empty base64 for a removed file.
+function takeWrittenFiles() {
+  if (!live() || language !== "python") return [];
+  try {
+    const text = engine.pythonCall("__zipp_py_vfs_changed", []);
+    if (typeof text !== "string" || !text) return [];
+    return text.split("\n").filter(Boolean).map((line) => {
+      const tab = line.indexOf("\t");
+      return { path: line.slice(0, tab), base64: line.slice(tab + 1) };
+    });
+  } catch {
+    return [];
+  }
 }
 
 function frame(m) {
@@ -216,7 +243,7 @@ function frame(m) {
   if (hooks.update) call("update", []);
   if (hooks.draw) call("draw", []);
   drainHost();
-  return { ui: takeUi(), console: drainConsole() };
+  return { ui: takeUi(), console: drainConsole(), files: takeWrittenFiles() };
 }
 
 self.onmessage = async (event) => {
@@ -264,6 +291,7 @@ self.onmessage = async (event) => {
       disposed,
       console: drainConsole(),
       ui: disposed ? [] : takeUi(),
+      files: disposed ? [] : takeWrittenFiles(),
     });
   }
 };

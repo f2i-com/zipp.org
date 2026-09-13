@@ -170,11 +170,26 @@ Classes (including metaclasses, descriptors and `__slots__`), exceptions
 with full tracebacks, generators, closures, comprehensions, `match`
 statements, f-strings, the builtin types and a set of standard-library
 modules (`math`, `json`, `re`, `collections`, `itertools`, `functools`,
-`dataclasses`, `enum`, `contextlib`, `typing`, ...) all work; `async` and
-real files do not yet. Semantics are checked
+`dataclasses`, `enum`, `contextlib`, `typing`, `struct`, `hashlib`, ...)
+all work; `async` does not yet. Semantics are checked
 differentially against CPython: `tests/python_corpus/*.py` must print
-exactly what CPython prints. A folder runs as a project:
-`zipp py examples/python/project`. The scope
+exactly what CPython prints.
+
+A folder runs as a project: `zipp py examples/python/project` runs its
+`main.py`, and `zipp py lab/train.py --steps 20` runs one script of a
+folder with arguments. Every file of the folder (subfolders included, up to
+8 MiB each and 64 MiB in total) is loaded into the program's virtual
+filesystem, so `open()`, `os`, `os.path`, `pathlib` and `json.load` see the
+project's data; `.py` files are modules and packages by folder
+(`legacy/fast_memory.py` is `legacy.fast_memory`, with or without an
+`__init__.py`); `sys.argv` carries the arguments; and files the program
+writes are copied back under the folder when it finishes. A `test_*.py`
+entry runs its tests through the bundled `pytest` subset. The bundled
+library also includes a `torch` subset (tensors over typed arrays with
+reverse-mode autograd, `nn`, `nn.functional`, `optim`, `save`/`load` in
+PyTorch's checkpoint format) that runs on the engine's CPU kernels, so a
+small research lab written for PyTorch trains and evaluates unchanged; it
+is not GPU-backed and is many times slower than PyTorch. The scope
 matrix, limits and the bytecode design are in
 [docs/PYTHON_FRONTEND_EXPERIMENT.md](docs/PYTHON_FRONTEND_EXPERIMENT.md). The
 feature is on by default in the CLI (`--no-default-features` builds the
@@ -190,10 +205,14 @@ program back with the outputs; natively the same code evaluates on the CPU.
 See [crates/zipp-wasm/README.md](crates/zipp-wasm/README.md#gpu-compute-for-python-programs).
 
 There is also a local [playground](crates/zipp-wasm/playground/README.md)
-that runs a folder of Python or JavaScript files on the WebAssembly engine,
-with an editor, a console and a canvas the program draws on through a small
-`ui` API (`draw`/`update`/`on_click`/`on_key` hooks for animation and input),
-and a GPU sample that steps life on the compute backend every frame:
+that runs a folder of Python or JavaScript files on the WebAssembly engine:
+open or drop a whole project folder (subfolders, data files and binary
+checkpoints included), browse it in a file tree, pick any script as the
+entry, give it arguments, and run it in the browser; files the program
+writes show up in the tree. It has an editor, a console and a canvas the
+program draws on through a small `ui` API (`draw`/`update`/`on_click`/
+`on_key` hooks for animation and input), and a GPU sample that steps life
+on the compute backend every frame:
 
 ```sh
 cd crates/zipp-wasm && ./build-variants.sh all && node playground/serve.cjs

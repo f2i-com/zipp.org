@@ -4,7 +4,7 @@ from pathlib import Path
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT.parents[1] / "zipp-vm" / "src" / "frontend" / "python" / "lib"))
+sys.path.insert(0, str(ROOT.parents[1] / "zipp-vm" / "src" / "frontend" / "python" / "lib" / "shared"))
 from zipp_gpu import Graph
 
 

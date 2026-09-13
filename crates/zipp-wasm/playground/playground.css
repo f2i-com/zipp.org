@@ -143,6 +143,12 @@ code { font-family: var(--mono); font-size: 0.92em; color: #c9d1d9; }
 .file-list li.active { background: #1f6feb33; color: var(--text); }
 .file-list li.ignored { color: var(--muted); font-style: italic; }
 .file-list li .entry { color: var(--accent-2); font-size: 11px; }
+.file-list li.folder { color: var(--muted); cursor: default; font-size: 12px; padding-top: 6px; }
+.file-list li.folder:hover { background: transparent; }
+.file-list li.data { color: #a5b0bd; }
+.file-list li .bin { color: var(--muted); font-size: 10px; border: 1px solid var(--border); border-radius: 3px; padding: 0 4px; }
+.file-list li .written { color: #d29922; font-size: 11px; }
+.args { min-width: 180px; flex: 1; max-width: 360px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-family: var(--mono); font-size: 12px; }
 .sidebar-foot { display: flex; gap: 4px; padding: 6px 8px; border-top: 1px solid var(--border); }
 .hint { margin: 0; padding: 10px 12px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--border); }
 

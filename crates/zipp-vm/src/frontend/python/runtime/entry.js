@@ -7,6 +7,7 @@ function __zipp_py_has(name) { return __zipp_py.__rt.hostHas(name); }
 function __zipp_py_call(name, args) { return __zipp_py.__rt.hostCall(name, args); }
 function __zipp_py_take_ui() { const out = __zipp_py_ui; __zipp_py_ui = []; return out; }
 function __zipp_py_take_host() { return __zipp_py.__rt.takeHostRequests(); }
+function __zipp_py_vfs_changed() { return __zipp_py.__rt.vfsChangedText(); }
 function __zipp_py_set_input(json) {
     const i = JSON.parse(json);
     __zipp_py_input = {
@@ -26,7 +27,7 @@ function __zipp_py_set_input(json) {
         if (exc.cls === E.SystemExit) {
             const code = exc.args.items.length ? exc.args.items[0] : 0n;
             if (code === null || code === 0n || code === false) return null;
-            const err = new Error(typeof code === "string" ? code : "SystemExit: " + rt.str(code)); err.name = "SystemExit"; return err;
+            const err = new Error(rt.str(code)); err.name = "SystemExit"; return err;
         }
         let message = rt.str(exc);
         let chain = "";
@@ -84,7 +85,29 @@ function __zipp_py_set_input(json) {
             return rt.deliverHost(n, reply);
         }],
         ["__zipp_py_pending_host", function () { return BigInt(rt.pendingHostRequests()); }],
+        // Files the program wrote or removed, one per line: `path<TAB>base64`
+        // (an empty base64 for a removed file). Text or binary alike; the
+        // host decides how to show them.
+        ["__zipp_py_vfs_changed", function () { return rt.vfsChangedText(); }],
+        ["__zipp_py_vfs_list", function () { return rt.vfs.list(); }],
     ]);
+    rt.vfsChangedText = function () {
+            const lines = [];
+            for (const path of rt.vfs.changed()) {
+                const bytes = rt.vfs.get(path);
+                lines.push(path + "\t" + (bytes === undefined ? "" : base64(bytes)));
+            }
+            return lines.join("\n");
+    };
+    const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    function base64(bytes) {
+        let out = "";
+        for (let i = 0; i < bytes.length; i += 3) {
+            const a = bytes[i], b = i + 1 < bytes.length ? bytes[i + 1] : 0, c = i + 2 < bytes.length ? bytes[i + 2] : 0;
+            out += B64[a >> 2] + B64[((a & 3) << 4) | (b >> 4)] + (i + 1 < bytes.length ? B64[((b & 15) << 2) | (c >> 6)] : "=") + (i + 2 < bytes.length ? B64[c & 63] : "=");
+        }
+        return out;
+    }
     rt.hostHas = function (name) {
         if (runtimeHooks.has(String(name))) return true;
         const f = entryGlobal(String(name));

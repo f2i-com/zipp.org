@@ -10,7 +10,7 @@ deliver events — for as long as the page lives. That is what `Engine` is.
 rustup +1.92.0 target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version '=0.2.126' --locked
 cd crates/zipp-wasm
-RUSTFLAGS='-Dwarnings -C link-arg=--max-memory=1073741824 -C link-arg=-zstack-size=1048576' \
+RUSTFLAGS='-Dwarnings -C link-arg=--max-memory=1073741824 -C link-arg=-zstack-size=16777216' \
   cargo +1.92.0 build --locked --release --target wasm32-unknown-unknown
 wasm-bindgen --target web --out-dir pkg \
   --remove-name-section --remove-producers-section \
@@ -79,7 +79,9 @@ the JavaScript-only gate proves the refusal path.
 | method | purpose |
 | --- | --- |
 | `initSource(source, "python")` | one file, as the `main` module |
-| `initPythonProject(files, entry)` | a project: `files` maps module names (file stems) to source, `entry` names the module that runs; modules `import` each other by name and the built-in `ui` module, nothing else |
+| `initPythonProject(files, entry, argv?)` | a project folder: `files` maps root-relative paths to contents (a string for text, `{base64}` for a binary file; the original bare-module-name form still works), `entry` names the `.py` path or module that runs, `argv` becomes `sys.argv[1:]`. Every `.py` file is a module or package by folder, every file is readable through `open()`/`os`/`pathlib`, and only the modules the entry imports are compiled. Limits: 8 MiB per file, 64 MiB in total |
+| `takeFailedConsole()` | what a failed initialization printed before its error (a program's output ahead of a raise, a test report ahead of its non-zero exit), tagged like `takeConsole`; the one method that answers on a disposed engine, and it drains |
+| `pythonCall("__zipp_py_vfs_changed", [])` | the files the program wrote or removed since the last call, as `path<TAB>base64` lines (an empty base64 for a removed file); the playground shows them in its tree |
 | `pythonHas(name)` | whether the entry module defines a top-level function `name` |
 | `pythonCall(name, args)` | call it with an array of host values (integers, strings, booleans, null, arrays) and get host data back; a throw leaves the engine usable and classifies as `guest` |
 | `takeUi()` | drain the `ui` module's command buffer: `[["rect", x, y, w, h, color], ...]` |
@@ -88,8 +90,15 @@ the JavaScript-only gate proves the refusal path.
 | `pythonCall("__zipp_py_deliver", [id, reply])` | answer a host request: `reply` is `{ok: true, value}` or `{ok: false, error: {code, message}}`; the program's callback runs inside this call, and the result is `true` when the id was pending |
 
 `playground/` is a complete host over this surface (and over the JavaScript ABI
-for `.js` projects): a folder of files, an editor, a console and a canvas driven
-by `draw`/`update`/`on_click`/`on_key`. See `playground/README.md`.
+for `.js` projects): a project folder with subfolders and binaries, an
+editor, program arguments, a console and a canvas driven by
+`draw`/`update`/`on_click`/`on_key`. See `playground/README.md`.
+
+The bundled `torch` subset (see `docs/PYTHON_FRONTEND_EXPERIMENT.md`) runs
+inside the engine on typed-array CPU kernels: a PyTorch research lab loaded
+as a folder trains, evaluates, saves and reloads checkpoints in the browser,
+but nothing of it runs on the GPU. WebGPU and WebGL2 are reached through
+`zipp_gpu` graphs (below), which is a separate, explicit path.
 
 #### GPU compute for Python programs
 

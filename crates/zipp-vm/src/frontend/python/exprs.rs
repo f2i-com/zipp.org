@@ -389,7 +389,7 @@ impl<'a> Emitter<'a> {
             self.patch(j, here)?;
         }
         let name = self.string(cmpop_name(op))?;
-        let r = self.helper("cmp", &[name, left, right])?;
+        let r = self.helper("richcmp", &[name, left, right])?;
         self.emit(Instr::Move { dst, src: r })?;
         if let Some(end) = end {
             let here = self.here();

@@ -131,8 +131,10 @@ fn unknown_and_unsupported_imports_are_compile_errors() {
         .err()
         .unwrap();
     assert!(err.contains("duplicate"), "{err}");
-    // Diagnostics name the file.
-    let err = project("main", &[("main", "x = 1\n"), ("util", "x = = 2\n")])
+    // Diagnostics name the file (a module is compiled once something
+    // imports it; an unrelated file with a syntax error costs nothing).
+    assert!(project("main", &[("main", "x = 1\n"), ("util", "x = = 2\n")]).is_ok());
+    let err = project("main", &[("main", "import util\n"), ("util", "x = = 2\n")])
         .err()
         .unwrap();
     assert!(err.contains("util.py:1:5"), "{err}");
@@ -305,4 +307,101 @@ fn new_builtins_and_list_pop() {
         .err()
         .unwrap()
         .contains("ValueError"));
+}
+
+/// `compile_python_program`: packages by dotted name, the virtual filesystem
+/// and `sys.argv`, as the CLI and the playground hand a folder over.
+fn run_program(
+    entry: &str,
+    modules: &[(&str, &str)],
+    files: &[(&str, &[u8])],
+    argv: &[&str],
+) -> Result<Vec<String>, String> {
+    use zipp_vm::frontend::compile_python_program;
+    let entry = entry.to_owned();
+    let modules: Vec<(String, String)> = modules
+        .iter()
+        .map(|(n, s)| (n.to_string(), s.to_string()))
+        .collect();
+    let files: Vec<(String, Vec<u8>)> = files
+        .iter()
+        .map(|(n, b)| (n.to_string(), b.to_vec()))
+        .collect();
+    let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+    big_stack(move || {
+        let mut compiled = compile_python_program(&entry, &modules, &files, &argv, false)?;
+        let state = compiled.state_mut();
+        state.set_limits(50_000_000, None);
+        state.run_init()?;
+        Ok(state.take_output())
+    })
+}
+
+#[test]
+fn packages_files_and_argv_reach_the_program() {
+    let main = "import sys, os, json\nfrom legacy.fast_memory import Memory\nimport legacy\n\
+                from pkg import helper\nimport pkg.sub.deep as deep\nimport pkg\n\
+                print(sys.argv)\nprint(Memory().name, legacy.fast_memory.Memory is Memory)\n\
+                print(helper.answer(), deep.LEVEL, pkg.sub.deep.LEVEL)\n\
+                print(sorted(os.listdir('data')), os.path.exists('data/cfg.json'), os.path.isdir('legacy'))\n\
+                with open('data/cfg.json') as f:\n    cfg = json.load(f)\nprint(cfg['steps'] * 2)\n\
+                with open('data/blob.bin', 'rb') as f:\n    blob = f.read()\nprint(len(blob), blob[:2], blob[-1])\n\
+                with open('out/result.txt', 'w') as f:\n    f.write('done ' + sys.argv[2])\n\
+                print(open('out/result.txt').read())\n";
+    let modules = [
+        ("main", main),
+        ("legacy.fast_memory", "class Memory:\n    name = 'fast'\n"),
+        ("pkg", "print('pkg init')\n"),
+        ("pkg.helper", "def answer():\n    return 42\n"),
+        ("pkg.sub.deep", "LEVEL = 3\n"),
+        ("unused", "raise RuntimeError('never compiled')\n"),
+    ];
+    let blob: Vec<u8> = (0..=255u8).collect();
+    let files: [(&str, &[u8]); 4] = [
+        ("data/cfg.json", b"{\"steps\": 21}"),
+        ("data/blob.bin", &blob),
+        ("legacy/fast_memory.py", b"class Memory:\n    name = 'fast'\n"),
+        ("main.py", main.as_bytes()),
+    ];
+    let out = run_program("main", &modules, &files, &["--steps", "7"]).unwrap();
+    assert_eq!(
+        out,
+        vec![
+            "pkg init",
+            "['main.py', '--steps', '7']",
+            "fast True",
+            "42 3 3",
+            "['blob.bin', 'cfg.json'] True True",
+            "42",
+            "256 b'\\x00\\x01' 255",
+            "done 7",
+        ]
+    );
+    // A missing file is a FileNotFoundError, and a folder is not a file.
+    let err = run_program("main", &[("main", "open('nope.txt')\n")], &[], &[])
+        .err()
+        .unwrap();
+    assert!(err.contains("FileNotFoundError"), "{err}");
+    let err = run_program(
+        "main",
+        &[("main", "open('data')\n")],
+        &[("data/x.txt", b"x")],
+        &[],
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("IsADirectoryError"), "{err}");
+}
+
+#[test]
+fn a_test_module_entry_runs_its_tests() {
+    let source = "import pytest\n\ndef test_ok():\n    assert 1 + 1 == 2\n\n\
+                  @pytest.mark.parametrize('n', [1, 2])\ndef test_param(n):\n    assert n > 0\n";
+    let out = run_program("test_lab", &[("test_lab", source)], &[], &[]).unwrap();
+    assert!(out.iter().any(|l| l.contains("3 passed")), "{out:?}");
+    let failing = "def test_bad():\n    assert 1 == 2\n";
+    let err = run_program("test_lab", &[("test_lab", failing)], &[], &[])
+        .err()
+        .unwrap();
+    assert!(err.contains("SystemExit"), "{err}");
 }
