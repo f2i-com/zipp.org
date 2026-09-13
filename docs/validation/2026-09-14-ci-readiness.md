@@ -101,5 +101,11 @@ executions pass. Both shard gates pass with expectations scoped to their
 selection. Related class and direct-eval regressions also pass, as do 554 VM
 library tests (two existing opt-in tests remain ignored) and eleven runner tests.
 
+The first follow-up safe-profile CI run completed its selected tests successfully
+but then failed because a newly wrapped shell argument line lacked a continuation
+backslash. That workflow typo is corrected; the new Intl regression and global
+fingerprint test remain in the same Cargo invocation. The README headline also
+retains the format consumed by both landing-page statistics adapters.
+
 Do not infer release readiness from this repair note: the candidate must pass
 both CI workflows at its final committed revision before promotion or tagging.

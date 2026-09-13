@@ -900,7 +900,7 @@ below.
 ## Correctness and language coverage
 
 The [latest completed Test262 run](https://github.com/f2i-com/zipp-python/actions/runs/34761803672/job/103735841023)
-at engine revision `0a5c1e2e` passes **95,669 of 95,680** executions (**99.989%**),
+at engine revision `0a5c1e2e` reports **99.989% of test262**: 95,669 / 95,680 executions,
 with **11 expected failures and zero skips**. The corpus is pinned to
 `4249661388e5d3f92a85186213da140a6481490f`, including staging and excluding the
 separate ECMA-402 suite. A green gate means no unexpected failures, stale
