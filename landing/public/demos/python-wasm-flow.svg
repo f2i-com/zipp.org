@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="410" viewBox="0 0 1400 410" role="img" aria-labelledby="title desc">
+<title id="title">Python runs on ZIPP WebAssembly</title>
+<desc id="desc">Python source compiles to register bytecode, executes on the Zipp WebAssembly VM in a browser Worker, and submits graph operations to a JavaScript WebGL2 or WebGPU host. Compiled Torch results return to Python callbacks.</desc>
+<defs><linearGradient id="bg" x2="1" y2="1"><stop stop-color="#111525"/><stop offset="1" stop-color="#102b32"/></linearGradient><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 8 4 0 8" fill="none" stroke="#a3a5d6" stroke-width="1.5"/></marker></defs>
+<rect width="1400" height="410" rx="24" fill="url(#bg)"/>
+<g font-family="Segoe UI,Arial,sans-serif">
+<text x="48" y="50" fill="#a4a0e5" font-size="13" letter-spacing="2">THE PYTHON PLAYGROUND / EXECUTION PATH</text>
+<text x="48" y="100" fill="#f6f5ff" font-size="34" font-weight="700">Python source. ZIPP bytecode. A real WASM VM.</text>
+<g fill="#1c2339" stroke="#414968"><rect x="48" y="144" width="275" height="138" rx="12"/><rect x="390" y="144" width="275" height="138" rx="12"/><rect x="732" y="144" width="275" height="138" rx="12"/></g>
+<rect x="1074" y="144" width="278" height="138" rx="12" fill="#143c3b" stroke="#4b9b86"/>
+<g fill="#a8a8d5" font-size="13"><text x="70" y="174">01 / AUTHOR</text><text x="412" y="174">02 / COMPILE</text><text x="754" y="174">03 / EXECUTE</text><text x="1096" y="174" fill="#92ddc4">04 / GPU GRAPHS</text></g>
+<g fill="#f3f1ff" font-size="23" font-weight="650"><text x="70" y="211">Python source</text><text x="412" y="211">ZIPP compiler</text><text x="754" y="211">ZIPP WASM VM</text><text x="1096" y="211">JavaScript host</text></g>
+<g fill="#b2bacf" font-size="16"><text x="70" y="244">Torch tensors + Life rules</text><text x="412" y="244">Python → register bytecode</text><text x="754" y="244">Python runs in a Worker</text><text x="1096" y="244" fill="#a8d7c9">WebGL2 / WebGPU shaders</text></g>
+<g fill="none" stroke="#a3a5d6" stroke-width="2" marker-end="url(#arrow)"><path d="M334 212h43"/><path d="M676 212h43"/><path d="M1018 212h43"/><path d="M1210 292v31H870v-30"/></g>
+<text x="48" y="337" fill="#e5e0fe" font-size="17">Python control flow executes in ZIPP. Supported graph operations execute on the GPU.</text>
+<text x="918" y="352" fill="#92ddc4" font-size="14">Torch tensor → Python callback</text>
+<text x="48" y="382" fill="#8f9daf" font-size="15">Game of Life: one toroidal grid, GPU-computed generations, and Python callbacks for each new state.</text>
+</g></svg>

@@ -103,7 +103,11 @@ impl<'p> Vm<'p> {
             "best fit",
             &["lookup", "best fit"],
         )?;
-        let locale = lookup_matcher(&requested);
+        let locale = if kind == INTL_DATETIMEFORMAT {
+            lookup_matcher_in(&requested, DTF_AVAILABLE_LOCALES)
+        } else {
+            lookup_matcher(&requested)
+        };
         let loc = self.alloc_str(locale.clone());
         let mut r = ObjMap::new();
         r.set("locale", loc);
@@ -453,8 +457,12 @@ impl<'p> Vm<'p> {
                 }
                 let calv = self.alloc_str(calr);
                 r.set("calendar", calv);
-                let (nsr, keep_nu) =
-                    resolve_ext_key(ns_opt, ext("nu"), AVAILABLE_NUMBERING_SYSTEMS, "latn");
+                let (nsr, keep_nu) = resolve_ext_key(
+                    ns_opt,
+                    ext("nu"),
+                    AVAILABLE_NUMBERING_SYSTEMS,
+                    crate::vm::dtf_locale::for_locale(&locale).numbering_system,
+                );
                 if keep_nu {
                     ext_used.push(("nu", nsr.clone()));
                 }
@@ -481,10 +489,16 @@ impl<'p> Vm<'p> {
                     // hour12:false is h23; hour12:true keeps the locale's
                     // 12-hour cycle (h12 for the en-style default).
                     (Some(false), _) => "h23".to_string(),
-                    (Some(true), _) => "h12".to_string(),
+                    (Some(true), _) => crate::vm::dtf_locale::for_locale(&locale)
+                        .hour_cycle12
+                        .to_string(),
                     (None, opt) => {
-                        let (v, keep) =
-                            resolve_ext_key(opt, ext("hc"), &["h11", "h12", "h23", "h24"], "h12");
+                        let (v, keep) = resolve_ext_key(
+                            opt,
+                            ext("hc"),
+                            &["h11", "h12", "h23", "h24"],
+                            crate::vm::dtf_locale::for_locale(&locale).hour_cycle,
+                        );
                         if keep {
                             ext_used.push(("hc", v.clone()));
                         }

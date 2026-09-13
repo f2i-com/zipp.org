@@ -1,5 +1,99 @@
 # Zipp performance handoff
 
+### 14 September: canonical promotion approved
+
+The user approved preparing a promotion PR in `f2i-com/zipp.org` and running
+CI on the exact final commit. Canonical `main` is an ancestor of the current
+integration branch, with no competing commits at preparation time. Merge and
+v0.0.18 tagging remain behind the final CI gates. The local validation below
+is retained as historical evidence; its earlier push hold has been superseded
+for this promotion branch and PR.
+
+PR #19 is open on `codex/promote-0.0.18`. At `1539eb4b`, canonical standard
+CI and the original/corrected Test262 gates all passed. The earlier broad
+native run failed only because its preinstalled Node lacked Float16Array;
+`typedarray_interp_index_fast` compared unequal row counts. The native lane now
+selects and verifies Node 24, matching standard CI. Its focused test passes
+locally. The updated head needs fresh hosted gates before merge or release.
+
+### 14 September: local conformance follow-up; pushes held
+
+The user explicitly requested no further pushes until tests pass. The
+DateTimeFormat changes and documented Test262 corrections remain local.
+`tools/run_test262_dual.py` runs the original pinned core corpus and a separate
+five-file correction profile, retaining both reports. The nine contradictory
+upstream executions remain visible in the original result; the corrected run
+has no expected-failure allowance. The two German staging failures are fixed
+in the VM, without test patches. The German-only phase completed with original
+95,671/95,680 and corrected 95,680/95,680, no skips, in
+`target/test262-dual-v2/comparison.json`. The expanded DateTimeFormat release
+build's full comparison also completed with those exact counts and both gates
+passing, in `target/test262-dtf-final`. Durable build hashes and summaries are in
+`docs/validation/2026-09-14-test262-datetimeformat.json`.
+
+Native library and locale checks pass in default and safe profiles. Both WASM
+feature variants compile. The original DateTimeFormat ECMA-402 shard now passes
+488/488, zero failures/skips, in both debug and release. CLDR 48 tables cover
+English, German, Japanese, Chinese and Egyptian Arabic for this service; other
+Intl services retain their English locale set. Calendar patterns, related/cyclic
+years, leap months, era names, hour cycles and localized numbering are fixed.
+No canonical push, tag or release is authorized
+by a partial or patched-suite result alone. See
+[the corrections guide](tools/test262-corrections/README.md).
+
+Use `target/dtf-dev/release/zipp.exe` for this validation. An earlier baseline
+checkout shared `target/` and Cargo reused its VM artifacts; that comparison
+was discarded and the final build uses an isolated target directory.
+
+### 14 September: Test262 baseline follow-up
+
+The latest completed Test262 run at `0a5c1e2e` is 95,669 PASS / 11 FAIL / 0 SKIP,
+not 100% conformance. Eight failures are pinned harness conflicts, one has an
+obsolete Annex B assertion, and two expose the documented German-locale gap.
+Investigating the Annex B failure uncovered a separate block-binding bug; the
+follow-up fixes declaration timing and sloppy arrow var setup, with parameter
+shadowing covered independently. README counts and baseline explanations now
+match the actual hosted evidence. See the CI repair note below for details.
+
+### 14 September: broader CI repair candidate
+
+See [the CI repair evidence](docs/validation/2026-09-14-ci-readiness.md).
+This fixes class-body closure bindings, replaces the parser's unmaintained UNIC
+dependencies, matches the native regression thread to the native sandbox stack,
+and reduces CI linker resource use. The Test262 gate retains the pinned corpus,
+zero skips and exact expected-failure checking, with eight documented upstream
+harness inconsistencies added to the original three. Date tests have a bounded
+120-second deadline and two workers. All previous release-hold notes below are
+historical; promotion still requires green workflows at the candidate revision.
+
+
+### 13 September: 0.0.18 candidate, promotion on hold
+
+The test repository contains the Vite 8.3 update and release preparation for
+separate JavaScript (`web.zip`, 1 MiB stack) and JavaScript + Python
+(`web-python.zip`, 16 MiB stack) packages. Manifests say 0.0.18; this is not a
+published release. Canonical main and the v0.0.18 tag must wait for green gates.
+
+Local release builds with Rust 1.92 and `-Dwarnings` passed all 21 shared Node
+boundary checks in each variant. The combined build also passed CPU Conv2d,
+dense training/PyTorch parity, optimizer transaction and disabled interop checks.
+The Vite production build, nine landing tests and actual browser GPU smoke
+passed on RTX 5090 WebGL2 and WebGPU, including 100 training steps.
+
+Broad CI at 11f7a5c0 found release blockers:
+[Security run 34760541481](https://github.com/f2i-com/zipp-python/actions/runs/34760541481).
+The safe interpreter suite aborted with a native stack overflow; native workspace
+linking failed with a linker bus error; cargo-audit denied six unmaintained UNIC
+transitive dependencies introduced by the Python parser. These are maintenance
+advisories, not a report of six exploitable vulnerabilities. Keep all gates intact.
+The separate Python CI toolchain mismatch is fixed by pinning build-variants.sh
+to `cargo +1.92.0`; Linux runners had installed wasm32 only for that toolchain.
+
+The checked-in browser demo engines remain the previously validated 0.0.17
+artifacts. Release CI builds new binaries from the exact tag and verifies version,
+commit and languages. NCA stays in its separate repository.
+
+
 This is the current continuation note. Historical snapshots through B252 are
 archived in [`docs/archive/HANDOFF-through-B252.md`](docs/archive/HANDOFF-through-B252.md),
 and the B001–B252 experiment ledger is preserved in

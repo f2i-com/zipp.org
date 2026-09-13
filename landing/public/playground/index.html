@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zipp Playground · Python, JavaScript &amp; GPU</title>
+<link rel="stylesheet" href="playground.css">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; worker-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'">
+</head>
+<body>
+<header class="toolbar">
+  <div class="brand">
+    <span class="bolt">⚡</span>
+    <a href="/" target="_top" class="playground-home">Zipp playground ↗</a>
+    <span class="muted">Python &amp; JavaScript on the WASM engine</span>
+  </div>
+  <div class="actions">
+    <label class="button" title="Load a local project folder, including subfolders and data; files stay in your browser">
+      Open folder
+      <input id="folder-input" type="file" webkitdirectory multiple hidden>
+    </label>
+    <label class="button" title="Open one or more source files">
+      Open files
+      <input id="files-input" type="file" multiple accept=".py,.js,.mjs" hidden>
+    </label>
+    <div class="menu">
+      <button class="button" id="sample-button" type="button">Samples ▾</button>
+      <div class="menu-items" id="sample-menu" hidden>
+        <button type="button" data-sample="python">Python: bouncing balls</button>
+        <button type="button" data-sample="javascript">JavaScript: bouncing balls</button>
+        <button type="button" data-sample="ant">Python: Langton's ant (classes, dataclasses, enum)</button>
+        <button type="button" data-sample="training">Python: Torch ML training (GPU)</button>
+        <button type="button" data-sample="torch">Python: Torch ML inference (GPU)</button>
+        <button type="button" data-sample="gpu">Python: Game of Life (Torch on the GPU)</button>
+        <button type="button" data-sample="python-hello">Python: hello, world</button>
+        <button type="button" data-sample="javascript-hello">JavaScript: hello, world</button>
+      </div>
+    </div>
+    <button class="button" id="new-file" type="button">New file</button>
+    <input id="program-args" class="args" type="text" placeholder="program arguments (sys.argv)" title="Arguments for the program, as on a command line: sys.argv[1:]" spellcheck="false">
+    <label class="button" title="Where Python zipp_gpu graphs run: auto tries WebGPU, then WebGL2, then compiled WASM, then a JavaScript reference">
+      GPU
+      <select id="gpu-backend">
+        <option value="auto">auto</option>
+        <option value="webgpu">WebGPU</option>
+        <option value="webgl2">WebGL2</option>
+        <option value="wasm">WASM kernels</option>
+        <option value="cpu-js">JavaScript</option>
+      </select>
+    </label>
+    <span class="spacer"></span>
+    <button class="button primary" id="run" type="button" title="Ctrl+Enter">▶ Run</button>
+    <button class="button" id="stop" type="button" disabled>■ Stop</button>
+  </div>
+</header>
+
+<main class="layout" id="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <span id="project-name" class="project-name">untitled</span>
+      <span id="project-language" class="badge"></span>
+    </div>
+    <ul class="file-list" id="file-list"></ul>
+    <div class="sidebar-foot">
+      <button class="link" id="set-entry" type="button">Set as entry</button>
+      <button class="link" id="rename-file" type="button">Rename</button>
+      <button class="link danger" id="delete-file" type="button">Delete</button>
+    </div>
+    <p class="hint">
+      Drop a folder anywhere on the page: every file comes along, subfolders
+      included. The entry file (<code>main.py</code> / <code>main.js</code>, or
+      any file you set) runs first; Python modules import each other by name
+      and by package, and the program can <code>open()</code> the folder's
+      files (files it writes appear here). JavaScript files share one global
+      scope. Define <code>draw()</code> and <code>update()</code> to animate,
+      <code>on_click(x, y)</code> and <code>on_key(key)</code> for input.
+    </p>
+  </aside>
+
+  <section class="editor-pane">
+    <div class="editor-head">
+      <span id="current-file" class="current-file">no file</span>
+      <span id="dirty" class="muted"></span>
+    </div>
+    <div class="editor" id="editor-wrap">
+      <pre class="gutter" id="gutter" aria-hidden="true">1</pre>
+      <div class="code">
+        <pre class="highlight" id="highlight" aria-hidden="true"><code id="highlight-code"></code></pre>
+        <textarea id="editor" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off"></textarea>
+      </div>
+    </div>
+  </section>
+
+  <section class="output-pane">
+    <div class="canvas-panel">
+      <div class="panel-head">
+        <span>Canvas</span>
+        <span id="frame-stats" class="muted"></span>
+      </div>
+      <div class="canvas-wrap" id="canvas-wrap">
+        <canvas id="canvas" width="480" height="320" tabindex="0"></canvas>
+        <div class="canvas-hint" id="canvas-hint">Programs draw here through the <code>ui</code> module.</div>
+      </div>
+    </div>
+    <div class="console-panel">
+      <div class="panel-head">
+        <span>Console</span>
+        <button class="link" id="clear-console" type="button">Clear</button>
+      </div>
+      <pre class="console" id="console"></pre>
+    </div>
+  </section>
+</main>
+
+<footer class="status" id="status">Loading the engine…</footer>
+<div class="drop-overlay" id="drop-overlay" hidden>Drop a folder or files to open them</div>
+
+<script type="module" src="playground.js"></script>
+</body>
+</html>

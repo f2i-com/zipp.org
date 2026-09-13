@@ -6,10 +6,19 @@ use crate::heap::{
     PromiseState, PropAttr, ReactionPair, Reactions,
 };
 use crate::value::Value;
+use crate::vm::dtf_pattern;
 use crate::vm::*;
-use crate::vm::{cldr_en, dtf_pattern};
 
 impl<'p> Vm<'p> {
+    fn dtf_locale(&self, resolved: u32) -> &'static crate::vm::dtf_locale::DateTimeLocale {
+        crate::vm::dtf_locale::for_locale(&self.display(self.intl_slot(resolved, "locale")))
+    }
+
+    fn dtf_patterns(&self, resolved: u32) -> crate::vm::dtf_locale::CalendarPatterns {
+        self.dtf_locale(resolved)
+            .patterns(&self.display(self.intl_slot(resolved, "calendar")))
+    }
+
     /// HandleDateTimeValue's argument classification: `None` for an ordinary time
     /// value (a Number, a Date, anything ToNumber-able), `Some(k)` for a
     /// `Temporal.*` argument (k = the HeapObj::Temporal kind). formatRange pairs
@@ -318,9 +327,11 @@ impl<'p> Vm<'p> {
             return parts;
         }
         // `intervalFormatFallback` — format both endpoints whole and join.
-        let (pre, post) = cldr_en::INTERVAL_FALLBACK
+        let patterns = self.dtf_patterns(resolved);
+        let (pre, post) = patterns
+            .interval_fallback
             .split_once("{0}")
-            .unwrap_or(("", cldr_en::INTERVAL_FALLBACK));
+            .unwrap_or(("", patterns.interval_fallback));
         let sep = post
             .split_once("{1}")
             .map(|(s, _)| s)
@@ -362,7 +373,8 @@ impl<'p> Vm<'p> {
             (None, Some(g)) => (&t_items, g),
             (None, None) => return None,
         };
-        let pattern = dtf_pattern::interval_pattern(half, hour12, greatest)?;
+        let pattern =
+            dtf_pattern::interval_pattern(&self.dtf_patterns(resolved), half, hour12, greatest)?;
         let items = dtf_pattern::parse_pattern(&pattern);
         let (sep, first, last) = dtf_pattern::interval_layout(&items)?;
         // Items outside the two ranged runs are common to both endpoints.
@@ -390,7 +402,7 @@ impl<'p> Vm<'p> {
             .map(|(t, v)| (t.to_string(), v, "shared"))
             .collect();
         Some(dtf_pattern::splice_glue_parts(
-            cldr_en::DATETIME_GLUE_AT[glue],
+            self.dtf_patterns(resolved).datetime_glue_at[glue],
             &shared,
             &ranged,
         ))
@@ -633,7 +645,7 @@ impl<'p> Vm<'p> {
     }
 
     /// FormatDateTimePattern (ECMA-402 §11.5.6) over the CLDR `en` patterns in
-    /// `cldr_en`, as a typed part list. `format` is this joined; `formatToParts`
+    /// CLDR locale data, as a typed part list. `format` is this joined; `formatToParts`
     /// is this wrapped.
     ///
     /// The pattern is chosen first — from `dateStyle`/`timeStyle` when they are
@@ -650,7 +662,9 @@ impl<'p> Vm<'p> {
     ) -> Vec<(&'static str, String)> {
         let (d, t, glue) = self.dtf_pattern_halves(resolved, fields);
         let items = match (d.is_empty(), t.is_empty()) {
-            (false, false) => dtf_pattern::splice_glue(cldr_en::DATETIME_GLUE_AT[glue], &d, &t),
+            (false, false) => {
+                dtf_pattern::splice_glue(self.dtf_patterns(resolved).datetime_glue_at[glue], &d, &t)
+            }
             (false, true) => d,
             _ => t,
         };
@@ -673,12 +687,16 @@ impl<'p> Vm<'p> {
             }
         };
         let (req, hour12) = self.dtf_request(resolved, fields);
+        let cal_for_pat = slot("calendar").unwrap_or_else(|| "gregory".to_string());
+        let include_era = !matches!(cal_for_pat.as_str(), "chinese" | "dangi")
+            && (fields & Self::F_ERA != 0
+                || !matches!(cal_for_pat.as_str(), "gregory" | "iso8601"));
         // Which CLASSES survive: a field the pattern carries but this argument
         // does not have is dropped by `dtf_filter`.
         let has = |bit: u16| fields & bit != 0;
         let keep = move |c: char| match c {
-            'G' => has(Self::F_ERA),
-            'y' | 'Y' | 'u' => has(Self::F_YEAR),
+            'G' => include_era,
+            'y' | 'Y' | 'u' | 'r' | 'U' => has(Self::F_YEAR),
             'M' | 'L' => has(Self::F_MONTH),
             'd' => has(Self::F_DAY),
             'E' | 'e' | 'c' => has(Self::F_WEEKDAY),
@@ -702,42 +720,108 @@ impl<'p> Vm<'p> {
             // era that gregorian's do not, hebrew is day-first ("27 Nisan 5760",
             // not "Nisan 27, 5760"), and chinese/dangi use `r(U)`. Falling back
             // to gregorian's produced correct field VALUES in the wrong shape.
-            let cal_for_pat = slot("calendar").unwrap_or_else(|| "gregory".to_string());
             let dpat = ds.map(|i| {
-                cldr_en::CAL_DATE_FORMATS
+                self.dtf_locale(resolved)
+                    .cal_date_formats
                     .iter()
                     .find(|(id, _)| *id == cal_for_pat)
                     .map(|(_, pats)| pats[i])
-                    .unwrap_or(cldr_en::DATE_FORMATS[i])
+                    .unwrap_or(self.dtf_locale(resolved).date_formats[i])
                     .to_string()
             });
-            let tpat = ts.map(|i| cldr_en::TIME_FORMATS[i].to_string());
+            let tpat = ts.map(|i| self.dtf_locale(resolved).time_formats[i].to_string());
             // A dateStyle pattern is used AS STORED (ECMA-402
             // DateTimeStylePattern) — the style implies its own components, so
             // the era that every non-gregorian calendar's pattern carries must
             // survive the component keep-set, which only knows about explicitly
             // requested fields. The rest of the keep-set still applies, so a
             // Temporal argument that genuinely lacks a field still drops it.
-            let d_items = dpat.map(|p| {
-                Self::dtf_filter(dtf_pattern::parse_pattern(&p), &|c: char| {
-                    c == 'G' || keep(c)
-                })
-            });
+            let d_items = dpat.map(|p| Self::dtf_filter(dtf_pattern::parse_pattern(&p), &keep));
             let t_items = tpat.map(|p| {
-                // `en`'s four stored time patterns are 12-hour (`h:mm:ss a …`).
-                // An h23/h24 request rewrites the hour field to the padded
-                // 24-hour form CLDR uses for it; the day period is then dropped
-                // by `keep` above, taking its separator with it.
-                let items = dtf_pattern::parse_pattern(&p)
+                // Preserve the style's widths while honoring all four hour
+                // cycles. German styles are 24-hour by default; their 12-hour
+                // alternatives also need the locale's CLDR day-period suffix.
+                let hc = slot("hourCycle").unwrap_or_default();
+                let mut items: Vec<_> = dtf_pattern::parse_pattern(&p)
                     .into_iter()
                     .map(|it| match it {
-                        dtf_pattern::Item::Field('h', _) if !hour12 => {
-                            let hc = slot("hourCycle").unwrap_or_default();
-                            dtf_pattern::Item::Field(if hc == "h24" { 'k' } else { 'H' }, 2)
+                        dtf_pattern::Item::Field('h' | 'H' | 'k' | 'K', n) => {
+                            let c = match hc.as_str() {
+                                "h11" => 'K',
+                                "h12" => 'h',
+                                "h24" => 'k',
+                                _ => 'H',
+                            };
+                            dtf_pattern::Item::Field(c, if hour12 { n } else { 2 })
                         }
                         other => other,
                     })
                     .collect();
+                if hour12
+                    && !items
+                        .iter()
+                        .any(|it| matches!(it, dtf_pattern::Item::Field('a' | 'b' | 'B', _)))
+                {
+                    let data = self.dtf_locale(resolved);
+                    if let Some((_, pattern)) =
+                        data.available_formats.iter().find(|(key, _)| *key == "hm")
+                    {
+                        let alternate = dtf_pattern::parse_pattern(pattern);
+                        if let Some(period) = alternate
+                            .iter()
+                            .position(|it| matches!(it, dtf_pattern::Item::Field('a', _)))
+                        {
+                            let hour = alternate
+                                .iter()
+                                .position(|it| {
+                                    matches!(it, dtf_pattern::Item::Field('h' | 'H' | 'K' | 'k', _))
+                                })
+                                .unwrap_or(0);
+                            if period < hour {
+                                // Japanese and Chinese put the period before
+                                // the hour; preserve that locale ordering.
+                                let insertion = items
+                                    .iter()
+                                    .position(|it| {
+                                        matches!(
+                                            it,
+                                            dtf_pattern::Item::Field('h' | 'H' | 'K' | 'k', _)
+                                        )
+                                    })
+                                    .unwrap_or(0);
+                                items.splice(
+                                    insertion..insertion,
+                                    alternate[..hour].iter().cloned(),
+                                );
+                            } else {
+                                let suffix_start = if period > 0
+                                    && matches!(alternate[period - 1], dtf_pattern::Item::Lit(_))
+                                {
+                                    period - 1
+                                } else {
+                                    period
+                                };
+                                let zone = items
+                                    .iter()
+                                    .position(|it| {
+                                        matches!(it, dtf_pattern::Item::Field('z' | 'v', _))
+                                    })
+                                    .unwrap_or(items.len());
+                                let insertion = if zone > 0
+                                    && matches!(items[zone - 1], dtf_pattern::Item::Lit(_))
+                                {
+                                    zone - 1
+                                } else {
+                                    zone
+                                };
+                                items.splice(
+                                    insertion..insertion,
+                                    alternate[suffix_start..=period].iter().cloned(),
+                                );
+                            }
+                        }
+                    }
+                }
                 Self::dtf_filter(items, &keep)
             });
             // CLDR 42+ keeps a second "at time" glue for exactly this
@@ -749,7 +833,12 @@ impl<'p> Vm<'p> {
                 ds.unwrap_or(3),
             );
         }
-        let (dpat, tpat, glue) = dtf_pattern::best_pattern_halves(&req, hour12);
+        let (dpat, tpat, glue) = dtf_pattern::best_pattern_halves(
+            self.dtf_locale(resolved),
+            &self.dtf_patterns(resolved),
+            &req,
+            hour12,
+        );
         (
             Self::dtf_filter(dtf_pattern::parse_pattern(&dpat), &keep),
             Self::dtf_filter(dtf_pattern::parse_pattern(&tpat), &keep),
@@ -830,11 +919,32 @@ impl<'p> Vm<'p> {
                 None => (0usize, y),
             },
         };
+        let era_calendar = if cal_id == "japanese" && (iso_y, iso_mo, iso_d) < (1873, 1, 1) {
+            "gregory"
+        } else {
+            &cal_id
+        };
+        let (month_number, leap_month) = cal
+            .map(|c| crate::vm::temporal::calendar::cal_month_code(c, y, mo))
+            .unwrap_or((mo, false));
         let minutes_of_day = (t[0] * 60 + t[1]) as i32;
         let mut out: Vec<(&'static str, String)> = vec![];
-        for item in items {
+        for (item_index, item) in items.iter().enumerate() {
             match item {
-                dtf_pattern::Item::Lit(s) => out.push(("literal", s.clone())),
+                dtf_pattern::Item::Lit(s) => {
+                    // Match the selected CLDR ASCII AM/PM spacing in interval
+                    // patterns too, which do not all provide an ASCII alias.
+                    let value = if s == "\u{202f}"
+                        && matches!(
+                            items.get(item_index + 1),
+                            Some(dtf_pattern::Item::Field('a' | 'b', _))
+                        ) {
+                        " ".to_string()
+                    } else {
+                        s.clone()
+                    };
+                    out.push(("literal", value));
+                }
                 dtf_pattern::Item::Field(c, n) => {
                     let n = *n;
                     // CLDR width index: 0 = wide, 1 = abbreviated, 2 = narrow.
@@ -844,7 +954,15 @@ impl<'p> Vm<'p> {
                         _ => 1,
                     };
                     match c {
-                        'G' => out.push(("era", cal_era_name(&cal_id, era_idx, text_width(n)))),
+                        'G' => out.push((
+                            "era",
+                            cal_era_name(
+                                self.dtf_locale(resolved),
+                                era_calendar,
+                                era_idx,
+                                text_width(n),
+                            ),
+                        )),
                         'y' | 'Y' | 'u' => {
                             let v = if *c == 'u' { y } else { era_year };
                             // `yy` is the last two digits, zero-padded; any other
@@ -856,23 +974,84 @@ impl<'p> Vm<'p> {
                             };
                             out.push(("year", s));
                         }
+                        'r' => out.push(("relatedYear", y.to_string())),
+                        'U' => {
+                            if let Some((_, names)) = self
+                                .dtf_locale(resolved)
+                                .cyclic_years
+                                .iter()
+                                .find(|(id, _)| *id == cal_id)
+                            {
+                                let index = (y - 4).rem_euclid(60) as usize;
+                                out.push(("yearName", names[index].to_string()));
+                            }
+                        }
                         'M' | 'L' => {
                             let s = match n {
-                                1 => mo.to_string(),
-                                2 => format!("{mo:02}"),
-                                3 => cal_month_name(&cal_id, cal, y, mo, 1),
-                                5 => cal_month_name(&cal_id, cal, y, mo, 2),
-                                _ => cal_month_name(&cal_id, cal, y, mo, 0),
+                                1 | 2 if cal_id == "hebrew" => cal_month_name(
+                                    self.dtf_locale(resolved),
+                                    &cal_id,
+                                    cal,
+                                    y,
+                                    mo,
+                                    1,
+                                    *c == 'L',
+                                ),
+                                1 | 2 => {
+                                    let base = if n == 2 {
+                                        format!("{month_number:02}")
+                                    } else {
+                                        month_number.to_string()
+                                    };
+                                    if leap_month {
+                                        leap_month_name(
+                                            self.dtf_locale(resolved),
+                                            &cal_id,
+                                            &base,
+                                            3,
+                                            *c == 'L',
+                                        )
+                                    } else {
+                                        base
+                                    }
+                                }
+                                3 => cal_month_name(
+                                    self.dtf_locale(resolved),
+                                    &cal_id,
+                                    cal,
+                                    y,
+                                    mo,
+                                    1,
+                                    *c == 'L',
+                                ),
+                                5 => cal_month_name(
+                                    self.dtf_locale(resolved),
+                                    &cal_id,
+                                    cal,
+                                    y,
+                                    mo,
+                                    2,
+                                    *c == 'L',
+                                ),
+                                _ => cal_month_name(
+                                    self.dtf_locale(resolved),
+                                    &cal_id,
+                                    cal,
+                                    y,
+                                    mo,
+                                    0,
+                                    *c == 'L',
+                                ),
                             };
                             out.push(("month", s));
                         }
                         'd' => out.push(("day", format!("{:0width$}", d, width = n))),
                         'E' | 'e' | 'c' => {
                             let s = match n {
-                                4 => cldr_en::DAYS_WIDE[weekday],
-                                5 => cldr_en::DAYS_NARROW[weekday],
-                                6 => cldr_en::DAYS_SHORT[weekday],
-                                _ => cldr_en::DAYS_ABBR[weekday],
+                                4 => self.dtf_locale(resolved).days_wide[weekday],
+                                5 => self.dtf_locale(resolved).days_narrow[weekday],
+                                6 => self.dtf_locale(resolved).days_short[weekday],
+                                _ => self.dtf_locale(resolved).days_abbr[weekday],
                             };
                             out.push(("weekday", s.to_string()));
                         }
@@ -880,14 +1059,27 @@ impl<'p> Vm<'p> {
                             let key = if t[0] < 12 { "am" } else { "pm" };
                             out.push((
                                 "dayPeriod",
-                                dtf_pattern::day_period_name(key, text_width(n)).to_string(),
+                                dtf_pattern::day_period_name(
+                                    self.dtf_locale(resolved),
+                                    key,
+                                    text_width(n),
+                                )
+                                .to_string(),
                             ));
                         }
                         'B' => {
-                            let key = dtf_pattern::day_period_key(minutes_of_day);
+                            let key = dtf_pattern::day_period_key(
+                                self.dtf_locale(resolved),
+                                minutes_of_day,
+                            );
                             out.push((
                                 "dayPeriod",
-                                dtf_pattern::day_period_name(key, text_width(n)).to_string(),
+                                dtf_pattern::day_period_name(
+                                    self.dtf_locale(resolved),
+                                    key,
+                                    text_width(n),
+                                )
+                                .to_string(),
                             ));
                         }
                         'h' | 'H' | 'K' | 'k' => {
@@ -939,19 +1131,54 @@ impl<'p> Vm<'p> {
         // The date-time NUMBERS follow the resolved numbering system too
         // (`format/numbering-system.js`); the literals between them do not.
         let ns = slot("numberingSystem").unwrap_or_else(|| "latn".to_string());
-        if ns != "latn" {
-            for (ty, v) in out.iter_mut() {
-                if *ty != "literal" && *ty != "timeZoneName" && *ty != "dayPeriod" {
-                    *v = translate_digits(v, &ns);
+        let data = self.dtf_locale(resolved);
+        let style_numbering = slot("dateStyle")
+            .and_then(|style| dtf_pattern::style_index(&style))
+            .and_then(|style| {
+                data.cal_date_number_systems
+                    .iter()
+                    .find(|(id, _)| *id == cal_id)
+                    .map(|(_, systems)| systems[style])
+            })
+            .unwrap_or("");
+        for (ty, v) in out.iter_mut() {
+            if *ty == "year"
+                && era_year == 1
+                && style_numbering == "y=jpanyear"
+                && !data.japanese_first_year.is_empty()
+            {
+                *v = data.japanese_first_year.to_string();
+                continue;
+            }
+            if *ty == "day" && style_numbering == "d=hanidays" {
+                if let Some(name) = data.lunar_day_names.get((d - 1) as usize) {
+                    *v = name.to_string();
+                    continue;
                 }
             }
+            let system = if style_numbering == "hanidec"
+                && matches!(*ty, "year" | "relatedYear" | "month" | "day")
+            {
+                "hanidec"
+            } else {
+                &ns
+            };
+            if system != "latn"
+                && !matches!(*ty, "literal" | "timeZoneName" | "dayPeriod" | "yearName")
+            {
+                *v = translate_digits(v, system);
+            }
+        }
+        if ns != "latn" {
             // FormatDateTimePattern step 11 formats the fractional seconds with
             // a NumberFormat carrying [[NumberingSystem]], so the separator in
             // front of them is that system's decimal separator, not the
             // pattern's ASCII "." — `en-US-u-nu-arab` prints ٠٦٫٧٨٩.
             if let Some((dec, _)) = numbering_separators(&ns) {
                 for i in 1..out.len() {
-                    if out[i].0 == "fractionalSecond" && out[i - 1] == ("literal", ".".to_string())
+                    if out[i].0 == "fractionalSecond"
+                        && out[i - 1]
+                            == ("literal", self.dtf_locale(resolved).sym_decimal.to_string())
                     {
                         out[i - 1].1 = dec.to_string();
                     }
@@ -969,7 +1196,7 @@ impl<'p> Vm<'p> {
     /// self-consistent with the rest of the pattern rather than an invented name.
     ///
     /// The ONE zone that does get its CLDR name is "UTC": `en` gives Etc/UTC the
-    /// short name "UTC" and the long name "Coordinated Universal Time", and that
+    /// short name "UTC" and the locale's long UTC name, and that
     /// is not interchangeable with the GMT fallback — an OFFSET zone of `+00:00`
     /// still prints "GMT" (`ZonedDateTime/…/toLocaleString/offset-time-zones.js`
     /// asserts the GMT spelling, `…/default-includes-time-and-time-zone-name.js`
@@ -986,7 +1213,7 @@ impl<'p> Vm<'p> {
         let utc_named = slot("timeZone").as_deref() == Some("UTC") && c == 'z';
         if utc_named {
             return if n >= 4 {
-                "Coordinated Universal Time"
+                self.dtf_locale(resolved).utc_long
             } else {
                 "UTC"
             }
@@ -1004,7 +1231,7 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// Intl.DateTimeFormat.prototype.format(date) — UTC, en-US conventions.
+    /// Intl.DateTimeFormat.prototype.format(date), using the resolved locale.
     pub(crate) fn dtf_format(&self, resolved: u32, ms: f64, fields: u16, absolute: bool) -> String {
         self.dtf_parts(resolved, ms, fields, absolute)
             .into_iter()
@@ -1089,7 +1316,7 @@ impl<'p> Vm<'p> {
 
 // ── per-calendar CLDR name lookup ───────────────────────────────────────────
 // `gregory`/`iso8601` keep the top-level MONTHS_*/ERAS_* tables; every other
-// calendar reads `cldr_en::CAL_MONTHS` / `CAL_ERAS`, both generated from the
+// calendar reads the locale's month and era tables, both generated from the
 // same CLDR release by `tools/gen_cldr_en.py`.
 
 /// The name index for era CODE `code` in calendar `cal_id`. `cal_era` returns
@@ -1116,13 +1343,13 @@ fn cal_era_index(cal_id: &str, code: &str) -> usize {
     match (cal_id, code) {
         // Two-era calendars: the BEFORE era is ordinal 0.
         (_, "bce") | (_, "bc") | (_, "broc") => 0,
-        // Coptic and Ethiopic both store a pre-era at 0 and the era actually in
-        // use at 1 (CLDR spells the coptic pair "ERA0"/"ERA1"); `cal_era`'s
-        // "am" is the latter for both. Ethioaa has a single era.
-        ("roc", "roc") | ("ethiopic", "am") | ("coptic", "am") => 1,
+        // Ethiopic AM follows its pre-era. CLDR 48 Coptic AM and Ethioaa
+        // each have a single era at index 0.
+        ("roc", "roc") | ("ethiopic", "am") => 1,
+        ("islamic-civil" | "islamic-tbla" | "islamic-umalqura", "bh") => 1,
         (_, "ce") | (_, "ad") => 1,
-        // Single-era calendars (buddhist BE, islamic AH, hebrew AM, persian AP,
-        // indian Saka, ethioaa) have exactly one name.
+        // The remaining calendar eras use index 0, including Islamic AH;
+        // CLDR 48 adds BH at index 1.
         _ => 0,
     }
 }
@@ -1131,16 +1358,21 @@ fn cal_era_index(cal_id: &str, code: &str) -> usize {
 /// 2 narrow). Falls back to the gregorian table for gregory/iso8601, and to the
 /// empty string when a calendar carries no era names at that width (chinese and
 /// dangi have none at all — their patterns never contain `G`).
-fn cal_era_name(cal_id: &str, idx: usize, width: usize) -> String {
+fn cal_era_name(
+    data: &crate::vm::dtf_locale::DateTimeLocale,
+    cal_id: &str,
+    idx: usize,
+    width: usize,
+) -> String {
     if cal_id == "gregory" || cal_id == "iso8601" {
         let t = match width {
-            0 => &cldr_en::ERAS_WIDE[..],
-            2 => &cldr_en::ERAS_NARROW[..],
-            _ => &cldr_en::ERAS_ABBR[..],
+            0 => &data.eras_wide[..],
+            2 => &data.eras_narrow[..],
+            _ => &data.eras_abbr[..],
         };
         return t.get(idx).copied().unwrap_or_default().to_string();
     }
-    for (id, wide, abbr, narrow) in cldr_en::CAL_ERAS {
+    for (id, wide, abbr, narrow) in data.cal_eras {
         if *id == cal_id {
             let t = match width {
                 0 => wide,
@@ -1169,22 +1401,27 @@ fn cal_era_name(cal_id: &str, idx: usize, width: usize) -> String {
 /// year is the one that renames — and its name is the extra trailing entry the
 /// generator appends.
 fn cal_month_name(
+    data: &crate::vm::dtf_locale::DateTimeLocale,
     cal_id: &str,
     cal: Option<crate::vm::temporal::calendar::Cal>,
     y: i64,
     mo: i64,
     width: usize,
+    standalone: bool,
 ) -> String {
     if cal_id == "gregory" || cal_id == "iso8601" {
         let i = (mo - 1) as usize;
-        let t = match width {
-            0 => &cldr_en::MONTHS_WIDE[..],
-            2 => &cldr_en::MONTHS_NARROW[..],
-            _ => &cldr_en::MONTHS_ABBR[..],
+        let t = match (standalone, width) {
+            (true, 0) => &data.months_sa_wide[..],
+            (true, 2) => &data.months_sa_narrow[..],
+            (true, _) => &data.months_sa_abbr[..],
+            (false, 0) => &data.months_wide[..],
+            (false, 2) => &data.months_narrow[..],
+            (false, _) => &data.months_abbr[..],
         };
         return t.get(i).copied().unwrap_or_default().to_string();
     }
-    for (id, wide, abbr, narrow) in cldr_en::CAL_MONTHS {
+    for (id, wide, abbr, narrow) in data.cal_months {
         if *id != cal_id {
             continue;
         }
@@ -1193,17 +1430,48 @@ fn cal_month_name(
             2 => narrow,
             _ => abbr,
         };
-        let mut i = (mo - 1) as usize;
+        let (number, is_leap) = cal
+            .map(|c| crate::vm::temporal::calendar::cal_month_code(c, y, mo))
+            .unwrap_or((mo, false));
+        let mut i = (number - 1) as usize;
         if cal_id == "hebrew" {
             let leap = cal
                 .map(|c| crate::vm::temporal::calendar::cal_in_leap_year(c, y))
                 .unwrap_or(false);
             // The trailing entry is Adar II; it is month 7 only in a leap year.
-            if leap && mo == 7 {
-                i = t.len() - 1;
-            }
+            i = if leap && mo == 7 {
+                t.len() - 1
+            } else if !leap && mo >= 6 {
+                mo as usize
+            } else {
+                (mo - 1) as usize
+            };
         }
-        return t.get(i).copied().unwrap_or_default().to_string();
+        let name = t.get(i).copied().unwrap_or_default();
+        return if is_leap {
+            leap_month_name(data, cal_id, name, width, standalone)
+        } else {
+            name.to_string()
+        };
     }
     String::new()
+}
+
+fn leap_month_name(
+    data: &crate::vm::dtf_locale::DateTimeLocale,
+    calendar: &str,
+    name: &str,
+    width: usize,
+    standalone: bool,
+) -> String {
+    match data
+        .leap_month_patterns
+        .iter()
+        .find(|(id, _, _)| *id == calendar)
+    {
+        Some((_, format, stand_alone)) => {
+            (if standalone { stand_alone } else { format })[width].replace("{0}", name)
+        }
+        None => name.to_string(),
+    }
 }

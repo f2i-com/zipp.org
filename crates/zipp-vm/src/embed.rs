@@ -234,7 +234,7 @@ pub fn compile_script_with_preamble(
 
 impl ScriptState {
     /// Take ownership of a compiled program and boot a VM over it.
-    fn from_program(program: Program) -> ScriptState {
+    pub(crate) fn from_program(program: Program) -> ScriptState {
         let cell = OwnedVm::new(Box::new(program), |program| {
             let mut vm = Vm::new(program);
             // No test262 host object for embedded code. `$262.agent.start()`

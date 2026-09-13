@@ -1,0 +1,33 @@
+hello, world HELLO, WORLD hELLO, wORLD Hello, World Hello world 12 W World
+4 8 -1 7 3 True True
+HeLLo, WorLd HeLlo, World ['Hello', 'World'] ['He', '', 'o, Wor', 'd'] ['a', 'b', 'c'] ['a', 'b', '', 'c'] ['a', 'b c']
+pad pad     pad| hi ***abc*** abc  |   abc 00042 -0042
+a-b-c 01234 0, 1, 2
+a   b\n "quote's" 'dq"' 'both\'"' '\n\t\\' plain 'h\xe9llo'
+abcabc abcdef True True True True True
+SS True strasse ω 1 b'\xf0\x9f\x98\x80' 😀
+True True True True True True True False
+['a', 'b', 'c'] ['line1', 'line2', 'line3'] ['a\n', 'b']
+('par', 't', 'ition') ('parti', 't', 'ion') ('no', '', '') example.com file
+123 1.5 True None [1, 'a'] {'k': (1,)} 42 2.5 255 5 -7
+A 65 😀 128512 b'abc' abc b'Hi' 2 b'abcd'
+Ada has 42 items at 3.14 each,    42|42   | 42  |00042|+42|   3.142|2a|101010|52|4.200000e+01
+'Ada' Ada    Ada **Ada** nested Ada 84 [1, 2] {literal} 3 1,000,000.0 1,234,567 50.000000% 0x2a
+   3.142|Ada     |      42
+1 two 3.0 a b a X is 5    1|2   | 3  
+0.667 2 1,234,567.891 1.234568e+04 1.234e-05 1.23457e+08 25.600000%
+1 2 3 -003.142 +5  5 's'
+str 42  3.14 ab   | 00042 ff 10 1.234568e+04 'r' %
+x and 2 [1, 2]   1|2  | abc hi
+3.14 00101010   x 1,234,567 0.30000000000000004 1e-07
+0.30000000000000004 0.3333333333333333 0.6666666666666666 1e+16 1000000000000000.0 1.2345678901234568e+17 0.0001 1e-05 -0.0 1.0 100.0 inf inf -inf nan
+1.1 0.1 3.3000000000000003 3.3000000000000003 1.4142135623730951 100000000000000000000 3.333333333333333e+19 3.0 2 -2 0.5 (-4, 1) (3.0, 1.5)
+2 4 -2 0.12 1.0 2.67 1200 3.142 7 3 -3
+True True True 2 2.5 2 1 0.5 4 -4 1000000 31 15 10 1000.0 1000
+5 5.5 2.5 -1.5 1024 24 0.25 0b1010 0o10 0xff -0b101
+True True True True True False default None 2 0 True False
+1 0.0 False False False False False False True True TrueFalse
+1000000000000000000000000000000 1267650600228229401496703205376 -9223372036854775808 9223372036854775807 1219326311370217952237463801111263526900 142857142857142857142857142857 1 100
+0.30000000000000004 1e-05 1.5e-10 12345678.9 1234567890123456.0 1.2345678901234568e+16 5e-324 1.7976931348623157e+308 2.5e-05 1e+17
+4 The Quick Brown Fox Jumps Over The Lazy Dog ['dog', 'lazy', 'the'] ['a', 'b', 'c', 'd', 'e'] 16
+a   42 3.0 2 1 n=42 name + '!'='Ada!'

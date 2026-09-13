@@ -39,6 +39,17 @@ export default defineConfig(({ command }) => ({
     cloudflare({ viteEnvironment: { name: 'server' } }),
     command === 'serve' && {
       name: 'zipp-dev-csp',
+      configureServer(server) {
+        server.middlewares.use((request, response, next) => {
+          const routedRequest = request as typeof request & { url?: string }
+          const [pathname, query] = (routedRequest.url || '').split('?')
+          if (pathname === '/playground') {
+            response.writeHead(302, { location: '/playground/' + (query ? `?${query}` : '') }); response.end(); return
+          }
+          if (pathname === '/playground/') routedRequest.url = '/playground/index.html' + (query ? `?${query}` : '')
+          next()
+        })
+      },
       transformIndexHtml(html) {
         // Vite injects imported CSS into a style element during development.
         // Keep the production document strict while allowing the dev server to

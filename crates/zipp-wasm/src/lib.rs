@@ -277,14 +277,102 @@ struct Helpers {
     cancel_host_call: Option<u32>,
 }
 
+/// The dotted module name of a root-relative `.py` path, or None for any
+/// other path: `legacy/fast_memory.py` → `legacy.fast_memory`,
+/// `pkg/__init__.py` → `pkg`, `main.py` → `main`.
+#[cfg(feature = "python")]
+fn module_name_of_path(path: &str) -> Option<String> {
+    let stem = path.strip_suffix(".py")?;
+    let stem = stem.strip_suffix("/__init__").unwrap_or(stem);
+    if stem.is_empty() || stem.starts_with('/') || stem.contains("..") {
+        return None;
+    }
+    let name = stem.replace('/', ".");
+    let valid = name.split('.').all(|segment| {
+        let mut chars = segment.chars();
+        matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    valid.then_some(name)
+}
+
+/// A host value rendered as an argument string.
+#[cfg(feature = "python")]
+fn host_value_text(value: &HostValue) -> String {
+    match value {
+        HostValue::String(s) => s.clone(),
+        HostValue::Number(n) => {
+            if n.fract() == 0.0 && n.abs() < 1e15 {
+                format!("{}", *n as i64)
+            } else {
+                format!("{n}")
+            }
+        }
+        HostValue::Bool(b) => format!("{b}"),
+        _ => String::new(),
+    }
+}
+
+/// Standard base64 (with or without padding) to bytes.
+#[cfg(feature = "python")]
+fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+    let mut acc: u32 = 0;
+    let mut bits = 0u32;
+    for c in text.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' | b'\n' | b'\r' | b' ' => continue,
+            _ => return Err("invalid base64".into()),
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xff) as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Global slots of the Python runtime's host hooks (see `runtime.js`).
+#[cfg(feature = "python")]
+#[derive(Clone, Copy)]
+struct PythonHooks {
+    has: Option<u32>,
+    call: Option<u32>,
+    take_ui: Option<u32>,
+    take_host: Option<u32>,
+    set_input: Option<u32>,
+}
+
+/// An input snapshot is a few coordinates and a key map; anything larger is
+/// a host bug, not a frame.
+#[cfg(feature = "python")]
+const MAX_PYTHON_INPUT_BYTES: usize = 64 * 1024;
+
 /// A compiled script plus the live VM running it.
 #[wasm_bindgen]
 pub struct Engine {
     state: Option<ScriptState>,
+    /// Which frontend compiled `state`. JS-only ABI methods (global slots,
+    /// callFunction, evalInContext) reject Python states.
+    source_language: zipp_vm::frontend::LanguageId,
+    /// The Python runtime's host hooks, by global slot; `None` for a
+    /// JavaScript state or before initialization.
+    #[cfg(feature = "python")]
+    python_hooks: Option<PythonHooks>,
     /// Script symbol name → global slot. Preamble names are excluded.
     slots: Vec<(String, u32, SymbolScope)>,
     helpers: Helpers,
     bridges: Rc<RefCell<Bridges>>,
+    /// What a failed initialization printed before its error, kept for
+    /// `takeFailedConsole` after the engine is disposed.
+    failed_init_console: Vec<(ConsoleStream, String)>,
     /// Number of lines the preamble adds, so a host can correct the line
     /// numbers in a compile error back to its own source.
     preamble_lines: u32,
@@ -335,6 +423,10 @@ impl Engine {
         });
         Engine {
             state: None,
+            source_language: zipp_vm::frontend::LanguageId::JavaScript,
+            #[cfg(feature = "python")]
+            python_hooks: None,
+            failed_init_console: Vec::new(),
             slots: Vec::new(),
             helpers: Helpers::default(),
             bridges: Rc::new(RefCell::new(Bridges::default())),
@@ -446,6 +538,142 @@ impl Engine {
     /// `_init`) commonly reads `localStorage` or queries `db`.
     #[wasm_bindgen(js_name = initScript)]
     pub fn init_script(&mut self, source: &str) -> Result<JsValue, JsValue> {
+        self.init_source(source, "javascript")
+    }
+
+    /// [`Self::init_script`] with an explicit source language: `"javascript"`
+    /// (identical to `initScript`) or `"python"` (the experimental subset
+    /// frontend; requires the `python` Cargo feature). A Python state has no
+    /// preamble, exposes no global slots, and rejects the JS-only
+    /// global/call/eval methods.
+    #[wasm_bindgen(js_name = initSource)]
+    pub fn init_source(&mut self, source: &str, language: &str) -> Result<JsValue, JsValue> {
+        let language: zipp_vm::frontend::LanguageId = language
+            .parse()
+            .map_err(|error: String| JsValue::from_str(&error))?;
+        self.initialize(language, source.len(), || match language {
+            zipp_vm::frontend::LanguageId::JavaScript => {
+                compile_script_with_preamble(PREAMBLE, source, &GUEST_COMPILE_OPTIONS)
+            }
+            zipp_vm::frontend::LanguageId::Python => zipp_vm::frontend::compile_source(
+                source,
+                zipp_vm::frontend::Frontend::Python {
+                    mode: zipp_vm::frontend::PythonMode::Module,
+                },
+            )
+            .map(|compiled| compiled.into_state()),
+        })
+    }
+
+    /// Initialize a multi-file Python project. `files` is a plain object
+    /// mapping module names (the `.py` file stems) to their source; `entry`
+    /// names the module whose top level runs. Modules import one another by
+    /// name, and the built-in `ui` module; nothing else can be imported. The
+    /// same limits and lifecycle as `initSource(..., "python")` apply, with the
+    /// initial-source ceiling charged against the total of every file.
+    #[cfg(feature = "python")]
+    #[wasm_bindgen(js_name = initPythonProject)]
+    pub fn init_python_project(&mut self, files: JsValue, entry: &str, argv: JsValue) -> Result<JsValue, JsValue> {
+        // `files` maps either module names to source (the original form:
+        // `{main: "..."}`) or root-relative paths to contents: a `.py` path
+        // is a module (`legacy/fast_memory.py` → `legacy.fast_memory`,
+        // `pkg/__init__.py` → `pkg`) and every path is also a file of the
+        // program's virtual filesystem; a text file is a string, a binary
+        // one `{base64: "..."}`. `entry` is a module name or a `.py` path.
+        let files = match from_js(&files).map_err(|error| self.to_js_error(error))? {
+            HostValue::Object(entries) => entries,
+            _ => {
+                self.note_error_kind("usage");
+                return Err(JsValue::from_str(
+                    "TypeError: files must be a plain object of path (or module name) to contents",
+                ));
+            }
+        };
+        let argv = match from_js(&argv).map_err(|error| self.to_js_error(error))? {
+            HostValue::Undefined | HostValue::Null => Vec::new(),
+            HostValue::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for item in items {
+                    match item {
+                        HostValue::String(s) => out.push(s),
+                        other => out.push(host_value_text(&other)),
+                    }
+                }
+                out
+            }
+            _ => {
+                self.note_error_kind("usage");
+                return Err(JsValue::from_str("TypeError: argv must be an array of strings"));
+            }
+        };
+        let mut modules = Vec::with_capacity(files.len());
+        let mut vfs = Vec::with_capacity(files.len());
+        let mut total = 0usize;
+        for (name, contents) in files {
+            let bytes: Vec<u8> = match contents {
+                HostValue::String(source) => {
+                    total = total.saturating_add(source.len());
+                    if let Some(module) = module_name_of_path(&name) {
+                        modules.push((module, source.clone()));
+                    } else if !name.contains('/') && !name.contains('.') {
+                        // The original form: a bare module name.
+                        modules.push((name.clone(), source.clone()));
+                        continue;
+                    }
+                    source.into_bytes()
+                }
+                HostValue::Object(fields) => {
+                    let mut decoded = None;
+                    for (key, value) in fields {
+                        if key == "base64" {
+                            if let HostValue::String(text) = value {
+                                decoded = Some(base64_decode(&text).map_err(|e| {
+                                    self.note_error_kind("usage");
+                                    JsValue::from_str(&format!("TypeError: file {name:?}: {e}"))
+                                })?);
+                            }
+                        }
+                    }
+                    match decoded {
+                        Some(bytes) => {
+                            total = total.saturating_add(bytes.len());
+                            bytes
+                        }
+                        None => {
+                            self.note_error_kind("usage");
+                            return Err(JsValue::from_str(&format!(
+                                "TypeError: file {name:?} must be a string or {{base64: ...}}"
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    self.note_error_kind("usage");
+                    return Err(JsValue::from_str(&format!(
+                        "TypeError: file {name:?} must be a string or {{base64: ...}}"
+                    )));
+                }
+            };
+            vfs.push((name, bytes));
+        }
+        let entry = module_name_of_path(entry).unwrap_or_else(|| entry.to_owned());
+        self.initialize(zipp_vm::frontend::LanguageId::Python, total, move || {
+            // Hosted: the embedder drains `takeHostRequests` and answers
+            // through `pythonCall("__zipp_py_deliver", ...)`.
+            zipp_vm::frontend::compile_python_program(&entry, &modules, &vfs, &argv, true)
+                .map(|compiled| compiled.into_state())
+        })
+    }
+
+    /// The shared initialization path: one program, whichever frontend
+    /// compiled it. `source_len` is what the initial-source ceiling is charged
+    /// against; `compile` runs only after the checks that precede compilation.
+    fn initialize(
+        &mut self,
+        language: zipp_vm::frontend::LanguageId,
+        source_len: usize,
+        compile: impl FnOnce() -> Result<ScriptState, String>,
+    ) -> Result<JsValue, JsValue> {
         self.ensure_live()?;
         if self.state.is_some() {
             self.terminate();
@@ -456,10 +684,16 @@ impl Engine {
         // Freeze authority before compilation and before any guest top-level
         // code can invoke a synchronous host bridge.
         self.host_configuration_frozen = true;
+        self.source_language = language;
+        self.preamble_lines = if language == zipp_vm::frontend::LanguageId::JavaScript {
+            PREAMBLE.lines().count() as u32
+        } else {
+            0
+        };
         // Reject before allocating the combined preamble+guest buffer or
         // entering the parser. Source size is a compile-time resource, so the
         // VM's execution/heap recorder cannot protect this path for us.
-        if source.len() > MAX_INITIAL_SOURCE_BYTES {
+        if source_len > MAX_INITIAL_SOURCE_BYTES {
             self.terminate();
             return Err(JsValue::from_str(&format!(
                 "RangeError: initial script source exceeds the {MAX_INITIAL_SOURCE_BYTES}-byte limit"
@@ -475,11 +709,10 @@ impl Engine {
             // the guest reaches by name, and the guest's OWN directive
             // prologue stays in force even though preamble statements now
             // precede it (the 11 September 2026 audit's ZIPP-01).
-            let mut st = compile_script_with_preamble(PREAMBLE, source, &GUEST_COMPILE_OPTIONS)
-                .map_err(|e| {
-                    self.note_error_kind("source");
-                    JsValue::from_str(&e)
-                })?;
+            let mut st = compile().map_err(|e| {
+                self.note_error_kind("source");
+                JsValue::from_str(&e)
+            })?;
             if let Some(seed) = self.fingerprint_seed {
                 st.set_fingerprint_seed(seed);
             }
@@ -510,16 +743,23 @@ impl Engine {
             let init = st.run_init();
             if let Some(error) = st.resource_limit_error() {
                 self.note_error_kind("resource");
+                self.failed_init_console = st.console_snapshot();
                 return Err(JsValue::from_str(error));
             }
-            init.map_err(|e| {
+            if let Err(e) = init {
                 self.note_error_kind("source");
-                JsValue::from_str(&e)
-            })?;
+                self.failed_init_console = st.console_snapshot();
+                return Err(JsValue::from_str(&e));
+            }
 
             let mut slots = Vec::new();
             let mut exposed = Vec::new();
             for s in st.symbols() {
+                // A Python state's only JS bindings are the private runtime
+                // bootstrap; never expose them as user globals.
+                if language == zipp_vm::frontend::LanguageId::Python {
+                    continue;
+                }
                 // Preamble names are engine plumbing, with one exception: the host
                 // needs a slot for the bridge objects it also writes to (it syncs
                 // `window.__foo` keys both ways), so those stay visible. Hosts are
@@ -558,6 +798,20 @@ impl Engine {
                 resolve_host_call: find("__zResolveHostCall"),
                 cancel_host_call: find("__zCancelHostCall"),
             };
+            #[cfg(feature = "python")]
+            {
+                self.python_hooks = if language == zipp_vm::frontend::LanguageId::Python {
+                    Some(PythonHooks {
+                        has: find("__zipp_py_has"),
+                        call: find("__zipp_py_call"),
+                        take_ui: find("__zipp_py_take_ui"),
+                        take_host: find("__zipp_py_take_host"),
+                        set_input: find("__zipp_py_set_input"),
+                    })
+                } else {
+                    None
+                };
+            }
             let out = to_js(&HostValue::Object(exposed)).map_err(|error| self.to_js_error(error))?;
             self.slots = slots;
             self.helpers = helpers;
@@ -574,6 +828,11 @@ impl Engine {
     /// classes, `Map`, `Date`, …) read as `null`.
     #[wasm_bindgen(js_name = getGlobalByIndex)]
     pub fn get_global_by_index(&mut self, index: u32) -> Result<JsValue, JsValue> {
+        if self.source_language == zipp_vm::frontend::LanguageId::Python {
+            return Err(JsValue::from_str(
+                "get_global_by_index is unavailable for the experimental Python frontend",
+            ));
+        }
         self.ensure_live()?;
         let Some(st) = self.state.as_mut() else {
             return Ok(JsValue::UNDEFINED);
@@ -587,6 +846,11 @@ impl Engine {
     /// back cannot destroy the script's own functions.
     #[wasm_bindgen(js_name = setGlobalByIndex)]
     pub fn set_global_by_index(&mut self, index: u32, value: JsValue) -> Result<(), JsValue> {
+        if self.source_language == zipp_vm::frontend::LanguageId::Python {
+            return Err(JsValue::from_str(
+                "set_global_by_index is unavailable for the experimental Python frontend",
+            ));
+        }
         self.ensure_live()?;
         let value = from_js(&value).map_err(|error| self.to_js_error(error))?;
         if let Some(st) = self.state.as_mut() {
@@ -600,6 +864,11 @@ impl Engine {
     /// Read many globals in one boundary crossing.
     #[wasm_bindgen(js_name = getGlobalsBatch)]
     pub fn get_globals_batch(&mut self, indices: JsValue) -> Result<JsValue, JsValue> {
+        if self.source_language == zipp_vm::frontend::LanguageId::Python {
+            return Err(JsValue::from_str(
+                "get_globals_batch is unavailable for the experimental Python frontend",
+            ));
+        }
         self.ensure_live()?;
         let mut budget = HostValueBudget::default();
         let indices = index_list(&indices, &mut budget).map_err(|error| self.to_js_error(error))?;
@@ -736,6 +1005,11 @@ impl Engine {
     /// that it only moves deliberately.
     #[wasm_bindgen(js_name = getGlobalsFingerprint)]
     pub fn get_globals_fingerprint(&mut self, indices: JsValue) -> Result<JsValue, JsValue> {
+        if self.source_language == zipp_vm::frontend::LanguageId::Python {
+            return Err(JsValue::from_str(
+                "get_globals_fingerprint is unavailable for the experimental Python frontend",
+            ));
+        }
         self.ensure_live()?;
         let mut budget = HostValueBudget::default();
         let indices = index_list(&indices, &mut budget).map_err(|error| self.to_js_error(error))?;
@@ -765,6 +1039,11 @@ impl Engine {
     /// the first slot is written, as before.
     #[wasm_bindgen(js_name = setGlobalsBatch)]
     pub fn set_globals_batch(&mut self, indices: JsValue, values: JsValue) -> Result<(), JsValue> {
+        if self.source_language == zipp_vm::frontend::LanguageId::Python {
+            return Err(JsValue::from_str(
+                "set_globals_batch is unavailable for the experimental Python frontend",
+            ));
+        }
         self.ensure_live()?;
         let mut budget = HostValueBudget::default();
         let idx = index_list(&indices, &mut budget).map_err(|error| self.to_js_error(error))?;
@@ -806,6 +1085,11 @@ impl Engine {
     /// returns, so promise callbacks the call scheduled have already run.
     #[wasm_bindgen(js_name = callFunction)]
     pub fn call_function(&mut self, name: &str, args: JsValue) -> Result<JsValue, JsValue> {
+        if self.source_language == zipp_vm::frontend::LanguageId::Python {
+            return Err(JsValue::from_str(
+                "call_function is unavailable for the experimental Python frontend",
+            ));
+        }
         self.ensure_live()?;
         let Some(slot) = self
             .slots
@@ -837,6 +1121,127 @@ impl Engine {
         to_js(&value).map_err(|error| self.to_js_error(error))
     }
 
+    /// Call a function defined at the top level of a Python project's entry
+    /// module, with `args` an array of host values (integers, strings,
+    /// booleans, null, arrays), and return its result as host data. This is
+    /// the Python state's counterpart of `callFunction`: the playground's
+    /// frame loop drives `update`/`draw`/`on_click`/`on_key` through it.
+    #[cfg(feature = "python")]
+    #[wasm_bindgen(js_name = pythonCall)]
+    pub fn python_call(&mut self, name: &str, args: JsValue) -> Result<JsValue, JsValue> {
+        self.ensure_live()?;
+        let slot = self.python_hook(|hooks| hooks.call)?;
+        let args = from_js(&args).map_err(|error| self.to_js_error(error))?;
+        let args = match args {
+            HostValue::Undefined | HostValue::Null => HostValue::Array(Vec::new()),
+            HostValue::Array(items) => HostValue::Array(items),
+            _ => {
+                self.note_error_kind("usage");
+                return Err(JsValue::from_str(
+                    "TypeError: call arguments must be an array",
+                ));
+            }
+        };
+        let st = self
+            .state
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
+        let (result, kind) = classified_call(st, slot, &[HostValue::String(name.to_owned()), args]);
+        let value = self.finish_classified_execution(result, kind)?;
+        to_js(&value).map_err(|error| self.to_js_error(error))
+    }
+
+    /// Whether the Python entry module defines a top-level function `name`.
+    #[cfg(feature = "python")]
+    #[wasm_bindgen(js_name = pythonHas)]
+    pub fn python_has(&mut self, name: &str) -> Result<bool, JsValue> {
+        self.ensure_live()?;
+        let slot = self.python_hook(|hooks| hooks.has)?;
+        let st = self
+            .state
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
+        let (result, kind) = classified_call(st, slot, &[HostValue::String(name.to_owned())]);
+        Ok(matches!(
+            self.finish_classified_execution(result, kind)?,
+            HostValue::Bool(true)
+        ))
+    }
+
+    /// Drain the `ui` module's command buffer: an array of commands, each an
+    /// array whose first element names the operation (`canvas`, `clear`,
+    /// `rect`, `circle`, `line`, `text`, `font`, `button`) followed by its
+    /// arguments. The buffer is empty afterwards.
+    #[cfg(feature = "python")]
+    #[wasm_bindgen(js_name = takeUi)]
+    pub fn take_ui(&mut self) -> Result<JsValue, JsValue> {
+        self.ensure_live()?;
+        let slot = self.python_hook(|hooks| hooks.take_ui)?;
+        let st = self
+            .state
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
+        let (result, kind) = classified_call(st, slot, &[]);
+        let value = self.finish_classified_execution(result, kind)?;
+        to_js(&value).map_err(|error| self.to_js_error(error))
+    }
+
+    /// Drain the program's pending host requests: an array of
+    /// `{id, kind, payload}` records, each a piece of work the program asked
+    /// its embedder to do (`kind` `"gpu.execute"` carries a compute graph as
+    /// `payload`). Answer one with
+    /// `pythonCall("__zipp_py_deliver", [id, reply])`, where `reply` is
+    /// `{ok: true, value}` or `{ok: false, error: {code, message}}`; the
+    /// program's callback for that request then runs inside that call. A
+    /// request never delivered is simply dropped with the engine. The
+    /// queue is empty afterwards.
+    #[cfg(feature = "python")]
+    #[wasm_bindgen(js_name = takeHostRequests)]
+    pub fn take_host_requests(&mut self) -> Result<JsValue, JsValue> {
+        self.ensure_live()?;
+        let slot = self.python_hook(|hooks| hooks.take_host)?;
+        let st = self
+            .state
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
+        let (result, kind) = classified_call(st, slot, &[]);
+        let value = self.finish_classified_execution(result, kind)?;
+        to_js(&value).map_err(|error| self.to_js_error(error))
+    }
+
+    /// Replace the input snapshot the `ui` module reads (`mouse`, `clicked`,
+    /// `key`, `button`, `width`, `height`): a JSON object such as
+    /// `{"mx":10,"my":20,"down":false,"clicked":false,"keys":{"ArrowUp":true},"w":640,"h":480}`.
+    #[cfg(feature = "python")]
+    #[wasm_bindgen(js_name = setPythonInput)]
+    pub fn set_python_input(&mut self, json: &str) -> Result<(), JsValue> {
+        self.ensure_live()?;
+        if json.len() > MAX_PYTHON_INPUT_BYTES {
+            self.note_error_kind("usage");
+            return Err(JsValue::from_str("RangeError: input snapshot too large"));
+        }
+        let slot = self.python_hook(|hooks| hooks.set_input)?;
+        let st = self
+            .state
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
+        let (result, kind) = classified_call(st, slot, &[HostValue::String(json.to_owned())]);
+        self.finish_classified_execution(result, kind).map(|_| ())
+    }
+
+    #[cfg(feature = "python")]
+    fn python_hook(&self, pick: impl FnOnce(&PythonHooks) -> Option<u32>) -> Result<u32, JsValue> {
+        match self.python_hooks.as_ref().and_then(pick) {
+            Some(slot) => Ok(slot),
+            None => {
+                self.note_error_kind("usage");
+                Err(JsValue::from_str(
+                    "zipp: this method needs a Python state (initSource with \"python\" or initPythonProject)",
+                ))
+            }
+        }
+    }
+
     /// Evaluate `expr` in the script's global context and return its value
     /// as a JSON PROJECTION: the result is passed through the guest's
     /// `JSON.stringify` and parsed on the host side. That contract differs
@@ -856,6 +1261,11 @@ impl Engine {
     /// [`Engine::callFunction`] there.
     #[wasm_bindgen(js_name = evalInContext)]
     pub fn eval_in_context(&mut self, expr: &str) -> Result<JsValue, JsValue> {
+        if self.source_language == zipp_vm::frontend::LanguageId::Python {
+            return Err(JsValue::from_str(
+                "eval_in_context is unavailable for the experimental Python frontend",
+            ));
+        }
         // Route the result through JSON so structured values survive; the
         // shallow `eval_in_context` marshaller would render them as ToString.
         let wrapped = self.account_eval("evalInContext", expr, EVAL_PREFIX, EVAL_SUFFIX)?;
@@ -902,6 +1312,11 @@ impl Engine {
     /// and retains a program. One-off host queries only.
     #[wasm_bindgen(js_name = evalInContextRich)]
     pub fn eval_in_context_rich(&mut self, expr: &str) -> Result<JsValue, JsValue> {
+        if self.source_language == zipp_vm::frontend::LanguageId::Python {
+            return Err(JsValue::from_str(
+                "eval_in_context_rich is unavailable for the experimental Python frontend",
+            ));
+        }
         let wrapped = self.account_eval(
             "evalInContextRich",
             expr,
@@ -1262,6 +1677,19 @@ impl Engine {
             st.discard_console_prefix(count);
         }
         Ok(result)
+    }
+
+    /// The console entries a failed initialization produced before its
+    /// error (a program's own output ahead of the raise, a test report
+    /// ahead of its non-zero exit), in `takeConsole`'s tagged form. The one
+    /// method that answers on a disposed engine; it drains, and an engine
+    /// that initialized returns an empty array.
+    #[wasm_bindgen(js_name = takeFailedConsole)]
+    pub fn take_failed_console(&mut self) -> Result<JsValue, JsValue> {
+        let snapshot = std::mem::take(&mut self.failed_init_console);
+        let (value, _) =
+            console_output_prefix(&snapshot, true).map_err(|error| self.to_js_error(error))?;
+        to_js(&value).map_err(|error| self.to_js_error(error))
     }
 
     /// Tear the VM down. The engine is unusable afterwards.
@@ -1638,6 +2066,10 @@ impl Engine {
     }
 
     fn terminate(&mut self) {
+        #[cfg(feature = "python")]
+        {
+            self.python_hooks = None;
+        }
         // Account what this engine leaves behind in the instance before the
         // state that knows the figures is dropped.
         if let Some(st) = self.state.as_ref() {
@@ -1982,6 +2414,15 @@ fn parse_accel_identifier(kind: &str, text: &str) -> Result<f64, String> {
 /// artifact by `tests/node/check-wasm-memory.cjs`.
 const LINKED_MEMORY_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// The source languages this artifact accepts through `initSource`, as JSON
+/// string literals: the build variant's identity, so a host can tell the
+/// JavaScript-only and the combined module apart.
+const LANGUAGES: &[&str] = &[
+    "\"javascript\"",
+    #[cfg(feature = "python")]
+    "\"python\"",
+];
+
 /// The limits and semantics this artifact was built with, as JSON.
 ///
 /// A host used to have only the README's table to go by, and at v0.0.14 four
@@ -2014,6 +2455,7 @@ pub fn zipp_profile() -> String {
             "\"profileVersion\":2,",
             "\"source\":{{\"sha\":{source_sha},\"target\":\"wasm32-unknown-unknown\"}},",
             "\"features\":[\"safe-sandbox\",\"meter-only\",\"wasm-no-fs-loader\",\"wasm-single-agent\"],",
+            "\"languages\":[{languages}],",
             "\"semantics\":{{",
             "\"callOrder\":\"strict\",",
             "\"parseGoal\":\"script-compat\",",
@@ -2084,6 +2526,7 @@ pub fn zipp_profile() -> String {
         capability_entries = MAX_SYNC_CAPABILITY_ENTRIES,
         host_value_nodes = DEFAULT_HOST_VALUE_MAX_NODES,
         host_value_string_bytes = DEFAULT_HOST_VALUE_MAX_STRING_BYTES,
+        languages = LANGUAGES.join(","),
         host_call_queue = PREAMBLE_HOST_CALL_QUEUE_MAX,
         host_call_pending = PREAMBLE_HOST_CALL_PENDING_MAX,
         host_call_request_units = PREAMBLE_HOST_CALL_REQUEST_MAX_UNITS,

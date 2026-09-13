@@ -1,8 +1,51 @@
 # ZIPP landing page
 
-React + TypeScript, with Vite and a Cloudflare Worker. The landing page includes
-an executable ZIPP WASM playground, Softn and Outerstead project showcases,
-repository activity, and dated native benchmark evidence.
+React + TypeScript, with Vite and a Cloudflare Worker. The landing page introduces
+Python, JavaScript and browser GPU compute. It embeds
+the full folder playground, provides a dedicated `/playground/` route, and includes
+a recorded Python Game of Life GIF. Existing Softn/Outerstead
+showcases, repository activity, dated native benchmarks and the optional JavaScript
+story scratchpad remain available.
+
+## Full Python / JavaScript project playground
+
+`/playground` opens the same folder-based UI as `crates/zipp-wasm/playground`:
+local folder/file loading, samples, source editor, entry selection, arguments,
+canvas, console, autosave, run/stop, and WebGL2/WebGPU selection for Python graphs.
+Files are read into a browser virtual filesystem, not sent to a server to execute.
+The page runs a Python-enabled Zipp WASM engine. The `torch` subset still uses CPU;
+browser GPU graphs use `zipp_gpu`. JavaScript guest GPU requests are not yet wired
+into the stock playground, as described in the main README.
+
+`scripts/sync-playground.mjs` copies the maintained browser sources, GPU kernels
+and selected examples into `public/` before dev/build. The paired engine files
+under `public/playground-runtime/` are committed and SHA-256 checked against their
+manifest, so a clean checkout can build without Rust or downloading WASM.
+To update that pair after rebuilding `crates/zipp-wasm/dist/all/`, run:
+
+```sh
+node scripts/sync-playground.mjs --refresh-engine
+```
+
+The landing's iframe and dedicated route load the same public files. The old
+JavaScript-only story scratchpad loads only when expanded. The native NCA research
+project is maintained separately at https://github.com/f2i-com/neuralautomata.com.
+
+## Recorded examples
+
+`public/demos/` contains the actual local browser captures, still posters, an SVG
+explaining Python on Zipp WASM, and `provenance.json`. Both README and landing reuse
+these same files. GIFs autoplay and loop continuously. The landing honors
+reduced-motion settings and lets readers pause GIFs by switching to static posters.
+Regenerate from the repository root:
+
+```sh
+python crates/zipp-wasm/playground/capture-demos.py
+```
+
+This needs Chrome, Python Playwright, ffmpeg on PATH, the Python-enabled WASM
+build and working browser WebGL2 hardware. Python Life executes in Zipp WASM. They are not
+performance measurements or claims that full PyTorch runs in browser WASM.
 
 ## Develop and check
 
@@ -12,6 +55,13 @@ npm run dev
 npm run test
 npm run build
 ```
+
+For browser integration checks, start `npm run preview` and run
+`python scripts/smoke-browser.py http://127.0.0.1:4173` with Chrome and Python
+Playwright installed. This checks the embedded and dedicated playground, real
+Python/JavaScript execution, nested folder loading, media controls and mobile
+layout. Set `REQUIRE_GPU=1` to also require hardware WebGL2 and WebGPU; the default
+checks the portable WASM compute backend.
 
 The dependency-free tests use Node's TypeScript stripping (Node 22.18+ or 24
 recommended). They cover GitHub response validation, caching, concurrent
@@ -70,11 +120,15 @@ v0.0.13; the page uses the artifact's recorded v0.0.12 identity. Benchmark
 headlines, confidence intervals, row counts, and the table refer to the same
 capture, rather than silently mixing new README headlines with old table rows.
 
-The checked-in browser engine is v0.0.15, 5,119,419 raw bytes, SHA-256
+The optional JavaScript story scratchpad's browser engine is v0.0.15, 5,119,419 raw bytes, SHA-256
 `7c40f488d8b69209eea9e56dea2b0be13b3da0fd3810f3d8ec1d44c3d95972e4`.
-The file pair is fingerprinted together in Vite configuration to avoid loading
+Its file pair is fingerprinted together in Vite configuration to avoid loading
 mismatched glue and WASM files. Each run uses a disposable Worker, a 6-second
 host deadline, and the module's instruction and heap limits.
+
+The full Python project playground uses its separately checked
+`public/playground-runtime/manifest.json` pair and a five-second per-request
+deadline. Its actual profile appears in the playground status bar.
 
 The adventure demonstrates classes, getters, closures, Math.imul and a seeded
 PRNG, Map, Set, object/array operations, branching, and JSON serialization.

@@ -40,17 +40,25 @@ const MAX_FRAMES: usize = 100_000;
 /// is a Rust frame on the OS stack — unlike interpreter calls, which stay flat
 /// inside one `run_loop` — so runaway recursion routed through a re-entry
 /// (e.g. a generator body that re-enters its driver) must hit this catchable
-/// RangeError before the native stack overflows. The safe profile's deliberately
-/// small ceiling was validated on a 1 MiB Windows main-thread stack; the native
-/// footprint of one re-entry varies substantially across builtin call paths.
+/// RangeError before the native stack overflows. The native footprint of one
+/// re-entry varies substantially across builtin call paths.
 #[cfg(feature = "safe-sandbox")]
-// A JavaScript callback reached from a native meta-operation carries a much
-// larger Rust frame than transparent Proxy/prototype forwarding. On the 1 MiB
-// worker stack, allowing a fourth simultaneous `run_loop` entry can overflow
-// before a larger numeric ceiling is observed (nested Proxy get/has traps are a
-// compact reproducer). The outer script itself occupies depth one, so three
-// still preserves two nested observable callback/trap invocations.
-const MAX_RUN_LOOP_DEPTH: u32 = 3;
+// Two stacks bound this in the wasm build: the linear-memory shadow stack
+// (`-zstack-size=16777216`, 16 MiB, in build-variants.sh and both
+// .cargo/config.toml files) and the embedder's machine stack, which V8 caps
+// near 1 MiB for wasm frames. Measured on 2026-09-13 with both re-entry caps
+// lifted (tests/node/native-depth.cjs): every shape tried — nested Proxy get
+// traps, generator-in-generator, sort comparators, replace callbacks, JSON
+// toJSON, Python generators inside `sum`/`any` and Python `__iter__` chains —
+// ran 256 levels deep and failed between 384 and 512 with a catchable
+// RangeError from the machine stack; with node's stack raised to 8 MB the
+// shadow stack lasted past 1536. Thirty-two therefore keeps an order of
+// magnitude below the first limit. Python-shaped code needs the room: every
+// generator resumed by a builtin (`sum(x for ...)`, `''.join(...)`, a
+// `for` over a tensor's generator `__iter__`) is one nested entry, and a
+// research script nests four or five in ordinary use, where the earlier
+// ceiling of three (validated on a 1 MiB shadow stack) failed.
+const MAX_RUN_LOOP_DEPTH: u32 = 32;
 #[cfg(not(feature = "safe-sandbox"))]
 const MAX_RUN_LOOP_DEPTH: u32 = 4096;
 
@@ -933,7 +941,10 @@ impl RegisterFile {
     #[inline(always)]
     // Read by the JIT plan builders and the full instrument tracer only (the
     // meter-only profile compiles no trace consumer).
-    #[cfg(any(feature = "jit", all(feature = "instrument", not(feature = "meter-only"))))]
+    #[cfg(any(
+        feature = "jit",
+        all(feature = "instrument", not(feature = "meter-only"))
+    ))]
     pub(crate) fn get(&self, index: usize) -> Option<&Value> {
         self.storage[..self.logical_len].get(index)
     }
@@ -2708,7 +2719,12 @@ mod array_ops;
 pub(crate) mod bigint;
 mod cldr_alias;
 mod cldr_alias_data;
+mod cldr_ar_eg;
+mod cldr_de;
+mod cldr_dtf_en;
 mod cldr_en;
+mod cldr_ja;
+mod cldr_zh;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod closure_make_jit;
 mod coerce;
@@ -2717,6 +2733,7 @@ mod const_cache;
 mod construct;
 #[cfg(all(feature = "meter-only", not(feature = "jit")))]
 mod counted_loop;
+mod dtf_locale;
 mod dtf_pattern;
 mod enum_stream;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

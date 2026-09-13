@@ -1,19 +1,19 @@
 import { useState } from 'react'
 
 const layers = [
-  { name: 'Your JavaScript app', label: '01 / THE HOST', symbol: '{ }', copy: 'Your app runs in the browser’s JavaScript environment. It loads ZIPP WASM and chooses which capabilities to expose to guest scripts.' },
-  { name: 'ZIPP WASM', label: '02 / THE ENGINE', symbol: 'ϟ', copy: 'ZIPP’s Rust JavaScript engine is compiled to WebAssembly. It interprets guest JavaScript inside its own VM, on top of your existing JavaScript environment.' },
-  { name: 'Sandboxed JavaScript', label: '03 / THE GUEST', symbol: '</>', copy: 'User code runs inside ZIPP. It can use only the host capabilities you provide. Instruction limits and host-enforced deadlines help keep execution under control.' },
+  { name: 'Python or JavaScript', label: '01 / YOUR SOURCE', symbol: '{ }', copy: 'Write JavaScript or use the experimental Python frontend. In the Python-enabled build, both languages compile into ZIPP’s own VM bytecode.' },
+  { name: 'ZIPP WASM', label: '02 / THE ENGINE', symbol: 'ϟ', copy: 'ZIPP’s Rust engine is compiled to WebAssembly. Playground Python runs inside this VM in a browser Worker. It is not translated into JavaScript or run by a second Python interpreter.' },
+  { name: 'Browser GPU host', label: '03 / COMPUTE & OUTPUT', symbol: '</>', copy: 'Python zipp_gpu requests are handled by JavaScript and executed through WebGL2 or WebGPU. The host returns named graph outputs for the program to inspect and draw.' },
 ]
 
 export function SandboxStack() {
   const [active, setActive] = useState(1)
 
   return (
-    <aside className="stack-lab" aria-label="Explore JavaScript on top of JavaScript">
+    <aside className="stack-lab" aria-label="Explore Python and JavaScript on ZIPP WASM">
       <div className="lab-heading"><span className="lab-label">A LITTLE ENGINE. A WHOLE NEW LAYER.</span><span aria-hidden="true">✳</span></div>
-      <div className="stack-caption"><span>JavaScript</span><span>on JavaScript.</span></div>
-      <p className="stack-hint">Same language. A sandbox of its own.</p>
+      <div className="stack-caption"><span>Python + JS.</span><span>One ZIPP VM.</span></div>
+      <p className="stack-hint">Choose a layer to see where the work happens.</p>
       <div className="stack-layers" aria-label="Choose a runtime layer">
         {layers.map((layer, index) => (
           <button type="button" key={layer.name} className={`stack-layer stack-layer-${index}`} aria-pressed={active === index} aria-controls="stack-explanation" onClick={() => setActive(index)}>

@@ -1,0 +1,46 @@
+i 0
+i 2
+for-else
+n 2
+n 4
+n 6
+0 0
+0 1
+1 0
+1 1
+[0, 1, 1, 2, 3, 5, 8, 13, 21] [3, 2, 1] [0, 1, 4, 9, 16] True 30
+1 2 3 end
+exhausted
+[]
+big pos 2 2
+walrus 20
+['bb'] 2
+True False True NoneType
+[0, 1] [0, 1] [0, 1] True
+5 5
+local global
+UnboundLocalError: True
+NameError: name 'a' is not defined
+[2, 1, 3]
+{'k': [11, 2]}
+[[0, 5, 0], [0, 0, 0]]
+[[0, 5, 0], [0, 5, 0]]
+1
+0.25
+(1, 2, 3)
+abab
+10 -11 -10 10 1 7 6 1024 128 -1
+True True True True True False True
+True True True True
+[1, 2] (1, 5, 2) cba
+(3, 2) (-4, 3) -3 -4 512 64 -9 9 2.5 2 2.0
+1 True True True True
+1 1 3 3 0 3
+[('a', 2), ('b', 1)] {'a': 2, 'b': 1} [2, 1] [0, 1, 2, 'a', 'b'] {1, 2, 3} (1, 2)
+3 True __main__
+[4, 6, 8] [2] {'b': 2}
+0 x 1
+1 y 2
+generator [0, 1, 4]
+133
+True None <class 'bool'> <class 'int'> <class 'float'> <class 'str'> <class 'list'> <class 'dict'> <class 'tuple'> <class 'set'> <class 'type'> <class 'object'>

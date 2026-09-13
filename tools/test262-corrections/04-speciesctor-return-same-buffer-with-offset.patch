@@ -1,0 +1,17 @@
+--- a/test/built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js
++++ b/test/built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js
+@@ -37,6 +37,14 @@
+     }
+   };
+ 
++  // The harness also supplies immutable buffers. Species destinations
++  // must permit writes; rejection must leave the source unchanged.
++  if (ta.buffer.immutable) {
++    assert.throws(TypeError, function() { ta.slice(1, 4); });
++    assert.compareArray(ta, [10, 20, 30, 40, 50, 60]);
++    return;
++  }
++
+   var result = ta.slice(1, 4);
+ 
+   assert.compareArray(result, [

@@ -6,5 +6,5 @@
 # or deadline can discard the complete instance.
 rustflags = [
     "-C", "link-arg=--max-memory=1073741824",
-    "-C", "link-arg=-zstack-size=1048576",
+    "-C", "link-arg=-zstack-size=16777216",
 ]

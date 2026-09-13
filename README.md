@@ -1,50 +1,199 @@
 <p align="center">
-  <img src="docs/assets/zipp-hero.svg" alt="Zipp — a clean-sheet JavaScript engine in Rust" width="100%">
+  <img src="docs/assets/zipp-hero.svg" alt="Zipp — two languages, one VM, your GPU" width="100%">
+</p>
+
+<h1 align="center">Zipp: two languages. One VM. Your GPU.</h1>
+
+<p align="center">
+  <strong>Write Python or JavaScript. Run natively or in WebAssembly. Give supported compute to the GPU.</strong>
 </p>
 
 <p align="center">
-  <strong>Run JavaScript. Embed an engine. Explore how it works.</strong>
-</p>
-
-<p align="center">
-  <a href="https://zipp.org/#playground"><strong>Try the live demo</strong></a> ·
-  <a href="https://github.com/f2i-com/zipp.org/releases"><strong>Download Zipp</strong></a> ·
+  <a href="#start-the-local-gpu-lab"><strong>Run the GPU lab</strong></a> ·
+  <a href="#gpu-computing-from-javascript-and-python"><strong>Write GPU code</strong></a> ·
   <a href="DOC.md"><strong>Read the docs</strong></a>
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
+  <a href="#what-runs-where">What runs where</a> ·
   <a href="#performance-measured-honestly">Performance</a> ·
   <a href="#correctness-and-language-coverage">Language support</a> ·
   <a href="#choose-the-right-execution-profile">Security</a> ·
   <a href="#reproduce-and-contribute">Contribute</a>
 </p>
 
-Zipp is a JavaScript engine built in Rust, from the first token to native
-machine code. Run scripts from your terminal, embed a VM in your application,
-or use the WebAssembly build in a browser.
+**Zipp brings Python and JavaScript into the same Rust register-bytecode VM.**
+Build an embedded scripting runtime, run a folder of code in a browser Worker,
+or turn a familiar Torch model into a browser GPU compute graph.
+
+The experimental Python frontend compiles directly to Zipp bytecode. It does not
+ship CPython or translate your Python program into browser JavaScript. Both
+frontends use the same engine, with native and WebAssembly builds.
+
+- **Bring a project, not just a snippet.** The playground loads folders, modules
+  and data, with an editor, virtual files, console and graphics in one place.
+- **Start with familiar ML code.** The bundled Torch subset supports eager CPU
+  tensors, autograd and training. Experimental `torch.compile(model)` records
+  supported inference and dense-model SGD training for WebGPU, WebGL2 or an explicit CPU fallback.
+- **Keep the host in control.** Execution budgets and explicit host capabilities
+  let embedders decide which resources a program can use.
+- **Explore one engine across languages.** An optional trusted-code build adds
+  Python-to-JavaScript evaluation inside the very same VM instance.
+
+Python support and Torch compatibility are experimental. The
+[Torch compatibility guide](docs/TORCH_COMPATIBILITY.md) and
+[Python frontend guide](docs/PYTHON_FRONTEND_EXPERIMENT.md) explain the supported
+surface and remaining differences.
+
+## What runs where
+
+| What you want to do | Where your code runs | Where the numerical or drawing work runs |
+|---|---|---|
+| Run JavaScript scripts or embed Zipp | Native Rust VM/JIT, or Zipp's WebAssembly build | CPU; host APIs are supplied by the embedding application |
+| Run Python projects in Zipp | Experimental Python frontend on the same VM | CPU, including the bundled `torch` subset |
+| Compile a supported Torch model or submit a Python `zipp_gpu` graph from the playground | Python in the WASM Worker; JavaScript handles the graph | WebGPU compute shaders or WebGL2 fragment shaders; visible CPU fallback in `auto` mode |
+| Use GPU graphs from browser JavaScript | An ordinary browser ES module or Worker | The same GPU runtime, without requiring Python or the Zipp VM |
+| Draw a custom browser visualization | Browser JavaScript with a canvas | WebGL/WebGL2 through the browser-selected adapter |
+
+**GPU support does not automatically move all Python or JavaScript onto a GPU.**
+The graph API executes its supported operations on the selected backend.
+The playground's `ui` drawing API uses a 2D canvas; the Life computation runs
+on the selected graph backend.
+
+## Familiar Torch code, browser GPU execution
+
+```python
+import torch
+from torch import nn
+
+model = nn.Sequential(nn.Linear(2, 4), nn.ReLU(), nn.Linear(4, 1))
+x = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+inference = torch.compile(model)(x)  # no zipp_gpu import or backend name
+inference.submit(lambda y: print(y.tolist()))
+```
+
+Your model, tensor creation and forward pass use the supported Torch API.
+Zipp records the inference graph and the host executes it on the selected
+backend. **`submit(callback)` is a Zipp extension:** browser GPU completion is
+asynchronous; this is not a drop-in implementation of PyTorch's `torch.compile`.
+It supports float32 inference and an opt-in dense-model GPU training path; it does not run CUDA scripts.
+The callback receives a regular CPU Torch-compatible tensor. Eager CPU
+`nn.Conv2d` also supports forward/backward passes and optimizer updates;
+GPU convolution remains future work.
+
+Try **Samples → Python: Torch ML inference (GPU)** in the playground. The
+[complete example](examples/python/torch_gpu/main.py) draws its predictions and
+checks them against eager inference with the same weights. Explicit GPU selection
+fails visibly if unavailable; automatic selection reports the backend it used.
+
+[![Torch model predictions computed on WebGL2 from Python in Zipp WASM](landing/public/demos/torch-inference.png)](examples/python/torch_gpu/main.py)
+
+## Train a small model on the browser GPU
+
+The ordinary training step stays familiar:
+
+```python
+import torch.nn.functional as F
+
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+target = torch.tensor([[1.0], [2.0]])
+
+def train_step(x, target):
+    optimizer.zero_grad()
+    loss = F.mse_loss(model(x), target)
+    loss.backward()
+    optimizer.step()
+    return loss
+
+compiled_step = torch.compile(train_step, training=True)
+compiled_step(x, target).submit(lambda loss: print(loss.item()))
+```
+
+**`training=True` and `.submit(...)` are experimental Zipp extensions**, not
+PyTorch's synchronous `torch.compile` API. Forward computation, first-order
+gradients and SGD updates execute on the selected backend. The success callback
+receives the loss after the CPU model's weights and gradients have been updated.
+Wait for that callback before recording the next step.
+
+Try **Samples → Python: Torch ML training (GPU)** to watch a small network learn
+`y = x²`, with predictions and a live loss curve. Its
+[model and training step](examples/python/torch_training/model.py) also run in
+native PyTorch; the [playground driver](examples/python/torch_training/main.py)
+provides asynchronous scheduling and graphics.
+
+[![Torch training on WebGL2: Python source, learned curve and falling loss](landing/public/demos/torch-training.png)](examples/python/torch_training/model.py)
+
+This first path supports float32 dense layers, ReLU, MSE and SGD without momentum.
+**Each call captures a new graph, uploads inputs and weights, and reads back the
+loss, gradients and updated weights.** There is no `compiled.prepare()` API,
+resident model/optimizer state, graph cache or multi-GPU training yet. Small
+examples demonstrate correctness, not a GPU speedup. See the
+[Torch compatibility guide](docs/TORCH_COMPATIBILITY.md) for supported operations,
+limits and failure behavior. NCA experiments remain in their separate repository.
+
+## Python and JavaScript inside one VM
+
+Build with `python-js-interop` for trusted mixed-language projects:
+
+```python
+import javascript
+print(javascript.eval("[1, 2, 3].map(x => x * 2)"))  # [2, 4, 6]
+```
+
+This uses Zipp's own JavaScript evaluator in the **same VM instance**, with copied
+lists, dictionaries and scalar results. `from js import eval` is also available.
+It is opt-in because JavaScript shares VM globals with the Python runtime.
+There are no live cross-language object proxies or JavaScript `.py` imports yet.
+See the [build instructions and contract](docs/LANGUAGE_INTEROP.md).
 
 ## See Zipp in action
 
-**Yes, it runs Doom.** Watch it running in **SoftDOS**, an MS-DOS-compatible
-emulator hosted by Zipp's WebAssembly JavaScript runtime. Host acceleration is
-enabled in this demo.
+**Python running on Zipp WASM, with Game of Life on the GPU.** This is a recording
+of the actual folder playground: the Python source is compiled and executed by
+Zipp's WebAssembly VM. The displayed `life.py` uses ordinary Torch matrix
+operations and ReLU, with no `zipp_gpu` imports. These same rules run in regular
+PyTorch. A separate playground driver compiles each update for WebGL2 and
+receives its result asynchronously for drawing.
 
-[![Animated preview of Doom running in SoftDOS on Zipp. Open the full 30-second video.](docs/assets/softdos-zipp-preview.gif)](docs/assets/softdos-zipp-demo.mp4)
+[![Python runs on Zipp WASM: source, compiler, VM and GPU host](landing/public/demos/python-wasm-flow.svg)](landing/public/demos/python-wasm-flow.svg)
 
-**[Try SoftDOS in your browser](https://softn.com/app/soft-dos)** ·
-[Full 30-second video with sound (MP4)](docs/assets/softdos-zipp-demo.mp4)
+[![Actual Python Game of Life running in the Zipp WASM playground on WebGL2](landing/public/demos/python-life.gif)](landing/public/demos/python-life.gif)
+
+**[Open the full project playground](https://zipp.org/playground/)** ·
+[Static screenshot](landing/public/demos/python-playground.png) ·
+[Portable Torch Life rules](examples/python/gpu/life.py) ·
+[Playground driver](examples/python/gpu/main.py)
+
+<details>
+<summary>Inspect the Python editor, canvas, WASM status and GPU output in a still screenshot</summary>
+
+![Python source executing in the actual Zipp WASM playground](landing/public/demos/python-playground.png)
+
+</details>
+
+The recording shows a glider gun, pulsar, growing patterns and interacting
+debris in one toroidal Life grid. GIFs autoplay and loop; the landing page offers
+a pause button and honors reduced-motion settings. [Capture provenance](landing/public/demos/provenance.json)
+records the engine, adapter, source hashes and duration. Regenerate with
+`python crates/zipp-wasm/playground/capture-demos.py` (Chrome, Python Playwright,
+ffmpeg and the Python WASM build required).
 
 ## Why Zipp
 
 | Fast to start | Modern JavaScript | Ready to embed |
 |---|---|---|
-| **7.4 ms** median process launch in the canonical capture. No snapshot to load. | **99.997%** of core Test262 executions: **95,939 / 95,942**. | A native CLI, a Rust embedding API, and a browser WebAssembly runtime. |
+| **7.4 ms** median process launch in the canonical capture. No snapshot to load. | **99.991%** in the pinned original core Test262 run: **95,671 / 95,680**, with nine documented upstream inconsistencies. | A native CLI, a Rust embedding API, and a browser WebAssembly runtime. |
 
 - **Explore the whole engine.** The lexer, parser, register VM, GC, inline caches
   and JITs live together in this repository.
 - **Choose how to run it.** Use the native JIT for trusted programs, a browser
   Worker for WebAssembly, or the separately built hardened native runner.
+- **Use Python and JavaScript.** Explore the experimental Python frontend or
+  call the browser's GPU graph runtime directly from JavaScript.
+- **Watch code at work.** Explore Game of Life, Langton's ant, bouncing balls,
+  and GPU graph examples with visible source, canvas and console output.
 - **See the evidence.** Benchmarks include exact-output checks, raw results,
   confidence intervals and the workloads that still need work.
 
@@ -54,8 +203,45 @@ and their scope.
 
 ## Quick start
 
-The [`v0.0.17` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.17)
-includes ready-to-run x86-64 binaries and a browser WebAssembly package.
+### Start the local GPU lab
+
+The landing page embeds the complete project playground and exposes it at
+**[`/playground`](https://zipp.org/playground/)**. It supports folders, loose files,
+Python/JavaScript samples, entry files, arguments, editing, console/canvas output
+and GPU selection. Files stay in the browser's virtual filesystem.
+
+For a local source checkout:
+
+```sh
+cd crates/zipp-wasm
+./build-variants.sh all
+node playground/serve.cjs
+```
+
+Open the printed playground URL, choose **Samples → Python: Game of Life**, select
+WebGL2 or WebGPU, and press Run. The console identifies the actual backend.
+`auto` visibly falls back to CPU/WASM when hardware is unavailable; explicit GPU
+selection reports an error instead. Browser settings decide which adapter is used.
+
+The native NCA research project now lives independently at
+[neuralautomata.com](https://github.com/f2i-com/neuralautomata.com).
+Zipp does not include its PyTorch runner, models, checkpoints or native endpoints.
+
+### Run the JavaScript engine
+
+The `0.0.18` release configuration provides x86-64 JavaScript CLI binaries and
+two browser WebAssembly packages:
+
+| Download | Use it for |
+| --- | --- |
+| `zipp-wasm-0.0.18-web.zip` | JavaScript applications and embedding |
+| `zipp-wasm-0.0.18-web-python.zip` | JavaScript plus experimental Python projects, Torch and browser GPU adapters |
+
+See [GitHub Releases](https://github.com/f2i-com/zipp.org/releases) for published
+assets and [0.0.18 release notes](docs/releases/0.0.18.md) for scope and limits.
+This checkout is a release candidate; the download commands below still use
+published **0.0.17** until 0.0.18 passes every release gate. Both WASM archives carry the
+exact source revision, language profile and checksums.
 
 Save this as `app.js`, then choose your platform below:
 
@@ -142,7 +328,185 @@ runtime data-file dependency.
 
 </details>
 
-### Embed Zipp WebAssembly in a web app
+### Run Python (experimental)
+
+The CLI also runs Python: Zipp's own Python 3 implementation, with the
+source lowered straight to the engine's register bytecode (no transpilation
+to JavaScript and no second interpreter), so a `.py` file runs on the same VM.
+Save this as `fib.py`:
+
+```python
+def fib(n):
+    a = 0
+    b = 1
+    for i in range(n):
+        a, b = b, a + b
+    return a
+
+print(fib(30))
+```
+
+```sh
+zipp py fib.py                 # 832040
+zipp run fib.py                # frontend chosen by extension, shebang or directive
+zipp run --lang=python -       # from standard input
+```
+
+Classes (including metaclasses, descriptors and `__slots__`), exceptions
+with full tracebacks, generators, closures, comprehensions, `match`
+statements, f-strings, the builtin types and a set of standard-library
+modules (`math`, `json`, `re`, `collections`, `itertools`, `functools`,
+`dataclasses`, `enum`, `contextlib`, `typing`, `struct`, `hashlib`, ...)
+all work; `async` does not yet. Semantics are checked
+differentially against CPython: `tests/python_corpus/*.py` must print
+exactly what CPython prints.
+
+A folder runs as a project: `zipp py examples/python/project` runs its
+`main.py`, and `zipp py lab/train.py --steps 20` runs one script of a
+folder with arguments. Every file of the folder (subfolders included, up to
+8 MiB each and 64 MiB in total) is loaded into the program's virtual
+filesystem, so `open()`, `os`, `os.path`, `pathlib` and `json.load` see the
+project's data; `.py` files are modules and packages by folder
+(`legacy/fast_memory.py` is `legacy.fast_memory`, with or without an
+`__init__.py`); `sys.argv` carries the arguments; and files the program
+writes are copied back under the folder when it finishes. A `test_*.py`
+entry runs its tests through the bundled `pytest` subset. The bundled
+library also includes a `torch` subset (tensors over typed arrays with
+reverse-mode autograd, `nn`, `nn.functional`, `optim`, `save`/`load` in
+supported PyTorch checkpoint layouts) that runs on the engine's CPU kernels, so
+supported ML code can train and evaluate inside Zipp. Eager execution is CPU;
+`torch.compile` adds supported asynchronous GPU inference and dense-model SGD training. The scope
+matrix, limits and the bytecode design are in
+[docs/PYTHON_FRONTEND_EXPERIMENT.md](docs/PYTHON_FRONTEND_EXPERIMENT.md). The
+feature is on by default in the CLI (`--no-default-features` builds the
+JavaScript-only binary) and off by default in the `zipp-vm` library and the
+WebAssembly package, which offers it as a
+[separate build variant](crates/zipp-wasm/README.md#build-variants-javascript-only-or-javascript-and-python).
+
+Python programs can also compute on the GPU in the browser: the bundled
+`zipp_gpu` library records a float32 graph (`+`, `*`, `@`, `relu`, `sum`,
+a Conway-life step) and `submit`s it, and the host runs it through WebGPU,
+WebGL2, compiled WebAssembly kernels or a JavaScript reference, calling the
+program back with the outputs; natively the same code evaluates on the CPU.
+See [crates/zipp-wasm/README.md](crates/zipp-wasm/README.md#gpu-compute-for-python-programs).
+
+There is also a local [playground](crates/zipp-wasm/playground/README.md)
+that runs a folder of Python or JavaScript files on the WebAssembly engine:
+open or drop a whole project folder (subfolders, data files and binary
+checkpoints included), browse it in a file tree, pick any script as the
+entry, give it arguments, and run it in the browser; files the program
+writes show up in the tree. It has an editor, a console and a canvas the
+program draws on through a small `ui` API (`draw`/`update`/`on_click`/
+`on_key` hooks for animation and input), and a GPU sample that steps life
+on the compute backend every frame:
+
+```sh
+cd crates/zipp-wasm && ./build-variants.sh all && node playground/serve.cjs
+```
+
+## GPU computing from JavaScript and Python
+
+**Yes: JavaScript can use WebGL directly.** [WebGL is a browser JavaScript API](https://developer.mozilla.org/en-US/docs/Web/API/WebGL_API),
+and this project's [WebGL2 graph backend](crates/zipp-wasm/gpu-lab/src/backends/webgl2.mjs),
+[WebGPU graph backend](crates/zipp-wasm/gpu-lab/src/backends/webgpu.mjs), and
+[WebGL2 backend](crates/zipp-wasm/gpu-lab/src/backends/webgl2.mjs) are written in
+JavaScript. Python is one way to author work for that runtime.
+
+### Browser JavaScript: run a GPU graph
+
+Save the following as `gpu-example.html` in the repository root, start the local
+server above, and open `http://127.0.0.1:8765/gpu-example.html` (using the printed
+port). It runs directly in the browser and requires no Python or Zipp build.
+
+```html
+<!doctype html>
+<meta charset="utf-8">
+<title>JavaScript GPU graph</title>
+<pre id="output">Running a WebGL2 graph…</pre>
+<script type="module">
+import { createRuntime } from "/crates/zipp-wasm/gpu-lab/src/runtime.mjs";
+
+const output = document.getElementById("output");
+let runtime;
+try {
+  runtime = await createRuntime({ backend: "webgl2" });
+  const result = await runtime.execute({
+    version: 1,
+    nodes: [
+      { id: 0, op: "input", shape: [3], data: [-2, 3, 4] },
+      { id: 1, op: "input", shape: [3], data: [10, 20, 30] },
+      { id: 2, op: "mul", a: 0, b: 1 },
+      { id: 3, op: "relu", a: 2 }
+    ],
+    outputs: [{ name: "values", id: 3 }]
+  });
+  output.textContent = JSON.stringify({
+    backend: result.backend,
+    adapter: runtime.info().adapter,
+    values: result.outputs.values.data // [0, 60, 120]
+  }, null, 2);
+} catch (error) {
+  output.textContent = error.message;
+} finally {
+  runtime?.dispose();
+}
+</script>
+```
+
+Use `backend: "webgpu"` for WGSL compute shaders, or `"auto"` to try WebGPU,
+WebGL2, compiled WASM and JavaScript in that order. Explicit GPU selections
+fail if unavailable; `auto` reports any initialization fallback through
+`runtime.info().fallbackAttempts`. Await each execution before submitting
+another to the same runtime. Only named outputs are read back to JavaScript.
+
+For your own graphics, browser JavaScript can create a separate canvas and call
+`canvas.getContext("webgl2", { powerPreference: "high-performance" })` to work
+with WebGL directly. The graph API supplies a bounded set of float32 operations;
+it does not turn arbitrary JavaScript into shaders. The WebGL2 backend shows
+how float tensors are uploaded and processed with GLSL.
+
+### Python: author the same graph in the playground
+
+Paste this into a Python entry file in the WASM playground, select WebGL2 or
+WebGPU in its toolbar, and press **Run**:
+
+```python
+from zipp_gpu import Graph
+
+def show(result):
+    print(result["backend"], result["outputs"]["values"]["data"])
+
+g = Graph()
+a = g.tensor([-2, 3, 4])
+b = g.tensor([10, 20, 30])
+g.submit(show, values=(a * b).relu())  # callback receives [0, 60, 120]
+```
+
+Python records the graph and submits it through a host request. The Worker's
+JavaScript runtime validates it, allocates GPU buffers/textures, runs the shaders,
+reads the requested outputs, and delivers the callback between VM calls.
+Supported operations include elementwise arithmetic, ReLU, matrix multiplication,
+sum and a wrapped Conway-Life update. These are float32 operations, with the
+shape/work limits in the [GPU Lab documentation](crates/zipp-wasm/gpu-lab/README.md).
+Running this Python code through the native Zipp CLI instead uses its local CPU
+reference evaluator; it does not start PyTorch or CUDA.
+
+### Browser JavaScript versus JavaScript inside Zipp
+
+The HTML example runs in the **browser's JavaScript engine**. JavaScript files
+loaded into the **Zipp playground editor** run inside the Zipp VM and do not
+automatically receive browser `document`, canvas or WebGL objects.
+
+The current playground connects `zipp_gpu` requests for **Python guest programs**.
+Its JavaScript guest GPU bridge is **not yet wired into that playground**. For a
+custom Zipp embedder, the repository supplies
+[`createZippGPUAdapter`](crates/zipp-wasm/gpu-lab/src/zipp-adapter.mjs) and
+[`gpuExecute` / `gpuExecuteAsync`](crates/zipp-wasm/gpu-lab/src/zipp-guest.js):
+the host must install the guest shim, grant `gpu.execute`, drain and dispatch
+the host-call queue, and deliver callbacks. The adapter tests cover that contract;
+they are not a claim that the stock JavaScript playground exposes it already.
+
+## Embed Zipp WebAssembly in a web app
 
 Run the browser build in a dedicated Worker, with a deadline controlled by
 your page. The complete example includes setup, cleanup and resource limits.
@@ -535,14 +899,30 @@ below.
 
 ## Correctness and language coverage
 
-Zipp currently passes **95,939 of 95,942** required test262 executions. The
-three known remaining cases are one Annex B test carrying a superseded ES2017
-expectation and two rows that require German CLDR data; the exact list is
-[`tools/test262-expected-failures.txt`](tools/test262-expected-failures.txt).
+The [local validation](docs/validation/2026-09-14-ci-readiness.md) reports
+**99.991% of test262**: 95,671 / 95,680 executions in the original pinned core
+suite, with **nine documented upstream inconsistencies and zero skips**.
+The corpus is pinned to `4249661388e5d3f92a85186213da140a6481490f`, including
+staging and excluding the separate ECMA-402 suite.
+
+| Validation profile | Passed | Failed | Skipped |
+| --- | ---: | ---: | ---: |
+| Original pinned core Test262 | 95,671 | 9 | 0 |
+| Core with five documented test corrections | 95,680 | 0 | 0 |
+| Original DateTimeFormat ECMA-402 tests | 488 | 0 | 0 |
+
+Eight original failures expose contradictions in the pinned Error/TypedArray
+harnesses; one Annex B test carries a superseded ES2017 expectation.
+[The corrections](tools/test262-corrections/README.md) retain both original and
+corrected reports, with exact file hashes and no skipped executions. The
+corrected profile permits no expected failures. Its 100% result is explicitly
+separate from unmodified upstream conformance. The German formatting failures
+are fixed in the VM without test changes. Passing the DateTimeFormat shard
+does not establish complete ECMA-402 coverage or universal ICU parity.
 
 The [12 September 2026 correctness audit](docs/audits/2026-09-12-correctness.md)
-verified this result against Test262 `defaaf1571`, including staging and excluding
-the separate ECMA-402 suite. It tightened negative-test scoring and fixed 42
+recorded an earlier **95,939 / 95,942** result against corpus `defaaf1571`.
+That older corpus has a different execution count. The audit tightened negative-test scoring and fixed 42
 executions previously counted as passes despite reporting the wrong error type.
 The runner's `--expected-failures` option now rejects unexpected failures, stale
 expectations and skips; `--json` records the engine and corpus identities.
@@ -573,7 +953,9 @@ ES2015–ES2025 is essentially complete, including:
 - `eval`, `Function`, `ShadowRealm`, structured cloning, and browser-oriented
   embedding APIs.
 
-Only the `en` CLDR locale ships today. The detailed support notes and durable
+DateTimeFormat ships CLDR 48 data for `en`/`en-US`, `de`/`de-DE`, `ja`/`ja-JP`,
+`zh`/`zh-CN` and `ar-EG`. Other Intl services
+currently ship English locale data only. The detailed support notes and durable
 architecture reference live in [`DOC.md`](DOC.md).
 
 ## How it works
@@ -603,8 +985,8 @@ Workspace map:
 
 | Path | Purpose |
 |---|---|
-| [`crates/zipp-vm`](crates/zipp-vm) | Parser, compiler, VM, runtime, GC, and JITs. |
-| [`crates/zipp-cli`](crates/zipp-cli) | `zipp js` / `zipp mjs` command line. |
+| [`crates/zipp-vm`](crates/zipp-vm) | Parser, compiler, VM, runtime, GC, JITs, and the experimental Python frontend (`src/frontend`). |
+| [`crates/zipp-cli`](crates/zipp-cli) | `zipp js` / `zipp mjs` / `zipp py` command line. |
 | [`crates/regress-fork`](crates/regress-fork) | ECMAScript regex engine fork and conformance fixes. |
 | [`crates/zipp-wasm`](crates/zipp-wasm/README.md) | Browser/Worker embedding. |
 | [`crates/zipp-sandbox`](crates/zipp-sandbox/README.md) | Separately resolved hardened native runner. |

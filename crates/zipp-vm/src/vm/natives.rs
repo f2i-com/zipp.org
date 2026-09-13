@@ -4573,15 +4573,14 @@ impl<'p> Vm<'p> {
             WS_HAS => self.weakset_method(this, "has", args)?,
             WS_DELETE => self.weakset_method(this, "delete", args)?,
             WR_DEREF => {
-                let target = match this.is_heap().then(|| self.heap.get(this.heap_index())) {
-                    Some(HeapObj::WeakRef(t)) => *t,
-                    _ => {
-                        return Err(Thrown(
+                let target =
+                    match this.is_heap().then(|| self.heap.get(this.heap_index())) {
+                        Some(HeapObj::WeakRef(t)) => *t,
+                        _ => return Err(Thrown(
                             "TypeError: WeakRef.prototype.deref called on incompatible receiver"
                                 .into(),
-                        ))
-                    }
-                };
+                        )),
+                    };
                 if target != Value::UNDEFINED {
                     self.keep_during_job(target);
                 }
@@ -6287,7 +6286,7 @@ impl<'p> Vm<'p> {
                 let items: Vec<Value> = sorted.into_iter().map(|s| self.alloc_str(s)).collect();
                 self.alloc_array_current_realm(items)
             }
-            INTL_SUPPORTED_LOCALES_OF => {
+            INTL_SUPPORTED_LOCALES_OF | INTL_DTF_SUPPORTED_LOCALES_OF => {
                 let list = self.canonicalize_locale_list(a0)?;
                 // SupportedLocales step 1 is `? ToObject(options)`, NOT
                 // GetOptionsObject: `supportedLocalesOf([], 7)` wraps the number
@@ -6314,9 +6313,14 @@ impl<'p> Vm<'p> {
                 let list: Vec<String> = list
                     .into_iter()
                     .filter(|tag| {
-                        crate::vm::intl::best_available_locale(&crate::vm::intl::strip_extensions(
-                            tag,
-                        ))
+                        crate::vm::intl::best_available_locale_in(
+                            &crate::vm::intl::strip_extensions(tag),
+                            if id == INTL_DTF_SUPPORTED_LOCALES_OF {
+                                crate::vm::intl::DTF_AVAILABLE_LOCALES
+                            } else {
+                                crate::vm::intl::AVAILABLE_LOCALES
+                            },
+                        )
                         .is_some()
                     })
                     .collect();

@@ -1,0 +1,352 @@
+TAP version 13
+# Subtest: GPU host capability is denied unless explicitly granted
+ok 1 - GPU host capability is denied unless explicitly granted
+  ---
+  duration_ms: 1.110051
+  type: 'test'
+  ...
+# Subtest: adapter serializes graph requests and completes exact callback IDs
+ok 2 - adapter serializes graph requests and completes exact callback IDs
+  ---
+  duration_ms: 2.797822
+  type: 'test'
+  ...
+# Subtest: unknown kinds, bad arity and duplicate IDs do not become GPU access
+ok 3 - unknown kinds, bad arity and duplicate IDs do not become GPU access
+  ---
+  duration_ms: 0.369667
+  type: 'test'
+  ...
+# Subtest: tenant invalidation drops queued and in-flight completions
+ok 4 - tenant invalidation drops queued and in-flight completions
+  ---
+  duration_ms: 1.642032
+  type: 'test'
+  ...
+# Subtest: disposed Engine is never re-entered for a late result
+ok 5 - disposed Engine is never re-entered for a late result
+  ---
+  duration_ms: 0.32502
+  type: 'test'
+  ...
+# Subtest: queue and lifetime quotas reject excess work
+ok 6 - queue and lifetime quotas reject excess work
+  ---
+  duration_ms: 0.526122
+  type: 'test'
+  ...
+# Subtest: guest callback and promise shim round-trip against documented queue shape (mock Engine, not ZIPP WASM)
+ok 7 - guest callback and promise shim round-trip against documented queue shape (mock Engine, not ZIPP WASM)
+  ---
+  duration_ms: 6.088206
+  type: 'test'
+  ...
+# Subtest: cpu-js: Python-generated vector recipe
+ok 8 - cpu-js: Python-generated vector recipe
+  ---
+  duration_ms: 12.077683
+  type: 'test'
+  ...
+# Subtest: cpu-js: rectangular matrix multiplication
+ok 9 - cpu-js: rectangular matrix multiplication
+  ---
+  duration_ms: 1.024122
+  type: 'test'
+  ...
+# Subtest: cpu-js: tiny MLP has expected explicit-weight result
+ok 10 - cpu-js: tiny MLP has expected explicit-weight result
+  ---
+  duration_ms: 1.019756
+  type: 'test'
+  ...
+# Subtest: cpu-js: 24 Life steps translate a glider by six cells
+ok 11 - cpu-js: 24 Life steps translate a glider by six cells
+  ---
+  duration_ms: 10.431284
+  type: 'test'
+  ...
+# Subtest: cpu-js: odd reduction, scalar operations and output alias
+ok 12 - cpu-js: odd reduction, scalar operations and output alias
+  ---
+  duration_ms: 0.796319
+  type: 'test'
+  ...
+# Subtest: cpu-js: sum of one element, full scalar, unused node
+ok 13 - cpu-js: sum of one element, full scalar, unused node
+  ---
+  duration_ms: 0.337578
+  type: 'test'
+  ...
+# Subtest: cpu-js: repeated executions do not reuse stale data
+ok 14 - cpu-js: repeated executions do not reuse stale data
+  ---
+  duration_ms: 3.271014
+  type: 'test'
+  ...
+# Subtest: cpu-js: finite input that overflows computation rejects readback
+ok 15 - cpu-js: finite input that overflows computation rejects readback
+  ---
+  duration_ms: 0.340473
+  type: 'test'
+  ...
+# Subtest: wasm: Python-generated vector recipe
+ok 16 - wasm: Python-generated vector recipe
+  ---
+  duration_ms: 9.943309
+  type: 'test'
+  ...
+# Subtest: wasm: rectangular matrix multiplication
+ok 17 - wasm: rectangular matrix multiplication
+  ---
+  duration_ms: 1.238415
+  type: 'test'
+  ...
+# Subtest: wasm: tiny MLP has expected explicit-weight result
+ok 18 - wasm: tiny MLP has expected explicit-weight result
+  ---
+  duration_ms: 4.301456
+  type: 'test'
+  ...
+# Subtest: wasm: 24 Life steps translate a glider by six cells
+ok 19 - wasm: 24 Life steps translate a glider by six cells
+  ---
+  duration_ms: 3.517466
+  type: 'test'
+  ...
+# Subtest: wasm: odd reduction, scalar operations and output alias
+ok 20 - wasm: odd reduction, scalar operations and output alias
+  ---
+  duration_ms: 2.237078
+  type: 'test'
+  ...
+# Subtest: wasm: sum of one element, full scalar, unused node
+ok 21 - wasm: sum of one element, full scalar, unused node
+  ---
+  duration_ms: 1.916445
+  type: 'test'
+  ...
+# Subtest: wasm: repeated executions do not reuse stale data
+ok 22 - wasm: repeated executions do not reuse stale data
+  ---
+  duration_ms: 1.825809
+  type: 'test'
+  ...
+# Subtest: wasm: finite input that overflows computation rejects readback
+ok 23 - wasm: finite input that overflows computation rejects readback
+  ---
+  duration_ms: 5.556275
+  type: 'test'
+  ...
+# Subtest: deterministic random differential tests across JS and compiled WASM
+ok 24 - deterministic random differential tests across JS and compiled WASM
+  ---
+  duration_ms: 5.100148
+  type: 'test'
+  ...
+# Subtest: WASM module has no imports and grows/rebinds its memory safely
+ok 25 - WASM module has no imports and grows/rebinds its memory safely
+  ---
+  duration_ms: 1.742253
+  type: 'test'
+  ...
+# Subtest: validator rejects version
+ok 26 - validator rejects version
+  ---
+  duration_ms: 0.195665
+  type: 'test'
+  ...
+# Subtest: validator rejects unknown op
+ok 27 - validator rejects unknown op
+  ---
+  duration_ms: 0.096595
+  type: 'test'
+  ...
+# Subtest: validator rejects extra field
+ok 28 - validator rejects extra field
+  ---
+  duration_ms: 0.085038
+  type: 'test'
+  ...
+# Subtest: validator rejects forward reference
+ok 29 - validator rejects forward reference
+  ---
+  duration_ms: 0.080131
+  type: 'test'
+  ...
+# Subtest: validator rejects negative reference
+ok 30 - validator rejects negative reference
+  ---
+  duration_ms: 0.129214
+  type: 'test'
+  ...
+# Subtest: validator rejects duplicate ID
+ok 31 - validator rejects duplicate ID
+  ---
+  duration_ms: 0.120471
+  type: 'test'
+  ...
+# Subtest: validator rejects wrong data size
+ok 32 - validator rejects wrong data size
+  ---
+  duration_ms: 0.077887
+  type: 'test'
+  ...
+# Subtest: validator rejects NaN
+ok 33 - validator rejects NaN
+  ---
+  duration_ms: 0.07324
+  type: 'test'
+  ...
+# Subtest: validator rejects float32 overflow
+ok 34 - validator rejects float32 overflow
+  ---
+  duration_ms: 0.068403
+  type: 'test'
+  ...
+# Subtest: validator rejects boolean
+ok 35 - validator rejects boolean
+  ---
+  duration_ms: 0.077717
+  type: 'test'
+  ...
+# Subtest: validator rejects zero dimension
+ok 36 - validator rejects zero dimension
+  ---
+  duration_ms: 0.068534
+  type: 'test'
+  ...
+# Subtest: validator rejects fractional dimension
+ok 37 - validator rejects fractional dimension
+  ---
+  duration_ms: 0.120201
+  type: 'test'
+  ...
+# Subtest: validator rejects unsafe output
+ok 38 - validator rejects unsafe output
+  ---
+  duration_ms: 0.101623
+  type: 'test'
+  ...
+# Subtest: validator rejects duplicate output
+ok 39 - validator rejects duplicate output
+  ---
+  duration_ms: 0.083556
+  type: 'test'
+  ...
+# Subtest: validator rejects invalid output reference
+ok 40 - validator rejects invalid output reference
+  ---
+  duration_ms: 0.07353
+  type: 'test'
+  ...
+# Subtest: validator rejects empty outputs
+ok 41 - validator rejects empty outputs
+  ---
+  duration_ms: 0.058458
+  type: 'test'
+  ...
+# Subtest: validator rejects data accessors and inherited fields
+ok 42 - validator rejects data accessors and inherited fields
+  ---
+  duration_ms: 0.177938
+  type: 'test'
+  ...
+# Subtest: shape mismatch and invalid matmul fail before backend allocation
+ok 43 - shape mismatch and invalid matmul fail before backend allocation
+  ---
+  duration_ms: 0.156355
+  type: 'test'
+  ...
+# Subtest: explicit node, memory, work, input and output limits are enforced
+ok 44 - explicit node, memory, work, input and output limits are enforced
+  ---
+  duration_ms: 0.284258
+  type: 'test'
+  ...
+# Subtest: busy execution and dispose-while-running reject without interrupting work
+ok 45 - busy execution and dispose-while-running reject without interrupting work
+  ---
+  duration_ms: 0.198369
+  type: 'test'
+  ...
+# Subtest: backend failure frees already allocated resources and remains diagnosable
+ok 46 - backend failure frees already allocated resources and remains diagnosable
+  ---
+  duration_ms: 0.309356
+  type: 'test'
+  ...
+# Subtest: invalid backend selection does not silently switch implementation
+ok 47 - invalid backend selection does not silently switch implementation
+  ---
+  duration_ms: 0.35874
+  type: 'test'
+  ...
+# Subtest: validated graph owns input data before awaiting
+ok 48 - validated graph owns input data before awaiting
+  ---
+  duration_ms: 0.127762
+  type: 'test'
+  ...
+# Subtest: WebGPU contract mock: bounds guard emitted for a non-workgroup-multiple length
+ok 49 - WebGPU contract mock: bounds guard emitted for a non-workgroup-multiple length
+  ---
+  duration_ms: 2.160673
+  type: 'test'
+  ...
+# Subtest: WebGPU contract mock: pairwise sum has guarded tails and releases scratch buffers
+ok 50 - WebGPU contract mock: pairwise sum has guarded tails and releases scratch buffers
+  ---
+  duration_ms: 0.804752
+  type: 'test'
+  ...
+# Subtest: WebGPU contract mock: scalar sum uses guarded copy path
+ok 51 - WebGPU contract mock: scalar sum uses guarded copy path
+  ---
+  duration_ms: 2.498511
+  type: 'test'
+  ...
+# Subtest: WebGPU contract mock: rejected compilation destroys the output allocation
+ok 52 - WebGPU contract mock: rejected compilation destroys the output allocation
+  ---
+  duration_ms: 0.839624
+  type: 'test'
+  ...
+# Subtest: WebGPU contract mock: mapping rejection destroys staging allocation
+ok 53 - WebGPU contract mock: mapping rejection destroys staging allocation
+  ---
+  duration_ms: 0.508626
+  type: 'test'
+  ...
+# Subtest: WebGPU contract mock: limit rejection happens before buffer creation
+ok 54 - WebGPU contract mock: limit rejection happens before buffer creation
+  ---
+  duration_ms: 0.273622
+  type: 'test'
+  ...
+# Subtest: WebGPU contract mock: lost device fails closed
+ok 55 - WebGPU contract mock: lost device fails closed
+  ---
+  duration_ms: 0.224769
+  type: 'test'
+  ...
+# Subtest: portable browser acceptance cases also pass in Node: cpu-js
+ok 56 - portable browser acceptance cases also pass in Node: cpu-js
+  ---
+  duration_ms: 28.36952
+  type: 'test'
+  ...
+# Subtest: portable browser acceptance cases also pass in Node: wasm
+ok 57 - portable browser acceptance cases also pass in Node: wasm
+  ---
+  duration_ms: 10.818217
+  type: 'test'
+  ...
+1..57
+# tests 57
+# suites 0
+# pass 57
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 128.096357

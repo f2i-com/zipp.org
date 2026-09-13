@@ -45,6 +45,49 @@ env:
   WASM_BINDGEN_CLI: "0.2.126"
 
 jobs:
+  python:
+    name: Python frontend, project files and GPU contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || '' }}
+          persist-credentials: false
+      - name: Install Rust and wasm32 target
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown --toolchain 1.92.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Test the Python-enabled VM and CLI (including filesystem policy)
+        run: |
+          cargo +1.92.0 test --locked -p zipp-vm --features python --test python_frontend --test python_project --test python_corpus --test python_torch --test python_javascript
+          cargo +1.92.0 test --locked -p zipp-vm --features python-js-interop --test python_javascript
+          cargo +1.92.0 test --locked -p zipp-cli
+      - name: Build the Python-enabled browser artifact
+        working-directory: crates/zipp-wasm
+        run: |
+          cargo +1.92.0 install wasm-bindgen-cli --locked --version "=$WASM_BINDGEN_CLI"
+          export ZIPP_SOURCE_SHA="$(git rev-parse HEAD)"
+          ./build-variants.sh all
+          wasm-bindgen --target nodejs --out-dir tests/node/pkg target/variants/all/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          node -e 'if (!JSON.parse(require("./tests/node/pkg/zipp_wasm.js").zippProfile()).languages.includes("python")) throw Error("Python feature missing")'
+          node tests/node/python-frontend.cjs
+          node tests/node/python-gpu.cjs
+          node tests/node/python-conv2d.cjs
+          node tests/node/python-training.cjs
+          node tests/node/python-javascript.cjs
+          ./build-variants.sh interop
+          wasm-bindgen --target nodejs --out-dir tests/node/pkg target/variants/interop/wasm32-unknown-unknown/release/zipp_wasm.wasm
+          node tests/node/python-javascript.cjs --enabled
+      - name: Test portable GPU contracts and Python graph authoring
+        working-directory: crates/zipp-wasm/gpu-lab
+        run: |
+          npm test
+          python3 tests/test_python.py
+
   engine:
     name: Engine (unit tests + audit regressions)
     runs-on: ubuntu-latest
@@ -74,13 +117,14 @@ jobs:
       - name: Validate the test quarantine manifest
         run: python3 tools/ci_quarantine.py --check --print
       - name: Test Test262 scoring and failure gate
-        run: python3 -B -m unittest tools.test_run_test262
+        run: python3 -B -m unittest tools.test_run_test262 tools.test_run_test262_dual
       - name: Unit tests and the audit-day regressions (default profile)
         run: >-
           cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast
           --lib
           --test call_order_default
-          --test global_fingerprint
+          --test class_body_bindings --test annexb_arguments_bindings
+          --test intl_locale_fallback --test global_fingerprint
           --test audit_20260911_host_work
           --test audit_20260911_test262_gaps
           --test audit_20260912_buffer_reentrancy

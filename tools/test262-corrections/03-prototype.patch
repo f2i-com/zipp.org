@@ -1,0 +1,12 @@
+--- a/test/staging/sm/Error/prototype.js
++++ b/test/staging/sm/Error/prototype.js
+@@ -10,7 +10,8 @@
+ 
+ assert.sameValue(Reflect.getPrototypeOf(Error.prototype), Object.prototype)
+ 
+-for (const error of nativeErrors) {
++// Error itself is asserted above; the harness also includes it.
++for (const error of nativeErrors.filter(ctor => ctor !== Error)) {
+     assert.sameValue(Reflect.getPrototypeOf(error.prototype), Error.prototype);
+ }
+ 

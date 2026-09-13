@@ -1,2 +1,12 @@
 *.sh text eol=lf
+tools/test262-corrections/** text eol=lf
+# Unified patches encode empty context lines as one space; preserve that syntax.
+tools/test262-corrections/*.patch whitespace=-blank-at-eol,-blank-at-eof
 bench/pgo-training/** text eol=lf
+
+# Preserve upstream parser sources/snapshots, including generated whitespace.
+crates/rustpython-parser-fork/** text eol=lf
+crates/rustpython-parser-fork/README.md whitespace=-blank-at-eol
+crates/rustpython-parser-fork/src/lib.rs whitespace=-blank-at-eol
+crates/rustpython-parser-fork/src/parser.rs whitespace=-blank-at-eol
+crates/rustpython-parser-fork/src/python.rs whitespace=-blank-at-eol

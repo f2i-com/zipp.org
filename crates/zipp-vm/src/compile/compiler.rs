@@ -601,11 +601,16 @@ impl Compiler {
             // must NOT touch (B.3.3 skip). Existing FUNCTION names are blockers (no
             // NEW b33 var) but are NOT protected — a block function updates them.
             let mut protect = std::collections::HashSet::new();
-            for p in params {
+            let mut parameter_bindings = fc.param_names.clone();
+            if let Some(pa) = params_ast {
+                parameter_bindings.extend(param_pattern_leaves(pa));
+            }
+            for p in &parameter_bindings {
                 blockers.insert(p.clone());
                 protect.insert(p.clone());
             }
-            // B.3.3.1 and `arguments`: a BLOCKER but deliberately NOT protected.
+            // B.3.3.1 and `arguments`: retain the block binding and outer sync,
+            // but do not create or initialize a new outer var below.
             // The extension's outer guard is `paramNames does not contain F`, and
             // since ES2018 `paramNames` is never mutated to hold "arguments" — the
             // arguments object is appended to a SEPARATE `paramBindings` list — so
@@ -627,9 +632,6 @@ impl Compiler {
             // `arguments` as a genuine FORMAL PARAMETER is unaffected: the params
             // loop above puts it in both sets, which is correct, because then
             // paramNames really does contain it and the whole extension is skipped.
-            if !is_script {
-                blockers.insert("arguments".to_string());
-            }
             for s in body {
                 match s {
                     ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
@@ -695,6 +697,14 @@ impl Compiler {
                     collect_b33_block_fns(s, false, &blockers, &mut b33);
                 }
                 for name in &b33 {
+                    if name == "arguments" && fc.arguments_reg.is_some() {
+                        // FunctionDeclarationInstantiation already created this
+                        // binding. Keep the arguments object until the block's
+                        // declaration evaluates; b33_names still makes a lexical
+                        // block function and emits its later outer update. An
+                        // arrow has no own arguments object and needs a var.
+                        continue;
+                    }
                     // CreateMutableBinding + InitializeBinding(undefined) at entry.
                     let reg = fc.declare_local(name);
                     if fc.cell_regs.contains(&reg) {
@@ -1013,56 +1023,7 @@ impl Compiler {
         // names, the three immutable global value spellings take this path so a
         // same-named local lexical shadows them from body entry and observes TDZ.
         if !is_script {
-            let mut lex = std::collections::HashSet::new();
-            for s in body {
-                match s {
-                    ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
-                        for decl in &d.decls {
-                            capture::collect_pattern_names(&decl.id, &mut lex);
-                        }
-                    }
-                    ast::Stmt::ClassDecl(c) => {
-                        if let Some(id) = &c.name {
-                            lex.insert(id.to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Sorted: this loop calls alloc_reg(), so raw HashSet order would
-            // hand out CELL REGISTERS in a different order per compile.
-            for name in &crate::compile::helpers::sorted_name_vec(&lex) {
-                // `box_all_locals` here means "this body references `eval`". A
-                // direct eval may name any of these lexicals, but
-                // `capture::captured_locals` cannot see inside the eval STRING, so
-                // `fc.captured` does not list them. Without the cell at entry, the
-                // function declarations materialised just below — they compile
-                // BEFORE the body's textual statements — snapshot an environment
-                // with no such binding, and the eval inside one resolved the name
-                // as a global:
-                //   (function(){ let a=1; function f(){ return eval("a"); }
-                //                return f(); })()   // ReferenceError
-                // while the same code with a function EXPRESSION worked. That is
-                // what killed every sm/expressions/destructuring-array-default-*
-                // (their harness evals `class D extends C` from a nested function
-                // declaration, with `C` a lexical of the enclosing IIFE).
-                if (fc.captured.contains(name)
-                    || fc.box_all_locals
-                    || matches!(name.as_str(), "undefined" | "NaN" | "Infinity"))
-                    && !fc.scopes[0].iter().any(|(n, _)| n == name)
-                {
-                    // Box a TDZ cell: a read before the textual declaration runs
-                    // (e.g. via a forward-materialised function) throws a
-                    // ReferenceError rather than reading undefined.
-                    let r = fc.alloc_reg();
-                    fc.scopes[0].push((name.clone(), r));
-                    fc.emit(Instr::MakeCellTdz { reg: r });
-                    fc.cell_regs.insert(r);
-                    fc.entry_lexicals.insert(name.clone());
-                    // `const`-ness is recorded by the textual declaration (which
-                    // reuses this reg), so an assignment after it still TypeErrors.
-                }
-            }
+            fc.predeclare_body_lexicals(body);
         }
 
         // Materialise top-level function declarations at entry so a forward call or
@@ -1416,6 +1377,14 @@ impl Compiler {
                 fc.bind_params(pa)?;
             }
         }
+        // Hoisted declarations must capture the method/constructor's own
+        // bindings even when their textual declarations appear later.
+        for local in hoisted_var_names(body) {
+            if !fc.scopes[0].iter().any(|(n, _)| n == &local) {
+                fc.declare_local(&local);
+            }
+        }
+        fc.predeclare_body_lexicals(body);
         for s in body {
             if let ast::Stmt::FnDecl(f) = s {
                 if let Some(id) = &f.name {
@@ -1430,10 +1399,20 @@ impl Compiler {
         // registered and never disposed, so `class C { static { using x = r; } }`
         // never ran r[Symbol.dispose]
         // (staging/explicit-resource-management/call-dispose-methods.js).
+        // Hoisted function declarations are materialised at entry (see
+        // `compile_function_body`).
+        for s in body {
+            if let ast::Stmt::FnDecl(f) = s {
+                fc.func_decl(f)?;
+            }
+        }
         if FnCompiler::block_has_using(body) {
-            fc.compile_using_block(body, false)?;
+            fc.compile_using_block(body, true)?;
         } else {
             for s in body {
+                if let ast::Stmt::FnDecl(_) = s {
+                    continue;
+                }
                 fc.stmt(s)?;
             }
         }
@@ -1562,6 +1541,50 @@ impl Compiler {
                 fc.emit(Instr::Return { src: r });
             }
             ast::ArrowBody::Block(b) => {
+                // Sloppy arrows also run FunctionDeclarationInstantiation's
+                // Annex B pass. In particular, `arguments` here is an own var,
+                // not the enclosing function's implicit arguments object.
+                if !is_strict {
+                    let mut blockers: HashSet<String> = fc.param_names.iter().cloned().collect();
+                    blockers.extend(param_pattern_leaves(&a.params));
+                    for s in &b.stmts {
+                        match s {
+                            ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                                for decl in &d.decls {
+                                    capture::collect_pattern_names(&decl.id, &mut blockers);
+                                }
+                            }
+                            ast::Stmt::ClassDecl(c) => {
+                                if let Some(id) = &c.name {
+                                    blockers.insert(id.to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    fc.protect_names = blockers.clone();
+                    for s in &b.stmts {
+                        if let Some(id) = labelled_fn_decl(s).and_then(|f| f.name.as_ref()) {
+                            blockers.insert(id.to_string());
+                        }
+                    }
+                    let mut b33 = HashSet::new();
+                    for s in &b.stmts {
+                        collect_b33_block_fns(s, false, &blockers, &mut b33);
+                    }
+                    for name in &sorted_name_vec(&b33) {
+                        let reg = fc.declare_local(name);
+                        if fc.cell_regs.contains(&reg) {
+                            let t = fc.temp();
+                            fc.emit(Instr::LoadUndefined { dst: t });
+                            fc.emit(Instr::CellSet { cell: reg, src: t });
+                            fc.dec_next_reg(1);
+                        } else {
+                            fc.emit(Instr::LoadUndefined { dst: reg });
+                        }
+                    }
+                    fc.b33_names = b33;
+                }
                 // hoist nested function declarations (same as a normal body)
                 for s in &b.stmts {
                     if let ast::Stmt::FnDecl(f) = s {
@@ -1658,7 +1681,18 @@ impl Compiler {
                         }
                     }
                 }
+                // Function declarations are materialised at entry, as in a
+                // function body: a reference textually above the declaration
+                // (`const t = [g]; function g() {}`) already sees the function.
                 for s in &b.stmts {
+                    if let ast::Stmt::FnDecl(f) = s {
+                        fc.func_decl(f)?;
+                    }
+                }
+                for s in &b.stmts {
+                    if let ast::Stmt::FnDecl(_) = s {
+                        continue;
+                    }
                     fc.stmt(s)?;
                 }
                 fc.emit(Instr::ReturnUndefined);
@@ -1801,5 +1835,61 @@ mod m1_tests {
             "compiler throughput degraded by {:.3}x from 12k to 24k functions",
             ns_per_mb[3] / ns_per_mb[2]
         );
+    }
+}
+
+impl<'a> FnCompiler<'a> {
+    /// Allocate function-body lexical cells before hoisted closures capture them.
+    fn predeclare_body_lexicals(&mut self, body: &[ast::Stmt]) {
+        let mut lex = std::collections::HashSet::new();
+        for s in body {
+            match s {
+                ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                    for decl in &d.decls {
+                        capture::collect_pattern_names(&decl.id, &mut lex);
+                    }
+                }
+                ast::Stmt::ClassDecl(c) => {
+                    if let Some(id) = &c.name {
+                        lex.insert(id.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Sorted: this loop calls alloc_reg(), so raw HashSet order would
+        // hand out CELL REGISTERS in a different order per compile.
+        for name in &crate::compile::helpers::sorted_name_vec(&lex) {
+            // `box_all_locals` here means "this body references `eval`". A
+            // direct eval may name any of these lexicals, but
+            // `capture::captured_locals` cannot see inside the eval STRING, so
+            // `self.captured` does not list them. Without the cell at entry, the
+            // function declarations materialised just below — they compile
+            // BEFORE the body's textual statements — snapshot an environment
+            // with no such binding, and the eval inside one resolved the name
+            // as a global:
+            //   (function(){ let a=1; function f(){ return eval("a"); }
+            //                return f(); })()   // ReferenceError
+            // while the same code with a function EXPRESSION worked. That is
+            // what killed every sm/expressions/destructuring-array-default-*
+            // (their harness evals `class D extends C` from a nested function
+            // declaration, with `C` a lexical of the enclosing IIFE).
+            if (self.captured.contains(name)
+                || self.box_all_locals
+                || matches!(name.as_str(), "undefined" | "NaN" | "Infinity"))
+                && !self.scopes[0].iter().any(|(n, _)| n == name)
+            {
+                // Box a TDZ cell: a read before the textual declaration runs
+                // (e.g. via a forward-materialised function) throws a
+                // ReferenceError rather than reading undefined.
+                let r = self.alloc_reg();
+                self.scopes[0].push((name.clone(), r));
+                self.emit(Instr::MakeCellTdz { reg: r });
+                self.cell_regs.insert(r);
+                self.entry_lexicals.insert(name.clone());
+                // `const`-ness is recorded by the textual declaration (which
+                // reuses this reg), so an assignment after it still TypeErrors.
+            }
+        }
     }
 }

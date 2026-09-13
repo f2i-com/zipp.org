@@ -1,0 +1,56 @@
+--- a/test/annexB/language/function-code/block-decl-func-skip-arguments.js
++++ b/test/annexB/language/function-code/block-decl-func-skip-arguments.js
+@@ -6,21 +6,10 @@
+ esid: sec-web-compat-functiondeclarationinstantiation
+ flags: [noStrict]
+ info: |
+-    FunctionDeclarationInstantiation ( _func_, _argumentsList_ )
+-
+-    [...]
+-    7. Let _parameterNames_ be the BoundNames of _formals_.
+-    [...]
+-    22. If argumentsObjectNeeded is true, then
+-      f. Append "arguments" to parameterNames.
+-
+-    Changes to FunctionDeclarationInstantiation
+-
+-    [...]
+-    ii. If replacing the |FunctionDeclaration| _f_ with a |VariableStatement| that has _F_
+-        as a |BindingIdentifier| would not produce any Early Errors for _func_ and _F_ is
+-        not an element of _parameterNames_, then
+-      [...]
++    Current Annex B checks formal parameter names when deciding whether
++    to create a legacy var binding. The implicit arguments object is
++    not a formal parameter. At the block declaration, that binding is
++    updated to the block function.
+ ---*/
+ 
+ // Simple parameters
+@@ -31,7 +20,8 @@
+     function arguments() {}
+     assert.sameValue(arguments(), undefined);
+   }
+-  assert.sameValue(arguments.toString(), "[object Arguments]");
++  assert.sameValue(typeof arguments, "function");
++  assert.sameValue(arguments(), undefined);
+ }());
+ 
+ // Single named parameter
+@@ -42,7 +32,8 @@
+     function arguments() {}
+     assert.sameValue(arguments(), undefined);
+   }
+-  assert.sameValue(arguments.toString(), "[object Arguments]");
++  assert.sameValue(typeof arguments, "function");
++  assert.sameValue(arguments(), undefined);
+ }());
+ 
+ // Non-simple parameters
+@@ -53,5 +44,6 @@
+     function arguments() {}
+     assert.sameValue(arguments(), undefined);
+   }
+-  assert.sameValue(arguments.toString(), "[object Arguments]");
++  assert.sameValue(typeof arguments, "function");
++  assert.sameValue(arguments(), undefined);
+ }());

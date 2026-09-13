@@ -1,0 +1,18 @@
+cat says meow | rex says woof loudly | yip: bit says woof loudly
+Animal('cat') cat cat [Animal('cat'), Animal('rex')]
+MEOW! purr PURR!
+3 3 animalia made says woof loudly
+['sit', 'roll']
+True False True True
+[Animal('bit'), Animal('cat'), Animal('rex')] True False True
+True Puppy Puppy True
+Puppy Animal True False none
+Vector(4, 5) Vector(2, 3) Vector(6, 8) Vector(6, 8) Vector(-3, -4) 5.0 2 3 4 [3, 4] True False
+True False Vector(30, 40) (3, 4) [6, 8]
+3 4
+111
+42 dynamic-anything True
+True False
+[1, 2] 2 2 True [1, 2, 3]
+212.0 -40.0
+<class 'int'> <class 'str'> <class 'NoneType'> float True

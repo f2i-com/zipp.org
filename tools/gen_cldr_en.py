@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate `crates/zipp-vm/src/vm/cldr_en.rs` from the upstream CLDR JSON release.
+"""Generate compact locale tables from the upstream CLDR JSON release.
 
-zipp advertises exactly one locale (`[[AvailableLocales]] = ["en", "en-US"]`,
-see `vm/intl.rs`), so this is the whole of the locale content it ships — V8's
-`small-icu` shape. Every string below is copied verbatim out of the CLDR release
+Most Intl services ship en/en-US. DateTimeFormat ships English, German,
+Japanese, Chinese and Egyptian Arabic tables from CLDR 48. Use
+`--locale de --date-time-only` for that service's German tables. Every string
+below is copied verbatim out of the CLDR release
 named by `--version`; nothing here is hand-written, translated or guessed.
 
 Inputs (download side by side into one directory, or pass a cldr-json checkout):
@@ -23,12 +24,18 @@ Usage:
     python tools/gen_cldr_en.py <dir-with-the-json> --version 47.0.0 \
         -o crates/zipp-vm/src/vm/cldr_en.rs
 
-CLDR 47 is the release ICU 77 carries, which is what node 24 links; that pairing
-is deliberate, because it makes `node` an exact value-by-value oracle for this
-table rather than an approximate one.
+    python tools/gen_cldr_en.py <dir-with-German-json> --version 48.0.0 \
+        --locale de --date-time-only -o crates/zipp-vm/src/vm/cldr_de.rs
+
+The legacy full English table remains on CLDR 47. DateTimeFormat additionally
+reads supplemental timeData/likelySubtags, timeZoneNames and calendar JSONs;
+Japanese and Chinese also need cldr-rbnf's locale rbnf.json for date-style
+number annotations. Generated headers list every input and its source hash.
+Node comparisons must account for the ICU/CLDR version linked by that build.
 """
 
 import argparse
+import re
 import hashlib
 import json
 import os
@@ -101,13 +108,35 @@ def load(root, *rel):
     sys.exit("missing input: none of %s under %s" % (", ".join(rel), root))
 
 
+def lunar_day_from_rbnf(rules, name, value, depth=0):
+    """Expand the pinned CLDR small-integer rules into a finite day-name table."""
+    if not 0 <= value <= 31 or depth > 12:
+        raise ValueError("unsupported lunar-day RBNF input")
+    base, pattern = max((int(k), p) for k, p in rules[name] if k.isdigit() and int(k) <= value)
+    divisor = 10 ** (len(str(base)) - 1) if base else 1
+    remainder = value % divisor
+    pattern = pattern.removesuffix(';')
+    pattern = re.sub(r'\[([^\[\]]*)\]', lambda m: m[1] if remainder else '', pattern)
+    pattern = re.sub(r'=([^=]+)=', lambda m: lunar_day_from_rbnf(rules, m[1], value, depth + 1), pattern)
+    if '←←' in pattern:
+        pattern = pattern.replace('←←', lunar_day_from_rbnf(rules, name, value // divisor, depth + 1))
+    if '→→' in pattern:
+        pattern = pattern.replace('→→', lunar_day_from_rbnf(rules, name, remainder, depth + 1))
+    if any(c in pattern for c in '←→=[];'):
+        raise ValueError("unsupported lunar-day RBNF syntax")
+    return pattern
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("root", help="directory holding the CLDR JSON files")
+    ap.add_argument("--date-time-only", action="store_true", help="emit only DateTimeFormat data")
+    ap.add_argument("--locale", default="en", choices=["en", "de", "ja", "zh", "ar-EG"], help="CLDR locale to emit")
     ap.add_argument("--version", required=True, help="CLDR release, e.g. 47.0.0")
     ap.add_argument("-o", "--out", required=True)
     a = ap.parse_args()
 
+    locale = a.locale
     src_digests = []
 
     def get(*rel):
@@ -116,20 +145,21 @@ def main():
         src_digests.append((os.path.basename(p), h))
         return obj
 
-    gregorian = get("ca-gregorian.json", "cldr-dates-full/main/en/ca-gregorian.json")
-    gregorian = gregorian["main"]["en"]["dates"]["calendars"]["gregorian"]
+    gregorian = get("ca-gregorian.json", f"cldr-dates-full/main/{locale}/ca-gregorian.json")
+    gregorian = gregorian["main"][locale]["dates"]["calendars"]["gregorian"]
     dayperiods = get("dayPeriods.json", "cldr-core/supplemental/dayPeriods.json")
-    dp_rules = dayperiods["supplemental"]["dayPeriodRuleSet"]["en"]
-    fields = get("dateFields.json", "cldr-dates-full/main/en/dateFields.json")
-    fields = fields["main"]["en"]["dates"]["fields"]
-    numbers = get("numbers.json", "cldr-numbers-full/main/en/numbers.json")
-    numbers = numbers["main"]["en"]["numbers"]
-    units = get("units.json", "cldr-units-full/main/en/units.json")
-    units = units["main"]["en"]["units"]
-    lists = get("listPatterns.json", "cldr-misc-full/main/en/listPatterns.json")
-    lists = lists["main"]["en"]["listPatterns"]
-    ldn = get("localeDisplayNames.json", "cldr-localenames-full/main/en/localeDisplayNames.json")
-    ldn = ldn["main"]["en"]["localeDisplayNames"]
+    dp_rules = dayperiods["supplemental"]["dayPeriodRuleSet"][locale.split('-')[0]]
+    fields = get("dateFields.json", f"cldr-dates-full/main/{locale}/dateFields.json")
+    fields = fields["main"][locale]["dates"]["fields"]
+    numbers = get("numbers.json", f"cldr-numbers-full/main/{locale}/numbers.json")
+    numbers = numbers["main"][locale]["numbers"]
+    if not a.date_time_only:
+        units = get("units.json", f"cldr-units-full/main/{locale}/units.json")
+        units = units["main"][locale]["units"]
+        lists = get("listPatterns.json", f"cldr-misc-full/main/{locale}/listPatterns.json")
+        lists = lists["main"][locale]["listPatterns"]
+        ldn = get("localeDisplayNames.json", f"cldr-localenames-full/main/{locale}/localeDisplayNames.json")
+        ldn = ldn["main"][locale]["localeDisplayNames"]
     # ── the non-gregorian calendars Intl.DateTimeFormat can resolve ──────────
     # One CLDR package per calendar (`cldr-cal-<x>-full/main/en/ca-<x>.json`).
     # `islamic` covers the three variants ECMA-402 lists separately
@@ -141,13 +171,39 @@ def main():
                  "indian", "islamic", "japanese", "persian", "roc"]
     cal_data = {}
     for c in cal_files:
-        obj = get("ca-%s.json" % c, "cldr-cal-%s-full/main/en/ca-%s.json" % (c, c))
-        cal_data[c] = obj["main"]["en"]["dates"]["calendars"][c]
+        obj = get("ca-%s.json" % c, "cldr-cal-%s-full/main/%s/ca-%s.json" % (c, locale, c))
+        cal_data[c] = obj["main"][locale]["dates"]["calendars"][c]
+
+    if a.date_time_only:
+        zones = get("timeZoneNames.json", f"cldr-dates-full/main/{locale}/timeZoneNames.json")["main"][locale]["dates"]["timeZoneNames"]
+        time_data = get("timeData.json", "cldr-core/supplemental/timeData.json")["supplemental"]["timeData"]
+        likely = get("likelySubtags.json", "cldr-core/supplemental/likelySubtags.json")["supplemental"]["likelySubtags"]
+        territory = next((s for s in locale.split('-')[1:] if len(s) == 2 and s.isupper()), None)
+        if territory is None:
+            territory = likely[locale.split('-')[0]].replace('_', '-').split('-')[-1]
+        clock = time_data[territory]
+        cycles = {'h': 'h12', 'H': 'h23', 'K': 'h11', 'k': 'h24'}
+        hour_cycle = cycles[clock['_preferred']]
+        hour_cycle12 = next(cycles[s[0]] for s in clock['_allowed'].split() if s[0] in 'hK')
+        first_year = ''
+        lunar_days = []
+        if locale in ['ja', 'zh']:
+            rules = get('rbnf.json', f'cldr-rbnf/rbnf/{locale}.json')['rbnf']['rbnf']['SpelloutRules']
+            if locale == 'ja':
+                first_year = dict(rules['%spellout-numbering-year-latn'])['1'].removesuffix(';')
+            else:
+                lunar_days = [lunar_day_from_rbnf(rules, '%spellout-numbering-days', day) for day in range(1, 31)]
+
+    def pattern_value(mapping, key):
+        # CLDR explicitly supplies ASCII alternatives for spacing around AM/PM.
+        # Use that supported presentation consistently in format and parts.
+        value = mapping.get(key + '-alt-ascii', mapping[key]) if a.date_time_only else mapping[key]
+        return value['_value'] if isinstance(value, dict) else value
 
     L = []
     w = L.append
 
-    w("//! CLDR `en` locale content — GENERATED by `tools/gen_cldr_en.py`, do not edit.")
+    w(f"//! CLDR `{locale}` locale content — GENERATED by `tools/gen_cldr_en.py`, do not edit.")
     w("//!")
     w("//! Source: CLDR release %s (https://github.com/unicode-org/cldr-json, tag %s),"
       % (a.version, a.version))
@@ -155,12 +211,8 @@ def main():
     for name, h in src_digests:
         w("//!   %-24s %s" % (name, h))
     w("//!")
-    w("//! zipp's `[[AvailableLocales]]` is exactly `[\"en\", \"en-US\"]`, so this file is")
-    w("//! the engine's ENTIRE locale content: shipping it makes that advertised claim")
-    w("//! true end to end instead of approximately true. Nothing here is invented — a")
-    w("//! value absent from CLDR is absent here, and the callers fall back rather than")
-    w("//! guess. CLDR 47 is the release ICU 77 / node 24 carry, which is what makes")
-    w("//! `node` an exact oracle for these values (see `tools/gen_cldr_en.py`).")
+    w("//! Locale availability is service-specific; these are upstream data, not")
+    w("//! a promise that every Intl service supports this locale. See intl/shared.rs.")
     w("#![allow(dead_code)]")
     w("")
     w("/// The CLDR release these tables were cut from.")
@@ -257,7 +309,7 @@ def main():
     for cid, src in CAL_ID_SOURCE:
         df = cal_data[src]["dateFormats"]
         w("    (%s, [%s, %s, %s, %s])," % (
-            rs(cid), rs(df["full"]), rs(df["long"]), rs(df["medium"]), rs(df["short"])))
+            rs(cid), *(rs(pattern_value(df, style)) for style in STYLES4)))
     w("];")
     w("")
     w("pub const DAY_PERIODS: &[(&str, &str, &str, &str)] = &[")
@@ -271,7 +323,7 @@ def main():
         h, m = t.split(":")
         return int(h) * 60 + int(m)
 
-    w("/// UTS #35 §4.7 flexible day-period rules for `en` (supplemental/dayPeriods.json).")
+    w(f"/// UTS #35 §4.7 flexible day-period rules for `{locale}` (supplemental/dayPeriods.json).")
     w("/// `(key, at, from, before)` in minutes past local midnight; `at` is -1 for a")
     w("/// range rule, and `from`/`before` are -1 for an instant rule. `at` rules win.")
     w("pub const DAY_PERIOD_RULES: &[(&str, i32, i32, i32)] = &[")
@@ -286,9 +338,9 @@ def main():
     # ── date/time patterns ─────────────────────────────────────────────────
     w("// ── date/time patterns, indexed [full, long, medium, short]")
     w("pub const DATE_FORMATS: [&str; 4] = [%s];"
-      % ", ".join(rs(gregorian["dateFormats"][s]) for s in STYLES4))
+      % ", ".join(rs(pattern_value(gregorian["dateFormats"], s)) for s in STYLES4))
     w("pub const TIME_FORMATS: [&str; 4] = [%s];"
-      % ", ".join(rs(gregorian["timeFormats"][s]) for s in STYLES4))
+      % ", ".join(rs(pattern_value(gregorian["timeFormats"], s)) for s in STYLES4))
     w("/// The `{1} … {0}` glue joining a date pattern to a time pattern.")
     w("pub const DATETIME_GLUE: [&str; 4] = [%s];"
       % ", ".join(rs(gregorian["dateTimeFormats"][s]) for s in STYLES4))
@@ -307,7 +359,7 @@ def main():
     for k, v in sorted(gregorian["dateTimeFormats"]["availableFormats"].items()):
         if "-alt-" in k:
             continue  # `-alt-ascii` duplicates the default with ASCII spacing
-        w("    (%s, %s)," % (rs(k), rs(v)))
+        w("    (%s, %s)," % (rs(k), rs(pattern_value(gregorian["dateTimeFormats"]["availableFormats"], k))))
     w("];")
     w("")
     w("/// `appendItems`: how a requested field that the matched pattern does not")
@@ -338,6 +390,65 @@ def main():
     w("/// Used when no interval pattern matches: format both endpoints and join.")
     w("pub const INTERVAL_FALLBACK: &str = %s;" % rs(ivf["intervalFormatFallback"]))
     w("")
+
+    if a.date_time_only:
+        w("pub const JAPANESE_FIRST_YEAR: &str = %s;" % rs(first_year))
+        w("pub const LUNAR_DAY_NAMES: &[&str] = &[%s];" % ', '.join(rs(day) for day in lunar_days))
+        w("pub const CAL_DATE_NUMBER_SYSTEMS: &[(&str, [&str; 4])] = &[")
+        for cid, src in CAL_ID_SOURCE:
+            df = cal_data[src]['dateFormats']
+            overrides = [df[s].get('_numbers', '') if isinstance(df[s], dict) else '' for s in STYLES4]
+            if any(overrides):
+                w("    (%s, [%s])," % (rs(cid), ', '.join(rs(s) for s in overrides)))
+        w("];")
+        w("/// Calendar-specific skeletons and intervals; gregorian is not a universal template.")
+        w("pub const CAL_PATTERNS: &[super::dtf_locale::CalendarPatterns] = &[")
+        for cid, src in CAL_ID_SOURCE:
+            node = cal_data[src]
+            formats = node['dateTimeFormats']
+            w("    super::dtf_locale::CalendarPatterns {")
+            w("        id: %s," % rs(cid))
+            w("        available_formats: &[")
+            for key in sorted(formats['availableFormats']):
+                if '-alt-' not in key:
+                    w("            (%s, %s)," % (rs(key), rs(pattern_value(formats['availableFormats'], key))))
+            w("        ],")
+            w("        interval_formats: &[")
+            intervals = formats['intervalFormats']
+            for key in sorted(intervals):
+                if key != 'intervalFormatFallback' and '-alt-' not in key:
+                    for greatest in sorted(intervals[key]):
+                        w("            (%s, %s, %s)," % (rs(key), rs(greatest), rs(intervals[key][greatest])))
+            w("        ],")
+            w("        interval_fallback: %s," % rs(intervals['intervalFormatFallback']))
+            glue = node.get('dateTimeFormats-atTime', {}).get('standard', formats)
+            w("        datetime_glue_at: [%s]," % ', '.join(rs(glue[s]) for s in STYLES4))
+            w("    },")
+        w("];")
+        w("pub const CYCLIC_YEARS: &[(&str, &[&str])] = &[")
+        for cid, src in CAL_ID_SOURCE:
+            cyclic = cal_data[src].get('cyclicNameSets', {}).get('years', {}).get('format', {}).get('abbreviated')
+            if cyclic:
+                w("    (%s, &[%s])," % (rs(cid), ', '.join(rs(cyclic[str(i)]) for i in range(1, 61))))
+        w("];")
+        w("/// Leap-month templates in wide/abbreviated/narrow/numeric order, for both contexts.")
+        w("pub const LEAP_MONTH_PATTERNS: &[(&str, [&str; 4], [&str; 4])] = &[")
+        for cid, src in CAL_ID_SOURCE:
+            leap = cal_data[src].get('monthPatterns')
+            if leap:
+                forms = []
+                for form in ['format', 'stand-alone']:
+                    forms.append('[' + ', '.join(rs(leap[form][width]['leap']) for width in ['wide','abbreviated','narrow']) + ', ' + rs(leap['numeric']['all']['leap']) + ']')
+                w("    (%s, %s, %s)," % (rs(cid), *forms))
+        w("];")
+        w("pub const DEFAULT_HOUR_CYCLE: &str = %s;" % rs(hour_cycle))
+        w("pub const DEFAULT_HOUR_CYCLE12: &str = %s;" % rs(hour_cycle12))
+        w("pub const DEFAULT_NUMBERING_SYSTEM: &str = %s;" % rs(numbers['defaultNumberingSystem']))
+        w("pub const SYM_DECIMAL: &str = %s;" % rs(numbers["symbols-numberSystem-latn"]["decimal"]))
+        w("pub const UTC_LONG: &str = %s;" % rs(zones["zone"]["Etc"]["UTC"]["long"]["standard"]))
+        open(a.out, "w", encoding="utf-8", newline="\n").write("\n".join(L) + "\n")
+        print("wrote %s (%d lines)" % (a.out, len(L)))
+        return
 
     # ── list patterns ──────────────────────────────────────────────────────
     w("/// ListFormat patterns: `(type, style, two, start, middle, end)`.")

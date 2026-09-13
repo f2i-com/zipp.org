@@ -1,0 +1,9 @@
+a True 3 Meta True
+[('C1', 'x'), ('C2', None)]
+unset
+8 _x
+1 2
+slots: 'S' object has no attribute 'c' and no __dict__ for setting new attributes
+G[<class 'int'>]
+V(3) V(3) V(6) V(-2) 5 False True [V(1), V(3)] {V(2)} 8 True 3 [2, 2] 7 <   2> 3 2 2.0 V(3)
+[classes] TypeError: '>=' not supported between instances of 'V' and 'V'

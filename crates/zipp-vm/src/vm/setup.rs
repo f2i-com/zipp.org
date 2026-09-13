@@ -2199,7 +2199,14 @@ impl<'p> Vm<'p> {
                 self.proto_of.insert(proto, Value::heap(obj_proto));
                 self.intl_protos[kind as usize] = proto;
                 let statics: Vec<(&str, u16)> = if slo {
-                    vec![("supportedLocalesOf", INTL_SUPPORTED_LOCALES_OF)]
+                    vec![(
+                        "supportedLocalesOf",
+                        if kind == native::INTL_DATETIMEFORMAT {
+                            INTL_DTF_SUPPORTED_LOCALES_OF
+                        } else {
+                            INTL_SUPPORTED_LOCALES_OF
+                        },
+                    )]
                 } else {
                     vec![]
                 };

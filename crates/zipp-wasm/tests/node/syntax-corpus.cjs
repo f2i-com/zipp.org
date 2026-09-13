@@ -1,5 +1,5 @@
 // The parse-shape limits in the hardened profile are calibrated against THIS
-// artifact: a wasm module linked with -zstack-size=1048576. Every other test of
+// artifact: a wasm module linked with -zstack-size=16777216. Every other test of
 // them runs natively, where a frame costs an order of magnitude more and the
 // stack is whatever the host thread was given, so nothing here can be inferred
 // from a `cargo test` run.

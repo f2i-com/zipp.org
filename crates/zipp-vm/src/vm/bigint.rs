@@ -287,6 +287,24 @@ impl<'p> Vm<'p> {
         va: Value,
         vb: Value,
     ) -> Result<Value, Thrown> {
+        // Two fast-tier BigInts need no coercion; a checked op that fails
+        // (overflow, zero divisor) takes the general path below.
+        if let Some((x, y)) = self.small_bigint_pair(va, vb) {
+            let r = match op {
+                BigOp::Add => x.checked_add(y),
+                BigOp::Sub => x.checked_sub(y),
+                BigOp::Mul => x.checked_mul(y),
+                BigOp::Div => x.checked_div(y),
+                BigOp::Mod => x.checked_rem(y),
+                BigOp::And => Some(x & y),
+                BigOp::Or => Some(x | y),
+                BigOp::Xor => Some(x ^ y),
+                _ => None,
+            };
+            if let Some(r) = r {
+                return Ok(self.make_bigint(r));
+            }
+        }
         // GC INVARIANT: `pa` (possibly a fresh primitive from va's valueOf) is
         // held in a Rust local — unrooted — while vb's coercion runs user code.
         let _gc = self.gc_lock_guard();

@@ -15,13 +15,19 @@ path = "src/main.rs"
 # which enables mimalloc/secure and excludes unsafe/JIT engine features. Keep an
 # opt-in hardened allocator here for deployments that accept its measured cost.
 mimalloc = { version = "0.1.52", default-features = false }
+serde_json = "1.0"
 # The CLI's explicit `sandbox` command uses the VM's instruction/heap meter.
 # Ordinary `zipp js` does not attach a recorder, preserving its semantics; the
 # feature contributes one predictable null check to interpreted dispatch.
 zipp-vm = { path = "../zipp-vm", features = ["instrument"] }
 
 [features]
-default = []
+# The experimental Python-subset frontend (`zipp py file.py`, `zipp run`,
+# `--lang=python`). Default-on for the CLI only; `--no-default-features`
+# yields the JavaScript-only binary.
+default = ["python"]
+python = ["zipp-vm/python"]
+python-js-interop = ["python", "zipp-vm/python-js-interop"]
 secure-allocator = ["mimalloc/secure"]
 regex-linear = ["zipp-vm/regex-linear"]
 

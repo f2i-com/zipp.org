@@ -5245,7 +5245,8 @@ impl<'p> Vm<'p> {
                         ip += 1;
                     }
                     Instr::LoadBigInt { dst, value } => {
-                        let v = Value::heap(self.heap.alloc(HeapObj::BigInt(value)));
+                        // Small literals come from the pinned intern table.
+                        let v = self.make_bigint(value);
                         self.set(base, dst, v);
                         ip += 1;
                     }

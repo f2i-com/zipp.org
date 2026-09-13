@@ -1,0 +1,198 @@
+{
+  "testedAt": "2026-09-13T05:03:22.252298+00:00",
+  "browser": "144.0.7559.96",
+  "mode": "Offline local-source evaluation on about:blank; no real-origin Worker/HTTP coverage",
+  "reports": [
+    {
+      "backend": "webgpu",
+      "status": "unavailable",
+      "passed": 0,
+      "error": "Requested backend unavailable: webgpu: WebGPU is unavailable (use HTTPS or localhost)",
+      "checks": []
+    },
+    {
+      "backend": "webgl2",
+      "status": "unavailable",
+      "passed": 0,
+      "error": "Requested backend unavailable: webgl2: WebGL2 is unavailable",
+      "checks": []
+    },
+    {
+      "backend": "wasm",
+      "status": "passed",
+      "passed": 15,
+      "info": {
+        "backend": "wasm",
+        "description": "Compiled standalone C float32 kernels in WebAssembly",
+        "adapter": null,
+        "fallbackAttempts": []
+      },
+      "checks": [
+        {
+          "name": "multiply/add/relu/sum length 1",
+          "status": "passed",
+          "totalWallMs": 1.099999999976717
+        },
+        {
+          "name": "multiply/add/relu/sum length 3",
+          "status": "passed",
+          "totalWallMs": 0.30000000004656613
+        },
+        {
+          "name": "multiply/add/relu/sum length 63",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "multiply/add/relu/sum length 64",
+          "status": "passed",
+          "totalWallMs": 0.09999999997671694
+        },
+        {
+          "name": "multiply/add/relu/sum length 65",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "multiply/add/relu/sum length 129",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "multiply/add/relu/sum length 1025",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "scalar-left subtraction",
+          "status": "passed",
+          "totalWallMs": 1.8000000000465661
+        },
+        {
+          "name": "constant fill",
+          "status": "passed",
+          "totalWallMs": 0.09999999997671694
+        },
+        {
+          "name": "matmul 1x1x1",
+          "status": "passed",
+          "totalWallMs": 0.2000000000698492
+        },
+        {
+          "name": "matmul 2x3x7",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "matmul 17x13x9",
+          "status": "passed",
+          "totalWallMs": 0.09999999997671694
+        },
+        {
+          "name": "Life torus 1x1, eight steps",
+          "status": "passed",
+          "totalWallMs": 0.10000000009313226
+        },
+        {
+          "name": "Life torus 3x5, eight steps",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "Life torus 32x32, eight steps",
+          "status": "passed",
+          "totalWallMs": 0.19999999995343387
+        }
+      ]
+    },
+    {
+      "backend": "cpu-js",
+      "status": "passed",
+      "passed": 15,
+      "info": {
+        "backend": "cpu-js",
+        "description": "Host JavaScript float32 reference",
+        "adapter": null,
+        "fallbackAttempts": []
+      },
+      "checks": [
+        {
+          "name": "multiply/add/relu/sum length 1",
+          "status": "passed",
+          "totalWallMs": 0.09999999997671694
+        },
+        {
+          "name": "multiply/add/relu/sum length 3",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "multiply/add/relu/sum length 63",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "multiply/add/relu/sum length 64",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "multiply/add/relu/sum length 65",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "multiply/add/relu/sum length 129",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "multiply/add/relu/sum length 1025",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "scalar-left subtraction",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "constant fill",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "matmul 1x1x1",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "matmul 2x3x7",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "matmul 17x13x9",
+          "status": "passed",
+          "totalWallMs": 0.09999999997671694
+        },
+        {
+          "name": "Life torus 1x1, eight steps",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "Life torus 3x5, eight steps",
+          "status": "passed",
+          "totalWallMs": 0
+        },
+        {
+          "name": "Life torus 32x32, eight steps",
+          "status": "passed",
+          "totalWallMs": 6.300000000046566
+        }
+      ]
+    }
+  ],
+  "visualMobileOverflow": false
+}

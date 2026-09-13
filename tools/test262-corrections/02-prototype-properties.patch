@@ -1,0 +1,12 @@
+--- a/test/staging/sm/Error/prototype-properties.js
++++ b/test/staging/sm/Error/prototype-properties.js
+@@ -15,7 +15,8 @@
+ assert.sameValue(Error.prototype.name, "Error");
+ assert.sameValue(Error.prototype.message, "");
+ 
+-for (const error of nativeErrors) {
++// Error itself is asserted above; the harness also includes it.
++for (const error of nativeErrors.filter(ctor => ctor !== Error)) {
+     assert.sameValue(Reflect.ownKeys(error.prototype).sort().toString(), "constructor,message,name");
+     assert.sameValue(error.prototype.name, error.name);
+     assert.sameValue(error.prototype.message, "");

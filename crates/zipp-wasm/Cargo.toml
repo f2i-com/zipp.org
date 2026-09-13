@@ -1,6 +1,6 @@
 [package]
 name = "zipp-wasm"
-version = "0.0.17"
+version = "0.0.18"
 edition = "2021"
 license = "Apache-2.0"
 description = "WebAssembly embedding of the zipp JavaScript engine: a persistent VM a browser host can keep alive across re-entries."
@@ -42,3 +42,19 @@ wasm-bindgen = "=0.2.126"
 # `unsafe-eval` constructors into the trusted host surface.
 js-sys = { version = "=0.3.103", default-features = false, features = ["std"] }
 console_error_panic_hook = "=0.1.7"
+
+# Two artifacts come out of this one crate. JavaScript is always present (the
+# engine IS the JavaScript VM, and the Python runtime is itself JavaScript the
+# engine compiles); `python` adds the RustPython parser and the lowering code,
+# which is the whole size difference, so it stays off the default artifact.
+#
+#   JavaScript only (the shipped default): cargo build --release --target wasm32-unknown-unknown
+#   JavaScript + Python:                   cargo build --release --target wasm32-unknown-unknown --features python
+#
+# `build-variants.sh` builds and post-processes both and prints sizes.
+[features]
+default = []
+# `Engine.initSource(source, "python")`: the experimental Python-subset
+# frontend (docs/PYTHON_FRONTEND_EXPERIMENT.md).
+python = ["zipp-vm/python"]
+python-js-interop = ["python", "zipp-vm/python-js-interop"]

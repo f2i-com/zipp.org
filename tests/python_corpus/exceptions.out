@@ -1,0 +1,53 @@
+ok 2
+done 5
+ValueError: zero is not allowed ('zero is not allowed',) ValueError('zero is not allowed')
+done 0
+lookup: KeyError -1 -1
+done -1
+ok 3
+done 3
+NotFound [404] missing b 404 True KeyError ('b',)
+wrapped ZeroDivisionError
+finally runs before return
+try
+body 0
+cleanup 0
+cleanup 1
+body 2
+cleanup 2
+cleanup 3
+end
+inner finally
+caught inner
+outer finally
+1
+bare raise outside handler: No active exception to reraise
+re-raised first
+IndexError: list index out of range
+KeyError: 'k' KeyError('k')
+ValueError: invalid literal for int() with base 10: 'x'
+AttributeError: 'NoneType' object has no attribute 'attr'
+NameError: name 'undefined_name' is not defined
+TypeError: can only concatenate str (not "int") to str
+TypeError: object of type 'int' has no len()
+TypeError: <lambda>() takes 0 positional arguments but 1 was given
+UnboundLocalError: cannot access local variable 'late' where it is not associated with a value
+enter a
+enter b
+inside a b
+exit b None
+exit a None
+enter swallow
+exit swallow ValueError
+after swallow
+enter propagate
+exit propagate ValueError
+caught propagated
+enter ret
+exit ret None
+returned
+AssertionError: math is broken
+StopIteration caught
+[1, None, 3]
+True True True
+('a', 1) ('a', 1) ValueError('a', 1)
