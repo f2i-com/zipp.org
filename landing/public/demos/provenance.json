@@ -1,18 +1,19 @@
 {
-  "capturedAtUtc": "20260913T114210Z",
+  "capturedAtUtc": "20260913T122032Z",
   "browser": "152.0.7977.83",
   "wasmProfile": "zipp-wasm 0.0.17 \u00b7 languages: javascript, python\nidle",
-  "backend": "\u25b6 gpu-compute (python, entry main.py)\nProgram defines draw, update; running frames. Click the canvas for keyboard input.\nGPU compute: webgl2 \u2014 WebGL2 fragment shaders on RGBA32F textures (ANGLE (NVIDIA, NVIDIA GeForce RTX 5090 (0x00002B85) Direct3D11 vs_5_0 ps_5_0, D3D11))\nvector: result = [14.0, 44.0, 94.0, 164.0]  [webgl2]\nvector: total = [316.0]  [webgl2]\nmatmul: result = [58.0, 64.0, 139.0, 154.0]  [webgl2]\nmlp: result = [4.375, 2.125, -1.125, 3.375]  [webgl2]",
+  "backend": "\u25b6 gpu-compute (python, entry main.py)\nLife rules: ordinary Torch; browser GPU results arrive asynchronously.\nProgram defines draw, update; running frames. Click the canvas for keyboard input.\nGPU compute: webgl2 \u2014 WebGL2 fragment shaders on RGBA32F textures (ANGLE (NVIDIA, NVIDIA GeForce RTX 5090 (0x00002B85) Direct3D11 vs_5_0 ps_5_0, D3D11))\nLife generation 1: 301 alive webgl2",
   "clips": {
     "python-life": {
       "frames": 60,
-      "capturedSeconds": 9.9,
-      "playbackFps": 6.061
+      "capturedSeconds": 9.89,
+      "playbackFps": 6.066
     }
   },
   "sourceSha256": {
-    "examples/python/gpu/main.py": "1aa8568b70a4f70a3f6cb62e6f79491caaec26af2e907facaaab599fca267cd7",
+    "examples/python/gpu/main.py": "aad7fd8a4ba4bda1a093f583a7eff8dd82422b5d3a07cb96a1314796fcfd05c7",
+    "examples/python/gpu/life.py": "0052d97bd61c5c097f1a42e569fbe7d7ff86c5a7e673cff6ce84c47849f83deb",
     "crates/zipp-wasm/playground/engine.worker.js": "660ba28b1b6dfc711f6b7738ddf3bbb64ce5b3487226489cece78ef53b0df567"
   },
-  "note": "Actual local browser captures. Python Life runs in Zipp WASM and submits WebGL2 graphs. GIFs are demonstrations, not benchmarks."
+  "note": "Actual local browser captures. The displayed life.py uses ordinary Torch operations, executed by Zipp WASM and compiled to WebGL2 graphs; main.py supplies the playground UI and asynchronous submission. GIFs are demonstrations, not benchmarks."
 }

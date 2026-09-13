@@ -128,6 +128,27 @@ print("recorded")
     adapter.invalidate(); runtime.dispose(); e.dispose();
   }
 
+  // Run the actual portable Life module: a glider shifts diagonally after 4 steps.
+  const lifeSource = await readFile(path.join(__dirname, "../../../../examples/python/gpu/life.py"), "utf8");
+  for (const backend of ["cpu-js", "wasm"]) {
+    const e = new Engine();
+    const runtime = await createRuntime({ backend, wasmBytes });
+    const adapter = createPythonGPUAdapter(e, runtime, { allowExecute: true });
+    e.initPythonProject({ life: lifeSource, main: `import torch
+from life import step, neighbor_matrix
+cells = torch.tensor([[0.,1.,0.,0.,0.],[0.,0.,1.,0.,0.],[1.,1.,1.,0.,0.],[0.,0.,0.,0.,0.],[0.,0.,0.,0.,0.]])
+@torch.compile
+def evolve(cells, neighbors):
+    for _ in range(4):
+        cells = step(cells, neighbors)
+    return cells
+evolve(cells, neighbor_matrix(5)).submit(lambda y: print(y.tolist()))
+` }, "main");
+    adapter.drain(); await adapter.idle();
+    eq(`${backend}: portable Torch Life advances a glider by one cell`, e.takeOutput(), ["[[0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0, 0.0], [0.0, 1.0, 1.0, 1.0, 0.0], [0.0, 0.0, 0.0, 0.0, 0.0]]"]);
+    adapter.invalidate(); runtime.dispose(); e.dispose();
+  }
+
   // ---- denial, disposal, and a callback that raises ---------------------------------
   {
     const e = new Engine();

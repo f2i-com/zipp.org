@@ -117,7 +117,7 @@ def main():
         for backend in backends:
             page.locator('#gpu-backend').select_option(backend)
             run(page, f'GPU compute: {backend}')
-            expect(page.locator('#console')).to_contain_text(re.compile(r'\[58(?:\.0)?, 64(?:\.0)?, 139(?:\.0)?, 154(?:\.0)?\]'), timeout=30000)
+            expect(page.locator('#console')).to_contain_text('Life generation 1:', timeout=60000)
             expect(page.locator('#frame-stats')).not_to_be_empty(timeout=30000)
             console = page.locator('#console').inner_text()
             assert 'life stopped:' not in console, console

@@ -376,6 +376,42 @@ class Conv1d(Module):
         return "%d, %d, kernel_size=%s, stride=%s" % (self.in_channels, self.out_channels, self.kernel_size, self.stride)
 
 
+class Conv2d(Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True, padding_mode="zeros", device=None, dtype=None):
+        torch._check_cpu_device(device)
+        super().__init__()
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < 1 for v in (in_channels, out_channels, groups)):
+            raise ValueError("channels and groups must be positive integers")
+        if in_channels % groups or out_channels % groups:
+            raise ValueError("in_channels and out_channels must be divisible by groups")
+        if padding_mode != "zeros":
+            raise NotImplementedError("Conv2d supports zero padding only")
+        if dtype is not None and dtype not in (torch.float32, torch.float64):
+            raise TypeError("Conv2d requires float32 or float64")
+        self.in_channels, self.out_channels, self.groups = in_channels, out_channels, groups
+        self.kernel_size = F._conv_pair(kernel_size, "kernel_size")
+        self.stride = F._conv_pair(stride, "stride")
+        self.padding = F._conv_pair(padding, "padding", 0)
+        self.dilation = F._conv_pair(dilation, "dilation")
+        self.padding_mode = padding_mode
+        self.weight = Parameter(torch.empty(out_channels, in_channels // groups, *self.kernel_size, dtype=dtype))
+        self.bias = Parameter(torch.empty(out_channels, dtype=dtype)) if bias else None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in = self.in_channels // self.groups * self.kernel_size[0] * self.kernel_size[1]
+            bound = 1 / math.sqrt(fan_in)
+            init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x):
+        return F.conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+    def extra_repr(self):
+        return "%d, %d, kernel_size=%s, stride=%s, padding=%s, dilation=%s, groups=%d" % (self.in_channels, self.out_channels, self.kernel_size, self.stride, self.padding, self.dilation, self.groups)
+
+
 class GRUCell(Module):
     def __init__(self, input_size, hidden_size, bias=True, device=None, dtype=None):
         torch._check_cpu_device(device)

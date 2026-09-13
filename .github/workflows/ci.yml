@@ -76,6 +76,7 @@ jobs:
           node -e 'if (!JSON.parse(require("./tests/node/pkg/zipp_wasm.js").zippProfile()).languages.includes("python")) throw Error("Python feature missing")'
           node tests/node/python-frontend.cjs
           node tests/node/python-gpu.cjs
+          node tests/node/python-conv2d.cjs
           node tests/node/python-javascript.cjs
           ./build-variants.sh interop
           wasm-bindgen --target nodejs --out-dir tests/node/pkg target/variants/interop/wasm32-unknown-unknown/release/zipp_wasm.wasm

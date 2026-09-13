@@ -22,6 +22,44 @@ fn run(source: &str) -> Result<Vec<String>, String> {
 }
 
 #[test]
+fn conv2d_matches_pytorch_forward_gradients_and_optimizer() {
+    let out = run(include_str!("fixtures/torch_conv2d.py")).unwrap();
+    assert_eq!(
+        out,
+        [
+            "conv2d case 0 passed",
+            "conv2d case 1 passed",
+            "conv2d case 2 passed",
+            "conv2d case 3 passed",
+            "conv2d optimizer passed"
+        ]
+    );
+}
+
+#[test]
+fn conv2d_rejects_unsupported_shapes_and_options() {
+    let out = run(r#"
+import torch
+from torch import nn
+import torch.nn.functional as F
+x = torch.ones(1, 2, 3, 3)
+w = torch.ones(2, 2, 2, 2)
+for action in [lambda: F.conv2d(x,w,stride=0), lambda: F.conv2d(x,w,padding=-1), lambda: F.conv2d(x,w,groups=2), lambda: F.conv2d(x,w,torch.ones(3)), lambda: nn.Conv2d(2,3,3,groups=2), lambda: nn.Conv2d(1,1,3,device='cuda'), lambda: nn.Conv2d(1,1,3,padding_mode='reflect'), lambda: F.conv2d(torch.ones(1,2,1,1),w)]:
+    try:
+        action()
+        print('not rejected')
+    except (ValueError, RuntimeError, NotImplementedError):
+        print('rejected')
+try:
+    torch.compile(nn.Conv2d(2,2,1))(x)
+except NotImplementedError:
+    print('CPU only')
+"#).unwrap();
+    assert_eq!(&out[..8], ["rejected"; 8]);
+    assert_eq!(out[8], "CPU only");
+}
+
+#[test]
 fn tensors_autograd_modules_and_checkpoints() {
     let source = r#"
 import torch

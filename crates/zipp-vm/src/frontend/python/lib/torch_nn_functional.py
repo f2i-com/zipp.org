@@ -65,6 +65,38 @@ def conv1d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
     return out
 
 
+def _conv_pair(value, name, minimum=1):
+    pair = (value, value) if isinstance(value, int) else tuple(value) if isinstance(value, (tuple, list)) else ()
+    if len(pair) != 2 or any(isinstance(v, bool) or not isinstance(v, int) or v < minimum for v in pair):
+        raise ValueError(name + " must be an integer or pair of integers >= " + str(minimum))
+    return pair
+
+
+def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
+    if getattr(x, "_zipp_graph", False):
+        raise NotImplementedError("conv2d currently supports eager CPU tensors only")
+    stride = _conv_pair(stride, "stride")
+    padding = _conv_pair(padding, "padding", 0)
+    dilation = _conv_pair(dilation, "dilation")
+    if isinstance(groups, bool) or not isinstance(groups, int) or groups < 1:
+        raise ValueError("groups must be a positive integer")
+    if len(x.shape) == 3:
+        return conv2d(x.unsqueeze(0), weight, bias, stride, padding, dilation, groups).squeeze(0)
+    if len(x.shape) != 4 or len(weight.shape) != 4:
+        raise RuntimeError("conv2d expects CHW or NCHW input and OIHW weights")
+    if bias is not None and tuple(bias.shape) != (weight.shape[0],):
+        raise RuntimeError("conv2d bias must match the output channels")
+    storage, shape = _k.conv2d(x._s, x.shape, weight._s, weight.shape, None if bias is None else bias._s, stride, padding, dilation, groups)
+    out = Tensor(storage, shape, x.dtype)
+    if torch._needs_grad(x, weight, bias):
+        def backward(g):
+            gx, gw, gb = _k.conv2d_backward(x._s, x.shape, weight._s, weight.shape, g._s, stride, padding, dilation, groups)
+            return (Tensor(gx, x.shape, x.dtype), Tensor(gw, weight.shape, weight.dtype), None if bias is None else Tensor(gb, bias.shape, bias.dtype))
+        out.requires_grad = True
+        out._node = torch._Node(backward, (x, weight, bias), "Conv2d")
+    return out
+
+
 def silu(x, inplace=False):
     return torch.silu(x)
 

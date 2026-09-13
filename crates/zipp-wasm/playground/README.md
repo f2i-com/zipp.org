@@ -110,8 +110,9 @@ A program that defines neither `draw` nor `update` just runs its top level:
   (`../gpu-lab/`), which runs it on WebGPU, WebGL2, compiled WASM kernels or
   a JavaScript reference (the **GPU** selector in the toolbar; `auto` tries
   them in that order and the console says which one answered), then calls
-  the program back with the outputs between frames. The "GPU compute" sample
-  runs a few graphs and steps Conway's life on the backend every frame.
+  the program back with the outputs between frames. The "Game of Life" sample
+  uses ordinary Torch rules in `life.py`, with GPU submission and drawing in
+  `main.py`. The rules also run unchanged in regular PyTorch.
 - `serve.cjs` is the server; `smoke.cjs` drives the page in a local
   Chrome or Edge through Playwright (`npm install --no-save playwright`, then
   `node playground/smoke.cjs`; set `PLAYWRIGHT_CHANNEL=msedge` for Edge).

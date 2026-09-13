@@ -79,7 +79,9 @@ Zipp records the inference graph and the host executes it on the selected
 backend. **`submit(callback)` is a Zipp extension:** browser GPU completion is
 asynchronous; this is not a drop-in implementation of PyTorch's `torch.compile`.
 It currently supports float32 inference, not GPU autograd or CUDA scripts.
-The callback receives a regular CPU Torch-compatible tensor.
+The callback receives a regular CPU Torch-compatible tensor. Eager CPU
+`nn.Conv2d` also supports forward/backward passes and optimizer updates;
+GPU convolution and GPU training remain future work.
 
 Try **Samples → Python: Torch ML inference (GPU)** in the playground. The
 [complete example](examples/python/torch_gpu/main.py) draws its predictions and
@@ -107,8 +109,10 @@ See the [build instructions and contract](docs/LANGUAGE_INTEROP.md).
 
 **Python running on Zipp WASM, with Game of Life on the GPU.** This is a recording
 of the actual folder playground: the Python source is compiled and executed by
-Zipp's WebAssembly VM. Each Life update submits a float32 graph to JavaScript's
-WebGL2 host; its named outputs return to Python for drawing.
+Zipp's WebAssembly VM. The displayed `life.py` uses ordinary Torch matrix
+operations and ReLU, with no `zipp_gpu` imports. These same rules run in regular
+PyTorch. A separate playground driver compiles each update for WebGL2 and
+receives its result asynchronously for drawing.
 
 [![Python runs on Zipp WASM: source, compiler, VM and GPU host](landing/public/demos/python-wasm-flow.svg)](landing/public/demos/python-wasm-flow.svg)
 
@@ -116,7 +120,8 @@ WebGL2 host; its named outputs return to Python for drawing.
 
 **[Open the full project playground](https://zipp.org/playground/)** ·
 [Static screenshot](landing/public/demos/python-playground.png) ·
-[Python example source](examples/python/gpu/main.py)
+[Portable Torch Life rules](examples/python/gpu/life.py) ·
+[Playground driver](examples/python/gpu/main.py)
 
 <details>
 <summary>Inspect the Python editor, canvas, WASM status and GPU output in a still screenshot</summary>
@@ -170,7 +175,7 @@ cd crates/zipp-wasm
 node playground/serve.cjs
 ```
 
-Open the printed playground URL, choose **Samples → Python: GPU compute**, select
+Open the printed playground URL, choose **Samples → Python: Game of Life**, select
 WebGL2 or WebGPU, and press Run. The console identifies the actual backend.
 `auto` visibly falls back to CPU/WASM when hardware is unavailable; explicit GPU
 selection reports an error instead. Browser settings decide which adapter is used.
@@ -316,9 +321,9 @@ writes are copied back under the folder when it finishes. A `test_*.py`
 entry runs its tests through the bundled `pytest` subset. The bundled
 library also includes a `torch` subset (tensors over typed arrays with
 reverse-mode autograd, `nn`, `nn.functional`, `optim`, `save`/`load` in
-PyTorch's checkpoint format) that runs on the engine's CPU kernels, so a
-small research lab written for PyTorch trains and evaluates unchanged; it
-is not GPU-backed and is many times slower than PyTorch. The scope
+supported PyTorch checkpoint layouts) that runs on the engine's CPU kernels, so
+supported ML code can train and evaluate inside Zipp. Eager execution is CPU;
+`torch.compile(model)` adds the supported asynchronous GPU inference path. The scope
 matrix, limits and the bytecode design are in
 [docs/PYTHON_FRONTEND_EXPERIMENT.md](docs/PYTHON_FRONTEND_EXPERIMENT.md). The
 feature is on by default in the CLI (`--no-default-features` builds the

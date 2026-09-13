@@ -84,6 +84,8 @@ def main():
                 page.locator('#run').click()
                 page.wait_for_function("document.querySelector('#console').textContent.includes('GPU compute: webgl2')", timeout=20000)
                 page.wait_for_function("document.querySelector('#frame-stats').textContent.length > 0", timeout=15000)
+                page.wait_for_function("document.querySelector('#console').textContent.includes('Life generation 1:')", timeout=60000)
+                page.locator('#file-list [data-name="life.py"]').click()
                 gpu_log = page.locator('#console').inner_text()
                 assert 'NVIDIA' in gpu_log, gpu_log
                 # This is a real UI screenshot with the Python editor, canvas,
@@ -94,11 +96,11 @@ def main():
 
                 if errors:
                     raise RuntimeError(str(errors))
-                tracked_sources = ['examples/python/gpu/main.py', 'crates/zipp-wasm/playground/engine.worker.js']
+                tracked_sources = ['examples/python/gpu/main.py', 'examples/python/gpu/life.py', 'crates/zipp-wasm/playground/engine.worker.js']
                 provenance = dict(capturedAtUtc=stamp, browser=browser.version, wasmProfile=profile,
                     backend=gpu_log, clips=clips,
                     sourceSha256={name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in tracked_sources},
-                    note='Actual local browser captures. Python Life runs in Zipp WASM and submits WebGL2 graphs. GIFs are demonstrations, not benchmarks.')
+                    note='Actual local browser captures. The displayed life.py uses ordinary Torch operations, executed by Zipp WASM and compiled to WebGL2 graphs; main.py supplies the playground UI and asynchronous submission. GIFs are demonstrations, not benchmarks.')
                 (OUT / 'provenance.json').write_text(json.dumps(provenance, indent=2), encoding='utf-8')
                 browser.close()
         finally:

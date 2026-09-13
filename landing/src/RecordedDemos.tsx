@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 
 const clips = [
-  { id: 'python-life', tag: 'PYTHON → ZIPP WASM → WEBGL2', title: 'A living grid, driven by Python.', description: 'Python runs in Zipp’s WebAssembly VM. Each generation submits a Conway-Life graph to the browser’s WebGL2 backend, then draws the returned state.', alt: 'Recorded Python source running in the Zipp playground with a changing green Game of Life grid and a verified WebGL2 backend.' },
+  { id: 'python-life', tag: 'PYTHON → ZIPP WASM → WEBGL2', title: 'A living grid, driven by Python.', description: 'Python runs in Zipp’s WebAssembly VM. The displayed Life rules use ordinary Torch operations, compiled for WebGL2 by a separate playground driver.', alt: 'Recorded portable Torch Life source running in the Zipp playground with a changing green Game of Life grid and a verified WebGL2 backend.' },
 ]
 
 export function RecordedDemos() {

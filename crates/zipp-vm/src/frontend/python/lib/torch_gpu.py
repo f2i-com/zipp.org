@@ -18,6 +18,8 @@ class _Capture:
                 raise ValueError("Cannot mix separate compiled GPU calls")
             return value
         if isinstance(value, torch.Tensor):
+            if len(value.shape) > 2:
+                raise NotImplementedError("Compiled GPU inference currently supports scalar, vector and matrix tensors only")
             if value.dtype != torch.float32:
                 raise TypeError("zipp_gpu compilation requires float32 tensors")
             key = id(value)

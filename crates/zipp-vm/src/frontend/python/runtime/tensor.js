@@ -385,6 +385,46 @@
         }
         return tuple([gx, gw, gb]);
     }
+    // Contiguous NCHW cross-correlation; the same index walk computes gradients.
+    function conv2d(x, xs, w, ws, bias, stride, padding, dilation, groups, grad = null) {
+        if (xs.length !== 4 || ws.length !== 4 || stride.length !== 2 || padding.length !== 2 || dilation.length !== 2)
+            fail(E.RuntimeError, "conv2d: invalid dimensions");
+        const [B, C, H, W] = xs, [O, Cg, Kh, Kw] = ws;
+        if (![B,C,H,W,O,Cg,Kh,Kw,groups,...stride,...padding,...dilation].every(Number.isSafeInteger) ||
+            B < 0 || Math.min(C,H,W,O,Cg,Kh,Kw,groups,...stride,...dilation) < 1 || Math.min(...padding) < 0 ||
+            C !== Cg * groups || O % groups !== 0 || x.data.length !== B*C*H*W || w.data.length !== O*Cg*Kh*Kw ||
+            !["float32","float64"].includes(x.dtype) || x.dtype !== w.dtype || (bias && (bias.data.length !== O || bias.dtype !== x.dtype)))
+            fail(E.RuntimeError, "conv2d: incompatible shape, dtype or convolution parameters");
+        const [Sh, Sw] = stride, [Ph, Pw] = padding, [Dh, Dw] = dilation;
+        const Ho = Math.floor((H + 2*Ph - Dh*(Kh-1) - 1)/Sh) + 1;
+        const Wo = Math.floor((W + 2*Pw - Dw*(Kw-1) - 1)/Sw) + 1;
+        if (Ho < 1 || Wo < 1) fail(E.RuntimeError, "conv2d: kernel exceeds padded input");
+        if (grad && (grad.data.length !== B*O*Ho*Wo || grad.dtype !== x.dtype)) fail(E.RuntimeError, "conv2d: invalid gradient");
+        const out = grad ? null : alloc(x.dtype, B*O*Ho*Wo);
+        const gx = grad ? alloc(x.dtype, x.data.length) : null;
+        const gw = grad ? alloc(w.dtype, w.data.length) : null;
+        const gb = grad ? alloc(w.dtype, O) : null;
+        const perGroup = O / groups;
+        for (let b=0; b<B; b++) for (let o=0; o<O; o++) {
+            const firstChannel = Math.floor(o/perGroup)*Cg;
+            for (let h=0; h<Ho; h++) for (let v=0; v<Wo; v++) {
+                const oi = ((b*O+o)*Ho+h)*Wo+v;
+                const gv = grad ? grad.data[oi] : 0;
+                let sum = bias ? bias.data[o] : 0;
+                if (grad) gb.data[o] += gv;
+                for (let c=0; c<Cg; c++) for (let kh=0; kh<Kh; kh++) for (let kw=0; kw<Kw; kw++) {
+                    const ih = h*Sh-Ph+kh*Dh, iw = v*Sw-Pw+kw*Dw;
+                    if (ih<0 || ih>=H || iw<0 || iw>=W) continue;
+                    const xi = ((b*C+firstChannel+c)*H+ih)*W+iw;
+                    const wi = ((o*Cg+c)*Kh+kh)*Kw+kw;
+                    if (grad) { gx.data[xi] += gv*w.data[wi]; gw.data[wi] += gv*x.data[xi]; }
+                    else sum += x.data[xi]*w.data[wi];
+                }
+                if (!grad) out.data[oi] = sum;
+            }
+        }
+        return grad ? tuple([gx,gw,gb]) : tuple([out,pyShape([B,O,Ho,Wo])]);
+    }
     function softmax(a, shape, dim, log) {
         const d = dim < 0 ? dim + shape.length : dim, n = shape[d];
         const outer = numel(shape.slice(0, d)), inner = numel(shape.slice(d + 1));
@@ -587,6 +627,8 @@
         fn("matmul", 4, (a) => matmul(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3])));
         fn("conv1d", 5, (a) => conv1d(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), a[4] === null ? null : needS(a[4])));
         fn("conv1d_backward", 5, (a) => conv1dBackward(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), needS(a[4])));
+        fn("conv2d", 9, (a) => conv2d(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), a[4] === null ? null : needS(a[4]), shapeOf(a[5]), shapeOf(a[6]), shapeOf(a[7]), num(a[8])));
+        fn("conv2d_backward", 9, (a) => conv2d(needS(a[0]), shapeOf(a[1]), needS(a[2]), shapeOf(a[3]), null, shapeOf(a[5]), shapeOf(a[6]), shapeOf(a[7]), num(a[8]), needS(a[4])));
         fn("softmax", 4, (a) => softmax(needS(a[0]), shapeOf(a[1]), num(a[2]), rt.truth(a[3])));
         fn("argsort", 4, (a) => argsort(needS(a[0]), shapeOf(a[1]), num(a[2]), rt.truth(a[3])));
         fn("one_hot", 2, (a) => oneHot(needS(a[0]), num(a[1])));

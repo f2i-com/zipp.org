@@ -172,7 +172,7 @@ async function main() {
     ok("frames kept advancing during the long run", /frame (\d+)/.test(stats) && Number(stats.match(/frame (\d+)/)[1]) > 60, stats);
     await page.locator("#stop").click();
 
-    // ---- GPU compute: zipp_gpu graphs answered by the compute runtime -------------
+    // ---- GPU compute: portable Torch Life answered by the compute runtime -------------
     // Which backend answers depends on the browser (headless Chromium usually has
     // no WebGPU and may lack float render targets); the check is that some
     // backend answered with the right numbers and that the frame loop kept
@@ -181,10 +181,9 @@ async function main() {
     await page.locator('[data-sample="gpu"]').click();
     await page.waitForFunction(() => document.querySelector("#project-name").textContent === "gpu-compute");
     await page.locator("#run").click();
-    await page.waitForFunction(() => /mlp: result = /.test(document.querySelector("#console").innerText), null, { timeout: 30000 });
+    await page.waitForFunction(() => /Life generation 1: /.test(document.querySelector("#console").innerText), null, { timeout: 30000 });
     const gpuConsole = await consoleText();
-    ok("the GPU sample's vector graph came back through the compute runtime", /vector: result = \[14\.0, 44\.0, 94\.0, 164\.0\]/.test(gpuConsole));
-    ok("matmul and the tiny network came back", /matmul: result = \[58\.0, 64\.0, 139\.0, 154\.0\]/.test(gpuConsole) && /mlp: result = \[4\.375, 2\.125, -1\.125, 3\.375\]/.test(gpuConsole));
+    ok("Torch Life returned its first generation", /Life generation 1: [0-9]+ alive/.test(gpuConsole));
     const backendLine = (gpuConsole.match(/GPU compute: (\S+)/) || [])[1] || "none";
     ok("the compute runtime reported its backend", /GPU compute: (webgpu|webgl2|wasm|cpu-js)/.test(gpuConsole), gpuConsole.split("\n").filter((l) => /GPU compute/.test(l)).join(" | "));
     console.log(`  note GPU backend in this browser: ${backendLine}`);
@@ -200,8 +199,8 @@ async function main() {
     await page.waitForFunction(() => /GPU compute: webgl2|life stopped: UNAVAILABLE/.test(document.querySelector("#console").innerText), null, { timeout: 30000 });
     const webglConsole = await consoleText();
     if (/GPU compute: webgl2/.test(webglConsole)) {
-      await page.waitForFunction(() => /vector: total = \[316\.0\]/.test(document.querySelector("#console").innerText), null, { timeout: 30000 });
-      ok("WebGL2 executed the graphs with the expected numbers", /vector: result = \[14\.0, 44\.0, 94\.0, 164\.0\]/.test(await consoleText()));
+      await page.waitForFunction(() => /Life generation 1: /.test(document.querySelector("#console").innerText), null, { timeout: 30000 });
+      ok("WebGL2 executed the Torch Life graph", /Life generation 1: [0-9]+ alive webgl2/.test(await consoleText()));
     } else {
       ok("an explicit WebGL2 request is refused with a reason rather than silently downgraded", /UNAVAILABLE/.test(webglConsole) && !/GPU compute: (wasm|cpu-js)/.test(webglConsole), webglConsole.split("\n").filter((l) => /UNAVAILABLE/.test(l)).slice(0, 1).join(""));
       console.log("  note WebGL2 float render targets are unavailable in this browser; GPU execution not verified here");

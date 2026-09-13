@@ -10,7 +10,7 @@ export function ProjectPlayground() {
       <div className="project-playground-links">
         <a className="button button-primary" href="/playground/" target="_blank" rel="noreferrer">Open full playground ↗</a>
         <a href="https://github.com/f2i-com/zipp.org/blob/main/crates/zipp-wasm/playground/README.md" target="_blank" rel="noreferrer">Examples &amp; API guide ↗</a>
-        <span>Try Samples → Python: GPU compute → Run</span>
+        <span>Try Samples → Python: Game of Life → Run</span>
       </div>
       <iframe className="project-playground-frame" src="/playground/" title="Zipp folder playground: Python, JavaScript and browser GPU" loading="lazy" />
       <p className="project-playground-note">The Python-enabled engine runs inside a Worker with execution deadlines.

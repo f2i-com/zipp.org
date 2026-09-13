@@ -30,7 +30,7 @@ integration date every corpus program matched.
 | Built-in modules | `math`, `random` (seedable, deterministic), `time`, `sys`, `os`/`os.path` (a virtual empty filesystem), `io` (`StringIO`), `json`, `string`, `textwrap`, `copy`, `operator`, `itertools`, `functools` (`reduce`, `partial`, `lru_cache`/`cache`, `wraps`, `total_ordering`, `cmp_to_key`), `collections` (`Counter`, `defaultdict`, `deque`, `namedtuple`, `OrderedDict`, `ChainMap`), `heapq`, `bisect`, `statistics`, `re` (a JavaScript-backed subset with groups, named groups, `sub` with callables), `dataclasses` (`dataclass`, `field`, `asdict`, `astuple`, `replace`, `fields`; `order`, `frozen`), `enum` (`Enum`, `IntEnum`, `Flag`, `IntFlag`, `auto`), `typing` (generic aliases, `NamedTuple`, `TypedDict`), `abc` (`ABC` with abstract-method enforcement), `contextlib` (`contextmanager`, `suppress`, `closing`, `nullcontext`, `ExitStack`), `struct` (`pack`/`unpack`/`calcsize`/`iter_unpack`/`Struct` for the standard codes and byte orders), `hashlib` (`md5`, `sha1`, `sha256`), `platform`, `importlib` (`import_module` over the project), `io` (`StringIO`, `BytesIO`), `__future__` (`annotations`: PEP 563 string annotations, plus `X | None` union types) |
 | Files | a virtual filesystem holding the project folder's files (the CLI and the playground load them; 8 MiB per file, 64 MiB in total): `open()` in text and binary modes with `read`/`readline`/`readlines`/`write`/`seek`/`tell`/`truncate`, iteration and context managers; `os.listdir`/`makedirs`/`remove`/`rename`/`rmdir`/`getcwd`, `os.path`, `pathlib.Path` (`read_text`, `write_bytes`, `glob`, `rglob`, `mkdir`, ...); `sys.argv` from the host. Written files are reported back to the host (`__zipp_py_vfs_changed`), which the CLI copies to disk and the playground shows in its tree |
 | Bundled Python-source modules | `zipp_gpu` (`crates/zipp-vm/src/frontend/python/lib/shared/zipp_gpu.py`): float32 compute graphs (`Graph`, `Tensor`, `submit`, `program`, `to_json`, `execute_locally`); `pickle` (protocol 2 with `persistent_load`/`find_class`), `zipfile` (stored entries, zip64 reads), `pathlib`, `argparse`, `inspect` (signatures), `pytest` (`raises`, `approx`, `mark.parametrize`/`skip`/`skipif`, `fixture`, `tmp_path`, `main`; a `test_*.py` entry runs its tests automatically and a failure exits non-zero); and a `torch` subset (below). Each is compiled into a program only when imported. `zipp_gpu.py` also runs under CPython, which is how the corpus checks it |
-| `torch` subset | `crates/zipp-vm/src/frontend/python/lib/torch*.py` over the runtime's `_zipp_tensor` kernels (contiguous tensors on typed-array storages): dtypes, creation (`tensor`, `zeros`, `ones`, `full`, `arange`, `eye`, `randn`, `rand`, `randint`, `multinomial`, `randperm`), indexing and slicing (basic, advanced, boolean), shape ops (`view`, `reshape`, `permute`, `transpose`, `cat`, `stack`, `roll`, `unsqueeze`, `expand`, ...), elementwise and reduction ops with broadcasting, `matmul`/`@`/`einsum`, `softmax`/`log_softmax`, comparisons, in-place ops, reverse-mode autograd (`backward`, `autograd.grad`, `no_grad`, `requires_grad`), `nn` (`Module`, `Parameter`, `Sequential`, `ModuleList`, `Linear`, `Embedding`, `Conv1d` with stride 1, `GRUCell`, `LSTMCell`, `LayerNorm`, `Dropout`, activations, the common losses), `nn.functional`, `nn.init`, `nn.utils.clip_grad_norm_`, `optim` (`SGD`, `Adam`, `AdamW`, `RMSprop`, `lr_scheduler.StepLR`), `manual_seed`/`Generator` (seeded and deterministic; sample streams are not guaranteed to match PyTorch's), `save`/`load` of state dicts and tensors in PyTorch's zip checkpoint format (checkpoints written by PyTorch load, and the ones written here load in PyTorch). Everything runs on CPU kernels inside the engine: there is no GPU execution behind `torch`, no CUDA, no `torch.compile`, and speed is that of an interpreter over typed arrays |
+| `torch` subset | `crates/zipp-vm/src/frontend/python/lib/torch*.py` over the runtime's `_zipp_tensor` kernels (contiguous tensors on typed-array storages): dtypes, creation (`tensor`, `zeros`, `ones`, `full`, `arange`, `eye`, `randn`, `rand`, `randint`, `multinomial`, `randperm`), indexing and slicing (basic, advanced, boolean), shape ops (`view`, `reshape`, `permute`, `transpose`, `cat`, `stack`, `roll`, `unsqueeze`, `expand`, ...), elementwise and reduction ops with broadcasting, `matmul`/`@`/`einsum`, `softmax`/`log_softmax`, comparisons, in-place ops, reverse-mode autograd (`backward`, `autograd.grad`, `no_grad`, `requires_grad`), `nn` (`Module`, `Parameter`, `Sequential`, `ModuleList`, `Linear`, `Embedding`, `Conv1d` with stride 1, `GRUCell`, `LSTMCell`, `LayerNorm`, `Dropout`, activations, the common losses), `nn.functional`, `nn.init`, `nn.utils.clip_grad_norm_`, `optim` (`SGD`, `Adam`, `AdamW`, `RMSprop`, `lr_scheduler.StepLR`), `manual_seed`/`Generator` (seeded and deterministic; sample streams are not guaranteed to match PyTorch's), `save`/`load` of state dicts and tensors in PyTorch's zip checkpoint format (checkpoints written by PyTorch load, and the ones written here load in PyTorch). Everything runs on CPU kernels inside the engine: eager execution is CPU-only; experimental `torch.compile` records supported GPU inference with asynchronous completion (see [Torch compatibility](TORCH_COMPATIBILITY.md)) |
 | Host requests | a program can hand its embedder plain-data work (`kind`, `payload`, a callback); the wasm engine exposes them through `takeHostRequests()` and answers through `pythonCall("__zipp_py_deliver", [id, reply])`, and `zipp_gpu.Graph.submit` is the first user (`gpu.execute`). Compiled without a host (`zipp py`), `submit` evaluates the graph with the library's own float32 reference implementation |
 | Object model | metaclasses (`metaclass=`, inherited metaclasses, metaclass `__call__`/`__new__`, `type(name, bases, ns)`), `__init_subclass__` with class keywords, `__set_name__`, `__class_getitem__`, `__slots__` (attribute restriction), user descriptors (`__get__`/`__set__`), a live `obj.__dict__`, function `__annotations__` |
 | `match` | every pattern kind: literals and value patterns, singletons, captures and wildcards, `as`, `\|` alternatives, sequence patterns with a star, mapping patterns with `**rest`, class patterns with positional (`__match_args__`, self-matching builtins, named tuples, dataclasses) and keyword sub-patterns, guards |
@@ -45,7 +45,7 @@ integration date every corpus program matched.
   CLI copies written files back under the project folder when the run
   finishes; the wasm engine only reports them). `input()` raises `EOFError`.
 - Most of `torch`: anything not listed above (sparse tensors, complex
-  dtypes, `Conv2d`, attention modules, `DataLoader`, `torch.compile`, CUDA)
+  dtypes, attention modules, `DataLoader`, full PyTorch compiler support, CUDA)
   is missing, and float64 accumulations differ from PyTorch's float32
   kernels in the last bits.
 - `__getattribute__` overrides, weak references, `__del__`.
@@ -132,18 +132,17 @@ contents), `pythonCall`, `pythonHas`, `takeUi`, `setPythonInput`,
 current directory when the script is inside it), skipping `.git`,
 `__pycache__`, `node_modules`, `target` and virtual environments.
 
-### A PyTorch research lab as the reference workload
+### CPU Torch compatibility evidence
 
-`nca_fast_memory_language_lab` (a cellular-automaton memory model with a
-byte-level causal language model, training scripts, checkpoints and a
-pytest suite; not part of this repository) runs unchanged through
-`zipp py`: `replay_memory.py` on a saved checkpoint reproduces the recorded
-exact-recall result in about 0.5 s, `generate_language.py` samples 60 bytes
-from the trained checkpoint in about 1.4 s, `tests/test_lab.py` passes its
-22 tests in about 3 s, and `run_memory.py --steps 20 --batch 16` trains,
-evaluates and writes its metrics and checkpoint in about 3.5 minutes on a
-release build (PyTorch does the same in seconds). Loaded as a folder in the
-playground, the same scripts run in the browser with the same results.
+The checked-in [Torch regressions](../crates/zipp-vm/tests/python_torch.rs)
+exercise learning with Adam, tensor gradients, recurrent cells and checkpoints.
+The [Conv2d fixture](../crates/zipp-vm/tests/fixtures/torch_conv2d.py) checks forward
+values, input/weight/bias gradients and an optimizer update against PyTorch CPU.
+These are bounded compatibility examples, not a claim that arbitrary research
+projects or native Torch dependencies work unchanged in every host.
+See [Torch compatibility](TORCH_COMPATIBILITY.md) for integer precision,
+view/stride differences and the CPU/GPU boundary.
+
 Every host-boundary limit of a JavaScript state applies (initial source size,
 instruction budget, heap, output, dynamic-code gates), plus the frontend's
 compile-time caps (1 MiB per module, 2^20 tokens, 200 nested brackets, 100
