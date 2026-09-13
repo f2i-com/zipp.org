@@ -109,3 +109,115 @@ retains the format consumed by both landing-page statistics adapters.
 
 Do not infer release readiness from this repair note: the candidate must pass
 both CI workflows at its final committed revision before promotion or tagging.
+# Local follow-up: German DateTimeFormat and separate corrected Test262 reports
+
+The user requested that all subsequent pushes remain on hold until tests pass.
+The following work is local and has not been published or released.
+
+The remaining two German `staging/sm/String/internalUsage.js` modes pass against
+the original test source after adding service-specific CLDR 47 German date/time
+data. `DateTimeFormat.supportedLocalesOf` now advertises `de`/`de-DE`; other Intl
+services retain their English locale set. The generated names, calendar data,
+patterns, flexible day periods, intervals and localized UTC name have recorded
+input hashes and reproduce exactly with the generator and rustfmt. The Unicode
+license is retained in `LICENSE-UNICODE`.
+
+The user approved documented corrections for nine contradictory upstream
+executions. [Five reviewable patches](../../tools/test262-corrections/README.md)
+retain the original assertions where applicable and correct only the conflicting
+cases. All five corrected files also run successfully under Node 24.19.0;
+ZIPP's focused shards cover 17 executions in each of interpreter-only,
+forced-JIT and major-only-GC modes, with no failures. Node's run covers the
+factories supported by that Node build; the immutable factory is tested by ZIPP.
+
+The two-suite driver records raw upstream and corrected reports separately,
+with explicit corpus labels and executable/patch/report hashes. The corrected
+profile cannot claim unmodified Test262 conformance. Its gate allows no expected
+failures or skips. The preflight rejects revision drift, unlisted modifications,
+incorrect file hashes and newline conversions. A Windows clone needs persistent
+`--config core.autocrlf=false`, including during subsequent `git apply` calls.
+
+Validation completed so far:
+
+- Default VM: 554 library tests plus five locale regressions passed; two existing
+  opt-in library tests remained ignored.
+- Safe interpreter: 489 library tests plus 23 selected regression tests passed;
+  one existing opt-in library test remained ignored.
+- JavaScript-only and JavaScript+Python `wasm32-unknown-unknown` checks passed.
+- Eighteen conformance-tool tests passed, including a real runner invocation
+  that verifies both failed reports are retained. Actionlint passed for the
+  changed workflows.
+- Separate DateTimeFormat ECMA-402 shard: baseline clean `09704737` debug build
+  had 454 PASS / 34 FAIL / 0 SKIP; the new release build has 458 PASS / 30 FAIL /
+  0 SKIP, with no newly failing identities. Four hour-cycle executions now pass.
+  Remaining numbering-system, unsupported-locale and calendar cases are not
+  included in the core conformance percentage.
+
+The German-only phase's full core comparison completed: original **95,671 PASS /
+9 FAIL / 0 SKIP**, corrected **95,680 PASS / 0 FAIL / 0 SKIP**, both exact gates
+passed. Reports are in `target/test262-dual-v2`. Its exact release binary is
+`09704737235b2a285ee0fbce0ed5a39e27a8870e+dirty.b5241fb64da12d89b07ded5231273a40d07c3efc2980af4fd76d0fa2c23c8911`,
+SHA-256 `25a532c11a1eebe041bb4befb1e638a8558dc35440d72e77934b44f8578e7d8f`.
+This is explicitly a working-tree build, not a clean committed release.
+
+# Local follow-up: all pinned DateTimeFormat tests pass
+
+The later DateTimeFormat implementation uses service-specific CLDR 48 tables
+for English, German, Japanese, Chinese and Egyptian Arabic. Other Intl services
+retain their existing English data. Fixes include calendar-specific patterns,
+related years and cyclic year names, Chinese/Dangi leap-month labels, Hebrew
+common/leap-month names, Islamic/Coptic/Japanese eras, all four hour cycles,
+Arabic digits, and Japanese/Chinese date-style numbering annotations. The data
+generator reproduces all five tables from the pinned upstream inputs; headers
+retain their hashes and `LICENSE-UNICODE` preserves the upstream license.
+
+The **original, unmodified DateTimeFormat tests pass 488/488 executions, with
+zero failures and zero skips**, in both debug and release builds. This is the
+244-file shard at the same pinned Test262 revision, not the entire ECMA-402 suite.
+It has no test patches or expected-failure allowance. Broad locale coverage,
+all Intl services and exact parity with every ICU version remain outside this
+claim. For example, time-only intervals spanning distinct dates are not yet
+fully aligned with ICU's date-expansion behavior.
+
+The release report is `target/dtf-final-release.json`; debug evidence is
+`target/dtf-final-debug.json`. Its engine identity is
+`09704737235b2a285ee0fbce0ed5a39e27a8870e+dirty.e4bf953edb8b95219c0c6789d60c1e3beaae34bf360956b04acc30e8387e1bfa`.
+Only documentation, comments and runner-check coverage were updated after
+freezing this binary; the runtime implementation and locale data values are
+unchanged. An earlier shared-target comparison mixed cached baseline VM
+artifacts and was discarded; final builds use the isolated `target/dtf-dev`.
+
+Additional local checks:
+
+- Default VM: 554 library tests and nine locale regressions passed; two existing
+  opt-in library tests remained ignored.
+- Safe interpreter: 489 library tests and 27 selected regressions passed; one
+  existing opt-in library test remained ignored.
+- Both JavaScript-only and JavaScript+Python WASM target checks passed.
+- Twenty conformance-tool tests and actionlint passed. Verified reuse of a
+  corrected checkout still rejects changed file hashes, and corpus preflight
+  rejects untracked files that could alter the execution set.
+- The full 488-execution DateTimeFormat shard also passes in interpreter-only,
+  forced-JIT and majors-only-GC modes. The adjacent Locale.getHourCycles shard
+  passes all ten original executions.
+
+CI now retains both core reports and requires the original DateTimeFormat shard
+to have zero failures/skips. These changes have not been pushed. The previously
+dispatched broad CI run at committed `09704737` is separate evidence and does not
+validate the uncommitted implementation.
+
+The final release build's full core rerun completed successfully: **original
+95,671 PASS / 9 FAIL / 0 SKIP; documented corrected profile 95,680 PASS / 0 FAIL /
+0 SKIP**. Both gates pass, with the same binary and pinned corpus selection.
+The original failure identities are unchanged. Final preflight also confirmed
+that neither corpus contained untracked files after execution.
+
+[The durable evidence summary](2026-09-14-test262-datetimeformat.json) records
+the engine identity, original/corrected labels, exact counts and hashes for the
+binary, patches and raw reports. Raw local reports are in
+`target/test262-dtf-final` and `target/dtf-final-release.json`. Binary SHA-256:
+`ffe2ae17e29950a0a295939d7395e2b1014b5f50a1d12db537b2d15cd2ddb833`.
+
+At the last status check, the earlier hosted broad CI run had seven successful
+jobs and its native workspace job still running. No release-readiness claim is
+made for that incomplete run, and nothing from this follow-up has been pushed.

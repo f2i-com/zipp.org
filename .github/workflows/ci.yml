@@ -117,7 +117,7 @@ jobs:
       - name: Validate the test quarantine manifest
         run: python3 tools/ci_quarantine.py --check --print
       - name: Test Test262 scoring and failure gate
-        run: python3 -B -m unittest tools.test_run_test262
+        run: python3 -B -m unittest tools.test_run_test262 tools.test_run_test262_dual
       - name: Unit tests and the audit-day regressions (default profile)
         run: >-
           cargo +1.92.0 test --locked -p zipp-vm --no-fail-fast

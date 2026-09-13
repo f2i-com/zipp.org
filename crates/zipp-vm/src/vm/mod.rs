@@ -941,7 +941,10 @@ impl RegisterFile {
     #[inline(always)]
     // Read by the JIT plan builders and the full instrument tracer only (the
     // meter-only profile compiles no trace consumer).
-    #[cfg(any(feature = "jit", all(feature = "instrument", not(feature = "meter-only"))))]
+    #[cfg(any(
+        feature = "jit",
+        all(feature = "instrument", not(feature = "meter-only"))
+    ))]
     pub(crate) fn get(&self, index: usize) -> Option<&Value> {
         self.storage[..self.logical_len].get(index)
     }
@@ -2716,7 +2719,12 @@ mod array_ops;
 pub(crate) mod bigint;
 mod cldr_alias;
 mod cldr_alias_data;
+mod cldr_ar_eg;
+mod cldr_de;
+mod cldr_dtf_en;
 mod cldr_en;
+mod cldr_ja;
+mod cldr_zh;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod closure_make_jit;
 mod coerce;
@@ -2725,6 +2733,7 @@ mod const_cache;
 mod construct;
 #[cfg(all(feature = "meter-only", not(feature = "jit")))]
 mod counted_loop;
+mod dtf_locale;
 mod dtf_pattern;
 mod enum_stream;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]

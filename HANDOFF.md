@@ -1,5 +1,43 @@
 # Zipp performance handoff
 
+### 14 September: canonical promotion approved
+
+The user approved preparing a promotion PR in `f2i-com/zipp.org` and running
+CI on the exact final commit. Canonical `main` is an ancestor of the current
+integration branch, with no competing commits at preparation time. Merge and
+v0.0.18 tagging remain behind the final CI gates. The local validation below
+is retained as historical evidence; its earlier push hold has been superseded
+for this promotion branch and PR.
+
+### 14 September: local conformance follow-up; pushes held
+
+The user explicitly requested no further pushes until tests pass. The
+DateTimeFormat changes and documented Test262 corrections remain local.
+`tools/run_test262_dual.py` runs the original pinned core corpus and a separate
+five-file correction profile, retaining both reports. The nine contradictory
+upstream executions remain visible in the original result; the corrected run
+has no expected-failure allowance. The two German staging failures are fixed
+in the VM, without test patches. The German-only phase completed with original
+95,671/95,680 and corrected 95,680/95,680, no skips, in
+`target/test262-dual-v2/comparison.json`. The expanded DateTimeFormat release
+build's full comparison also completed with those exact counts and both gates
+passing, in `target/test262-dtf-final`. Durable build hashes and summaries are in
+`docs/validation/2026-09-14-test262-datetimeformat.json`.
+
+Native library and locale checks pass in default and safe profiles. Both WASM
+feature variants compile. The original DateTimeFormat ECMA-402 shard now passes
+488/488, zero failures/skips, in both debug and release. CLDR 48 tables cover
+English, German, Japanese, Chinese and Egyptian Arabic for this service; other
+Intl services retain their English locale set. Calendar patterns, related/cyclic
+years, leap months, era names, hour cycles and localized numbering are fixed.
+No canonical push, tag or release is authorized
+by a partial or patched-suite result alone. See
+[the corrections guide](tools/test262-corrections/README.md).
+
+Use `target/dtf-dev/release/zipp.exe` for this validation. An earlier baseline
+checkout shared `target/` and Cargo reused its VM artifacts; that comparison
+was discarded and the final build uses an isolated target directory.
+
 ### 14 September: Test262 baseline follow-up
 
 The latest completed Test262 run at `0a5c1e2e` is 95,669 PASS / 11 FAIL / 0 SKIP,

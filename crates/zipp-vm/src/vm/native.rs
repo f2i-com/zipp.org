@@ -695,6 +695,7 @@ pub const INTL_GET_CANONICAL_LOCALES: u16 = 560;
 pub const INTL_SUPPORTED_VALUES_OF: u16 = 561;
 pub const INTL_RESOLVED_OPTIONS: u16 = 562;
 pub const INTL_SUPPORTED_LOCALES_OF: u16 = 563;
+pub const INTL_DTF_SUPPORTED_LOCALES_OF: u16 = 951;
 pub const INTL_NF_FORMAT: u16 = 564;
 pub const INTL_NF_FORMAT_TO_PARTS: u16 = 565;
 pub const INTL_DTF_FORMAT: u16 = 566;
@@ -1710,7 +1711,7 @@ pub fn static_name_length(id: u16) -> Option<(&'static str, u8)> {
         n if n >= INTL_RESOLVED_OPTIONS_BASE && n < INTL_RESOLVED_OPTIONS_BASE + 10 => {
             ("resolvedOptions", 0)
         }
-        INTL_SUPPORTED_LOCALES_OF => ("supportedLocalesOf", 1),
+        INTL_SUPPORTED_LOCALES_OF | INTL_DTF_SUPPORTED_LOCALES_OF => ("supportedLocalesOf", 1),
         // The `format`/`compare` TARGETS are never exposed directly: the accessor
         // hands out a Bound wrapper whose name is "" (handled in
         // callable_name_length), so these entries only cover a direct .call().

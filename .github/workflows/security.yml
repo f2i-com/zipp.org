@@ -146,7 +146,8 @@ jobs:
             --test audit_20260912_typedarray_species \
             --test audit_20260912_weak_gc \
             --test class_body_bindings --test annexb_arguments_bindings \
-            --test intl_locale_fallback --test global_fingerprint
+            --test intl_locale_fallback --test intl_german_datetime \
+            --test intl_calendar_formatting --test global_fingerprint
 
   native-sandbox:
     name: Isolated native sandbox
@@ -277,23 +278,29 @@ jobs:
           assert info["source"] == expected and info["dirty"] is False, info
           print("Test262 engine source:", expected)
           PY
-      - name: Require the exact expected-failure identities and zero skips
+      - name: Test conformance scoring and corpus provenance checks
+        run: python3 -m unittest discover -s tools -p 'test_run_test262*.py'
+      - name: Report upstream and require all documented corrected tests to pass
         run: >-
-          python3 tools/run_test262.py
+          python3 tools/run_test262_dual.py
           --t262 target/test262
+          --corrected-tree target/test262-corrected
           --zipp target/release/zipp
           --jobs 2 --timeout 120
-          --expected-failures tools/test262-expected-failures.txt
-          --dump-fails test262-failures.txt
-          --json test262-results.json
+          --output-dir target/test262-evidence
+      - name: Require the original DateTimeFormat ECMA-402 tests to pass
+        run: >-
+          python3 tools/run_test262.py --t262 target/test262
+          --sub test/intl402/DateTimeFormat --include-intl402
+          --zipp target/release/zipp --jobs 2 --timeout 120
+          --dump-fails target/test262-evidence/datetimeformat-failures.txt
+          --json target/test262-evidence/datetimeformat.json
       - name: Upload the conformance evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test262-evidence
-          path: |
-            test262-failures.txt
-            test262-results.json
+          path: target/test262-evidence/
           if-no-files-found: warn
           retention-days: 30
 

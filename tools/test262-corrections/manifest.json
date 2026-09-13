@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "upstream_commit": "4249661388e5d3f92a85186213da140a6481490f",
+  "profile": "zipp-documented-corrections-v1",
+  "corrections": [
+    {
+      "path": "test/staging/sm/Error/constructor-proto.js",
+      "patch": "01-constructor-proto.patch",
+      "original_sha256": "e42a648845a28cbcf52adc3c0a437b6afe0a18d8ea0cef5821ba9dcdd3c08738",
+      "corrected_sha256": "2bfe19e7f884b1070643a32957082772542e1de4362881835f9f17aba459dead",
+      "reason": "The current harness includes Error itself. Keep its separate assertions and apply NativeError subclass assertions only to subclasses.",
+      "specification": "https://tc39.es/ecma262/multipage/fundamental-objects.html#sec-native-error-types-used-in-this-standard"
+    },
+    {
+      "path": "test/staging/sm/Error/prototype-properties.js",
+      "patch": "02-prototype-properties.patch",
+      "original_sha256": "e91457931236bdc6fe42d96e96569fd9bfff1ee2c0592aca19c3dc2a4886b5b2",
+      "corrected_sha256": "8c7518da25731c9045015a8082369e58c87291212844bc8b96ba83ea4e45559e",
+      "reason": "The current harness includes Error itself. Keep its separate assertions and apply NativeError subclass assertions only to subclasses.",
+      "specification": "https://tc39.es/ecma262/multipage/fundamental-objects.html#sec-native-error-types-used-in-this-standard"
+    },
+    {
+      "path": "test/staging/sm/Error/prototype.js",
+      "patch": "03-prototype.patch",
+      "original_sha256": "ee62fb50ca1cee2a3a6de258af03b38a8750dde2e0485101f997db2bd730f770",
+      "corrected_sha256": "9ca10517e37098676f03b363bf5a037ced1d381fa18d475ab0f510ba1b31bb00",
+      "reason": "The current harness includes Error itself. Keep its separate assertions and apply NativeError subclass assertions only to subclasses.",
+      "specification": "https://tc39.es/ecma262/multipage/fundamental-objects.html#sec-native-error-types-used-in-this-standard"
+    },
+    {
+      "path": "test/built-ins/TypedArray/prototype/slice/speciesctor-return-same-buffer-with-offset.js",
+      "patch": "04-speciesctor-return-same-buffer-with-offset.patch",
+      "original_sha256": "2136a50c608ac2dd74815ca4cb4ec6e0eb7bd54d1fc102bec5fe53b322563a6b",
+      "corrected_sha256": "63b8aa6b02f2fbf4aa2db2382a0292e4678cb9044305b2549f5901fae49cc17e",
+      "reason": "Preserve alias-copy assertions for mutable buffers; assert the required TypeError and unchanged source for the newly added immutable factory.",
+      "specification": "https://tc39.es/proposal-immutable-arraybuffer/#sec-typedarrayspeciescreate"
+    },
+    {
+      "path": "test/annexB/language/function-code/block-decl-func-skip-arguments.js",
+      "patch": "05-block-decl-func-skip-arguments.patch",
+      "original_sha256": "8a225aefbeb41d9a8f5630403141e3b718330d1e946c15a9fb35678da9a90d01",
+      "corrected_sha256": "e9fe769f4b14ef4213e29b524cd3a8b39a1cb1b30952b85a79c5fb8320baa9aa",
+      "reason": "Replace the superseded ES2017 final arguments-object assertion with the current Annex B function binding; retain pre-block and inside-block assertions in all three parameter forms.",
+      "specification": "https://tc39.es/ecma262/multipage/additional-ecmascript-features-for-web-browsers.html#sec-web-compat-functiondeclarationinstantiation"
+    }
+  ]
+}

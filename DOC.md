@@ -70,16 +70,21 @@ executable still contains the native JIT machinery. Use the separately built
 
 ## Conformance and language coverage
 
-The current required test262 result is **95,939 / 95,942 (99.997%)** on the
-pinned suite revision. The expected-failure file is authoritative:
-[`tools/test262-expected-failures.txt`](tools/test262-expected-failures.txt).
+The core Test262 corpus is pinned to
+`4249661388e5d3f92a85186213da140a6481490f`, including staging and excluding the
+separate `intl402` suite. See the README for measured counts and build identity.
+The [original failure manifest](tools/test262-expected-failures.txt) and
+[documented corrections](tools/test262-corrections/README.md) serve distinct
+purposes: the original run retains nine inconsistent upstream executions, while
+the separately patched run must pass every execution with zero skips and no
+expected-failure allowance. Both raw reports are retained. A patched result is
+never presented as unmodified upstream conformance.
 
-The remaining three executions are:
-
-- one Annex B test that asserts wording removed after ES2017; the paired staging
-  test and current specification require the behavior Zipp implements; and
-- two `staging/sm/String/internalUsage.js` modes that require German CLDR date
-  formatting, while Zipp deliberately ships only the `en` locale today.
+The German `String/internalUsage.js` modes now pass without test changes.
+DateTimeFormat uses generated CLDR 48 data for `en`/`en-US`, `de`/`de-DE`,
+`ja`/`ja-JP`, `zh`/`zh-CN` and `ar-EG`. Its original pinned ECMA-402 shard passes
+488/488 executions without skips. Other Intl services currently ship English
+locale data only; this is not a claim of complete ECMA-402 conformance.
 
 Errored module cycles, repeat dynamic import of those cycles, deferred-module
 top-level-await ordering, module-source path handling, and cross-realm
@@ -107,8 +112,9 @@ Zipp implements modern ES2015–ES2025 language and runtime features, including:
 Temporal includes fifteen calendars. Twelve are closed-form; Chinese and Dangi
 use astronomical calculation, and Umm al-Qura follows the required month data.
 The IANA time-zone database is generated from pinned upstream data. Broad
-Intl/CLDR locale data is the material remaining platform gap; the project does
-not add one-off guessed locale patterns merely to make individual tests green.
+Intl/CLDR locale coverage and some calendar/numbering-system behavior remain
+platform gaps. The DateTimeFormat tables come from the official CLDR
+release, with recorded hashes and the upstream Unicode license.
 
 The conformance gate is intentionally multi-mode: default JIT,
 interpreter-only, forced-JIT, and majors-only-GC runs must produce the same

@@ -1,4 +1,7 @@
 *.sh text eol=lf
+tools/test262-corrections/** text eol=lf
+# Unified patches encode empty context lines as one space; preserve that syntax.
+tools/test262-corrections/*.patch whitespace=-blank-at-eol,-blank-at-eof
 bench/pgo-training/** text eol=lf
 
 # Preserve upstream parser sources/snapshots, including generated whitespace.

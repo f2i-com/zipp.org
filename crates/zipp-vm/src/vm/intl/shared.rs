@@ -981,7 +981,16 @@ impl<'p> Vm<'p> {
             // and "search" are excluded from this list by the spec.
             "getCollations" => strings(self, &["default"]),
             // The hour cycle DateTimeFormat resolves when nothing overrides it.
-            "getHourCycles" => strings(self, &["h12"]),
+            "getHourCycles" => {
+                let requested = self.display(self.intl_slot(resolved, "hourCycle"));
+                let default = crate::vm::dtf_locale::for_locale(&tag).hour_cycle;
+                let cycle = if matches!(requested.as_str(), "h11" | "h12" | "h23" | "h24") {
+                    requested.as_str()
+                } else {
+                    default
+                };
+                strings(self, &[cycle])
+            }
             "getTimeZones" => {
                 // Structural rule: no region subtag → undefined, no data needed.
                 if self.intl_slot(resolved, "region") == Value::UNDEFINED {
@@ -1192,6 +1201,9 @@ fn is_rtl_script(script: &str) -> bool {
 /// Sorted, and every entry is a canonical tag — `best_available_locale` relies
 /// on both.
 pub(crate) const AVAILABLE_LOCALES: &[&str] = &["en", "en-US"];
+pub(crate) const DTF_AVAILABLE_LOCALES: &[&str] = &[
+    "ar-EG", "de", "de-DE", "en", "en-US", "ja", "ja-JP", "zh", "zh-CN",
+];
 
 /// DefaultLocale(). Must itself be in [[AvailableLocales]].
 pub(crate) const DEFAULT_LOCALE: &str = "en";
@@ -1237,14 +1249,17 @@ pub(crate) fn unicode_extension_of(tag: &str) -> Option<String> {
 /// No match anywhere falls back to DefaultLocale() and — per LookupMatcher
 /// step 5 — WITHOUT an extension: the keywords of a locale the engine does not
 /// have say nothing about the one it will actually use. That is why
-/// `new Intl.DateTimeFormat("de-u-hc-h11")` resolves to plain `en` here rather
-/// than to `en-u-hc-h11` (`resolvedOptions/hourCycle.js` wants the h11, and
-/// only a `de` in [[AvailableLocales]] would earn it).
+/// `new Intl.NumberFormat("de-u-nu-arab")` resolves to plain `en` here rather
+/// than retaining extension keywords from an unsupported service locale.
 pub(crate) fn lookup_matcher(requested: &[String]) -> String {
+    lookup_matcher_in(requested, AVAILABLE_LOCALES)
+}
+
+pub(crate) fn lookup_matcher_in(requested: &[String], available: &[&str]) -> String {
     requested
         .iter()
         .find_map(|tag| {
-            best_available_locale(&strip_extensions(tag)).map(|found| {
+            best_available_locale_in(&strip_extensions(tag), available).map(|found| {
                 // Only the `-u-` travels; `-t-`/`-x-` carry no
                 // [[RelevantExtensionKeys]].
                 match unicode_extension_of(tag) {
@@ -1260,13 +1275,15 @@ pub(crate) fn lookup_matcher(requested: &[String]) -> String {
 /// in [[AvailableLocales]], truncating one subtag at a time and never leaving a
 /// trailing single-character subtag behind. `locale` must already have its
 /// extensions stripped.
+#[cfg(test)]
 pub(crate) fn best_available_locale(locale: &str) -> Option<String> {
+    best_available_locale_in(locale, AVAILABLE_LOCALES)
+}
+
+pub(crate) fn best_available_locale_in(locale: &str, available: &[&str]) -> Option<String> {
     let mut candidate = locale.to_string();
     loop {
-        if AVAILABLE_LOCALES
-            .iter()
-            .any(|a| a.eq_ignore_ascii_case(&candidate))
-        {
+        if available.iter().any(|a| a.eq_ignore_ascii_case(&candidate)) {
             return Some(candidate);
         }
         let Some(pos) = candidate.rfind('-') else {

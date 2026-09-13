@@ -1,5 +1,5 @@
-//! UTS #35 date-time pattern selection and interpretation over the CLDR `en`
-//! tables in `cldr_en`.
+//! UTS #35 date-time pattern selection and interpretation over the shipped CLDR
+//! locale tables.
 //!
 //! ECMA-402's DateTimeFormat resolves a set of *components* (year, month,
 //! weekday, … each with a width) into a locale PATTERN, then renders that
@@ -18,10 +18,9 @@
 //!   * `parse_pattern` splits a pattern into literal runs and fields so the
 //!     caller can emit one typed part per field.
 //!
-//! Nothing here is locale-general — it reads `cldr_en` and formats `en`. That
-//! is the whole point: `[[AvailableLocales]]` is `["en", "en-US"]`.
+//! Pattern selection receives the DateTimeFormat service's resolved locale data.
 
-use crate::vm::cldr_en as d;
+use crate::vm::dtf_locale::{CalendarPatterns, DateTimeLocale};
 
 /// One piece of a CLDR pattern: a literal run, or `count` repetitions of a
 /// field letter.
@@ -113,21 +112,28 @@ pub(crate) fn class_of_pub(c: char) -> Option<u8> {
 /// is what `formatRangeToParts` asserts ("Jan" and "2019" shared, the two days
 /// start/endRange).
 pub(crate) fn interval_layout(items: &[Item]) -> Option<(usize, usize, usize)> {
+    // Related year and cyclic year name share a matching class, but they are
+    // different fields at one endpoint, not a repeated range boundary.
+    let range_key = |c| match c {
+        'r' => Some(13),
+        'U' => Some(14),
+        _ => class_of(c),
+    };
     let mut count = [0u8; 16];
     for it in items {
         if let Item::Field(c, _) = it {
-            if let Some(k) = class_of(*c) {
+            if let Some(k) = range_key(*c) {
                 count[k as usize] += 1;
             }
         }
     }
-    let repeated = |it: &Item| matches!(it, Item::Field(c, _) if class_of(*c).is_some_and(|k| count[k as usize] > 1));
+    let repeated = |it: &Item| matches!(it, Item::Field(c, _) if range_key(*c).is_some_and(|k| count[k as usize] > 1));
     // The SECOND occurrence of a repeated class opens the end endpoint.
     let mut seen = [false; 16];
     let mut second = None;
     for (i, it) in items.iter().enumerate() {
         let Item::Field(c, _) = it else { continue };
-        let Some(k) = class_of(*c) else { continue };
+        let Some(k) = range_key(*c) else { continue };
         if seen[k as usize] {
             second = Some(i);
             break;
@@ -264,10 +270,21 @@ fn adjust_widths(pattern: &str, req: &Request) -> String {
                             3 => n <= 2 && *wn <= 2, // month has both forms
                             _ => true,
                         };
-                        // The letter always comes from the request: it carries
-                        // the hour CYCLE (h/H/K/k) and the zone STYLE (z/v/O).
-                        let count = if numeric { (*wn).max(n) } else { *wn };
-                        out.push_str(&wc.to_string().repeat(count))
+                        // Preserve calendar year kinds and standalone months;
+                        // other letters follow the requested hour cycle or zone style.
+                        let count = if matches!(c, 'r' | 'U') || (k == 3 && n >= 3 && *wn <= 2) {
+                            n
+                        } else if numeric {
+                            (*wn).max(n)
+                        } else {
+                            *wn
+                        };
+                        let letter = if matches!(c, 'r' | 'U') || (c == 'L' && *wc == 'M') {
+                            c
+                        } else {
+                            *wc
+                        };
+                        out.push_str(&letter.to_string().repeat(count))
                     }
                     None => out.push_str(&c.to_string().repeat(n)),
                 }
@@ -288,7 +305,13 @@ fn distance(cand: &str, want: &[(u8, char, usize)]) -> Option<u32> {
     const WRONG_KIND: u32 = 100;
     let cf = pattern_fields(cand);
     let mut score = 0u32;
-    for (k, _, n) in &cf {
+    for (k, c, n) in &cf {
+        // A cyclic-year-only skeleton is not a numeric-year request. CLDR's
+        // Chinese `yyyyMd` supplies the related year, while `UMd` names only
+        // the sexagenary year; width distance must not prefer the latter.
+        if *k == 1 && *c == 'U' && want.iter().any(|(wk, wc, _)| *wk == 1 && *wc != 'U') {
+            return None;
+        }
         match want.iter().find(|(wk, ..)| wk == k) {
             Some((_, _, wn)) => {
                 // Month is the one ECMA-402 field with both a NUMERIC form
@@ -314,16 +337,23 @@ fn distance(cand: &str, want: &[(u8, char, usize)]) -> Option<u32> {
 
 /// The best CLDR pattern for one half of a request (all date fields, or all
 /// time fields).
-fn best_half(want: &[(u8, char, usize)], hour12: bool) -> Option<String> {
+fn best_half(
+    data: &DateTimeLocale,
+    patterns: &CalendarPatterns,
+    want: &[(u8, char, usize)],
+    hour12: bool,
+) -> Option<String> {
     if want.is_empty() {
         return None;
     }
     let mut best: Option<(u32, &str)> = None;
-    for (sk, pat) in d::AVAILABLE_FORMATS {
+    for (sk, pat) in patterns.available_formats {
         // `availableFormats` carries an `h…`/`H…` twin of every time pattern;
         // only the one matching the resolved hour cycle is a candidate.
         let f = pattern_fields(sk);
-        if f.iter().any(|(k, c, _)| *k == 8 && (*c == 'h') != hour12) {
+        if f.iter()
+            .any(|(k, c, _)| *k == 8 && matches!(*c, 'h' | 'K') != hour12)
+        {
             continue;
         }
         // Plural-keyed rows ('week' W 'of' MMMM) are not skeletons.
@@ -356,7 +386,8 @@ fn best_half(want: &[(u8, char, usize)], hour12: bool) -> Option<String> {
             .collect();
         missing.sort_by_key(|(k, ..)| *k);
         for (k, c, n) in missing {
-            let Some((_, glue, name)) = d::APPEND_ITEMS
+            let Some((_, glue, name)) = data
+                .append_items
                 .iter()
                 .find(|(l, ..)| l.chars().next().and_then(class_of) == Some(*k))
             else {
@@ -375,7 +406,12 @@ fn best_half(want: &[(u8, char, usize)], hour12: bool) -> Option<String> {
 
 /// `best_pattern` without the join: the date pattern, the time pattern, and the
 /// index of the glue that would join them. `formatRange` needs the halves apart.
-pub(crate) fn best_pattern_halves(req: &Request, hour12: bool) -> (String, String, usize) {
+pub(crate) fn best_pattern_halves(
+    data: &DateTimeLocale,
+    patterns: &CalendarPatterns,
+    req: &Request,
+    hour12: bool,
+) -> (String, String, usize) {
     let all: Vec<(u8, char, usize)> = req
         .fields
         .iter()
@@ -392,13 +428,13 @@ pub(crate) fn best_pattern_halves(req: &Request, hour12: bool) -> (String, Strin
         .filter(|(k, ..)| !is_date_class(*k) && *k != 11)
         .collect();
     let frac = all.iter().find(|(k, ..)| *k == 11).copied();
-    let dp = best_half(&date, hour12)
+    let dp = best_half(data, patterns, &date, hour12)
         .map(|p| adjust_widths(&p, req))
         .unwrap_or_default();
-    let tp = best_half(&time, hour12)
+    let tp = best_half(data, patterns, &time, hour12)
         .map(|p| adjust_widths(&p, req))
         .map(|p| match frac {
-            Some((_, c, n)) => splice_fraction(&p, c, n),
+            Some((_, c, n)) => splice_fraction(data, &p, c, n),
             None => p,
         })
         .unwrap_or_default();
@@ -408,7 +444,7 @@ pub(crate) fn best_pattern_halves(req: &Request, hour12: bool) -> (String, Strin
 
 /// Attach `SSS…` to the seconds field with the locale's decimal separator, so
 /// `{second, fractionalSecondDigits: 2}` reads "47.00" and not "47 00".
-fn splice_fraction(pattern: &str, c: char, n: usize) -> String {
+fn splice_fraction(data: &DateTimeLocale, pattern: &str, c: char, n: usize) -> String {
     let mut out = String::new();
     let mut done = false;
     for item in parse_pattern(pattern) {
@@ -426,7 +462,7 @@ fn splice_fraction(pattern: &str, c: char, n: usize) -> String {
                 out.push_str(&fc.to_string().repeat(fn_));
                 if fc == 's' && !done {
                     done = true;
-                    out.push_str(d::SYM_DECIMAL);
+                    out.push_str(data.sym_decimal);
                     out.push_str(&c.to_string().repeat(n));
                 }
             }
@@ -497,7 +533,12 @@ pub(crate) fn style_index(s: &str) -> Option<usize> {
 /// The `intervalFormats` pattern for `skeleton` at the greatest differing field,
 /// or None when CLDR has no row (the caller then formats both endpoints whole
 /// and joins them with `INTERVAL_FALLBACK`).
-pub(crate) fn interval_pattern(half: &[Item], hour12: bool, greatest: char) -> Option<String> {
+pub(crate) fn interval_pattern(
+    patterns: &CalendarPatterns,
+    half: &[Item],
+    hour12: bool,
+    greatest: char,
+) -> Option<String> {
     // The request is the HALF's own pattern, not the whole formatter's: a
     // date+time formatter whose time moved matches CLDR's `hms` interval rows,
     // and a `dateStyle` formatter matches the style pattern's own skeleton
@@ -518,12 +559,14 @@ pub(crate) fn interval_pattern(half: &[Item], hour12: bool, greatest: char) -> O
     let req = &req;
     let gk = class_of(greatest)?;
     let mut best: Option<(u32, &str)> = None;
-    for (sk, gd, pat) in d::INTERVAL_FORMATS {
+    for (sk, gd, pat) in patterns.interval_formats {
         if class_of(gd.chars().next()?) != Some(gk) {
             continue;
         }
         let f = pattern_fields(sk);
-        if f.iter().any(|(k, c, _)| *k == 8 && (*c == 'h') != hour12) {
+        if f.iter()
+            .any(|(k, c, _)| *k == 8 && matches!(*c, 'h' | 'K') != hour12)
+        {
             continue;
         }
         if let Some(dist) = distance(sk, &want) {
@@ -551,7 +594,7 @@ pub(crate) fn interval_pattern(half: &[Item], hour12: bool, greatest: char) -> O
             })
         })
         .or_else(|| {
-            let (_, post) = d::INTERVAL_FALLBACK.split_once("{0}")?;
+            let (_, post) = patterns.interval_fallback.split_once("{0}")?;
             post.split_once("{1}").map(|(s, _)| s.to_string())
         })
         .unwrap_or_else(|| " \u{2013} ".to_string());
@@ -580,7 +623,7 @@ fn serialize(items: &[Item]) -> String {
 /// The flexible day period (UTS #35 §4.7) covering `minutes` past local
 /// midnight, e.g. "morning1" or "noon" for `en`. `_at` rules are instants and
 /// take precedence over the ranges that contain them.
-pub(crate) fn day_period_key(minutes: i32) -> &'static str {
+pub(crate) fn day_period_key(data: &DateTimeLocale, minutes: i32) -> &'static str {
     // `midnight` is in the rule set but is NOT a flexible day period: UTS #35
     // gives it to the `b` field (am/pm/noon/midnight), while `B` — the only
     // field ECMA-402's `dayPeriod` option can produce — uses the ranges around
@@ -588,12 +631,12 @@ pub(crate) fn day_period_key(minutes: i32) -> &'static str {
     // `format/dayPeriod-short-en.js` enumerates all 24 hours and asserts the
     // only values `en` may return are morning/noon/afternoon/evening/night.
     let usable = |k: &str| k != "midnight";
-    for (key, at, ..) in d::DAY_PERIOD_RULES {
+    for (key, at, ..) in data.day_period_rules {
         if *at >= 0 && *at == minutes && usable(key) {
             return key;
         }
     }
-    for (key, at, from, before) in d::DAY_PERIOD_RULES {
+    for (key, at, from, before) in data.day_period_rules {
         if *at >= 0 || !usable(key) {
             continue;
         }
@@ -617,8 +660,8 @@ pub(crate) fn day_period_key(minutes: i32) -> &'static str {
 
 /// A day-period name at a CLDR width index (0 = wide, 1 = abbreviated,
 /// 2 = narrow).
-pub(crate) fn day_period_name(key: &str, width: usize) -> &'static str {
-    for (k, wide, abbr, narrow) in d::DAY_PERIODS {
+pub(crate) fn day_period_name(data: &DateTimeLocale, key: &str, width: usize) -> &'static str {
+    for (k, wide, abbr, narrow) in data.day_periods {
         if *k == key {
             return [wide, abbr, narrow][width.min(2)];
         }

@@ -184,7 +184,7 @@ ffmpeg and the Python WASM build required).
 
 | Fast to start | Modern JavaScript | Ready to embed |
 |---|---|---|
-| **7.4 ms** median process launch in the canonical capture. No snapshot to load. | **99.989%** in the latest pinned core Test262 run: **95,669 / 95,680**, with 11 expected failures. | A native CLI, a Rust embedding API, and a browser WebAssembly runtime. |
+| **7.4 ms** median process launch in the canonical capture. No snapshot to load. | **99.991%** in the pinned original core Test262 run: **95,671 / 95,680**, with nine documented upstream inconsistencies. | A native CLI, a Rust embedding API, and a browser WebAssembly runtime. |
 
 - **Explore the whole engine.** The lexer, parser, register VM, GC, inline caches
   and JITs live together in this repository.
@@ -899,18 +899,26 @@ below.
 
 ## Correctness and language coverage
 
-The [latest completed Test262 run](https://github.com/f2i-com/zipp-python/actions/runs/34761803672/job/103735841023)
-at engine revision `0a5c1e2e` reports **99.989% of test262**: 95,669 / 95,680 executions,
-with **11 expected failures and zero skips**. The corpus is pinned to
-`4249661388e5d3f92a85186213da140a6481490f`, including staging and excluding the
-separate ECMA-402 suite. A green gate means no unexpected failures, stale
-expectations or skips; it does **not** mean every execution passed.
+The [local validation](docs/validation/2026-09-14-ci-readiness.md) reports
+**99.991% of test262**: 95,671 / 95,680 executions in the original pinned core
+suite, with **nine documented upstream inconsistencies and zero skips**.
+The corpus is pinned to `4249661388e5d3f92a85186213da140a6481490f`, including
+staging and excluding the separate ECMA-402 suite.
 
-Eight failures expose contradictions in the pinned Error/TypedArray harnesses;
-one Annex B test carries a superseded ES2017 expectation; two require German
-CLDR formatting, which Zipp does not yet provide. See the
-[evidence and limitations](docs/validation/2026-09-14-ci-readiness.md) and
-[exact failure manifest](tools/test262-expected-failures.txt).
+| Validation profile | Passed | Failed | Skipped |
+| --- | ---: | ---: | ---: |
+| Original pinned core Test262 | 95,671 | 9 | 0 |
+| Core with five documented test corrections | 95,680 | 0 | 0 |
+| Original DateTimeFormat ECMA-402 tests | 488 | 0 | 0 |
+
+Eight original failures expose contradictions in the pinned Error/TypedArray
+harnesses; one Annex B test carries a superseded ES2017 expectation.
+[The corrections](tools/test262-corrections/README.md) retain both original and
+corrected reports, with exact file hashes and no skipped executions. The
+corrected profile permits no expected failures. Its 100% result is explicitly
+separate from unmodified upstream conformance. The German formatting failures
+are fixed in the VM without test changes. Passing the DateTimeFormat shard
+does not establish complete ECMA-402 coverage or universal ICU parity.
 
 The [12 September 2026 correctness audit](docs/audits/2026-09-12-correctness.md)
 recorded an earlier **95,939 / 95,942** result against corpus `defaaf1571`.
@@ -945,7 +953,9 @@ ES2015–ES2025 is essentially complete, including:
 - `eval`, `Function`, `ShadowRealm`, structured cloning, and browser-oriented
   embedding APIs.
 
-Only the `en` CLDR locale ships today. The detailed support notes and durable
+DateTimeFormat ships CLDR 48 data for `en`/`en-US`, `de`/`de-DE`, `ja`/`ja-JP`,
+`zh`/`zh-CN` and `ar-EG`. Other Intl services
+currently ship English locale data only. The detailed support notes and durable
 architecture reference live in [`DOC.md`](DOC.md).
 
 ## How it works
