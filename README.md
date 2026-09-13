@@ -184,7 +184,7 @@ ffmpeg and the Python WASM build required).
 
 | Fast to start | Modern JavaScript | Ready to embed |
 |---|---|---|
-| **7.4 ms** median process launch in the canonical capture. No snapshot to load. | **99.991%** in the pinned original core Test262 run: **95,671 / 95,680**, with nine documented upstream inconsistencies. | A native CLI, a Rust embedding API, and a browser WebAssembly runtime. |
+| **7.4 ms** median process launch in the canonical capture. No snapshot to load. | **100% of the documented corrected core Test262 suite:** **95,680 / 95,680**, zero failures or skips. [Original and corrected results](#correctness-and-language-coverage) are reported separately. | A native CLI, a Rust embedding API, and a browser WebAssembly runtime. |
 
 - **Explore the whole engine.** The lexer, parser, register VM, GC, inline caches
   and JITs live together in this repository.
@@ -899,16 +899,24 @@ below.
 
 ## Correctness and language coverage
 
-The [local validation](docs/validation/2026-09-14-ci-readiness.md) reports
-**99.991% of test262**: 95,671 / 95,680 executions in the original pinned core
-suite, with **nine documented upstream inconsistencies and zero skips**.
+[Hosted CI at `1539eb4b`](https://github.com/f2i-com/zipp.org/actions/runs/34768127494/job/103752682947)
+confirms **100% of the documented corrected core Test262 suite passes**:
+**95,680 / 95,680 executions, zero failures and zero skips**. This profile applies
+[five documented test corrections](tools/test262-corrections/README.md) covering
+nine inconsistent upstream executions. The original DateTimeFormat ECMA-402
+shard also passes **488 / 488**, without corrections or skips.
+
+For comparison, the unmodified pinned core result is
+**99.991% of test262**: 95,671 / 95,680 executions, with the same nine documented
+upstream inconsistencies and zero skips. [Validation evidence](docs/validation/2026-09-14-ci-readiness.md)
+retains both results; the corrected profile is not an unmodified-upstream claim.
 The corpus is pinned to `4249661388e5d3f92a85186213da140a6481490f`, including
 staging and excluding the separate ECMA-402 suite.
 
 | Validation profile | Passed | Failed | Skipped |
 | --- | ---: | ---: | ---: |
-| Original pinned core Test262 | 95,671 | 9 | 0 |
 | Core with five documented test corrections | 95,680 | 0 | 0 |
+| Original pinned core Test262 | 95,671 | 9 | 0 |
 | Original DateTimeFormat ECMA-402 tests | 488 | 0 | 0 |
 
 Eight original failures expose contradictions in the pinned Error/TypedArray
