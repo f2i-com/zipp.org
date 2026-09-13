@@ -9,6 +9,13 @@ v0.0.18 tagging remain behind the final CI gates. The local validation below
 is retained as historical evidence; its earlier push hold has been superseded
 for this promotion branch and PR.
 
+PR #19 is open on `codex/promote-0.0.18`. At `1539eb4b`, canonical standard
+CI and the original/corrected Test262 gates all passed. The earlier broad
+native run failed only because its preinstalled Node lacked Float16Array;
+`typedarray_interp_index_fast` compared unequal row counts. The native lane now
+selects and verifies Node 24, matching standard CI. Its focused test passes
+locally. The updated head needs fresh hosted gates before merge or release.
+
 ### 14 September: local conformance follow-up; pushes held
 
 The user explicitly requested no further pushes until tests pass. The

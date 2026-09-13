@@ -82,6 +82,14 @@ jobs:
       # not show is a toolchain drift signal, not a release blocker.
       - name: Select stable Rust (canary)
         run: rustup toolchain install stable --profile minimal --no-self-update
+      # Differential tests use Node 24 as their reference, including Float16Array.
+      # The runner's preinstalled Node may omit it and produce fewer output rows.
+      - name: Select the Node.js reference runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Verify reference runtime capabilities
+        run: node -e 'if (Number(process.versions.node.split(".")[0]) !== 24 || typeof Float16Array !== "function") throw Error("Native parity tests require Node 24 with Float16Array"); console.log(process.version)'
       - name: Validate and print the test quarantine
         run: python3 tools/ci_quarantine.py --check --print
       - name: Test the root native workspace

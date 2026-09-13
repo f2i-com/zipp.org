@@ -221,3 +221,24 @@ binary, patches and raw reports. Raw local reports are in
 At the last status check, the earlier hosted broad CI run had seven successful
 jobs and its native workspace job still running. No release-readiness claim is
 made for that incomplete run, and nothing from this follow-up has been pushed.
+
+# Canonical promotion CI and native reference-runtime repair
+
+Draft PR [zipp.org #19](https://github.com/f2i-com/zipp.org/pull/19) promotes
+commit `1539eb4b8b50e270c42f7a197d7aab65dcde5949`. Its standard CI passed all
+three jobs. The hosted Test262 job independently confirmed original core
+95,671 PASS / 9 FAIL / 0 SKIP, corrected core 95,680 PASS / 0 FAIL / 0 SKIP,
+and original DateTimeFormat 488 PASS / 0 FAIL / 0 SKIP on that clean commit.
+
+The earlier native workspace run at `09704737` completed after about 86 minutes
+with one failing target: `typedarray_interp_index_fast`. Its output matched
+apart from the Float16Array row: ZIPP emitted the row while the runner's Node
+reference omitted it because Float16Array was unavailable. The broad workflow
+had not selected Node 24, unlike standard CI.
+
+The broad native lane now explicitly selects Node 24 and checks its version
+and Float16Array support before the expensive build. No runtime behavior or
+test assertion was changed. Both tests in `typedarray_interp_index_fast` pass
+locally with Node 24.19.0, including interpreter GC-stress comparison, and
+actionlint passes. The updated PR head requires fresh CI; merge and tagging
+remain gated on those results.
