@@ -28,7 +28,7 @@ header('Cache-Control: no-store');
 header('X-Content-Type-Options: nosniff');
 
 $cacheDir = is_writable(__DIR__ . '/cache') ? __DIR__ . '/cache' : sys_get_temp_dir();
-$cacheFile = $cacheDir . '/zipp-landing-stats.json';
+$cacheFile = $cacheDir . '/zipp-landing-stats-v2.json';
 
 $cached = null;
 if (is_file($cacheFile)) {
@@ -263,6 +263,15 @@ if ($readme !== null && $readme[0] === 200) {
         $facts['test262_pct'] = (float) $m[1];
         $facts['test262_pass'] = (int) str_replace(',', '', $m[2]);
         $facts['test262_total'] = (int) str_replace(',', '', $m[3]);
+    }
+    // Preserve original facts and expose the explicitly corrected profile separately.
+    if (preg_match('/^\| Core with five documented test corrections \|\s*([0-9,]+)\s*\|\s*([0-9,]+)\s*\|\s*([0-9,]+)\s*\|\s*$/m', $text, $m)) {
+        $pass = (int) str_replace(',', '', $m[1]);
+        $total = $pass + (int) str_replace(',', '', $m[2]) + (int) str_replace(',', '', $m[3]);
+        if ($total > 0 && $pass <= $total && $total <= 9007199254740991) {
+            $facts['test262_corrected_pass'] = $pass;
+            $facts['test262_corrected_total'] = $total;
+        }
     }
     // Zipp has\n21 of 30 Node point wins.
     if (preg_match('/Zipp has\s+(\d+) of 30 Node point wins/', $text, $m)) {

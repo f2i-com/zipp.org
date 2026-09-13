@@ -4,6 +4,7 @@ import { SandboxStack, ProjectShowcase } from './Experience'
 import { RepositoryActivity } from './RepositoryActivity'
 import { ProjectPlayground } from './ProjectPlayground'
 import { RecordedDemos } from './RecordedDemos'
+import { test262Summary } from './repoData'
 
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
 const F2I_URL = 'https://f2i.com'
@@ -179,6 +180,11 @@ function StarIcon() {
   )
 }
 
+function ConformanceLink({ stats }: { stats: RepoStats }) {
+  const result = test262Summary(stats)
+  return <a href={`${GITHUB_URL}/blob/${stats.sourceCommit ?? 'main'}/README.md#correctness-and-language-coverage`} target="_blank" rel="noreferrer" title={result?.detail}>{result?.label ?? 'ECMAScript compatibility'}</a>
+}
+
 function LiveRepoStrip({ stats, status }: { stats: RepoStats; status: RepoStatus }) {
   const version = stats.releaseTag ?? 'View releases'
   const pushed = relativeTime(stats?.pushedAt ?? stats?.latestCommitDate)
@@ -193,9 +199,7 @@ function LiveRepoStrip({ stats, status }: { stats: RepoStats; status: RepoStatus
         <a href={GITHUB_URL} target="_blank" rel="noreferrer"><b>{formatCount(stats.stars)}</b> stars</a>
       ) : null}
       {pushed && <span><b>updated</b> {pushed}</span>}
-      {stats?.test262Pct !== undefined && (
-        <span><b>{stats.test262Pct}%</b> of test262</span>
-      )}
+      {test262Summary(stats) && <ConformanceLink stats={stats} />}
     </div>
   )
 }
@@ -952,7 +956,7 @@ function App() {
             </div>
 
             <div className="hero-trust" aria-label="Zipp highlights">
-              <a href={`${GITHUB_URL}/blob/${stats.sourceCommit ?? 'main'}/README.md`} target="_blank" rel="noreferrer" title="Compatibility reported by the repository README">{stats.test262Pct !== undefined ? `${stats.test262Pct}% test262` : 'ECMAScript compatibility'}</a>
+              <ConformanceLink stats={stats} />
               <span><i />Native + WASM</span>
               <a href={`${GITHUB_URL}/blob/main/LICENSE-APACHE`} target="_blank" rel="noreferrer">Open source · {stats.license ?? 'Apache-2.0'}</a>
             </div>

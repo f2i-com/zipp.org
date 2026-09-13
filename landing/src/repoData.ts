@@ -22,6 +22,8 @@ export type RepoStats = {
   test262Pct?: number
   test262Pass?: number
   test262Total?: number
+  test262CorrectedPass?: number
+  test262CorrectedTotal?: number
 }
 
 const obj = (v: unknown): Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v) ? v as Record<string, unknown> : {}
@@ -47,6 +49,8 @@ export function parseRepoStats(raw: unknown): RepoStats | null {
     return tag && url ? [{ tag, name: str(item.name) ?? tag, url, publishedAt: date(item.published_at) }] : []
   })
   const pct = typeof readme.test262_pct === 'number' && readme.test262_pct >= 0 && readme.test262_pct <= 100 ? readme.test262_pct : undefined
+  const correctedPass = count(readme.test262_corrected_pass), correctedTotal = count(readme.test262_corrected_total)
+  const correctedValid = correctedPass !== undefined && correctedTotal !== undefined && correctedTotal > 0 && correctedPass <= correctedTotal
   return {
     generatedAt, stale: root.stale === true, cached: root.cached === true,
     branch: str(source.branch) ?? 'main', sourceCommit: str(source.commit),
@@ -55,7 +59,23 @@ export function parseRepoStats(raw: unknown): RepoStats | null {
     releaseTag: str(release.tag), releaseUrl: repositoryUrl(release.url), releasePublishedAt: date(release.published_at), releases,
     latestCommitSha: str(latest.sha), latestCommitMessage: str(latest.message), latestCommitDate: date(latest.date), latestCommitUrl: repositoryUrl(latest.url),
     test262Pct: pct, test262Pass: count(readme.test262_pass), test262Total: count(readme.test262_total),
+    test262CorrectedPass: correctedValid ? correctedPass : undefined,
+    test262CorrectedTotal: correctedValid ? correctedTotal : undefined,
   }
+}
+
+export function test262Summary(stats: RepoStats): { label: string; detail: string } | null {
+  const pass = stats.test262CorrectedPass, total = stats.test262CorrectedTotal
+  if (pass !== undefined && total !== undefined) {
+    // A rounded percentage must never claim 100 while an execution did not pass.
+    const pct = pass === total ? 100 : Math.min(99.999, Number((100 * pass / total).toFixed(3)))
+    const original = stats.test262Pass !== undefined && stats.test262Total !== undefined
+      ? ` Original core: ${formatCount(stats.test262Pass)} / ${formatCount(stats.test262Total)} passed.` : ''
+    return { label: `${pct}% Test262 · corrected suite`, detail: `${formatCount(pass)} / ${formatCount(total)} executions passed with documented upstream test corrections.${original} See both reports.` }
+  }
+  return stats.test262Pct !== undefined
+    ? { label: `${stats.test262Pct}% Test262 · original suite`, detail: 'Original pinned core Test262 result. See the README for its scope and known failures.' }
+    : null
 }
 
 export function relativeTime(iso: string | undefined, now = Date.now()): string {

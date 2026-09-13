@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createStatsHandler, fetchRepository, readReadmeFacts, REFRESH_SECONDS, MAX_STALE_SECONDS } from '../worker/repository.js'
-import { parseRepoStats, repositoryUrl } from '../src/repoData.ts'
+import { parseRepoStats, repositoryUrl, test262Summary } from '../src/repoData.ts'
 
 const snapshot = JSON.parse(readFileSync(new URL('../src/repo-snapshot.json', import.meta.url)))
 const sha = 'a'.repeat(40)
@@ -92,4 +92,31 @@ test('client rejects malformed data and unsafe links while retaining legitimate 
   for (const url of ['https://github.com.evil.test/f2i-com/zipp.org/releases', 'https://github.com/other/repo/releases', 'https://user:secret@github.com/f2i-com/zipp.org/releases']) assert.equal(repositoryUrl(url), undefined)
   assert.deepEqual(readReadmeFacts('**200% of test262**: 200 / 100'), {})
   assert.deepEqual(readReadmeFacts('A new README format'), {})
+})
+
+test('current README preserves original results and labels the corrected 100% separately', () => {
+  const facts = readReadmeFacts(readFileSync(new URL('../../README.md', import.meta.url), 'utf8'))
+  assert.equal(facts.test262_pct, 99.991)
+  assert.equal(facts.test262_pass, 95671)
+  assert.equal(facts.test262_corrected_pass, 95680)
+  assert.equal(facts.test262_corrected_total, 95680)
+  const summary = test262Summary(parseRepoStats({ ...snapshot, readme: facts }))
+  assert.equal(summary.label, '100% Test262 · corrected suite')
+  assert.match(summary.detail, /Original core: 95,671 \/ 95,680 passed/)
+})
+
+test('missing or malformed corrected data never relabels the original result', () => {
+  for (const extra of [{}, { test262_corrected_pass: 2, test262_corrected_total: 1 }, { test262_corrected_pass: 0, test262_corrected_total: 0 }]) {
+    const stats = parseRepoStats({ ...snapshot, readme: { test262_pct: 99.991, ...extra } })
+    assert.equal(test262Summary(stats).label, '99.991% Test262 · original suite')
+  }
+})
+
+test('corrected failures and skips reduce the result and cannot round to 100%', () => {
+  const facts = readReadmeFacts('| Core with five documented test corrections | 95,678 | 1 | 1 |')
+  assert.equal(facts.test262_corrected_total, 95680)
+  const summary = test262Summary(parseRepoStats({ ...snapshot, readme: facts }))
+  assert.ok(!summary.label.startsWith('100%'))
+  const almost = parseRepoStats({ ...snapshot, readme: { test262_corrected_pass: 999999, test262_corrected_total: 1000000 } })
+  assert.equal(test262Summary(almost).label, '99.999% Test262 · corrected suite')
 })

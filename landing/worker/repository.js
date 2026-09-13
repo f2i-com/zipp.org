@@ -5,14 +5,26 @@ export const MAX_STALE_SECONDS = 24 * 60 * 60
 const API = `https://api.github.com/repos/${REPOSITORY}`
 
 export function readReadmeFacts(text) {
+  const facts = {}
   const match = text.match(/\*\*([\d.]+)% of test262\*\*:\s*([\d,]+)\s*\/\s*([\d,]+)/)
-  if (!match) return {}
-  const [, percent, passed, total] = match
-  const pass = Number(passed.replaceAll(',', ''))
-  const count = Number(total.replaceAll(',', ''))
-  return pass <= count && count > 0 && Number(percent) <= 100
-    ? { test262_pct: Number(percent), test262_pass: pass, test262_total: count }
-    : {}
+  if (match) {
+    const [, percent, passed, total] = match
+    const pass = Number(passed.replaceAll(',', ''))
+    const count = Number(total.replaceAll(',', ''))
+    if (pass <= count && count > 0 && Number(percent) <= 100) {
+      Object.assign(facts, { test262_pct: Number(percent), test262_pass: pass, test262_total: count })
+    }
+  }
+  // Keep the corrected profile separate; never relabel the original percentage.
+  const corrected = text.match(/^\| Core with five documented test corrections \|\s*([\d,]+)\s*\|\s*([\d,]+)\s*\|\s*([\d,]+)\s*\|\s*$/m)
+  if (corrected) {
+    const [pass, fail, skip] = corrected.slice(1).map(value => Number(value.replaceAll(',', '')))
+    const total = pass + fail + skip
+    if ([pass, fail, skip, total].every(Number.isSafeInteger) && total > 0) {
+      Object.assign(facts, { test262_corrected_pass: pass, test262_corrected_total: total })
+    }
+  }
+  return facts
 }
 
 export async function fetchRepository(fetcher = fetch, token) {
@@ -61,7 +73,7 @@ export function createStatsHandler({ fetcher = fetch, now = Date.now } = {}) {
   let retryAfter = 0
   return async function repositoryStats(request, env = {}, cache) {
     if (request.method !== 'GET' && request.method !== 'HEAD') return new Response(null, { status: 405, headers: { Allow: 'GET, HEAD' } })
-    const key = new Request(new URL('/api/repository-cache-v1', request.url))
+    const key = new Request(new URL('/api/repository-cache-v2', request.url))
     let cached = memory
     if (!cached && cache) {
       try { cached = await (await cache.match(key))?.json() } catch { /* Cache failure must not prevent a refresh. */ }
