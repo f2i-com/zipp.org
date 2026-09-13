@@ -8,7 +8,7 @@ const explanations = {
 };
 let token, cursor = 0, renderer, ready = false, running = false, submitting = false, selectedJob = '', jobs = [], mutation = 0;
 const frames = new Map(), losses = new Map(), results = new Map();
-let logs = [];
+let logs = [], connectionError = null;
 function error(message) { $('error').textContent = message || ''; $('error').hidden = !message; }
 try {
   renderer = createStateRenderer($('state'));
@@ -31,12 +31,14 @@ function buttons() {
   for (const input of $('devices').querySelectorAll('[data-unusable]')) input.disabled = true;
 }
 function renderDevices(data) {
-  const list = $('devices'); list.replaceChildren();
+  const list = $('devices'), hadDevices = !!list.querySelector('input');
+  const selected = new Set([...list.querySelectorAll('input:checked')].map(input => input.value));
+  list.replaceChildren();
   let chosen = false;
   for (const device of [...data.devices, { id: 'cpu', name: 'CPU', usable: true }]) {
     const label = document.createElement('label'); label.className = 'device';
     const input = document.createElement('input'); input.type = 'checkbox'; input.value = device.id;
-    input.checked = device.usable && !chosen; if (input.checked) chosen = true;
+    input.checked = device.usable && (hadDevices ? selected.has(device.id) : !chosen); if (input.checked) chosen = true;
     input.disabled = !device.usable; if (!device.usable) input.dataset.unusable = 'true';
     const title = document.createElement('span'); title.textContent = `${device.id} · ${device.name}`;
     const detail = document.createElement('small');
@@ -49,11 +51,20 @@ function telemetry(gpus) {
   if (!gpus.length) { $('telemetry').textContent = 'NVIDIA telemetry unavailable.'; return; }
   for (const gpu of gpus) {
     const card = document.createElement('div'); card.className = 'gpu-card';
-    const title = document.createElement('strong'); title.textContent = `${gpu.id} · ${gpu.name}`;
+    const title = document.createElement('strong'); title.textContent = `${gpu.cudaDevices?.join(', ') || gpu.id} · ${gpu.name}`;
     const meter = document.createElement('div'); meter.className = 'meter'; const bar = document.createElement('div');
     bar.style.width = `${Math.max(0, Math.min(100, gpu.utilization || 0))}%`; meter.append(bar);
     const detail = document.createElement('p'); detail.textContent = `${gpu.utilization ?? '—'}% GPU · ${gpu.usedMiB ?? '—'} / ${gpu.totalMiB ?? '—'} MiB\n${gpu.temperature ?? '—'} °C · ${gpu.watts ?? '—'} W`;
     card.append(title, meter, detail); $('telemetry').append(card);
+  }
+}
+function drawState(frame, memory = true) {
+  if (!renderer) return;
+  try { renderer.draw(frame, memory); $('empty').hidden = !!frame; }
+  catch (e) {
+    error(e.message); renderer = null; $('empty').hidden = false;
+    $('empty').textContent = 'Visualization unavailable. Native compute continues.';
+    $('renderer').textContent = e.message;
   }
 }
 function renderFrame() {
@@ -62,10 +73,7 @@ function renderFrame() {
   const memory = job.mode.startsWith('memory');
   $('view-title').textContent = memory ? 'Private memory · cell × channel' : frame?.phase === 'training' ? 'Recurrent activations · channel × byte position' : 'Incremental cache · stage × channel';
   if (frame) {
-    if (renderer) {
-      try { renderer.draw(frame, memory); $('empty').hidden = true; }
-      catch (e) { error(e.message); renderer = null; $('empty').hidden = false; $('empty').textContent = 'Visualization unavailable. Native compute continues.'; }
-    }
+    drawState(frame, memory);
     $('frame-status').textContent = `${job.device} · ${frame.phase} ${frame.step}${frame.cell != null ? ` · cell ${frame.cell} · key ${frame.key}` : ''}`;
     if (frame.text != null) $('output').textContent = frame.text;
   }
@@ -75,7 +83,7 @@ function renderFrame() {
     const maxStep = Math.max(2, points.at(-1).step);
     $('loss-line').setAttribute('points', points.map(p => `${5 + (p.step - 1) / (maxStep - 1) * 490},${110 - (p.loss - low) / Math.max(.001, high - low) * 100}`).join(' '));
     $('loss-value').textContent = points.at(-1).loss.toFixed(4);
-    $('loss-caption').textContent = `Steps 1–${points.at(-1).step} · loss ${low.toFixed(3)}–${high.toFixed(3)} · ${memory ? 'binary cross-entropy' : 'nats per byte'}`;
+    $('loss-caption').textContent = `Steps ${points[0].step}–${points.at(-1).step} · loss ${low.toFixed(3)}–${high.toFixed(3)} · ${memory ? 'binary cross-entropy' : 'nats per byte'}`;
   } else {
     $('loss-line').setAttribute('points', ''); $('loss-value').textContent = '—'; $('loss-caption').textContent = 'A curve appears during training.';
   }
@@ -110,6 +118,8 @@ async function poll() {
   try {
     const data = await api(`status?after=${cursor}`);
     if (stamp !== mutation) { setTimeout(poll, 180); return; }
+    if (connectionError && $('error').textContent === connectionError) error('');
+    connectionError = null;
     // A restarted server has a new token and cursor sequence.
     if (token && data.token !== token) { cursor = 0; ready = false; frames.clear(); losses.clear(); results.clear(); }
     token = data.token; cursor = data.cursor;
@@ -136,7 +146,7 @@ async function poll() {
     logs = logs.slice(-60); $('events').textContent = logs.join('\n');
     $('connection').textContent = running ? `● ${jobs.filter(j => ['starting', 'running', 'stopping'].includes(j.state)).length} active device(s)` : jobs.length ? jobs.map(j => `${j.device}: ${j.state}`).join(' · ') : '● Local runner connected';
     buttons(); renderFrame();
-  } catch (e) { ready = false; $('connection').textContent = 'Runner unavailable'; error(e.message); buttons(); }
+  } catch (e) { ready = false; connectionError = e.message; $('connection').textContent = 'Runner unavailable'; error(e.message); buttons(); }
   setTimeout(poll, running ? 180 : 1800);
 }
 $('controls').addEventListener('submit', async event => {
@@ -149,8 +159,10 @@ $('controls').addEventListener('submit', async event => {
     });
     frames.clear(); losses.clear(); results.clear(); logs = [];
     $('output').textContent = 'Starting Python and loading the model…'; $('empty').hidden = false;
-    if (renderer) renderer.draw(null);
     updateJobs(data.jobs); running = true;
+    $('frame-status').textContent = 'Waiting for the new model';
+    $('loss-line').setAttribute('points', ''); $('loss-value').textContent = '—';
+    drawState(null);
   } catch (e) { error(e.message); }
   finally { mutation++; submitting = false; buttons(); }
 });

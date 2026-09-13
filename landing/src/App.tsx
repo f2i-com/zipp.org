@@ -2,6 +2,8 @@ import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from 'rea
 import { formatCount, relativeTime, useRepoStats, type RepoStats, type RepoStatus } from './repoStats'
 import { SandboxStack, ProjectShowcase } from './Experience'
 import { RepositoryActivity } from './RepositoryActivity'
+import { ProjectPlayground } from './ProjectPlayground'
+import { RecordedDemos } from './RecordedDemos'
 
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
 const F2I_URL = 'https://f2i.com'
@@ -748,7 +750,7 @@ function Playground() {
   }[status]
 
   return (
-    <section className="playground-section section-wrap" id="playground">
+    <section className="playground-section" id="javascript-scratchpad">
       <div className="playground-heading">
         <div>
           <p className="section-kicker">LESS TALK. MORE TINKERING.</p>
@@ -826,6 +828,7 @@ function Playground() {
 }
 
 function App() {
+  const [classicOpen, setClassicOpen] = useState(false)
   const [copyState, setCopyState] = useState<'idle' | 'copied' | 'error'>('idle')
   const [menuOpen, setMenuOpen] = useState(false)
   const [benchmarkFilter, setBenchmarkFilter] = useState<BenchmarkFilter>('all')
@@ -906,6 +909,7 @@ function App() {
 
         <nav className={`nav-links ${menuOpen ? 'nav-open' : ''}`} id="primary-navigation" aria-label="Primary navigation">
           <a href="#playground" onClick={closeMenu}>Playground</a>
+          <a href="#recorded-demos" onClick={closeMenu}>Python &amp; GPU</a>
           <a href="#use-cases" onClick={closeMenu}>Use cases</a>
           <a href="#updates" onClick={closeMenu}>What’s new</a>
           <a href="#controls" onClick={closeMenu}>Controls</a>
@@ -926,24 +930,24 @@ function App() {
       <main id="main-content">
         <section className="hero section-wrap" id="top">
           <div className="hero-copy">
-            <a className="result-pill" href="#use-cases">
-              <span>BUILT TO BE EMBEDDED</span>
-              <strong>Already at play in Softn</strong>
+            <a className="result-pill" href="#recorded-demos">
+              <span>PYTHON · JAVASCRIPT · GPU</span>
+              <strong>See the real programs run</strong>
               <span aria-hidden="true">↗</span>
             </a>
 
             <h1>
-              Big ideas.<br /><em>Tiny sandbox.</em>
+              Two languages.<br /><em>More to explore.</em>
             </h1>
 
             <p className="hero-intro">
-              Give the code your users bring a place to play. ZIPP is a fast,
-              embeddable JavaScript engine built in Rust. Run it natively, or use
-              <strong> ZIPP WASM to run sandboxed JavaScript on top of JavaScript.</strong>
+              A Rust engine with JavaScript and experimental Python, a WebAssembly
+              playground, and a local GPU lab.
+              <strong> Write code, run it, and watch actual model state change.</strong>
             </p>
 
             <div className="hero-actions">
-              <a className="button button-primary" href="#playground">Let’s play with JavaScript <span aria-hidden="true">↗</span></a>
+              <a className="button button-primary" href="#recorded-demos">Watch the examples <span aria-hidden="true">↗</span></a>
               <ExternalLink className="button button-secondary" href={GITHUB_URL}>Explore on GitHub</ExternalLink>
             </div>
 
@@ -985,11 +989,15 @@ function App() {
           </div>
         </section>
 
+        <RecordedDemos />
+
+        <ProjectPlayground />
+
         <ProjectShowcase />
 
         <RepositoryActivity stats={stats} status={repoStatus} refreshing={refreshing} refresh={refresh} />
 
-        <Playground />
+        <details className="classic-examples section-wrap" onToggle={event => setClassicOpen(event.currentTarget.open)}><summary>More JavaScript examples · story generator &amp; CPU benchmarks</summary>{classicOpen && <Playground />}</details>
 
         <section className="use-case-section section-wrap" id="possibilities">
           <div className="section-heading split-heading">
@@ -1316,7 +1324,7 @@ function App() {
         <section className="closing-cta section-wrap">
           <div>
             <p className="section-kicker">Fast. Explicit. Yours to embed.</p>
-            <h2>Give users JavaScript.<br />Keep control of the runtime.</h2>
+            <h2>Write Python or JavaScript.<br />Explore how it runs.</h2>
             <p className="closing-star-note">
               Zipp is open source and built in the open. If it is useful to you, a star on GitHub is the
               simplest way to help other engineers find it{stats?.stars ? ` — ${formatCount(stats.stars)} already have.` : '.'}
@@ -1335,7 +1343,7 @@ function App() {
       <footer className="site-footer section-wrap">
         <a className="brand" href="#top" aria-label="Back to top"><Brand /></a>
         <p>
-          A clean-sheet JavaScript engine in Rust · part of{' '}
+          Python, JavaScript, WebAssembly &amp; GPU experiments · part of{' '}
           <a href={F2I_URL} target="_blank" rel="noreferrer">f2i.com</a>
         </p>
         <div>

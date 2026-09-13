@@ -99,6 +99,7 @@ Acceptance checks (Python Playwright plus installed Chrome required):
 ```powershell
 python crates/zipp-wasm/playground/nca-smoke.py
 node --test --test-isolation=none crates/zipp-wasm/gpu-lab/tests/*.test.mjs
+node --test --test-isolation=none crates/zipp-wasm/playground/native-lab.test.cjs
 ```
 
 The smoke script tests all four examples, concurrent CUDA devices, explicit CPU,
@@ -107,6 +108,9 @@ real WebGL2 / WebGPU backend. Missing GPU hardware is an acceptance failure.
 Reports and screenshots are written under `target/nca-smoke/`.
 Verified on Windows with two RTX 5090s, PyTorch 2.11.0+cu128 and Chrome:
 both CUDA devices passed, and both browser GPU backends passed all 15 cases.
+The bridge regression tests cover split UTF-8 requests, option-like prompts,
+CUDA/NVIDIA UUID mapping, launch failures, and input validation. Browser acceptance
+also checks that a lost WebGL context does not prevent native run/stop controls.
 
 The memory and language models remain separate research examples. Supplied
 language weights use template text and a 17-byte context, as documented by the lab.
@@ -147,6 +151,14 @@ language weights use template text and a 17-byte context, as documented by the l
   built with.
 
 ## The program contract
+
+**JavaScript GPU access:** ordinary browser JavaScript can call the shared
+`createRuntime` API directly or create its own WebGL canvas. The
+[JavaScript and Python GPU examples](../../../README.md#gpu-computing-from-javascript-and-python)
+show both paths. JavaScript in this playground's editor executes inside Zipp's
+VM, where browser DOM/WebGL objects are not automatically available. Only the
+Python guest GPU bridge is currently wired here; the separate JavaScript host
+adapter requires integration by an embedder.
 
 Python modules `import` each other by file stem (`from physics import step`)
 or by folder (`from pkg.tools import twice`), can import the built-in

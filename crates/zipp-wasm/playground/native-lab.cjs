@@ -5,7 +5,7 @@ const { randomBytes } = require('node:crypto');
 const path = require('node:path');
 const readline = require('node:readline');
 
-function createLab({ root, port }) {
+function createLab({ root, port, executeFile = execFile, spawnProcess = spawn }) {
   const python = process.env.NCA_PYTHON || 'python';
   const lab = path.resolve(process.env.NCA_LAB_DIR || path.join(root, '..', 'nca_fast_memory_language_lab'));
   const env = { ...process.env, NCA_LAB_DIR: lab, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' };
@@ -15,12 +15,18 @@ function createLab({ root, port }) {
   let probePromise, hardware, active = [], jobs = [], events = [], cursor = 0, generation = 0;
   let telemetryCache = { time: 0, data: [] }, telemetryPromise;
   const record = event => { events.push({ ...event, cursor: ++cursor }); if (events.length > 400) events.shift(); };
+  // Some launch failures throw synchronously, before an error callback exists.
+  function execute(file, args, options, callback) {
+    try { executeFile(file, args, options, callback); }
+    catch (error) { queueMicrotask(() => callback(error, '', '')); }
+  }
   function probe() {
     return probePromise ||= new Promise(resolve => {
-      execFile(python, ['-u', script, '--probe'], { env, windowsHide: true, timeout: 60000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
+      execute(python, ['-u', script, '--probe'], { env, windowsHide: true, timeout: 60000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
         try {
+          if (error) throw error;
           const data = stdout.trim().split('\n').map(s => JSON.parse(s)).find(x => x.type === 'probe');
-          if (error || !data) throw error || Error(stderr || 'No PyTorch response');
+          if (!data) throw Error(stderr || 'No PyTorch response');
           hardware = data; resolve(data);
         } catch (err) { resolve({ error: `Cannot use ${python}: ${err.message}`, lab, devices: [] }); }
       });
@@ -29,12 +35,12 @@ function createLab({ root, port }) {
   function telemetry() {
     if (Date.now() - telemetryCache.time < 1500) return Promise.resolve(telemetryCache.data);
     return telemetryPromise ||= new Promise(resolve => {
-      execFile('nvidia-smi', ['--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw', '--format=csv,noheader,nounits'],
+      execute('nvidia-smi', ['--query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw', '--format=csv,noheader,nounits'],
         { windowsHide: true, timeout: 4000, maxBuffer: 65536 }, (error, stdout) => {
           const data = error ? [] : stdout.trim().split('\n').filter(Boolean).map(line => {
-            const [index, name, utilization, usedMiB, totalMiB, temperature, watts] = line.split(',').map(s => s.trim());
-            const number = s => Number.isFinite(Number(s)) ? Number(s) : null;
-            return { id: `cuda:${index}`, name, utilization: number(utilization), usedMiB: number(usedMiB), totalMiB: number(totalMiB), temperature: number(temperature), watts: number(watts) };
+            const [index, uuid, name, utilization, usedMiB, totalMiB, temperature, watts] = line.split(',').map(s => s.trim());
+            const number = s => s && Number.isFinite(Number(s)) ? Number(s) : null;
+            return { id: `nvidia:${index}`, uuid, name, utilization: number(utilization), usedMiB: number(usedMiB), totalMiB: number(totalMiB), temperature: number(temperature), watts: number(watts) };
           });
           telemetryCache = { time: Date.now(), data }; telemetryPromise = null; resolve(data);
         });
@@ -50,10 +56,17 @@ function createLab({ root, port }) {
       const args = ['-u', script, '--mode', config.mode, '--device', device, '--out', output,
         '--steps', String(config.steps), '--batch', String(config.batch), '--length', String(config.length),
         '--seed', String(config.seed + index), '--bytes', String(config.bytes), '--temperature', String(config.temperature),
-        '--frame-ms', String(config.frameMs), '--prompt', config.prompt];
-      const child = spawn(python, args, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+        '--frame-ms', String(config.frameMs), `--prompt=${config.prompt}`];
       const job = { id, device, seed: config.seed + index, mode: config.mode, output, state: 'starting' };
-      jobs.push(job); active.push({ child, job });
+      jobs.push(job);
+      let child;
+      try { child = spawnProcess(python, args, { env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }); }
+      catch (error) {
+        job.state = 'failed'; job.error = error.message;
+        record({ type: 'exit', job: id, device, state: job.state, error: job.error });
+        continue;
+      }
+      active.push({ child, job });
       let stderr = '', finished = false;
       const lines = readline.createInterface({ input: child.stdout });
       lines.on('line', line => {
@@ -109,14 +122,23 @@ function createLab({ root, port }) {
       if (url.pathname === '/api/nca/status' && req.method === 'GET') {
         const [capabilities, gpus] = await Promise.all([probe(), telemetry()]);
         const after = Number(url.searchParams.get('after')) || 0;
-        json(res, 200, { ...capabilities, token, gpus, jobs, running: active.length > 0, cursor,
+        const normalizeUuid = uuid => String(uuid || '').replace(/^GPU-/i, '').toLowerCase();
+        const mappedGpus = gpus.map(gpu => ({ ...gpu, cudaDevices: (capabilities.devices || [])
+          .filter(device => device.uuid && normalizeUuid(device.uuid) === normalizeUuid(gpu.uuid)).map(device => device.id) }));
+        json(res, 200, { ...capabilities, token, gpus: mappedGpus, jobs, running: active.length > 0, cursor,
           events: events.filter(e => e.cursor > after) });
       } else if (req.method === 'POST' && ['/api/nca/run', '/api/nca/stop'].includes(url.pathname)) {
         if (req.headers['x-nca-token'] !== token || req.headers['content-type'] !== 'application/json') {
           json(res, 403, { error: 'Reload the lab page before running' }); return true;
         }
-        let body = '';
-        for await (const chunk of req) { body += chunk; if (Buffer.byteLength(body) > 8192) { json(res, 413, { error: 'Request too large' }); return true; } }
+        const chunks = []; let bytes = 0;
+        for await (const chunk of req) {
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          bytes += buffer.length;
+          if (bytes > 8192) { json(res, 413, { error: 'Request too large' }); return true; }
+          chunks.push(buffer);
+        }
+        const body = Buffer.concat(chunks).toString('utf8');
         if (url.pathname.endsWith('/stop')) {
           for (const { child, job } of active) { job.state = 'stopping'; child.kill(); }
           json(res, 200, { stopping: active.length });

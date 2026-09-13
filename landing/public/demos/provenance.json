@@ -1,0 +1,44 @@
+{
+  "capturedAtUtc": "20260913T105708Z",
+  "browser": "152.0.7977.83",
+  "wasmProfile": "zipp-wasm 0.0.17 · languages: javascript, python\nidle",
+  "torch": "2.11.0+cu128",
+  "cuda": "12.8",
+  "devices": [
+    {
+      "id": "cuda:0",
+      "name": "NVIDIA GeForce RTX 5090",
+      "totalMiB": 32607,
+      "usable": true
+    },
+    {
+      "id": "cuda:1",
+      "name": "NVIDIA GeForce RTX 5090",
+      "totalMiB": 32607,
+      "usable": true
+    }
+  ],
+  "clips": {
+    "python-life": {
+      "frames": 60,
+      "capturedSeconds": 9.91,
+      "playbackFps": 6.057
+    },
+    "nca-memory": {
+      "frames": 60,
+      "capturedSeconds": 9.88,
+      "playbackFps": 6.07
+    },
+    "nca-language": {
+      "frames": 72,
+      "capturedSeconds": 11.88,
+      "playbackFps": 6.059
+    }
+  },
+  "sourceSha256": {
+    "crates/zipp-wasm/playground/native_lab.py": "906213f74d5f6a1fcc6ee302bd4c6dfa3895c43c0c5d8ef808cada6609b581f6",
+    "crates/zipp-wasm/playground/nca-renderer.mjs": "bffb300fd8e9d7b5d04655ff53c4ec3d153286bad1c21a4f7cb9dc779b46506f",
+    "examples/python/gpu/main.py": "04de6447619675fc1cd4f6ff41b655da4c186d60ab41a2939f1a8d9673b506d9"
+  },
+  "note": "Actual local browser captures. Python Life runs in Zipp WASM and submits WebGL2 graphs; NCA runs in native CPython/PyTorch CUDA. GIFs are demonstrations, not benchmarks."
+}

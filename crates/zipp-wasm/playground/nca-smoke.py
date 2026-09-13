@@ -7,13 +7,18 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import socket
 import time
 import urllib.request
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[3]
 OUT = ROOT / 'target/nca-smoke'
-PORT = 8772
+# Reserve an ephemeral port briefly; startup below verifies that our own server
+# acquired it before sending any run/stop request.
+with socket.socket() as reservation:
+    reservation.bind(('127.0.0.1', 0))
+    PORT = reservation.getsockname()[1]
 BASE = f'http://127.0.0.1:{PORT}'
 
 
@@ -22,13 +27,17 @@ def main():
     with (OUT / 'server.log').open('w') as log:
         server = subprocess.Popen(['node', str(Path(__file__).with_name('serve.cjs'))], cwd=ROOT,
                                   env=dict(os.environ, PORT=str(PORT)), stdout=log, stderr=log)
+        owns_server = False
         try:
             for _ in range(100):
-                try:
-                    urllib.request.urlopen(BASE + '/crates/zipp-wasm/playground/nca.html', timeout=1).close()
+                if server.poll() is not None:
+                    raise RuntimeError('Test server failed to start; inspect target/nca-smoke/server.log')
+                if f'native GPU lab: {BASE}/' in (OUT / 'server.log').read_text():
+                    owns_server = True
                     break
-                except OSError:
-                    time.sleep(.1)
+                time.sleep(.1)
+            if not owns_server:
+                raise RuntimeError('Timed out waiting for the owned test server')
             with sync_playwright() as p:
                 browser = p.chromium.launch(channel=os.environ.get('PLAYWRIGHT_CHANNEL', 'chrome'), headless=True)
                 page = browser.new_page(viewport=dict(width=1500, height=1180))
@@ -41,6 +50,8 @@ def main():
                 assert not status.get('error'), status
                 devices = [d['id'] for d in status['devices'] if d['usable']]
                 assert devices, 'No working CUDA device; GPU acceptance cannot pass'
+                mapped_devices = [device for gpu in status['gpus'] for device in gpu['cudaDevices']]
+                assert set(devices).issubset(mapped_devices), 'GPU telemetry UUID mapping is incomplete'
                 print('CUDA devices:', devices, flush=True)
                 headers = {'content-type': 'application/json', 'x-nca-token': status['token']}
                 # Local bridge contract checks use only the fixed API.
@@ -88,6 +99,10 @@ def main():
                 assert page.locator('#loss-line').get_attribute('points'), 'Missing loss curve'
                 page.screenshot(path=str(OUT / 'language-training.png'), full_page=True)
                 run_mode('language', count=16)
+                page.locator('#prompt').fill('--été 🧪')
+                unicode_run = run_mode('language', count=2)
+                assert all(j['result']['text'].startswith('--été 🧪') for j in unicode_run['jobs'])
+                page.locator('#prompt').fill('The ')
                 print('Memory training, language training, checkpoint generation passed', flush=True)
                 # CPU remains an explicit choice and never masquerades as CUDA.
                 for d in devices:
@@ -114,13 +129,22 @@ def main():
                 page.set_viewport_size(dict(width=390, height=844))
                 assert page.evaluate('document.documentElement.scrollWidth <= innerWidth'), 'Mobile horizontal overflow'
                 page.screenshot(path=str(OUT / 'mobile.png'), full_page=True)
+                # Rendering failures must not prevent starting/stopping native work.
+                page.evaluate("document.querySelector('#state').getContext('webgl2').getExtension('WEBGL_lose_context').loseContext()")
+                page.wait_for_function("document.querySelector('#state').getContext('webgl2').isContextLost()")
+                run_mode('memory')
+                assert 'WebGL context lost' in page.locator('#renderer').inner_text()
+                assert page.locator('#stop').is_disabled()
+                assert not errors, errors
+                print('Unicode prompts, device UUIDs and lost-WebGL-context handling passed', flush=True)
                 browser.close()
         finally:
             # Stop any fixed child workloads before terminating this test server.
             try:
-                s = json.load(urllib.request.urlopen(BASE + '/api/nca/status', timeout=3))
-                req = urllib.request.Request(BASE + '/api/nca/stop', data=b'{}', headers={'Content-Type': 'application/json', 'X-Nca-Token': s['token']})
-                urllib.request.urlopen(req, timeout=3).close()
+                if owns_server and server.poll() is None:
+                    s = json.load(urllib.request.urlopen(BASE + '/api/nca/status', timeout=3))
+                    req = urllib.request.Request(BASE + '/api/nca/stop', data=b'{}', headers={'Content-Type': 'application/json', 'X-Nca-Token': s['token']})
+                    urllib.request.urlopen(req, timeout=3).close()
             except OSError:
                 pass
             server.terminate(); server.wait(timeout=10)

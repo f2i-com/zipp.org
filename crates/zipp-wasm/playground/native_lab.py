@@ -20,6 +20,7 @@ def probe():
     devices = []
     for i in range(torch.cuda.device_count()):
         row = dict(id=f"cuda:{i}", name=torch.cuda.get_device_name(i),
+                   uuid=str(getattr(torch.cuda.get_device_properties(i), 'uuid', '')),
                    totalMiB=round(torch.cuda.get_device_properties(i).total_memory / 2**20))
         try:
             with torch.cuda.device(i):
@@ -143,7 +144,7 @@ def language(a, lab, out):
                 row = dict(step=step, loss=loss.item(), bitsPerByte=loss.item() / 0.6931471805599453)
                 log.write(json.dumps(row) + '\n')
                 if step == 1 or step % max(1, a.steps // 100) == 0 or step == a.steps:
-                    # A hook below captures actual final recurrent activations.
+                    # The head's input hook captures actual final recurrent activations.
                     emit('frame', phase='training', **row, grid=grid(last_state[0][0]))
         torch.save(dict(model=model.state_dict(), config=model.config_dict()), out / 'model.pt')
         validation_result = evaluate(model, validation, a.length)
