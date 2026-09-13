@@ -159,3 +159,22 @@ fn uncaught_exceptions_report_type_message_and_location() {
     assert!(err.contains("SystemExit"), "{err}");
     assert!(execute("import sys\nsys.exit(0)\n").is_ok());
 }
+
+#[test]
+fn maintained_unicode_tables_preserve_python_identifier_rules() {
+    // Greek, CJK, supplementary-plane and combining continuation characters.
+    assert_eq!(
+        execute("π = 2\n变量 = 3\n𐐀 = 4\ná = 5\nprint(π + 变量 + 𐐀 + á)\n").unwrap(),
+        ["14"]
+    );
+    // Todhri was assigned after the old UNIC tables; the fork uses Unicode 17.
+    assert_eq!(execute("𐗀 = 9\nprint(𐗀)\n").unwrap(), ["9"]);
+    // Preserve the upstream single-emoji extension, not the broader Emoji set.
+    assert_eq!(execute("🙂 = 7\nprint(🙂)\n").unwrap(), ["7"]);
+    for source in ["© = 1\n", "́a = 1\n", "1name = 1\n"] {
+        assert!(
+            execute(source).is_err(),
+            "invalid identifier accepted: {source:?}"
+        );
+    }
+}

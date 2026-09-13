@@ -22,7 +22,9 @@ members = [
 # here would combine the native CLI's JIT with their `safe-sandbox` feature,
 # defeating the compile-time guarantee that hardened builds contain no VM or
 # regex JIT and no unsafe code in either engine.
-exclude = ["crates/zipp-sandbox", "crates/zipp-wasm"]
+# The parser fork is consumed only with ZIPP's explicit Python feature set,
+# not built as a root workspace member with its upstream default features.
+exclude = ["crates/zipp-sandbox", "crates/zipp-wasm", "crates/rustpython-parser-fork"]
 
 [workspace.package]
 version = "0.0.18"

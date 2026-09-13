@@ -1013,56 +1013,7 @@ impl Compiler {
         // names, the three immutable global value spellings take this path so a
         // same-named local lexical shadows them from body entry and observes TDZ.
         if !is_script {
-            let mut lex = std::collections::HashSet::new();
-            for s in body {
-                match s {
-                    ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
-                        for decl in &d.decls {
-                            capture::collect_pattern_names(&decl.id, &mut lex);
-                        }
-                    }
-                    ast::Stmt::ClassDecl(c) => {
-                        if let Some(id) = &c.name {
-                            lex.insert(id.to_string());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Sorted: this loop calls alloc_reg(), so raw HashSet order would
-            // hand out CELL REGISTERS in a different order per compile.
-            for name in &crate::compile::helpers::sorted_name_vec(&lex) {
-                // `box_all_locals` here means "this body references `eval`". A
-                // direct eval may name any of these lexicals, but
-                // `capture::captured_locals` cannot see inside the eval STRING, so
-                // `fc.captured` does not list them. Without the cell at entry, the
-                // function declarations materialised just below — they compile
-                // BEFORE the body's textual statements — snapshot an environment
-                // with no such binding, and the eval inside one resolved the name
-                // as a global:
-                //   (function(){ let a=1; function f(){ return eval("a"); }
-                //                return f(); })()   // ReferenceError
-                // while the same code with a function EXPRESSION worked. That is
-                // what killed every sm/expressions/destructuring-array-default-*
-                // (their harness evals `class D extends C` from a nested function
-                // declaration, with `C` a lexical of the enclosing IIFE).
-                if (fc.captured.contains(name)
-                    || fc.box_all_locals
-                    || matches!(name.as_str(), "undefined" | "NaN" | "Infinity"))
-                    && !fc.scopes[0].iter().any(|(n, _)| n == name)
-                {
-                    // Box a TDZ cell: a read before the textual declaration runs
-                    // (e.g. via a forward-materialised function) throws a
-                    // ReferenceError rather than reading undefined.
-                    let r = fc.alloc_reg();
-                    fc.scopes[0].push((name.clone(), r));
-                    fc.emit(Instr::MakeCellTdz { reg: r });
-                    fc.cell_regs.insert(r);
-                    fc.entry_lexicals.insert(name.clone());
-                    // `const`-ness is recorded by the textual declaration (which
-                    // reuses this reg), so an assignment after it still TypeErrors.
-                }
-            }
+            fc.predeclare_body_lexicals(body);
         }
 
         // Materialise top-level function declarations at entry so a forward call or
@@ -1416,6 +1367,14 @@ impl Compiler {
                 fc.bind_params(pa)?;
             }
         }
+        // Hoisted declarations must capture the method/constructor's own
+        // bindings even when their textual declarations appear later.
+        for local in hoisted_var_names(body) {
+            if !fc.scopes[0].iter().any(|(n, _)| n == &local) {
+                fc.declare_local(&local);
+            }
+        }
+        fc.predeclare_body_lexicals(body);
         for s in body {
             if let ast::Stmt::FnDecl(f) = s {
                 if let Some(id) = &f.name {
@@ -1822,5 +1781,61 @@ mod m1_tests {
             "compiler throughput degraded by {:.3}x from 12k to 24k functions",
             ns_per_mb[3] / ns_per_mb[2]
         );
+    }
+}
+
+impl<'a> FnCompiler<'a> {
+    /// Allocate function-body lexical cells before hoisted closures capture them.
+    fn predeclare_body_lexicals(&mut self, body: &[ast::Stmt]) {
+        let mut lex = std::collections::HashSet::new();
+        for s in body {
+            match s {
+                ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                    for decl in &d.decls {
+                        capture::collect_pattern_names(&decl.id, &mut lex);
+                    }
+                }
+                ast::Stmt::ClassDecl(c) => {
+                    if let Some(id) = &c.name {
+                        lex.insert(id.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Sorted: this loop calls alloc_reg(), so raw HashSet order would
+        // hand out CELL REGISTERS in a different order per compile.
+        for name in &crate::compile::helpers::sorted_name_vec(&lex) {
+            // `box_all_locals` here means "this body references `eval`". A
+            // direct eval may name any of these lexicals, but
+            // `capture::captured_locals` cannot see inside the eval STRING, so
+            // `self.captured` does not list them. Without the cell at entry, the
+            // function declarations materialised just below — they compile
+            // BEFORE the body's textual statements — snapshot an environment
+            // with no such binding, and the eval inside one resolved the name
+            // as a global:
+            //   (function(){ let a=1; function f(){ return eval("a"); }
+            //                return f(); })()   // ReferenceError
+            // while the same code with a function EXPRESSION worked. That is
+            // what killed every sm/expressions/destructuring-array-default-*
+            // (their harness evals `class D extends C` from a nested function
+            // declaration, with `C` a lexical of the enclosing IIFE).
+            if (self.captured.contains(name)
+                || self.box_all_locals
+                || matches!(name.as_str(), "undefined" | "NaN" | "Infinity"))
+                && !self.scopes[0].iter().any(|(n, _)| n == name)
+            {
+                // Box a TDZ cell: a read before the textual declaration runs
+                // (e.g. via a forward-materialised function) throws a
+                // ReferenceError rather than reading undefined.
+                let r = self.alloc_reg();
+                self.scopes[0].push((name.clone(), r));
+                self.emit(Instr::MakeCellTdz { reg: r });
+                self.cell_regs.insert(r);
+                self.entry_lexicals.insert(name.clone());
+                // `const`-ness is recorded by the textual declaration (which
+                // reuses this reg), so an assignment after it still TypeErrors.
+            }
+        }
     }
 }

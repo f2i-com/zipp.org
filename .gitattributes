@@ -1,2 +1,9 @@
 *.sh text eol=lf
 bench/pgo-training/** text eol=lf
+
+# Preserve upstream parser sources/snapshots, including generated whitespace.
+crates/rustpython-parser-fork/** text eol=lf
+crates/rustpython-parser-fork/README.md whitespace=-blank-at-eol
+crates/rustpython-parser-fork/src/lib.rs whitespace=-blank-at-eol
+crates/rustpython-parser-fork/src/parser.rs whitespace=-blank-at-eol
+crates/rustpython-parser-fork/src/python.rs whitespace=-blank-at-eol

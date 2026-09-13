@@ -64,6 +64,13 @@ jobs:
     # The full native workspace is the expensive lane: weekly and on demand.
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    # Hundreds of debug test executables otherwise duplicate full VM/parser
+    # symbols and can exhaust the hosted runner during linking. Keep debug
+    # assertions and optimization unchanged; omit only debugging metadata.
+    env:
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -138,7 +145,7 @@ jobs:
             --test audit_20260912_strict_tonumber_bigint \
             --test audit_20260912_typedarray_species \
             --test audit_20260912_weak_gc \
-            --test global_fingerprint
+            --test class_body_bindings --test global_fingerprint
 
   native-sandbox:
     name: Isolated native sandbox
@@ -264,6 +271,7 @@ jobs:
           python3 tools/run_test262.py
           --t262 .test262
           --zipp target/release/zipp
+          --jobs 2 --timeout 120
           --expected-failures tools/test262-expected-failures.txt
           --dump-fails test262-failures.txt
           --json test262-results.json

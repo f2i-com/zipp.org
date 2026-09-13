@@ -1,15 +1,16 @@
 //! Safe-profile regressions for guest-controlled Rust recursion inside one
-//! object meta-operation. These probes run on the same 1 MiB stack budget as
-//! the hardened Wasm worker so a missing guard fails here instead of trapping
-//! the production sandbox.
+//! object meta-operation. Native debug frames are larger than optimized Wasm
+//! frames, so these probes use the hardened native runner's 256 MiB
+//! interpreter-thread contract. The production Wasm boundary suite
+//! independently checks the actual artifact and its 1 MiB linker stack.
 
 #![cfg(feature = "safe-sandbox")]
 
-fn run_on_small_stack(source: &str) -> Vec<String> {
+fn run_on_native_stack(source: &str) -> Vec<String> {
     let source = source.to_string();
     std::thread::Builder::new()
         .name("native-meta-recursion-probe".into())
-        .stack_size(1024 * 1024)
+        .stack_size(256 * 1024 * 1024)
         .spawn(move || {
             let result = zipp_vm::run(&source).expect("source compiles");
             assert!(
@@ -27,7 +28,7 @@ fn run_on_small_stack(source: &str) -> Vec<String> {
 #[test]
 fn deep_object_create_has_is_catchable_and_counter_unwinds() {
     assert_eq!(
-        run_on_small_stack(
+        run_on_native_stack(
             r#"
             var deep = null;
             for (var i = 0; i < 512; i++) deep = Object.create(deep);
@@ -55,7 +56,7 @@ fn deep_object_create_has_is_catchable_and_counter_unwinds() {
 #[test]
 fn nested_proxy_get_and_has_fail_closed_but_shallow_semantics_survive() {
     assert_eq!(
-        run_on_small_stack(
+        run_on_native_stack(
             r#"
             var target = {answer: 42};
             var deep = target;
@@ -121,7 +122,7 @@ fn nested_proxy_get_and_has_fail_closed_but_shallow_semantics_survive() {
 #[test]
 fn proxy_meta_operation_siblings_share_the_depth_budget() {
     assert_eq!(
-        run_on_small_stack(
+        run_on_native_stack(
             r#"
             function wrapped() {
                 var value = {x: 1};
@@ -149,7 +150,7 @@ fn proxy_meta_operation_siblings_share_the_depth_budget() {
 #[test]
 fn transparent_callable_and_constructor_wrappers_cannot_recurse_the_host_stack() {
     assert_eq!(
-        run_on_small_stack(
+        run_on_native_stack(
             r#"
             function F() { return 7; }
             var proxyCall = F;

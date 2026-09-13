@@ -1,5 +1,17 @@
 # Zipp performance handoff
 
+### 14 September: broader CI repair candidate
+
+See [the CI repair evidence](docs/validation/2026-09-14-ci-readiness.md).
+This fixes class-body closure bindings, replaces the parser's unmaintained UNIC
+dependencies, matches the native regression thread to the native sandbox stack,
+and reduces CI linker resource use. The Test262 gate retains the pinned corpus,
+zero skips and exact expected-failure checking, with eight documented upstream
+harness inconsistencies added to the original three. Date tests have a bounded
+120-second deadline and two workers. All previous release-hold notes below are
+historical; promotion still requires green workflows at the candidate revision.
+
+
 ### 13 September: 0.0.18 candidate, promotion on hold
 
 The test repository contains the Vite 8.3 update and release preparation for
