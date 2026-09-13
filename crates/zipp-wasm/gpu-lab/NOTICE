@@ -1,0 +1,7 @@
+ZIPP Python GPU Lab 0.1.0
+Standalone integration experiment prepared for Lance Baker, September 2026.
+
+This archive contains original experiment code and its compiled C/WASM kernels.
+It does not contain source from the private zipp-python repository or a ZIPP/Python
+runtime binary. Referencing the public ZIPP host API does not claim upstream
+integration or endorsement.

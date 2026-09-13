@@ -1,0 +1,1 @@
+{"version":1,"nodes":[{"id":0,"op":"input","shape":[4],"data":[1.0,2.0,3.0,4.0]},{"id":1,"op":"input","shape":[4],"data":[10.0,20.0,30.0,40.0]},{"id":2,"op":"mul","a":0,"b":1},{"id":3,"op":"input","shape":[],"data":[4.0]},{"id":4,"op":"add","a":2,"b":3},{"id":5,"op":"relu","a":4},{"id":6,"op":"sum","a":5}],"outputs":[{"name":"result","id":5},{"name":"total","id":6}]}

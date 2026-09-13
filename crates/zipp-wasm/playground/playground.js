@@ -13,6 +13,7 @@ const SAMPLES = {
   python: { name: "python-balls", entry: "main.py", base: "../../../examples/python/project/", files: ["main.py", "physics.py"] },
   javascript: { name: "js-balls", entry: "main.js", base: "../../../examples/js/project/", files: ["physics.js", "main.js"] },
   ant: { name: "langtons-ant", entry: "main.py", base: "../../../examples/python/langtons_ant/", files: ["main.py", "rules.py"] },
+  gpu: { name: "gpu-compute", entry: "main.py", base: "../../../examples/python/gpu/", files: ["main.py"] },
   "python-hello": { name: "python-hello", entry: "main.py", inline: { "main.py": 'import ui\n\ndef fib(n):\n    a = 0\n    b = 1\n    for i in range(n):\n        a, b = b, a + b\n    return a\n\nprint("fib(30) =", fib(30))\n\nui.canvas(320, 120)\nui.clear("#10141c")\nui.font(28)\nui.text(24, 70, "hello from Python", "#ffcc00")\n' } },
   "javascript-hello": { name: "js-hello", entry: "main.js", inline: { "main.js": 'const fib = (n) => (n < 2 ? n : fib(n - 1) + fib(n - 2));\nconsole.log("fib(20) =", fib(20));\n\nui.canvas(320, 120);\nui.clear("#10141c");\nui.font(28);\nui.text(24, 70, "hello from JavaScript", "#58a6ff");\n' } },
 };
@@ -24,7 +25,7 @@ const el = {
   highlight: $("#highlight"), highlightCode: $("#highlight-code"),
   canvas: $("#canvas"), canvasHint: $("#canvas-hint"), consoleOut: $("#console"),
   status: $("#status"), frameStats: $("#frame-stats"), run: $("#run"), stop: $("#stop"),
-  dropOverlay: $("#drop-overlay"), sampleMenu: $("#sample-menu"),
+  dropOverlay: $("#drop-overlay"), sampleMenu: $("#sample-menu"), gpuBackend: $("#gpu-backend"),
 };
 const ctx = el.canvas.getContext("2d");
 
@@ -376,6 +377,7 @@ function startWorker() {
   worker.instance = new Worker(new URL("./engine.worker.js", import.meta.url), { type: "module" });
   worker.instance.onmessage = (event) => {
     const m = event.data;
+    if (m.type === "event") { hostEvent(m); return; }
     const p = worker.pending.get(m.id);
     if (!p) return;
     clearTimeout(p.timer);
@@ -455,7 +457,7 @@ async function run() {
   log(`▶ ${project.name} (${language}, entry ${project.entry})`, "note");
   el.run.disabled = true;
   try {
-    const reply = await request({ type: "run", language, files, order, entry, budget: INSTRUCTION_BUDGET }, DEADLINE_MS);
+    const reply = await request({ type: "run", language, files, order, entry, budget: INSTRUCTION_BUDGET, gpuBackend: el.gpuBackend.value }, DEADLINE_MS);
     logConsole(reply.console);
     if (reply.type === "error") {
       reportError(reply);
@@ -475,6 +477,19 @@ async function run() {
   } finally {
     el.run.disabled = false;
   }
+}
+// Something happened between requests: a GPU result reached the program
+// (whatever its callback printed and drew arrives here), or the compute
+// runtime reported which backend it is using.
+function hostEvent(m) {
+  if (m.gpu) {
+    const why = m.gpu.attempts && m.gpu.attempts.length ? ` (after: ${m.gpu.attempts.join("; ")})` : "";
+    log(`GPU compute: ${m.gpu.backend} — ${m.gpu.description}${why}`, "note");
+    return;
+  }
+  logConsole(m.console);
+  render(m.ui);
+  if (m.error) reportError(m);
 }
 function reportError(reply) {
   log(reply.error, "error");

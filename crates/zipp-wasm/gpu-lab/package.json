@@ -1,0 +1,13 @@
+{
+  "name": "zipp-python-gpu-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Python-authored compute graphs for WebGPU, WebGL2 and standalone WASM, with a ZIPP host adapter",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "demo": "python3 scripts/serve.py",
+    "generate": "python3 examples/build_examples.py"
+  },
+  "engines": { "node": ">=18" }
+}

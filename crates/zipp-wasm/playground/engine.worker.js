@@ -14,6 +14,8 @@
 // the one-line shim below and the ordinary JavaScript ABI (`callFunction`,
 // global slots). Either way the page sees the same command arrays.
 import init, { Engine, zippProfile } from "../dist/all/zipp_wasm.js";
+import { createRuntime } from "../gpu-lab/src/runtime.mjs";
+import { createPythonGPUAdapter } from "../gpu-lab/src/zipp-python-adapter.mjs";
 
 const HOOK_NAMES = ["draw", "update", "on_click", "on_key"];
 // One line, so JavaScript compile errors are off by exactly one line plus the
@@ -47,7 +49,83 @@ let language = null;
 let hooks = {};
 let jsSlots = null;
 
+// ---- GPU compute for Python programs -----------------------------------------
+// A Python program's `zipp_gpu` graphs leave the engine as host requests
+// (`takeHostRequests`), run on the gpu-lab compute runtime (WebGPU, WebGL2,
+// compiled WASM or the JavaScript reference, per the page's choice), and the
+// answers go back through `pythonCall("__zipp_py_deliver", ...)` between
+// engine calls. The runtime is created on the first request so a program
+// that never computes never touches the GPU; it is kept across runs and
+// replaced when the page picks another backend.
+const gpu = { backend: "auto", runtime: null, creating: null, adapter: null };
+
+async function computeRuntime() {
+  if (gpu.runtime) return gpu.runtime;
+  if (!gpu.creating) {
+    gpu.creating = createRuntime({
+      backend: gpu.backend,
+      wasmUrl: new URL("../gpu-lab/wasm/kernels.wasm", import.meta.url),
+      limits: { maxNodes: 512, maxWork: 50_000_000 },
+    }).then((runtime) => {
+      gpu.runtime = runtime;
+      const info = runtime.info();
+      const attempts = (info.fallbackAttempts || []).map((a) => `${a.backend}: ${a.error}`);
+      self.postMessage({ type: "event", gpu: { backend: info.backend, description: info.description, adapter: info.adapter, attempts } });
+      return runtime;
+    }).finally(() => { gpu.creating = null; });
+  }
+  return gpu.creating;
+}
+// `createZippGPUHandler` only needs `execute`; creating the runtime lazily
+// keeps the adapter synchronous to create.
+const lazyRuntime = { async execute(program) { return (await computeRuntime()).execute(program); } };
+
+function selectGpuBackend(backend) {
+  const wanted = ["auto", "webgpu", "webgl2", "wasm", "cpu-js"].includes(backend) ? backend : "auto";
+  if (wanted === gpu.backend) return;
+  gpu.backend = wanted;
+  if (gpu.runtime && !gpu.runtime.busy) { try { gpu.runtime.dispose(); } catch { /* keep going */ } }
+  gpu.runtime = null;
+}
+
+function attachGpu() {
+  gpu.adapter = createPythonGPUAdapter(engine, lazyRuntime, {
+    allowExecute: true,
+    maxPending: 16,
+    maxRequests: 100000,
+    onDelivered: ({ error }) => {
+      // The callback ran (or failed) outside any page request: report what
+      // it printed and drew as an unsolicited event, then look for the
+      // requests it may have submitted in turn.
+      const event = { type: "event", console: drainConsole(), ui: takeUi() };
+      if (error) {
+        let kind = "guest", disposed = true;
+        try { kind = engine ? engine.lastErrorKind() : "usage"; disposed = !live(); } catch { /* engine gone */ }
+        event.error = String(error && error.message ? error.message : error);
+        event.kind = kind;
+        event.disposed = disposed;
+      }
+      self.postMessage(event);
+      drainHost();
+    },
+  });
+}
+
+// After every engine call: hand new GPU requests to the adapter.
+function drainHost() {
+  if (language !== "python" || !gpu.adapter || !live()) return;
+  const others = gpu.adapter.drain();
+  for (const request of others) {
+    // No other request kinds exist yet; answer so the program is not left waiting.
+    try { engine.pythonCall("__zipp_py_deliver", [request.id, { ok: false, error: { code: "DENIED", message: `unknown host request ${request.kind}` } }]); } catch { /* reported with the next reply */ }
+  }
+}
+
 function disposeEngine() {
+  if (gpu.adapter) {
+    gpu.adapter.invalidate();
+    gpu.adapter = null;
+  }
   if (engine) {
     try { engine.dispose(); } catch { /* already gone */ }
   }
@@ -95,13 +173,16 @@ function setInput(input) {
 
 function run(m) {
   disposeEngine();
+  selectGpuBackend(m.gpuBackend);
   engine = new Engine();
   engine.setInstructionBudget(m.budget);
   language = m.language;
   let prelude = 0;
   if (language === "python") {
+    attachGpu();
     engine.initPythonProject(m.files, m.entry);
     hooks = Object.fromEntries(HOOK_NAMES.map((name) => [name, engine.pythonHas(name)]));
+    drainHost();
   } else {
     // Classic-script semantics: every file shares one global scope, in the
     // order the page lists them (the entry last), like successive <script>
@@ -134,6 +215,7 @@ function frame(m) {
   }
   if (hooks.update) call("update", []);
   if (hooks.draw) call("draw", []);
+  drainHost();
   return { ui: takeUi(), console: drainConsole() };
 }
 

@@ -79,6 +79,14 @@ A program that defines neither `draw` nor `update` just runs its top level:
 - `playground.js` is the page: project state, the editor, the frame loop, the
   canvas renderer and the deadline (5 s per request; a miss terminates the
   Worker and starts a fresh one).
+- Python programs can compute on the GPU: `from zipp_gpu import Graph`, build
+  a float32 graph with tensor arithmetic, and `graph.submit(callback,
+  result=...)`. The worker hands the graph to the vendored GPU Lab runtime
+  (`../gpu-lab/`), which runs it on WebGPU, WebGL2, compiled WASM kernels or
+  a JavaScript reference (the **GPU** selector in the toolbar; `auto` tries
+  them in that order and the console says which one answered), then calls
+  the program back with the outputs between frames. The "GPU compute" sample
+  runs a few graphs and steps Conway's life on the backend every frame.
 - `serve.cjs` is the static server; `smoke.cjs` drives the page in a local
   Chrome or Edge through Playwright (`npm install --no-save playwright`, then
   `node playground/smoke.cjs`; set `PLAYWRIGHT_CHANNEL=msedge` for Edge).
@@ -89,5 +97,7 @@ renewed by the worker before every frame so a long-running animation is
 bounded per frame rather than in total, the engine's heap and output ceilings,
 and the Python frontend's compile-time caps. The Python side is Zipp's own
 Python 3 implementation described in `docs/PYTHON_FRONTEND_EXPERIMENT.md`
-(classes, exceptions, generators, the builtin types and a set of standard
-modules; no `async`, `match` or real files).
+(classes, exceptions, generators, `match`, the builtin types and a set of
+standard modules; no `async` or real files). GPU graphs are validated and
+bounded again by the host runtime (node count, tensor sizes, work and
+allocation budgets) and served one at a time, at most 16 pending.

@@ -1,0 +1,29 @@
+{
+  "mode": "Python client against loopback static server; not browser Worker acceptance",
+  "results": [
+    {
+      "path": "/demo/",
+      "status": 200,
+      "contentType": "text/html",
+      "bytes": 3973
+    },
+    {
+      "path": "/demo/app.mjs",
+      "status": 200,
+      "contentType": "text/javascript",
+      "bytes": 6561
+    },
+    {
+      "path": "/wasm/kernels.wasm",
+      "status": 200,
+      "contentType": "application/wasm",
+      "bytes": 3521
+    },
+    {
+      "path": "/generated/vector.json",
+      "status": 200,
+      "contentType": "application/json",
+      "bytes": 370
+    }
+  ]
+}

@@ -6,6 +6,7 @@
 function __zipp_py_has(name) { return __zipp_py.__rt.hostHas(name); }
 function __zipp_py_call(name, args) { return __zipp_py.__rt.hostCall(name, args); }
 function __zipp_py_take_ui() { const out = __zipp_py_ui; __zipp_py_ui = []; return out; }
+function __zipp_py_take_host() { return __zipp_py.__rt.takeHostRequests(); }
 function __zipp_py_set_input(json) {
     const i = JSON.parse(json);
     __zipp_py_input = {
@@ -48,17 +49,17 @@ function __zipp_py_set_input(json) {
         if (typeof v === "boolean" || typeof v === "string") return v;
         if (typeof v === "number") return Number.isInteger(v) ? BigInt(v) : v;
         if (typeof v === "bigint") return v;
-        if (Array.isArray(v)) return rt.list(v.map((x) => fromHost(x, depth + 1)));
-        if (typeof v === "object") { const d = rt.dict(); for (const k of Object.keys(v)) rt.dictSet(d, k, fromHost(v[k], depth + 1)); return d; }
+        if (Array.isArray(v)) { const items = []; for (let i = 0; i < v.length; i++) items.push(fromHost(v[i], depth + 1)); return rt.list(items); }
+        if (typeof v === "object") { const d = rt.dict(); const keys = Object.keys(v); for (let i = 0; i < keys.length; i++) rt.dictSet(d, keys[i], fromHost(v[keys[i]], depth + 1)); return d; }
         rt.fail(E.TypeError, "unsupported host value");
     }
     function toHost(v, depth) {
         if (depth > 32) rt.fail(E.TypeError, "value nesting limit exceeded");
         if (v === null || typeof v === "boolean" || typeof v === "string" || typeof v === "number") return v;
         if (typeof v === "bigint") return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v.toString();
-        if (v.cls === T.list || v.cls === T.tuple) return v.items.map((x) => toHost(x, depth + 1));
-        if (v.cls === T.dict) { const o = {}; for (const [k, x] of rt.dictEntries(v)) o[rt.str(k)] = toHost(x, depth + 1); return o; }
-        if (v.cls === T.set || v.cls === T.frozenset) return rt.setList(v).map((x) => toHost(x, depth + 1));
+        if (v.cls === T.list || v.cls === T.tuple) { const out = []; for (let i = 0; i < v.items.length; i++) out.push(toHost(v.items[i], depth + 1)); return out; }
+        if (v.cls === T.dict) { const o = {}; const entries = rt.dictEntryList(v); for (let i = 0; i < entries.length; i++) o[rt.str(entries[i][0])] = toHost(entries[i][1], depth + 1); return o; }
+        if (v.cls === T.set || v.cls === T.frozenset) { const items = rt.setList(v), out = []; for (let i = 0; i < items.length; i++) out.push(toHost(items[i], depth + 1)); return out; }
         return rt.str(v);
     }
     function entryGlobal(name) {
@@ -66,19 +67,45 @@ function __zipp_py_set_input(json) {
         if (m === null) return undefined;
         return m.globals.get(name);
     }
+    // Host requests leave as plain data; the answer to one comes back through
+    // `__zipp_py_deliver(id, reply)`, which `pythonCall` reaches like a
+    // program-defined hook.
+    rt.takeHostRequests = (function (take) {
+        return function () {
+            const taken = take(), out = [];
+            for (let i = 0; i < taken.length; i++) out.push({ id: taken[i].id, kind: taken[i].kind, payload: toHost(taken[i].payload, 0) });
+            return out;
+        };
+    })(rt.takeHostRequests);
+    const runtimeHooks = new Map([
+        ["__zipp_py_deliver", function (id, reply) {
+            const n = typeof id === "bigint" ? Number(id) : Number(id);
+            if (!Number.isSafeInteger(n) || n < 1) rt.fail(E.TypeError, "deliver: a request id is a positive integer");
+            return rt.deliverHost(n, reply);
+        }],
+        ["__zipp_py_pending_host", function () { return BigInt(rt.pendingHostRequests()); }],
+    ]);
     rt.hostHas = function (name) {
+        if (runtimeHooks.has(String(name))) return true;
         const f = entryGlobal(String(name));
         return f !== undefined && f !== null && typeof f === "object" && (f.cls === T.function || f.cls === T.builtin_function_or_method || f.cls === T.method || f.isType === true || rt.typeMethod(f, "__call__") !== undefined);
     };
     rt.hostCall = function (name, args) {
         try {
-            const f = entryGlobal(String(name));
-            if (f === undefined) rt.fail(E.NameError, "entry module has no function '" + name + "'");
             const converted = [];
             if (args !== null && args !== undefined) {
                 if (!Array.isArray(args)) rt.fail(E.TypeError, "call arguments must be an array");
                 for (let i = 0; i < args.length; i++) converted.push(fromHost(args[i], 0));
             }
+            const hook = runtimeHooks.get(String(name));
+            if (hook !== undefined) {
+                // A direct call: `apply` would re-enter the VM natively.
+                const r = hook(converted[0], converted[1]);
+                rt.flushOut();
+                return toHost(r, 0);
+            }
+            const f = entryGlobal(String(name));
+            if (f === undefined) rt.fail(E.NameError, "entry module has no function '" + name + "'");
             const result = toHost(rt.call(f, converted, null), 0);
             rt.flushOut();
             return result;

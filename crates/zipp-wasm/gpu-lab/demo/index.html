@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark"><title>ZIPP / Python GPU Lab</title>
+<link rel="icon" href="data:,"><link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<main>
+<header><a class="brand" href="./">ZIPP<span>/</span>LABS</a><span class="version">EXPERIMENT 001 · v0.1.0</span></header>
+<section class="intro"><p class="eyebrow">PYTHON-AUTHORED · BROWSER-EXECUTED</p><h1>Small Python.<br><span>Parallel possibilities.</span></h1><p class="subtitle">Build a graph in Python. Run its numerical work through WebGPU, WebGL2, or compiled WebAssembly. One graph goes in. Only the results come back.</p></section>
+<div class="notice"><strong>What this lab proves:</strong> a portable compute bridge, not a new Python interpreter. The examples were authored with the included Python library and exported as JSON. This page does not execute arbitrary Python or the private zipp-python runtime.</div>
+<section class="control-card">
+<div class="control"><label for="backend">Execution backend</label><select id="backend"><option value="auto">Auto: WebGPU → WebGL2 → WASM → JS</option><option value="webgpu">WebGPU · compute shaders</option><option value="webgl2">WebGL2 · fragment shaders</option><option value="wasm">WASM · compiled C kernels</option><option value="cpu-js">JavaScript · reference implementation</option></select></div>
+<div class="control"><label for="example">Python-authored example</label><select id="example"><option value="vector">01 / Vector arithmetic + reduction</option><option value="matmul">02 / Matrix multiplication</option><option value="tiny_mlp">03 / Tiny neural-network inference</option><option value="life">04 / Cellular automaton · 24 steps</option></select></div>
+<button id="run" class="primary">Run graph <span>↗</span></button>
+</section>
+<div class="status-line"><span id="statusDot" class="dot"></span><span id="status" role="status" aria-live="polite">Ready. Choose an example and run it.</span><span id="engineBadge" class="badge">NOT STARTED</span></div>
+<section class="workspace">
+<article class="panel"><div class="panel-head"><h2>Python recipe</h2><span class="tag">AUTHORING</span></div><pre id="pythonCode"></pre><details><summary>Inspect the actual computation graph</summary><pre id="graphCode" class="small-code"></pre></details></article>
+<article class="panel"><div class="panel-head"><h2>Computed result</h2><span id="outputTag" class="tag">AWAITING EXECUTION</span></div><div id="metrics" class="metrics"></div><canvas id="lifeCanvas" width="384" height="384" aria-label="Final cellular-automaton state" hidden></canvas><pre id="resultCode">Your result will appear here.</pre><p class="fine">Timings include host overhead and may include shader compilation. These are not GPU-only timings or hardware performance claims.</p></article>
+</section>
+<section class="verification panel"><div class="panel-head"><h2>Trust the result, not the badge.</h2><span class="tag">15 CHECKS / BACKEND</span></div><p>Check numerical results against the JavaScript reference, including odd lengths, scalar broadcasting, rectangular matrices and boundary-wrapped cell updates. Unavailable backends are reported, never counted as passes.</p><div class="actions"><button id="check">Check all backends</button><label class="file-button">Open a graph JSON<input id="upload" type="file" accept=".json,application/json"></label><button id="save" disabled>Save report</button></div><pre id="checkOutput">No backend checks run yet.</pre></section>
+<details class="diagnostics"><summary>Backend selection and diagnostics</summary><pre id="diagnostics">No runtime initialized.</pre></details>
+<footer><span>GPU-resident intermediates. Explicit readback. No runtime dependencies.</span><span>ZIPP PYTHON GPU LAB</span></footer>
+</main>
+<script type="module" src="./app.mjs"></script>
+</body></html>

@@ -284,6 +284,7 @@ struct PythonHooks {
     has: Option<u32>,
     call: Option<u32>,
     take_ui: Option<u32>,
+    take_host: Option<u32>,
     set_input: Option<u32>,
 }
 
@@ -530,7 +531,9 @@ impl Engine {
         }
         let entry = entry.to_owned();
         self.initialize(zipp_vm::frontend::LanguageId::Python, total, move || {
-            zipp_vm::frontend::compile_python_project(&entry, &modules)
+            // Hosted: the embedder drains `takeHostRequests` and answers
+            // through `pythonCall("__zipp_py_deliver", ...)`.
+            zipp_vm::frontend::compile_python_project_hosted(&entry, &modules, true)
                 .map(|compiled| compiled.into_state())
         })
     }
@@ -673,6 +676,7 @@ impl Engine {
                         has: find("__zipp_py_has"),
                         call: find("__zipp_py_call"),
                         take_ui: find("__zipp_py_take_ui"),
+                        take_host: find("__zipp_py_take_host"),
                         set_input: find("__zipp_py_set_input"),
                     })
                 } else {
@@ -1044,6 +1048,29 @@ impl Engine {
     pub fn take_ui(&mut self) -> Result<JsValue, JsValue> {
         self.ensure_live()?;
         let slot = self.python_hook(|hooks| hooks.take_ui)?;
+        let st = self
+            .state
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("zipp: not initialized"))?;
+        let (result, kind) = classified_call(st, slot, &[]);
+        let value = self.finish_classified_execution(result, kind)?;
+        to_js(&value).map_err(|error| self.to_js_error(error))
+    }
+
+    /// Drain the program's pending host requests: an array of
+    /// `{id, kind, payload}` records, each a piece of work the program asked
+    /// its embedder to do (`kind` `"gpu.execute"` carries a compute graph as
+    /// `payload`). Answer one with
+    /// `pythonCall("__zipp_py_deliver", [id, reply])`, where `reply` is
+    /// `{ok: true, value}` or `{ok: false, error: {code, message}}`; the
+    /// program's callback for that request then runs inside that call. A
+    /// request never delivered is simply dropped with the engine. The
+    /// queue is empty afterwards.
+    #[cfg(feature = "python")]
+    #[wasm_bindgen(js_name = takeHostRequests)]
+    pub fn take_host_requests(&mut self) -> Result<JsValue, JsValue> {
+        self.ensure_live()?;
+        let slot = self.python_hook(|hooks| hooks.take_host)?;
         let st = self
             .state
             .as_mut()

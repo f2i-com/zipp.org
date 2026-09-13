@@ -609,10 +609,141 @@
         fn(g, "pairwise", 1, (a) => { const items = drain(a[0]); let i = 0; return gen(() => i + 1 < items.length ? tuple([items[i], items[++i]]) : STOP); });
         fn(g, "batched", 2, (a) => { const items = drain(a[0]); const n = Number(needInt(a[1])); let i = 0; return gen(() => { if (i >= items.length) return STOP; const b = items.slice(i, i + n); i += n; return tuple(b); }); });
     });
+    // ---- _zipp_gpu: the transport behind zipp_gpu.Graph.submit ------------------------------
+    mod("_zipp_gpu", (g) => {
+        fn(g, "hosted", 0, () => rt.hosted === true);
+        fn(g, "post", 2, (a) => {
+            const program = a[0];
+            if (program === null || typeof program !== "object" || program.cls !== T.dict) fail(E.TypeError, "a program is a dict");
+            const callback = a[1];
+            if (!(callback !== null && typeof callback === "object" && (callback.cls === T.function || callback.cls === T.method || callback.cls === T.builtin_function_or_method))) fail(E.TypeError, "post() needs a callable");
+            return BigInt(rt.postHost("gpu.execute", program, callback));
+        });
+        fn(g, "pending", 0, () => BigInt(rt.pendingHostRequests()));
+    });
+    // ---- struct: pack/unpack of the standard codes through a DataView ---------------------
+    mod("struct", (g) => {
+        const StructError = rt.newType("error", [E.Exception], new Map(), "struct");
+        g.set("error", StructError);
+        const SIZES = { x: 1, c: 1, b: 1, B: 1, "?": 1, h: 2, H: 2, i: 4, I: 4, l: 4, L: 4, q: 8, Q: 8, n: 8, N: 8, e: 2, f: 4, d: 8, s: 1, p: 1, P: 8 };
+        const NATIVE_ALIGN = { h: 2, H: 2, i: 4, I: 4, l: 4, L: 4, q: 8, Q: 8, n: 8, N: 8, e: 2, f: 4, d: 8, P: 8 };
+        function parse(fmt) {
+            fmt = needStr(fmt);
+            let little = true, native = true, i = 0;
+            if (fmt.length && "@=<>!".includes(fmt[0])) { const c = fmt[0]; native = c === "@"; little = c === "<" || (c === "@" || c === "=" ? true : false); i = 1; }
+            const items = []; let size = 0;
+            while (i < fmt.length) {
+                const ch = fmt[i];
+                if (ch === " " || ch === "\t" || ch === "\n") { i++; continue; }
+                let count = "";
+                while (i < fmt.length && fmt[i] >= "0" && fmt[i] <= "9") count += fmt[i++];
+                const code = fmt[i++];
+                if (code === undefined || SIZES[code] === undefined) fail(StructError, "bad char in struct format");
+                const n = count === "" ? 1 : parseInt(count, 10);
+                if (native && NATIVE_ALIGN[code]) { const al = NATIVE_ALIGN[code]; size = Math.ceil(size / al) * al; }
+                if (code === "s" || code === "p") { items.push({ code, count: n, offset: size }); size += n; }
+                else for (let k = 0; k < n; k++) { items.push({ code, count: 1, offset: size }); size += SIZES[code]; }
+            }
+            return { little, items, size };
+        }
+        const RANGE = { b: [-128n, 127n], B: [0n, 255n], h: [-32768n, 32767n], H: [0n, 65535n], i: [-2147483648n, 2147483647n], I: [0n, 4294967295n], l: [-2147483648n, 2147483647n], L: [0n, 4294967295n], q: [-9223372036854775808n, 9223372036854775807n], Q: [0n, 18446744073709551615n], n: [-9223372036854775808n, 9223372036854775807n], N: [0n, 18446744073709551615n], P: [0n, 18446744073709551615n] };
+        function pack(fmt, values) {
+            const s = parse(fmt), buf = new ArrayBuffer(s.size), view = new DataView(buf), bytes = new Uint8Array(buf);
+            const needed = s.items.filter((it) => it.code !== "x").length;
+            if (values.length !== needed) fail(StructError, "pack expected " + needed + " items for packing (got " + values.length + ")");
+            let vi = 0;
+            for (const it of s.items) {
+                const c = it.code;
+                if (c === "x") continue;
+                const v = values[vi++];
+                if (c === "s" || c === "p") {
+                    if (v === null || typeof v !== "object" || v.cls !== T.bytes) fail(StructError, "argument for '" + c + "' must be a bytes object");
+                    for (let k = 0; k < it.count && k < v.items.length; k++) bytes[it.offset + k] = v.items[k];
+                    continue;
+                }
+                if (c === "c") { if (v === null || typeof v !== "object" || v.cls !== T.bytes || v.items.length !== 1) fail(StructError, "char format requires a bytes object of length 1"); bytes[it.offset] = v.items[0]; continue; }
+                if (c === "?") { bytes[it.offset] = rt.truth(v) ? 1 : 0; continue; }
+                if (c === "f" || c === "d" || c === "e") {
+                    if (!isNum(v)) fail(StructError, "required argument is not a float");
+                    const x = toFloat(v);
+                    if (c === "f") { if (Number.isFinite(x) && !Number.isFinite(Math.fround(x))) fail(E.OverflowError, "float too large to pack with f format"); view.setFloat32(it.offset, x, s.little); }
+                    else if (c === "d") view.setFloat64(it.offset, x, s.little);
+                    else view.setUint16(it.offset, halfBits(x), s.little);
+                    continue;
+                }
+                if (!isInt(v)) fail(StructError, "required argument is not an integer");
+                const n = asInt(v), [lo, hi] = RANGE[c];
+                if (n < lo || n > hi) fail(StructError, "'" + c + "' format requires " + lo + " <= number <= " + hi);
+                const size = SIZES[c];
+                if (size === 8) { if (c === "q" || c === "n") view.setBigInt64(it.offset, n, s.little); else view.setBigUint64(it.offset, n, s.little); }
+                else if (size === 4) { if (c === "i" || c === "l") view.setInt32(it.offset, Number(n), s.little); else view.setUint32(it.offset, Number(n), s.little); }
+                else if (size === 2) { if (c === "h") view.setInt16(it.offset, Number(n), s.little); else view.setUint16(it.offset, Number(n), s.little); }
+                else { if (c === "b") view.setInt8(it.offset, Number(n)); else view.setUint8(it.offset, Number(n)); }
+            }
+            return rt.bytes(Array.from(bytes));
+        }
+        function halfBits(x) {
+            // IEEE 754 binary16 with round-to-nearest-even.
+            if (Number.isNaN(x)) return 0x7e00;
+            const sign = x < 0 || Object.is(x, -0) ? 0x8000 : 0; x = Math.abs(x);
+            if (x === Infinity) return sign | 0x7c00;
+            if (x === 0) return sign;
+            if (x >= 65520) fail(E.OverflowError, "float too large to pack with e format");
+            let e = Math.floor(Math.log2(x)); let m = x / Math.pow(2, e);
+            if (m >= 2) { m /= 2; e++; } else if (m < 1) { m *= 2; e--; }
+            if (e < -14) { const sub = Math.round(x / Math.pow(2, -24)); return sign | sub; }
+            let frac = Math.round((m - 1) * 1024);
+            if (frac === 1024) { frac = 0; e++; }
+            return sign | ((e + 15) << 10) | frac;
+        }
+        function halfValue(bits) {
+            const sign = bits & 0x8000 ? -1 : 1, e = (bits >> 10) & 0x1f, f = bits & 0x3ff;
+            if (e === 0) return sign * f * Math.pow(2, -24);
+            if (e === 31) return f ? NaN : sign * Infinity;
+            return sign * (1 + f / 1024) * Math.pow(2, e - 15);
+        }
+        function unpack(fmt, data, offset) {
+            const s = parse(fmt);
+            if (data === null || typeof data !== "object" || data.cls !== T.bytes) fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(data).name + "'");
+            offset = offset === undefined ? 0 : Number(needInt(offset));
+            if (data.items.length - offset !== s.size && offset === 0) fail(StructError, "unpack requires a buffer of " + s.size + " bytes");
+            if (data.items.length - offset < s.size) fail(StructError, "unpack_from requires a buffer of at least " + (s.size + offset) + " bytes");
+            const bytes = Uint8Array.from(data.items.slice(offset, offset + s.size)), view = new DataView(bytes.buffer);
+            const out = [];
+            for (const it of s.items) {
+                const c = it.code;
+                if (c === "x") continue;
+                if (c === "s") { out.push(rt.bytes(Array.from(bytes.slice(it.offset, it.offset + it.count)))); continue; }
+                if (c === "p") { const n = Math.min(bytes[it.offset], it.count - 1); out.push(rt.bytes(Array.from(bytes.slice(it.offset + 1, it.offset + 1 + n)))); continue; }
+                if (c === "c") { out.push(rt.bytes([bytes[it.offset]])); continue; }
+                if (c === "?") { out.push(bytes[it.offset] !== 0); continue; }
+                if (c === "f") { out.push(view.getFloat32(it.offset, s.little)); continue; }
+                if (c === "d") { out.push(view.getFloat64(it.offset, s.little)); continue; }
+                if (c === "e") { out.push(halfValue(view.getUint16(it.offset, s.little))); continue; }
+                const size = SIZES[c];
+                if (size === 8) out.push(c === "q" || c === "n" ? view.getBigInt64(it.offset, s.little) : view.getBigUint64(it.offset, s.little));
+                else if (size === 4) out.push(BigInt(c === "i" || c === "l" ? view.getInt32(it.offset, s.little) : view.getUint32(it.offset, s.little)));
+                else if (size === 2) out.push(BigInt(c === "h" ? view.getInt16(it.offset, s.little) : view.getUint16(it.offset, s.little)));
+                else out.push(BigInt(c === "b" ? view.getInt8(it.offset) : view.getUint8(it.offset)));
+            }
+            return tuple(out);
+        }
+        fn(g, "pack", -1, (a) => pack(a[0], a.slice(1)));
+        fn(g, "unpack", 2, (a) => unpack(a[0], a[1]));
+        fn(g, "unpack_from", 3, (a) => unpack(a[0], a[1], a[2]), 2);
+        fn(g, "calcsize", 1, (a) => BigInt(parse(a[0]).size));
+        fn(g, "iter_unpack", 2, (a) => { const s = parse(a[0]); const data = a[1]; const out = []; for (let off = 0; off + s.size <= data.items.length; off += s.size) out.push(unpack(a[0], data, off)); return iter(list(out)); });
+        const Struct = rt.newType("Struct", [rt.ObjectType], new Map(), "struct");
+        Struct.dict.set("__init__", builtin("__init__", 2, (a) => { a[0].dict.set("format", needStr(a[1])); a[0].dict.set("size", BigInt(parse(a[1]).size)); return null; }));
+        Struct.dict.set("pack", builtin("pack", -1, (a) => pack(a[0].dict.get("format"), a.slice(1))));
+        Struct.dict.set("unpack", builtin("unpack", 2, (a) => unpack(a[0].dict.get("format"), a[1])));
+        Struct.dict.set("unpack_from", builtin("unpack_from", 3, (a) => unpack(a[0].dict.get("format"), a[1], a[2]), 2));
+        g.set("Struct", Struct);
+    });
     mod("contextlib", (g) => {
         // A generator-backed context manager: __enter__ runs to the first
         // yield, __exit__ resumes it (throwing the block's exception in).
-        const GCM = rt.newType("_GeneratorContextManager", [ObjectType], new Map(), "contextlib");
+        const GCM = rt.newType("_GeneratorContextManager", [rt.ObjectType], new Map(), "contextlib");
         const stopped = (e) => e !== null && typeof e === "object" && e.cls !== undefined && isInstance(e, E.StopIteration);
         GCM.dict.set("__enter__", builtin("__enter__", 1, (a) => {
             const gen = a[0].gen;
@@ -644,23 +775,23 @@
             w.kwnames = true; w.dict = new Map([["__wrapped__", f]]);
             return w;
         });
-        const Suppress = rt.newType("suppress", [ObjectType], new Map(), "contextlib");
+        const Suppress = rt.newType("suppress", [rt.ObjectType], new Map(), "contextlib");
         Suppress.dict.set("__init__", builtin("__init__", -1, (a) => { a[0].kinds = tuple(a.slice(1)); return null; }));
         Suppress.dict.set("__enter__", builtin("__enter__", 1, () => null));
         Suppress.dict.set("__exit__", builtin("__exit__", 4, (a) => a[2] !== null && R.excmatch(a[2], a[0].kinds)));
         g.set("suppress", Suppress);
-        const Closing = rt.newType("closing", [ObjectType], new Map(), "contextlib");
+        const Closing = rt.newType("closing", [rt.ObjectType], new Map(), "contextlib");
         Closing.dict.set("__init__", builtin("__init__", 2, (a) => { a[0].thing = a[1]; return null; }));
         Closing.dict.set("__enter__", builtin("__enter__", 1, (a) => a[0].thing));
         Closing.dict.set("__exit__", builtin("__exit__", 4, (a) => { callMethod(a[0].thing, "close", []); return false; }));
         g.set("closing", Closing);
-        const Null = rt.newType("nullcontext", [ObjectType], new Map(), "contextlib");
+        const Null = rt.newType("nullcontext", [rt.ObjectType], new Map(), "contextlib");
         Null.dict.set("__init__", builtin("__init__", 2, (a) => { a[0].value = a[1] === undefined ? null : a[1]; return null; }, 1));
         Null.dict.set("__enter__", builtin("__enter__", 1, (a) => a[0].value));
         Null.dict.set("__exit__", builtin("__exit__", 4, () => false));
         g.set("nullcontext", Null);
         // ExitStack: exits run in reverse; a truthy __exit__ swallows the exception.
-        const Stack = rt.newType("ExitStack", [ObjectType], new Map(), "contextlib");
+        const Stack = rt.newType("ExitStack", [rt.ObjectType], new Map(), "contextlib");
         Stack.dict.set("__init__", builtin("__init__", 1, (a) => { a[0].exits = []; return null; }));
         Stack.dict.set("__enter__", builtin("__enter__", 1, (a) => a[0]));
         Stack.dict.set("enter_context", builtin("enter_context", 2, (a) => { const [exit, value] = R.withenter(a[1]); a[0].exits.push(exit); return value; }));

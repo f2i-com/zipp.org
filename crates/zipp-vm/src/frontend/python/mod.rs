@@ -64,11 +64,20 @@ pub(super) const BUILTIN_MODULES: &[&str] = &[
     "bisect",
     "statistics",
     "fractions",
+    "struct",
+    "contextlib",
+    "_zipp_gpu",
 ];
+
+/// Library modules written in Python and bundled with the frontend. One is
+/// compiled into a program only when a module of the program imports it
+/// (directly or through another bundled module), so a program that never
+/// mentions it pays nothing.
+pub(super) const BUNDLED_MODULES: &[(&str, &str)] = &[("zipp_gpu", include_str!("lib/zipp_gpu.py"))];
 
 /// A single-file program: the source is the `main` module.
 pub(super) fn compile(source: &str) -> R<Program> {
-    compile_project("main", &[("main".to_owned(), source.to_owned())])
+    compile_project("main", &[("main".to_owned(), source.to_owned())], false)
 }
 
 /// What the emitter knows about the whole project.
@@ -79,7 +88,63 @@ pub(super) struct Project<'a> {
 
 /// A multi-module program. `modules` pairs each module name (the `.py` file's
 /// stem) with its source; `entry` names the module whose top level runs.
-pub(super) fn compile_project(entry: &str, modules: &[(String, String)]) -> R<Program> {
+/// The module names a suite imports anywhere in its statements.
+fn imported_modules(suite: &[ast::Stmt], out: &mut BTreeSet<String>) {
+    for stmt in suite {
+        match stmt {
+            ast::Stmt::Import(i) => {
+                for alias in &i.names {
+                    let head = alias.name.as_str().split('.').next().unwrap_or("");
+                    out.insert(head.to_owned());
+                }
+            }
+            ast::Stmt::ImportFrom(i) => {
+                if let Some(module) = &i.module {
+                    let head = module.as_str().split('.').next().unwrap_or("");
+                    out.insert(head.to_owned());
+                }
+            }
+            ast::Stmt::If(s) => {
+                imported_modules(&s.body, out);
+                imported_modules(&s.orelse, out);
+            }
+            ast::Stmt::For(s) => {
+                imported_modules(&s.body, out);
+                imported_modules(&s.orelse, out);
+            }
+            ast::Stmt::While(s) => {
+                imported_modules(&s.body, out);
+                imported_modules(&s.orelse, out);
+            }
+            ast::Stmt::With(s) => imported_modules(&s.body, out),
+            ast::Stmt::Try(s) => {
+                imported_modules(&s.body, out);
+                for handler in &s.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    imported_modules(&h.body, out);
+                }
+                imported_modules(&s.orelse, out);
+                imported_modules(&s.finalbody, out);
+            }
+            ast::Stmt::FunctionDef(s) => imported_modules(&s.body, out),
+            ast::Stmt::ClassDef(s) => imported_modules(&s.body, out),
+            ast::Stmt::Match(s) => {
+                for case in &s.cases {
+                    imported_modules(&case.body, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `hosted` tells the runtime that an embedder will drain and answer host
+/// requests (the wasm engine does); otherwise requests are settled locally.
+pub(super) fn compile_project(
+    entry: &str,
+    modules: &[(String, String)],
+    hosted: bool,
+) -> R<Program> {
     if modules.is_empty() {
         return Err("Python project: no modules".into());
     }
@@ -104,11 +169,17 @@ pub(super) fn compile_project(entry: &str, modules: &[(String, String)]) -> R<Pr
             "Python project: entry module {entry:?} is not in the project"
         ));
     }
+    // Project modules first, then any bundled library module they import
+    // (a project module of the same name shadows the bundled one).
+    let mut sources: Vec<(String, String)> = modules.to_vec();
     let mut parsed = Vec::with_capacity(modules.len());
-    for (name, source) in modules {
+    let mut wanted = BTreeSet::new();
+    let mut index = 0;
+    while index < sources.len() {
+        let (name, source) = &sources[index];
         let file = format!("{name}.py");
         preflight(&file, source)?;
-        let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+        let source: &str = source.strip_prefix('\u{feff}').unwrap_or(source);
         let suite = ast::Suite::parse(source, &file).map_err(|e| {
             format!(
                 "SyntaxError: {} ({})",
@@ -117,8 +188,30 @@ pub(super) fn compile_project(entry: &str, modules: &[(String, String)]) -> R<Pr
             )
         })?;
         let table = symtable::analyse(&suite, name).map_err(|e| format!("{file}: {e}"))?;
-        parsed.push((name.as_str(), file, source, suite, table));
+        imported_modules(&suite, &mut wanted);
+        parsed.push((index, file, suite, table));
+        for (bundled, text) in BUNDLED_MODULES {
+            if wanted.contains(*bundled) && !sources.iter().any(|(n, _)| n == bundled) {
+                sources.push(((*bundled).to_owned(), (*text).to_owned()));
+            }
+        }
+        index += 1;
     }
+    let sources = &sources;
+    let mut names = names;
+    let mut module_names = module_names;
+    for (name, _) in sources.iter().skip(modules.len()) {
+        names.insert(name.as_str());
+        module_names.push(name.as_str());
+    }
+    let parsed: Vec<_> = parsed
+        .into_iter()
+        .map(|(index, file, suite, table)| {
+            let (name, source) = &sources[index];
+            let source: &str = source.strip_prefix('\u{feff}').unwrap_or(source);
+            (name.as_str(), file, source, suite, table)
+        })
+        .collect();
     // Compile a fixed seed program. Its root initializes the private runtime and
     // then calls __zipp_py_entry. Replace only that empty function's prototype;
     // retain all seed globals and function IDs. Never relocate JS bytecode.
@@ -206,6 +299,8 @@ pub(super) fn compile_project(entry: &str, modules: &[(String, String)]) -> R<Pr
     }
     let name = out.string(entry)?;
     out.helper("entry", &[name])?;
+    let hosted_r = out.boolean(hosted)?;
+    out.helper("hosted", &[hosted_r])?;
     let name = out.string(entry)?;
     out.helper("runmain", &[name])?;
     let value = out.none()?;

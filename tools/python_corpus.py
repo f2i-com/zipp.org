@@ -24,8 +24,14 @@ ROOT = Path(__file__).resolve().parent.parent
 CORPUS = ROOT / "tests" / "python_corpus"
 
 
+# Library modules bundled with the frontend (crates/zipp-vm/src/frontend/python/lib)
+# are importable from CPython too, so corpus programs can use them.
+LIB = ROOT / "crates" / "zipp-vm" / "src" / "frontend" / "python" / "lib"
+
+
 def run(cmd: list[str], cwd: Path) -> tuple[int, str, str]:
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    env = dict(os.environ, PYTHONPATH=str(LIB), PYTHONDONTWRITEBYTECODE="1")
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, env=env)
     return p.returncode, p.stdout.replace("\r\n", "\n"), p.stderr.replace("\r\n", "\n")
 
 
@@ -45,7 +51,7 @@ def main() -> int:
         return 2
     failed = 0
     for path in files:
-        code, out, err = run([args.python, "-X", "utf8", str(path)], CORPUS)
+        code, out, err = run([args.python, "-X", "utf8", "-P", str(path)], CORPUS)
         if args.write_expected:
             path.with_suffix(".out").write_text(out, encoding="utf-8", newline="\n")
             path.with_suffix(".status").write_text("0\n" if code == 0 else "1\n", encoding="utf-8", newline="\n")

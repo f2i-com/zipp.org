@@ -51,6 +51,7 @@ const CHECKS = [
   // The experimental Python frontend's boundary contract; adapts to the
   // artifact's `languages`, so the JavaScript-only build proves the refusal.
   ["python-frontend.cjs"],
+  ["python-gpu.cjs"],
 ];
 
 if (process.argv.includes("--list")) {

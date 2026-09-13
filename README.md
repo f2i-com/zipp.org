@@ -182,10 +182,18 @@ JavaScript-only binary) and off by default in the `zipp-vm` library and the
 WebAssembly package, which offers it as a
 [separate build variant](crates/zipp-wasm/README.md#build-variants-javascript-only-or-javascript-and-python).
 
+Python programs can also compute on the GPU in the browser: the bundled
+`zipp_gpu` library records a float32 graph (`+`, `*`, `@`, `relu`, `sum`,
+a Conway-life step) and `submit`s it, and the host runs it through WebGPU,
+WebGL2, compiled WebAssembly kernels or a JavaScript reference, calling the
+program back with the outputs; natively the same code evaluates on the CPU.
+See [crates/zipp-wasm/README.md](crates/zipp-wasm/README.md#gpu-compute-for-python-programs).
+
 There is also a local [playground](crates/zipp-wasm/playground/README.md)
 that runs a folder of Python or JavaScript files on the WebAssembly engine,
 with an editor, a console and a canvas the program draws on through a small
-`ui` API (`draw`/`update`/`on_click`/`on_key` hooks for animation and input):
+`ui` API (`draw`/`update`/`on_click`/`on_key` hooks for animation and input),
+and a GPU sample that steps life on the compute backend every frame:
 
 ```sh
 cd crates/zipp-wasm && ./build-variants.sh all && node playground/serve.cjs

@@ -1118,6 +1118,32 @@ var __zipp_py = (function () {
         }
         return m;
     }
+    // ---- host requests -----------------------------------------------------------------------
+    // A program hands work to its embedder as plain data (`kind`, `payload`)
+    // with a callback; the host drains the queue after a call returns and
+    // delivers each answer later through `__zipp_py_deliver`. Without a host
+    // (`hosted` false) modules settle requests themselves.
+    rt.hosted = false;
+    R.hosted = function (v) { rt.hosted = v === true; return null; };
+    const hostRequests = [], hostCallbacks = new Map();
+    let nextRequest = 1;
+    const MAX_HOST_PENDING = 64;
+    rt.postHost = function (kind, payload, callback) {
+        if (hostCallbacks.size >= MAX_HOST_PENDING) fail(E.RuntimeError, "too many host requests are pending (" + MAX_HOST_PENDING + ")");
+        const id = nextRequest++;
+        hostCallbacks.set(id, callback);
+        hostRequests.push({ id: id, kind: kind, payload: payload });
+        return id;
+    };
+    rt.takeHostRequests = function () { const out = hostRequests.slice(); hostRequests.length = 0; return out; };
+    rt.deliverHost = function (id, reply) {
+        const callback = hostCallbacks.get(id);
+        if (callback === undefined) return false;
+        hostCallbacks.delete(id);
+        call(callback, [reply], null);
+        return true;
+    };
+    rt.pendingHostRequests = function () { return hostCallbacks.size; };
     R.runmain = function (name) {
         const init = inits.get(name);
         if (init === undefined) fail(E.ModuleNotFoundError, name);

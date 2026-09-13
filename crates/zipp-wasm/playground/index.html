@@ -28,11 +28,22 @@
         <button type="button" data-sample="python">Python: bouncing balls</button>
         <button type="button" data-sample="javascript">JavaScript: bouncing balls</button>
         <button type="button" data-sample="ant">Python: Langton's ant (classes, dataclasses, enum)</button>
+        <button type="button" data-sample="gpu">Python: GPU compute (zipp_gpu graphs, life on the GPU)</button>
         <button type="button" data-sample="python-hello">Python: hello, world</button>
         <button type="button" data-sample="javascript-hello">JavaScript: hello, world</button>
       </div>
     </div>
     <button class="button" id="new-file" type="button">New file</button>
+    <label class="button" title="Where Python zipp_gpu graphs run: auto tries WebGPU, then WebGL2, then compiled WASM, then a JavaScript reference">
+      GPU
+      <select id="gpu-backend">
+        <option value="auto">auto</option>
+        <option value="webgpu">WebGPU</option>
+        <option value="webgl2">WebGL2</option>
+        <option value="wasm">WASM kernels</option>
+        <option value="cpu-js">JavaScript</option>
+      </select>
+    </label>
     <span class="spacer"></span>
     <button class="button primary" id="run" type="button" title="Ctrl+Enter">▶ Run</button>
     <button class="button" id="stop" type="button" disabled>■ Stop</button>

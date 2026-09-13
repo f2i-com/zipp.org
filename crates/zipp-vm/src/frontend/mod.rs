@@ -96,9 +96,20 @@ pub fn compile_python_project(
     entry: &str,
     modules: &[(String, String)],
 ) -> Result<CompiledSource, String> {
+    compile_python_project_hosted(entry, modules, false)
+}
+/// `compile_python_project` for an embedder that drains the program's host
+/// requests (`__zipp_py_take_host`) and answers them (`__zipp_py_deliver`):
+/// with `hosted`, a request such as a GPU graph waits for the host instead
+/// of being settled by the runtime's own reference implementation.
+pub fn compile_python_project_hosted(
+    entry: &str,
+    modules: &[(String, String)],
+    hosted: bool,
+) -> Result<CompiledSource, String> {
     #[cfg(feature = "python")]
     {
-        let program = python::compile_project(entry, modules)?;
+        let program = python::compile_project(entry, modules, hosted)?;
         let mut state = ScriptState::from_program(program);
         state.disable_vm_jit();
         Ok(CompiledSource {
@@ -108,7 +119,7 @@ pub fn compile_python_project(
     }
     #[cfg(not(feature = "python"))]
     {
-        let _ = (entry, modules);
+        let _ = (entry, modules, hosted);
         Err("Python support is not built; enable the `python` Cargo feature".into())
     }
 }

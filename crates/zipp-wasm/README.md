@@ -63,7 +63,7 @@ LTO, one codegen unit, 13 September 2026, Windows x86-64):
 | variant | raw | Brotli-11 | vs. JavaScript-only (wire) |
 | --- | ---: | ---: | ---: |
 | `javascript` | 5,308,147 | 1,239,957 | baseline |
-| `all` | 7,741,966 | 1,769,619 | +529,662 (+43%) |
+| `all` | 7,773,932 | 1,777,382 | +537,425 (+43%) |
 
 A Python state keeps every host-boundary limit of a JavaScript one (initial
 source size, instruction budget, heap, output, dynamic-code gates) and adds the
@@ -84,10 +84,51 @@ the JavaScript-only gate proves the refusal path.
 | `pythonCall(name, args)` | call it with an array of host values (integers, strings, booleans, null, arrays) and get host data back; a throw leaves the engine usable and classifies as `guest` |
 | `takeUi()` | drain the `ui` module's command buffer: `[["rect", x, y, w, h, color], ...]` |
 | `setPythonInput(json)` | replace the input snapshot `ui.mouse()`/`clicked()`/`key()`/`button()`/`width()`/`height()` read: `{"mx","my","down","clicked","keys":{...},"w","h"}` |
+| `takeHostRequests()` | drain the program's pending host requests: `[{id, kind, payload}, ...]`; today the one kind is `"gpu.execute"`, whose payload is a `zipp_gpu` compute graph (plain data, protocol version 1) |
+| `pythonCall("__zipp_py_deliver", [id, reply])` | answer a host request: `reply` is `{ok: true, value}` or `{ok: false, error: {code, message}}`; the program's callback runs inside this call, and the result is `true` when the id was pending |
 
 `playground/` is a complete host over this surface (and over the JavaScript ABI
 for `.js` projects): a folder of files, an editor, a console and a canvas driven
 by `draw`/`update`/`on_click`/`on_key`. See `playground/README.md`.
+
+#### GPU compute for Python programs
+
+A Python program imports the bundled `zipp_gpu` library, records a float32
+graph with tensor arithmetic (`+`, `-`, `*`, `@`, `relu`, `sum`, `life`) and
+calls `Graph.submit(callback, on_error=None, **outputs)`. The graph leaves the
+engine as a `gpu.execute` host request; nothing inside the engine touches a
+GPU. `gpu-lab/` (the vendored GPU Lab: `src/runtime.mjs` and its WebGPU,
+WebGL2, compiled-WASM and JavaScript backends) executes it in the host, and
+`gpu-lab/src/zipp-python-adapter.mjs` is the glue a host uses:
+
+```javascript
+import { createRuntime } from "./gpu-lab/src/runtime.mjs";
+import { createPythonGPUAdapter } from "./gpu-lab/src/zipp-python-adapter.mjs";
+
+const compute = await createRuntime({ backend: "auto" });   // webgpu → webgl2 → wasm → cpu-js
+const adapter = createPythonGPUAdapter(engine, compute, { allowExecute: true, maxPending: 16 });
+engine.initPythonProject(files, "main");
+adapter.drain();                       // after every engine call: admits new gpu.execute requests
+// ... each answer is delivered with pythonCall("__zipp_py_deliver", ...) once the
+// asynchronous compute is done, outside any active engine call; call adapter.drain()
+// again from onDelivered because a callback may submit more work.
+adapter.invalidate(); await adapter.idle(); compute.dispose();   // teardown, in that order
+```
+
+The grant is explicit (`allowExecute`), requests are admitted one at a time
+with pending and lifetime quotas, an explicit backend choice is never
+downgraded to a CPU implementation, a late result never reaches a disposed
+engine, and the host validates every graph itself (shapes, node count, work
+and allocation budgets) before a kernel runs. Natively (`zipp py`) and under
+CPython the same `submit` evaluates the graph with the library's float32
+reference implementation and reports `backend: "cpu-python"`.
+`tests/node/python-gpu.cjs` holds the channel and the adapter to this over the
+JavaScript reference and compiled-WASM backends; `playground/smoke.cjs` runs
+the graphs through a real browser, records which backend answered, and checks
+that an explicit WebGL2 request either runs on WebGL2 or is refused with a
+reason. `gpu-lab/README.md` describes the vendored package and its own
+standalone demo (`gpu-lab/demo/`), which stays useful as an isolated
+diagnostic for a browser's GPU support.
 
 ### Why there is no `wasm-opt` step
 
