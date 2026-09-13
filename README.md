@@ -142,6 +142,51 @@ runtime data-file dependency.
 
 </details>
 
+### Run Python (experimental)
+
+The CLI also carries an experimental Python-subset frontend: Python source is
+parsed and lowered straight to the engine's register bytecode (no
+transpilation to JavaScript), so a `.py` file runs on the same VM. Save this
+as `fib.py`:
+
+```python
+def fib(n):
+    a = 0
+    b = 1
+    for i in range(n):
+        a, b = b, a + b
+    return a
+
+print(fib(30))
+```
+
+```sh
+zipp py fib.py                 # 832040
+zipp run fib.py                # frontend chosen by extension, shebang or directive
+zipp run --lang=python -       # from standard input
+```
+
+It is a deliberately small integer-centric subset (functions, loops, lists,
+tuples, ranges, strings, and modules that import each other within a project;
+no floats, classes or exceptions yet) and every unsupported construct is a
+compile error rather than a guess. A folder runs as a project:
+`zipp py examples/python/project`. The scope
+matrix, limits and the bytecode design are in
+[docs/PYTHON_FRONTEND_EXPERIMENT.md](docs/PYTHON_FRONTEND_EXPERIMENT.md). The
+feature is on by default in the CLI (`--no-default-features` builds the
+JavaScript-only binary) and off by default in the `zipp-vm` library and the
+WebAssembly package, which offers it as a
+[separate build variant](crates/zipp-wasm/README.md#build-variants-javascript-only-or-javascript-and-python).
+
+There is also a local [playground](crates/zipp-wasm/playground/README.md)
+that runs a folder of Python or JavaScript files on the WebAssembly engine,
+with an editor, a console and a canvas the program draws on through a small
+`ui` API (`draw`/`update`/`on_click`/`on_key` hooks for animation and input):
+
+```sh
+cd crates/zipp-wasm && ./build-variants.sh all && node playground/serve.cjs
+```
+
 ### Embed Zipp WebAssembly in a web app
 
 Run the browser build in a dedicated Worker, with a deadline controlled by
@@ -603,8 +648,8 @@ Workspace map:
 
 | Path | Purpose |
 |---|---|
-| [`crates/zipp-vm`](crates/zipp-vm) | Parser, compiler, VM, runtime, GC, and JITs. |
-| [`crates/zipp-cli`](crates/zipp-cli) | `zipp js` / `zipp mjs` command line. |
+| [`crates/zipp-vm`](crates/zipp-vm) | Parser, compiler, VM, runtime, GC, JITs, and the experimental Python frontend (`src/frontend`). |
+| [`crates/zipp-cli`](crates/zipp-cli) | `zipp js` / `zipp mjs` / `zipp py` command line. |
 | [`crates/regress-fork`](crates/regress-fork) | ECMAScript regex engine fork and conformance fixes. |
 | [`crates/zipp-wasm`](crates/zipp-wasm/README.md) | Browser/Worker embedding. |
 | [`crates/zipp-sandbox`](crates/zipp-sandbox/README.md) | Separately resolved hardened native runner. |

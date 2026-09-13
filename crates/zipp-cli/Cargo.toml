@@ -21,7 +21,11 @@ mimalloc = { version = "0.1.52", default-features = false }
 zipp-vm = { path = "../zipp-vm", features = ["instrument"] }
 
 [features]
-default = []
+# The experimental Python-subset frontend (`zipp py file.py`, `zipp run`,
+# `--lang=python`). Default-on for the CLI only; `--no-default-features`
+# yields the JavaScript-only binary.
+default = ["python"]
+python = ["zipp-vm/python"]
 secure-allocator = ["mimalloc/secure"]
 regex-linear = ["zipp-vm/regex-linear"]
 

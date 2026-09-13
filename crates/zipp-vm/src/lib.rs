@@ -68,6 +68,7 @@ mod compile;
 /// Persistent-VM embedding API, for hosts that keep a script alive across many
 /// re-entries rather than running it once (see the module docs).
 pub mod embed;
+pub mod frontend;
 
 /// B187 scouting support: expose the exact object-construction floor to the
 /// `build_floor_micro` bench test without widening any real API. Not for
@@ -547,7 +548,7 @@ pub fn parse_to_text(src: &str, module: bool) -> Result<String, String> {
 
 /// Parse + compile, no VM. Shares `run_with_base`'s Annex B parse-retry so the
 /// dump reflects what would actually run.
-fn compile_only(src: &str, module: bool) -> Result<bytecode::Program, String> {
+pub(crate) fn compile_only(src: &str, module: bool) -> Result<bytecode::Program, String> {
     let ast = if module {
         front::parse_module(src)?
     } else {

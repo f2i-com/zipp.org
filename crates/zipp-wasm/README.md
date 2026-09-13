@@ -24,6 +24,71 @@ node tests/node/check-wasm-memory.cjs pkg/zipp_wasm_bg.wasm
 brotli -q 11 -f -o pkg/zipp_wasm_bg.wasm.br pkg/zipp_wasm_bg.wasm
 ```
 
+## Build variants: JavaScript only, or JavaScript and Python
+
+The crate builds two artifacts. The shipped default is JavaScript-only and is
+byte-for-byte the module the steps above produce; the `python` feature adds
+the experimental Python-subset frontend (`docs/PYTHON_FRONTEND_EXPERIMENT.md`)
+behind `Engine.initSource(source, "python")` alongside the unchanged
+JavaScript entry points.
+
+| variant | features | entry points |
+| --- | --- | --- |
+| `javascript` (default) | none | `initScript`, `initSource(src, "javascript")` |
+| `all` | `--features python` | the above plus `initSource(src, "python")` |
+
+```sh
+cd crates/zipp-wasm
+./build-variants.sh            # both into dist/<variant>/, with sizes
+./build-variants.sh all        # one variant
+```
+
+The script applies exactly the post-processing above (section strip,
+`target_features` strip, memory/import check, Brotli) to each build, in its
+own target directory, and prints a raw / Brotli-11 size table. A host can tell
+the variants apart at runtime: `zippProfile().languages` is `["javascript"]`
+or `["javascript","python"]`, and `initSource(src, "python")` on the
+JavaScript-only module fails with a clear message and disposes the engine like
+any failed initialization.
+
+There is deliberately no Python-only variant. The engine is the JavaScript VM
+and the Python runtime's helpers are themselves JavaScript that the VM
+compiles, so a build without the JavaScript entry points still carries the
+whole engine; measured, it came out 85 bytes *larger* on the wire than the
+combined module. The size that matters is the parser and lowering code the
+`python` feature adds. Measured on this source, same toolchain and
+post-processing as the table above (Rust 1.92.0, wasm-bindgen 0.2.126, fat
+LTO, one codegen unit, 13 September 2026, Windows x86-64):
+
+| variant | raw | Brotli-11 | vs. JavaScript-only (wire) |
+| --- | ---: | ---: | ---: |
+| `javascript` | 5,306,505 | 1,239,135 | baseline |
+| `all` | 7,308,914 | 1,684,636 | +445,501 (+36%) |
+
+A Python state keeps every host-boundary limit of a JavaScript one (initial
+source size, instruction budget, heap, output, dynamic-code gates) and adds the
+frontend's own compile-time caps. It exposes no global slots — the only JS
+bindings in a Python program are the private runtime bootstrap — and the
+slot/`callFunction`/`evalInContext` methods reject it rather than reading that
+bootstrap. `tests/node/python-frontend.cjs` holds both variants to this; it is
+part of `run-boundary-suite.cjs` and adapts to the artifact's `languages`, so
+the JavaScript-only gate proves the refusal path.
+
+### The Python surface of the combined module
+
+| method | purpose |
+| --- | --- |
+| `initSource(source, "python")` | one file, as the `main` module |
+| `initPythonProject(files, entry)` | a project: `files` maps module names (file stems) to source, `entry` names the module that runs; modules `import` each other by name and the built-in `ui` module, nothing else |
+| `pythonHas(name)` | whether the entry module defines a top-level function `name` |
+| `pythonCall(name, args)` | call it with an array of host values (integers, strings, booleans, null, arrays) and get host data back; a throw leaves the engine usable and classifies as `guest` |
+| `takeUi()` | drain the `ui` module's command buffer: `[["rect", x, y, w, h, color], ...]` |
+| `setPythonInput(json)` | replace the input snapshot `ui.mouse()`/`clicked()`/`key()`/`button()`/`width()`/`height()` read: `{"mx","my","down","clicked","keys":{...},"w","h"}` |
+
+`playground/` is a complete host over this surface (and over the JavaScript ABI
+for `.js` projects): a folder of files, an editor, a console and a canvas driven
+by `draw`/`update`/`on_click`/`on_key`. See `playground/README.md`.
+
 ### Why there is no `wasm-opt` step
 
 There used to be a `wasm-opt -Oz --strip-debug` line here, marked optional. It is

@@ -396,7 +396,7 @@ fn skip_leading_trivia(s: &str) -> &str {
     }
 }
 
-fn placeholder(name: &str) -> FuncProto {
+pub(crate) fn placeholder(name: &str) -> FuncProto {
     FuncProto {
         name: name.to_string(),
         code: Vec::new(),
