@@ -261,16 +261,26 @@ jobs:
         with:
           repository: tc39/test262
           ref: 4249661388e5d3f92a85186213da140a6481490f
-          path: .test262
+          # Keep the external corpus out of the engine's source-identity scan.
+          path: target/test262
           persist-credentials: false
       - name: Select the pinned release Rust toolchain
         run: rustup toolchain install 1.92.0 --profile minimal --no-self-update
       - name: Build the locked release CLI
         run: cargo +1.92.0 build --locked --release --package zipp-cli --bin zipp
+      - name: Verify the CLI records the clean checked-out source
+        run: |
+          python3 - <<'PY'
+          import json, subprocess
+          info = json.loads(subprocess.check_output(["target/release/zipp", "--version", "--json"]))
+          expected = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          assert info["source"] == expected and info["dirty"] is False, info
+          print("Test262 engine source:", expected)
+          PY
       - name: Require the exact expected-failure identities and zero skips
         run: >-
           python3 tools/run_test262.py
-          --t262 .test262
+          --t262 target/test262
           --zipp target/release/zipp
           --jobs 2 --timeout 120
           --expected-failures tools/test262-expected-failures.txt

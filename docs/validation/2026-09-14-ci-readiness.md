@@ -72,9 +72,9 @@ unexpected passes of these identities and any skips fail the gate.
 
 ## Hosted result and follow-up
 
-At `0a5c1e2e`, the
+The earlier standard candidate `635b4183` passed the
 [standard CI workflow](https://github.com/f2i-com/zipp-python/actions/runs/34761802416)
-passed. The
+as confirmed by its checkout logs. The broader run at `0a5c1e2e` contains the
 [Test262 job](https://github.com/f2i-com/zipp-python/actions/runs/34761803672/job/103735841023)
 ran all 95,680 executions: **95,669 PASS, 11 FAIL, 0 SKIP**, with zero unexpected
 failures or stale expectations. The native-workspace lane was still running
@@ -85,6 +85,13 @@ it changes ZIPP's failure from an early TypeError to the same final assertion
 as Node. The exact eleven-entry manifest is unchanged. The README now reports
 the current corpus/counts and explicitly distinguishes gate success from every
 test passing. Neither the pinned corpus nor its tests are edited.
+
+The Test262 log also exposed a provenance issue: checking the external corpus
+out into unignored `.test262/` made the CLI identify the source as
+`0a5c1e2e+dirty.unknown`. The corpus now lives under ignored `target/test262/`,
+and CI requires the built CLI's source to equal the checked-out commit with
+`dirty: false` before running conformance. The earlier result above remains
+explicitly tied to that earlier run; fresh CI must validate the corrected build.
 
 Local follow-up validation: all five new binding/locale tests pass in default
 and safe-sandbox profiles, and all four binding programs produce the same
