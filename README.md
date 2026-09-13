@@ -184,7 +184,7 @@ ffmpeg and the Python WASM build required).
 
 | Fast to start | Modern JavaScript | Ready to embed |
 |---|---|---|
-| **7.4 ms** median process launch in the canonical capture. No snapshot to load. | **99.997%** of core Test262 executions: **95,939 / 95,942**. | A native CLI, a Rust embedding API, and a browser WebAssembly runtime. |
+| **7.4 ms** median process launch in the canonical capture. No snapshot to load. | **99.989%** in the latest pinned core Test262 run: **95,669 / 95,680**, with 11 expected failures. | A native CLI, a Rust embedding API, and a browser WebAssembly runtime. |
 
 - **Explore the whole engine.** The lexer, parser, register VM, GC, inline caches
   and JITs live together in this repository.
@@ -899,14 +899,22 @@ below.
 
 ## Correctness and language coverage
 
-Zipp currently passes **95,939 of 95,942** required test262 executions. The
-three known remaining cases are one Annex B test carrying a superseded ES2017
-expectation and two rows that require German CLDR data; the exact list is
-[`tools/test262-expected-failures.txt`](tools/test262-expected-failures.txt).
+The [latest completed Test262 run](https://github.com/f2i-com/zipp-python/actions/runs/34761803672/job/103735841023)
+at engine revision `0a5c1e2e` passes **95,669 of 95,680** executions (**99.989%**),
+with **11 expected failures and zero skips**. The corpus is pinned to
+`4249661388e5d3f92a85186213da140a6481490f`, including staging and excluding the
+separate ECMA-402 suite. A green gate means no unexpected failures, stale
+expectations or skips; it does **not** mean every execution passed.
+
+Eight failures expose contradictions in the pinned Error/TypedArray harnesses;
+one Annex B test carries a superseded ES2017 expectation; two require German
+CLDR formatting, which Zipp does not yet provide. See the
+[evidence and limitations](docs/validation/2026-09-14-ci-readiness.md) and
+[exact failure manifest](tools/test262-expected-failures.txt).
 
 The [12 September 2026 correctness audit](docs/audits/2026-09-12-correctness.md)
-verified this result against Test262 `defaaf1571`, including staging and excluding
-the separate ECMA-402 suite. It tightened negative-test scoring and fixed 42
+recorded an earlier **95,939 / 95,942** result against corpus `defaaf1571`.
+That older corpus has a different execution count. The audit tightened negative-test scoring and fixed 42
 executions previously counted as passes despite reporting the wrong error type.
 The runner's `--expected-failures` option now rejects unexpected failures, stale
 expectations and skips; `--json` records the engine and corpus identities.

@@ -1,5 +1,15 @@
 # Zipp performance handoff
 
+### 14 September: Test262 baseline follow-up
+
+The latest completed Test262 run at `0a5c1e2e` is 95,669 PASS / 11 FAIL / 0 SKIP,
+not 100% conformance. Eight failures are pinned harness conflicts, one has an
+obsolete Annex B assertion, and two expose the documented German-locale gap.
+Investigating the Annex B failure uncovered a separate block-binding bug; the
+follow-up fixes declaration timing and sloppy arrow var setup, with parameter
+shadowing covered independently. README counts and baseline explanations now
+match the actual hosted evidence. See the CI repair note below for details.
+
 ### 14 September: broader CI repair candidate
 
 See [the CI repair evidence](docs/validation/2026-09-14-ci-readiness.md).

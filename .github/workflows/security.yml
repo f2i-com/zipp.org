@@ -145,7 +145,8 @@ jobs:
             --test audit_20260912_strict_tonumber_bigint \
             --test audit_20260912_typedarray_species \
             --test audit_20260912_weak_gc \
-            --test class_body_bindings --test global_fingerprint
+            --test class_body_bindings --test annexb_arguments_bindings
+            --test intl_locale_fallback --test global_fingerprint
 
   native-sandbox:
     name: Isolated native sandbox

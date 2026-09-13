@@ -601,11 +601,16 @@ impl Compiler {
             // must NOT touch (B.3.3 skip). Existing FUNCTION names are blockers (no
             // NEW b33 var) but are NOT protected — a block function updates them.
             let mut protect = std::collections::HashSet::new();
-            for p in params {
+            let mut parameter_bindings = fc.param_names.clone();
+            if let Some(pa) = params_ast {
+                parameter_bindings.extend(param_pattern_leaves(pa));
+            }
+            for p in &parameter_bindings {
                 blockers.insert(p.clone());
                 protect.insert(p.clone());
             }
-            // B.3.3.1 and `arguments`: a BLOCKER but deliberately NOT protected.
+            // B.3.3.1 and `arguments`: retain the block binding and outer sync,
+            // but do not create or initialize a new outer var below.
             // The extension's outer guard is `paramNames does not contain F`, and
             // since ES2018 `paramNames` is never mutated to hold "arguments" — the
             // arguments object is appended to a SEPARATE `paramBindings` list — so
@@ -627,9 +632,6 @@ impl Compiler {
             // `arguments` as a genuine FORMAL PARAMETER is unaffected: the params
             // loop above puts it in both sets, which is correct, because then
             // paramNames really does contain it and the whole extension is skipped.
-            if !is_script {
-                blockers.insert("arguments".to_string());
-            }
             for s in body {
                 match s {
                     ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
@@ -695,6 +697,14 @@ impl Compiler {
                     collect_b33_block_fns(s, false, &blockers, &mut b33);
                 }
                 for name in &b33 {
+                    if name == "arguments" && fc.arguments_reg.is_some() {
+                        // FunctionDeclarationInstantiation already created this
+                        // binding. Keep the arguments object until the block's
+                        // declaration evaluates; b33_names still makes a lexical
+                        // block function and emits its later outer update. An
+                        // arrow has no own arguments object and needs a var.
+                        continue;
+                    }
                     // CreateMutableBinding + InitializeBinding(undefined) at entry.
                     let reg = fc.declare_local(name);
                     if fc.cell_regs.contains(&reg) {
@@ -1531,6 +1541,50 @@ impl Compiler {
                 fc.emit(Instr::Return { src: r });
             }
             ast::ArrowBody::Block(b) => {
+                // Sloppy arrows also run FunctionDeclarationInstantiation's
+                // Annex B pass. In particular, `arguments` here is an own var,
+                // not the enclosing function's implicit arguments object.
+                if !is_strict {
+                    let mut blockers: HashSet<String> = fc.param_names.iter().cloned().collect();
+                    blockers.extend(param_pattern_leaves(&a.params));
+                    for s in &b.stmts {
+                        match s {
+                            ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                                for decl in &d.decls {
+                                    capture::collect_pattern_names(&decl.id, &mut blockers);
+                                }
+                            }
+                            ast::Stmt::ClassDecl(c) => {
+                                if let Some(id) = &c.name {
+                                    blockers.insert(id.to_string());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    fc.protect_names = blockers.clone();
+                    for s in &b.stmts {
+                        if let Some(id) = labelled_fn_decl(s).and_then(|f| f.name.as_ref()) {
+                            blockers.insert(id.to_string());
+                        }
+                    }
+                    let mut b33 = HashSet::new();
+                    for s in &b.stmts {
+                        collect_b33_block_fns(s, false, &blockers, &mut b33);
+                    }
+                    for name in &sorted_name_vec(&b33) {
+                        let reg = fc.declare_local(name);
+                        if fc.cell_regs.contains(&reg) {
+                            let t = fc.temp();
+                            fc.emit(Instr::LoadUndefined { dst: t });
+                            fc.emit(Instr::CellSet { cell: reg, src: t });
+                            fc.dec_next_reg(1);
+                        } else {
+                            fc.emit(Instr::LoadUndefined { dst: reg });
+                        }
+                    }
+                    fc.b33_names = b33;
+                }
                 // hoist nested function declarations (same as a normal body)
                 for s in &b.stmts {
                     if let ast::Stmt::FnDecl(f) = s {
