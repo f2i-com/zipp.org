@@ -122,6 +122,11 @@ function run(m) {
 }
 
 function frame(m) {
+  // The engine's instruction budget is a lifetime total; renewing it before
+  // each frame makes it a per-frame bound instead, so an animation runs for
+  // as long as the page keeps calling it while one frame still cannot spin
+  // forever (the page's deadline covers the rest).
+  engine.renewInstructionBudget();
   setInput(m.input);
   for (const event of m.events) {
     if (event.type === "click" && hooks.on_click) call("on_click", [event.x, event.y]);

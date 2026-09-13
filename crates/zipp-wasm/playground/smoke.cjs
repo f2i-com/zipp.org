@@ -160,6 +160,14 @@ async function main() {
       return n;
     });
     ok("the ant painted cells after space started it", dark > 200, `dark pixels: ${dark}`);
+    // A long run: the budget is renewed per frame, so thousands of steps
+    // (each frame redraws the whole 100x100 grid) must not exhaust it.
+    await page.keyboard.press("ArrowUp"); await page.keyboard.press("ArrowUp"); await page.keyboard.press("ArrowUp");
+    await page.waitForTimeout(6000);
+    const consoleAfter = await consoleText();
+    ok("a long ant run stays within the per-frame budget", !/instruction budget|resource limit|disposed/.test(consoleAfter), consoleAfter.split("\n").slice(-2).join(" | "));
+    const stats = await page.evaluate(() => document.querySelector("#frame-stats").textContent);
+    ok("frames kept advancing during the long run", /frame (\d+)/.test(stats) && Number(stats.match(/frame (\d+)/)[1]) > 60, stats);
     await page.locator("#stop").click();
 
     // ---- hello samples: no hooks, just output and a static drawing --------------

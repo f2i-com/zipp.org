@@ -83,8 +83,10 @@ A program that defines neither `draw` nor `update` just runs its top level:
   Chrome or Edge through Playwright (`npm install --no-save playwright`, then
   `node playground/smoke.cjs`; set `PLAYWRIGHT_CHANNEL=msedge` for Edge).
 
-Limits are the engine's: a 2,000,000,000-instruction lifetime budget per
-run (the maximum the engine allows), the engine's heap and output ceilings,
+Limits are the engine's: a 2,000,000,000-instruction budget (the maximum
+the engine allows) for the program's top level and then for each frame,
+renewed by the worker before every frame so a long-running animation is
+bounded per frame rather than in total, the engine's heap and output ceilings,
 and the Python frontend's compile-time caps. The Python side is Zipp's own
 Python 3 implementation described in `docs/PYTHON_FRONTEND_EXPERIMENT.md`
 (classes, exceptions, generators, the builtin types and a set of standard
