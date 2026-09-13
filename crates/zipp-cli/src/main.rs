@@ -3,7 +3,7 @@
 //! Usage:
 //!   zipp js  <file.js>            run a script
 //!   zipp mjs <file.mjs> [harness] run a file as an ES module
-//!   zipp py  <file.py>            run a Python-subset program (see docs/PYTHON_FRONTEND_EXPERIMENT.md)
+//!   zipp py  <file.py>            run a Python program (see docs/PYTHON_FRONTEND_EXPERIMENT.md)
 //!   zipp run [--lang=L] <file>    run, selecting the frontend by flag, extension or shebang
 
 use std::process::ExitCode;
@@ -524,7 +524,7 @@ fn run(args: &[String]) -> Result<(), String> {
                 "  zipp sandbox [limits] <file.js> run an untrusted classic script with limits"
             );
             println!("  zipp mjs <file.mjs>             run a file as an ES module");
-            println!("  zipp py  <file.py>              run a Python-subset program (experimental)");
+            println!("  zipp py  <file.py>              run a Python program (--bc prints the bytecode)");
             println!("  zipp run [--lang=L] <file>      run; L = javascript|python, else by extension/shebang");
             println!("  zipp bc  <file.js> [--module]   compile only, print the bytecode");
             println!("  zipp bcdiff <path>...           compile a corpus twice, diff the result");

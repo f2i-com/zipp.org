@@ -64,7 +64,13 @@ pub(super) struct Emitter<'a> {
     /// Cell object registers by name (both own cells and captured free cells).
     pub cells: BTreeMap<String, Reg>,
     /// Locals known to be bound on every path reaching the current point.
+    /// Blocks save and restore it, so a binding made inside a branch, loop
+    /// body or handler is definite only until that block ends.
     pub definite: BTreeSet<String>,
+    /// Non-zero while compiling an operand that may not be evaluated (the
+    /// right side of `and`/`or`, a conditional expression's arms): a walrus
+    /// there must not count as a definite binding.
+    pub speculative: usize,
     pub control_depth: usize,
     pub loops: Vec<LoopCtx>,
     pub handler_depth: usize,
@@ -113,6 +119,7 @@ impl<'a> Emitter<'a> {
             locals: BTreeMap::new(),
             cells: BTreeMap::new(),
             definite: BTreeSet::new(),
+            speculative: 0,
             control_depth: 0,
             loops: Vec::new(),
             handler_depth: 0,
@@ -438,32 +445,153 @@ impl<'a> Emitter<'a> {
         })?;
         Ok(dst)
     }
-    /// Call a Python callable through a prepared `{code, self, args}` record:
-    /// a direct VM call, so the callee's frame lives on the explicit frame
-    /// stack rather than recursing natively.
-    pub fn call_prepared(&mut self, prepared: Reg) -> R<Reg> {
-        let code = self.prop(prepared, "code")?;
-        let this_v = self.prop(prepared, "self")?;
-        let args = self.prop(prepared, "args")?;
+    /// A function or module body under a catch-all handler that records
+    /// this frame (file, line, name) on any exception passing through, then
+    /// rethrows: the traceback CPython prints, at the cost of one handler
+    /// push per call. The line register starts at the definition line so a
+    /// failure before the first statement (an argument-count error) still
+    /// names the frame.
+    pub fn frame_guard(
+        &mut self,
+        line: i32,
+        body: impl FnOnce(&mut Emitter<'a>) -> R<()>,
+    ) -> R<()> {
+        self.emit(Instr::LoadInt {
+            dst: self.r_line,
+            val: self.unit.module_index as i32 * 1_000_000 + line,
+        })?;
+        let ereg = self.alloc()?;
+        let push = self.emit(Instr::PushHandler {
+            catch_target: 0,
+            catch_reg: ereg,
+        })?;
+        self.handler_depth += 1;
+        body(self)?;
+        self.handler_depth -= 1;
+        let here = self.here();
+        self.patch(push, here)?;
+        self.forget_line();
+        let exc = self.helper("addframe", &[ereg, REG_FUNC, self.r_line])?;
+        self.emit(Instr::Throw { src: exc })?;
+        Ok(())
+    }
+    /// `call(f, args, kwargs)` through the runtime (one helper frame around
+    /// the callee's own).
+    pub fn call_value(&mut self, f: Reg, args: Reg, kwargs: Reg) -> R<Reg> {
+        self.helper("callv", &[f, args, kwargs])
+    }
+    /// A call with positional arguments only. Callables that need no
+    /// argument shuffling carry a `fast` entry point (plain functions with
+    /// only positional parameters, fixed-arity builtins, classes) which is
+    /// called directly; the callee validates the count. Anything else goes
+    /// through `bind`.
+    pub fn call_positional(&mut self, f: Reg, args: Reg) -> R<Reg> {
+        let none = self.none()?;
+        let not_none = self.alloc()?;
+        self.emit(Instr::Ne {
+            dst: not_none,
+            a: f,
+            b: none,
+        })?;
+        let slow_none = self.jump_if_false(not_none)?;
+        let fast = self.prop(f, "fast")?;
+        let is_fn = self.typeof_is(fast, "function")?;
+        let slow = self.jump_if_false(is_fn)?;
         let (arg_base, argc) = self.arguments(&[args])?;
         let dst = self.alloc()?;
         self.emit(Instr::CallWithThis {
             dst,
-            callee: code,
-            this_v,
+            callee: fast,
+            this_v: f,
             arg_base,
             argc,
             name: NO_NAME,
         })?;
+        let end = self.jump()?;
+        let here = self.here();
+        self.patch(slow_none, here)?;
+        self.patch(slow, here)?;
+        let result = self.call_value(f, args, none)?;
+        self.emit(Instr::Move { dst, src: result })?;
+        let here = self.here();
+        self.patch(end, here)?;
         Ok(dst)
     }
-    /// `bind(f, args, kwargs)` then call.
-    pub fn call_value(&mut self, f: Reg, args: Reg, kwargs: Reg) -> R<Reg> {
-        let prepared = self.helper("bind", &[f, args, kwargs])?;
-        self.call_prepared(prepared)
+    /// The callee side of the direct call path: a function whose parameters
+    /// are all plain positionals checks the argument count itself (the
+    /// `bind` path also checks, so both entry points agree). Generators keep
+    /// the checked entry only, so the error is raised at the call.
+    pub fn arity_guard(&mut self, count: usize) -> R<()> {
+        if self.proto.is_generator {
+            return Ok(());
+        }
+        let len = self.prop(REG_ARGS, "length")?;
+        let expected = self.small_int(count as i32)?;
+        let ok = self.alloc()?;
+        self.emit(Instr::Eq {
+            dst: ok,
+            a: len,
+            b: expected,
+        })?;
+        let skip = self.jump_if_true(ok)?;
+        self.helper("arity", &[REG_FUNC, REG_ARGS])?;
+        let here = self.here();
+        self.patch(skip, here)?;
+        Ok(())
     }
+    /// Only plain positional parameters: no defaults, `*args`, `**kwargs`
+    /// or keyword-only names. Returns the parameter count.
+    pub fn simple_arity(args: &ast::Arguments) -> Option<usize> {
+        let plain = args.posonlyargs.iter().chain(&args.args);
+        if args.vararg.is_some()
+            || args.kwarg.is_some()
+            || !args.kwonlyargs.is_empty()
+            || plain.clone().any(|a| a.default.is_some())
+        {
+            return None;
+        }
+        Some(plain.count())
+    }
+    /// `dst = typeof value === <name>` as one fused instruction.
+    pub fn typeof_is(&mut self, value: Reg, name: &str) -> R<Reg> {
+        let code = crate::bytecode::TYPEOF_NAMES
+            .iter()
+            .position(|n| *n == name)
+            .map(|i| i as u8)
+            .unwrap_or(255);
+        let dst = self.alloc()?;
+        self.emit(Instr::TypeOfIs {
+            dst,
+            a: value,
+            code,
+            neg: false,
+        })?;
+        Ok(dst)
+    }
+    /// Python truth of `value`: a JS boolean is its own truth (the common
+    /// result of a comparison); anything else asks the runtime.
     pub fn truth(&mut self, value: Reg) -> R<Reg> {
-        self.helper("truth", &[value])
+        let dst = self.alloc()?;
+        let is_bool = self.typeof_is(value, "boolean")?;
+        let slow = self.jump_if_false(is_bool)?;
+        self.emit(Instr::Move { dst, src: value })?;
+        let end = self.jump()?;
+        let here = self.here();
+        self.patch(slow, here)?;
+        let r = self.helper("truth", &[value])?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let here = self.here();
+        self.patch(end, here)?;
+        Ok(dst)
+    }
+    /// Both operands are BigInts (Python ints): jump to the returned label
+    /// otherwise. The caller patches it to the slow path.
+    pub fn both_ints(&mut self, a: Reg, b: Reg) -> R<Vec<usize>> {
+        let ta = self.typeof_is(a, "bigint")?;
+        let j1 = self.jump_if_false(ta)?;
+        let tb = self.typeof_is(b, "bigint")?;
+        let j2 = self.jump_if_false(tb)?;
+        Ok(vec![j1, j2])
     }
     pub fn cell_get(&mut self, cell: Reg) -> R<Reg> {
         self.prop(cell, "v")
@@ -496,6 +624,11 @@ impl<'a> Emitter<'a> {
         self.patch(skip, end)?;
         Ok(())
     }
+    /// Whether a read of `name` here can skip the unbound check: bound on
+    /// every path to this point and never the target of a `del`.
+    fn is_definite(&self, name: &str) -> bool {
+        self.definite.contains(name) && !self.scope().deleted.contains(name)
+    }
     pub fn load_name(&mut self, name: &str) -> R<Reg> {
         match self.sym_kind(name) {
             SymKind::Local => {
@@ -503,7 +636,7 @@ impl<'a> Emitter<'a> {
                     .locals
                     .get(name)
                     .ok_or_else(|| format!("Python emitter: unreserved local {name}"))?;
-                if !self.definite.contains(name) {
+                if !self.is_definite(name) {
                     self.check_bound(reg, name)?;
                 }
                 Ok(reg)
@@ -511,7 +644,7 @@ impl<'a> Emitter<'a> {
             SymKind::Cell | SymKind::Free => {
                 let cell = self.cell_reg(name)?;
                 let value = self.cell_get(cell)?;
-                if !self.definite.contains(name) {
+                if !self.is_definite(name) {
                     self.check_bound(value, name)?;
                 }
                 Ok(value)
@@ -543,14 +676,14 @@ impl<'a> Emitter<'a> {
                     .get(name)
                     .ok_or_else(|| format!("Python emitter: unreserved local {name}"))?;
                 self.emit(Instr::Move { dst, src: value })?;
-                if self.control_depth == 0 {
+                if self.speculative == 0 {
                     self.definite.insert(name.to_owned());
                 }
             }
             SymKind::Cell | SymKind::Free => {
                 let cell = self.cell_reg(name)?;
                 self.cell_set(cell, value)?;
-                if self.control_depth == 0 {
+                if self.speculative == 0 {
                     self.definite.insert(name.to_owned());
                 }
             }

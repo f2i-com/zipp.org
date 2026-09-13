@@ -84,7 +84,15 @@
     B.set("object", ObjectType); B.set("type", TypeType);
     for (const name of ["int", "float", "str", "bool", "list", "tuple", "dict", "set", "frozenset", "range", "bytes", "slice", "property", "staticmethod", "classmethod", "super", "enumerate", "zip", "map", "filter", "reversed"]) B.set(name, T[name]);
     B.set("NotImplemented", NOTIMPL); B.set("Ellipsis", rt.ELLIPSIS); B.set("None", null); B.set("True", true); B.set("False", false);
-    method(TypeType, "__call__", -1, function (args) { return rt.construct(args[0], args.slice(1), null); });
+    methodkw(TypeType, "__call__", function (args) { const kw = args[args.length - 1] instanceof Map ? args.pop() : null; return rt.constructDefault(args[0], args.slice(1), kw); });
+    methodkw(TypeType, "__new__", function (args) {
+        const kw = args[args.length - 1] instanceof Map ? args.pop() : null;
+        if (args.length === 2 && (kw === null || kw.size === 0)) return rt.typeOf(args[1]);
+        if (args.length !== 4) fail(E.TypeError, "type.__new__() takes exactly 3 arguments (" + (args.length - 1) + " given)");
+        return rt.makeClass(args[0], args[1], args[2], args[3], kw);
+    });
+    methodkw(TypeType, "__init__", function () { return null; });
+    method(TypeType, "__prepare__", -1, function () { return dict(); });
     method(TypeType, "__repr__", 1, function (args) { return repr(args[0]); });
     method(TypeType, "mro", 1, function (args) { return list(args[0].mro.slice()); });
     method(TypeType, "__subclasses__", 1, function () { return list([]); });
@@ -168,6 +176,23 @@
     method(T.int, "__index__", 1, (a) => asInt(a[0]));
     method(T.int, "__int__", 1, (a) => asInt(a[0]));
     method(T.int, "__float__", 1, (a) => Number(asInt(a[0])));
+    for (const [t, base] of [[T.int, true], [T.float, false]]) {
+        for (const [name, op] of [["add", "add"], ["sub", "sub"], ["mul", "mul"], ["truediv", "truediv"], ["floordiv", "floordiv"], ["mod", "mod"], ["pow", "pow"], ["and", "and"], ["or", "or"], ["xor", "xor"], ["lshift", "lshift"], ["rshift", "rshift"]]) {
+            if (!base && ["and", "or", "xor", "lshift", "rshift"].includes(op)) continue;
+            method(t, "__" + name + "__", 2, (a) => isNum(a[1]) ? R.binop(op, a[0], a[1]) : NOTIMPL);
+            method(t, "__r" + name + "__", 2, (a) => isNum(a[1]) ? R.binop(op, a[1], a[0]) : NOTIMPL);
+        }
+        method(t, "__neg__", 1, (a) => R.unop("neg", a[0]));
+        method(t, "__pos__", 1, (a) => a[0]);
+        method(t, "__abs__", 1, (a) => { const v = a[0]; return isInt(v) ? (asInt(v) < 0n ? -asInt(v) : asInt(v)) : Math.abs(v); });
+        method(t, "__bool__", 1, (a) => rt.truth(a[0]));
+        for (const [name, op] of [["__eq__", "eq"], ["__ne__", "ne"], ["__lt__", "lt"], ["__le__", "le"], ["__gt__", "gt"], ["__ge__", "ge"]]) method(t, name, 2, (a) => isNum(a[1]) ? rt.cmp(op, a[0], a[1]) : NOTIMPL);
+        method(t, "__str__", 1, (a) => str(a[0]));
+    }
+    method(T.int, "__invert__", 1, (a) => R.unop("invert", a[0]));
+    method(T.int, "bit_count", 1, (a) => { let n = asInt(a[0]); if (n < 0n) n = -n; let c = 0n; while (n) { c += n & 1n; n >>= 1n; } return c; });
+    method(T.int, "as_integer_ratio", 1, (a) => tuple([asInt(a[0]), 1n]));
+    method(T.int, "is_integer", 1, () => true);
     method(T.int, "bit_length", 1, (a) => { const v = asInt(a[0]); return BigInt((v < 0n ? -v : v).toString(2).replace("0", v === 0n ? "" : "0").length); });
     T.int.dict.set("bit_length", builtin("bit_length", 1, (a) => { const v = asInt(a[0]); return v === 0n ? 0n : BigInt((v < 0n ? -v : v).toString(2).length); }));
     method(T.int, "conjugate", 1, (a) => asInt(a[0]));
@@ -195,7 +220,8 @@
     method(T.float, "__float__", 1, (a) => a[0]);
     method(T.float, "__repr__", 1, (a) => rt.floatRepr(a[0]));
     method(T.float, "__round__", -1, (a) => R.bind ? roundValue(a[0], a[1]) : null);
-    method(T.float, "hex", 1, (a) => a[0].toString(16));
+    method(T.float, "hex", 1, (a) => rt.floatHex(a[0]));
+    T.float.dict.set("fromhex", { cls: T.classmethod, func: builtin("fromhex", 2, (a) => rt.floatFromHex(needStr(a[1]))) });
     method(T.float, "conjugate", 1, (a) => a[0]);
     method(T.float, "as_integer_ratio", 1, (a) => {
         let x = a[0]; if (!Number.isFinite(x)) fail(E.ValueError, "cannot convert to integer ratio");
@@ -341,7 +367,7 @@
     method(S, "rfind", 4, (a) => findImpl(a, true, false), 2);
     method(S, "index", 4, (a) => findImpl(a, false, true), 2);
     method(S, "rindex", 4, (a) => findImpl(a, true, true), 2);
-    method(S, "count", 4, (a) => { const s = strSelf(a), sub = needStr(a[1]); if (sub === "") return BigInt(codepoints(s).length + 1); return BigInt(s.split(sub).length - 1); }, 2);
+    method(S, "count", 4, (a) => { const s = strSelf(a), sub = needStr(a[1]); if (sub === "") return BigInt(rt.strLen(s) + 1); return BigInt(s.split(sub).length - 1); }, 2);
     function affix(a, end) {
         const s = strSelf(a); const p = a[1];
         const test = (x) => end ? s.endsWith(needStr(x)) : s.startsWith(needStr(x));
@@ -351,21 +377,21 @@
     method(S, "startswith", 4, (a) => affix(a, false), 2);
     method(S, "endswith", 4, (a) => affix(a, true), 2);
     method(S, "isdigit", 1, (a) => /^[0-9٠-٩۰-۹]+$/.test(strSelf(a)));
-    method(S, "isdecimal", 1, (a) => /^[0-9]+$/.test(strSelf(a)));
-    method(S, "isnumeric", 1, (a) => /^[0-9]+$/.test(strSelf(a)));
+    method(S, "isdecimal", 1, (a) => /^\p{Nd}+$/u.test(strSelf(a)));
+    method(S, "isnumeric", 1, (a) => /^[\p{Nd}\p{Nl}\p{No}]+$/u.test(strSelf(a)));
     method(S, "isalpha", 1, (a) => /^[\p{L}]+$/u.test(strSelf(a)));
     method(S, "isalnum", 1, (a) => /^[\p{L}\p{N}]+$/u.test(strSelf(a)));
     method(S, "isspace", 1, (a) => /^\s+$/.test(strSelf(a)));
     method(S, "isupper", 1, (a) => { const s = strSelf(a); return /[A-Za-z]/.test(s) && s === s.toUpperCase(); });
     method(S, "islower", 1, (a) => { const s = strSelf(a); return /[A-Za-z]/.test(s) && s === s.toLowerCase(); });
     method(S, "istitle", 1, (a) => { const s = strSelf(a); return /[A-Za-z]/.test(s) && s === s.replace(/[A-Za-z]+/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase()); });
-    method(S, "isidentifier", 1, (a) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(strSelf(a)));
-    method(S, "isascii", 1, (a) => /^[\x00-\x7f]*$/.test(strSelf(a)));
+    method(S, "isidentifier", 1, (a) => /^[\p{L}\p{Nl}_][\p{L}\p{Nl}\p{Mn}\p{Mc}\p{Nd}\p{Pc}_]*$/u.test(strSelf(a)));
+    method(S, "isascii", 1, (a) => { const s = strSelf(a); for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) > 0x7f) return false; return true; });
     method(S, "isprintable", 1, (a) => !/[\x00-\x1f\x7f]/.test(strSelf(a)));
     function pad(a, mode) {
         const s = strSelf(a); const width = Number(needInt(a[1])); const fill = a[2] === undefined ? " " : needStr(a[2]);
         if (codepoints(fill).length !== 1) fail(E.TypeError, "The fill character must be exactly one character long");
-        const n = codepoints(s).length; if (width <= n) return s;
+        const n = rt.strLen(s); if (width <= n) return s;
         const total = width - n;
         if (mode < 0) return s + fill.repeat(total);
         if (mode > 0) return fill.repeat(total) + s;
@@ -378,7 +404,7 @@
     method(S, "zfill", 2, (a) => { const s = strSelf(a); const width = Number(needInt(a[1])); if (s.length >= width) return s; const sign = s[0] === "-" || s[0] === "+" ? s[0] : ""; return sign + "0".repeat(width - s.length) + s.slice(sign.length); });
     method(S, "partition", 2, (a) => { const s = strSelf(a), sep = needStr(a[1]); const i = s.indexOf(sep); return i < 0 ? tuple([s, "", ""]) : tuple([s.slice(0, i), sep, s.slice(i + sep.length)]); });
     method(S, "rpartition", 2, (a) => { const s = strSelf(a), sep = needStr(a[1]); const i = s.lastIndexOf(sep); return i < 0 ? tuple(["", "", s]) : tuple([s.slice(0, i), sep, s.slice(i + sep.length)]); });
-    method(S, "encode", -1, (a) => { kwOf(a, ["encoding", "errors"]); return rt.encodeStr(strSelf(a), a[1] === undefined ? "utf-8" : a[1]); });
+    method(S, "encode", -1, (a) => { const kw = kwOf(a, ["encoding", "errors"]); return rt.encodeStr(strSelf(a), a[1] === undefined ? kwget(kw, "encoding", "utf-8") : a[1], a[2] === undefined ? kwget(kw, "errors", "strict") : a[2]); });
     method(S, "format", -1, (a) => { const kw = kwOf(a, null) === null ? null : null; return rt.strFormat(strSelf(a), a.slice(1), a.kwmap || null); });
     S.dict.get("format").kwnames = true;
     S.dict.set("format", builtin("format", -1, (a) => { const last = a[a.length - 1]; let kw = null; if (last instanceof Map) { kw = last; a.pop(); } return rt.strFormat(strSelf(a), a.slice(1), kw); }));
@@ -397,10 +423,62 @@
         return d;
     }, 1) });
     method(S, "translate", 2, (a) => { const table = a[1]; let out = ""; for (const ch of codepoints(strSelf(a))) { const cp = BigInt(ch.codePointAt(0)); let v; try { v = getitem(table, cp); } catch (e) { if (e && (e.cls === E.LookupError || isInstance(e, E.LookupError))) { out += ch; continue; } throw e; } if (v === null) continue; out += isInt(v) ? String.fromCodePoint(Number(asInt(v))) : str(v); } return out; });
-    rt.encodeStr = function (s, encoding) {
+    // float.hex(): sign, 0x, 13 hex digits of mantissa, p, decimal exponent.
+    rt.floatHex = function (x) {
+        if (Number.isNaN(x)) return "nan";
+        if (x === Infinity) return "inf";
+        if (x === -Infinity) return "-inf";
+        const sign = x < 0 || Object.is(x, -0) ? "-" : "";
+        x = Math.abs(x);
+        if (x === 0) return sign + "0x0.0p+0";
+        let e = Math.floor(Math.log2(x));
+        let m = x / Math.pow(2, e);
+        if (m >= 2) { m /= 2; e++; } else if (m < 1) { m *= 2; e--; }
+        // Subnormals keep the minimum exponent with a leading 0 digit.
+        let lead = "1";
+        if (e < -1022) { m = x / Math.pow(2, -1022); e = -1022; lead = "0"; }
+        let frac = m - Number(lead);
+        let digits = "";
+        for (let i = 0; i < 13; i++) { frac *= 16; const d = Math.floor(frac); digits += d.toString(16); frac -= d; }
+        return sign + "0x" + lead + "." + digits + "p" + (e < 0 ? "-" : "+") + Math.abs(e);
+    };
+    rt.floatFromHex = function (s) {
+        const t = s.trim().toLowerCase();
+        if (t === "inf" || t === "+inf" || t === "infinity") return Infinity;
+        if (t === "-inf" || t === "-infinity") return -Infinity;
+        if (t === "nan" || t === "+nan" || t === "-nan") return NaN;
+        const m = /^([+-])?(?:0x)?([0-9a-f]*)(?:\.([0-9a-f]*))?(?:p([+-]?\d+))?$/.exec(t);
+        if (m === null || (m[2] === "" && (m[3] === undefined || m[3] === ""))) fail(E.ValueError, "invalid hexadecimal floating-point string");
+        let v = 0;
+        for (const c of m[2]) v = v * 16 + parseInt(c, 16);
+        let scale = 1 / 16;
+        for (const c of m[3] || "") { v += parseInt(c, 16) * scale; scale /= 16; }
+        const r = v * Math.pow(2, m[4] === undefined ? 0 : parseInt(m[4], 10));
+        if (!Number.isFinite(r)) fail(E.OverflowError, "hexadecimal value too large to represent as a float");
+        return m[1] === "-" ? -r : r;
+    };
+    rt.encodeStr = function (s, encoding, errors) {
         const enc = String(encoding).toLowerCase().replace("-", "");
         const out = [];
-        if (enc === "ascii" || enc === "latin1" || enc === "latin_1" || enc === "iso88591") { for (const ch of s) { const cp = ch.codePointAt(0); if (cp > (enc === "ascii" ? 127 : 255)) fail(E.UnicodeEncodeError, "'" + encoding + "' codec can't encode character " + rt.quoteStr(ch)); out.push(cp); } return rt.bytes(out); }
+        if (enc === "ascii" || enc === "latin1" || enc === "latin_1" || enc === "iso88591") {
+            const limit = enc === "ascii" ? 127 : 255;
+            let pos = 0;
+            for (const ch of s) {
+                const cp = ch.codePointAt(0);
+                if (cp > limit) {
+                    switch (errors === undefined ? "strict" : errors) {
+                        case "ignore": break;
+                        case "replace": out.push(63); break;
+                        case "backslashreplace": for (const c of (cp > 0xffff ? "\\U" + cp.toString(16).padStart(8, "0") : cp > 0xff ? "\\u" + cp.toString(16).padStart(4, "0") : "\\x" + cp.toString(16).padStart(2, "0"))) out.push(c.charCodeAt(0)); break;
+                        case "xmlcharrefreplace": for (const c of "&#" + cp + ";") out.push(c.charCodeAt(0)); break;
+                        default: fail(E.UnicodeEncodeError, "'" + encoding + "' codec can't encode character " + rt.quoteStr(ch) + " in position " + pos + ": ordinal not in range(" + (limit + 1) + ")");
+                    }
+                }
+                else out.push(cp);
+                pos++;
+            }
+            return rt.bytes(out);
+        }
         for (const ch of s) { let cp = ch.codePointAt(0); if (cp < 0x80) out.push(cp); else if (cp < 0x800) out.push(0xC0 | (cp >> 6), 0x80 | (cp & 63)); else if (cp < 0x10000) out.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63)); else out.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 63), 0x80 | ((cp >> 6) & 63), 0x80 | (cp & 63)); }
         return rt.bytes(out);
     };
@@ -438,7 +516,38 @@
     method(T.bytes, "decode", -1, (a) => { kwOf(a, ["encoding", "errors"]); return rt.decodeBytes(a[0], a[1] === undefined ? "utf-8" : a[1]); });
     method(T.bytes, "__len__", 1, (a) => BigInt(a[0].items.length));
     method(T.bytes, "hex", 1, (a) => a[0].items.map((c) => c.toString(16).padStart(2, "0")).join(""));
+    // Byte strings borrow the str algorithms through a Latin-1 view.
+    const b2s = (b) => { let s = ""; for (const c of b.items) s += String.fromCharCode(c); return s; };
+    const s2b = (s) => { const out = []; for (let i = 0; i < s.length; i++) out.push(s.charCodeAt(i) & 255); return rt.bytes(out); };
+    const bArg = (v, what) => { if (v !== null && typeof v === "object" && v.cls === T.bytes) return b2s(v); if (isInt(v)) return String.fromCharCode(Number(asInt(v))); fail(E.TypeError, (what || "argument") + " should be integer or bytes-like object, not '" + typeOf(v).name + "'"); };
+    const bIdx = (v) => v === undefined || v === null ? undefined : Number(needInt(v));
+    method(T.bytes, "find", 4, (a) => { const s = b2s(a[0]); const i = s.slice(0, bIdx(a[3])).indexOf(bArg(a[1]), bIdx(a[2])); return BigInt(i); }, 2);
+    method(T.bytes, "rfind", 4, (a) => { const s = b2s(a[0]); const i = s.slice(0, bIdx(a[3])).lastIndexOf(bArg(a[1])); return BigInt(i >= (bIdx(a[2]) || 0) ? i : -1); }, 2);
+    method(T.bytes, "index", 4, (a) => { const i = b2s(a[0]).slice(0, bIdx(a[3])).indexOf(bArg(a[1]), bIdx(a[2])); if (i < 0) fail(E.ValueError, "subsection not found"); return BigInt(i); }, 2);
+    method(T.bytes, "count", 4, (a) => { const s = b2s(a[0]).slice(bIdx(a[2]) || 0, bIdx(a[3])), sub = bArg(a[1]); if (sub === "") return BigInt(s.length + 1); return BigInt(s.split(sub).length - 1); }, 2);
+    method(T.bytes, "startswith", 4, (a) => { const s = b2s(a[0]).slice(bIdx(a[2]) || 0, bIdx(a[3])); const p = a[1]; if (p !== null && typeof p === "object" && p.cls === T.tuple) return p.items.some((x) => s.startsWith(bArg(x))); return s.startsWith(bArg(p)); }, 2);
+    method(T.bytes, "endswith", 4, (a) => { const s = b2s(a[0]).slice(bIdx(a[2]) || 0, bIdx(a[3])); const p = a[1]; if (p !== null && typeof p === "object" && p.cls === T.tuple) return p.items.some((x) => s.endsWith(bArg(x))); return s.endsWith(bArg(p)); }, 2);
+    method(T.bytes, "split", 3, (a) => { const s = b2s(a[0]); const max = a[2] === undefined ? -1 : Number(needInt(a[2])); let parts; if (a[1] === undefined || a[1] === null) { parts = s.split(/[ \t\n\r\x0b\x0c]+/).filter((x) => x !== ""); if (max >= 0 && parts.length > max + 1) { const head = parts.slice(0, max); const rest = s.replace(/^[ \t\n\r\x0b\x0c]+/, ""); let pos = 0; for (let i = 0; i < max; i++) { pos = rest.indexOf(head[i], pos) + head[i].length; } parts = head.concat([rest.slice(pos).replace(/^[ \t\n\r\x0b\x0c]+/, "")]); } } else { const sep = bArg(a[1]); if (sep === "") fail(E.ValueError, "empty separator"); parts = s.split(sep); if (max >= 0 && parts.length > max + 1) parts = parts.slice(0, max).concat([parts.slice(max).join(sep)]); } return list(parts.map(s2b)); }, 1);
+    method(T.bytes, "join", 2, (a) => { const sep = b2s(a[0]); const parts = drain(a[1]).map((x) => { if (x === null || typeof x !== "object" || x.cls !== T.bytes) fail(E.TypeError, "sequence item: expected a bytes-like object, " + typeOf(x).name + " found"); return b2s(x); }); return s2b(parts.join(sep)); });
+    const bStrip = (name, fnc) => method(T.bytes, name, 2, (a) => { const s = b2s(a[0]); const chars = a[1] === undefined || a[1] === null ? " \t\n\r\x0b\x0c" : bArg(a[1]); return s2b(fnc(s, chars)); }, 1);
+    const lstrip = (s, cs) => { let i = 0; while (i < s.length && cs.indexOf(s[i]) >= 0) i++; return s.slice(i); };
+    const rstrip = (s, cs) => { let j = s.length; while (j > 0 && cs.indexOf(s[j - 1]) >= 0) j--; return s.slice(0, j); };
+    bStrip("strip", (s, cs) => rstrip(lstrip(s, cs), cs)); bStrip("lstrip", lstrip); bStrip("rstrip", rstrip);
+    method(T.bytes, "replace", 4, (a) => { const s = b2s(a[0]), old = bArg(a[1]), nw = bArg(a[2]); const max = a[3] === undefined ? -1 : Number(needInt(a[3])); if (max < 0) return s2b(s.split(old).join(nw)); let out = "", rest = s, n = 0; while (n < max) { const i = rest.indexOf(old); if (i < 0) break; out += rest.slice(0, i) + nw; rest = rest.slice(i + old.length); n++; } return s2b(out + rest); }, 3);
+    method(T.bytes, "lower", 1, (a) => s2b(b2s(a[0]).replace(/[A-Z]/g, (c) => c.toLowerCase())));
+    method(T.bytes, "upper", 1, (a) => s2b(b2s(a[0]).replace(/[a-z]/g, (c) => c.toUpperCase())));
+    method(T.bytes, "isdigit", 1, (a) => a[0].items.length > 0 && a[0].items.every((c) => c >= 48 && c <= 57));
+    method(T.bytes, "isalpha", 1, (a) => a[0].items.length > 0 && a[0].items.every((c) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122)));
+    method(T.bytes, "isalnum", 1, (a) => a[0].items.length > 0 && a[0].items.every((c) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)));
+    method(T.bytes, "isspace", 1, (a) => a[0].items.length > 0 && a[0].items.every((c) => c === 32 || (c >= 9 && c <= 13)));
+    method(T.bytes, "isupper", 1, (a) => /[A-Z]/.test(b2s(a[0])) && !/[a-z]/.test(b2s(a[0])));
+    method(T.bytes, "islower", 1, (a) => /[a-z]/.test(b2s(a[0])) && !/[A-Z]/.test(b2s(a[0])));
+    method(T.bytes, "zfill", 2, (a) => s2b(b2s(a[0]).padStart(Number(needInt(a[1])), "0")));
+    method(T.bytes, "partition", 2, (a) => { const s = b2s(a[0]), sep = bArg(a[1]); const i = s.indexOf(sep); return tuple(i < 0 ? [a[0], rt.bytes([]), rt.bytes([])] : [s2b(s.slice(0, i)), s2b(sep), s2b(s.slice(i + sep.length))]); });
+    method(T.bytes, "splitlines", 2, (a) => list(b2s(a[0]).split(/\r\n|\r|\n/).filter((x, i, arr) => !(i === arr.length - 1 && x === "")).map(s2b)), 1);
+    rt.bytesToLatin1 = b2s; rt.latin1ToBytes = s2b;
     method(T.bytes, "__repr__", 1, (a) => rt.bytesRepr(a[0]));
+    T.bytes.dict.set("fromhex", { cls: T.classmethod, func: builtin("fromhex", 2, (a) => { const s = needStr(a[1]).replace(/\s+/g, ""); if (s.length % 2 || /[^0-9a-fA-F]/.test(s)) fail(E.ValueError, "non-hexadecimal number found in fromhex() arg"); const out = []; for (let i = 0; i < s.length; i += 2) out.push(parseInt(s.slice(i, i + 2), 16)); return rt.bytes(out); }) });
 
     // ---- list ---------------------------------------------------------------------------------------------------
     const L = T.list;
@@ -556,9 +665,15 @@
         method(v, "__repr__", 1, (a) => repr(a[0]));
     }
     method(T.dict_keys, "__contains__", 2, (a) => rt.dictHas(a[0].dict, a[1]));
-    method(T.dict_keys, "__sub__", 2, (a) => setFrom(a[0], T.set) && rt.setBinop("sub", setFrom(a[0], T.set), setFrom(a[1], T.set), false));
-    method(T.dict_keys, "__and__", 2, (a) => rt.setBinop("and", setFrom(a[0], T.set), setFrom(a[1], T.set), false));
-    method(T.dict_keys, "__or__", 2, (a) => rt.setBinop("or", setFrom(a[0], T.set), setFrom(a[1], T.set), false));
+    method(T.dict_items, "__contains__", 2, (a) => { const p = a[1]; if (p === null || typeof p !== "object" || p.cls !== T.tuple || p.items.length !== 2) return false; const v = rt.dictGet(a[0].dict, p.items[0]); return v !== undefined && rt.eq(v, p.items[1]); });
+    // Keys and items views behave as sets in the set operators.
+    for (const v of [T.dict_keys, T.dict_items]) {
+        for (const [name, op] of [["__sub__", "sub"], ["__and__", "and"], ["__or__", "or"], ["__xor__", "xor"]]) {
+            method(v, name, 2, (a) => rt.setBinop(op, setFrom(a[0], T.set), setFrom(a[1], T.set), false));
+            method(v, "__r" + name.slice(2), 2, (a) => rt.setBinop(op, setFrom(a[1], T.set), setFrom(a[0], T.set), false));
+        }
+        method(v, "isdisjoint", 2, (a) => rt.setBinop("and", setFrom(a[0], T.set), setFrom(a[1], T.set), false).size === 0);
+    }
     D.dict.set("fromkeys", { cls: T.classmethod, func: builtin("fromkeys", 3, (a) => { const d = rt.construct(a[0], [], null); const v = a[2] === undefined ? null : a[2]; for (const k of drain(a[1])) dictSet(d, k, v); return d; }, 2) });
 
     // ---- set / frozenset -------------------------------------------------------------------------------------------------
@@ -644,6 +759,8 @@
         const v = args[0];
         if (v !== null && typeof v === "object" && (v.cls === T.list || v.cls === T.tuple)) { let i = v.items.length; return { cls: T.reversed, next: () => i > 0 ? v.items[--i] : STOP }; }
         if (typeof v === "string") { const cps = codepoints(v); let i = cps.length; return { cls: T.reversed, next: () => i > 0 ? cps[--i] : STOP }; }
+        if (v !== null && typeof v === "object" && v.map !== undefined && isInstance(v, T.dict)) { const ks = rt.dictEntryList(v).map((e) => e[0]); let i = ks.length; return { cls: T.reversed, next: () => i > 0 ? ks[--i] : STOP }; }
+        if (v !== null && typeof v === "object" && (v.cls === T.dict_keys || v.cls === T.dict_values || v.cls === T.dict_items)) { const xs = drain(v); let i = xs.length; return { cls: T.reversed, next: () => i > 0 ? xs[--i] : STOP }; }
         const m = typeMethod(v, "__reversed__");
         if (m !== undefined) return call(descrGet(m, v, typeOf(v)), [], null);
         if (typeMethod(v, "__len__") !== undefined && typeMethod(v, "__getitem__") !== undefined) { let i = len(v); return { cls: T.reversed, next: () => i > 0n ? getitem(v, --i) : STOP }; }
@@ -675,6 +792,7 @@
     rt.flushOut = function () { if (outBuf.length) { console.log(outBuf); outBuf = ""; } if (errBuf.length) { console.error(errBuf); errBuf = ""; } };
     def("len", 1, (a) => len(a[0]));
     def("repr", 1, (a) => repr(a[0]));
+    rt.ascii = (v) => repr(v).replace(/[^\x00-\x7f]/g, (c) => { const cp = c.codePointAt(0); return cp < 0x100 ? "\\x" + cp.toString(16).padStart(2, "0") : cp < 0x10000 ? "\\u" + cp.toString(16).padStart(4, "0") : "\\U" + cp.toString(16).padStart(8, "0"); });
     def("ascii", 1, (a) => repr(a[0]).replace(/[^\x00-\x7f]/g, (c) => { const cp = c.codePointAt(0); return cp < 0x100 ? "\\x" + cp.toString(16).padStart(2, "0") : cp < 0x10000 ? "\\u" + cp.toString(16).padStart(4, "0") : "\\U" + cp.toString(16).padStart(8, "0"); }));
     def("abs", 1, (a) => { const v = a[0]; if (isInt(v)) { const i = asInt(v); return i < 0n ? -i : i; } if (typeof v === "number") return Math.abs(v); const r = callMethod(v, "__abs__", []); if (r !== undefined) return r; fail(E.TypeError, "bad operand type for abs(): '" + typeOf(v).name + "'"); });
     defkw("min", (a) => minmax(a, "lt", "min"));
@@ -689,7 +807,29 @@
         for (let i = 1; i < items.length; i++) { const k = key === null ? items[i] : call(key, [items[i]], null); if (cmp(op, k, bestKey)) { best = items[i]; bestKey = k; } }
         return best;
     }
-    defkw("sum", (a) => { const kw = kwOf(a, ["start"]); let acc = a[1] !== undefined ? a[1] : kwget(kw, "start", 0n); if (typeof acc === "string") fail(E.TypeError, "sum() can't sum strings [use ''.join(seq) instead]"); const it = iter(a[0]); for (;;) { const v = fornext(it); if (v === STOP) break; acc = R.binop("add", acc, v); } return acc; });
+    defkw("sum", (a) => {
+        const kw = kwOf(a, ["start"]); let acc = a[1] !== undefined ? a[1] : kwget(kw, "start", 0n);
+        if (typeof acc === "string") fail(E.TypeError, "sum() can't sum strings [use ''.join(seq) instead]");
+        const it = iter(a[0]);
+        // Floats add with Neumaier compensation, as CPython's sum() does.
+        let fsum = 0, comp = 0, floating = false;
+        for (;;) {
+            const v = fornext(it); if (v === STOP) break;
+            if (typeof v === "number" && (floating || isInt(acc) || typeof acc === "number")) {
+                if (!floating) { fsum = toFloat(acc); comp = 0; floating = true; }
+                const t = fsum + v;
+                comp += Math.abs(fsum) >= Math.abs(v) ? (fsum - t) + v : (v - t) + fsum;
+                fsum = t;
+                continue;
+            }
+            if (floating) {
+                if (isInt(v)) { const t = fsum + Number(asInt(v)); comp += Math.abs(fsum) >= Math.abs(t - fsum) ? (fsum - t) + Number(asInt(v)) : (Number(asInt(v)) - t) + fsum; fsum = t; continue; }
+                acc = fsum + comp; floating = false;
+            }
+            acc = R.binop("add", acc, v);
+        }
+        return floating ? fsum + comp : acc;
+    });
     defkw("sorted", (a) => { const kw = kwOf(a, ["key", "reverse"]); return list(rt.sortItems(drain(a[0]), kwget(kw, "key", null), truth(kwget(kw, "reverse", false)))); });
     def("any", 1, (a) => { const it = iter(a[0]); for (;;) { const v = fornext(it); if (v === STOP) return false; if (truth(v)) return true; } });
     def("all", 1, (a) => { const it = iter(a[0]); for (;;) { const v = fornext(it); if (v === STOP) return true; if (!truth(v)) return false; } });
@@ -722,7 +862,34 @@
     def("open", -1, (a) => fail(E.OSError, "open() is not available: the Python sandbox has no filesystem"));
     def("exit", 1, (a) => { throw rt.makeExc(E.SystemExit, a.length ? [a[0]] : []); }, 0);
     B.set("quit", B.get("exit"));
-    def("vars", 1, (a) => { if (a.length === 0) fail(E.TypeError, "vars() without arguments is not supported"); const v = a[0]; if (v !== null && typeof v === "object" && v.dict) return rt.dictFromMap(v.dict); if (v !== null && typeof v === "object" && v.cls === T.module) return rt.dictFromMap(v.globals); fail(E.TypeError, "vars() argument must have __dict__ attribute"); }, 0);
+    def("vars", 1, (a) => { if (a.length === 0) fail(E.TypeError, "vars() without arguments is not supported"); const v = a[0]; if (v !== null && typeof v === "object" && v.dict) return rt.instanceDict(v); if (v !== null && typeof v === "object" && v.cls === T.module) return rt.dictFromMap(v.globals); fail(E.TypeError, "vars() argument must have __dict__ attribute"); }, 0);
+    {
+        // Writes through obj.__dict__ land on the instance itself.
+        const ID = rt.newType("dict", [], new Map(), "builtins");
+        const m = (name, arity, code, min) => ID.dict.set(name, builtin(name, arity, code, min));
+        const target = (a) => a[0].target.dict;
+        const keyStr = (k) => { if (typeof k !== "string") throw rt.makeExc(E.KeyError, [k]); return k; };
+        m("__getitem__", 2, (a) => { const v = target(a).get(keyStr(a[1])); if (v === undefined) throw rt.makeExc(E.KeyError, [a[1]]); return v; });
+        m("__setitem__", 3, (a) => { if (typeof a[1] !== "string") fail(E.TypeError, "attribute name must be string"); target(a).set(a[1], a[2]); return null; });
+        m("__delitem__", 2, (a) => { if (!target(a).delete(keyStr(a[1]))) throw rt.makeExc(E.KeyError, [a[1]]); return null; });
+        m("__contains__", 2, (a) => typeof a[1] === "string" && target(a).has(a[1]));
+        m("__len__", 1, (a) => BigInt(target(a).size));
+        m("__iter__", 1, (a) => iter(list(Array.from(target(a).keys()))));
+        m("keys", 1, (a) => list(Array.from(target(a).keys())));
+        m("values", 1, (a) => list(Array.from(target(a).values())));
+        m("items", 1, (a) => list(Array.from(target(a), ([k, v]) => tuple([k, v]))));
+        m("get", 3, (a) => { const v = typeof a[1] === "string" ? target(a).get(a[1]) : undefined; return v === undefined ? (a[2] === undefined ? null : a[2]) : v; }, 2);
+        m("pop", 3, (a) => { const v = typeof a[1] === "string" ? target(a).get(a[1]) : undefined; if (v === undefined) { if (a[2] === undefined) throw rt.makeExc(E.KeyError, [a[1]]); return a[2]; } target(a).delete(a[1]); return v; }, 2);
+        m("setdefault", 3, (a) => { const v = target(a).get(keyStr(a[1])); if (v !== undefined) return v; const d = a[2] === undefined ? null : a[2]; target(a).set(a[1], d); return d; }, 2);
+        m("update", 2, (a) => { for (const [k, v] of rt.dictEntries(rt.asDict(a[1]))) target(a).set(needStr(k), v); return null; });
+        m("clear", 1, (a) => { target(a).clear(); return null; });
+        m("copy", 1, (a) => rt.dictFromMap(target(a)));
+        m("__repr__", 1, (a) => repr(rt.dictFromMap(target(a))));
+        m("__eq__", 2, (a) => rt.eq(rt.dictFromMap(target(a)), a[1]));
+        m("__or__", 2, (a) => R.binop("or", rt.dictFromMap(target(a)), a[1]));
+        rt.instanceDict = (obj) => ({ cls: ID, target: obj });
+        rt.T.instancedict = ID;
+    }
     def("dir", 1, (a) => list(a.length ? dirOf(a[0]) : []), 0);
     def("globals", 0, () => { const m = rt.entryModule(); return m ? rt.dictFromMap(m.globals) : dict(); });
     def("locals", 0, () => dict());
@@ -738,6 +905,19 @@
     def("complex", -1, () => fail(E.TypeError, "complex numbers are not supported"));
     B.set("__name__", "builtins");
     B.set("__debug__", true);
+    // ExceptionGroup(message, exceptions): `.message`, `.exceptions`, and
+    // `.subgroup(type)`.
+    E.BaseExceptionGroup.dict.set("__init__", builtin("__init__", 3, (a) => {
+        const self = a[0]; const excs = drain(a[2]);
+        if (typeof a[1] !== "string") fail(E.TypeError, "argument 1 must be str, not " + typeOf(a[1]).name);
+        if (!excs.length) fail(E.ValueError, "second argument (exceptions) must be a non-empty sequence");
+        self.args = tuple([a[1], list(excs)]); self.dict.set("message", a[1]); self.dict.set("exceptions", tuple(excs)); rt.refreshExc(self); return null;
+    }));
+    E.BaseExceptionGroup.dict.set("__str__", builtin("__str__", 1, (a) => { const n = a[0].dict.get("exceptions").items.length; return a[0].dict.get("message") + " (" + n + " sub-exception" + (n === 1 ? "" : "s") + ")"; }));
+    E.BaseExceptionGroup.dict.set("__repr__", builtin("__repr__", 1, (a) => typeOf(a[0]).name + "(" + repr(a[0].dict.get("message")) + ", " + repr(list(a[0].dict.get("exceptions").items.slice())) + ")"));
+    E.BaseExceptionGroup.dict.set("subgroup", builtin("subgroup", 2, (a) => { const keep = a[0].dict.get("exceptions").items.filter((e) => R.excmatch(e, a[1])); if (!keep.length) return null; return rt.construct(typeOf(a[0]), [a[0].dict.get("message"), list(keep)], null); }));
+    E.BaseExceptionGroup.dict.set("split", builtin("split", 2, (a) => { const items = a[0].dict.get("exceptions").items; const keep = items.filter((e) => R.excmatch(e, a[1])), rest = items.filter((e) => !R.excmatch(e, a[1])); const mk = (xs) => xs.length ? rt.construct(typeOf(a[0]), [a[0].dict.get("message"), list(xs)], null) : null; return tuple([mk(keep), mk(rest)]); }));
+    for (const n of ["BaseExceptionGroup", "ExceptionGroup"]) B.set(n, E[n]);
     // `object` and friends double as constructors through `construct`.
     rt.constructors.set(ObjectType, (args, kw, cls) => { if (cls === ObjectType) { if (args.length || (kw && kw.size)) fail(E.TypeError, "object() takes no arguments"); return { cls: ObjectType, dict: new Map() }; } return null; });
     rt.constructors.delete(ObjectType);

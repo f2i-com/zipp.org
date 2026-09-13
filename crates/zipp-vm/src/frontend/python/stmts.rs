@@ -18,9 +18,13 @@ impl<'a> Emitter<'a> {
     /// A nested block: statements inside a branch, loop or handler. Locals
     /// bound inside are not definitely bound afterwards.
     fn block_suite(&mut self, suite: &[ast::Stmt], depth: usize) -> R<()> {
+        // Bindings made inside the block are definite for the rest of the
+        // block only; afterwards the block may not have run at all.
+        let saved = self.definite.clone();
         self.control_depth += 1;
         let result = self.suite(suite, depth);
         self.control_depth -= 1;
+        self.definite = saved;
         self.forget_line();
         result
     }
@@ -66,6 +70,7 @@ impl<'a> Emitter<'a> {
                 };
                 self.emit(Instr::Return { src: value })?;
             }
+            ast::Stmt::Match(s) => self.match_stmt(s, depth)?,
             ast::Stmt::If(s) => {
                 let value = self.expr(&s.test, depth + 1)?;
                 let cond = self.truth(value)?;
@@ -92,24 +97,110 @@ impl<'a> Emitter<'a> {
                 });
                 self.block_suite(&s.body, depth + 1)?;
                 self.emit(Instr::Jump { target: head })?;
-                self.finish_loop(exhausted, &s.orelse, depth + 1)?;
+                self.finish_loop(vec![exhausted], &s.orelse, depth + 1)?;
             }
             ast::Stmt::For(s) => {
-                let value = self.expr(&s.iter, depth + 1)?;
-                let iter = self.helper("iter", &[value])?;
+                // `for x in range(...)` with the builtin `range` runs as a
+                // counted loop on BigInt registers: no iterator object and no
+                // helper call per step. `range` is checked at runtime (it may
+                // be shadowed), and any other iterable takes the generic path
+                // through the same loop body.
+                let counted = self.range_call(&s.iter, depth + 1)?;
+                let (iter, cursor, stop, step, positive, use_counter) = match counted {
+                    Some((f, args)) => {
+                        let is_range = self.helper("rangecheck", &[f])?;
+                        let use_counter = self.alloc()?;
+                        self.emit(Instr::Move {
+                            dst: use_counter,
+                            src: is_range,
+                        })?;
+                        let iter = self.alloc()?;
+                        let cursor = self.alloc()?;
+                        let stop = self.alloc()?;
+                        let step = self.alloc()?;
+                        let positive = self.alloc()?;
+                        let generic = self.jump_if_false(is_range)?;
+                        // Counted: start/stop/step as ints, `positive` = step > 0.
+                        let spec = self.helper("rangeargs", &[args])?;
+                        let zero = self.small_int(0)?;
+                        self.emit(Instr::GetIndex { dst: cursor, obj: spec, key: zero })?;
+                        let one = self.small_int(1)?;
+                        self.emit(Instr::GetIndex { dst: stop, obj: spec, key: one })?;
+                        let two = self.small_int(2)?;
+                        self.emit(Instr::GetIndex { dst: step, obj: spec, key: two })?;
+                        let three = self.small_int(3)?;
+                        self.emit(Instr::GetIndex { dst: positive, obj: spec, key: three })?;
+                        let skip = self.jump()?;
+                        let here = self.here();
+                        self.patch(generic, here)?;
+                        let null = self.none()?;
+                        let value = self.call_value(f, args, null)?;
+                        let it = self.helper("iter", &[value])?;
+                        self.emit(Instr::Move { dst: iter, src: it })?;
+                        let here = self.here();
+                        self.patch(skip, here)?;
+                        (iter, cursor, stop, step, positive, Some(use_counter))
+                    }
+                    None => {
+                        let value = self.expr(&s.iter, depth + 1)?;
+                        let iter = self.helper("iter", &[value])?;
+                        (iter, 0, 0, 0, 0, None)
+                    }
+                };
                 let head = self.here();
                 self.forget_line();
-                let item = self.helper("fornext", &[iter])?;
-                let done = self.alloc()?;
-                self.emit(Instr::Eq {
-                    dst: done,
-                    a: item,
-                    b: self.r_stop,
-                })?;
-                let exhausted = self.jump_if_true(done)?;
-                self.control_depth += 1;
+                let item = self.alloc()?;
+                let mut exits = Vec::new();
+                match use_counter {
+                    Some(use_counter) => {
+                        let generic = self.jump_if_false(use_counter)?;
+                        // Counted step: exhausted when cursor >= stop (or <= stop
+                        // for a negative step); else item = cursor, cursor += step.
+                        let neg = self.jump_if_false(positive)?;
+                        let more = self.alloc()?;
+                        self.emit(Instr::Lt { dst: more, a: cursor, b: stop })?;
+                        exits.push(self.jump_if_false(more)?);
+                        let advance = self.jump()?;
+                        let here = self.here();
+                        self.patch(neg, here)?;
+                        self.emit(Instr::Gt { dst: more, a: cursor, b: stop })?;
+                        exits.push(self.jump_if_false(more)?);
+                        let here = self.here();
+                        self.patch(advance, here)?;
+                        self.emit(Instr::Move { dst: item, src: cursor })?;
+                        self.emit(Instr::Add { dst: cursor, a: cursor, b: step })?;
+                        let bound = self.jump()?;
+                        let here = self.here();
+                        self.patch(generic, here)?;
+                        let next = self.helper("fornext", &[iter])?;
+                        self.emit(Instr::Move { dst: item, src: next })?;
+                        let done = self.alloc()?;
+                        self.emit(Instr::Eq {
+                            dst: done,
+                            a: item,
+                            b: self.r_stop,
+                        })?;
+                        exits.push(self.jump_if_true(done)?);
+                        let here = self.here();
+                        self.patch(bound, here)?;
+                    }
+                    None => {
+                        let next = self.helper("fornext", &[iter])?;
+                        self.emit(Instr::Move { dst: item, src: next })?;
+                        let done = self.alloc()?;
+                        self.emit(Instr::Eq {
+                            dst: done,
+                            a: item,
+                            b: self.r_stop,
+                        })?;
+                        exits.push(self.jump_if_true(done)?);
+                    }
+                }
+                let exhausted = exits;
+                // The target is bound before every iteration of the body, but
+                // not necessarily after the loop (the iterable may be empty).
+                let saved = self.definite.clone();
                 self.assign(&s.target, item, depth + 1)?;
-                self.control_depth -= 1;
                 self.loops.push(LoopCtx {
                     head,
                     breaks: Vec::new(),
@@ -118,6 +209,7 @@ impl<'a> Emitter<'a> {
                 });
                 self.block_suite(&s.body, depth + 1)?;
                 self.emit(Instr::Jump { target: head })?;
+                self.definite = saved;
                 self.finish_loop(exhausted, &s.orelse, depth + 1)?;
             }
             ast::Stmt::Break(_) => {
@@ -173,6 +265,7 @@ impl<'a> Emitter<'a> {
                     &s.args,
                     &s.body,
                     &s.decorator_list,
+                    s.returns.as_deref(),
                     depth + 1,
                 )?;
                 self.store_name(s.name.as_str(), value)?;
@@ -238,13 +331,221 @@ impl<'a> Emitter<'a> {
         }
     }
 
-    fn finish_loop(&mut self, exhausted: usize, otherwise: &[ast::Stmt], depth: usize) -> R<()> {
+    // ---- match statement ------------------------------------------------------------
+    // Each case compiles its pattern to straight-line code that falls
+    // through on success (with capture names stored along the way) and
+    // jumps to the next case on failure. Captures are stored as they are
+    // matched, so a failed case can leave some names bound, as in CPython.
+    fn match_stmt(&mut self, s: &ast::StmtMatch, depth: usize) -> R<()> {
+        let subject = self.expr(&s.subject, depth + 1)?;
+        let mut ends = Vec::new();
+        for case in &s.cases {
+            self.forget_line();
+            self.stamp_line(&case.pattern)?;
+            let mut fails = Vec::new();
+            self.speculative += 1;
+            let matched = self.pattern(&case.pattern, subject, &mut fails, depth + 1);
+            self.speculative -= 1;
+            matched?;
+            if let Some(guard) = &case.guard {
+                let value = self.expr(guard, depth + 1)?;
+                let cond = self.truth(value)?;
+                fails.push(self.jump_if_false(cond)?);
+            }
+            self.block_suite(&case.body, depth + 1)?;
+            ends.push(self.jump()?);
+            let here = self.here();
+            for jump in fails {
+                self.patch(jump, here)?;
+            }
+        }
+        let here = self.here();
+        for jump in ends {
+            self.patch(jump, here)?;
+        }
+        self.forget_line();
+        Ok(())
+    }
+
+    fn pattern(
+        &mut self,
+        p: &ast::Pattern,
+        subject: Reg,
+        fails: &mut Vec<usize>,
+        depth: usize,
+    ) -> R<()> {
+        self.depth(p, depth)?;
+        match p {
+            ast::Pattern::MatchValue(v) => {
+                let value = self.expr(&v.value, depth + 1)?;
+                let ok = self.helper("meq", &[subject, value])?;
+                fails.push(self.jump_if_false(ok)?);
+            }
+            ast::Pattern::MatchSingleton(s) => {
+                let constant = match &s.value {
+                    ast::Constant::None => self.none()?,
+                    ast::Constant::Bool(b) => self.boolean(*b)?,
+                    _ => return Err(self.error(p, "unsupported singleton pattern")),
+                };
+                let ok = self.alloc()?;
+                self.emit(Instr::Eq {
+                    dst: ok,
+                    a: subject,
+                    b: constant,
+                })?;
+                fails.push(self.jump_if_false(ok)?);
+            }
+            ast::Pattern::MatchAs(a) => {
+                if let Some(inner) = &a.pattern {
+                    self.pattern(inner, subject, fails, depth + 1)?;
+                }
+                if let Some(name) = &a.name {
+                    self.store_name(name.as_str(), subject)?;
+                }
+            }
+            ast::Pattern::MatchStar(_) => {
+                return Err(self.error(p, "star pattern outside a sequence pattern"));
+            }
+            ast::Pattern::MatchSequence(q) => {
+                let star = q
+                    .patterns
+                    .iter()
+                    .position(|x| matches!(x, ast::Pattern::MatchStar(_)));
+                let count = self.small_int(q.patterns.len() as i32)?;
+                let star_at = self.small_int(star.map(|i| i as i32).unwrap_or(-1))?;
+                let items = self.helper("mseq", &[subject, count, star_at])?;
+                self.fail_if_none(items, fails)?;
+                for (i, sub) in q.patterns.iter().enumerate() {
+                    let item = self.index_of(items, i)?;
+                    match sub {
+                        ast::Pattern::MatchStar(st) => {
+                            if let Some(name) = &st.name {
+                                self.store_name(name.as_str(), item)?;
+                            }
+                        }
+                        _ => self.pattern(sub, item, fails, depth + 1)?,
+                    }
+                }
+            }
+            ast::Pattern::MatchMapping(m) => {
+                let mut keys = Vec::new();
+                for k in &m.keys {
+                    keys.push(self.expr(k, depth + 1)?);
+                }
+                let keys = self.array(&keys)?;
+                let values = self.helper("mmap", &[subject, keys])?;
+                self.fail_if_none(values, fails)?;
+                for (i, sub) in m.patterns.iter().enumerate() {
+                    let item = self.index_of(values, i)?;
+                    self.pattern(sub, item, fails, depth + 1)?;
+                }
+                if let Some(rest) = &m.rest {
+                    let remaining = self.helper("mrest", &[subject, keys])?;
+                    self.store_name(rest.as_str(), remaining)?;
+                }
+            }
+            ast::Pattern::MatchClass(c) => {
+                let cls = self.expr(&c.cls, depth + 1)?;
+                let count = self.small_int(c.patterns.len() as i32)?;
+                let values = self.helper("mcls", &[subject, cls, count])?;
+                self.fail_if_none(values, fails)?;
+                for (i, sub) in c.patterns.iter().enumerate() {
+                    let item = self.index_of(values, i)?;
+                    self.pattern(sub, item, fails, depth + 1)?;
+                }
+                for (name, sub) in c.kwd_attrs.iter().zip(&c.kwd_patterns) {
+                    let key = self.string(name.as_str())?;
+                    let value = self.helper("mattr", &[subject, key])?;
+                    let missing = self.alloc()?;
+                    self.emit(Instr::Eq {
+                        dst: missing,
+                        a: value,
+                        b: self.r_unb,
+                    })?;
+                    fails.push(self.jump_if_true(missing)?);
+                    self.pattern(sub, value, fails, depth + 1)?;
+                }
+            }
+            ast::Pattern::MatchOr(o) => {
+                let mut done = Vec::new();
+                let last = o.patterns.len().saturating_sub(1);
+                for (i, alt) in o.patterns.iter().enumerate() {
+                    if i == last {
+                        self.pattern(alt, subject, fails, depth + 1)?;
+                    } else {
+                        let mut alt_fails = Vec::new();
+                        self.pattern(alt, subject, &mut alt_fails, depth + 1)?;
+                        done.push(self.jump()?);
+                        let here = self.here();
+                        for jump in alt_fails {
+                            self.patch(jump, here)?;
+                        }
+                    }
+                }
+                let here = self.here();
+                for jump in done {
+                    self.patch(jump, here)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fail_if_none(&mut self, value: Reg, fails: &mut Vec<usize>) -> R<()> {
+        let null = self.none()?;
+        let is_null = self.alloc()?;
+        self.emit(Instr::Eq {
+            dst: is_null,
+            a: value,
+            b: null,
+        })?;
+        fails.push(self.jump_if_true(is_null)?);
+        Ok(())
+    }
+
+    fn index_of(&mut self, array: Reg, index: usize) -> R<Reg> {
+        let key = self.small_int(index as i32)?;
+        let dst = self.alloc()?;
+        self.emit(Instr::GetIndex {
+            dst,
+            obj: array,
+            key,
+        })?;
+        Ok(dst)
+    }
+
+    /// `range(a[, b[, c]])` by name, with plain positional arguments: the
+    /// callee value and the evaluated argument array, for the counted-loop
+    /// fast path. `None` for any other iterable expression.
+    fn range_call(&mut self, iter: &ast::Expr, depth: usize) -> R<Option<(Reg, Reg)>> {
+        let ast::Expr::Call(c) = iter else {
+            return Ok(None);
+        };
+        let ast::Expr::Name(n) = c.func.as_ref() else {
+            return Ok(None);
+        };
+        if n.id.as_str() != "range"
+            || c.args.is_empty()
+            || c.args.len() > 3
+            || !c.keywords.is_empty()
+            || c.args.iter().any(|a| matches!(a, ast::Expr::Starred(_)))
+        {
+            return Ok(None);
+        }
+        let f = self.load_name("range")?;
+        let args = self.sequence_array(&c.args, depth)?;
+        Ok(Some((f, args)))
+    }
+
+    fn finish_loop(&mut self, exhausted: Vec<usize>, otherwise: &[ast::Stmt], depth: usize) -> R<()> {
         let context = self.loops.pop().ok_or("Python emitter: missing loop")?;
         for jump in context.continues {
             self.patch(jump, context.head)?;
         }
         let here = self.here();
-        self.patch(exhausted, here)?;
+        for jump in exhausted {
+            self.patch(jump, here)?;
+        }
         self.forget_line();
         self.block_suite(otherwise, depth)?;
         let end = self.here();
@@ -343,12 +644,11 @@ impl<'a> Emitter<'a> {
         }
     }
     fn aug_assign(&mut self, s: &ast::StmtAugAssign, depth: usize) -> R<()> {
-        let op = self.string(binop_name(&s.op))?;
         match s.target.as_ref() {
             ast::Expr::Name(n) => {
                 let left = self.load_name(n.id.as_str())?;
                 let right = self.expr(&s.value, depth)?;
-                let value = self.helper("iop", &[op, left, right])?;
+                let value = self.arith(&s.op, left, right, true)?;
                 self.store_name(n.id.as_str(), value)
             }
             ast::Expr::Subscript(t) => {
@@ -356,7 +656,7 @@ impl<'a> Emitter<'a> {
                 let index = self.expr(&t.slice, depth)?;
                 let left = self.helper("getitem", &[obj, index])?;
                 let right = self.expr(&s.value, depth)?;
-                let value = self.helper("iop", &[op, left, right])?;
+                let value = self.arith(&s.op, left, right, true)?;
                 self.helper("setitem", &[obj, index, value])?;
                 Ok(())
             }
@@ -365,7 +665,7 @@ impl<'a> Emitter<'a> {
                 let name = self.string(a.attr.as_str())?;
                 let left = self.helper("getattr", &[obj, name])?;
                 let right = self.expr(&s.value, depth)?;
-                let value = self.helper("iop", &[op, left, right])?;
+                let value = self.arith(&s.op, left, right, true)?;
                 self.helper("setattr", &[obj, name, value])?;
                 Ok(())
             }
@@ -528,13 +828,13 @@ impl<'a> Emitter<'a> {
             catch_reg: ereg,
         })?;
         self.handler_depth += 1;
-        self.control_depth += 1;
         if rest.is_empty() {
-            self.suite(body, depth)?;
+            self.block_suite(body, depth)?;
         } else {
+            let saved = self.definite.clone();
             self.with_stmt(rest, body, depth)?;
+            self.definite = saved;
         }
-        self.control_depth -= 1;
         self.emit(Instr::PopHandler)?;
         self.handler_depth -= 1;
         let j1 = self.leave_normally(true, kind_reg)?;
@@ -570,6 +870,7 @@ impl<'a> Emitter<'a> {
         args: &ast::Arguments,
         body: &[ast::Stmt],
         decorators: &[ast::Expr],
+        returns: Option<&ast::Expr>,
         depth: usize,
     ) -> R<Reg> {
         self.validate_args(node, args)?;
@@ -595,11 +896,18 @@ impl<'a> Emitter<'a> {
             },
             _ => self.none()?,
         };
+        let simple = Emitter::simple_arity(args);
+        let line = self.line_of(node);
         let (func_id, child) = self.compile_child(node, name, qualname.clone(), |e| {
-            e.suite(body, depth)?;
-            let none = e.none()?;
-            e.emit(Instr::Return { src: none })?;
-            Ok(())
+            if let Some(count) = simple {
+                e.arity_guard(count)?;
+            }
+            e.frame_guard(line, |e| {
+                e.suite(body, depth)?;
+                let none = e.none()?;
+                e.emit(Instr::Return { src: none })?;
+                Ok(())
+            })
         })?;
         let mut value = self.make_function(
             func_id,
@@ -612,6 +920,35 @@ impl<'a> Emitter<'a> {
             kw_values,
             doc,
         )?;
+        // Annotations evaluate in the defining scope, into `__annotations__`.
+        let mut ann_names = Vec::new();
+        let mut ann_values = Vec::new();
+        for a in args
+            .posonlyargs
+            .iter()
+            .chain(&args.args)
+            .chain(&args.kwonlyargs)
+        {
+            if let Some(ann) = &a.def.annotation {
+                ann_names.push(self.string(a.def.arg.as_str())?);
+                ann_values.push(self.expr(ann, depth)?);
+            }
+        }
+        for a in [&args.vararg, &args.kwarg].into_iter().flatten() {
+            if let Some(ann) = &a.annotation {
+                ann_names.push(self.string(a.arg.as_str())?);
+                ann_values.push(self.expr(ann, depth)?);
+            }
+        }
+        if let Some(ret) = returns {
+            ann_names.push(self.string("return")?);
+            ann_values.push(self.expr(ret, depth)?);
+        }
+        if !ann_names.is_empty() {
+            let names = self.array(&ann_names)?;
+            let values = self.array(&ann_values)?;
+            self.helper("fannotate", &[value, names, values])?;
+        }
         for d in decorator_regs.into_iter().rev() {
             let args = self.array(&[value])?;
             let null = self.none()?;

@@ -47,6 +47,8 @@ pub(super) struct Scope {
     /// array at runtime.
     pub free_order: Vec<String>,
     pub is_generator: bool,
+    /// Names a `del` statement unbinds somewhere in this scope.
+    pub deleted: BTreeSet<String>,
     /// The scope defines `super`/`__class__` uses (methods) — needs the
     /// implicit `__class__` cell from the enclosing class body.
     pub uses_class_cell: bool,
@@ -74,6 +76,7 @@ struct Raw {
     params: Vec<String>,
     is_generator: bool,
     is_comprehension: bool,
+    deleted: BTreeSet<String>,
     uses_class_cell: bool,
     children: Vec<usize>,
 }
@@ -108,6 +111,7 @@ impl Raw {
             params: Vec::new(),
             is_generator: false,
             is_comprehension: false,
+            deleted: BTreeSet::new(),
             uses_class_cell: false,
             children: Vec::new(),
         }
@@ -145,6 +149,26 @@ impl Builder {
                     self.expr(d)?;
                 }
                 self.arg_defaults(&f.args)?;
+                // Annotations are expressions of the defining scope.
+                for a in f
+                    .args
+                    .posonlyargs
+                    .iter()
+                    .chain(&f.args.args)
+                    .chain(&f.args.kwonlyargs)
+                {
+                    if let Some(ann) = &a.def.annotation {
+                        self.expr(ann)?;
+                    }
+                }
+                for a in [&f.args.vararg, &f.args.kwarg].into_iter().flatten() {
+                    if let Some(ann) = &a.annotation {
+                        self.expr(ann)?;
+                    }
+                }
+                if let Some(ret) = &f.returns {
+                    self.expr(ret)?;
+                }
                 self.bind(f.name.as_str());
                 self.function(
                     f.name.as_str(),
@@ -183,6 +207,11 @@ impl Builder {
             ast::Stmt::Delete(d) => {
                 for t in &d.targets {
                     self.target(t)?;
+                    if let ast::Expr::Name(n) = t {
+                        // A deleted local can be unbound anywhere after: its
+                        // reads always carry the unbound check.
+                        self.raws[self.current].deleted.insert(n.id.to_string());
+                    }
                 }
             }
             ast::Stmt::Assign(a) => {
@@ -287,9 +316,69 @@ impl Builder {
             ast::Stmt::Pass(_) | ast::Stmt::Break(_) | ast::Stmt::Continue(_) => {}
             ast::Stmt::AsyncFor(x) => return Err(unsupported(x, "async for")),
             ast::Stmt::AsyncWith(x) => return Err(unsupported(x, "async with")),
-            ast::Stmt::Match(x) => return Err(unsupported(x, "match statements")),
+            ast::Stmt::Match(x) => {
+                self.expr(&x.subject)?;
+                for case in &x.cases {
+                    self.pattern(&case.pattern)?;
+                    if let Some(guard) = &case.guard {
+                        self.expr(guard)?;
+                    }
+                    self.stmts(&case.body)?;
+                }
+            }
             ast::Stmt::TypeAlias(x) => return Err(unsupported(x, "type aliases")),
             ast::Stmt::TryStar(x) => return Err(unsupported(x, "except* groups")),
+        }
+        Ok(())
+    }
+    /// Capture patterns bind in the enclosing scope, like assignment targets.
+    fn pattern(&mut self, p: &ast::Pattern) -> R<()> {
+        match p {
+            ast::Pattern::MatchValue(v) => self.expr(&v.value)?,
+            ast::Pattern::MatchSingleton(_) => {}
+            ast::Pattern::MatchSequence(q) => {
+                for x in &q.patterns {
+                    self.pattern(x)?;
+                }
+            }
+            ast::Pattern::MatchMapping(m) => {
+                for k in &m.keys {
+                    self.expr(k)?;
+                }
+                for x in &m.patterns {
+                    self.pattern(x)?;
+                }
+                if let Some(rest) = &m.rest {
+                    self.bind(rest.as_str());
+                }
+            }
+            ast::Pattern::MatchClass(c) => {
+                self.expr(&c.cls)?;
+                for x in &c.patterns {
+                    self.pattern(x)?;
+                }
+                for x in &c.kwd_patterns {
+                    self.pattern(x)?;
+                }
+            }
+            ast::Pattern::MatchStar(s) => {
+                if let Some(name) = &s.name {
+                    self.bind(name.as_str());
+                }
+            }
+            ast::Pattern::MatchAs(a) => {
+                if let Some(inner) = &a.pattern {
+                    self.pattern(inner)?;
+                }
+                if let Some(name) = &a.name {
+                    self.bind(name.as_str());
+                }
+            }
+            ast::Pattern::MatchOr(o) => {
+                for x in &o.patterns {
+                    self.pattern(x)?;
+                }
+            }
         }
         Ok(())
     }
@@ -723,6 +812,7 @@ fn resolve(raws: Vec<Raw>) -> R<SymTable> {
             params: raw.params,
             free_order,
             is_generator: raw.is_generator,
+            deleted: raw.deleted,
             uses_class_cell: raw.uses_class_cell,
             offset: raw.offset,
             parent: raw.parent,

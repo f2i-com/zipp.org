@@ -29,10 +29,16 @@ fn run(args: &[String]) -> Result<(), String> {
         0
     };
     let mut options = true;
+    let mut bytecode = false;
     while index < args.len() {
         let arg = &args[index];
         if options && arg == "--" {
             options = false;
+            index += 1;
+            continue;
+        }
+        if options && arg == "--bc" {
+            bytecode = true;
             index += 1;
             continue;
         }
@@ -62,7 +68,7 @@ fn run(args: &[String]) -> Result<(), String> {
         index += 1;
     }
     let filename = filename.ok_or(
-        "usage: zipp py FILE|DIR | zipp run [--lang=python|javascript] FILE | zipp --lang=python -",
+        "usage: zipp py [--bc] FILE|DIR | zipp run [--lang=python|javascript] FILE | zipp --lang=python -",
     )?;
     let stdin = filename == "-";
     // A directory is a Python project: every top-level `.py` file is a module
@@ -122,6 +128,14 @@ fn run(args: &[String]) -> Result<(), String> {
             mode: PythonMode::Module,
         },
     };
+    if bytecode {
+        // Developer inspection: the compiled program, no execution.
+        println!(
+            "{}",
+            zipp_vm::frontend::compile_source_to_text(&source, frontend)?
+        );
+        return Ok(());
+    }
     let compiled = compile_source(&source, frontend)?;
     execute(compiled)
 }

@@ -30,12 +30,14 @@ function __zipp_py_set_input(json) {
         let message = rt.str(exc);
         let chain = "";
         let cause = exc.cause, ctx = exc.context;
-        if (cause !== null) chain = rt.typeOf(cause).name + ": " + rt.str(cause) + "\n\nThe above exception was the direct cause of the following exception:\n\n";
-        else if (ctx !== null && !exc.suppress) chain = rt.typeOf(ctx).name + ": " + rt.str(ctx) + "\n\nDuring handling of the above exception, another exception occurred:\n\n";
-        const where = exc.traceback ? "  File " + exc.traceback.replace(/^ \((.*):(\d+)\)$/, '"$1", line $2') + "\n" : "";
-        const err = new Error(chain + "Traceback (most recent call last):\n" + where + exc.cls.name + (message ? ": " + message : ""));
+        if (cause !== null) chain = "The direct cause: " + rt.typeOf(cause).name + ": " + rt.str(cause) + (cause.traceback || "");
+        else if (ctx !== null && !exc.suppress) chain = "While handling: " + rt.typeOf(ctx).name + ": " + rt.str(ctx) + (ctx.traceback || "");
+        // `name: message` is what the host prints; the frames follow on
+        // their own lines, outermost first, like CPython.
+        const frames = rt.tracebackText(exc);
+        const err = new Error(message);
         err.name = exc.cls.name;
-        err.message = (message ? message : "") + (exc.traceback || "");
+        err.message = (message ? message : "") + (exc.traceback || "") + (frames ? "\n" + frames.replace(/\n$/, "") : "") + (chain ? "\n" + chain : "");
         err.pyexc = exc;
         return err;
     }

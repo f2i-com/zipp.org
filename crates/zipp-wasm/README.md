@@ -62,8 +62,8 @@ LTO, one codegen unit, 13 September 2026, Windows x86-64):
 
 | variant | raw | Brotli-11 | vs. JavaScript-only (wire) |
 | --- | ---: | ---: | ---: |
-| `javascript` | 5,306,505 | 1,239,135 | baseline |
-| `all` | 7,645,836 | 1,749,325 | +510,190 (+41%) |
+| `javascript` | 5,308,147 | 1,239,957 | baseline |
+| `all` | 7,741,966 | 1,769,619 | +529,662 (+43%) |
 
 A Python state keeps every host-boundary limit of a JavaScript one (initial
 source size, instruction budget, heap, output, dynamic-code gates) and adds the

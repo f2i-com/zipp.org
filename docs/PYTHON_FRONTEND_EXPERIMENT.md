@@ -27,27 +27,37 @@ integration date every corpus program matched.
 | Statements | `if`/`elif`/`else`, `while`/`for` with `else`, `break`/`continue` through `try`/`finally`, `pass`, annotations (`__annotations__`), walrus `:=`, `global`/`nonlocal`, `import`/`from ... import` (including inside functions) |
 | Modules | one module per `.py` file, `__name__ == "__main__"`, cycles resolved like CPython, `import x as y`, `from x import *`, `__all__` |
 | Builtins | `print` (sep/end/file), `len`, `range`, `enumerate`, `zip` (strict), `map`, `filter`, `reversed`, `sorted`/`list.sort` (stable, key, reverse), `min`/`max` (key, default), `sum`, `any`/`all`, `abs`, `round`, `divmod`, `pow`, `isinstance`/`issubclass`, `hasattr`/`getattr`/`setattr`/`delattr`, `id`, `hash`, `callable`, `chr`/`ord`, `bin`/`oct`/`hex`, `format`, `repr`/`ascii`, `iter`/`next`, `type`, `object`, `dir`, `vars`, `globals`, `exit` |
-| Built-in modules | `math`, `random` (seedable, deterministic), `time`, `sys`, `os`/`os.path` (a virtual empty filesystem), `io` (`StringIO`), `json`, `string`, `textwrap`, `copy`, `operator`, `itertools`, `functools` (`reduce`, `partial`, `lru_cache`/`cache`, `wraps`, `total_ordering`, `cmp_to_key`), `collections` (`Counter`, `defaultdict`, `deque`, `namedtuple`, `OrderedDict`, `ChainMap`), `heapq`, `bisect`, `statistics`, `re` (a JavaScript-backed subset with groups, named groups, `sub` with callables), `dataclasses` (`dataclass`, `field`, `asdict`, `astuple`, `replace`, `fields`; `order`, `frozen`), `enum` (`Enum`, `IntEnum`, `auto`), `typing` (names only), `abc`, `__future__` |
+| Built-in modules | `math`, `random` (seedable, deterministic), `time`, `sys`, `os`/`os.path` (a virtual empty filesystem), `io` (`StringIO`), `json`, `string`, `textwrap`, `copy`, `operator`, `itertools`, `functools` (`reduce`, `partial`, `lru_cache`/`cache`, `wraps`, `total_ordering`, `cmp_to_key`), `collections` (`Counter`, `defaultdict`, `deque`, `namedtuple`, `OrderedDict`, `ChainMap`), `heapq`, `bisect`, `statistics`, `re` (a JavaScript-backed subset with groups, named groups, `sub` with callables), `dataclasses` (`dataclass`, `field`, `asdict`, `astuple`, `replace`, `fields`; `order`, `frozen`), `enum` (`Enum`, `IntEnum`, `Flag`, `IntFlag`, `auto`), `typing` (generic aliases, `NamedTuple`, `TypedDict`), `abc` (`ABC` with abstract-method enforcement), `contextlib` (`contextmanager`, `suppress`, `closing`, `nullcontext`, `ExitStack`), `__future__` |
+| Object model | metaclasses (`metaclass=`, inherited metaclasses, metaclass `__call__`/`__new__`, `type(name, bases, ns)`), `__init_subclass__` with class keywords, `__set_name__`, `__class_getitem__`, `__slots__` (attribute restriction), user descriptors (`__get__`/`__set__`), a live `obj.__dict__`, function `__annotations__` |
+| `match` | every pattern kind: literals and value patterns, singletons, captures and wildcards, `as`, `\|` alternatives, sequence patterns with a star, mapping patterns with `**rest`, class patterns with positional (`__match_args__`, self-matching builtins, named tuples, dataclasses) and keyword sub-patterns, guards |
+| Tracebacks | an uncaught exception prints the full call chain, outermost frame first, with file, line and function names (long recursions are collapsed like CPython's `[Previous line repeated N more times]`), plus the chained cause or context |
 | Host `ui` module | buffered drawing commands (`canvas`, `clear`, `rect`, `circle`, `line`, `text`, `font`, `button`) and an input snapshot (`mouse`, `clicked`, `key`, `width`, `height`) for a host that renders them; see the wasm README and `crates/zipp-wasm/playground/` |
 
 ## What does not run yet
 
-- `async`/`await`, `match` statements, type-parameter syntax, `except*`,
-  complex numbers.
+- `async`/`await`, type-parameter syntax, `except*`, complex numbers.
 - Real files, sockets, processes, threads: `open()` and the `os` calls that
   need a filesystem raise `OSError`; `input()` raises `EOFError`. The sandbox
   has no filesystem by design.
-- Metaclasses beyond `type` (a `metaclass=` keyword is called like `type` but
-  custom metaclass machinery is not modelled), `__getattribute__` overrides,
-  weak references, `__del__`, `__set_name__`.
-- Tracebacks are one frame: an uncaught exception reports its type, message
-  and the file/line of the raising statement, not the full call chain.
+- `__getattribute__` overrides, weak references, `__del__`.
+- Iteration order of sets follows insertion order, except that a set of
+  small non-negative ints iterates ascending as CPython's hash table does;
+  a set of strings can print in a different order from CPython (whose
+  string hashes are randomised per process).
 - `str` formatting of `float` uses Python's rules for `repr`, `f`, `e`, `g`,
   `%`; a few exotic spec combinations (`=` alignment with `0` padding of
   strings, `n` locale forms) are approximations.
-- Performance: every operator and call goes through the runtime's dispatch;
-  ints are BigInts. It is a correct interpreter first; dedicated bytecodes
-  for the hot Python operations are the next step.
+- Performance: ints are BigInts (the VM interns small ones and has fast
+  paths for BigInt arithmetic and comparison); int arithmetic, `for` over
+  `range`, comparisons, truth tests and calls of plain functions compile to
+  inline register code, and dict/list indexing, method calls and attribute
+  reads take short paths in the runtime. It is still an interpreter over a
+  JavaScript-shaped VM: on a release build, `fib(25)` takes about 0.09 s,
+  a million-iteration `total += i % 7` loop about 0.5 s and 200k dict
+  insertions with `str` keys about 0.7 s (CPython: 0.005 s, 0.05 s and
+  0.03 s). The remaining cost is dominated by BigInt allocation for large
+  values and by per-operation dispatch; dedicated Python bytecodes are the
+  next step.
 
 ## Language selection
 

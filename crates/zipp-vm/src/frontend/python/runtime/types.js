@@ -173,6 +173,8 @@
         }
         if (a.map !== undefined && b !== null && typeof b === "object" && b.map !== undefined && !isInstance(b, T.dict)) return rt.setBinop(op, a, b, inplace);
         if (isInstance(a, T.bytes) && op === "add" && b !== null && typeof b === "object" && isInstance(b, T.bytes)) return { cls: T.bytes, items: a.items.concat(b.items) };
+        if (isInstance(a, T.bytes) && op === "mul" && isInt(b)) return { cls: T.bytes, items: repeat({ cls: T.bytes, items: a.items }, b).items };
+        if (isInstance(b, T.bytes) && op === "mul" && isInt(a)) return { cls: T.bytes, items: repeat({ cls: T.bytes, items: b.items }, a).items };
         return NOTIMPL;
     }
     rt.baseBinop = baseBinop;
@@ -269,7 +271,7 @@
                 }
                 return !eq(a, b);
             }
-            case "is": return a === b || (isInt(a) && isInt(b) && typeof a === typeof b && a === b);
+            case "is": return typeof a === "number" && typeof b === "number" ? Object.is(a, b) : a === b || (isInt(a) && isInt(b) && typeof a === typeof b && a === b);
             case "isnot": return !cmp("is", a, b);
             case "in": return contains(b, a);
             case "notin": return !contains(b, a);
@@ -325,11 +327,16 @@
         if (container.map !== undefined && isInstance(container, T.dict)) return rt.dictHas(container, needle);
         if (container.map !== undefined) return rt.setHas(container, needle);
         if (isInstance(container, T.range)) {
+            if (typeof needle === "number" && Number.isInteger(needle)) needle = BigInt(needle);
             if (!isInt(needle)) return false;
             const x = asInt(needle), r = container;
             return (r.step > 0n ? x >= r.start && x < r.stop : x <= r.start && x > r.stop) && (x - r.start) % r.step === 0n;
         }
-        if (isInstance(container, T.bytes)) { if (!isInt(needle)) return false; return container.items.indexOf(Number(asInt(needle))) >= 0; }
+        if (isInstance(container, T.bytes)) {
+            if (isInt(needle)) return container.items.indexOf(Number(asInt(needle))) >= 0;
+            if (needle !== null && typeof needle === "object" && needle.cls === T.bytes) return rt.bytesToLatin1(container).indexOf(rt.bytesToLatin1(needle)) >= 0;
+            fail(E.TypeError, "a bytes-like object is required, not '" + typeOf(needle).name + "'");
+        }
         const it = rt.iter(container);
         for (;;) { const v = rt.fornext(it); if (v === STOP) return false; if (eq(v, needle)) return true; }
     }
@@ -351,53 +358,77 @@
     rt.contains = contains;
 
     // ---- hashing: the bucket key of a value in dicts and sets ----------------------------------------------
-    // Primitives get a canonical string; instances use identity unless their
-    // class defines __hash__ (then "h:<hash>" buckets compared with __eq__).
+    // The bucket key is whatever is cheapest that keeps Python's equality:
+    // strings are themselves (a NUL-led string is escaped, NUL leads every
+    // composite key), integers within 2^53 (and integral floats and bools,
+    // which equal them) are JS numbers, None is one sentinel object, and
+    // identity-hashed instances are the object itself. Big ints, NaN,
+    // tuples and hashed instances get NUL-prefixed strings. Values with the
+    // same bucket are then compared with __eq__.
+    const NONE_KEY = { none: true };
+    const SAFE = 9007199254740991;
     function keyOf(v) {
-        switch (typeof v) {
-            case "string": return "s" + v;
-            case "bigint": return "n" + v.toString();
-            case "boolean": return v ? "n1" : "n0";
-            case "number": return Number.isInteger(v) ? "n" + BigInt(v).toString() : "f" + String(v);
-            case "undefined": return "N";
+        const tv = typeof v;
+        if (tv === "string") return v.charCodeAt(0) === 0 ? "\0s" + v : v;
+        if (tv === "bigint") { const n = Number(v); return Number.isSafeInteger(n) ? n : "\0n" + v.toString(); }
+        if (tv !== "object") {
+            if (tv === "boolean") return v ? 1 : 0;
+            if (tv === "number") {
+                if (v !== v) return "\0f";
+                if (Number.isInteger(v) && (v > SAFE || v < -SAFE)) return "\0n" + BigInt(v).toString();
+                return v;
+            }
+            return NONE_KEY;
         }
-        if (v === null) return "N";
+        if (v === null) return NONE_KEY;
         const c = v.cls;
-        if (c === T.tuple || c === T.frozenset || c === T.bytes || c === T.range) return baseKey(v);
+        if (c === T.tuple || c === T.frozenset || c === T.bytes || c === T.range) return "\0" + baseKey(v);
         if (c === T.list || c === T.dict || c === T.set) fail(E.TypeError, "unhashable type: '" + c.name + "'");
         if (c === T.slice) fail(E.TypeError, "unhashable type: 'slice'");
         const h = typeMethod(v, "__hash__");
         if (h === null) fail(E.TypeError, "unhashable type: '" + c.name + "'");
-        if (h !== undefined && h.isBase) return baseKey(v);
-        if (h !== undefined && h !== rt.ObjectType.dict.get("__hash__")) {
-            const r = call(descrGet(h, v, c), [], null);
-            if (!isInt(r)) fail(E.TypeError, "__hash__ method should return an integer");
-            return "h" + asInt(r).toString();
+        if (h === undefined || h === rt.ObjectType.dict.get("__hash__")) {
+            // Identity, unless the class redefines equality without a hash
+            // (Python then sets __hash__ = None).
+            const eqm = typeMethod(v, "__eq__");
+            if (eqm !== undefined && eqm !== rt.ObjectType.dict.get("__eq__")) fail(E.TypeError, "unhashable type: '" + c.name + "'");
+            return v;
         }
-        const eqm = typeMethod(v, "__eq__");
-        if (eqm !== undefined && eqm !== rt.ObjectType.dict.get("__eq__")) fail(E.TypeError, "unhashable type: '" + c.name + "'");
-        return "o" + rt.ident(v);
+        if (h.isBase) return "\0" + baseKey(v);
+        const r = call(descrGet(h, v, c), [], null);
+        if (!isInt(r)) fail(E.TypeError, "__hash__ method should return an integer");
+        return "\0h" + asInt(r).toString();
     }
     rt.keyOf = keyOf;
+    // The bucket key as a string, for composing tuple keys and hashes.
+    function keyStr(v) {
+        const k = keyOf(v);
+        switch (typeof k) {
+            case "string": return k.charCodeAt(0) === 0 ? k.slice(1) : "s" + k;
+            case "number": return "n" + k;
+        }
+        return k === NONE_KEY ? "N" : "o" + rt.ident(k);
+    }
+    rt.keyStr = keyStr;
     function baseKey(v) {
-        if (isInstance(v, T.tuple)) { let s = "t("; for (const x of v.items) s += keyOf(x) + ","; return s + ")"; }
-        if (isInstance(v, T.frozenset)) { const ks = []; for (const x of rt.setValues(v)) ks.push(keyOf(x)); ks.sort(); return "F{" + ks.join(",") + "}"; }
+        if (isInstance(v, T.tuple)) { let s = "t("; for (const x of v.items) s += keyStr(x) + ","; return s + ")"; }
+        if (isInstance(v, T.frozenset)) { const ks = []; for (const x of rt.setValues(v)) ks.push(keyStr(x)); ks.sort(); return "F{" + ks.join(",") + "}"; }
         if (isInstance(v, T.bytes)) return "b" + v.items.join(",");
         if (isInstance(v, T.range)) return "r" + v.start + ":" + v.stop + ":" + v.step;
-        if (typeof v === "string" || isNum(v) || v === null) return keyOf(v);
+        if (typeof v === "string" || isNum(v) || v === null) return keyStr(v);
         fail(E.TypeError, "unhashable type: '" + typeOf(v).name + "'");
     }
     rt.baseKey = baseKey;
-    rt.baseHash = function (v) { const k = baseKey(v); let h = 0n; for (let i = 0; i < k.length; i++) h = (h * 1000003n + BigInt(k.charCodeAt(i))) & 0x7FFFFFFFFFFFFFFFn; return h; };
+    function strHash(k) { let h = 0n; for (let i = 0; i < k.length; i++) h = (h * 1000003n + BigInt(k.charCodeAt(i))) & 0x7FFFFFFFFFFFFFFFn; return h; }
+    rt.baseHash = function (v) { return strHash(baseKey(v)); };
     function hashInt(v) {
         // A stable, Python-shaped hash for the `hash()` builtin.
         if (isInt(v)) { const i = asInt(v); const m = ((i % 2305843009213693951n) + 2305843009213693951n) % 2305843009213693951n; return m === 2305843009213693951n - 1n ? -2n : m; }
         if (typeof v === "number") return Number.isInteger(v) ? hashInt(BigInt(v)) : BigInt(Math.trunc(v * 1000003)) ;
         const k = keyOf(v);
-        if (k.startsWith("h")) return BigInt(k.slice(1));
-        let h = 0n;
-        for (let i = 0; i < k.length; i++) h = (h * 1000003n + BigInt(k.charCodeAt(i))) & 0x7FFFFFFFFFFFFFFFn;
-        return h;
+        if (typeof k === "string") return k.startsWith("\0h") ? BigInt(k.slice(2)) : strHash(keyStr(v));
+        if (k === NONE_KEY) return strHash("N");
+        return BigInt(rt.ident(k));
     }
     rt.hashInt = hashInt;
 
@@ -405,8 +436,8 @@
     // {cls: T.dict, map: Map<bucket, Array<[key, value]>>, size}
     function dict() { return { cls: T.dict, map: new Map(), size: 0 }; }
     function findEntry(bucket, key) {
-        if (bucket.length === 1) return eq(bucket[0][0], key) ? 0 : -1;
-        for (let i = 0; i < bucket.length; i++) if (eq(bucket[i][0], key)) return i;
+        if (bucket.length === 1) { const k = bucket[0][0]; return k === key || eq(k, key) ? 0 : -1; }
+        for (let i = 0; i < bucket.length; i++) { const k = bucket[i][0]; if (k === key || eq(k, key)) return i; }
         return -1;
     }
     function dictGet(d, key) {
@@ -484,8 +515,23 @@
         const i = b.findIndex((x) => eq(x, v)); if (i < 0) return false;
         b.splice(i, 1); s.size--; if (b.length === 0) s.map.delete(k); return true;
     }
-    function* setValues(s) { for (const b of s.map.values()) for (const x of b) yield x; }
-    function setList(s) { const out = []; for (const b of s.map.values()) for (const x of b) out.push(x); return out; }
+    function* setValues(s) { for (const x of setList(s)) yield x; }
+    function setList(s) {
+        const out = []; for (const b of s.map.values()) for (const x of b) out.push(x);
+        // CPython iterates a set in hash-table order. Its table is sized by
+        // the element count, and small non-negative ints hash to themselves,
+        // so a set of such ints below the table size comes out ascending; the
+        // common `{3, 1, 2}` prints `{1, 2, 3}` there and here.
+        if (out.length > 1 && out.length <= 50000) {
+            let size = 8, fill = 0;
+            for (let i = 0; i < out.length; i++) { fill++; if (fill * 5 >= (size - 1) * 3) { let next = 8; while (next <= fill * 4) next *= 2; size = next; } }
+            const bound = BigInt(size);
+            let small = true;
+            for (const x of out) { if (typeof x !== "bigint" || x < 0n || x >= bound) { small = false; break; } }
+            if (small) out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+        }
+        return out;
+    }
     function setIter(s) {
         const items = setList(s); let i = 0; const size = s.size;
         return { cls: T.iterator, next: () => { if (s.size !== size) fail(E.RuntimeError, "Set changed size during iteration"); return i < items.length ? items[i++] : STOP; } };
@@ -557,8 +603,24 @@
         return out;
     }
     rt.sliceArray = sliceArray;
-    function codepoints(s) { return Array.from(s); }
+    function codepoints(s) { return hasSurrogate(s) ? Array.from(s) : s.split(""); }
     rt.codepoints = codepoints;
+    function hasSurrogate(s) {
+        const n = s.length;
+        if (n < 48) {
+            for (let i = 0; i < n; i++) { const c = s.charCodeAt(i); if (c >= 0xd800 && c <= 0xdfff) return true; }
+            return false;
+        }
+        return /[\ud800-\udfff]/.test(s);
+    }
+    rt.hasSurrogate = hasSurrogate;
+    // The length in code points.
+    function strLen(s) {
+        if (!hasSurrogate(s)) return s.length;
+        let n = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c < 0xdc00 || c > 0xdfff) n++; }
+        return n;
+    }
+    rt.strLen = strLen;
     function normIndex(i, length, what) {
         let n = Number(rt.indexOf(i, what));
         if (n < 0) n += length;
@@ -574,12 +636,9 @@
     function isSlice(k) { return k !== null && typeof k === "object" && k.cls === T.slice; }
     function baseGetitem(o, k) {
         if (typeof o === "string") {
-            if (isSlice(k)) {
-                if (/^[\x00-\x7f]*$/.test(o)) return sliceArray(o.split(""), k).join("");
-                return sliceArray(codepoints(o), k).join("");
-            }
-            if (/^[\x00-\x7f]*$/.test(o)) return o[normIndex(k, o.length, "string")];
-            const cps = codepoints(o); return cps[normIndex(k, cps.length, "string")];
+            if (isSlice(k)) return sliceArray(codepoints(o), k).join("");
+            if (!hasSurrogate(o)) return o[normIndex(k, o.length, "string")];
+            const cps = Array.from(o); return cps[normIndex(k, cps.length, "string")];
         }
         if (o.items !== undefined && (isInstance(o, T.list) || isInstance(o, T.tuple))) {
             const base = isInstance(o, T.list) ? T.list : T.tuple;
@@ -613,7 +672,17 @@
         if (typeof o === "string") return baseGetitem(o, k);
         if (o !== null && typeof o === "object") {
             const c = o.cls;
-            if (c === T.list || c === T.tuple || c === T.dict || c === T.range || c === T.bytes) return baseGetitem(o, k);
+            if (c === T.dict) {
+                const v = dictGet(o, k);
+                if (v !== undefined) return v;
+                throw rt.makeExc(E.KeyError, [k]);
+            }
+            if ((c === T.list || c === T.tuple) && typeof k === "bigint") {
+                const items = o.items; let i = Number(k); if (i < 0) i += items.length;
+                if (i < 0 || i >= items.length) fail(E.IndexError, c.name + " index out of range");
+                return items[i];
+            }
+            if (c === T.list || c === T.tuple || c === T.range || c === T.bytes) return baseGetitem(o, k);
             if (c === T.dict_keys || c === T.dict_values || c === T.dict_items) fail(E.TypeError, "'" + c.name + "' object is not subscriptable");
             if (o.isType) {
                 const cg = rt.classDunder(o, "__getitem__") || rt.classDunder(o, "__class_getitem__");
@@ -644,7 +713,15 @@
     function setitem(o, k, v) {
         if (o !== null && typeof o === "object") {
             const c = o.cls;
-            if (c === T.list || c === T.dict) return baseSetitem(o, k, v);
+            if (c === T.dict) { dictSet(o, k, v); return null; }
+            if (c === T.list) {
+                if (typeof k === "bigint") {
+                    const items = o.items; let i = Number(k); if (i < 0) i += items.length;
+                    if (i < 0 || i >= items.length) fail(E.IndexError, "list assignment index out of range");
+                    items[i] = v; return null;
+                }
+                return baseSetitem(o, k, v);
+            }
             const m = typeMethod(o, "__setitem__");
             if (m !== undefined) { if (m.isBase) return baseSetitem(o, k, v); call(descrGet(m, o, c), [k, v], null); return null; }
         }
@@ -676,7 +753,7 @@
     rt.getitem = getitem; rt.setitem = setitem; rt.delitem = delitem;
     rt.baseGetitem = baseGetitem; rt.baseSetitem = baseSetitem; rt.baseDelitem = baseDelitem;
     function baseLen(v) {
-        if (typeof v === "string") return BigInt(codepoints(v).length);
+        if (typeof v === "string") return BigInt(strLen(v));
         if (v.items !== undefined) return BigInt(v.items.length);
         if (v.map !== undefined) return BigInt(v.size);
         if (isInstance(v, T.range)) return rangeLength(v);
@@ -684,10 +761,12 @@
     }
     rt.baseLen = baseLen;
     function len(v) {
-        if (typeof v === "string") return baseLen(v);
+        if (typeof v === "string") return BigInt(strLen(v));
         if (v !== null && typeof v === "object") {
             const c = v.cls;
-            if (c === T.list || c === T.tuple || c === T.bytes || c === T.dict || c === T.set || c === T.frozenset || c === T.range) return baseLen(v);
+            if (c === T.list || c === T.tuple) return BigInt(v.items.length);
+            if (c === T.dict || c === T.set) return BigInt(v.size);
+            if (c === T.bytes || c === T.frozenset || c === T.range) return baseLen(v);
             if (c === T.dict_keys || c === T.dict_values || c === T.dict_items) return BigInt(v.dict.size);
             if (v.isType) { const cl = rt.classDunder(v, "__len__"); if (cl !== undefined) return asInt(call(cl, [], null)); }
             const m = typeMethod(v, "__len__");
@@ -743,13 +822,14 @@
     const reprStack = [];
     function repr(v) {
         if (v === null) return "None";
-        switch (typeof v) {
-            case "boolean": return v ? "True" : "False";
-            case "bigint": return v.toString();
-            case "number": return floatRepr(v);
-            case "string": return quoteStr(v);
-            case "undefined": return "None";
-            case "function": return "<built-in function>";
+        const tv = typeof v;
+        if (tv !== "object") {
+            if (tv === "bigint") return v.toString();
+            if (tv === "string") return quoteStr(v);
+            if (tv === "number") return floatRepr(v);
+            if (tv === "boolean") return v ? "True" : "False";
+            if (tv === "undefined") return "None";
+            if (tv === "function") return "<built-in function>";
         }
         if (v === NOTIMPL) return "NotImplemented";
         if (v === rt.ELLIPSIS) return "Ellipsis";
@@ -839,10 +919,12 @@
                     case "__doc__": return obj.doc;
                     case "__module__": return obj.module;
                     case "__defaults__": return obj.defaults.length ? tuple(obj.defaults.slice()) : null;
-                    case "__dict__": return dictFromMap(obj.dict);
+                    case "__dict__": return rt.instanceDict(obj);
                     case "__globals__": return dictFromMap(obj.globals);
                     case "__code__": return { cls: T.code, name: obj.name, argcount: obj.positional, varnames: obj.argnames };
                     case "__wrapped__": return obj.dict.get("__wrapped__");
+                    case "__annotations__": return dictFromMap(obj.annotations || new Map());
+                    case "__kwdefaults__": return obj.kwdefaults === null ? null : dictFromMap(obj.kwdefaults);
                 }
             } else if (c === T.builtin_function_or_method) {
                 if (name === "__name__" || name === "__qualname__") return obj.name;

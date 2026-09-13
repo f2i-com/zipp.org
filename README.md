@@ -166,10 +166,12 @@ zipp run fib.py                # frontend chosen by extension, shebang or direct
 zipp run --lang=python -       # from standard input
 ```
 
-Classes, exceptions, generators, closures, comprehensions, f-strings, the
-builtin types and a set of standard-library modules (`math`, `json`, `re`,
-`collections`, `itertools`, `functools`, `dataclasses`, `enum`, ...) all
-work; `async`, `match` and real files do not yet. Semantics are checked
+Classes (including metaclasses, descriptors and `__slots__`), exceptions
+with full tracebacks, generators, closures, comprehensions, `match`
+statements, f-strings, the builtin types and a set of standard-library
+modules (`math`, `json`, `re`, `collections`, `itertools`, `functools`,
+`dataclasses`, `enum`, `contextlib`, `typing`, ...) all work; `async` and
+real files do not yet. Semantics are checked
 differentially against CPython: `tests/python_corpus/*.py` must print
 exactly what CPython prints. A folder runs as a project:
 `zipp py examples/python/project`. The scope

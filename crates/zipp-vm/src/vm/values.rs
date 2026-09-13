@@ -1782,6 +1782,12 @@ impl<'p> Vm<'p> {
 
     /// Allocate a BigInt value.
     pub(crate) fn make_bigint(&mut self, v: i128) -> Value {
+        // Small values come from the pinned intern table (no allocation).
+        if (crate::heap::INTERN_BIGINT_MIN..=crate::heap::INTERN_BIGINT_MAX).contains(&v) {
+            return Value::heap(
+                crate::heap::INTERN_BIGINT_START + (v - crate::heap::INTERN_BIGINT_MIN) as u32,
+            );
+        }
         Value::heap(self.heap.alloc(HeapObj::BigInt(v)))
     }
 

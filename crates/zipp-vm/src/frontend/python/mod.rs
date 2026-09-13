@@ -168,9 +168,12 @@ pub(super) fn compile_project(entry: &str, modules: &[(String, String)]) -> R<Pr
             &program,
             "<module>".to_owned(),
         )?;
-        out.suite(suite, 0)?;
-        let value = out.none()?;
-        out.emit(Instr::Return { src: value })?;
+        out.frame_guard(1, |out| {
+            out.suite(suite, 0)?;
+            let value = out.none()?;
+            out.emit(Instr::Return { src: value })?;
+            Ok(())
+        })?;
         let mut p = program.borrow_mut();
         let func_id = p.functions.len() as u32;
         p.functions.push(out.finish());

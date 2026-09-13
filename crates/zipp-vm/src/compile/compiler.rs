@@ -1430,10 +1430,20 @@ impl Compiler {
         // registered and never disposed, so `class C { static { using x = r; } }`
         // never ran r[Symbol.dispose]
         // (staging/explicit-resource-management/call-dispose-methods.js).
+        // Hoisted function declarations are materialised at entry (see
+        // `compile_function_body`).
+        for s in body {
+            if let ast::Stmt::FnDecl(f) = s {
+                fc.func_decl(f)?;
+            }
+        }
         if FnCompiler::block_has_using(body) {
-            fc.compile_using_block(body, false)?;
+            fc.compile_using_block(body, true)?;
         } else {
             for s in body {
+                if let ast::Stmt::FnDecl(_) = s {
+                    continue;
+                }
                 fc.stmt(s)?;
             }
         }
@@ -1658,7 +1668,18 @@ impl Compiler {
                         }
                     }
                 }
+                // Function declarations are materialised at entry, as in a
+                // function body: a reference textually above the declaration
+                // (`const t = [g]; function g() {}`) already sees the function.
                 for s in &b.stmts {
+                    if let ast::Stmt::FnDecl(f) = s {
+                        fc.func_decl(f)?;
+                    }
+                }
+                for s in &b.stmts {
+                    if let ast::Stmt::FnDecl(_) = s {
+                        continue;
+                    }
                     fc.stmt(s)?;
                 }
                 fc.emit(Instr::ReturnUndefined);

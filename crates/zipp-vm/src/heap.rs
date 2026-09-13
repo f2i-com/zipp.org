@@ -5002,10 +5002,25 @@ pub const INTERN_EMPTY: u32 = 128;
 pub const INTERN_PAD2_START: u32 = INTERN_EMPTY + 1;
 pub const INTERN_PAD2_COUNT: u32 = 100;
 pub const INTERN_PAD2_END: u32 = INTERN_PAD2_START + INTERN_PAD2_COUNT - 1;
+/// The small-BigInt table: `INTERN_BIGINT_MIN..=INTERN_BIGINT_MAX` as
+/// pre-allocated, immutable `HeapObj::BigInt` slots. BigInt-heavy guests
+/// (the Python front end represents every `int` as a BigInt) produce these
+/// values constantly — loop counters, remainders, flags, small deltas — and
+/// `Vm::make_bigint` returns the pinned slot instead of allocating.
+pub const INTERN_BIGINT_START: u32 = INTERN_PAD2_END + 1;
+pub const INTERN_BIGINT_MIN: i128 = -256;
+pub const INTERN_BIGINT_MAX: i128 = 1023;
+pub const INTERN_BIGINT_COUNT: u32 = (INTERN_BIGINT_MAX - INTERN_BIGINT_MIN + 1) as u32;
+pub const INTERN_BIGINT_END: u32 = INTERN_BIGINT_START + INTERN_BIGINT_COUNT - 1;
+/// Permanent pinned slots beyond the single-character strings and the empty
+/// string: the pad2 table plus the small-BigInt table. GC accounting treats
+/// them as OLD from birth rather than as young allocation pressure.
+pub const INTERN_PREFIX_EXTRA: u32 = INTERN_PAD2_COUNT + INTERN_BIGINT_COUNT;
 /// Last immutable engine-interned slot. In-place string builders must accept
 /// only indices strictly above this boundary; unlike the single-character
-/// prefix, the pad2 table contains multi-character `Str`s.
-pub const INTERN_PINNED_END: u32 = INTERN_PAD2_END;
+/// prefix, the pad2 table contains multi-character `Str`s (and the BigInt
+/// table is not a string at all).
+pub const INTERN_PINNED_END: u32 = INTERN_BIGINT_END;
 
 pub struct Heap {
     objs: Vec<HeapObj>,
@@ -5597,6 +5612,11 @@ impl Heap {
             objs.push(HeapObj::Str(JsStr::from_ascii(bytes)));
             versions.push(0);
         }
+        debug_assert_eq!(objs.len(), INTERN_BIGINT_START as usize);
+        for n in INTERN_BIGINT_MIN..=INTERN_BIGINT_MAX {
+            objs.push(HeapObj::BigInt(n));
+            versions.push(0);
+        }
         debug_assert_eq!(objs.len(), INTERN_PINNED_END as usize + 1);
         let live = objs.len();
         let resident_payload_charged: Vec<Cell<usize>> = objs
@@ -5729,7 +5749,7 @@ impl Heap {
             // Keep the historical number of collectable allocations before
             // the first GC: the 100 new pad2 prefix slots are permanent OLD
             // objects, not young allocation pressure.
-            gc_threshold: GC_MIN_THRESHOLD + INTERN_PAD2_COUNT as usize,
+            gc_threshold: GC_MIN_THRESHOLD + INTERN_PREFIX_EXTRA as usize,
             born,
             epoch: 0,
             allocs_epoch: 0,
@@ -5743,7 +5763,7 @@ impl Heap {
             // Same offset as gc_threshold: a first minor's occupied count
             // includes these permanent slots, so preserve the old boundary in
             // terms of collectable survivors rather than total prefix size.
-            major_at: GC_MIN_THRESHOLD + INTERN_PAD2_COUNT as usize,
+            major_at: GC_MIN_THRESHOLD + INTERN_PREFIX_EXTRA as usize,
             big_bytes_since_gc: 0,
             major_due: false,
             minors_since_major: 0,
@@ -9919,7 +9939,7 @@ mod tests {
         // boundary plus the permanent pad2 prefix — no major has run yet):
         // the young sweep failed to shrink the heap, so the next collection
         // must be a major.
-        h.note_minor_done(GC_MIN_THRESHOLD + INTERN_PAD2_COUNT as usize);
+        h.note_minor_done(GC_MIN_THRESHOLD + INTERN_PREFIX_EXTRA as usize);
         assert!(!h.minor_due(false));
         // The major resets the anchor from its TRUE live count.
         h.note_gc_done(2000);

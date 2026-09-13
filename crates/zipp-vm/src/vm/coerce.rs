@@ -1408,6 +1408,23 @@ impl<'p> Vm<'p> {
         self.add_values(va, vb)
     }
 
+    /// Both operands as fast-tier (i128) BigInt primitives, else None. The
+    /// arithmetic and relational operators check this before any coercion:
+    /// a BigInt primitive is its own ToPrimitive/ToNumeric result, so the
+    /// shortcut changes nothing observable.
+    #[inline]
+    pub(crate) fn small_bigint_pair(&self, va: Value, vb: Value) -> Option<(i128, i128)> {
+        if va.is_heap() && vb.is_heap() {
+            if let (HeapObj::BigInt(x), HeapObj::BigInt(y)) = (
+                self.heap.get(va.heap_index()),
+                self.heap.get(vb.heap_index()),
+            ) {
+                return Some((*x, *y));
+            }
+        }
+        None
+    }
+
     /// Preflight a mutation of a flat guest string. The optimized append paths
     /// bypass ordinary `add_values`, so they must independently enforce both
     /// safe-profile ceilings before touching the uniquely-owned accumulator.
@@ -1449,6 +1466,13 @@ impl<'p> Vm<'p> {
         // compact Int tag and its checked-overflow widening behaviour.
         if va.is_number() && vb.is_number() {
             return Ok(Value::num(va.as_f64() + vb.as_f64()));
+        }
+        // Fast path: two fast-tier BigInts. Primitives pass ToPrimitive
+        // unchanged, so this is unobservable; overflow takes the full path.
+        if let Some((x, y)) = self.small_bigint_pair(va, vb) {
+            if let Some(r) = x.checked_add(y) {
+                return Ok(self.make_bigint(r));
+            }
         }
         // Fast path: string + string (the hot concat shape, incl. jit_concat) —
         // strings pass ToPrimitive unchanged, so skipping it is unobservable.
@@ -2256,6 +2280,9 @@ impl<'p> Vm<'p> {
         if va.is_int() && vb.is_int() {
             return Ok(va.as_int() < vb.as_int());
         }
+        if let Some((x, y)) = self.small_bigint_pair(va, vb) {
+            return Ok(x < y);
+        }
         // Abstract relational comparison: ToPrimitive (number hint) both operands,
         // then compare two strings lexicographically, else numerically. The SOURCE
         // left operand must be coerced first: `<` passes (a,b) with left_first=true;
@@ -2290,6 +2317,9 @@ impl<'p> Vm<'p> {
         let vb = self.get(base, b);
         if va.is_int() && vb.is_int() {
             return Ok(va.as_int() <= vb.as_int());
+        }
+        if let Some((x, y)) = self.small_bigint_pair(va, vb) {
+            return Ok(x <= y);
         }
         // ToPrimitive the SOURCE left operand first (see cmp_lt). `>=` swaps the
         // registers (b,a) with left_first=false so `b` coerces before `a`.

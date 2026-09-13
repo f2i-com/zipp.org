@@ -14,8 +14,7 @@ impl<'a> Emitter<'a> {
             ast::Expr::BinOp(b) => {
                 let a = self.expr(&b.left, depth + 1)?;
                 let c = self.expr(&b.right, depth + 1)?;
-                let op = self.string(binop_name(&b.op))?;
-                self.helper("binop", &[op, a, c])
+                self.arith(&b.op, a, c, false)
             }
             ast::Expr::UnaryOp(u) => {
                 let value = self.expr(&u.operand, depth + 1)?;
@@ -44,7 +43,15 @@ impl<'a> Emitter<'a> {
                 let dst = self.alloc()?;
                 let mut jumps = Vec::new();
                 for (i, value) in b.values.iter().enumerate() {
-                    let value = self.expr(value, depth + 1)?;
+                    // Operands after the first may not be evaluated.
+                    if i > 0 {
+                        self.speculative += 1;
+                    }
+                    let value = self.expr(value, depth + 1);
+                    if i > 0 {
+                        self.speculative -= 1;
+                    }
+                    let value = value?;
                     self.emit(Instr::Move { dst, src: value })?;
                     if i + 1 != b.values.len() {
                         let cond = self.truth(value)?;
@@ -65,10 +72,16 @@ impl<'a> Emitter<'a> {
                 let dst = self.boolean(true)?;
                 let mut jumps = Vec::new();
                 let mut left = self.expr(&c.left, depth + 1)?;
-                for (op, right) in c.ops.iter().zip(c.comparators.iter()) {
-                    let right = self.expr(right, depth + 1)?;
-                    let op = self.string(cmpop_name(op))?;
-                    let value = self.helper("cmp", &[op, left, right])?;
+                for (i, (op, right)) in c.ops.iter().zip(c.comparators.iter()).enumerate() {
+                    if i > 0 {
+                        self.speculative += 1;
+                    }
+                    let right = self.expr(right, depth + 1);
+                    if i > 0 {
+                        self.speculative -= 1;
+                    }
+                    let right = right?;
+                    let value = self.compare_once(op, left, right)?;
                     self.emit(Instr::Move { dst, src: value })?;
                     if c.ops.len() > 1 {
                         let cond = self.truth(value)?;
@@ -155,12 +168,18 @@ impl<'a> Emitter<'a> {
                 let cond = self.truth(value)?;
                 let dst = self.alloc()?;
                 let otherwise = self.jump_if_false(cond)?;
-                let yes = self.expr(&e.body, depth + 1)?;
+                self.speculative += 1;
+                let yes = self.expr(&e.body, depth + 1);
+                self.speculative -= 1;
+                let yes = yes?;
                 self.emit(Instr::Move { dst, src: yes })?;
                 let end = self.jump()?;
                 let here = self.here();
                 self.patch(otherwise, here)?;
-                let no = self.expr(&e.orelse, depth + 1)?;
+                self.speculative += 1;
+                let no = self.expr(&e.orelse, depth + 1);
+                self.speculative -= 1;
+                let no = no?;
                 self.emit(Instr::Move { dst, src: no })?;
                 let here = self.here();
                 self.patch(end, here)?;
@@ -183,8 +202,12 @@ impl<'a> Emitter<'a> {
                     format!("{}.<locals>.<lambda>", self.qualname)
                 };
                 let body = l.body.as_ref();
+                let simple = Emitter::simple_arity(&l.args);
                 let (func_id, child) =
                     self.compile_child(expr, "<lambda>", qualname.clone(), |e| {
+                        if let Some(count) = simple {
+                            e.arity_guard(count)?;
+                        }
                         let value = e.expr(body, depth + 1)?;
                         e.emit(Instr::Return { src: value })?;
                         Ok(())
@@ -269,6 +292,110 @@ impl<'a> Emitter<'a> {
             )),
             ast::Expr::Await(_) => Err(self.error(expr, "'await' is not supported")),
         }
+    }
+
+    /// `a op b` (or the in-place form): int op int runs as VM instructions
+    /// (JS BigInt arithmetic agrees with Python for + - *; `//` and `%` are
+    /// corrected from truncation to floor semantics inline), everything else
+    /// goes through the runtime's dispatch.
+    pub fn arith(&mut self, op: &ast::Operator, a: Reg, b: Reg, inplace: bool) -> R<Reg> {
+        let dst = self.alloc()?;
+        let mut slow_jumps = Vec::new();
+        let mut end_jumps = Vec::new();
+        match op {
+            ast::Operator::Add | ast::Operator::Sub | ast::Operator::Mult => {
+                slow_jumps = self.both_ints(a, b)?;
+                let instr = match op {
+                    ast::Operator::Add => Instr::Add { dst, a, b },
+                    ast::Operator::Sub => Instr::Sub { dst, a, b },
+                    _ => Instr::Mul { dst, a, b },
+                };
+                self.emit(instr)?;
+                end_jumps.push(self.jump()?);
+            }
+            ast::Operator::Mod | ast::Operator::FloorDiv => {
+                slow_jumps = self.both_ints(a, b)?;
+                let zero = self.alloc()?;
+                self.emit(Instr::LoadBigInt { dst: zero, value: 0 })?;
+                let is_zero = self.alloc()?;
+                self.emit(Instr::Eq { dst: is_zero, a: b, b: zero })?;
+                slow_jumps.push(self.jump_if_true(is_zero)?);
+                // Truncating result, then the floor correction when the
+                // remainder is non-zero and the signs differ.
+                let r = self.alloc()?;
+                self.emit(Instr::Mod { dst: r, a, b })?;
+                if matches!(op, ast::Operator::Mod) {
+                    self.emit(Instr::Move { dst, src: r })?;
+                } else {
+                    self.emit(Instr::Div { dst, a, b })?;
+                }
+                let nonzero = self.alloc()?;
+                self.emit(Instr::Ne { dst: nonzero, a: r, b: zero })?;
+                end_jumps.push(self.jump_if_false(nonzero)?);
+                let sa = self.alloc()?;
+                self.emit(Instr::Lt { dst: sa, a, b: zero })?;
+                let sb = self.alloc()?;
+                self.emit(Instr::Lt { dst: sb, a: b, b: zero })?;
+                let same = self.alloc()?;
+                self.emit(Instr::Eq { dst: same, a: sa, b: sb })?;
+                end_jumps.push(self.jump_if_true(same)?);
+                if matches!(op, ast::Operator::Mod) {
+                    self.emit(Instr::Add { dst, a: r, b })?;
+                } else {
+                    let one = self.alloc()?;
+                    self.emit(Instr::LoadBigInt { dst: one, value: 1 })?;
+                    self.emit(Instr::Sub { dst, a: dst, b: one })?;
+                }
+                end_jumps.push(self.jump()?);
+            }
+            _ => {}
+        }
+        let here = self.here();
+        for j in slow_jumps {
+            self.patch(j, here)?;
+        }
+        let name = self.string(binop_name(op))?;
+        let r = self.helper(if inplace { "iop" } else { "binop" }, &[name, a, b])?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let here = self.here();
+        for j in end_jumps {
+            self.patch(j, here)?;
+        }
+        Ok(dst)
+    }
+
+    /// One comparison: int-int ordering and equality as a VM instruction,
+    /// everything else through the runtime.
+    fn compare_once(&mut self, op: &ast::CmpOp, left: Reg, right: Reg) -> R<Reg> {
+        let dst = self.alloc()?;
+        let fast: Option<fn(Reg, Reg, Reg) -> Instr> = match op {
+            ast::CmpOp::Lt => Some(|dst, a, b| Instr::Lt { dst, a, b }),
+            ast::CmpOp::LtE => Some(|dst, a, b| Instr::Le { dst, a, b }),
+            ast::CmpOp::Gt => Some(|dst, a, b| Instr::Gt { dst, a, b }),
+            ast::CmpOp::GtE => Some(|dst, a, b| Instr::Ge { dst, a, b }),
+            ast::CmpOp::Eq => Some(|dst, a, b| Instr::Eq { dst, a, b }),
+            ast::CmpOp::NotEq => Some(|dst, a, b| Instr::Ne { dst, a, b }),
+            _ => None,
+        };
+        let mut end = None;
+        let mut slow_jumps = Vec::new();
+        if let Some(make) = fast {
+            slow_jumps = self.both_ints(left, right)?;
+            self.emit(make(dst, left, right))?;
+            end = Some(self.jump()?);
+        }
+        let here = self.here();
+        for j in slow_jumps {
+            self.patch(j, here)?;
+        }
+        let name = self.string(cmpop_name(op))?;
+        let r = self.helper("cmp", &[name, left, right])?;
+        self.emit(Instr::Move { dst, src: r })?;
+        if let Some(end) = end {
+            let here = self.here();
+            self.patch(end, here)?;
+        }
+        Ok(dst)
     }
 
     fn constant(&mut self, node: &ast::Expr, value: &ast::Constant) -> R<Reg> {
@@ -380,10 +507,12 @@ impl<'a> Emitter<'a> {
         if let ast::Expr::Attribute(a) = c.func.as_ref() {
             let obj = self.expr(&a.value, depth)?;
             let name = self.string(a.attr.as_str())?;
-            let prepared = self.helper("bindmethod", &[obj, name, args, kwargs])?;
-            return self.call_prepared(prepared);
+            return self.helper("callmethod", &[obj, name, args, kwargs]);
         }
         let f = self.expr(&c.func, depth)?;
+        if c.keywords.is_empty() {
+            return self.call_positional(f, args);
+        }
         self.call_value(f, args, kwargs)
     }
 

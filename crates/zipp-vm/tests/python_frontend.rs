@@ -107,7 +107,7 @@ fn classes_exceptions_and_generators() {
 fn unsupported_syntax_is_a_compile_error() {
     for source in [
         "async def f():\n    pass\n",
-        "match x:\n    case 1:\n        pass\n",
+        "type Point = tuple[int, int]\n",
         "x = 1j\n",
         "def f(:\n",
         "x = = 1\n",

@@ -1,0 +1,41 @@
+0 -> small
+2 -> small
+-5 -> negative -5
+7 -> int
+2.5 -> float 2.5
+'hi' -> str 'hi'
+None -> none
+True -> small
+False -> small
+[1, 2] -> pair 1 2
+(1, 2, 3) -> head 1 rest [2, 3]
+[] -> empty seq
+{'name': 'Al', 'age': 3, 'z': 1} -> person Al 3 ['z']
+{'kind': 'circle', 'r': 2} -> circle 2
+{'a': 1} -> mapping
+Point(x=0, y=0) -> origin
+Point(x=3, y=3) -> diag 3
+Point(x=1, y=2) -> point 1,2
+Pair(a=1, b=2) -> pair 1 2
+<Color.RED: 1> -> red
+<Color.GREEN: 2> -> other color
+range(0, 2) -> pair 0 1
+b'xy' -> other bytes
+set() -> other set
+go north -> move north
+go west -> bad direction
+pick up sword -> pick sword
+pick shield up -> pick shield
+drop a b -> drop a,b
+drop -> ?
+x 1 2 3 -> x many
+ -> ?
+nested 1 2 3 4
+capture 5
+mid [2]
+rest {'b': 2}
+bad ok
+TypeError: Bad() accepts 1 positional sub-pattern (2 given)
+TypeError: int() accepts 1 positional sub-pattern (2 given)
+TypeError: called match pattern must be a class
+or-as 3
