@@ -3,8 +3,9 @@ int64/bool tensors with broadcasting, reverse-mode autograd, and the modules,
 functional ops, optimizers and checkpoint format the bundled `torch.nn`,
 `torch.nn.functional`, `torch.optim` and `torch.autograd` provide.
 
-Everything runs on the engine's CPU kernels (`_zipp_tensor`, JavaScript
-typed arrays); there is no GPU device. Semantics follow PyTorch for the
+Eager operations run on the engine's CPU kernels (`_zipp_tensor`, JavaScript
+typed arrays); there is no CUDA device. The experimental compile extension
+records supported inference and SGD training graphs for asynchronous host execution. Semantics follow PyTorch for the
 supported subset; random streams use MT19937 with PyTorch's CPU transforms
 but bit-for-bit agreement with a given PyTorch build is not guaranteed.
 """
@@ -45,7 +46,7 @@ _default_dtype = float32
 class device:
     def __init__(self, kind="cpu"):
         if not (_isinstance(kind, device) or kind in ("cpu", "cpu:0")):
-            raise RuntimeError("Eager Zipp torch supports CPU only; use torch.compile(..., backend='zipp_gpu') for GPU inference")
+            raise RuntimeError("Eager Zipp torch supports CPU only; use torch.compile(..., backend='zipp_gpu') for GPU inference or training")
         self.type = "cpu"
 
     def __repr__(self):
@@ -66,10 +67,10 @@ def _check_cpu_device(value):
         device(value)
 
 
-def compile(model=None, *, backend="zipp_gpu"):
-    """Record supported float32 inference; submit(callback) executes on the host."""
+def compile(model=None, *, backend="zipp_gpu", training=False):
+    """Record float32 inference or SGD training; submit(callback) executes on the host."""
     from torch._gpu import compile as compile_gpu
-    return compile_gpu(model, backend=backend)
+    return compile_gpu(model, backend=backend, training=training)
 
 
 class _TensorIter:

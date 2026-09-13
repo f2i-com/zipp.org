@@ -7,6 +7,8 @@ function cases(){
     const a=Array.from({length},(_,i)=>(i%19-9)/3),b=Array.from({length},(_,i)=>(i%7-3)/5);
     result.push([`multiply/add/relu/sum length ${length}`,program([input(0,a),input(1,b),{id:2,op:'mul',a:0,b:1},{id:3,op:'add',a:2,b:0},{id:4,op:'relu',a:3},{id:5,op:'sum',a:4}])]);
   }
+  result.push(['rectangular transpose',program([input(0,[1,2,3,4,5,6],[2,3]),{id:1,op:'transpose',a:0}])]);
+  result.push(['ReLU gradient including zero',program([input(0,[-2,-0.0,0,1,3]),{id:1,op:'positive',a:0}])]);
   result.push(['scalar-left subtraction',program([input(0,[10],[]),input(1,[1,2,3,4,5]),{id:2,op:'sub',a:0,b:1}])]);
   result.push(['constant fill',program([{id:0,op:'full',shape:[7,9],value:0.125}])]);
   for(const [m,k,n] of [[1,1,1],[2,3,7],[17,13,9]])result.push([`matmul ${m}x${k}x${n}`,program([

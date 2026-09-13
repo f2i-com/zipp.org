@@ -53,5 +53,5 @@ test('WebGPU contract mock: lost device fails closed',async()=>{
 });
 for(const backend of ['cpu-js','wasm'])test(`portable browser acceptance cases also pass in Node: ${backend}`,async()=>{
   const wasmBytes=await readFile(new URL('../wasm/kernels.wasm',import.meta.url));const report=await checkBackend(backend,{wasmBytes});
-  assert.equal(report.status,'passed',JSON.stringify(report));assert.equal(report.passed,15);
+  assert.equal(report.status,'passed',JSON.stringify(report));assert.equal(report.passed,17);
 });

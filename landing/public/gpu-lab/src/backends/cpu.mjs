@@ -14,6 +14,8 @@ export class CPUBackend {
           out[i] = n.op === 'add' ? x + y : n.op === 'sub' ? x - y : x * y;
         } break;
       case 'relu': for (let i = 0; i < n.size; i++) out[i] = Math.max(0, a[i]); break;
+      case 'positive': for (let i=0;i<n.size;i++) out[i]=a[i]>0?1:0; break;
+      case 'transpose': for (let i=0;i<n.size;i++) out[i]=a[(i%n.shape[1])*n.shape[0]+Math.floor(i/n.shape[1])]; break;
       case 'sum': {
         // Pairwise reduction matches the GPU tree topology more closely than a double-precision sum.
         let work = a.slice();

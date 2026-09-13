@@ -29,6 +29,8 @@ export class WasmBackend {
       case 'add': case 'sub': case 'mul':
         this.e.binary(a,b,o.ptr,n.size,+n.aScalar,+n.bScalar,{add:0,sub:1,mul:2}[n.op]); break;
       case 'relu': this.e.relu(a,o.ptr,n.size); break;
+      case 'positive': this.e.positive(a,o.ptr,n.size); break;
+      case 'transpose': this.e.transpose(a,o.ptr,n.inputShape[0],n.inputShape[1]); break;
       case 'matmul': this.e.matmul(a,b,o.ptr,n.m,n.k,n.n); break;
       case 'life': this.e.life(a,o.ptr,n.shape[0],n.shape[1]); break;
       case 'sum': {

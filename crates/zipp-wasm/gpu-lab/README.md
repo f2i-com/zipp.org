@@ -15,7 +15,9 @@ and an animated Game of Life grid. The console reports the actual backend.
 Python compiles to Zipp bytecode and executes inside the WASM Worker. Its built-in
 `zipp_gpu` module records graphs; `src/zipp-python-adapter.mjs` drains
 `takeHostRequests()` and calls `pythonCall("__zipp_py_deliver", ...)` with results.
-The bundled `torch` subset is CPU-only. General Python is not compiled to shaders.
+The bundled `torch` subset is eager CPU-only; experimental `torch.compile` records
+supported GPU inference and dense-model SGD training. General Python is not
+compiled to shaders. See the [Torch compatibility guide](../../../docs/TORCH_COMPATIBILITY.md).
 
 ## Use JavaScript directly
 
@@ -28,7 +30,7 @@ it is not automatically granted browser APIs by the stock playground.
 ## Diagnostic demo
 
 `python scripts/serve.py` serves `demo/` with no npm install. It runs graphs
-previously exported from `python/zipp_gpu.py`, rather than executing the displayed
+previously exported from `../../zipp-vm/src/frontend/python/lib/shared/zipp_gpu.py`, rather than executing the displayed
 Python source. Use the project playground above to run/edit Python itself.
 The native `examples/run_native.py` harness uses installed CPython and Node.
 
@@ -40,7 +42,7 @@ selection fails if unavailable. Hardware GPU paths reject recognized software
 renderers. Browser/OS policy selects one adapter; this does not pool GPUs.
 
 Supported operations are input/full tensors, scalar or shape-matched add/sub/mul,
-ReLU, matrix multiplication, sum and toroidal Life. Only named outputs are read
+ReLU, positive masks, matrix transpose/multiplication, sum and toroidal Life. Only named outputs are read
 back. Inputs and outputs are finite float32. One graph runs at a time; await it
 before submitting another. Dispose the runtime after outstanding work finishes.
 
@@ -61,7 +63,7 @@ The adapter also bounds pending requests and rejects work after tenant invalidat
 - `src/runtime.mjs`, `src/backends/`: scheduling, shaders, fallback kernels and cleanup.
 - `src/zipp-python-adapter.mjs`: actual Python host bridge.
 - `src/zipp-adapter.mjs`, `src/zipp-guest.js`: opt-in JavaScript guest integration.
-- `python/zipp_gpu.py`: native Python graph authoring/export library.
+- `../../zipp-vm/src/frontend/python/lib/shared/zipp_gpu.py`: native Python graph authoring/export library.
 - `wasm/kernels.c`, `wasm/kernels.wasm`: freestanding C kernels and included binary.
 - `tests/`: numerical checks, allocation/lifecycle mocks and browser cases.
 - `docs/INTEGRATION.md`, `docs/ARCHITECTURE.md`, `docs/VALIDATION.md`: contracts and evidence.
@@ -75,13 +77,16 @@ python examples/run_native.py
 ```
 
 After building a Python-enabled Node package in `../tests/node/pkg`, run
-`node ../tests/node/python-frontend.cjs` and `node ../tests/node/python-gpu.cjs`.
+`node ../tests/node/python-frontend.cjs`, `node ../tests/node/python-gpu.cjs`
+and `node ../tests/node/python-training.cjs`.
 The dedicated Python CI lane builds this artifact explicitly and asserts Python
 is enabled. Real WebGL2/WebGPU execution requires browser hardware: use the demo's
 **Check all backends**, or `landing/scripts/smoke-browser.py` with `REQUIRE_GPU=1`.
 A missing GPU is not a successful GPU check.
 
 Rebuild the standalone kernel with `sh scripts/build_wasm.sh` using Clang/wasm-ld.
+On Windows, use `./scripts/build_wasm.ps1` (LLVM defaults to
+`C:\Program Files\LLVM\bin`; override with `-LlvmDirectory`).
 The kernel module is separate from Zipp WASM; rebuilding it does not rebuild Python.
 
 This remains an experimental graph engine: no kernel fusion, tiled matrix multiply,

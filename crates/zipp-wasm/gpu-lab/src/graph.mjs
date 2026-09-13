@@ -78,10 +78,11 @@ export function validateProgram(program, overrides = {}) {
         n.shape = [...(a.shape.length === 0 ? b.shape : a.shape)];
         n.aScalar = a.shape.length === 0; n.bScalar = b.shape.length === 0; break;
       }
-      case 'relu': case 'sum': case 'life': {
+      case 'relu': case 'sum': case 'life': case 'positive': case 'transpose': {
         keys(raw, ['id', 'op', 'a'], ['a']); const a = ref('a');
         check(raw.op !== 'life' || a.shape.length === 2, 'SHAPE', 'life requires a matrix');
-        n.shape = raw.op === 'sum' ? [] : [...a.shape];
+        check(raw.op !== 'transpose' || a.shape.length === 2, 'SHAPE', 'transpose requires a matrix');
+        n.shape = raw.op === 'sum' ? [] : raw.op === 'transpose' ? [a.shape[1], a.shape[0]] : [...a.shape];
         n.inputSize = a.size; n.inputShape = [...a.shape];
         units = a.size * (raw.op === 'life' ? 9 : raw.op === 'sum' ? 2 : 1); break;
       }

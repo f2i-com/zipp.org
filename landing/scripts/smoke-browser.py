@@ -134,6 +134,19 @@ def main():
             assert not page.locator('#console .error').count(), page.locator('#console').inner_text()
             page.screenshot(path=str(OUT / f'torch-{backend}.png'))
             page.locator('#stop').click()
+        sample(page, 'training', 'torch-training')
+        for backend in backends:
+            page.locator('#gpu-backend').select_option(backend)
+            run(page, f'GPU training: {backend}')
+            expect(page.locator('#console')).to_contain_text('step 100 / 100', timeout=120000)
+            console = page.locator('#console').inner_text()
+            losses = [float(value) for value in re.findall(r'loss ([0-9.]+)', console)]
+            assert len(losses) == 5 and losses[-1] < losses[0] / 4, console
+            assert not page.locator('#console .error').count(), console
+            page.locator('#file-list').get_by_text('model.py', exact=True).click()
+            page.screenshot(path=str(OUT / f'training-{backend}.png'))
+            print(f'{backend}: training loss {losses[0]} -> {losses[-1]} over 100 steps', flush=True)
+            page.locator('#stop').click()
         assert not errors, errors
         assert not failed, failed
         browser.close()

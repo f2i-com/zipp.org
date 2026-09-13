@@ -33,7 +33,7 @@ for (const name of ['index.html', 'playground.css', 'playground.js', 'engine.wor
 await copyTree(path.join(root, 'crates/zipp-wasm/gpu-lab/src'), path.join(output, 'gpu-lab/src'))
 await mkdir(path.join(output, 'gpu-lab/wasm'), { recursive: true })
 await copyFile(path.join(root, 'crates/zipp-wasm/gpu-lab/wasm/kernels.wasm'), path.join(output, 'gpu-lab/wasm/kernels.wasm'))
-for (const folder of ['python/project', 'python/langtons_ant', 'python/gpu', 'python/torch_gpu', 'js/project']) {
+for (const folder of ['python/project', 'python/langtons_ant', 'python/gpu', 'python/torch_gpu', 'python/torch_training', 'js/project']) {
   await copyTree(path.join(root, 'examples', folder), path.join(output, 'examples', folder), name => /\.(py|js)$/.test(name))
 }
 

@@ -16,6 +16,10 @@ class Optimizer:
         self.state = {}
 
     def zero_grad(self, set_to_none=True):
+        from torch._gpu import active_capture
+        capture = active_capture()
+        if capture is not None:
+            return capture.zero_grad(self, set_to_none)
         for g in self.param_groups:
             for p in g["params"]:
                 if set_to_none:
@@ -49,6 +53,10 @@ class SGD(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        from torch._gpu import active_capture
+        capture = active_capture()
+        if capture is not None:
+            return capture.sgd(self, closure)
         loss = closure() if closure is not None else None
         for g, p in self._params():
             grad = p.grad
@@ -74,6 +82,10 @@ class Adam(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        from torch._gpu import active_capture
+        capture = active_capture()
+        if capture is not None:
+            raise NotImplementedError("Compiled GPU training currently supports SGD only")
         loss = closure() if closure is not None else None
         for g, p in self._params():
             grad = p.grad
@@ -117,6 +129,10 @@ class RMSprop(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        from torch._gpu import active_capture
+        capture = active_capture()
+        if capture is not None:
+            raise NotImplementedError("Compiled GPU training currently supports SGD only")
         loss = closure() if closure is not None else None
         for g, p in self._params():
             grad = p.grad

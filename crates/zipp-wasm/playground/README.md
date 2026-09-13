@@ -128,10 +128,13 @@ standard modules; no `async` or real files). GPU graphs are validated and
 bounded again by the host runtime (node count, tensor sizes, work and
 allocation budgets) and served one at a time, at most 16 pending.
 
-## Torch inference
+## Torch inference and training
 
 Choose **Samples → Python: Torch ML inference (GPU)** to run a supported
 `torch.nn` model through `torch.compile(model)` on the selected backend.
 No `zipp_gpu` import is needed. `.submit(callback)` delivers a CPU tensor after
-the GPU completes; this is an experimental inference extension, not full
-PyTorch or GPU autograd. See the [compatibility guide](../../../docs/TORCH_COMPATIBILITY.md).
+the GPU completes; this is an experimental asynchronous extension, not full
+PyTorch. **Samples → Python: Torch ML training (GPU)** adds a live loss curve
+for a dense ReLU network trained using MSE and SGD. `torch.compile(training=True)`
+records forward, backward and updates. Each call uploads weights and reads them
+back; persistent compiled models and GPU Conv2d are not implemented. See the [compatibility guide](../../../docs/TORCH_COMPATIBILITY.md).

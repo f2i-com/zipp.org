@@ -35,7 +35,7 @@ frontends use the same engine, with native and WebAssembly builds.
   and data, with an editor, virtual files, console and graphics in one place.
 - **Start with familiar ML code.** The bundled Torch subset supports eager CPU
   tensors, autograd and training. Experimental `torch.compile(model)` records
-  supported inference for WebGPU, WebGL2 or an explicit CPU fallback.
+  supported inference and dense-model SGD training for WebGPU, WebGL2 or an explicit CPU fallback.
 - **Keep the host in control.** Execution budgets and explicit host capabilities
   let embedders decide which resources a program can use.
 - **Explore one engine across languages.** An optional trusted-code build adds
@@ -78,10 +78,10 @@ Your model, tensor creation and forward pass use the supported Torch API.
 Zipp records the inference graph and the host executes it on the selected
 backend. **`submit(callback)` is a Zipp extension:** browser GPU completion is
 asynchronous; this is not a drop-in implementation of PyTorch's `torch.compile`.
-It currently supports float32 inference, not GPU autograd or CUDA scripts.
+It supports float32 inference and an opt-in dense-model GPU training path; it does not run CUDA scripts.
 The callback receives a regular CPU Torch-compatible tensor. Eager CPU
 `nn.Conv2d` also supports forward/backward passes and optimizer updates;
-GPU convolution and GPU training remain future work.
+GPU convolution remains future work.
 
 Try **Samples → Python: Torch ML inference (GPU)** in the playground. The
 [complete example](examples/python/torch_gpu/main.py) draws its predictions and
@@ -89,6 +89,49 @@ checks them against eager inference with the same weights. Explicit GPU selectio
 fails visibly if unavailable; automatic selection reports the backend it used.
 
 [![Torch model predictions computed on WebGL2 from Python in Zipp WASM](landing/public/demos/torch-inference.png)](examples/python/torch_gpu/main.py)
+
+## Train a small model on the browser GPU
+
+The ordinary training step stays familiar:
+
+```python
+import torch.nn.functional as F
+
+optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+target = torch.tensor([[1.0], [2.0]])
+
+def train_step(x, target):
+    optimizer.zero_grad()
+    loss = F.mse_loss(model(x), target)
+    loss.backward()
+    optimizer.step()
+    return loss
+
+compiled_step = torch.compile(train_step, training=True)
+compiled_step(x, target).submit(lambda loss: print(loss.item()))
+```
+
+**`training=True` and `.submit(...)` are experimental Zipp extensions**, not
+PyTorch's synchronous `torch.compile` API. Forward computation, first-order
+gradients and SGD updates execute on the selected backend. The success callback
+receives the loss after the CPU model's weights and gradients have been updated.
+Wait for that callback before recording the next step.
+
+Try **Samples → Python: Torch ML training (GPU)** to watch a small network learn
+`y = x²`, with predictions and a live loss curve. Its
+[model and training step](examples/python/torch_training/model.py) also run in
+native PyTorch; the [playground driver](examples/python/torch_training/main.py)
+provides asynchronous scheduling and graphics.
+
+[![Torch training on WebGL2: Python source, learned curve and falling loss](landing/public/demos/torch-training.png)](examples/python/torch_training/model.py)
+
+This first path supports float32 dense layers, ReLU, MSE and SGD without momentum.
+**Each call captures a new graph, uploads inputs and weights, and reads back the
+loss, gradients and updated weights.** There is no `compiled.prepare()` API,
+resident model/optimizer state, graph cache or multi-GPU training yet. Small
+examples demonstrate correctness, not a GPU speedup. See the
+[Torch compatibility guide](docs/TORCH_COMPATIBILITY.md) for supported operations,
+limits and failure behavior. NCA experiments remain in their separate repository.
 
 ## Python and JavaScript inside one VM
 
@@ -323,7 +366,7 @@ library also includes a `torch` subset (tensors over typed arrays with
 reverse-mode autograd, `nn`, `nn.functional`, `optim`, `save`/`load` in
 supported PyTorch checkpoint layouts) that runs on the engine's CPU kernels, so
 supported ML code can train and evaluate inside Zipp. Eager execution is CPU;
-`torch.compile(model)` adds the supported asynchronous GPU inference path. The scope
+`torch.compile` adds supported asynchronous GPU inference and dense-model SGD training. The scope
 matrix, limits and the bytecode design are in
 [docs/PYTHON_FRONTEND_EXPERIMENT.md](docs/PYTHON_FRONTEND_EXPERIMENT.md). The
 feature is on by default in the CLI (`--no-default-features` builds the

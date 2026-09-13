@@ -127,6 +127,14 @@ class Tensor:
         """Reduce all elements to one float32 scalar."""
         return self._graph._unary("sum", self, ())
 
+    def transpose(self):
+        if len(self.shape) != 2:
+            raise GraphError("transpose requires a matrix")
+        return self._graph._unary("transpose", self, (self.shape[1], self.shape[0]))
+
+    def positive(self):
+        return self._graph._unary("positive", self, self.shape)
+
     def life(self):
         """One toroidal Conway-style life step. Not a trained neural model."""
         if len(self.shape) != 2:
@@ -303,6 +311,14 @@ def execute_locally(program):
         elif op == "relu":
             shape = shapes[node["a"]]
             out = [v if v > 0 else 0.0 for v in values[node["a"]]]
+        elif op == "positive":
+            shape = shapes[node["a"]]
+            out = [1.0 if v > 0 else 0.0 for v in values[node["a"]]]
+        elif op == "transpose":
+            h, w = shapes[node["a"]]
+            shape = (w, h)
+            a = values[node["a"]]
+            out = [a[r * w + c] for c in range(w) for r in range(h)]
         elif op == "sum":
             shape = ()
             out = [_pairwise_sum(values[node["a"]])]

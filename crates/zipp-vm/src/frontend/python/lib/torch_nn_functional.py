@@ -6,6 +6,8 @@ import _zipp_tensor as _k
 
 
 def linear(x, weight, bias=None):
+    if getattr(x, "_zipp_graph", False):
+        return x.linear(weight, bias)
     out = torch.matmul(x, weight.transpose(0, 1))
     return out if bias is None else out + bias
 

@@ -68,6 +68,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         case 'add': case 'sub': case 'mul':
           await this.dispatch(out,refs,`resultData[i] = aData[${n.aScalar?'0u':'i'}] ${{add:'+',sub:'-',mul:'*'}[n.op]} bData[${n.bScalar?'0u':'i'}];`); break;
         case 'relu': await this.dispatch(out,refs,'resultData[i] = max(aData[i], 0.0);'); break;
+        case 'positive': await this.dispatch(out,refs,'resultData[i] = select(0.0,1.0,aData[i] > 0.0);'); break;
+        case 'transpose': await this.dispatch(out,refs,`resultData[i] = aData[(i % ${n.shape[1]}u) * ${n.shape[0]}u + i / ${n.shape[1]}u];`); break;
         case 'matmul': await this.dispatch(out,refs,`
           let row = i / ${n.n}u; let col = i % ${n.n}u;
           var total: f32 = 0.0;

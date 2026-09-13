@@ -12,6 +12,15 @@ class GraphTests(unittest.TestCase):
         self.assertEqual([n["op"] for n in p["nodes"]],["input","input","mul","input","add","relu","sum"])
         self.assertEqual(c.shape,(2,)); self.assertEqual(c.dtype,"float32")
 
+    def test_gradient_kernels(self):
+        from zipp_gpu import execute_locally
+        g=Graph(); a=g.tensor([[-1,0,2],[3,-4,5]])
+        out=execute_locally(g.program(result=a.transpose(), mask=a.positive()))
+        self.assertEqual(out["outputs"]["result"]["shape"], [3,2])
+        self.assertEqual(out["outputs"]["result"]["data"], [-1,3,0,-4,2,5])
+        self.assertEqual(out["outputs"]["mask"]["data"], [0,0,1,1,0,1])
+        with self.assertRaises(GraphError): g.tensor([1,2]).transpose()
+
     def test_matrix_multiply_shape(self):
         g=Graph(); a=g.tensor([[1,2,3],[4,5,6]]); b=g.tensor([[1],[2],[3]])
         self.assertEqual((a@b).shape,(2,1))

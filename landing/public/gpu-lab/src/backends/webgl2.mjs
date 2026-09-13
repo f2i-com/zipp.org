@@ -110,6 +110,8 @@ export class WebGL2Backend {
         case 'add':case 'sub':case 'mul':
           this.dispatch(out,refs,`value=A(${n.aScalar?'0':'i'})${{add:'+',sub:'-',mul:'*'}[n.op]}B(${n.bScalar?'0':'i'});`);break;
         case 'relu':this.dispatch(out,refs,'value=max(A(i),0.);');break;
+        case 'positive':this.dispatch(out,refs,'value=A(i)>0.?1.:0.;');break;
+        case 'transpose':this.dispatch(out,refs,`value=A((i%${n.shape[1]})*${n.shape[0]}+i/${n.shape[1]});`);break;
         case 'matmul':this.dispatch(out,refs,`int row=i/${n.n};int col=i%${n.n};
           for(int k=0;k<${n.k};k++){value+=A(row*${n.k}+k)*B(k*${n.n}+col);}`);break;
         case 'sum': {

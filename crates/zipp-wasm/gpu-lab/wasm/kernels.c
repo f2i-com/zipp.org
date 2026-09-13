@@ -21,3 +21,8 @@ void life(const float*a,float*o,int h,int w){
   o[y*w+x]=(count==3||(count==2&&a[y*w+x]>0.5f))?1:0;
  }
 }
+
+__attribute__((export_name("positive")))
+void positive(const float*a,float*o,int n){for(int i=0;i<n;i++)o[i]=a[i]>0?1:0;}
+__attribute__((export_name("transpose")))
+void transpose(const float*a,float*o,int h,int w){for(int r=0;r<h;r++)for(int c=0;c<w;c++)o[c*h+r]=a[r*w+c];}

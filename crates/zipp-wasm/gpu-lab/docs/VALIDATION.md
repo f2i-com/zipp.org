@@ -54,3 +54,26 @@ Windows / Chrome 152 / NVIDIA GeForce RTX 5090:
   still reports pre-existing formatting differences in unrelated engine files.
 
 These are local results. The updated manual/reusable CI lane has not been run on GitHub.
+
+## Dense GPU training acceptance — 13 September 2026
+
+- Six native Torch tests passed, including five-step PyTorch loss/gradient/weight
+  parity and shared-parameter/input-gradient accumulation.
+- Actual WASM training passed with JavaScript and standalone WASM kernels;
+  backend failure, duplicate submission, stale weight/gradient/metadata changes
+  and unsupported optimizer options are checked before committing results.
+- Hardware WebGL2 (RTX 5090 / ANGLE D3D11) and WebGPU (NVIDIA Blackwell)
+  each passed 17 kernel cases and five training steps against CPU PyTorch 2.11.
+  Maximum absolute error across loss, gradients and weights was 7.45e-9 on
+  WebGL2 and zero on WebGPU for this fixture. Reproduce with
+  `python crates/zipp-wasm/tests/browser-training.py http://127.0.0.1:8766`
+  while serving the repository root at that URL.
+- 60 Node runtime tests, 13 native graph tests, 57 WASM frontend checks,
+  29 WASM GPU bridge checks and the WASM CPU Conv2d fixture passed.
+- Production playground acceptance passed on WASM, WebGL2 and WebGPU, including
+  100 training steps with loss 0.05558 → 0.00383, alongside Life, inference,
+  embedded Python, folder upload/VFS, media controls and responsive layout.
+
+Training records/uploads every call and reads back loss, gradients and updated
+weights. These measurements establish correctness, not speedup, resident model
+state, GPU Conv2d or multi-GPU training. The archive above is unchanged.

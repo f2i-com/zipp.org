@@ -16,6 +16,7 @@ const SKIP_DIRS = new Set([".git", "__pycache__", "node_modules", "target", ".ve
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_PROJECT_BYTES = 64 * 1024 * 1024;
 const SAMPLES = {
+  training: { name: "torch-training", entry: "main.py", base: "../../../examples/python/torch_training/", files: ["main.py", "model.py"] },
   torch: { name: "torch-inference", entry: "main.py", base: "../../../examples/python/torch_gpu/", files: ["main.py"] },
   python: { name: "python-balls", entry: "main.py", base: "../../../examples/python/project/", files: ["main.py", "physics.py"] },
   javascript: { name: "js-balls", entry: "main.js", base: "../../../examples/js/project/", files: ["physics.js", "main.js"] },
