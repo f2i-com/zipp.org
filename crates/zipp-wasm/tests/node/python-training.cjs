@@ -93,6 +93,50 @@ def duplicate():
     adapter.invalidate(); runtime.dispose(); e.dispose();
     console.log(`${backend}: 5-step PyTorch loss/gradient/weight parity; failure, duplicate and stale-result checks passed`);
   }
+  const edgeSource = await fs.readFile(path.join(root, 'crates/zipp-vm/tests/fixtures/torch_training_edges.py'), 'utf8');
+  const edgeProgram = edgeSource + `
+compiled = torch.compile(step, training=True)
+pending = None
+def record():
+    global pending
+    pending = compiled(x)
+def submit():
+    pending.submit(lambda loss: print('loss', loss.item()), lambda error: print('FAILED', str(error)))
+`;
+  for (const backend of ['cpu-js', 'wasm']) {
+    const runtime = await createRuntime({backend, wasmBytes});
+    // A leaf first seen under no_grad still contributes to later recorded ops.
+    // The detached branch contributes to loss, but must not contribute gradients.
+    const e = new Engine(); e.initPythonProject({main:edgeProgram}, 'main');
+    const adapter = createPythonGPUAdapter(e, runtime, {allowExecute:true});
+    e.pythonCall('record', []); e.pythonCall('submit', []);
+    adapter.drain(); await adapter.idle();
+    assert.deepEqual(e.takeOutput(), ['loss 202.0']);
+    const result = e.pythonCall('values', []);
+    assert.ok(Math.abs(result[0] - 1.9) < 1e-6);
+    assert.deepEqual(result.slice(1), [3, 1, 7]);
+    adapter.invalidate(); e.dispose();
+    // Check both changes before submit and changes while work is pending.
+    for (const timing of ['before-submit', 'pending']) {
+      for (const option of ['lr','weight_decay','maximize','momentum','dampening','nesterov','append','replace','remove','add_group','reorder_groups','remove_group','remove_option']) {
+        const e = new Engine(); e.initPythonProject({main:edgeProgram}, 'main');
+        const adapter = createPythonGPUAdapter(e, runtime, {allowExecute:true});
+        const before = e.pythonCall('values', []);
+        e.pythonCall('record', []);
+        if (timing === 'before-submit') e.pythonCall('change_optimizer', [option]);
+        e.pythonCall('submit', []);
+        if (timing === 'pending') e.pythonCall('change_optimizer', [option]);
+        adapter.drain(); await adapter.idle();
+        const lines = e.takeOutput();
+        assert.equal(lines.length, 1);
+        assert.match(lines[0], /FAILED.*stale.*optimizer changed/, `${backend} ${timing} ${option}`);
+        assert.deepEqual(e.pythonCall('values', []), before, `${option}: all weights/gradients, including q.grad, must survive`);
+        adapter.invalidate(); e.dispose();
+      }
+    }
+    runtime.dispose();
+    console.log(`${backend}: no_grad leaf/operation semantics and 26 optimizer mutation cases passed`);
+  }
   const rejectionSource = source + `
 compiled = torch.compile(train_step, training=True)
 for option in ['momentum', 'dampening', 'nesterov']:

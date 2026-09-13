@@ -18,6 +18,7 @@ with sync_playwright() as p:
       const {checkBackend} = await import(root + 'gpu-lab/tests/browser-cases.mjs');
       const source = await (await fetch('/crates/zipp-vm/tests/fixtures/torch_training.py')).text();
       const expected = await (await fetch('/crates/zipp-vm/tests/fixtures/torch_training_expected.json')).json();
+      const edgeSource = await (await fetch('/crates/zipp-vm/tests/fixtures/torch_training_edges.py')).text();
       const reports = [];
       for (const backend of ['webgl2', 'webgpu']) {
         const cases = await checkBackend(backend);
@@ -46,7 +47,27 @@ def request():
             });
           }
           if (events.some(e=>!e.delivered || !e.reply.ok || e.error)) throw Error('GPU callback failed');
-          reports.push({backend, info:rt.info(), steps:5, kernelCases:cases.passed, maxError});
+          const edge = new wasm.Engine();
+          const edgeAdapter = createPythonGPUAdapter(edge, rt, {allowExecute:true});
+          try {
+            edge.initPythonProject({main:edgeSource + `
+compiled = torch.compile(step, training=True)
+def request():
+    compiled(x).submit(lambda loss: print(loss.item()), lambda error: print('FAILED', str(error)))
+`}, 'main');
+            edge.pythonCall('request', []); edgeAdapter.drain(); await edgeAdapter.idle();
+            if (JSON.stringify(edge.takeOutput()) !== '["202.0"]') throw Error('no_grad loss mismatch');
+            const state = edge.pythonCall('values', []);
+            if (Math.abs(state[0]-1.9)>1e-6 || state[2]!==1 || state[3]!==7) throw Error('no_grad gradient mismatch');
+            for (const kind of ['lr', 'append']) {
+              const before = edge.pythonCall('values', []);
+              edge.pythonCall('request', []); edge.pythonCall('change_optimizer', [kind]);
+              edgeAdapter.drain(); await edgeAdapter.idle();
+              if (!/FAILED.*stale.*optimizer changed/.test(edge.takeOutput()[0])) throw Error('Changed optimizer was accepted');
+              if (JSON.stringify(edge.pythonCall('values', [])) !== JSON.stringify(before)) throw Error('Stale commit changed tensors');
+            }
+          } finally { edgeAdapter.invalidate(); edge.dispose(); }
+          reports.push({backend, info:rt.info(), steps:5, kernelCases:cases.passed, maxError, noGradAndOptimizerRaces:'passed'});
         } finally { adapter.invalidate(); rt.dispose(); e.dispose(); }
       }
       return reports;

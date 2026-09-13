@@ -13,7 +13,7 @@
 // `setPythonInput`); JavaScript programs get an identical `ui` object from
 // the one-line shim below and the ordinary JavaScript ABI (`callFunction`,
 // global slots). Either way the page sees the same command arrays.
-import init, { Engine, zippProfile } from "../playground-runtime/zipp_wasm.js?v=17dfec43c1f378c6";
+import init, { Engine, zippProfile } from "../playground-runtime/zipp_wasm.js?v=986d8e6c85515665";
 import { createRuntime } from "../gpu-lab/src/runtime.mjs";
 import { createPythonGPUAdapter } from "../gpu-lab/src/zipp-python-adapter.mjs";
 
@@ -42,7 +42,7 @@ const UI_SHIM =
   'height: function () { return __input.h; } ' +
   '}); })();';
 
-const ready = init({ module_or_path: new URL("../playground-runtime/zipp_wasm_bg.wasm?v=17dfec43c1f378c6", import.meta.url) }).then(() => JSON.parse(zippProfile()));
+const ready = init({ module_or_path: new URL("../playground-runtime/zipp_wasm_bg.wasm?v=986d8e6c85515665", import.meta.url) }).then(() => JSON.parse(zippProfile()));
 
 let engine = null;
 let language = null;

@@ -217,3 +217,54 @@ print('shared and input gradients', index)
 "#).unwrap();
     assert_eq!(out, ["shared and input gradients 2"]);
 }
+
+#[test]
+fn compiled_training_preserves_leaf_grad_across_no_grad() {
+    let source = format!(
+        "{}\n{}",
+        include_str!("fixtures/torch_training_edges.py"),
+        r#"
+compiled = torch.compile(step, training=True)
+compiled(x).submit(lambda loss: print(loss.item(), [round(v, 5) for v in values()]))
+"#
+    );
+    assert_eq!(run(&source).unwrap(), ["202.0 [1.9, 3.0, 1.0, 7.0]"]);
+}
+
+#[test]
+fn compiled_training_rejects_optimizer_changes_since_capture() {
+    let fixture = include_str!("fixtures/torch_training_edges.py");
+    for option in [
+        "lr",
+        "weight_decay",
+        "maximize",
+        "momentum",
+        "dampening",
+        "nesterov",
+        "append",
+        "replace",
+        "remove",
+        "add_group",
+        "reorder_groups",
+        "remove_group",
+        "remove_option",
+    ] {
+        let source = format!(
+            "{fixture}\noption = {option:?}\n{}",
+            r#"
+pending = torch.compile(step, training=True)(x)
+change_optimizer(option)
+pending.submit(lambda loss: print('unexpected success'), lambda error: print(str(error)))
+print(values())
+"#
+        );
+        assert_eq!(
+            run(&source).unwrap(),
+            [
+                "GPU training result is stale; optimizer changed before completion",
+                "[2.0, 3.0, 11.0, 7.0]"
+            ],
+            "{option}"
+        );
+    }
+}

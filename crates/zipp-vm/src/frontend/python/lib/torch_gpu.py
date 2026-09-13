@@ -13,6 +13,15 @@ def active_capture():
     return _active
 
 
+def _sgd_configuration(optimizer):
+    # Keep values and parameter identities, never aliases to mutable groups/lists.
+    options = ("lr", "weight_decay", "maximize", "momentum", "dampening", "nesterov")
+    return (id(optimizer), tuple(
+        (tuple(id(p) for p in group["params"]), tuple(group[name] for name in options))
+        for group in optimizer.param_groups
+    ))
+
+
 class _Capture:
     def __init__(self, training=False):
         self.graph = Graph()
@@ -24,6 +33,8 @@ class _Capture:
         self.grads = {}
         self.updates = []
         self.optimizer = None
+        self.optimizer_snapshot = None
+        self.optimizer_params = ()
         self.did_backward = False
         self.did_step = False
 
@@ -79,6 +90,8 @@ class _Capture:
             raise NotImplementedError("GPU SGD does not support closures")
         if optimizer is not self.optimizer or not self.did_backward or self.did_step:
             raise RuntimeError("GPU training requires one zero_grad/backward/step with the same SGD optimizer")
+        self.optimizer_snapshot = _sgd_configuration(optimizer)
+        self.optimizer_params = tuple(p for group in optimizer.param_groups for p in group["params"])
         seen = set()
         for group in optimizer.param_groups:
             if group["momentum"] or group["dampening"] or group["nesterov"]:
@@ -105,7 +118,7 @@ class _Capture:
 
 
 class _Tensor:
-    def __init__(self, capture, value, parents=(), pullback=None, requires_grad=False):
+    def __init__(self, capture, value, parents=(), pullback=None, requires_grad=None):
         self._capture = capture
         self._value = value
         self._zipp_graph = True
@@ -113,7 +126,12 @@ class _Tensor:
         self.dtype = torch.float32
         self.parents = parents
         self.pullback = pullback
-        self.requires_grad = capture.training and torch.is_grad_enabled() and (requires_grad or any(p.requires_grad for p in parents))
+        # Explicit requires_grad describes a source leaf. no_grad suppresses
+        # operation recording, but must not change a cached leaf's intrinsic flag.
+        self.requires_grad = capture.training and (
+            requires_grad if requires_grad is not None
+            else torch.is_grad_enabled() and any(p.requires_grad for p in parents)
+        )
         if self.requires_grad:
             capture.tape.append(self)
 
@@ -194,7 +212,7 @@ class GPUResult:
             raise RuntimeError("A GPU training result can only be submitted once")
         outputs = {"result": self._value._value}
         leaves = [entry for entry in capture.inputs.values() if id(entry[1]) in capture.grads]
-        optimizer_ids = set(id(p) for group in capture.optimizer.param_groups for p in group["params"]) if capture.training else set()
+        optimizer_ids = set(id(p) for p in capture.optimizer_params)
         for i, entry in enumerate(leaves):
             gradient = capture.grads[id(entry[1])]
             previous = capture.previous_grads[id(entry[0])]
@@ -215,6 +233,13 @@ class GPUResult:
                     raise RuntimeError("GPU training produced non-finite values; parameters were not updated")
                 return value
             try:
+                if capture.training:
+                    try:
+                        optimizer_changed = _sgd_configuration(capture.optimizer) != capture.optimizer_snapshot
+                    except Exception:
+                        optimizer_changed = True
+                    if optimizer_changed:
+                        raise RuntimeError("GPU training result is stale; optimizer changed before completion")
                 value = read("result", tuple(self.shape))
                 gradients = [(entry[0], read("grad" + str(i), tuple(entry[0].shape))) for i, entry in enumerate(leaves)]
                 updates = [(entry[0], read("weight" + str(i), tuple(entry[0].shape))) for i, entry in enumerate(capture.updates)]
@@ -229,9 +254,8 @@ class GPUResult:
                             raise RuntimeError("GPU training result is stale; a captured tensor changed before completion")
                     for parameter, new_value in updates:
                         parameter.data = new_value
-                    for group in capture.optimizer.param_groups:
-                        for parameter in group["params"]:
-                            parameter.grad = None
+                    for parameter in capture.optimizer_params:
+                        parameter.grad = None
                     for parameter, gradient in gradients:
                         parameter.grad = gradient
                 self.backend = result["backend"]

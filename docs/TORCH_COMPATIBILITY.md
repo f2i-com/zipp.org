@@ -56,7 +56,9 @@ updates. Float32 scalar/vector/matrix elementwise add/subtract/multiply, square,
 scalar division, matrix multiplication/transpose, ReLU, whole-tensor sum/mean and
 matrix-batched `nn.Linear` are supported. This covers small dense ReLU networks
 with MSE. ReLU's derivative at zero is zero. Shared parameters accumulate gradients
-from every captured use. Bias gradients reduce across the batch. SGD supports
+from every captured use. Bias gradients reduce across the batch. A leaf first used inside `no_grad()`
+retains its `requires_grad` flag; only operations inside that context are excluded
+from the backward graph. SGD supports
 learning rate, weight decay, maximize and parameter groups; momentum, dampening,
 Nesterov, closures, Adam/AdamW/RMSprop, higher-order gradients and retained graphs
 are rejected. Every trainable optimizer parameter must participate in the loss.
@@ -65,7 +67,11 @@ Weights and gradients stay unchanged while a supported step is recorded or pendi
 After successful readback, finite results are checked before committing weights
 and gradients. A backend error or changed captured tensor rejects the result and
 leaves the model unchanged by that submission. Changes to captured gradients,
-shape, dtype or `requires_grad` also invalidate a pending step. Each training result is single-use.
+shape, dtype or `requires_grad` also invalidate a pending step. SGD parameter
+identities, group membership/order and all supported SGD options are snapshotted
+when `step()` is captured; changing them before completion rejects that step.
+Gradient cleanup uses the captured parameter set, so newly added parameters
+cannot have their gradients cleared by an older request. Each training result is single-use.
 Wait for completion before preparing the next step: overlapping captures generally
 become stale after the first update. These guarantees cover recorded tensor/SGD
 updates, not arbitrary Python side effects inside a user function.

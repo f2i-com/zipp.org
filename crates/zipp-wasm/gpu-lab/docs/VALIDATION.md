@@ -77,3 +77,21 @@ These are local results. The updated manual/reusable CI lane has not been run on
 Training records/uploads every call and reads back loss, gradients and updated
 weights. These measurements establish correctness, not speedup, resident model
 state, GPU Conv2d or multi-GPU training. The archive above is unchanged.
+
+### Training review fixes — 13 September 2026
+
+- Source leaves keep intrinsic `requires_grad` when first encountered inside
+  `no_grad`; only operations in that context are detached. The fixture matches
+  native PyTorch: loss 202, parameter gradient 1 and updated weight 1.9.
+- SGD capture snapshots optimizer identity, parameter identities, group order and
+  membership, learning rate, weight decay, maximize, momentum, dampening and
+  Nesterov. Stale options/groups reject completion before any tensor write;
+  cleanup uses the captured parameters, preserving newly added parameters' grads.
+- Eight native Torch tests passed. Actual WASM passed 26 optimizer mutation
+  cases per JS/WASM backend, covering changes before submit and while pending,
+  plus no_grad and the existing five-step reference/transaction tests.
+- Hardware WebGL2 and WebGPU passed the new no_grad, learning-rate and parameter
+  append checks, as well as five-step reference parity and 17 kernel cases each.
+- The checked-in playground engine was rebuilt and the production landing build
+  passed. Python caches are ignored; the older tracked Test262 `.pyc` was removed
+  from version control. Historical validation reports remain unchanged.
