@@ -229,10 +229,19 @@ Zipp does not include its PyTorch runner, models, checkpoints or native endpoint
 
 ### Run the JavaScript engine
 
-The published [`v0.0.17` release](https://github.com/f2i-com/zipp.org/releases/tag/v0.0.17)
-provides x86-64 binaries and a browser WebAssembly package for the JavaScript
-engine. Those release downloads predate this checkout's Python and browser GPU
-lab additions; build this repository for its current engine features.
+The `0.0.18` release configuration provides x86-64 JavaScript CLI binaries and
+two browser WebAssembly packages:
+
+| Download | Use it for |
+| --- | --- |
+| `zipp-wasm-0.0.18-web.zip` | JavaScript applications and embedding |
+| `zipp-wasm-0.0.18-web-python.zip` | JavaScript plus experimental Python projects, Torch and browser GPU adapters |
+
+See [GitHub Releases](https://github.com/f2i-com/zipp.org/releases) for published
+assets and [0.0.18 release notes](docs/releases/0.0.18.md) for scope and limits.
+This checkout is a release candidate; the download commands below still use
+published **0.0.17** until 0.0.18 passes every release gate. Both WASM archives carry the
+exact source revision, language profile and checksums.
 
 Save this as `app.js`, then choose your platform below:
 

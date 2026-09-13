@@ -19,9 +19,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag (for example, v0.0.6)
+        description: Existing release tag (for example, v0.0.18)
         required: true
-        default: v0.0.6
+        default: v0.0.18
         type: string
 
 # Build jobs can only read the repository. The release job raises this to
@@ -304,8 +304,22 @@ jobs:
           retention-days: 7
 
   wasm:
-    name: Browser WebAssembly package
+    name: Browser WebAssembly (${{ matrix.variant }})
     needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: javascript
+            suffix: web
+            features: ""
+            stack_bytes: 1048576
+            languages: '["javascript"]'
+          - variant: javascript-python
+            suffix: web-python
+            features: "--features python"
+            stack_bytes: 16777216
+            languages: '["javascript","python"]'
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     defaults:
@@ -378,13 +392,13 @@ jobs:
           RUSTFLAGS: >-
             -Dwarnings
             -C link-arg=--max-memory=1073741824
-            -C link-arg=-zstack-size=1048576
+            -C link-arg=-zstack-size=${{ matrix.stack_bytes }}
           ZIPP_SOURCE_SHA: ${{ needs.validate.outputs.commit }}
-        run: cargo build --locked --release --target wasm32-unknown-unknown
+        run: cargo build --locked --release --target wasm32-unknown-unknown ${{ matrix.features }}
 
       # The one shared list (tests/node/run-boundary-suite.cjs): the same
       # checks CI runs, including the parse-shape limits calibrated against
-      # this artifact's 1 MiB linker stack (v0.0.1 shipped limits that
+      # the JS artifact's 1 MiB stack (Python uses 16 MiB; v0.0.1 shipped limits that
       # rejected two working applications because the only browser check at
       # the time parsed three tokens) and the audit regression suites the
       # release lane used to omit.
@@ -395,14 +409,25 @@ jobs:
             target/wasm32-unknown-unknown/release/zipp_wasm.wasm
           node tests/node/run-boundary-suite.cjs
 
+      - name: Exercise the combined artifact's Torch and interop contracts
+        if: matrix.variant == 'javascript-python'
+        run: |
+          node tests/node/python-conv2d.cjs
+          node tests/node/python-training.cjs
+          node tests/node/python-javascript.cjs
+
       - name: Package browser JS, TypeScript declarations, and WebAssembly
         shell: bash
         env:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
           EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
+          WASM_VARIANT: ${{ matrix.variant }}
+          WASM_SUFFIX: ${{ matrix.suffix }}
+          EXPECTED_LANGUAGES: ${{ matrix.languages }}
+          STACK_BYTES: ${{ matrix.stack_bytes }}
         run: |
           set -euo pipefail
-          bundle="zipp-wasm-$RELEASE_VERSION-web"
+          bundle="zipp-wasm-$RELEASE_VERSION-$WASM_SUFFIX"
           archive="$bundle.zip"
           mkdir -p "dist/$bundle"
           # Drop the name and producers sections from the SHIPPED bundle: 329 KB
@@ -463,6 +488,19 @@ jobs:
           if (profile.version !== process.env.RELEASE_VERSION) {
             throw new Error(`browser package reports version ${profile.version}, expected ${process.env.RELEASE_VERSION}`);
           }
+          if (JSON.stringify(profile.languages) !== process.env.EXPECTED_LANGUAGES) {
+            throw new Error(`wrong language variant: ${JSON.stringify(profile.languages)}`);
+          }
+          fs.writeFileSync(path.join(bundle, "PROFILE.json"), JSON.stringify(profile, null, 2) + "\n");
+          if (profile.languages.includes("python")) {
+            const python = new zipp.Engine();
+            try {
+              python.initSource("import torch\nx = torch.tensor([1.0, 2.0, 3.0])\nprint((x * 2).tolist())", "python");
+              if (JSON.stringify(python.takeOutput()) !== '["[2.0, 4.0, 6.0]"]') {
+                throw new Error("packaged Python/Torch smoke failed");
+              }
+            } finally { python.dispose(); python.free(); }
+          }
           const engine = new zipp.Engine();
           try {
             const symbols = engine.initScript(`
@@ -509,6 +547,13 @@ jobs:
           mkdir -p "dist/$bundle/host-sdk"
           install -m 0644 host-sdk/zipp-host.mjs host-sdk/zipp-host.worker.mjs host-sdk/README.md \
             "dist/$bundle/host-sdk/"
+          if [[ "$WASM_VARIANT" == "javascript-python" ]]; then
+            mkdir -p "dist/$bundle/gpu-lab/wasm" "dist/$bundle/docs"
+            cp -R gpu-lab/src "dist/$bundle/gpu-lab/"
+            install -m 0644 gpu-lab/wasm/kernels.wasm "dist/$bundle/gpu-lab/wasm/"
+            install -m 0644 gpu-lab/LICENSE gpu-lab/NOTICE "dist/$bundle/gpu-lab/"
+            install -m 0644 ../../docs/TORCH_COMPATIBILITY.md "dist/$bundle/docs/"
+          fi
           sdk_version="$(node -e 'import("./host-sdk/zipp-host.mjs").then((m) => console.log(m.ZIPP_HOST_SDK_VERSION))')"
           node --input-type=module --check < "dist/$bundle/host-sdk/zipp-host.mjs"
           node --input-type=module --check < "dist/$bundle/host-sdk/zipp-host.worker.mjs"
@@ -517,6 +562,9 @@ jobs:
             printf 'commit=%s\n' "$(git rev-parse HEAD)"
             printf 'rustc=%s\n' "$(rustc --version)"
             printf 'wasm-bindgen=%s\n' "$(wasm-bindgen --version)"
+            printf 'variant=%s\n' "$WASM_VARIANT"
+            printf 'languages=%s\n' "$EXPECTED_LANGUAGES"
+            printf 'stack-bytes=%s\n' "$STACK_BYTES"
             printf 'target=wasm32-unknown-unknown\n'
             printf 'host-sdk=%s\n' "$sdk_version"
           } > "dist/$bundle/BUILD-INFO.txt"
@@ -534,8 +582,8 @@ jobs:
       - name: Upload browser WebAssembly release archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-wasm-web
-          path: crates/zipp-wasm/dist/zipp-wasm-${{ needs.validate.outputs.version }}-web.zip
+          name: release-wasm-${{ matrix.suffix }}
+          path: crates/zipp-wasm/dist/zipp-wasm-${{ needs.validate.outputs.version }}-${{ matrix.suffix }}.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
@@ -591,6 +639,7 @@ jobs:
             "zipp-$RELEASE_VERSION-x86_64-unknown-linux-gnu.tar.gz"
             "zipp-$RELEASE_VERSION-x86_64-pc-windows-msvc.zip"
             "zipp-wasm-$RELEASE_VERSION-web.zip"
+            "zipp-wasm-$RELEASE_VERSION-web-python.zip"
           )
           for asset in "${expected[@]}"; do
             test -f "dist/$asset"
@@ -650,6 +699,7 @@ jobs:
                 "zipp-${{ needs.validate.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz"
                 "zipp-${{ needs.validate.outputs.version }}-x86_64-pc-windows-msvc.zip"
                 "zipp-wasm-${{ needs.validate.outputs.version }}-web.zip"
+                "zipp-wasm-${{ needs.validate.outputs.version }}-web-python.zip"
               )
               mapfile -t actual_existing < <(
                 find existing-assets -maxdepth 1 -type f -printf '%f\n' | sort
@@ -666,7 +716,6 @@ jobs:
 
               linux_bundle="zipp-$RELEASE_VERSION-x86_64-unknown-linux-gnu"
               windows_bundle="zipp-$RELEASE_VERSION-x86_64-pc-windows-msvc"
-              wasm_bundle="zipp-wasm-$RELEASE_VERSION-web"
               linux_info="$(
                 tar -xOf "existing-assets/$linux_bundle.tar.gz" \
                   "$linux_bundle/BUILD-INFO.json"
@@ -683,12 +732,24 @@ jobs:
                    .commit == $commit and .dirty == false' \
                   <<< "$info" >/dev/null
               done
-              wasm_info="$(
-                unzip -p "existing-assets/$wasm_bundle.zip" \
-                  "$wasm_bundle/BUILD-INFO.txt"
-              )"
-              grep -Fxq "version=$RELEASE_VERSION" <<< "$wasm_info"
-              grep -Fxq "commit=$EXPECTED_COMMIT" <<< "$wasm_info"
+              for suffix in web web-python; do
+                wasm_bundle="zipp-wasm-$RELEASE_VERSION-$suffix"
+                wasm_info="$(unzip -p "existing-assets/$wasm_bundle.zip" "$wasm_bundle/BUILD-INFO.txt")"
+                grep -Fxq "version=$RELEASE_VERSION" <<< "$wasm_info"
+                grep -Fxq "commit=$EXPECTED_COMMIT" <<< "$wasm_info"
+                languages='["javascript"]'
+                variant=javascript
+                if [[ "$suffix" == web-python ]]; then
+                  languages='["javascript","python"]'
+                  variant=javascript-python
+                fi
+                grep -Fxq "variant=$variant" <<< "$wasm_info"
+                grep -Fxq "languages=$languages" <<< "$wasm_info"
+                unzip -p "existing-assets/$wasm_bundle.zip" "$wasm_bundle/PROFILE.json" \
+                  | jq -e --arg version "$RELEASE_VERSION" --arg commit "$EXPECTED_COMMIT" \
+                      --argjson languages "$languages" \
+                      '.version == $version and .source.sha == $commit and .languages == $languages' >/dev/null
+              done
               verify_remote_tag
 
               release_url="$(jq -r .url existing-release.json)"
@@ -698,7 +759,12 @@ jobs:
             fi
           fi
 
-          gh release create "$RELEASE_TAG" dist/* \
+          notes_args=()
+          notes_file="docs/releases/$RELEASE_VERSION.md"
+          if [[ -f "$notes_file" ]]; then
+            notes_args=(--notes-file "$notes_file")
+          fi
+          gh release create "$RELEASE_TAG" dist/* "${notes_args[@]}" \
             --draft \
             --verify-tag \
             --target "$EXPECTED_COMMIT" \

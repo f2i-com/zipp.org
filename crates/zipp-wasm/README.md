@@ -26,8 +26,8 @@ brotli -q 11 -f -o pkg/zipp_wasm_bg.wasm.br pkg/zipp_wasm_bg.wasm
 
 ## Build variants: JavaScript only, or JavaScript and Python
 
-The crate builds two artifacts. The shipped default is JavaScript-only and is
-byte-for-byte the module the steps above produce; the `python` feature adds
+The crate builds two language variants. The default is JavaScript-only;
+the `python` feature adds
 the experimental Python-subset frontend (`docs/PYTHON_FRONTEND_EXPERIMENT.md`)
 behind `Engine.initSource(source, "python")` alongside the unchanged
 JavaScript entry points.
@@ -74,6 +74,27 @@ bootstrap. `tests/node/python-frontend.cjs` holds both variants to this; it is
 part of `run-boundary-suite.cjs` and adapts to the artifact's `languages`, so
 the JavaScript-only gate proves the refusal path.
 
+### Release downloads (0.0.18)
+
+The release workflow builds and tests both archives from the exact release tag:
+
+| archive | languages | linker stack |
+| --- | --- | --- |
+| `zipp-wasm-0.0.18-web.zip` | JavaScript | 1 MiB |
+| `zipp-wasm-0.0.18-web-python.zip` | JavaScript + experimental Python | 16 MiB |
+
+Both contain browser bindings, TypeScript declarations, `host-sdk/`, a runtime
+`PROFILE.json`, build identity and SHA-256 checksums. The combined archive also
+includes `gpu-lab/src/`, its CPU WASM kernels and the Torch compatibility guide.
+Select GPU backends through that host adapter; the engine itself does not access
+WebGL/WebGPU without a browser host. The source build above uses a 16 MiB stack
+for either variant; release builds explicitly use the sizes in this table.
+
+Neither release archive enables the separate `python-js-interop` feature.
+Python and Torch are experimental subsets, and GPU `torch.compile()` uses the
+nonstandard asynchronous `submit()` callback contract. It captures and uploads
+on each call; persistent GPU models and GPU Conv2d training are not implemented.
+
 ### The Python surface of the combined module
 
 | method | purpose |
@@ -95,10 +116,11 @@ editor, program arguments, a console and a canvas driven by
 `draw`/`update`/`on_click`/`on_key`. See `playground/README.md`.
 
 The bundled `torch` subset (see `docs/PYTHON_FRONTEND_EXPERIMENT.md`) runs
-inside the engine on typed-array CPU kernels: a PyTorch research lab loaded
-as a folder trains, evaluates, saves and reloads checkpoints in the browser,
-but nothing of it runs on the GPU. WebGPU and WebGL2 are reached through
-`zipp_gpu` graphs (below), which is a separate, explicit path.
+inside the engine on typed-array CPU kernels. Supported dense training steps
+can opt into WebGPU or WebGL2 through asynchronous `torch.compile(training=True)`
+submissions. CPU Conv2d and autograd remain available on the CPU; compiled GPU
+Conv2d is not implemented. The lower-level `zipp_gpu` graphs (below) power the
+Torch adapter and are also available directly.
 
 #### GPU compute for Python programs
 

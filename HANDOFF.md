@@ -1,5 +1,32 @@
 # Zipp performance handoff
 
+### 13 September: 0.0.18 candidate, promotion on hold
+
+The test repository contains the Vite 8.3 update and release preparation for
+separate JavaScript (`web.zip`, 1 MiB stack) and JavaScript + Python
+(`web-python.zip`, 16 MiB stack) packages. Manifests say 0.0.18; this is not a
+published release. Canonical main and the v0.0.18 tag must wait for green gates.
+
+Local release builds with Rust 1.92 and `-Dwarnings` passed all 21 shared Node
+boundary checks in each variant. The combined build also passed CPU Conv2d,
+dense training/PyTorch parity, optimizer transaction and disabled interop checks.
+The Vite production build, nine landing tests and actual browser GPU smoke
+passed on RTX 5090 WebGL2 and WebGPU, including 100 training steps.
+
+Broad CI at 11f7a5c0 found release blockers:
+[Security run 34760541481](https://github.com/f2i-com/zipp-python/actions/runs/34760541481).
+The safe interpreter suite aborted with a native stack overflow; native workspace
+linking failed with a linker bus error; cargo-audit denied six unmaintained UNIC
+transitive dependencies introduced by the Python parser. These are maintenance
+advisories, not a report of six exploitable vulnerabilities. Keep all gates intact.
+The separate Python CI toolchain mismatch is fixed by pinning build-variants.sh
+to `cargo +1.92.0`; Linux runners had installed wasm32 only for that toolchain.
+
+The checked-in browser demo engines remain the previously validated 0.0.17
+artifacts. Release CI builds new binaries from the exact tag and verifies version,
+commit and languages. NCA stays in its separate repository.
+
+
 This is the current continuation note. Historical snapshots through B252 are
 archived in [`docs/archive/HANDOFF-through-B252.md`](docs/archive/HANDOFF-through-B252.md),
 and the B001–B252 experiment ledger is preserved in

@@ -34,7 +34,7 @@ sizes=()
 for v in "${variants[@]}"; do
   echo "=== $v: cargo build --release --target $TARGET ${FEATURES[$v]}"
   # shellcheck disable=SC2086
-  cargo build --locked --release --target "$TARGET" --target-dir "target/variants/$v" ${FEATURES[$v]}
+  cargo +1.92.0 build --locked --release --target "$TARGET" --target-dir "target/variants/$v" ${FEATURES[$v]}
   out="dist/$v"
   rm -rf "$out"
   wasm-bindgen --target web --out-dir "$out" \
