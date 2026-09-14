@@ -404,6 +404,39 @@ callback records are guest-controlled too. Bind every dispatch to an immutable
 Worker/tenant generation, cancel or discard outstanding work when that Worker is
 terminated, and never route a completion using only a guest-provided ID.
 
+## Host lifetime policy
+
+`Engine.dispose()` tears down one VM; it does not shrink the WASM **instance**
+that hosted it, because dynamically compiled functions and classes that the
+guest created (`eval`, `new Function`, class expressions inside an eval) are
+owned by the instance's compiler arena. `zippInstanceUsage()` reports what an
+instance has accumulated across disposed engines; the only reclamation is a
+fresh instance. The ecosystem review of 14 September 2026 (ZP-01) turned that
+into a contract every host must meet, verified by
+`tests/node/instance-recycling-soak.cjs` in the boundary suite:
+
+1. Within one instance, batches of create → dynamic code → dispose keep
+   growing the instance account; the live VM heap per engine, the instance's
+   linear memory and the process RSS are three different numbers and are
+   reported separately (RSS is never asserted: allocator reservation is not a
+   leak).
+2. A recycled instance starts from zero.
+
+What the reviewed hosts do (the inventory is the review's, the policies are
+theirs):
+
+| Host | Instance | Recycled when | Wall clock |
+| --- | --- | --- | --- |
+| FormLogic browser sandbox (`formlogic/ui/src/lib/formlogic/engine.ts`) | one Worker per page | the Worker reports retained bytes over a budget or a lifetime evaluation count, at a quiet moment; also on watchdog kill | outside the guest (Worker.terminate) |
+| Softn Worker runtime | one Worker per app | hard deadline, app switch/unmount | outside the guest |
+| Softn sandbox executor | warm Worker | any error or 32 uses; engines now `dispose()` before `free()` so the account is measured | outside the guest |
+| Softn main-thread runtime | one instance per page | never (page lifetime); documented weaker guarantee, warns when chosen implicitly | in-guest budget only |
+| Softn PHP / FormLogic native runtime | one process per request | every request | outside the guest (PHP deadline + supervisor thread) |
+| OAIY workflow runner | one Worker per run | every run | per-run teardown |
+
+Hosts that serve more than one tenant from one instance must recycle at the
+tenant boundary; per-engine ceilings never bound the instance.
+
 ## Values
 
 Reads and writes cross as structured data — nested arrays and plain objects — not

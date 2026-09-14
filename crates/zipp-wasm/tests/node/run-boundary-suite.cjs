@@ -34,6 +34,7 @@ const CHECKS = [
   ["output-budget.cjs"],
   ["host-writeback-identity.cjs"],
   ["worker-deadline.cjs"],
+  ["instance-recycling-soak.cjs"],
   ["audit-defaults.cjs"],
   ["audit-2026-09-11.cjs"],
   ["audit-2026-09-11-close.cjs"],
