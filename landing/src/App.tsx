@@ -8,7 +8,8 @@ import { test262Summary } from './repoData'
 
 const GITHUB_URL = 'https://github.com/f2i-com/zipp.org'
 const F2I_URL = 'https://f2i.com'
-const DOCS_URL = `${GITHUB_URL}/blob/main/DOC.md#embedding`
+const DOCS_URL = '/javascript-engine/'
+const EMBEDDING_URL = '/embedding/'
 const BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/real13_8229b3fc_pgo_2026-09-02.json`
 const HOSTILE_BENCHMARK_URL = `${GITHUB_URL}/blob/main/bench/hostile/head_clean_8229b3fc_pgo_2026-09-02.json`
 const ROADMAP_URL = `${GITHUB_URL}/blob/main/PERF_ROADMAP.md`
@@ -16,6 +17,22 @@ const RELEASE_URL = `${GITHUB_URL}/releases/latest`
 const RELEASES_URL = `${GITHUB_URL}/releases`
 const COMMITS_URL = `${GITHUB_URL}/commits/main`
 const CAPTURE_README_URL = `${GITHUB_URL}/blob/e6e0f65dd402f1bf75b9675d7acd904cb239c5a3/README.md#canonical-public-capture`
+
+/** The static documentation pages (rendered from site/content.json), with anchor text that names the destination. */
+const DOC_LINKS = [
+  { href: '/javascript-engine/', title: 'JavaScript engine', text: 'What Zipp is, the language it implements, and how to run it.' },
+  { href: '/architecture/', title: 'JavaScript engine architecture', text: 'NaN-boxed values, the explicit-frame register VM, JIT tiers and the nursery GC.' },
+  { href: '/test262/', title: 'Test262 conformance', text: '95,680 executions of the pinned corpus, the corrections, and the CI gate.' },
+  { href: '/benchmarks/', title: 'Zipp benchmarks', text: 'Thirty native rows against Node, Bun and Deno, with hardware, flags and raw data.' },
+  { href: '/python/', title: 'Python frontend', text: 'Python 3 compiled to the same register bytecode, natively or in the browser.' },
+  { href: '/wasm/', title: 'WebAssembly runtime', text: 'The persistent, interpreter-only browser sandbox and every one of its limits.' },
+  { href: '/webgpu/', title: 'GPU compute', text: 'Float32 graphs from Python and JavaScript on WebGPU, WebGL2 or WASM kernels.' },
+  { href: '/embedding/', title: 'Embedding guide', text: 'The Rust embed API, the browser Engine class, and the CLI as a host.' },
+  { href: '/sandbox/', title: 'Sandboxing untrusted code', text: 'Three execution profiles, their guarantees, and their non-guarantees.' },
+  { href: '/comparisons/', title: 'Compared with QuickJS, Boa and V8', text: 'Where each engine is the better choice, stated fairly.' },
+  { href: '/journey/', title: 'The Zipp story', text: '1,927 commits in 108 days, told in five acts with the mistakes left in.' },
+  { href: '/journal/', title: 'Engineering journal', text: 'Dated entries with commit links, searchable, with an RSS feed.' },
+]
 
 /** Selectors whose matches fade and rise into view as the reader scrolls. */
 const REVEAL_SELECTORS = [
@@ -912,6 +929,7 @@ function App() {
         </button>
 
         <nav className={`nav-links ${menuOpen ? 'nav-open' : ''}`} id="primary-navigation" aria-label="Primary navigation">
+          <a href="/javascript-engine/">Docs</a>
           <a href="#playground" onClick={closeMenu}>Playground</a>
           <a href="#recorded-demos" onClick={closeMenu}>Python &amp; GPU</a>
           <a href="#use-cases" onClick={closeMenu}>Use cases</a>
@@ -945,8 +963,8 @@ function App() {
             </h1>
 
             <p className="hero-intro">
-              A Rust engine with JavaScript and experimental Python, a WebAssembly
-              playground, and browser GPU compute.
+              Zipp is a JavaScript and Python engine written in Rust: one register VM with native
+              JITs, a WebAssembly playground, and browser GPU compute.
               <strong> Write code, run it, and watch your simulations come alive.</strong>
             </p>
 
@@ -1071,7 +1089,7 @@ function App() {
                 <span><i /> VM state</span><strong>persistent</strong>
                 <span><i /> execution meter</span><strong>enabled</strong>
               </div>
-              <ExternalLink className="text-link" href={DOCS_URL}>Read the embedding guide</ExternalLink>
+              <a className="text-link" href={EMBEDDING_URL}>Read the embedding guide<ArrowIcon /></a>
             </div>
           </div>
         </section>
@@ -1306,7 +1324,7 @@ function App() {
             <h2>Four lines from source to JavaScript.</h2>
             <p>Build the native CLI with stable Rust, run trusted scripts and modules, then move to the embedding API when your host needs a live VM.</p>
             <div className="quickstart-links">
-              <ExternalLink className="text-link" href={DOCS_URL}>Embedding docs</ExternalLink>
+              <a className="text-link" href={EMBEDDING_URL}>Embedding docs<ArrowIcon /></a>
               <ExternalLink className="text-link" href={GITHUB_URL}>Browse the source</ExternalLink>
             </div>
           </div>
@@ -1325,6 +1343,22 @@ function App() {
           </div>
         </section>
 
+        <section className="docs-section section-wrap" id="docs" aria-labelledby="docs-heading">
+          <div className="section-heading">
+            <p className="section-kicker">Documentation</p>
+            <h2 id="docs-heading">Read how it works.</h2>
+            <p>Static, linkable pages for every part of the engine, all rendered from one content file.</p>
+          </div>
+          <div className="docs-grid">
+            {DOC_LINKS.map((doc) => (
+              <a className="docs-card" key={doc.href} href={doc.href}>
+                <strong>{doc.title}</strong>
+                <span>{doc.text}</span>
+              </a>
+            ))}
+          </div>
+        </section>
+
         <section className="closing-cta section-wrap">
           <div>
             <p className="section-kicker">Fast. Explicit. Yours to embed.</p>
@@ -1338,7 +1372,7 @@ function App() {
             <a className="button button-dark star-button" href={GITHUB_URL} target="_blank" rel="noreferrer">
               <StarIcon /> Star Zipp on GitHub
             </a>
-            <ExternalLink className="closing-doc-link" href={DOCS_URL}>Read the docs</ExternalLink>
+            <a className="closing-doc-link" href={DOCS_URL}>Read the docs<ArrowIcon /></a>
             <ExternalLink className="closing-doc-link" href={RELEASES_URL}>All releases</ExternalLink>
           </div>
         </section>
@@ -1351,8 +1385,9 @@ function App() {
           <a href={F2I_URL} target="_blank" rel="noreferrer">f2i.com</a>
         </p>
         <div>
-          <ExternalLink href={DOCS_URL}>Docs</ExternalLink>
-          <ExternalLink href={BENCHMARK_URL}>Benchmarks</ExternalLink>
+          <a href={DOCS_URL}>Docs<ArrowIcon /></a>
+          <a href="/benchmarks/">Benchmarks<ArrowIcon /></a>
+          <a href="/journal/">Journal<ArrowIcon /></a>
           <ExternalLink href={GITHUB_URL}>GitHub</ExternalLink>
           <ExternalLink href={F2I_URL}>f2i.com</ExternalLink>
         </div>

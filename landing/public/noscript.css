@@ -1,0 +1,71 @@
+/* Loaded only when JavaScript is disabled: show and style the static introduction
+   that index.html keeps hidden so it cannot flash before the app mounts. */
+:root {
+  --page: min(1240px, calc(100% - 64px));
+  --line: rgba(245, 246, 239, 0.14);
+  --line-strong: rgba(245, 246, 239, 0.26);
+  --lime: #cec0ff;
+  --dark-ink: #0a0c0d;
+}
+
+body {
+  margin: 0;
+  background: #101016;
+  color: #f5f6ef;
+  font-family: "Segoe UI Variable Text", "Segoe UI", Arial, sans-serif;
+}
+
+#static-intro[hidden] {
+  display: block;
+}
+
+#static-intro a {
+  color: inherit;
+  text-decoration: none;
+}
+
+#static-intro {
+  width: var(--page);
+  margin: 40px auto 0;
+  padding: 28px 30px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: #191921;
+}
+
+#static-intro h1 {
+  font-size: clamp(1.8rem, 3.6vw, 2.8rem);
+  font-weight: 850;
+  letter-spacing: -0.05em;
+  line-height: 1.1;
+}
+
+#static-intro p {
+  margin: 14px 0 18px;
+  max-width: 760px;
+  color: #b7b1c2;
+  line-height: 1.6;
+}
+
+#static-intro nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+#static-intro nav a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+#static-intro nav a:hover {
+  color: var(--dark-ink);
+  border-color: var(--lime);
+  background: var(--lime);
+}

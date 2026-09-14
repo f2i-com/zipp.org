@@ -15,6 +15,17 @@
 </p>
 
 <p align="center">
+  <a href="https://www.zipp.org/javascript-engine/">JavaScript engine</a> ·
+  <a href="https://www.zipp.org/python/">Python frontend</a> ·
+  <a href="https://www.zipp.org/wasm/">WebAssembly runtime</a> ·
+  <a href="https://www.zipp.org/webgpu/">GPU compute</a> ·
+  <a href="https://www.zipp.org/test262/">Test262 conformance</a> ·
+  <a href="https://www.zipp.org/benchmarks/">Benchmarks</a> ·
+  <a href="https://www.zipp.org/architecture/">Architecture</a> ·
+  <a href="https://www.zipp.org/journal/">Engineering journal</a>
+</p>
+
+<p align="center">
   <a href="#quick-start">Quick start</a> ·
   <a href="#what-runs-where">What runs where</a> ·
   <a href="#performance-measured-honestly">Performance</a> ·

@@ -4,6 +4,7 @@ import { cloudflare } from '@cloudflare/vite-plugin'
 import { sites } from '@openai/sites-vite-plugin'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { staticSite } from './site/vite-plugin.ts'
 
 // The wasm-bindgen glue and the .wasm are one artifact in two files: the import
 // names carry a per-build hash, so a new .wasm loaded against an older glue
@@ -37,6 +38,9 @@ export default defineConfig(({ command }) => ({
     react(),
     sites(),
     cloudflare({ viteEnvironment: { name: 'server' } }),
+    // Documentation pages, sitemap, robots.txt, 404 and the journal feed are
+    // rendered from site/content.json (see site/README.md).
+    staticSite(),
     command === 'serve' && {
       name: 'zipp-dev-csp',
       configureServer(server) {

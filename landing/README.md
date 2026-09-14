@@ -7,6 +7,19 @@ a recorded Python Game of Life GIF. Existing Softn/Outerstead
 showcases, repository activity, dated native benchmarks and the optional JavaScript
 story scratchpad remain available.
 
+## Documentation pages, sitemap and journal feed
+
+`/javascript-engine/`, `/python/`, `/wasm/`, `/webgpu/`, `/test262/`, `/benchmarks/`,
+`/architecture/`, `/embedding/`, `/sandbox/`, `/comparisons/`, `/releases/`,
+`/journey/`, `/articles/…` and `/journal/…` are static HTML pages rendered at build
+time from **one file, `site/content.json`**, by `site/render.mjs` through the
+`staticSite()` Vite plugin. The same build writes `sitemap.xml`, `robots.txt`,
+`404.html`, the journal RSS feed at `/journal/feed.xml` and the journal search
+index. `npm run dev` serves the pages live from the JSON; `npm test` validates the
+content (unique titles, description lengths, dates, internal links, feed shape).
+See `site/README.md` for the block types and editing rules. The canonical origin
+is `https://www.zipp.org`; the apex domain should redirect to it at the edge.
+
 ## Full Python / JavaScript project playground
 
 `/playground` opens the same folder-based UI as `crates/zipp-wasm/playground`:

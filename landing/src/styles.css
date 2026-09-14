@@ -3534,3 +3534,60 @@ svg {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Documentation index on the home page (links to the static pages rendered
+   from site/content.json). */
+.docs-section {
+  padding-block: 40px 126px;
+}
+
+.docs-section .section-heading > p {
+  max-width: 620px;
+  color: #aab0ad;
+  font-size: 17px;
+  line-height: 1.68;
+}
+
+.docs-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+  gap: 14px;
+}
+
+.docs-card {
+  display: grid;
+  gap: 6px;
+  padding: 22px 22px 24px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #1b1924;
+  transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.docs-card strong {
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+}
+
+.docs-card span {
+  color: #aaa1ba;
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.docs-card:hover {
+  transform: translateY(-3px);
+  border-color: var(--line-strong);
+  box-shadow: 0 18px 40px -28px rgba(124, 58, 237, 0.55);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .docs-card {
+    transition: none;
+  }
+
+  .docs-card:hover {
+    transform: none;
+  }
+}

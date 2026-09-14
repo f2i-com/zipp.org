@@ -8,31 +8,117 @@
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; img-src 'self' data:; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self'; style-src 'self'; connect-src 'self'; upgrade-insecure-requests"
     />
+    <title>Zipp: Rust JavaScript &amp; Python Engine</title>
     <meta
       name="description"
-      content="Explore Python and JavaScript on Zipp's Rust/WebAssembly engine. Load project folders, run browser GPU graphs, and watch Python Game of Life evolve on your GPU."
+      content="Zipp is a from-scratch JavaScript and Python engine written in Rust. Run the same register VM natively or in WebAssembly, with JIT compilation and WebGPU/WebGL2 compute."
     />
+    <link rel="canonical" href="https://www.zipp.org/" />
+    <link rel="alternate" type="application/rss+xml" title="Zipp engineering journal" href="https://www.zipp.org/journal/feed.xml" />
+    <link rel="sitemap" type="application/xml" href="/sitemap.xml" />
     <meta name="theme-color" content="#101016" />
     <meta name="color-scheme" content="dark" />
-    <meta property="og:title" content="Zipp — Python, JavaScript &amp; GPU experiments" />
+    <meta property="og:site_name" content="Zipp" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://www.zipp.org/" />
+    <meta property="og:title" content="Zipp: Rust JavaScript &amp; Python Engine" />
     <meta
       property="og:description"
-      content="A Rust engine, a Python and JavaScript project playground, browser GPU graphs, and recorded Python simulations."
+      content="A from-scratch JavaScript and Python engine written in Rust: one register VM, native JITs, a WebAssembly sandbox, and WebGPU/WebGL2 compute. 100% corrected-core Test262."
     />
-    <meta property="og:type" content="website" />
-    <meta property="og:image" content="https://raw.githubusercontent.com/f2i-com/zipp.org/main/landing/public/zipp-og-card.png" />
+    <meta property="og:image" content="https://www.zipp.org/zipp-og-card.png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
     <meta property="og:image:alt" content="A luminous purple-to-cyan lightning mark moving across a dark field" />
     <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Zipp — Python, JavaScript &amp; GPU experiments" />
-    <meta name="twitter:description" content="Python and JavaScript on Zipp WASM, browser GPU compute, and an interactive Game of Life example." />
-    <meta name="twitter:image" content="https://raw.githubusercontent.com/f2i-com/zipp.org/main/landing/public/zipp-og-card.png" />
+    <meta name="twitter:title" content="Zipp: Rust JavaScript &amp; Python Engine" />
+    <meta name="twitter:description" content="JavaScript and Python on one Rust register VM, natively or in WebAssembly, with JIT compilation and browser GPU compute." />
+    <meta name="twitter:image" content="https://www.zipp.org/zipp-og-card.png" />
     <meta name="twitter:image:alt" content="A luminous purple-to-cyan lightning mark moving across a dark field" />
     <link rel="icon" href="/zipp-bolt.svg" type="image/svg+xml" />
-    <title>Zipp — Python, JavaScript &amp; GPU experiments</title>
+    <noscript><link rel="stylesheet" href="/noscript.css" /></noscript>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@graph": [
+          {
+            "@type": "WebSite",
+            "@id": "https://www.zipp.org/#website",
+            "url": "https://www.zipp.org/",
+            "name": "Zipp",
+            "description": "Zipp is a from-scratch JavaScript and Python engine written in Rust.",
+            "inLanguage": "en",
+            "publisher": { "@id": "https://f2i.com/#organization" }
+          },
+          {
+            "@type": "Organization",
+            "@id": "https://f2i.com/#organization",
+            "name": "f2i",
+            "url": "https://f2i.com",
+            "logo": "https://www.zipp.org/zipp-bolt.svg"
+          },
+          {
+            "@type": "SoftwareApplication",
+            "@id": "https://www.zipp.org/#software",
+            "name": "Zipp",
+            "url": "https://www.zipp.org/",
+            "description": "A from-scratch JavaScript and Python engine written in Rust, with a register VM, x86-64 and ARM64 JIT tiers, a WebAssembly sandbox build and WebGPU/WebGL2 compute.",
+            "applicationCategory": "DeveloperApplication",
+            "applicationSubCategory": "JavaScript engine",
+            "operatingSystem": "Windows, Linux, WebAssembly",
+            "programmingLanguage": "Rust",
+            "softwareVersion": "0.0.18",
+            "datePublished": "2026-08-30",
+            "dateModified": "2026-09-14",
+            "license": "https://www.apache.org/licenses/LICENSE-2.0",
+            "isAccessibleForFree": true,
+            "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+            "downloadUrl": "https://github.com/f2i-com/zipp.org/releases",
+            "codeRepository": "https://github.com/f2i-com/zipp.org",
+            "author": { "@id": "https://f2i.com/#organization" },
+            "featureList": [
+              "ES2015 through ES2025 JavaScript with 95,680 of 95,680 corrected-core Test262 executions passing",
+              "Explicit-frame register VM with NaN-boxed values",
+              "x86-64 tiered JIT with on-stack replacement and an ARM64 baseline JIT",
+              "Non-moving generational garbage collector",
+              "Interpreter-only WebAssembly sandbox with no unsafe code",
+              "Experimental Python 3 frontend compiling to the same bytecode",
+              "WebGPU and WebGL2 compute graphs from Python and JavaScript"
+            ]
+          }
+        ]
+      }
+    </script>
   </head>
   <body>
+    <!--
+      Static introduction: what Zipp is and where the documentation lives, present in the
+      served HTML for crawlers and readers without JavaScript. The `hidden` attribute keeps
+      it from flashing before the stylesheet loads; noscript.css reveals it when scripts are
+      off, and main.tsx removes it once the app mounts.
+    -->
+    <section id="static-intro" aria-label="About Zipp" hidden>
+      <h1>Zipp is a JavaScript and Python engine written in Rust.</h1>
+      <p>
+        A from-scratch ECMAScript engine with an explicit-frame register VM, native x86-64 and ARM64
+        JIT tiers, a generational garbage collector, an experimental Python 3 frontend that compiles to
+        the same bytecode, an interpreter-only WebAssembly sandbox for the browser, and WebGPU/WebGL2
+        compute graphs. Open source under Apache-2.0.
+      </p>
+      <nav aria-label="Documentation">
+        <a href="/javascript-engine/">JavaScript engine</a>
+        <a href="/python/">Python frontend</a>
+        <a href="/wasm/">WebAssembly runtime</a>
+        <a href="/webgpu/">GPU compute</a>
+        <a href="/test262/">Test262 conformance</a>
+        <a href="/benchmarks/">Benchmarks</a>
+        <a href="/architecture/">Engine architecture</a>
+        <a href="/embedding/">Embedding guide</a>
+        <a href="/journal/">Engineering journal</a>
+        <a href="/playground/">Playground</a>
+        <a href="https://github.com/f2i-com/zipp.org">Source on GitHub</a>
+      </nav>
+    </section>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

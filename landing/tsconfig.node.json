@@ -12,5 +12,5 @@
     "noEmit": true,
     "strict": true
   },
-  "include": ["vite.config.ts", "vite-node-shims.d.ts"]
+  "include": ["vite.config.ts", "vite-node-shims.d.ts", "site/vite-plugin.ts", "site/render.d.mts"]
 }
