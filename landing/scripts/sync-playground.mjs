@@ -25,7 +25,7 @@ for (const name of ['index.html', 'playground.css', 'playground.js', 'engine.wor
     text = text.replace('<title>Zipp Playground</title>', '<title>Zipp Playground · Python, JavaScript &amp; GPU</title>')
       .replace('<strong>Zipp playground</strong>', '<a href="/" target="_top" class="playground-home">Zipp playground ↗</a>')
       .replace('Open a folder of .py or .js files (top level only)', 'Load a local project folder, including subfolders and data; files stay in your browser')
-      .replace('</head>', '<meta http-equiv="Content-Security-Policy" content="default-src \'self\'; script-src \'self\' \'wasm-unsafe-eval\'; style-src \'self\'; img-src \'self\' data:; worker-src \'self\'; connect-src \'self\'; object-src \'none\'; base-uri \'none\'">\n</head>')
+      .replace('</head>', '<meta http-equiv="Content-Security-Policy" content="default-src \'self\'; script-src \'self\' \'wasm-unsafe-eval\' https://static.cloudflareinsights.com; style-src \'self\'; img-src \'self\' data:; worker-src \'self\'; connect-src \'self\' https://cloudflareinsights.com; object-src \'none\'; base-uri \'none\'">\n</head>')
   }
   if (name === 'playground.css') text += '\n.playground-home{font-weight:700;color:inherit;text-decoration:none}\n'
   await writeFile(path.join(output, 'playground', name), text)

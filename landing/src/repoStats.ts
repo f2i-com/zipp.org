@@ -23,8 +23,9 @@ export function useRepoStats() {
     const timeout = window.setTimeout(() => controller.abort(), 25_000)
     try {
       let parsed: RepoStats | null = null
-      // The Worker handles /api/stats; existing PHP hosting keeps working too.
-      for (const path of ['api/stats', 'api/stats.php']) {
+      // The Cloudflare Worker answers both paths; plain PHP hosting only has the
+      // .php one. Asking for it first avoids a 404 on hosts without the Worker.
+      for (const path of ['api/stats.php', 'api/stats']) {
         if (controller.signal.aborted) break
         try {
           const response = await fetch(new URL(`${import.meta.env.BASE_URL}${path}`, document.baseURI), { signal: controller.signal, headers: { Accept: 'application/json' }, cache: 'no-cache' })

@@ -128,7 +128,7 @@ const renderToc = sections =>
 // ---------------------------------------------------------------------------
 
 const CSP =
-  "default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; connect-src 'self'; upgrade-insecure-requests"
+  "default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'self'; img-src 'self' data:; script-src 'self' https://static.cloudflareinsights.com; style-src 'self'; connect-src 'self' https://cloudflareinsights.com; upgrade-insecure-requests"
 
 function jsonLd(objects) {
   // JSON-LD is data, not executable script, so the strict CSP does not block it.

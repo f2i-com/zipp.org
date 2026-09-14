@@ -60,8 +60,8 @@ export default defineConfig(({ command }) => ({
         // render the same page engineers will build.
         return html
           .replace(
-            "script-src 'self' 'wasm-unsafe-eval';",
-            "script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline';",
+            "script-src 'self' 'wasm-unsafe-eval' https://static.cloudflareinsights.com;",
+            "script-src 'self' 'wasm-unsafe-eval' https://static.cloudflareinsights.com 'unsafe-inline';",
           )
           .replace("style-src 'self';", "style-src 'self' 'unsafe-inline';")
           // Local previews use HTTP. Upgrading their module requests to HTTPS

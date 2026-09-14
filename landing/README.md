@@ -83,7 +83,7 @@ the checked-in WASM engine. Build output is `dist/client` and `dist/server`.
 
 ## Automatic repository updates
 
-The browser requests `/api/stats` on mount, every 15 minutes while visible, and
+The browser requests `/api/stats.php` (then `/api/stats`) on mount, every 15 minutes while visible, and
 when returning to a tab whose data is due for refresh. Readers can also use
 “Check for updates.” Both `/api/stats` and `/api/stats.php` are routed to the
 Cloudflare Worker before static assets. Existing PHP hosting is supported by

@@ -10,3 +10,7 @@ crates/rustpython-parser-fork/README.md whitespace=-blank-at-eol
 crates/rustpython-parser-fork/src/lib.rs whitespace=-blank-at-eol
 crates/rustpython-parser-fork/src/parser.rs whitespace=-blank-at-eol
 crates/rustpython-parser-fork/src/python.rs whitespace=-blank-at-eol
+
+# The WASM engine pairs are hash-checked against their manifests; never convert line endings.
+landing/public/playground-runtime/** -text
+landing/public/wasm/** -text
