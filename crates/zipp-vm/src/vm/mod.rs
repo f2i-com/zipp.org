@@ -1508,6 +1508,12 @@ pub struct Vm<'p> {
     /// and integers — never traced, never pruned.
     matchall_caps_scratch: Vec<Option<std::ops::Range<usize>>>,
     matchall_flat_scratch: Vec<u32>,
+    /// The UTF-16 code units of the last non-ASCII RegExp exec subject, so a
+    /// global exec/match/split/replace loop over one string encodes it once
+    /// instead of once per exec (see [`proxy_regexp::RegexSubjectUnits`]).
+    /// Integers only: never traced; a major GC drops it with its subject.
+    #[cfg(not(feature = "safe-sandbox"))]
+    regex_subject_units: Option<proxy_regexp::RegexSubjectUnits>,
     /// Native bytes owned by completed RegExp matches that an outer operation
     /// retains while guest code can re-enter the VM (notably functional
     /// replacement callbacks). `heap_bytes()` cannot see those Rust-local

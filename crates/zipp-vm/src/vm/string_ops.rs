@@ -841,11 +841,11 @@ impl<'p> Vm<'p> {
                 let matcher = self.get_prop(rx, "@@matchAll")?;
                 Ok(Some(self.call_value(matcher, rx, &[s_val])?))
             }
-            "split" if self.as_regexp(arg0).is_some() => {
-                let re = self.as_regexp(arg0).unwrap();
-                let limit = args.get(1).copied().unwrap_or(Value::UNDEFINED);
-                Ok(Some(self.regexp_split_impl(re, Value::heap(idx), limit)?))
-            }
+            // A RegExp separator takes the generic `"split"` arm below: its
+            // GetMethod(@@split) is observable, and a shortcut straight to
+            // `regexp_split_impl` ignored an own, subclass or patched
+            // `RegExp.prototype[Symbol.split]`. The intrinsic @@split lands in
+            // the same `regexp_split_impl`, whose loop dwarfs the dispatch.
             "replace" if self.as_regexp(arg0).is_some() => {
                 let re = self.as_regexp(arg0).unwrap();
                 let repl = args.get(1).copied().unwrap_or(Value::UNDEFINED);

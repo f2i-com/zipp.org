@@ -5,7 +5,9 @@ dropped: `zipp-vm` calls `Regex::from_unicode_byteopt` (`src/api.rs`), which
 does not exist upstream, so the crates.io crate does not compile against this
 code at all. On top of that it carries seven correctness patches for bugs test262
 hits (`built-ins/RegExp/regexp-modifiers`, `named-groups`, `property-escapes`,
-and the `staging/sm/RegExp` unicode-flag cluster).
+and the `staging/sm/RegExp` unicode-flag cluster), plus the 15 September 2026
+audit patches B8-B11 (a backtracking crash, the anchored sticky attempt,
+lookbehind group names, and `[UnicodeMode]` grammar under `v`).
 
 ## Why not a different crate
 
@@ -161,10 +163,8 @@ reject U+017F.
 Still wrong, and NOT covered by these patches: the `v`-grammar
 `consume_class_set_expression` path builds `\W` the same inverted-then-closed
 way this patch fixed for the `[...]` grammar, so `/[^\W]/vi` and `/[\W]/vi`
-still answer the wrong way round for U+017F and U+212A. Separately, `\u`
-followed by something that is not four hex digits is still accepted as an
-IdentityEscape under `v` (`/\u/v` should be a SyntaxError) — the surrounding
-arms test `flags.unicode` where they mean `flags.unicode_mode()`.
+still answer the wrong way round for U+017F and U+212A. (The `flags.unicode`
+guards that meant `flags.unicode_mode()` are fixed by B11.)
 
 ## Patch B7: unicode-mode backreferences compare per code point, not per code unit
 
@@ -179,3 +179,66 @@ point, so the match must fail (staging/sm/RegExp/unicode-back-reference.js).
   range and the input with `cursor::next` (code-point-wise, like
   `backref_icase` already did); the unit-slice comparison is kept for the
   non-unicode path.
+
+## Patch B8: one-character loop backtracking cannot overshoot its bound
+
+A greedy one-character loop records `min` (its start plus the minimum
+iterations) and backtracks `max` toward it with the input's surrogate-aware
+`next_left_pos`. When the search started on the trailing half of a surrogate
+pair, `min` sits inside the pair: stepping left from just past the pair jumps
+two units, over `min`, so the `*max == *min` stop never fired, and the next
+step ran off the left end into `rs_unreachable!` — `unreachable_unchecked`
+without `prohibit-unsafe`, observed as a native crash from
+`/.*x/uy; re.lastIndex = 1; re.test("😀ab")` (a panic, and a WASM trap, with
+it). The lookbehind direction mirrors it.
+
+- `src/classicalbacktrack.rs`: `GreedyLoop1Char` and `NonGreedyLoop1Char`
+  compare the cursors by order, and a step that would cross the other bound
+  (or finds no position) clamps to it, so the bound itself is still tried
+  once. Neither arm can reach `rs_unreachable!` any more.
+- The VM also maps such a `lastIndex` to the pair's start for `u`/`v`
+  regexes, so JavaScript never searches from mid-pair; this patch is what
+  keeps a direct caller of `find_from_utf16` memory-safe.
+
+## Patch B9: anchored single-attempt search (`match_at_*`)
+
+The fork had no way to run the backtracker once at a given position, so the
+VM's sticky (`y`) exec ran `find_from_*(text, start).next()` and discarded a
+match that did not begin at `start`. A failing sticky exec therefore attempted
+every later position first, and `RegExp.prototype[@@split]` — a sticky exec per
+position — was quadratic in the gaps between separators.
+
+- `src/classicalbacktrack.rs`: `BacktrackExecutor::match_at(offset)` makes the
+  one attempt through the same `attempt_at` (native code where compiled) and
+  `successful_match` as `next_match_anchored`, honouring the budget.
+- `src/api.rs`: `Regex::match_at_{ascii,ucs2,utf16}` and their
+  `_with_limits` forms returning `(Option<Match>, MatchUsage)`. The ASCII form
+  always uses the classical executor, never the optional linear tier.
+
+## Patch B10: capture-group names are keyed by group id
+
+`Emitter` pushed each group's name in emission order, but `Match::captures`
+is indexed by the parser's group id, and a lookbehind's body is emitted in
+reverse (`ir::Node::reverse_cats`). Named groups inside a lookbehind therefore
+swapped names: `/(?<=(?<int>\d+)\.(?<frac>\d+))USD/` reported `int` as the
+fraction. Numbered captures and `\k<name>` (which use ids) were unaffected.
+
+- `src/emit.rs`: the `CaptureGroup` arm stores the name at index `id`.
+
+## Patch B11: `v` is a `[UnicodeMode]` grammar; two escape fixes
+
+B4 made `\u` ask `flags.unicode_mode()`, but the other `[UnicodeMode]`
+decisions still tested `flags.unicode`, so under `v` alone the parser took the
+Annex B paths: `/a{/v`, `/]/v`, `/(?=a)+/v`, `/\a/v`, `/\1/v`, `/\c/v`,
+`/\x1/v` and friends compiled instead of throwing.
+
+- `src/parse.rs`: the term arms (`\c`, lookahead quantifiability, lone `{`,
+  lone `* + ? ] { }`), the invalid braced quantifier, and the character-escape
+  arms (`\x`, `\u`, legacy octal, identity escape), `\1`-`\9` and `\k` ask
+  `unicode_mode()`. The `[...]` class-atom guards are left alone: under `v` the
+  class grammar is `consume_class_set_expression`.
+- `src/parse.rs`: `\b` inside a `v`-mode class is U+0008 (it produced `b`).
+- `src/parse.rs`: an Annex B `\x` not followed by two hex digits is the
+  identity escape `x`, and the characters after it are re-read as pattern text
+  (`/\x1/` matches `"x1"`); they were consumed, so `/[\x1]/` was an
+  "Unbalanced bracket" SyntaxError.

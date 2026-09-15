@@ -208,6 +208,8 @@ impl<'p> Vm<'p> {
             matchall_batches: rustc_hash::FxHashMap::default(),
             matchall_caps_scratch: Vec::new(),
             matchall_flat_scratch: Vec::new(),
+            #[cfg(not(feature = "safe-sandbox"))]
+            regex_subject_units: None,
             #[cfg(feature = "safe-sandbox")]
             regex_transient_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]

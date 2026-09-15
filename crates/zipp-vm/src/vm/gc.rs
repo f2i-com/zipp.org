@@ -838,6 +838,16 @@ impl Vm<'_> {
         self.dv_tracking.retain(|&k| marks[k as usize]);
         self.regexp_string_iters.retain(|&k, _| marks[k as usize]);
         self.matchall_batches.retain(|&k, _| marks[k as usize]);
+        // Correctness never depends on this (the cache is keyed by the slot
+        // version); it only stops a dead subject's units staying resident.
+        #[cfg(not(feature = "safe-sandbox"))]
+        if self
+            .regex_subject_units
+            .as_ref()
+            .is_some_and(|c| !marks[c.idx as usize])
+        {
+            self.regex_subject_units = None;
+        }
         self.method_brand.retain(|&k, _| marks[k as usize]);
         self.instance_brand.retain(|&k, _| marks[k as usize]);
         self.brand_owner.retain(|_, &mut c| marks[c as usize]);
