@@ -475,6 +475,16 @@ impl ScriptState {
         self.with_vm(|vm| vm.drain_microtasks());
     }
 
+    /// Deliver console lines to `sink` as they are produced, each tagged with
+    /// its stream, instead of buffering them for [`Self::take_output`] and
+    /// [`Self::take_console`]. A command-line host uses this to show a long
+    /// program's progress, and the two streams stay in production order by
+    /// construction. Lines already buffered stay buffered; the output ceiling
+    /// is charged exactly as before.
+    pub fn set_console_sink(&mut self, sink: Box<dyn FnMut(ConsoleStream, &str)>) {
+        self.with_vm(|vm| vm.console_sink = Some(sink));
+    }
+
     /// Take the `console.log`/`info`/`debug` lines produced so far, clearing the
     /// buffer. Un-drained output accumulates for the VM's lifetime, so a
     /// long-lived embedder should drain (or discard) periodically.

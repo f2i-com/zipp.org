@@ -76,9 +76,20 @@ pub(crate) enum Phase {
     /// with a row being entirely in the slow tier and said nothing either way.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     JitMem = 10,
+    /// Parsing JavaScript source to an AST: a program, an eval, a module, and
+    /// the Python frontend's runtime seed. Before these startup tags a short
+    /// run's parse and compile read as `interp/untagged`.
+    Parse = 11,
+    /// Compiling a JavaScript AST to bytecode.
+    Compile = 12,
+    /// The Python frontend's own work: lexing, parsing, symbol tables and
+    /// emission of the project's modules (the runtime seed nests as
+    /// `parse`/`compile`).
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    PyFrontend = 13,
 }
 
-const N_PHASES: usize = 11;
+const N_PHASES: usize = 14;
 
 const NAMES: [&str; N_PHASES] = [
     "interp/untagged",
@@ -92,10 +103,16 @@ const NAMES: [&str; N_PHASES] = [
     "jit-fast",
     "microtask",
     "jit-mem",
+    "parse",
+    "compile",
+    "py-frontend",
 ];
 
 static CURRENT: AtomicU8 = AtomicU8::new(Phase::Interp as u8);
 static COUNTS: [AtomicU64; N_PHASES] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),

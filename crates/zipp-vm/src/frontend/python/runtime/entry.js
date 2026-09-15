@@ -94,7 +94,8 @@ function __zipp_py_set_input(json) {
             const changes = [];
             for (const path of rt.vfs.changed()) {
                 const bytes = rt.vfs.get(path);
-                changes.push(bytes === undefined ? { path: path, deleted: true } : { path: path, base64: base64(bytes) });
+                // Files are Uint8Arrays: encode natively, not byte by byte here.
+                changes.push(bytes === undefined ? { path: path, deleted: true } : { path: path, base64: bytes instanceof Uint8Array ? bytes.toBase64() : base64(bytes) });
             }
             return JSON.stringify({ version: 1, changes: changes });
     };

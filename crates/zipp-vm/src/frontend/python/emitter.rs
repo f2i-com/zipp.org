@@ -351,6 +351,20 @@ impl<'a> Emitter<'a> {
         self.emit(Instr::LoadConst { dst, idx })?;
         Ok(dst)
     }
+    /// [`Self::string`] for a value known to be distinct from every other
+    /// constant (the virtual filesystem's paths and contents): it is appended
+    /// without searching the pool, which would be quadratic in the file count.
+    pub fn unique_string(&mut self, value: String) -> R<Reg> {
+        let dst = self.alloc()?;
+        let si = self.proto.string_constants.len() as u32;
+        self.proto.string_constants.push(value);
+        let idx = self.proto.constants.len() as u32;
+        self.proto
+            .constants
+            .push(crate::value::Value::heap(crate::vm::STRING_CONST_BIT | si));
+        self.emit(Instr::LoadConst { dst, idx })?;
+        Ok(dst)
+    }
     /// A Python int (a BigInt in the runtime's value model).
     pub fn integer(&mut self, text: &str) -> R<Reg> {
         if text.len() > 4096 {

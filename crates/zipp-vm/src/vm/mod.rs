@@ -1334,6 +1334,10 @@ pub struct Vm<'p> {
     /// two buffers can be merged back into one chronological log. One byte
     /// per line; the lines themselves are stored once, above.
     pub console_order: Vec<ConsoleStream>,
+    /// When set, console lines go to this sink as they are produced instead
+    /// of into the buffers above (a CLI that prints progress while a long
+    /// program runs). `None` everywhere else.
+    pub(crate) console_sink: Option<Box<dyn FnMut(ConsoleStream, &str)>>,
     /// Embedder host hook, backing the `HOST_CALL` native. `None` in every
     /// engine-internal path (`run`, `run_module_file`, the CLI, test262), so a
     /// stock build has no host surface at all; only `crate::embed` installs one.
@@ -2836,10 +2840,20 @@ pub(crate) use object_literal_jit::*;
 
 impl<'p> Vm<'p> {
     /// Append one console line to its stream, recording the order so
-    /// `ScriptState::take_console` can merge the streams chronologically.
+    /// `ScriptState::take_console` can merge the streams chronologically, or
+    /// hand it straight to the embedder's console sink when one is set.
     /// Every console emission goes through here.
     #[inline]
     pub(crate) fn push_console_line(&mut self, line: String, to_stderr: bool) {
+        if let Some(sink) = self.console_sink.as_mut() {
+            let stream = if to_stderr {
+                ConsoleStream::Stderr
+            } else {
+                ConsoleStream::Stdout
+            };
+            sink(stream, &line);
+            return;
+        }
         if to_stderr {
             self.console_order.push(ConsoleStream::Stderr);
             self.errput.push(line);

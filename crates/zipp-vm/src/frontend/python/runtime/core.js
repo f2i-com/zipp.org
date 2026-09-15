@@ -1176,10 +1176,8 @@ var __zipp_py = (function () {
         changed: () => { const out = Array.from(vfsChanged); vfsChanged.clear(); return out; },
     };
     const dirs = new Set();
-    R.vfs = function (path, latin1) {
-        const bytes = new Uint8Array(latin1.length);
-        for (let i = 0; i < latin1.length; i++) bytes[i] = latin1.charCodeAt(i) & 255;
-        vfs.set(vfsNorm(path), bytes);
+    R.vfs = function (path, base64) {
+        vfs.set(vfsNorm(path), Uint8Array.fromBase64(base64));
         return null;
     };
     rt.argv = [];

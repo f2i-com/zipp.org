@@ -33,6 +33,7 @@ pub fn parse(src: &str, opts: ParseOptions) -> PResult<Program> {
 /// As [`parse`], plus the EXACT WTF-8 bytes `src` is a lossy view of — see
 /// [`crate::parse::lexer::Lexer::set_exact_src`].
 pub fn parse_exact(src: &str, exact: Option<&[u8]>, opts: ParseOptions) -> PResult<Program> {
+    let _prof = crate::vm::prof::enter(crate::vm::prof::Phase::Parse);
     let goal = opts.goal;
     let mut p = Parser::new_exact(src, exact, opts)?;
     let program = p.parse_program(goal)?;

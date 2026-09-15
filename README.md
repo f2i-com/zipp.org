@@ -360,7 +360,8 @@ print(fib(30))
 ```sh
 zipp py fib.py                 # 832040
 zipp run fib.py                # frontend chosen by extension, shebang or directive
-zipp run --lang=python -       # from standard input
+zipp run tool                  # an extensionless `#!/usr/bin/env python3` script
+zipp run --lang=python -       # from standard input (no project folder)
 ```
 
 Classes (including metaclasses, descriptors and `__slots__`), exceptions
@@ -380,7 +381,10 @@ filesystem, so `open()`, `os`, `os.path`, `pathlib` and `json.load` see the
 project's data; `.py` files are modules and packages by folder
 (`legacy/fast_memory.py` is `legacy.fast_memory`, with or without an
 `__init__.py`); `sys.argv` carries the arguments; and files the program
-writes are copied back under the folder when it finishes. A `test_*.py`
+writes are copied back under the folder when it finishes (never over a file
+it could not see, such as one in `dist/`, a dot-folder or over the limits).
+Any script name runs, extensionless shebang scripts included, and output
+appears as the program prints it. A `test_*.py`
 entry runs its tests through the bundled `pytest` subset. The bundled
 library also includes a `torch` subset (tensors over typed arrays with
 reverse-mode autograd, `nn`, `nn.functional`, `optim`, `save`/`load` in

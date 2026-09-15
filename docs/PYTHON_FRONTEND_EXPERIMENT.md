@@ -19,7 +19,7 @@ integration date every corpus program matched.
 | Area | Supported |
 | --- | --- |
 | Numbers | arbitrary-precision `int`, `float` (Python `repr`/formatting rules, half-to-even rounding), `bool`; `+ - * / // % ** << >> & \| ^ ~`, chained comparisons, `divmod`, `round`, `pow` with modulus |
-| Strings | full `str` method set, `%` formatting, `str.format`, f-strings with conversions and nested format specs, `bytes` (utf-8/ascii/latin-1 encode/decode), code-point indexing |
+| Strings | full `str` method set, `%` formatting, `str.format`, f-strings with conversions and nested format specs, `bytes` (utf-8/ascii/latin-1 encode/decode), code-point indexing, `\N{...}` escapes for the common character names (see below) |
 | Containers | `list`, `tuple`, `dict` (insertion-ordered, `__missing__`), `set`, `frozenset`, `range`, slices with steps and slice assignment/deletion, comprehensions (list/set/dict/generator), starred unpacking, `del` |
 | Functions | defaults, keyword and keyword-only arguments, positional-only, `*args`/`**kwargs`, `*`/`**` at call sites, closures with `nonlocal`/`global`, lambdas, decorators, `__name__`/`__doc__`/`__defaults__`, generators (`yield`, `yield from`, `send`, `throw`, `close`, return value via `StopIteration.value`) |
 | Classes | single and multiple inheritance (C3 MRO), `super()` (zero- and two-argument), `__init__`/`__new__`, instance and class attributes, `property` with setters/deleters, `classmethod`, `staticmethod`, descriptors, `__getattr__`/`__setattr__`/`__delattr__`, `__init_subclass__`, `__class_getitem__`, `__slots__` (accepted), subclassing `list`/`dict`/`tuple`/`set`/exceptions, every operator, comparison, container, iteration, call, context-manager and conversion dunder |
@@ -40,6 +40,12 @@ integration date every corpus program matched.
 ## What does not run yet
 
 - `async`/`await`, type-parameter syntax, `except*`, complex numbers.
+- `\N{...}` knows a bundled table of names rather than all of Unicode
+  (Latin-1, Greek letters, punctuation, currency, arrows, mathematical
+  operators, box drawing, symbols, dingbats, common emoji, the control and
+  format character aliases, and `CJK UNIFIED IDEOGRAPH-XXXX`), matched
+  case-insensitively as CPython does. Any other name is a SyntaxError that
+  says so; spell the character or use `\u`/`\U`.
 - Sockets, processes, threads, and any file outside the project folder:
   the filesystem a program sees is the virtual one its host loaded (the
   CLI copies written files back under the project folder when the run
@@ -127,10 +133,38 @@ bytes, `sys.argv[1:]`) return a language-labelled handle owning an ordinary
 contents), `pythonCall`, `pythonHas`, `takeUi`, `setPythonInput`,
 `takeHostRequests`, and the written-file report through
 `pythonCall("__zipp_py_vfs_changed", [])`; the JavaScript global-slot,
-`callFunction` and `evalInContext` methods reject Python states. The CLI's
-`zipp py FILE|DIR [ARGS...]` loads the folder holding the script (the
-current directory when the script is inside it), skipping `.git`,
-`__pycache__`, `node_modules`, `target` and virtual environments.
+`callFunction` and `evalInContext` methods reject Python states.
+
+### The CLI's project runs
+
+`zipp py FILE|DIR [ARGS...]` (and `zipp run FILE` for a file detected as
+Python by its extension, shebang or directive) runs the script as the entry
+of a project:
+
+- **Root.** The current directory when the script is inside it (as
+  `python path/to/script.py` sees the tree from where it is run), otherwise
+  the script's own folder. A filesystem root or the home folder is where
+  scripts are run from rather than a project, so a script below one is
+  rooted at its own folder. `zipp py DIR` roots at `DIR` and runs its
+  `main.py`; `--bc` takes a file, never a folder.
+- **Entry.** Any file name runs, with `__name__ == "__main__"` and
+  `__file__`/`sys.argv[0]` its root-relative path: `my-script.py`,
+  `2024_report.py`, an extensionless shebang script, or a script under a
+  dot-folder or a skipped folder. A file name that is a module name is also
+  importable by it. Its folder comes first for bare module names, as
+  `sys.path[0]` does: `sub/util.py` shadows a root `util.py` for a script
+  in `sub/` (the shadowed file stays readable).
+- **Files loaded.** The script's folder first, then the tree breadth-first,
+  skipping links and reparse points, every folder whose name starts with a
+  dot, and `__pycache__`, `node_modules`, `target`, `venv` and `dist`. Up to
+  8 MiB per file and 64 MiB in total, source files first; a `.py` file is
+  a module up to 1 MiB, and up to 256 modules are importable. The walk stops
+  after 20,000 entries. Files and folders that are over the limits or
+  cannot be read are left out with a note on stderr, not an error.
+- **Output.** Console lines are written as the program produces them, with
+  stdout and stderr in the order written.
+- **Standard input.** `zipp --lang=python -` has no project folder; its
+  file writes are discarded with a warning.
 
 ### CPU Torch compatibility evidence
 
@@ -190,6 +224,21 @@ base64 string for a zero-byte file), or `{ "path": "file", "deleted": true }`.
 Rename reports deletion of the old path and a write to the new one. Reading the
 hook drains the change set. Hosts must update their parser with the engine;
 the old tab-separated protocol is no longer supported.
+
+The CLI checks every change before it writes anything, applies deletions
+first, and reports each change it refuses on stderr while the rest still
+apply; a refused change fails the run, and when the program itself failed
+too, its own error and traceback are still printed (after the refusals) and
+decide the exit status. A change is refused when its path
+is invalid on the host (Windows stream syntax `:`, for example) or when it
+would replace a file that exists on disk but was not loaded into the
+program: one in a skipped folder, over the size limits, or unreadable. The
+program saw such a file as missing, so writing it back would destroy
+contents the program never read; a new file in a skipped folder is written
+normally. The virtual filesystem is case-sensitive. On a case-insensitive
+disk (Windows, macOS) spellings that differ only in case are one file when
+written back: the last write wins, and a case-only rename keeps the file
+under its new spelling (the last one written, when there are several).
 
 The native CLI accepts `.py`/`.pyw` case-insensitively for project entry files and
 module discovery. It skips symlinks and Windows reparse points while collecting

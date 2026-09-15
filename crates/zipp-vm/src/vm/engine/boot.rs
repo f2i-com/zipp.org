@@ -180,6 +180,7 @@ impl<'p> Vm<'p> {
             output: Vec::new(),
             errput: Vec::new(),
             console_order: Vec::new(),
+            console_sink: None,
             host: None,
             host_ctx: None,
             start_mono_ms: crate::vm::clock::now_mono_ms(),
