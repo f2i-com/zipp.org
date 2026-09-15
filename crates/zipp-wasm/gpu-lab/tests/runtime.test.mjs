@@ -45,6 +45,19 @@ for(const backend of ['cpu-js','wasm']) {
     for(let v=0;v<40;v++)assert.deepEqual((await rt.execute(graph([{id:0,op:'full',shape:[3],value:v}]))).outputs.result.data,[v,v,v]);
     rt.dispose();await assert.rejects(()=>rt.execute(graph([input(0,[1])])),e=>e.code==='DISPOSED');
   });
+  test(`${backend}: Float32Array inputs and typed outputs match the list form`,async()=>{
+    const rt=await createRuntime({backend,wasmBytes});
+    const list=graph([input(0,[0.1,-2,3.5,4],[2,2]),input(1,[1,2,3,4],[2,2]),{id:2,op:'matmul',a:0,b:1},{id:3,op:'relu',a:2},{id:4,op:'sum',a:3}],
+      [{name:'values',id:3},{name:'alias',id:3},{name:'total',id:4}]);
+    const typed=structuredClone(list);for(const n of typed.nodes)if(n.op==='input')n.data=Float32Array.from(n.data);
+    const a=await rt.execute(list),b=await rt.execute(typed,{typedOutputs:true});
+    for(const name of ['values','alias','total']){
+      assert.ok(b.outputs[name].data instanceof Float32Array,name);assert.deepEqual(Array.from(b.outputs[name].data),a.outputs[name].data);
+    }
+    assert.notEqual(b.outputs.values.data,b.outputs.alias.data,'each output owns its array');
+    assert.ok(Array.isArray((await rt.execute(typed)).outputs.values.data),'lists unless typed outputs are asked for');
+    rt.dispose();
+  });
   test(`${backend}: finite input that overflows computation rejects readback`,async()=>{
     const rt=await createRuntime({backend,wasmBytes});const nodes=[input(0,[3e38]),{id:1,op:'mul',a:0,b:0}];
     await assert.rejects(()=>rt.execute(graph(nodes)),e=>e.code==='NUMBER');
@@ -119,5 +132,11 @@ test('invalid backend selection does not silently switch implementation',async()
 });
 test('validated graph owns input data before awaiting',async()=>{
   const rt=await createRuntime({backend:'cpu-js'}),p=graph([input(0,[1,2])]);const result=rt.execute(p);p.nodes[0].data[0]=999;
-  assert.deepEqual((await result).outputs.result.data,[1,2]);rt.dispose();
+  assert.deepEqual((await result).outputs.result.data,[1,2]);
+  const typed=graph([input(0,new Float32Array([1,2]))]);const later=rt.execute(typed);typed.nodes[0].data[0]=999;
+  assert.deepEqual((await later).outputs.result.data,[1,2]);rt.dispose();
+});
+test('validator rejects non-finite, mis-sized and non-float32 typed input',()=>{
+  for(const data of [new Float32Array([1,NaN]),new Float32Array([Infinity,1]),new Float32Array([1]),new Float64Array([1,2]),new Uint8Array([1,2])])
+    assert.throws(()=>validateProgram(graph([input(0,data,[2])])),e=>['NUMBER','SHAPE'].includes(e.code),String(data.constructor.name));
 });

@@ -65,16 +65,27 @@ const expectedImportStems = [
   "__wbg_get",
   "__wbg_get",
   "__wbg_has",
+  // Binary tensor transport (HostValue::Float32Array): ArrayBuffer.isView and
+  // `instanceof Float32Array` classify a host array, `new Float32Array(view)`
+  // copies it, its length getter and Float32Array.prototype.set move the copy
+  // into linear memory, and a Float32Array built from a slice leaves the
+  // engine. Typed-array data operations only; no new authority.
+  "__wbg_instanceof_Float32Array",
   "__wbg_isArray",
+  "__wbg_isView",
   "__wbg_keys",
+  "__wbg_length",
   "__wbg_length",
   "__wbg_new",
   "__wbg_new",
   "__wbg_new",
+  "__wbg_new",
+  "__wbg_new_from_slice",
   "__wbg_new_typed",
   "__wbg_new_with_length",
   "__wbg_now",
   "__wbg_parse",
+  "__wbg_prototypesetcall",
   "__wbg_push",
   "__wbg_set",
   "__wbg_set",

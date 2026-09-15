@@ -44,6 +44,12 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = Object, js_name = keys, catch)]
     fn try_object_keys(value: &JsValue) -> Result<js_sys::Array, JsValue>;
+
+    /// `new Float32Array(view)`: an owned copy of a host Float32Array.
+    #[wasm_bindgen(js_name = Float32Array)]
+    type Float32ArrayCopy;
+    #[wasm_bindgen(constructor, js_class = Float32Array, catch)]
+    fn new(source: &JsValue) -> Result<Float32ArrayCopy, JsValue>;
 }
 
 const PREAMBLE: &str = include_str!("preamble.js");
@@ -3025,6 +3031,11 @@ fn to_js_bounded(v: &HostValue, budget: &mut HostValueBudget) -> Result<JsValue,
             budget.charge_string_bytes(units.len().saturating_mul(3))?;
             Ok(utf16_units_to_js_string(units).into())
         }
+        // Tensor storage crosses as its bytes, not one JS number per element.
+        HostValue::Float32Array(values) => {
+            budget.charge_string_bytes(values.len().saturating_mul(4))?;
+            Ok(js_sys::Float32Array::from(values.as_slice()).into())
+        }
         HostValue::Array(items) => {
             budget.ensure_nodes(items.len())?;
             let a = js_sys::Array::new_with_length(items.len() as u32);
@@ -3135,6 +3146,24 @@ fn from_js_bounded(
     }
     if depth >= MAX_DEPTH {
         return Ok(HostValue::Null);
+    }
+    // Before the object walk, which would read a Float32Array as an object
+    // of index keys. `isView` is an internal-slot test (a Proxy is never a
+    // view) and the instanceof shim catches; the copy goes through a
+    // catching constructor, because a view over a detached or shrunk buffer
+    // throws. The claimed length is charged before the copy exists, and any
+    // excess the copy turns out to have after it.
+    if js_sys::ArrayBuffer::is_view(v) && v.is_instance_of::<js_sys::Float32Array>() {
+        let claimed = checked_array_length(v, "host Float32Array")? as usize;
+        budget.charge_string_bytes(claimed.saturating_mul(4))?;
+        let copy: js_sys::Float32Array = Float32ArrayCopy::new(v)
+            .map_err(|_| inspection_error("host Float32Array"))?
+            .unchecked_into();
+        let len = copy.length() as usize;
+        if len > claimed {
+            budget.charge_string_bytes((len - claimed).saturating_mul(4))?;
+        }
+        return Ok(HostValue::Float32Array(copy.to_vec()));
     }
     if checked_is_array(v, "host value")? {
         let object: js_sys::Object = v.clone().unchecked_into();

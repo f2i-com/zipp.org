@@ -6,7 +6,7 @@ import _zipp_tensor as _k
 
 
 def linear(x, weight, bias=None):
-    if getattr(x, "_zipp_graph", False):
+    if torch._graph_recording and getattr(x, "_zipp_graph", False):
         return x.linear(weight, bias)
     out = torch.matmul(x, weight.transpose(0, 1))
     return out if bias is None else out + bias
@@ -75,7 +75,7 @@ def _conv_pair(value, name, minimum=1):
 
 
 def conv2d(x, weight, bias=None, stride=1, padding=0, dilation=1, groups=1):
-    if getattr(x, "_zipp_graph", False):
+    if torch._graph_recording and getattr(x, "_zipp_graph", False):
         raise NotImplementedError("conv2d currently supports eager CPU tensors only")
     stride = _conv_pair(stride, "stride")
     padding = _conv_pair(padding, "padding", 0)

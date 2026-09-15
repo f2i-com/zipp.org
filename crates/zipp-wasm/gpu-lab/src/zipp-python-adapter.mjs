@@ -49,12 +49,16 @@ export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, m
     let payload;
     try { payload = structuredClone(request.payload); }
     catch { return Promise.reject(new ComputeError('PROTOCOL', 'Request payload is not cloneable data')); }
+    // An engine that sends tensor inputs as Float32Arrays takes outputs the
+    // same way (straight into tensor storage); one that sends lists gets
+    // lists, whatever its age.
+    const typedOutputs = Array.isArray(payload?.nodes) && payload.nodes.some((node) => node?.data instanceof Float32Array);
     const id = request.id;
     admitted++; pending++;
     const run = tail.then(async () => {
       if (!live()) return {delivered: false, cancelled: true};
       let reply;
-      try { reply = {ok: true, value: await handler.handle('gpu.execute', [payload])}; }
+      try { reply = {ok: true, value: await handler.handle('gpu.execute', [payload], {typedOutputs})}; }
       catch (error) { reply = {ok: false, error: {code: error.code || 'GPU', message: String(error.message || error).slice(0, 512)}}; }
       if (!live()) return {delivered: false, cancelled: true};
       // After the asynchronous host work, outside any engine call.

@@ -66,8 +66,12 @@ are rejected. Every trainable optimizer parameter must participate in the loss.
 Weights and gradients stay unchanged while a supported step is recorded or pending.
 After successful readback, finite results are checked before committing weights
 and gradients. A backend error or changed captured tensor rejects the result and
-leaves the model unchanged by that submission. Changes to captured gradients,
-shape, dtype or `requires_grad` also invalidate a pending step. SGD parameter
+leaves the model unchanged by that submission. "Changed" means written in place
+(`fill_`, `copy_`, `zero_`, indexed assignment, an optimizer) or rebound (`.data =`,
+in-place arithmetic) after capture, even back to equal values: each tensor
+storage carries a version counter, and a result is judged against the storage
+and version it was recorded from rather than by comparing values. Changes to
+captured gradients, shape, dtype or `requires_grad` also invalidate a pending step. SGD parameter
 identities, group membership/order and all supported SGD options are snapshotted
 when `step()` is captured; changing them before completion rejects that step.
 SGD options must be numeric or boolean scalars; mutable option values are rejected.
@@ -79,8 +83,11 @@ updates, not arbitrary Python side effects inside a user function.
 
 **This is capture per call, with uploads and readbacks per call.** There is no
 persistent compiled model, `prepare()` method, graph cache, resident parameter or
-optimizer state, or automatic multi-GPU distribution. Native Zipp uses its CPU
-graph evaluator; a browser GPU requires the host GPU grant and an available
+optimizer state, or automatic multi-GPU distribution. Uploads and readbacks move
+tensor bytes (`Float32Array`s at the host boundary, straight into tensor storage
+on the way back), not a number per element. Native Zipp evaluates the graph on
+its CPU tensor kernels, with the same float32 results as `zipp_gpu`'s pure-Python
+reference; a browser GPU requires the host GPU grant and an available
 WebGL2/WebGPU backend. Auto selection can fall back to CPU; inspect `.backend`.
 
 Each step returns the requested result plus leaf gradients and updated parameters.
@@ -134,6 +141,12 @@ within [-2**53, 2**53] can be represented exactly; values outside that range can
 round. Arithmetic does not provide true signed 64-bit or 32-bit overflow
 semantics. Keep indices and integer data within the exact range. Full-width
 integer storage is future work, not a current compatibility claim.
+
+Eager float32 `matmul`/`@` accumulates each dot product in float64 and rounds
+once when storing the float32 result, so results can differ from PyTorch's
+float32 kernels (and from earlier Zipp builds) in the last bits. The GPU graph
+reference (`zipp_gpu`) keeps float32 rounding after every step, matching the
+WebGPU/WebGL2 backends.
 
 General strided views are also future work. Slices and permutations materialize
 copies, so mutating a slice does not update its parent as ordinary PyTorch

@@ -7,6 +7,15 @@
  * here touches a GPU: this is the CPU path of the engine, on wasm or
  * native. Kernels take shapes as Python tuples of ints and return
  * `(storage, shape)` pairs where the shape changes.
+ *
+ * Python runs on the interpreter (the VM JIT is off for Python states), so
+ * the hot kernels are written as one inline loop per operation: a closure
+ * call per element costs a frame, which was most of an elementwise kernel.
+ *
+ * A storage carries a version, bumped by every kernel that writes into an
+ * existing storage (`fill`, `setitem`, `copy_into`, `setslice`, `scatter`,
+ * `scatter_add`, `axpy`), so a compiled GPU result can tell whether the
+ * tensors it was recorded from changed without keeping a copy to compare.
  */
 (function (R) {
     "use strict";
@@ -15,14 +24,23 @@
     const Storage = rt.newType("_Storage", [rt.ObjectType], new Map(), "_zipp_tensor");
     const ARRAY = { float32: Float32Array, float64: Float64Array, int64: Float64Array, int32: Float64Array, bool: Uint8Array, uint8: Uint8Array };
     const RANK = { bool: 0, uint8: 1, int32: 2, int64: 3, float32: 4, float64: 5 };
-    function make(dtype, data) { if (ARRAY[dtype] === undefined) fail(E.TypeError, "unknown dtype " + dtype); return { cls: Storage, dtype: dtype, data: data }; }
+    function make(dtype, data) { if (ARRAY[dtype] === undefined) fail(E.TypeError, "unknown dtype " + dtype); return { cls: Storage, dtype: dtype, data: data, version: 0 }; }
     function alloc(dtype, n) { return make(dtype, new ARRAY[dtype](n)); }
     function isStorage(v) { return v !== null && typeof v === "object" && v.cls === Storage; }
     function needS(v, what) { if (!isStorage(v)) fail(E.TypeError, (what || "argument") + " must be a tensor storage"); return v; }
-    function shapeOf(v) { const out = []; if (v === null || typeof v !== "object" || v.items === undefined) fail(E.TypeError, "shape must be a tuple"); for (const x of v.items) out.push(Number(rt.asInt(x))); return out; }
+    function written(s) { s.version++; }
+    // The host transport (entry.js): a float32 storage leaves as its
+    // Float32Array, and a Float32Array the host sends arrives as a storage
+    // that owns it (the VM made it from the host's copy).
+    rt.float32Storage = (data) => make("float32", data);
+    rt.isFloat32Storage = (v) => isStorage(v) && v.dtype === "float32";
+    function isFloatDtype(dtype) { return dtype === "float32" || dtype === "float64"; }
+    // Indexed loops, not for...of: these run on every kernel call, and the
+    // iterator protocol is several interpreter calls per element.
+    function shapeOf(v) { if (v === null || typeof v !== "object" || v.items === undefined) fail(E.TypeError, "shape must be a tuple"); const items = v.items, out = new Array(items.length); for (let i = 0; i < items.length; i++) out[i] = Number(rt.asInt(items[i])); return out; }
     function ints(v) { return shapeOf(v); }
-    function pyShape(shape) { const out = []; for (const d of shape) out.push(BigInt(d)); return tuple(out); }
-    function numel(shape) { let n = 1; for (const d of shape) n *= d; return n; }
+    function pyShape(shape) { const out = new Array(shape.length); for (let i = 0; i < shape.length; i++) out[i] = BigInt(shape[i]); return tuple(out); }
+    function numel(shape) { let n = 1; for (let i = 0; i < shape.length; i++) n *= shape[i]; return n; }
     function strides(shape) { const s = new Array(shape.length); let acc = 1; for (let i = shape.length - 1; i >= 0; i--) { s[i] = acc; acc *= shape[i]; } return s; }
     function promote(a, b) { return RANK[a] >= RANK[b] ? a : b; }
     function pyNumber(dtype, v) {
@@ -88,23 +106,93 @@
         floordiv: (x, y) => Math.floor(x / y), mod: (x, y) => x - Math.floor(x / y) * y,
     };
     const COMPARE = new Set(["eq", "ne", "lt", "le", "gt", "ge", "and", "or", "xor"]);
-    function binary(op, a, ashape, b, bshape) {
+    // How many trailing elements `part` tiles over `shape` with: its
+    // numel when `part` (leading 1s dropped) is exactly a suffix of `shape`,
+    // so element i of the result reads element i % tile of `part`; 0 when
+    // the broadcast is not of that form.
+    function suffixTile(part, shape) {
+        let lead = 0; while (lead < part.length && part[lead] === 1) lead++;
+        const off = shape.length - (part.length - lead);
+        if (off < 0) return 0;
+        let n = 1;
+        for (let i = lead; i < part.length; i++) { if (part[i] !== shape[off + i - lead]) return 0; n *= part[i]; }
+        return n;
+    }
+    // O[i] = A[i] op B[i % nb], or B[i % nb] op A[i] when `flip`; nb divides
+    // O.length. false when `op` has no inline loop.
+    function binaryTile(op, O, A, B, nb, flip) {
+        const n = O.length;
+        switch (op) {
+            case "add": for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] + B[j]; return true;
+            case "mul": for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] * B[j]; return true;
+            case "sub":
+                if (flip) for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = B[j] - A[i];
+                else for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] - B[j];
+                return true;
+            case "div":
+                if (flip) for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = B[j] / A[i];
+                else for (let i = 0; i < n;) for (let j = 0; j < nb; j++, i++) O[i] = A[i] / B[j];
+                return true;
+        }
+        return false;
+    }
+    // O[i] = A[i] op y, or y op A[i] when `flip`.
+    function binaryScalar(op, O, A, y, flip) {
+        const n = O.length;
+        switch (op) {
+            case "add": for (let i = 0; i < n; i++) O[i] = A[i] + y; return true;
+            case "mul": for (let i = 0; i < n; i++) O[i] = A[i] * y; return true;
+            case "sub":
+                if (flip) for (let i = 0; i < n; i++) O[i] = y - A[i];
+                else for (let i = 0; i < n; i++) O[i] = A[i] - y;
+                return true;
+            case "div":
+                if (flip) for (let i = 0; i < n; i++) O[i] = y / A[i];
+                else for (let i = 0; i < n; i++) O[i] = A[i] / y;
+                return true;
+            case "pow":
+                if (flip) for (let i = 0; i < n; i++) O[i] = Math.pow(y, A[i]);
+                else for (let i = 0; i < n; i++) O[i] = Math.pow(A[i], y);
+                return true;
+            case "gt": if (flip) for (let i = 0; i < n; i++) O[i] = y > A[i] ? 1 : 0; else for (let i = 0; i < n; i++) O[i] = A[i] > y ? 1 : 0; return true;
+            case "lt": if (flip) for (let i = 0; i < n; i++) O[i] = y < A[i] ? 1 : 0; else for (let i = 0; i < n; i++) O[i] = A[i] < y ? 1 : 0; return true;
+            case "ge": if (flip) for (let i = 0; i < n; i++) O[i] = y >= A[i] ? 1 : 0; else for (let i = 0; i < n; i++) O[i] = A[i] >= y ? 1 : 0; return true;
+            case "le": if (flip) for (let i = 0; i < n; i++) O[i] = y <= A[i] ? 1 : 0; else for (let i = 0; i < n; i++) O[i] = A[i] <= y ? 1 : 0; return true;
+        }
+        return false;
+    }
+    // A shape tuple the caller passed in, when the result has exactly that
+    // shape: the kernel hands it back instead of building an equal one.
+    function tupleShape(v) { return v !== undefined && (v.cls === T.tuple || rt.isSubclass(v.cls, T.tuple)); }
+    function binary(op, a, ashape, b, bshape, apy, bpy) {
         const f = BIN[op]; if (f === undefined) fail(E.ValueError, "unknown op " + op);
         const shape = broadcastShape(ashape, bshape);
         let dtype = COMPARE.has(op) ? "bool" : promote(a.dtype, b.dtype);
         if (op === "div" && RANK[dtype] < RANK.float32) dtype = "float32";
         if (op === "pow" && RANK[dtype] < RANK.float32 && b.dtype !== "int64") dtype = "float32";
-        const out = alloc(dtype, numel(shape)), A = a.data, Bd = b.data, O = out.data;
-        const f32 = dtype === "float32";
-        if (ashape.length === shape.length && bshape.length === shape.length && numel(ashape) === numel(shape) && numel(bshape) === numel(shape)) {
-            for (let i = 0; i < O.length; i++) O[i] = f(A[i], Bd[i]);
-        } else if (numel(bshape) === 1 && ashape.length === shape.length && numel(ashape) === numel(shape)) {
-            const y = Bd[0]; for (let i = 0; i < O.length; i++) O[i] = f(A[i], y);
+        const n = numel(shape), out = alloc(dtype, n), A = a.data, Bd = b.data, O = out.data;
+        // Every layout below visits elements in the same order and applies
+        // the same double-precision operation as the closure form, and the
+        // typed array rounds on store, so results are identical.
+        const na = numel(ashape), nb = numel(bshape);
+        // Same rank and (nonzero) size as an operand means the same shape.
+        const outShape = n !== 0 && na === n && ashape.length === shape.length && tupleShape(apy) ? apy
+            : n !== 0 && nb === n && bshape.length === shape.length && tupleShape(bpy) ? bpy : null;
+        if (na === n && ashape.length === shape.length) {
+            if (nb === 1 ? binaryScalar(op, O, A, Bd[0], false) : (nb === n && bshape.length === shape.length ? binaryTile(op, O, A, Bd, n, false) : (suffixTile(bshape, shape) === nb && binaryTile(op, O, A, Bd, nb, false))))
+                return tuple([out, outShape === null ? pyShape(shape) : outShape]);
+        } else if (nb === n && bshape.length === shape.length) {
+            if (na === 1 ? binaryScalar(op, O, Bd, A[0], true) : (suffixTile(ashape, shape) === na && binaryTile(op, O, Bd, A, na, true)))
+                return tuple([out, outShape === null ? pyShape(shape) : outShape]);
+        }
+        if (ashape.length === shape.length && bshape.length === shape.length && na === n && nb === n) {
+            for (let i = 0; i < n; i++) O[i] = f(A[i], Bd[i]);
+        } else if (nb === 1 && ashape.length === shape.length && na === n) {
+            const y = Bd[0]; for (let i = 0; i < n; i++) O[i] = f(A[i], y);
         } else {
             forEachBroadcast(shape, bstrides(ashape, shape), bstrides(bshape, shape), (o, x, y) => { O[o] = f(A[x], Bd[y]); });
         }
-        if (f32) { /* Float32Array rounds on store */ }
-        return tuple([out, pyShape(shape)]);
+        return tuple([out, outShape === null ? pyShape(shape) : outShape]);
     }
     const UN = {
         neg: (x) => -x, exp: Math.exp, log: Math.log, tanh: Math.tanh, sigmoid: (x) => 1 / (1 + Math.exp(-x)),
@@ -119,18 +207,33 @@
         if (op === "clamp") { const lo = p1 === null ? -Infinity : jsNumber(p1), hi = p2 === null ? Infinity : jsNumber(p2); f = (x) => (x < lo ? lo : x > hi ? hi : x); }
         if (f === undefined) fail(E.ValueError, "unknown op " + op);
         const dtype = op === "isfinite" || op === "isnan" || op === "not" ? "bool" : (["exp", "log", "tanh", "sigmoid", "silu", "sqrt", "reciprocal", "log1p", "expm1", "gelu", "softplus", "sin", "cos"].includes(op) && RANK[a.dtype] < RANK.float32 ? "float32" : a.dtype);
-        const out = alloc(dtype, a.data.length), A = a.data, O = out.data;
-        for (let i = 0; i < O.length; i++) O[i] = f(A[i]);
+        const out = alloc(dtype, a.data.length), A = a.data, O = out.data, n = O.length;
+        // The hot activations and their gradients inline; the expressions
+        // are the table's own.
+        switch (op) {
+            case "neg": for (let i = 0; i < n; i++) O[i] = -A[i]; break;
+            case "relu": for (let i = 0; i < n; i++) { const x = A[i]; O[i] = x > 0 ? x : 0; } break;
+            case "exp": for (let i = 0; i < n; i++) O[i] = Math.exp(A[i]); break;
+            case "log": for (let i = 0; i < n; i++) O[i] = Math.log(A[i]); break;
+            case "tanh": for (let i = 0; i < n; i++) O[i] = Math.tanh(A[i]); break;
+            case "sigmoid": for (let i = 0; i < n; i++) O[i] = 1 / (1 + Math.exp(-A[i])); break;
+            case "sqrt": for (let i = 0; i < n; i++) O[i] = Math.sqrt(A[i]); break;
+            case "square": for (let i = 0; i < n; i++) { const x = A[i]; O[i] = x * x; } break;
+            case "abs": for (let i = 0; i < n; i++) O[i] = Math.abs(A[i]); break;
+            case "sign": for (let i = 0; i < n; i++) { const x = A[i]; O[i] = x > 0 ? 1 : x < 0 ? -1 : 0; } break;
+            default: for (let i = 0; i < n; i++) O[i] = f(A[i]);
+        }
         return out;
     }
     // ---- reductions ------------------------------------------------------------------
+    const CONTIGUOUS_REDUCE = new Set(["sum", "mean", "prod", "max", "min", "argmax", "argmin", "all", "any"]);
     function reduce(op, a, shape, dims, keepdim) {
         const rank = shape.length;
-        let red = dims === null ? null : ints(dims).map((d) => (d < 0 ? d + rank : d));
-        if (red !== null) for (const d of red) if (d < 0 || d >= rank) fail(E.IndexError, "Dimension out of range");
+        const red = dims === null ? null : ints(dims);
+        if (red !== null) for (let i = 0; i < red.length; i++) { const d = red[i] < 0 ? red[i] + rank : red[i]; if (d < 0 || d >= rank) fail(E.IndexError, "Dimension out of range"); red[i] = d; }
         const all = red === null;
         const isRed = new Array(rank).fill(all);
-        if (!all) for (const d of red) isRed[d] = true;
+        if (!all) for (let i = 0; i < red.length; i++) isRed[red[i]] = true;
         const outShape = [], keptShape = [];
         for (let d = 0; d < rank; d++) { if (isRed[d]) { keptShape.push(1); } else { outShape.push(shape[d]); keptShape.push(shape[d]); } }
         const finalShape = keepdim ? keptShape : outShape;
@@ -141,10 +244,49 @@
         const init = op === "sum" || op === "mean" ? 0 : op === "prod" ? 1 : op === "max" || op === "argmax" ? -Infinity : op === "min" || op === "argmin" ? Infinity : op === "all" ? 1 : 0;
         const best = argOp ? new Float64Array(nOut).fill(init) : null;
         O.fill(init);
+        const count = nIn / (nOut || 1);
+        // Reduced dims that form one contiguous block (every dim, a leading
+        // batch dim, a trailing feature dim): outer x block x inner loops,
+        // one per op. Each output element takes its inputs in the same
+        // increasing flat order, through the same store, as the walk below.
+        let first = -1, last = -1, contiguous = true;
+        for (let d = 0; d < rank; d++) if (isRed[d]) { if (first < 0) first = d; else if (last !== d - 1) contiguous = false; last = d; }
+        // An arg reduction's index is the input's position within the
+        // reduced block, which is `r`.
+        if (contiguous && CONTIGUOUS_REDUCE.has(op)) {
+            const outer = first < 0 ? nIn : numel(shape.slice(0, first)), block = first < 0 ? 1 : numel(shape.slice(first, last + 1)), inner = first < 0 ? 1 : numel(shape.slice(last + 1));
+            let i = 0;
+            switch (op) {
+                case "sum": case "mean":
+                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) O[o] += A[i++];
+                    if (op === "mean") for (let k = 0; k < O.length; k++) O[k] /= count;
+                    break;
+                case "prod":
+                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) O[o] *= A[i++];
+                    break;
+                case "max":
+                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) { const v = A[i++]; if (v > O[o] || v !== v) O[o] = v; }
+                    break;
+                case "min":
+                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) { const v = A[i++]; if (v < O[o] || v !== v) O[o] = v; }
+                    break;
+                case "argmax":
+                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) { const v = A[i++]; if (v > best[o]) { best[o] = v; O[o] = r; } }
+                    break;
+                case "argmin":
+                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) { const v = A[i++]; if (v < best[o]) { best[o] = v; O[o] = r; } }
+                    break;
+                case "all":
+                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) if (!A[i++]) O[o] = 0;
+                    break;
+                case "any":
+                    for (let x = 0; x < outer; x++) for (let r = 0; r < block; r++) for (let k = 0, o = x * inner; k < inner; k++, o++) if (A[i++]) O[o] = 1;
+                    break;
+            }
+            return tuple([out, pyShape(finalShape)]);
+        }
         // Map every input index to its output offset.
         const inS = strides(shape), outS = strides(keptShape);
-        const idx = new Array(rank).fill(0);
-        const count = nIn / (nOut || 1);
         let oo = 0, pos = new Array(rank).fill(0);
         for (let flat = 0; flat < nIn; flat++) {
             const x = A[flat];
@@ -176,18 +318,39 @@
         return out;
     }
     // ---- shape kernels -----------------------------------------------------------------
+    // O[o] = A[base + offset of o], the offset stepping by the strides `sa`
+    // over `shape` in row-major order: forEachBroadcast's walk with the last
+    // dim as an inline loop and no callback.
+    function gatherStrided(O, A, shape, sa, base) {
+        const rank = shape.length, n = O.length;
+        if (rank === 0) { if (n) O[0] = A[base]; return; }
+        const lastN = shape[rank - 1], lastS = sa[rank - 1], idx = new Array(rank).fill(0);
+        let x = base, o = 0;
+        while (o < n) {
+            for (let k = 0, p = x; k < lastN; k++, p += lastS) O[o++] = A[p];
+            let d = rank - 2;
+            for (; d >= 0; d--) { idx[d]++; x += sa[d]; if (idx[d] < shape[d]) break; x -= sa[d] * shape[d]; idx[d] = 0; }
+            if (d < 0) break;
+        }
+    }
     function permute(a, shape, perm) {
         const p = ints(perm), rank = shape.length;
         const outShape = p.map((d) => shape[d]);
         const inS = strides(shape), sa = p.map((d) => inS[d]);
         const out = alloc(a.dtype, a.data.length), O = out.data, A = a.data;
-        forEachBroadcast(outShape, sa, new Array(rank).fill(0), (o, x) => { O[o] = A[x]; });
+        if (rank === 2 && p[0] === 1 && p[1] === 0) {
+            // A matrix transpose (every Linear's weight.T): column by column.
+            const h = shape[0], w = shape[1];
+            for (let j = 0, o = 0; j < w; j++) for (let i = 0, q = j; i < h; i++, q += w) O[o++] = A[q];
+        } else {
+            gatherStrided(O, A, outShape, sa, 0);
+        }
         return tuple([out, pyShape(outShape)]);
     }
     function expand(a, shape, target) {
         const t = ints(target);
         const sa = bstrides(shape, t), out = alloc(a.dtype, numel(t)), O = out.data, A = a.data;
-        forEachBroadcast(t, sa, new Array(t.length).fill(0), (o, x) => { O[o] = A[x]; });
+        gatherStrided(O, A, t, sa, 0);
         return out;
     }
     // spec: a Python list, one entry per dim: an int (drops the dim) or a
@@ -219,7 +382,7 @@
         let base = 0;
         for (let d = 0; d < shape.length; d++) { base += s.starts[d] * inS[d]; if (s.keep[d]) { outShape.push(s.counts[d]); sa.push(inS[d] * s.steps[d]); } }
         const out = alloc(a.dtype, numel(outShape)), O = out.data, A = a.data;
-        forEachBroadcast(outShape, sa, new Array(outShape.length).fill(0), (o, x) => { O[o] = A[base + x]; });
+        gatherStrided(O, A, outShape, sa, base);
         return tuple([out, pyShape(outShape)]);
     }
     function setSlice(a, shape, spec, v, vshape) {
@@ -229,6 +392,7 @@
         for (let d = 0; d < shape.length; d++) { base += s.starts[d] * inS[d]; if (s.keep[d]) { outShape.push(s.counts[d]); sa.push(inS[d] * s.steps[d]); } }
         const sv = bstrides(vshape, outShape), A = a.data, V = v.data, f32 = a.dtype === "float32";
         forEachBroadcast(outShape, sa, sv, (o, x, y) => { A[base + x] = castValue(a.dtype, V[y]); });
+        written(a);
         return null;
     }
     // Advanced indexing: `idx` is a Python list of int64 storages (already
@@ -260,6 +424,7 @@
             for (let d = 0; d < k; d++) { let j = I[d][i]; if (j < 0) j += shape[d]; if (j < 0 || j >= shape[d]) fail(E.IndexError, "index out of bounds"); base += j * inS[d]; }
             A[base + r] = castValue(a.dtype, V[y]);
         });
+        written(a);
         return null;
     }
     // Like scatter, but accumulating: the gradient of a gather.
@@ -274,6 +439,7 @@
             for (let d = 0; d < k; d++) { let j = I[d][i]; if (j < 0) j += shape[d]; if (j < 0 || j >= shape[d]) fail(E.IndexError, "index out of bounds"); base += j * inS[d]; }
             A[base + r] = castValue(a.dtype, A[base + r] + V[y]);
         });
+        written(a);
         return null;
     }
     function indexSelect(a, shape, dim, indices) {
@@ -340,16 +506,21 @@
         const nb = numel(batch), sa = bstrides(batchA, batch), sb = bstrides(batchB, batch);
         const dtype = promote(a.dtype, b.dtype);
         const out = alloc(dtype, nb * m * n), O = out.data, Ad = a.data, Bd = b.data;
-        const f32 = dtype === "float32";
+        // i-k-j order over one double-precision row: each output element
+        // sums its k products in the same order as i-j-k, and rounds to the
+        // dtype once, on store. float64 results are unchanged; float32 ones
+        // no longer round every partial sum, which moves them by at most a
+        // few ulps (the GPU reference keeps that rounding: `graph_matmul`).
+        const row = new Float64Array(n);
         forEachBroadcast(batch, sa, sb, (bi, oa, ob) => {
             const baseA = oa * m * k, baseB = ob * k * n, baseO = bi * m * n;
             for (let i = 0; i < m; i++) {
-                for (let j = 0; j < n; j++) {
-                    let s = 0;
-                    if (f32) { for (let p = 0; p < k; p++) s = Math.fround(s + Math.fround(Ad[baseA + i * k + p] * Bd[baseB + p * n + j])); }
-                    else { for (let p = 0; p < k; p++) s += Ad[baseA + i * k + p] * Bd[baseB + p * n + j]; }
-                    O[baseO + i * n + j] = s;
+                row.fill(0);
+                for (let p = 0, ia = baseA + i * k, ib = baseB; p < k; p++, ib += n) {
+                    const x = Ad[ia + p];
+                    for (let j = 0; j < n; j++) row[j] += x * Bd[ib + j];
                 }
+                O.set(row, baseO + i * n);
             }
         });
         let outShape = batch.concat([m, n]);
@@ -594,6 +765,49 @@
         if (dtype === "bool" || dtype === "uint8") { const m = n === undefined ? items.length : n, out = alloc(dtype, m); for (let i = 0; i < m; i++) out.data[i] = items[i]; return out; }
         fail(E.TypeError, "unknown dtype " + dtype);
     }
+    // ---- the zipp_gpu float32 reference ------------------------------------------------------------
+    // Without a host, `zipp_gpu` evaluates a graph with these: bit for bit
+    // what its pure-Python reference and the host's cpu-js backend compute.
+    // matmul rounds every partial sum to float32, a sum reduces pairwise
+    // (an odd tail adds 0), life counts toroidal neighbours above 0.5.
+    function graphMatmul(a, b, m, k, n) {
+        const out = alloc("float32", m * n), O = out.data, A = a.data, B = b.data, f = Math.fround;
+        for (let r = 0; r < m; r++) for (let c = 0; c < n; c++) {
+            let s = 0;
+            for (let j = 0, ia = r * k, ib = c; j < k; j++, ib += n) s = f(s + f(A[ia + j] * B[ib]));
+            O[r * n + c] = s;
+        }
+        return out;
+    }
+    function pairSum(a) {
+        // In place over a copy: step i reads 2i and 2i+1, never below i.
+        const work = new Float32Array(a.data);
+        let len = work.length;
+        if (len === 0) fail(E.ValueError, "sum of an empty graph tensor");
+        while (len > 1) {
+            const half = Math.ceil(len / 2);
+            for (let i = 0; i < half; i++) work[i] = work[2 * i] + (2 * i + 1 < len ? work[2 * i + 1] : 0);
+            len = half;
+        }
+        return make("float32", work.slice(0, 1));
+    }
+    function life(a, h, w) {
+        const out = alloc("float32", h * w), O = out.data, A = a.data;
+        for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+            let count = 0;
+            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++)
+                if ((dx !== 0 || dy !== 0) && A[((y + dy + h) % h) * w + (x + dx + w) % w] > 0.5) count++;
+            O[y * w + x] = count === 3 || (A[y * w + x] > 0.5 && count === 2) ? 1 : 0;
+        }
+        return out;
+    }
+    // No NaN or infinity: `x - x` is 0 exactly for finite x.
+    function allFinite(s) {
+        if (!isFloatDtype(s.dtype)) return true;
+        const d = s.data, n = d.length;
+        for (let i = 0; i < n; i++) { const x = d[i]; if (x - x !== 0) return false; }
+        return true;
+    }
     // ---- the module --------------------------------------------------------------------------------
     rt.defineModule("_zipp_tensor", (g) => {
         const fn = (name, arity, code, min) => g.set(name, rt.builtin(name, arity, code, min));
@@ -601,16 +815,41 @@
         fn("zeros", 2, (a) => alloc(rt.needStr(a[0]), num(a[1])));
         fn("full", 3, (a) => { const s = alloc(rt.needStr(a[0]), num(a[1])); s.data.fill(castValue(s.dtype, num(a[2]))); return s; });
         fn("from_flat", 2, (a) => { const items = a[1].items, s = alloc(rt.needStr(a[0]), items.length); for (let i = 0; i < items.length; i++) s.data[i] = castValue(s.dtype, jsNumber(items[i])); return s; });
-        fn("to_list", 1, (a) => { const s = needS(a[0]); const out = new Array(s.data.length); for (let i = 0; i < out.length; i++) out[i] = pyNumber(s.dtype, s.data[i]); return list(out); });
+        fn("to_list", 1, (a) => {
+            const s = needS(a[0]), d = s.data, out = new Array(d.length);
+            if (isFloatDtype(s.dtype)) { for (let i = 0; i < out.length; i++) out[i] = d[i]; }
+            else { for (let i = 0; i < out.length; i++) out[i] = pyNumber(s.dtype, d[i]); }
+            return list(out);
+        });
         fn("item", 2, (a) => { const s = needS(a[0]); return pyNumber(s.dtype, s.data[num(a[1])]); });
-        fn("setitem", 3, (a) => { const s = needS(a[0]); s.data[num(a[1])] = castValue(s.dtype, num(a[2])); return null; });
+        fn("setitem", 3, (a) => { const s = needS(a[0]); s.data[num(a[1])] = castValue(s.dtype, num(a[2])); written(s); return null; });
         fn("copy", 1, (a) => { const s = needS(a[0]); return make(s.dtype, s.data.slice()); });
-        fn("astype", 2, (a) => { const s = needS(a[0]), d = rt.needStr(a[1]); const out = alloc(d, s.data.length); for (let i = 0; i < out.data.length; i++) out.data[i] = castValue(d, s.data[i]); return out; });
+        fn("astype", 2, (a) => {
+            const s = needS(a[0]), d = rt.needStr(a[1]); const out = alloc(d, s.data.length);
+            // A float target converts exactly as castValue does (the typed
+            // array rounds float32 on store); integer targets truncate.
+            if (isFloatDtype(d)) out.data.set(s.data);
+            else for (let i = 0; i < out.data.length; i++) out.data[i] = castValue(d, s.data[i]);
+            return out;
+        });
         fn("dtype", 1, (a) => needS(a[0]).dtype);
         fn("size", 1, (a) => BigInt(needS(a[0]).data.length));
-        fn("fill", 2, (a) => { const s = needS(a[0]); s.data.fill(castValue(s.dtype, num(a[1]))); return null; });
-        fn("copy_into", 2, (a) => { const d = needS(a[0]), s = needS(a[1]); if (d.data.length !== s.data.length) fail(E.RuntimeError, "size mismatch"); for (let i = 0; i < d.data.length; i++) d.data[i] = castValue(d.dtype, s.data[i]); return null; });
-        fn("binary", 5, (a) => binary(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), needS(a[3]), shapeOf(a[4])));
+        fn("version", 1, (a) => BigInt(needS(a[0]).version));
+        fn("all_finite", 1, (a) => allFinite(needS(a[0])));
+        fn("graph_matmul", 5, (a) => graphMatmul(needS(a[0]), needS(a[1]), num(a[2]), num(a[3]), num(a[4])));
+        fn("pair_sum", 1, (a) => pairSum(needS(a[0])));
+        fn("life", 3, (a) => life(needS(a[0]), num(a[1]), num(a[2])));
+        fn("fill", 2, (a) => { const s = needS(a[0]); s.data.fill(castValue(s.dtype, num(a[1]))); written(s); return null; });
+        fn("copy_into", 2, (a) => {
+            const d = needS(a[0]), s = needS(a[1]); if (d.data.length !== s.data.length) fail(E.RuntimeError, "size mismatch");
+            // A float storage of its own dtype holds values castValue leaves
+            // unchanged, so a block copy is the same store.
+            if (d.dtype === s.dtype && isFloatDtype(d.dtype)) d.data.set(s.data);
+            else for (let i = 0; i < d.data.length; i++) d.data[i] = castValue(d.dtype, s.data[i]);
+            written(d);
+            return null;
+        });
+        fn("binary", 5, (a) => binary(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), needS(a[3]), shapeOf(a[4]), a[2], a[4]));
         fn("unary", 4, (a) => unary(rt.needStr(a[0]), needS(a[1]), a[2] === undefined ? null : a[2], a[3] === undefined ? null : a[3]), 2);
         fn("reduce", 5, (a) => reduce(rt.needStr(a[0]), needS(a[1]), shapeOf(a[2]), a[3], rt.truth(a[4])));
         fn("permute", 3, (a) => permute(needS(a[0]), shapeOf(a[1]), a[2]));
@@ -647,7 +886,7 @@
         fn("tobytes", 1, (a) => toBytes(needS(a[0])));
         fn("frombytes", 3, (a) => fromBytes(rt.needStr(a[0]), a[1], a[2] === undefined || a[2] === null ? null : num(a[2])), 2);
         fn("dot_sum", 2, (a) => { const x = needS(a[0]).data, y = needS(a[1]).data; let s = 0; for (let i = 0; i < x.length; i++) s += x[i] * y[i]; return s; });
-        fn("axpy", 3, (a) => { const alpha = num(a[0]), x = needS(a[1]).data, y = needS(a[2]).data; for (let i = 0; i < y.length; i++) y[i] = castValue(a[2].dtype, y[i] + alpha * x[i]); return null; });
+        fn("axpy", 3, (a) => { const alpha = num(a[0]), x = needS(a[1]).data, y = needS(a[2]).data; for (let i = 0; i < y.length; i++) y[i] = castValue(a[2].dtype, y[i] + alpha * x[i]); written(a[2]); return null; });
         g.set("Storage", Storage); g.set("Generator", Gen);
     });
 })(__zipp_py);

@@ -150,9 +150,13 @@ The grant is explicit (`allowExecute`), requests are admitted one at a time
 with pending and lifetime quotas, an explicit backend choice is never
 downgraded to a CPU implementation, a late result never reaches a disposed
 engine, and the host validates every graph itself (shapes, node count, work
-and allocation budgets) before a kernel runs. Natively (`zipp py`) and under
-CPython the same `submit` evaluates the graph with the library's float32
-reference implementation and reports `backend: "cpu-python"`.
+and allocation budgets) before a kernel runs. Tensor data moves as bytes: a
+graph built from `torch` tensors sends its inputs as `Float32Array`s, the
+adapter then asks the runtime for `Float32Array` outputs, and the engine takes
+those straight into tensor storage. Natively (`zipp py`) the same `submit`
+evaluates the graph on the engine's tensor kernels and under CPython with the
+library's pure-Python float32 reference, with the same float32 results, and
+reports `backend: "cpu-python"`.
 `tests/node/python-gpu.cjs` holds the channel and the adapter to this over the
 JavaScript reference and compiled-WASM backends; `playground/smoke.cjs` runs
 the graphs through a real browser, records which backend answered, and checks
@@ -443,9 +447,12 @@ Reads and writes cross as structured data — nested arrays and plain objects �
 JSON text and not `ToString`. Three rules, each because the alternative is worse:
 
 - **Only data crosses.** Functions, classes, `Map`/`Set`/`Date`/`RegExp`, typed
-  arrays and proxies read as `null`. A `Value` is a heap *index* whose meaning
-  depends on the live VM, so handing one out would hand out a dangling reference
-  the moment the collector moves.
+  arrays other than `Float32Array`, and proxies read as `null`. A `Value` is a
+  heap *index* whose meaning depends on the live VM, so handing one out would
+  hand out a dangling reference the moment the collector moves. A
+  `Float32Array` crosses as a copy of its elements, bit for bit: the host gets
+  its own `Float32Array`, and one the host sends arrives as a fresh array — a
+  numeric tensor costs its bytes, not one value per element.
 - **Writes skip those slots.** Setting a global that currently holds a function is
   a no-op, so a host that reads every global, edits one field and writes them all
   back cannot destroy the script's own functions on the round trip.
@@ -520,7 +527,7 @@ cover that way (string, regex, BigInt, array and nesting ceilings) come from
 | JSON replacer/object-key snapshots | 8,388,608 private allocation bytes per stringify, including key and container capacities |
 | Lifetime console output | 8,388,608 UTF-8 bytes total, including newlines, each line charged the cost of its own entry |
 | Synchronous host bridge | 64-byte kind, exact operation-specific arity (and never more than 16 arguments), 33,554,432 combined kind/argument bytes, and a 33,554,432-byte serialized reply |
-| Host value conversion | 2,000,000 nodes and 16,777,216 string bytes per boundary crossing (`getGlobalsBatch`, `setGlobalsBatch`, `callFunction`, `dispatchEvent`, `evalInContext`), plus 8 inspected property entries per node of that ceiling (16,000,000 in all: every entry of every object scanned, hidden and accessor entries included, charged before the scan); a fingerprint batch walks under the same 2,000,000-node, 16,777,216-byte, 16,000,000-entry budget — every element, hole, key and string byte charged, duplicate indices included — and answers `NaN` for what it cannot walk |
+| Host value conversion | 2,000,000 nodes and 16,777,216 string bytes per boundary crossing (`getGlobalsBatch`, `setGlobalsBatch`, `callFunction`, `dispatchEvent`, `evalInContext`; a `Float32Array` is one node and its elements are charged as string bytes, four each), plus 8 inspected property entries per node of that ceiling (16,000,000 in all: every entry of every object scanned, hidden and accessor entries included, charged before the scan); a fingerprint batch walks under the same 2,000,000-node, 16,777,216-byte, 16,000,000-entry budget — every element, hole, key and string byte charged, duplicate indices included — and answers `NaN` for what it cannot walk |
 | Asynchronous `host.call` | 4,096 requests queued between drains, 65,536 callbacks awaiting a reply, and 4,194,304 UTF-16 code units per request (kind plus arguments), all checked before anything registers; one drain delivers at most 4,096 requests and 33,554,432 string bytes, leaves the rest queued, and rejects (with explicit settlement) a single request that does not fit that allowance on its own; a drain also ATTEMPTS at most 64 peeks, retries and rejections and 8,000,000 nodes and 134,217,728 string bytes of walking across them, counted whether or not an attempt succeeded, and leaves the rest for the next drain |
 | `accel.make` binding spec | the public grammar only — `NAME=g:GLOBAL`, `NAME=c:GLOBAL`, `NAME=a:ID`, `NAME=n:NUMBER`, `NAME=t` — at most 8,192 bytes, 64 entries and 64-byte identifiers, names bound once (a set, not a scan), ids finite non-negative safe integers; the whole spec is validated before any region is resolved, regions are pinned as one transaction, and the engine's own `r:` region form is refused from guest text before the adapter sees the spec |
 

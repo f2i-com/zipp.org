@@ -60,13 +60,24 @@ export function validateProgram(program, overrides = {}) {
     };
     let units = 0;
     switch (raw.op) {
-      case 'input':
+      case 'input': {
         keys(raw, ['id', 'op', 'shape', 'data'], ['shape', 'data']);
         n.shape = shapeOf(raw.shape, limits);
-        check(Array.isArray(raw.data) && raw.data.length === sizeOf(n.shape), 'SHAPE', 'Flat input length does not match shape');
+        // A flat list of numbers, or a Float32Array (a ZIPP engine's binary
+        // tensor transport): owned by the plan either way, and checked in
+        // one pass for the typed form, whose elements are float32 already.
+        const typed = raw.data instanceof Float32Array;
+        check((typed || Array.isArray(raw.data)) && raw.data.length === sizeOf(n.shape), 'SHAPE', 'Flat input length does not match shape');
         inputElements += raw.data.length;
         check(inputElements <= limits.maxInputElements, 'LIMIT', 'Total input exceeds limit');
-        n.data = Float32Array.from(raw.data, finiteF32); break;
+        if (typed) {
+          n.data = new Float32Array(raw.data);
+          for (let i = 0; i < n.data.length; i++) check(Number.isFinite(n.data[i]), 'NUMBER', 'Values must be finite float32 numbers');
+        } else {
+          n.data = Float32Array.from(raw.data, finiteF32);
+        }
+        break;
+      }
       case 'full':
         keys(raw, ['id', 'op', 'shape', 'value'], ['shape', 'value']);
         n.shape = shapeOf(raw.shape, limits); n.value = finiteF32(raw.value); break;

@@ -73,6 +73,17 @@ def compile(model=None, *, backend="zipp_gpu", training=False):
     return compile_gpu(model, backend=backend, training=training)
 
 
+# How many compiled calls are recording. Only then can an operand be a graph
+# tensor, so eager ops test this before probing for one: the probe's miss
+# raised internally and cost more than the kernel on small tensors.
+_graph_recording = 0
+
+
+def _recording(delta):
+    global _graph_recording
+    _graph_recording += delta
+
+
 class _TensorIter:
     __slots__ = ("_t", "_i", "_n")
 
@@ -210,7 +221,9 @@ def _unbroadcast(grad, shape):
 class Tensor:
     def __init__(self, storage, shape, dt, requires_grad=False, node=None):
         self._s = storage
-        self.shape = Size(shape)
+        # A Size is immutable, so tensors of one shape share it: elementwise
+        # kernels hand an operand's own Size back as the result's shape.
+        self.shape = shape if type(shape) is Size else Size(shape)
         self.dtype = dt
         self.requires_grad = requires_grad
         self.grad = None
@@ -1104,7 +1117,11 @@ def bernoulli(p, generator=None):
 
 # ---- elementwise ops with autograd ------------------------------------------------------
 def _binary_nograd(op, a, b):
-    a, b = _as_tensor(a, b if _isinstance(b, Tensor) else None), _as_tensor(b, a if _isinstance(a, Tensor) else None)
+    a_tensor, b_tensor = _isinstance(a, Tensor), _isinstance(b, Tensor)
+    if not a_tensor:
+        a = _as_tensor(a, b if b_tensor else None)
+    if not b_tensor:
+        b = _as_tensor(b, a if a_tensor else None)
     storage, shape = _k.binary(op, a._s, a.shape, b._s, b.shape)
     return Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
 
@@ -1115,41 +1132,47 @@ def _unary_nograd(op, a, p1=None, p2=None):
 
 
 def _binary(op, a, b, name, backward):
-    ta = _as_tensor(a, b if _isinstance(b, Tensor) else None)
-    tb = _as_tensor(b, a if _isinstance(a, Tensor) else None)
+    # The per-op path: one type test per operand, and `_needs_grad` inline
+    # (both operands are tensors here).
+    a_tensor, b_tensor = _isinstance(a, Tensor), _isinstance(b, Tensor)
+    ta = a if a_tensor else _as_tensor(a, b if b_tensor else None)
+    tb = b if b_tensor else _as_tensor(b, a if a_tensor else None)
     storage, shape = _k.binary(op, ta._s, ta.shape, tb._s, tb.shape)
     out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])
-    if _needs_grad(ta, tb):
+    if _grad_enabled and (ta.requires_grad or tb.requires_grad):
         out.requires_grad = True
         out._node = _Node(lambda g: backward(g, ta, tb, out), (ta, tb), name)
     return out
 
 
 def add(a, b, alpha=1):
-    if hasattr(a, "_zipp_graph"):
-        return a.__add__((b * alpha))
-    if hasattr(b, "_zipp_graph"):
-        return (b * alpha).__radd__(a)
+    if _graph_recording:
+        if hasattr(a, "_zipp_graph"):
+            return a.__add__((b * alpha))
+        if hasattr(b, "_zipp_graph"):
+            return (b * alpha).__radd__(a)
     if alpha != 1:
         b = mul(b, alpha)
     return _binary("add", a, b, "Add", lambda g, x, y, o: (_unbroadcast(g, x.shape), _unbroadcast(g, y.shape)))
 
 
 def sub(a, b, alpha=1):
-    if hasattr(a, "_zipp_graph"):
-        return a.__sub__((b * alpha))
-    if hasattr(b, "_zipp_graph"):
-        return (b * alpha).__rsub__(a)
+    if _graph_recording:
+        if hasattr(a, "_zipp_graph"):
+            return a.__sub__((b * alpha))
+        if hasattr(b, "_zipp_graph"):
+            return (b * alpha).__rsub__(a)
     if alpha != 1:
         b = mul(b, alpha)
     return _binary("sub", a, b, "Sub", lambda g, x, y, o: (_unbroadcast(g, x.shape), _unbroadcast(neg(g), y.shape)))
 
 
 def mul(a, b):
-    if hasattr(a, "_zipp_graph"):
-        return a.__mul__(b)
-    if hasattr(b, "_zipp_graph"):
-        return b.__rmul__(a)
+    if _graph_recording:
+        if hasattr(a, "_zipp_graph"):
+            return a.__mul__(b)
+        if hasattr(b, "_zipp_graph"):
+            return b.__rmul__(a)
     return _binary("mul", a, b, "Mul", lambda g, x, y, o: (_unbroadcast(mul(g, y), x.shape), _unbroadcast(mul(g, x), y.shape)))
 
 
@@ -1176,7 +1199,7 @@ def minimum(a, b):
 def _unary(op, a, name, backward, p1=None, p2=None):
     storage = _k.unary(op, a._s, p1, p2)
     out = Tensor(storage, a.shape, _DTYPES[_k.dtype(storage)])
-    if _needs_grad(a):
+    if _grad_enabled and a.requires_grad:
         out.requires_grad = True
         out._node = _Node(lambda g: (backward(g, a, out),), (a,), name)
     return out
@@ -1212,7 +1235,7 @@ def _silu_grad(x):
 
 
 def relu(a):
-    if getattr(a, "_zipp_graph", False):
+    if _graph_recording and getattr(a, "_zipp_graph", False):
         return a.relu()
     return _unary("relu", a, "Relu", lambda g, x, o: mul(g, (x > 0).to(g.dtype)))
 
@@ -1319,7 +1342,7 @@ def _expand_back(g, a_shape, dims, keepdim):
 
 
 def sum(a, dim=None, keepdim=False, dtype=None):
-    if hasattr(a, "_zipp_graph"):
+    if _graph_recording and hasattr(a, "_zipp_graph"):
         return a.sum(dim, keepdim, dtype)
     if dtype is not None:
         a = a.to(dtype)
@@ -1333,7 +1356,7 @@ def sum(a, dim=None, keepdim=False, dtype=None):
 
 
 def mean(a, dim=None, keepdim=False, dtype=None):
-    if hasattr(a, "_zipp_graph"):
+    if _graph_recording and hasattr(a, "_zipp_graph"):
         return a.mean(dim, keepdim, dtype)
     if dtype is not None:
         a = a.to(dtype)
@@ -1918,10 +1941,11 @@ def nonzero(a):
 
 # ---- linear algebra ----------------------------------------------------------------------
 def matmul(a, b):
-    if getattr(a, "_zipp_graph", False):
-        return a @ b
-    if getattr(b, "_zipp_graph", False):
-        return b.__rmatmul__(a)
+    if _graph_recording:
+        if getattr(a, "_zipp_graph", False):
+            return a @ b
+        if getattr(b, "_zipp_graph", False):
+            return b.__rmatmul__(a)
     ta, tb = _as_tensor(a), _as_tensor(b)
     storage, shape = _k.matmul(ta._s, ta.shape, tb._s, tb.shape)
     out = Tensor(storage, shape, _DTYPES[_k.dtype(storage)])

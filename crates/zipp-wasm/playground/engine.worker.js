@@ -78,7 +78,7 @@ async function computeRuntime() {
 }
 // `createZippGPUHandler` only needs `execute`; creating the runtime lazily
 // keeps the adapter synchronous to create.
-const lazyRuntime = { async execute(program) { return (await computeRuntime()).execute(program); } };
+const lazyRuntime = { async execute(program, options) { return (await computeRuntime()).execute(program, options); } };
 
 function selectGpuBackend(backend) {
   const wanted = ["auto", "webgpu", "webgl2", "wasm", "cpu-js"].includes(backend) ? backend : "auto";

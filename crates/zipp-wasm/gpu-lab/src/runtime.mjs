@@ -22,7 +22,9 @@ export class ComputeRuntime {
   constructor(backend,limits={},attempts=[]){this.impl=backend;this.limits=limits;this.attempts=attempts;this.busy=false;this.disposed=false;}
   get backend(){return this.impl.name;}
   info(){return {backend:this.backend,description:this.impl.description,adapter:this.impl.info??null,fallbackAttempts:this.attempts};}
-  async execute(program){
+  // `typedOutputs`: each output's `data` is a Float32Array of its own rather
+  // than a list of numbers (a ZIPP engine takes it as tensor storage).
+  async execute(program,{typedOutputs=false}={}){
     check(!this.disposed,'DISPOSED','Runtime has been disposed');
     check(!this.busy,'BUSY','Runtime supports one graph at a time; await the previous execution');
     // Validation and owned input copies happen before any asynchronous work or GPU allocation.
@@ -40,9 +42,9 @@ export class ComputeRuntime {
       const submitted=clock(),outputs=Object.create(null),cache=new Map();
       for(const o of plan.outputs){
         let data=cache.get(o.id);
-        if(!data){data=Array.from(await this.impl.read(handles.get(o.id)));cache.set(o.id,data);}
+        if(!data){const read=await this.impl.read(handles.get(o.id));data=!typedOutputs?Array.from(read):read instanceof Float32Array?read:Float32Array.from(read);cache.set(o.id,data);}
         check(data.every(Number.isFinite),'NUMBER','Output contains non-finite values; graph v1 readback requires finite float32');
-        outputs[o.name]={shape:[...plan.nodes[o.id].shape],dtype:'float32',data:[...data]};
+        outputs[o.name]={shape:[...plan.nodes[o.id].shape],dtype:'float32',data:typedOutputs?data.slice():[...data]};
       }
       value={version:1,backend:this.backend,outputs,stats:{nodes:plan.nodes.length,estimatedWork:plan.work,
         logicalAllocationBytes:plan.logicalBytes,uploadElements:plan.inputElements,

@@ -50,6 +50,9 @@ function __zipp_py_set_input(json) {
         if (typeof v === "boolean" || typeof v === "string") return v;
         if (typeof v === "number") return Number.isInteger(v) ? BigInt(v) : v;
         if (typeof v === "bigint") return v;
+        // Binary tensor transport: the VM built this array from the host's
+        // copy, so the storage can own it outright.
+        if (v instanceof Float32Array) return rt.float32Storage(v);
         if (Array.isArray(v)) { const items = []; for (let i = 0; i < v.length; i++) items.push(fromHost(v[i], depth + 1)); return rt.list(items); }
         if (typeof v === "object") { const d = rt.dict(); const keys = Object.keys(v); for (let i = 0; i < keys.length; i++) rt.dictSet(d, keys[i], fromHost(v[keys[i]], depth + 1)); return d; }
         rt.fail(E.TypeError, "unsupported host value");
@@ -58,6 +61,9 @@ function __zipp_py_set_input(json) {
         if (depth > 32) rt.fail(E.TypeError, "value nesting limit exceeded");
         if (v === null || typeof v === "boolean" || typeof v === "string" || typeof v === "number") return v;
         if (typeof v === "bigint") return v >= BigInt(Number.MIN_SAFE_INTEGER) && v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : v.toString();
+        // A float32 tensor storage leaves as its bytes (the VM copies them
+        // into the host value), not one number per element.
+        if (rt.isFloat32Storage(v)) return v.data;
         if (v.cls === T.list || v.cls === T.tuple) { const out = []; for (let i = 0; i < v.items.length; i++) out.push(toHost(v.items[i], depth + 1)); return out; }
         if (v.cls === T.dict) { const o = Object.create(null); const entries = rt.dictEntryList(v); for (let i = 0; i < entries.length; i++) o[rt.str(entries[i][0])] = toHost(entries[i][1], depth + 1); return o; }
         if (v.cls === T.set || v.cls === T.frozenset) { const items = rt.setList(v), out = []; for (let i = 0; i < items.length; i++) out.push(toHost(items[i], depth + 1)); return out; }

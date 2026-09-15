@@ -11,10 +11,13 @@
 //! Three deliberate limits, each because the alternative is worse:
 //!
 //! - **Only data crosses.** Functions, classes, `Map`/`Set`/`Date`/`RegExp`,
-//!   typed arrays and proxies marshal to [`HostValue::Opaque`], never to a live
-//!   reference — a `Value` is a heap INDEX whose meaning depends on this VM, so
-//!   handing one out would be handing out a dangling reference the moment the
-//!   collector moves. A host that wants a function's result should call it.
+//!   typed arrays other than `Float32Array`, and proxies marshal to
+//!   [`HostValue::Opaque`], never to a live reference — a `Value` is a heap
+//!   INDEX whose meaning depends on this VM, so handing one out would be
+//!   handing out a dangling reference the moment the collector moves. A host
+//!   that wants a function's result should call it. A `Float32Array` crosses
+//!   as a copy of its elements ([`HostValue::Float32Array`]): numeric tensors
+//!   are data, and one value per element made them unaffordable to move.
 //! - **Writes skip opaque slots.** Setting a global that currently holds a
 //!   function or class is a no-op rather than a clobber, so a host that reads
 //!   its whole state, edits one field and writes it all back cannot destroy the
@@ -371,9 +374,17 @@ pub enum HostValue {
     /// A plain object, as its own enumerable data properties in insertion
     /// order. Accessors are not invoked and do not appear.
     Object(Vec<(String, HostValue)>),
+    /// A `Float32Array`'s elements, copied (bit patterns kept, NaN payloads
+    /// included). Binary transport for numeric tensors: a host moves one of
+    /// these for the price of its bytes, charged against the conversion's
+    /// string-byte ceiling, instead of one node per element. Writing one
+    /// creates a fresh `Float32Array` over its own buffer; a global slot that
+    /// already holds a typed array still refuses a whole-slot write (see
+    /// `host_set_slot`).
+    Float32Array(Vec<f32>),
     /// Something that cannot cross as data: a function, class, `Map`, `Set`,
-    /// `Date`, `RegExp`, typed array, proxy, … Reading one yields `Opaque`;
-    /// writing one is ignored.
+    /// `Date`, `RegExp`, a typed array of another kind, proxy, … Reading one
+    /// yields `Opaque`; writing one is ignored.
     Opaque,
 }
 
@@ -1033,6 +1044,7 @@ impl<'p> Vm<'p> {
             Str { units: usize },
             Array { len: usize },
             Object { keys: usize, visible: usize },
+            Float32,
             Opaque,
         }
         // Every entry of an object is inspected twice below — once to count
@@ -1044,6 +1056,7 @@ impl<'p> Vm<'p> {
             }
         }
         let shape = match self.heap.get(idx) {
+            HeapObj::TypedArray { kind: 7, .. } => Shape::Float32,
             HeapObj::Str(s) => Shape::Str { units: s.units() },
             HeapObj::Cons { len, .. } => Shape::Str { units: *len },
             HeapObj::Array(items) => Shape::Array { len: items.len() },
@@ -1065,6 +1078,24 @@ impl<'p> Vm<'p> {
         match shape {
             Shape::Opaque => {
                 fp_mix(h, 9);
+                true
+            }
+            Shape::Float32 => {
+                // Opaque, as `host_out` reads it, when detached or out of bounds.
+                let Some((buffer, offset, len)) = self.host_float32_view(idx) else {
+                    fp_mix(h, 9);
+                    return true;
+                };
+                // The same bytes `host_out` copies, charged the same way, so a
+                // digest never answers for an array the read could not marshal.
+                if !budget.charge_string_bytes(len.saturating_mul(4)) {
+                    return false;
+                }
+                fp_mix(h, 14);
+                fp_mix(h, len as u64);
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get(buffer) {
+                    fp_mix_bytes(h, &data[offset..offset + len * 4]);
+                }
                 true
             }
             Shape::Str { units } => {
@@ -1433,6 +1464,24 @@ impl<'p> Vm<'p> {
         }
     }
 
+    /// The live bytes of a `Float32Array` at heap index `idx`, as (buffer
+    /// index, byte offset, element count) — `None` for anything else, and
+    /// for a view whose buffer is detached or that has fallen out of its
+    /// buffer's bounds (those stay opaque, as every typed array used to).
+    fn host_float32_view(&self, idx: u32) -> Option<(u32, usize, usize)> {
+        let (buffer, offset) = match self.heap.get(idx) {
+            HeapObj::TypedArray {
+                buffer,
+                kind: 7,
+                byte_offset,
+                ..
+            } => (*buffer, *byte_offset),
+            _ => return None,
+        };
+        let len = self.ta_effective_len(idx)?;
+        Some((buffer, offset, len))
+    }
+
     /// Does this value refuse to cross as data?
     fn host_is_opaque(&self, v: Value) -> bool {
         if !v.is_heap() {
@@ -1483,9 +1532,11 @@ impl<'p> Vm<'p> {
             Str { units: usize },
             Array(Vec<Value>),
             Object(Vec<(String, Value)>),
+            Float32,
             Opaque,
         }
         let shape = match self.heap.get(idx) {
+            HeapObj::TypedArray { kind: 7, .. } => Shape::Float32,
             HeapObj::Str(s) => Shape::Str { units: s.units() },
             HeapObj::Cons { len, .. } => Shape::Str { units: *len },
             HeapObj::Array(items) => {
@@ -1518,6 +1569,22 @@ impl<'p> Vm<'p> {
 
         match shape {
             Shape::Opaque => Ok(HostValue::Opaque),
+            Shape::Float32 => {
+                // A detached or out-of-bounds view has no elements to copy.
+                let Some((buffer, offset, len)) = self.host_float32_view(idx) else {
+                    return Ok(HostValue::Opaque);
+                };
+                // Refused before the copy is made, like an over-long string.
+                budget.charge_string_bytes(len.saturating_mul(4))?;
+                let values = match self.heap.get(buffer) {
+                    HeapObj::ArrayBuffer { data, .. } => data[offset..offset + len * 4]
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                Ok(HostValue::Float32Array(values))
+            }
             Shape::Str { units } => {
                 budget.ensure_string_units(units)?;
                 Ok(self.host_out_string(idx, budget)?)
@@ -1624,6 +1691,26 @@ impl<'p> Vm<'p> {
                         vals.push(v);
                     }
                     return Value::heap(self.heap.alloc(HeapObj::Array(vals)));
+                }
+            }
+            return self.host_in(hv, depth);
+        }
+        // A Float32Array the host read and sent back unchanged keeps the
+        // guest's own array — its identity, and any other view sharing its
+        // buffer — rather than becoming a copy with the same elements. A
+        // changed one is an edit, and an explicit write wins.
+        if let HostValue::Float32Array(values) = hv {
+            if old.is_heap() {
+                if let Some((buffer, offset, len)) = self.host_float32_view(old.heap_index()) {
+                    let same = len == values.len()
+                        && matches!(self.heap.get(buffer), HeapObj::ArrayBuffer { data, .. }
+                            if data[offset..offset + len * 4]
+                                .chunks_exact(4)
+                                .zip(values)
+                                .all(|(b, v)| b == v.to_le_bytes()));
+                    if same {
+                        return old;
+                    }
                 }
             }
             return self.host_in(hv, depth);
@@ -1791,6 +1878,20 @@ impl<'p> Vm<'p> {
                     m.set(k, v);
                 }
                 Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
+            }
+            HostValue::Float32Array(values) => {
+                // `alloc_array_buffer` refuses only when the recorder's heap
+                // ceiling would be crossed; a write cannot throw, so the
+                // value reads as null then, as an over-deep one does.
+                let Ok(buffer) = self.alloc_array_buffer(values.len().saturating_mul(4)) else {
+                    return Value::NULL;
+                };
+                if let HeapObj::ArrayBuffer { data, .. } = self.heap.get_mut(buffer) {
+                    for (dst, v) in data.chunks_exact_mut(4).zip(values) {
+                        dst.copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                self.alloc_typed_array(buffer, 7, 0, values.len())
             }
         }
     }

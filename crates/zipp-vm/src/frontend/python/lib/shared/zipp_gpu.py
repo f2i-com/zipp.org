@@ -18,6 +18,13 @@ try:
     import _zipp_gpu
 except ImportError:
     _zipp_gpu = None
+try:
+    # Zipp's tensor kernels: float32 storage moves through a graph (and to
+    # and from the host) as typed arrays, and a graph evaluated without a
+    # host runs on them. CPython uses the lists and the reference below.
+    import _zipp_tensor as _k
+except ImportError:
+    _k = None
 
 __all__ = ["Graph", "Tensor", "GraphError", "ComputeError", "execute_locally"]
 
@@ -156,7 +163,14 @@ class Graph:
     def _append(self, op, tensor_shape, **fields):
         if len(self._nodes) >= 512:
             raise GraphError("Graph exceeds 512 nodes; split work into bounded batches")
-        shape = _shape(tensor_shape)
+        return self._record(op, _shape(tensor_shape), fields)
+
+    def _record(self, op, shape, fields):
+        # `shape` is one `_shape` accepted, or derived from such shapes
+        # without growing (elementwise, transpose, sum): recording a
+        # compiled step validates each shape once, not once per node.
+        if len(self._nodes) >= 512:
+            raise GraphError("Graph exceeds 512 nodes; split work into bounded batches")
         node_id = len(self._nodes)
         node = {"id": node_id, "op": op}
         node.update(fields)
@@ -173,36 +187,48 @@ class Graph:
         return tensor
 
     def tensor(self, data, shape=None):
+        if _k is not None and isinstance(data, _k.Storage):
+            # A float32 tensor storage (the bundled torch's, under Zipp):
+            # copied, so the graph owns its snapshot, and checked in one
+            # pass instead of value by value.
+            if _k.dtype(data) != "float32":
+                raise GraphError("Tensor storage must be float32")
+            shape = _shape((_k.size(data),) if shape is None else shape)
+            if _k.size(data) != _size(shape):
+                raise GraphError("Input length does not match shape")
+            if not _k.all_finite(data):
+                raise GraphError("Only finite float32 values are supported")
+            return self._record("input", shape, {"shape": list(shape), "data": _k.copy(data)})
         flat, inferred = _flatten(data)
         shape = _shape(inferred if shape is None else shape)
         if len(flat) != _size(shape):
             raise GraphError("Input length does not match shape")
-        return self._append("input", shape, shape=list(shape), data=flat)
+        return self._record("input", shape, {"shape": list(shape), "data": flat})
 
     def full(self, shape, value):
         shape = _shape(shape)
-        return self._append("full", shape, shape=list(shape), value=_number(value))
+        return self._record("full", shape, {"shape": list(shape), "value": _number(value)})
 
     def zeros(self, shape):
         return self.full(shape, 0)
 
-    def _coerce(self, value):
-        return self._owned(value) if isinstance(value, Tensor) else self.tensor(value)
-
     def _binary(self, op, left, right):
         # Check existing handles before recording a new scalar.
-        if isinstance(left, Tensor):
+        left_tensor, right_tensor = isinstance(left, Tensor), isinstance(right, Tensor)
+        if left_tensor:
             self._owned(left)
-        if isinstance(right, Tensor):
+        if right_tensor:
             self._owned(right)
-        a, b = self._coerce(left), self._coerce(right)
+        a = left if left_tensor else self.tensor(left)
+        b = right if right_tensor else self.tensor(right)
         if a.shape and b.shape and a.shape != b.shape:
             raise GraphError("Only matching shapes or scalar broadcasting are supported")
-        return self._append(op, a.shape or b.shape, a=a._id, b=b._id)
+        return self._record(op, a.shape or b.shape, {"a": a._id, "b": b._id})
 
     def _unary(self, op, tensor, shape):
+        # `shape` is the operand's own, reversed, or () (see `Tensor`).
         a = self._owned(tensor)
-        return self._append(op, shape, a=a._id)
+        return self._record(op, shape, {"a": a._id})
 
     def matmul(self, left, right):
         a, b = self._owned(left), self._owned(right)
@@ -212,6 +238,15 @@ class Graph:
 
     def program(self, **outputs):
         """The plain-data program: version, nodes, and the named outputs."""
+        program = self._program(outputs)
+        for node in program["nodes"]:
+            if "data" in node and not isinstance(node["data"], list):
+                node["data"] = _k.to_list(node["data"])
+        return program
+
+    def _program(self, outputs):
+        # Input data recorded from tensor storage stays storage here: it
+        # leaves for the host as a Float32Array. `program` lists it.
         if not 1 <= len(outputs) <= 16:
             raise GraphError("Request between 1 and 16 named outputs")
         names = []
@@ -223,7 +258,14 @@ class Graph:
             names.append({"name": name, "id": self._owned(value)._id})
         nodes = []
         for n in self._nodes:
-            nodes.append({key: list(value) if isinstance(value, list) else value for key, value in n.items()})
+            node = dict(n)
+            if "shape" in node:
+                # The only list fields: an input's or a full's shape, and a
+                # list input's data.
+                node["shape"] = list(node["shape"])
+                if type(node.get("data")) is list:
+                    node["data"] = list(node["data"])
+            nodes.append(node)
         return {"version": 1, "nodes": nodes, "outputs": names}
 
     def submit(self, callback, on_error=None, **outputs):
@@ -231,7 +273,7 @@ class Graph:
 
         The result is a plain dict: `result["backend"]` names what ran the
         graph (`webgpu`, `webgl2`, `wasm`, `cpu-js`, or `cpu-python` for the
-        reference implementation in this module), `result["outputs"][name]`
+        float32 reference implementation in this module), `result["outputs"][name]`
         has `shape`, `dtype` and `data` (a flat list), and `result["stats"]`
         carries the host's counters and timings.
 
@@ -239,19 +281,27 @@ class Graph:
         current call returns, so `callback` runs later (from a frame or the
         program's end); the program keeps going meanwhile. Without a host,
         the graph is evaluated here and `callback` runs before `submit`
-        returns. A host failure calls `on_error(ComputeError)` when given and
-        otherwise raises it.
+        returns (under Zipp the reference runs on the engine's tensor
+        kernels, with the same results bit for bit). A host failure calls
+        `on_error(ComputeError)` when given and otherwise raises it.
         """
+        return self._submit(callback, on_error, outputs, False)
+
+    def _submit(self, callback, on_error, outputs, storage, program=None):
+        # `storage` (Zipp only): each output's `data` is float32 tensor
+        # storage instead of a list, which is how torch.compile takes a
+        # result without a Python float per element. `program`: this
+        # graph's `_program(outputs)`, when the caller already built it.
         if not callable(callback):
             raise TypeError("submit() needs a callable to receive the result")
-        program = self.program(**outputs)
+        if program is None:
+            program = self._program(outputs)
         if _zipp_gpu is not None and _zipp_gpu.hosted():
             def deliver(reply):
                 if reply.get("ok"):
                     value = reply["value"]
-                    # Host numbers arrive as ints when integral; outputs are float32.
                     for out in value["outputs"].values():
-                        out["data"] = [float(v) for v in out["data"]]
+                        out["data"] = _host_data(out["data"], storage)
                     callback(value)
                     return
                 error = reply.get("error") or {}
@@ -261,7 +311,7 @@ class Graph:
                 on_error(exc)
             _zipp_gpu.post(program, deliver)
             return None
-        callback(execute_locally(program))
+        callback(execute_locally(program) if _k is None else _execute_kernels(program, storage))
         return None
 
     def to_json(self, **outputs):
@@ -359,3 +409,75 @@ def execute_locally(program):
         outputs[o["name"]] = {"shape": list(shapes[o["id"]]), "dtype": "float32", "data": list(data)}
     return {"version": 1, "backend": "cpu-python", "outputs": outputs,
             "stats": {"nodes": len(values), "readbackElements": sum(len(v["data"]) for v in outputs.values())}}
+
+
+def _host_data(data, storage):
+    # A host answers with a Float32Array (tensor storage here) or, from an
+    # older host, a list of numbers that arrive as ints when integral.
+    if _k is not None and isinstance(data, _k.Storage):
+        return data if storage else _k.to_list(data)
+    return _k.from_flat("float32", data) if storage else [float(v) for v in data]
+
+
+def _execute_kernels(program, storage):
+    """`execute_locally` on Zipp's tensor kernels: the same float32 numbers."""
+    values = []
+    shapes = []
+    zero = None
+    for node in program["nodes"]:
+        op = node["op"]
+        if op == "input":
+            shape = tuple(node["shape"])
+            data = node["data"]
+            out = data if isinstance(data, _k.Storage) else _k.from_flat("float32", data)
+        elif op == "full":
+            shape = tuple(node["shape"])
+            out = _k.full("float32", _size(shape), node["value"])
+        elif op in ("add", "sub", "mul"):
+            a, b = node["a"], node["b"]
+            shape = shapes[b] if not shapes[a] else shapes[a]
+            out = _k.binary(op, values[a], shapes[a], values[b], shapes[b])[0]
+        elif op == "relu":
+            shape = shapes[node["a"]]
+            out = _k.unary("relu", values[node["a"]])
+        elif op == "positive":
+            shape = shapes[node["a"]]
+            if zero is None:
+                zero = _k.zeros("float32", 1)
+            out = _k.astype(_k.binary("gt", values[node["a"]], shape, zero, ())[0], "float32")
+        elif op == "transpose":
+            h, w = shapes[node["a"]]
+            shape = (w, h)
+            out = _k.permute(values[node["a"]], (h, w), (1, 0))[0]
+        elif op == "sum":
+            shape = ()
+            out = _k.pair_sum(values[node["a"]])
+        elif op == "matmul":
+            (m, k), (_, n) = shapes[node["a"]], shapes[node["b"]]
+            shape = (m, n)
+            out = _k.graph_matmul(values[node["a"]], values[node["b"]], m, k, n)
+        elif op == "life":
+            shape = shapes[node["a"]]
+            out = _k.life(values[node["a"]], shape[0], shape[1])
+        else:
+            raise ComputeError("OP", "Unsupported operation: %s" % op)
+        values.append(out)
+        shapes.append(shape)
+    outputs = {}
+    delivered = set()
+    readback = 0
+    for o in program["outputs"]:
+        data = values[o["id"]]
+        if not _k.all_finite(data):
+            raise ComputeError("NUMBER", "Output contains non-finite values")
+        readback += _k.size(data)
+        if not storage:
+            data = _k.to_list(data)
+        elif o["id"] in delivered or data is program["nodes"][o["id"]].get("data"):
+            # Each output owns its storage, as a host's copies do: never
+            # another output's, nor the graph's recorded input.
+            data = _k.copy(data)
+        delivered.add(o["id"])
+        outputs[o["name"]] = {"shape": list(shapes[o["id"]]), "dtype": "float32", "data": data}
+    return {"version": 1, "backend": "cpu-python", "outputs": outputs,
+            "stats": {"nodes": len(values), "readbackElements": readback}}

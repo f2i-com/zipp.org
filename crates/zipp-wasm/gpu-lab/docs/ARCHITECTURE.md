@@ -58,6 +58,12 @@ shapes; other nodes reference earlier nodes by `a` and optionally `b`.
 }
 ```
 
+An input's `data` is a flat list of numbers or a `Float32Array` (a ZIPP engine's
+binary tensor transport), copied by the validator either way and checked in one
+finiteness pass for the typed form. `runtime.execute(program, {typedOutputs: true})`
+returns each output's `data` as a `Float32Array` of its own instead of a list;
+`zipp-python-adapter.mjs` asks for that when a request's inputs are typed.
+
 An empty shape means one scalar, not an empty array. Shapes are restricted to rank
 zero through two. Empty tensors and general broadcasting are intentionally absent.
 This keeps initial semantics explicit and testable.
@@ -138,8 +144,9 @@ runtime, implement exactly one transport function, pass the numerical checks on
 actual WebGPU and WebGL2 devices, and verify teardown with the real ZIPP WASM
 artifact. Record its version/profile/hash, browser, adapter and failures.
 
-**Second: bulk data transport.** JSON arrays are convenient but expensive. Add a
-separate host-owned binary upload path with explicit ownership, element type,
+**Second: bulk data transport.** JSON arrays are convenient but expensive. Float32
+tensor inputs and outputs now cross as `Float32Array` copies (see Graph v1);
+still open is a separate host-owned binary upload path with explicit ownership, element type,
 length, and per-tenant handles. Respect the actual ZIPP conversion/queue limits.
 Do not keep views into guest WASM memory across asynchronous work without a correct
 lifetime and memory-growth contract. GPU uploads still involve copies unless an

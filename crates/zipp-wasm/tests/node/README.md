@@ -62,6 +62,12 @@ top of each file if you put it elsewhere).
   metadata reported in bytes. The audit's own three-case WASM probe ran
   red on `1477070` for ZA-04 (an uncaught argument-count `RangeError` that
   also left the instance unusable).
+- **audit-2026-09-15-ml-transport.cjs** — binary tensor transport: a guest
+  `Float32Array` reads as a host `Float32Array` bit for bit (views, nesting,
+  an unchanged echo keeping the guest's array), a host one arrives as a fresh
+  array or, in a Python state, as float32 tensor storage, other typed arrays
+  still read as `null`, and a detached or over-budget array is a controlled
+  error that leaves the engine usable.
 - **sdk-contract.mjs** — the reference host adapter's main-thread contract
   under a mocked Worker and deterministic timers (ZA-01/02/03): envelope-
   based categories, send-failure cleanup, monotonic death, no operation
