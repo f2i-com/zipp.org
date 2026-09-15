@@ -596,6 +596,9 @@ impl<'p> Vm<'p> {
                                 // A key add or a descriptor change on the global
                                 // object invalidates any cached slot for it.
                                 self.heap.bump_version(gi);
+                                // Nursery barrier: the fresh (young) function
+                                // now sits in the (old) global object.
+                                self.heap.write_barrier_val(gi, v);
                                 continue;
                             }
                         }

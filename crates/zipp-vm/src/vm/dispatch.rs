@@ -4078,7 +4078,11 @@ impl<'p> Vm<'p> {
                                 }
                                 if let Some(props) = args.get(1).copied() {
                                     if props != Value::UNDEFINED {
-                                        self.object_define_properties(o, props)?;
+                                        // `o` is reachable only from this local while
+                                        // the descriptor getters run guest code.
+                                        self.with_host_roots(&[o], |vm| {
+                                            vm.object_define_properties(o, props)
+                                        })?;
                                     }
                                 }
                                 o
@@ -4571,6 +4575,13 @@ impl<'p> Vm<'p> {
                     Instr::JumpIfFalse { cond, target } => {
                         let v = self.get(base, cond);
                         if !self.truthy(v) {
+                            // A taken BACKWARD conditional closes a loop
+                            // (`do … while`): the same GC safe point as the
+                            // `Jump` back-edge, or an allocating loop with no
+                            // frame transition never collects.
+                            if (target as usize) < ip {
+                                self.maybe_gc();
+                            }
                             ip = target as usize;
                         } else {
                             ip += 1;
@@ -4579,6 +4590,11 @@ impl<'p> Vm<'p> {
                     Instr::JumpIfTrue { cond, target } => {
                         let v = self.get(base, cond);
                         if self.truthy(v) {
+                            // See `JumpIfFalse`: a backward taken branch is a
+                            // loop back-edge.
+                            if (target as usize) < ip {
+                                self.maybe_gc();
+                            }
                             ip = target as usize;
                         } else {
                             ip += 1;
@@ -5195,24 +5211,18 @@ impl<'p> Vm<'p> {
                         if let Some(or) = opts {
                             let options = self.get(base, or);
                             let kc = self.alloc_str("cause".to_string());
-                            if self.is_object_value(options)
-                                && self.has_property_dyn(options, kc)?
-                            {
-                                let cause = self.get_prop(options, "cause")?;
-                                if let HeapObj::Object(m) = self.heap.get_mut(v.heap_index()) {
-                                    m.define(
-                                        "cause",
-                                        cause,
-                                        PropAttr {
-                                            writable: true,
-                                            enumerable: false,
-                                            configurable: true,
-                                            accessor: false,
-                                            setter: Value::UNDEFINED,
-                                        },
-                                    );
+                            // The error lives only in `v` until `dst` is written,
+                            // and the `has` trap / `cause` getter run guest code
+                            // that can collect: root it (and the key) across them.
+                            self.with_host_roots(&[v, kc], |vm| -> Result<(), Thrown> {
+                                if vm.is_object_value(options)
+                                    && vm.has_property_dyn(options, kc)?
+                                {
+                                    let cause = vm.get_prop(options, "cause")?;
+                                    vm.install_error_cause(v, cause);
                                 }
-                            }
+                                Ok(())
+                            })?;
                         }
                         // AggregateError installs `errors` LAST (after message + cause):
                         // a non-enumerable own array of IterableToList(firstArg). It runs
@@ -5222,7 +5232,7 @@ impl<'p> Vm<'p> {
                             let errors_arg = errors
                                 .map(|er| self.get(base, er))
                                 .unwrap_or(Value::UNDEFINED);
-                            self.install_agg_errors(v, errors_arg)?;
+                            self.with_host_roots(&[v], |vm| vm.install_agg_errors(v, errors_arg))?;
                         }
                         self.set(base, dst, v);
                         ip += 1;
@@ -7602,9 +7612,15 @@ impl<'p> Vm<'p> {
                                 let jump_target =
                                     self.regs[base + val_reg as usize].as_int() as u32;
                                 let floor = (raw >> 2) as usize;
+                                let from = ip;
                                 match self.route_jump_through_finally(jump_target, floor) {
                                     Some(target) => ip = target as usize,
                                     None => ip = jump_target as usize,
+                                }
+                                // A `continue` resumed through a finally re-enters
+                                // its loop without the loop's `Jump` back-edge.
+                                if ip < from {
+                                    self.maybe_gc();
                                 }
                             }
                             _ => {
@@ -7613,13 +7629,13 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Instr::OpenUsingScope { dst } => {
-                        // Allocate a fresh `using` resource scope; its id (in a
-                        // register, so it rides the frame across suspensions) keys
-                        // the disposer list in `using_resources`.
-                        let id = self.using_next_id;
-                        self.using_next_id = self.using_next_id.wrapping_add(1);
-                        self.using_resources.insert(id, Vec::new());
-                        self.set(base, dst, Value::int(id as i32));
+                        // Allocate a fresh `using` resource scope: an internal
+                        // Array of disposers held in a register, so it rides the
+                        // frame across suspensions AND lives exactly as long as
+                        // the frame does — a generator abandoned mid-block takes
+                        // its resources with it instead of rooting them forever.
+                        let list = self.heap.alloc(HeapObj::Array(Vec::new()));
+                        self.set(base, dst, Value::heap(list));
                         ip += 1;
                     }
                     Instr::RegisterDisposable { scope, val } => {
@@ -7650,10 +7666,8 @@ impl<'p> Vm<'p> {
                                 this: v,
                                 args: Vec::new(),
                             }));
-                            let id = self.get(base, scope).as_int() as u32;
-                            if let Some(d) = self.using_resources.get_mut(&id) {
-                                d.push(disposer);
-                            }
+                            let list = self.get(base, scope);
+                            self.using_scope_push(list, disposer);
                             ip += 1;
                         }
                     }
@@ -7666,8 +7680,11 @@ impl<'p> Vm<'p> {
                         // any throw with the incoming completion (kind&3==2 â‡’ the
                         // block already threw) into a SuppressedError chain; rewrite
                         // kind/val so the following EndFinally re-raises the merge.
-                        let id = self.get(base, scope).as_int() as u32;
-                        let disposers = self.using_resources.remove(&id).unwrap_or_default();
+                        let list = self.get(base, scope);
+                        let disposers = self
+                            .using_scope_list(list)
+                            .map(std::mem::take)
+                            .unwrap_or_default();
                         let raw = self.regs[base + kind_reg as usize].as_int();
                         let incoming = if raw & 3 == 2 {
                             Some(self.regs[base + val_reg as usize])
@@ -7687,11 +7704,10 @@ impl<'p> Vm<'p> {
                         // @@asyncDispose FIRST (once), fall back to @@dispose only when
                         // it is nullish; both absent/non-callable â†’ TypeError.
                         let v = self.get(base, val);
-                        let id = self.get(base, scope).as_int() as u32;
+                        let list = self.get(base, scope);
                         if v.is_nullish() {
-                            if let Some(d) = self.using_resources.get_mut(&id) {
-                                d.push(Value::UNDEFINED); // inert: awaited, not called
-                            }
+                            // Inert: awaited, not called.
+                            self.using_scope_push(list, Value::UNDEFINED);
                             ip += 1;
                         } else {
                             if !self.is_object_value(v) {
@@ -7714,7 +7730,10 @@ impl<'p> Vm<'p> {
                                 ));
                             }
                             let disposer = if sync_fallback {
-                                let shim = self.sync_dispose_shim()?;
+                                // The first use compiles the shim with an eval;
+                                // `method` may be a getter's fresh function.
+                                let shim =
+                                    self.with_host_roots(&[method], Self::sync_dispose_shim)?;
                                 Value::heap(self.heap.alloc(HeapObj::Bound {
                                     target: shim,
                                     this: method,
@@ -7727,9 +7746,7 @@ impl<'p> Vm<'p> {
                                     args: Vec::new(),
                                 }))
                             };
-                            if let Some(d) = self.using_resources.get_mut(&id) {
-                                d.push(disposer);
-                            }
+                            self.using_scope_push(list, disposer);
                             ip += 1;
                         }
                     }
@@ -7739,8 +7756,8 @@ impl<'p> Vm<'p> {
                         // A real bound disposer is CALLED here (carrying its `this`);
                         // its result is left in `res` for the caller to Await. A sync
                         // throw propagates (caught by the loop's handler).
-                        let id = self.get(base, scope).as_int() as u32;
-                        let entry = self.using_resources.get_mut(&id).and_then(|d| d.pop());
+                        let list = self.get(base, scope);
+                        let entry = self.using_scope_list(list).and_then(|d| d.pop());
                         match entry {
                             None => {
                                 self.set(base, done, Value::bool(true));
@@ -7784,9 +7801,15 @@ impl<'p> Vm<'p> {
                         // A `break`/`continue` exiting one or more `try` blocks:
                         // run each intervening `finally` first, popping any
                         // intervening `catch`, then land at `target`.
+                        let from = ip;
                         match self.route_jump_through_finally(target, floor as usize) {
                             Some(t) => ip = t as usize,
                             None => ip = target as usize,
+                        }
+                        // `continue` out of a try lands back in the loop without
+                        // executing its `Jump` back-edge: poll like one.
+                        if ip < from {
+                            self.maybe_gc();
                         }
                     }
                     Instr::SetRaw { arr, raw } => {

@@ -78,7 +78,10 @@ pub const EMPTY: u32 = 1;
 /// far below it — `polymorphic-objects` builds 30,000 dictionaries and uses
 /// 1,071 shapes — while a program whose keys are effectively unique blows
 /// through it in one pass and every object thereafter is `DICT`, i.e. exactly
-/// today's behaviour at the cost of one compare per append.
+/// today's behaviour at the cost of one key hash and one index probe per
+/// append (a node with a hash index never scans its edges on an index miss;
+/// only a node below [`FANOUT_INDEX_AT`] edges is scanned, and that scan is
+/// short by definition).
 ///
 /// That second case is real, not hypothetical. `bench/real/json-large.js` builds
 /// its tree with `obj[WORDS[ri(256)] + "_" + j]` — randomly-named keys — and so
@@ -86,6 +89,17 @@ pub const EMPTY: u32 = 1;
 /// shape-keyed guard, and before this cap it paid ~9% for the privilege of
 /// finding that out on every append.
 const SHAPE_MAX: usize = 4096;
+
+/// Longest key (in bytes) an edge may carry. The table is thread-local, lives
+/// longer than any `Vm`, and is outside the heap meter, so a node count alone
+/// does not bound it: 4,096 edges of 8 MiB keys is gigabytes a guest whose
+/// live heap is tiny could leave behind. A key this long is data, not a field
+/// name a shape-keyed guard will ever pay off on, so its object goes `DICT`.
+const SHAPE_KEY_MAX: usize = 256;
+
+/// Total key bytes the table may retain — the byte-denominated twin of
+/// [`SHAPE_MAX`]. Once spent, new edges are refused exactly like a full table.
+const SHAPE_KEY_BYTES_MAX: usize = 512 << 10;
 
 /// Fan-out at which a node stops being scanned linearly and gains a hash index.
 /// Most nodes never reach it; the ones that do are the roots of wide, data-shaped
@@ -104,12 +118,14 @@ fn edge_hash(key: &str, bits: u8) -> u64 {
     h
 }
 
-/// One node of the transition tree: the shape reached by adding `key` to
-/// `parent`.
+/// One node of the transition tree: the shape reached by adding a key to
+/// `parent`. The key itself is stored ONCE, on the parent's `next` edge that
+/// leads here (the append path's scan reads it there); `edge` finds it again.
 struct Node {
     parent: u32,
-    /// The property this edge adds. Empty for the root.
-    key: Box<str>,
+    /// Position of the edge that reached this node in `parent`'s `next`.
+    /// Edges are never removed, so the position is stable.
+    edge: u32,
     /// Packed attribute bits of the added property — part of the shape's
     /// identity, because two objects whose `x` differs in enumerability do NOT
     /// have interchangeable layouts for a descriptor read.
@@ -129,15 +145,20 @@ struct Node {
     ///     tree with **max fan-out 313**, and scanning that per append cost it
     ///     ~9%.
     ///
-    /// The index maps a hash of `(key, bits)` to a candidate node, VERIFIED
-    /// against that node's real key so a collision is a miss rather than a wrong
-    /// shape; a miss falls back to the scan, which is always authoritative.
+    /// The index maps a hash of `(key, bits)` to the POSITION of a candidate
+    /// edge in `next`, VERIFIED against that edge's real key so a collision is
+    /// a miss rather than a wrong shape. Hashes are never removed and every
+    /// edge is indexed when it is added, so a hash ABSENT from the index proves
+    /// no edge matches; only a verified mismatch (an entry a colliding edge
+    /// overwrote) falls back to the scan.
     next: Vec<(Box<str>, u8, u32)>,
     index: Option<Box<std::collections::HashMap<u64, u32>>>,
 }
 
 struct Table {
     nodes: Vec<Node>,
+    /// Sum of every edge key's length, bounded by [`SHAPE_KEY_BYTES_MAX`].
+    key_bytes: usize,
 }
 
 impl Table {
@@ -148,7 +169,7 @@ impl Table {
             nodes: vec![
                 Node {
                     parent: 0,
-                    key: "".into(),
+                    edge: 0,
                     attr_bits: 0,
                     len: 0,
                     next: Vec::new(),
@@ -156,14 +177,21 @@ impl Table {
                 },
                 Node {
                     parent: 0,
-                    key: "".into(),
+                    edge: 0,
                     attr_bits: 0,
                     len: 0,
                     next: Vec::new(),
                     index: None,
                 },
             ],
+            key_bytes: 0,
         }
+    }
+
+    /// The key of the edge that reached `id` (not the root's: it has none).
+    fn key_of(&self, id: u32) -> &str {
+        let n = &self.nodes[id as usize];
+        &self.nodes[n.parent as usize].next[n.edge as usize].0
     }
 }
 
@@ -177,6 +205,12 @@ thread_local! {
     /// with no realm-specific content, so agents sharing a thread may share the
     /// tree safely; agents on different threads simply get their own.
     static TABLE: RefCell<Table> = RefCell::new(Table::new());
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Edges compared by `add`'s linear scans on this thread (tests only).
+    static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `ZIPP_NO_SHAPES=1` turns shape maintenance off — every object reports `DICT`
@@ -224,51 +258,73 @@ pub fn attr_bits(writable: bool, enumerable: bool, configurable: bool, accessor:
 /// append path in `ObjMap` probes with `pos()` first, and appending a duplicate
 /// would produce a shape whose slot mapping disagrees with the object's.
 pub fn add(from: u32, key: &str, bits: u8) -> u32 {
-    if from == DICT || disabled() {
+    if from == DICT || key.len() > SHAPE_KEY_MAX || disabled() {
         return DICT;
     }
     TABLE.with(|t| {
         let mut t = t.borrow_mut();
+        let mut hash = None;
         {
             let n = &t.nodes[from as usize];
-            if let Some(ix) = &n.index {
-                if let Some(&id) = ix.get(&edge_hash(key, bits)) {
-                    // Verify: a hash collision must be a MISS, never a wrong
-                    // shape. The scan below is the authority.
-                    let c = &t.nodes[id as usize];
-                    if c.attr_bits == bits && &*c.key == key {
-                        return id;
+            let scan = match &n.index {
+                Some(ix) => {
+                    let h = edge_hash(key, bits);
+                    hash = Some(h);
+                    match ix.get(&h) {
+                        Some(&pos) => {
+                            // Verify: a hash collision must be a MISS, never a
+                            // wrong shape.
+                            let (k, b, id) = &n.next[pos as usize];
+                            if *b == bits && &**k == key {
+                                return *id;
+                            }
+                            // A colliding edge overwrote the entry: the scan
+                            // is the authority for this hash.
+                            true
+                        }
+                        // No edge hashes to `h`, so none can match. Skipping
+                        // the scan here is what keeps a full table's append
+                        // at one probe instead of a pass over ~4,000 edges.
+                        None => false,
                     }
                 }
-            }
-            if let Some(&(_, _, id)) = n.next.iter().find(|(k, b, _)| *b == bits && &**k == key) {
-                return id;
+                None => true,
+            };
+            if scan {
+                #[cfg(test)]
+                SCANNED.with(|c| c.set(c.get() + n.next.len()));
+                if let Some(&(_, _, id)) =
+                    n.next.iter().find(|(k, b, _)| *b == bits && &**k == key)
+                {
+                    return id;
+                }
             }
         }
-        if t.nodes.len() >= SHAPE_MAX {
+        if t.nodes.len() >= SHAPE_MAX || t.key_bytes + key.len() > SHAPE_KEY_BYTES_MAX {
             return DICT;
         }
+        t.key_bytes += key.len();
         let len = t.nodes[from as usize].len + 1;
+        let pos = t.nodes[from as usize].next.len() as u32;
         let id = t.nodes.len() as u32;
         t.nodes.push(Node {
             parent: from,
-            key: key.into(),
+            edge: pos,
             attr_bits: bits,
             len,
             next: Vec::new(),
             index: None,
         });
-        let h = edge_hash(key, bits);
         let n = &mut t.nodes[from as usize];
         n.next.push((key.into(), bits, id));
         match &mut n.index {
             Some(ix) => {
-                ix.insert(h, id);
+                ix.insert(hash.unwrap_or_else(|| edge_hash(key, bits)), pos);
             }
             None if n.next.len() >= FANOUT_INDEX_AT => {
                 let mut ix = std::collections::HashMap::with_capacity(n.next.len() * 2);
-                for (k, b, nid) in &n.next {
-                    ix.insert(edge_hash(k, *b), *nid);
+                for (p, (k, b, _)) in n.next.iter().enumerate() {
+                    ix.insert(edge_hash(k, *b), p as u32);
                 }
                 n.index = Some(Box::new(ix));
             }
@@ -302,7 +358,7 @@ pub fn slot_of(shape: u32, key: &str) -> Option<u32> {
         let mut cur = shape;
         while cur != EMPTY && cur != DICT {
             let n = &t.nodes[cur as usize];
-            if &*n.key == key {
+            if t.key_of(cur) == key {
                 return Some(n.len - 1);
             }
             cur = n.parent;
@@ -327,7 +383,7 @@ pub fn describe(shape: u32) -> Vec<(Box<str>, u8)> {
         let mut cur = shape;
         while cur != EMPTY && cur != DICT {
             let n = &t.nodes[cur as usize];
-            out.push((n.key.clone(), n.attr_bits));
+            out.push((t.key_of(cur).into(), n.attr_bits));
             cur = n.parent;
         }
         out.reverse();
@@ -348,7 +404,7 @@ pub fn keys_of(shape: u32) -> Vec<String> {
         let mut cur = shape;
         while cur != EMPTY && cur != DICT {
             let n = &t.nodes[cur as usize];
-            out.push(n.key.to_string());
+            out.push(t.key_of(cur).to_string());
             cur = n.parent;
         }
         out.reverse();
@@ -426,6 +482,60 @@ mod tests {
         assert_eq!(add(DICT, "x", D), DICT);
         assert_eq!(len(DICT), 0);
         assert_eq!(slot_of(DICT, "x"), None);
+    }
+
+    #[test]
+    fn a_full_table_answers_new_first_keys_without_scanning_the_root() {
+        // Unique first keys fill the root's fan-out to the cap; every append
+        // after that must be one index probe, not a pass over ~4,000 edges.
+        // A fresh thread: the full table must not leak into other tests.
+        std::thread::spawn(|| {
+            let mut i = 0;
+            while count() < SHAPE_MAX {
+                add(EMPTY, &format!("first-key-{i}"), D);
+                i += 1;
+            }
+            let before = SCANNED.with(|c| c.get());
+            for j in 0..1_000 {
+                assert_eq!(add(EMPTY, &format!("late-key-{j}"), D), DICT);
+            }
+            let scanned = SCANNED.with(|c| c.get()) - before;
+            // Only a verified hash collision may scan (a handful at most).
+            assert!(scanned < 3 * SHAPE_MAX, "1,000 late appends scanned {scanned} edges");
+            // Existing edges are still found through the index.
+            assert_ne!(add(EMPTY, "first-key-0", D), DICT);
+        })
+        .join()
+        .expect("full-table thread");
+    }
+
+    #[test]
+    fn long_keys_never_enter_the_table() {
+        // The table outlives the heap meter: a key past SHAPE_KEY_MAX takes the
+        // object DICT instead of being retained forever.
+        let before = count();
+        let long = "k".repeat(SHAPE_KEY_MAX + 1);
+        assert_eq!(add(EMPTY, &long, D), DICT);
+        assert_eq!(count(), before);
+        let edge = "k".repeat(SHAPE_KEY_MAX);
+        assert_ne!(add(EMPTY, &edge, D), DICT);
+    }
+
+    #[test]
+    fn indexed_fan_out_finds_every_edge_and_mints_on_a_miss() {
+        // Past FANOUT_INDEX_AT the index answers misses without a scan; every
+        // existing edge must still be found through it, before and after the
+        // index is built.
+        let root = add(EMPTY, "fanout-root", D);
+        let ids: Vec<u32> = (0..64).map(|i| add(root, &format!("f{i}"), D)).collect();
+        for (i, &id) in ids.iter().enumerate() {
+            assert_eq!(add(root, &format!("f{i}"), D), id);
+            assert_eq!(slot_of(id, &format!("f{i}")), Some(1));
+        }
+        let fresh = add(root, "not-yet-an-edge", D);
+        assert!(!ids.contains(&fresh));
+        assert_eq!(add(root, "not-yet-an-edge", D), fresh);
+        assert_eq!(keys_of(fresh), vec!["fanout-root", "not-yet-an-edge"]);
     }
 
     #[test]

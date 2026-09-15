@@ -2560,19 +2560,35 @@ impl<'p> Vm<'p> {
         iterable: Value,
         ctor: Value,
     ) -> Result<Value, Thrown> {
-        use crate::heap::CombKind;
         // The iterator, per-element value, capability functions and freshly
         // returned Promise are held in Rust locals across re-entrant iterator
-        // getters/calls. This mirrors the other callback-driven collection
-        // builtins: defer collection until the synchronous combinator setup
-        // has installed every value in a Promise reaction or heap object.
-        let _gc = self.gc_lock_guard();
+        // getters/calls. B214's rule: ROOT them on `host_result_roots` (every
+        // exit releases the whole segment here) instead of suspending
+        // collection for the entire setup — `Promise.all(gen())` whose `next()`
+        // makes millions of temporaries otherwise never collects until the
+        // iteration ends.
+        let base = self.host_result_roots.len();
+        let r = self.promise_combine_rooted(kind, iterable, ctor);
+        self.host_result_roots.truncate(base);
+        r
+    }
+
+    fn promise_combine_rooted(
+        &mut self,
+        kind: crate::heap::CombKind,
+        iterable: Value,
+        ctor: Value,
+    ) -> Result<Value, Thrown> {
+        use crate::heap::CombKind;
+        self.host_result_roots.extend([iterable, ctor]);
         // NewPromiseCapability(C) — the result is a C-typed promise (a subclass
         // instance when `this` is a Promise subclass). A throwing/invalid capability
         // (executor not called / called twice / non-callable resolve-reject) throws
         // synchronously per ReturnIfAbrupt. A custom constructor may return any
         // object, so settlement must call its captured capability functions.
         let (cap_promise, cap_resolve, cap_reject) = self.new_promise_capability(ctor)?;
+        self.host_result_roots
+            .extend([cap_promise, cap_resolve, cap_reject]);
         let result = cap_promise.heap_index();
         // GetPromiseResolve(C): `promiseResolve = Get(C, "resolve")`, which must be
         // callable. This is the spec-observable step the tests check (overriding
@@ -2583,11 +2599,7 @@ impl<'p> Vm<'p> {
             match self.get_prop(ctor, "resolve") {
                 Ok(r) => Some(r),
                 Err(Thrown(msg)) => {
-                    let err = match self.pending_throw.take() {
-                        Some(v) => v,
-                        None => self.alloc_error_from_message(&msg),
-                    };
-                    self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
+                    self.reject_capability_with_thrown(cap_reject, &msg)?;
                     return Ok(Value::heap(result));
                 }
             }
@@ -2595,10 +2607,11 @@ impl<'p> Vm<'p> {
             None
         };
         if let Some(pr) = promise_resolve {
+            self.host_result_roots.push(pr);
             if !self.is_callable(pr) {
                 let err =
                     self.alloc_error_from_message("TypeError: Promise.resolve is not a function");
-                self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
+                self.reject_capability_with(cap_reject, err)?;
                 return Ok(Value::heap(result));
             }
         }
@@ -2613,7 +2626,7 @@ impl<'p> Vm<'p> {
                 let e = self.alloc_error_from_message(
                     "TypeError: Promise.allKeyed argument is not an object",
                 );
-                self.call_value(cap_reject, Value::UNDEFINED, &[e])?;
+                self.reject_capability_with(cap_reject, e)?;
                 return Ok(Value::heap(result));
             }
             // OwnPropertyKeys (incl. Symbols), filtered to enumerable own props —
@@ -2628,6 +2641,9 @@ impl<'p> Vm<'p> {
                     return Ok(Value::heap(result));
                 }
             };
+            // The key array keeps `kvals`' key values alive across the traps
+            // and getters below; each value read joins it on the root stack.
+            self.host_result_roots.push(karr);
             let kvals = self.array_snapshot(karr.heap_index());
             if let Err(Thrown(msg)) = self.preflight_native_iteration_work(kvals.len() as u64) {
                 self.reject_capability_with_thrown(cap_reject, &msg)?;
@@ -2657,9 +2673,12 @@ impl<'p> Vm<'p> {
                     }
                 };
                 comb_keys.push(ks);
+                self.host_result_roots.push(v);
                 vals.push(v);
             }
-            Value::heap(self.heap.alloc(HeapObj::Array(vals)))
+            let arr = Value::heap(self.heap.alloc(HeapObj::Array(vals)));
+            self.host_result_roots.push(arr);
+            arr
         } else {
             iterable
         };
@@ -2673,7 +2692,7 @@ impl<'p> Vm<'p> {
                 let disp = self.display(iterable);
                 let e =
                     self.alloc_error_from_message(&format!("TypeError: {disp} is not iterable"));
-                self.call_value(cap_reject, Value::UNDEFINED, &[e])?;
+                self.reject_capability_with(cap_reject, e)?;
                 return Ok(Value::heap(result));
             }
             Err(Thrown(msg)) => {
@@ -2681,6 +2700,7 @@ impl<'p> Vm<'p> {
                 return Ok(Value::heap(result));
             }
         };
+        self.host_result_roots.push(iter_method);
         // FAST ITERATION lane: a REAL Array whose @@iterator Get yielded the
         // PRISTINE intrinsic (and %ArrayIteratorPrototype%.next is untouched)
         // is stepped INLINE while dense, with the live length re-read per step.
@@ -2720,6 +2740,10 @@ impl<'p> Vm<'p> {
                 }
             };
         }
+        // `iter` is reassigned when the inline lane demotes: it keeps one
+        // root slot, rewritten with it.
+        let iter_slot = self.host_result_roots.len();
+        self.host_result_roots.push(iter);
         // Per-element intrinsic gates: Call(promiseResolve, C, val) and
         // Invoke(nextPromise, "then") collapse to their intrinsic native
         // behavior only when C IS the intrinsic %Promise%, `promiseResolve`
@@ -2750,12 +2774,19 @@ impl<'p> Vm<'p> {
                 cap_reject,
                 keys: comb_keys,
             })));
+        self.host_result_roots.push(Value::heap(comb));
+        // Per-element values (the step value, nextPromise, the element
+        // resolvers, `then`) are rooted above this mark for one element only:
+        // by the next step each is held by a reaction, a queued job, or the
+        // combinator itself.
+        let element_roots = self.host_result_roots.len();
         let mut native_work = 0u64;
         // Whether any resolve-element job ran eagerly at subscription (see
         // `eager_combinator_enabled`): the result promise then owes its settle
         // to a queued CombinatorFinish instead of the synchronous tail call.
         let mut eager_used = false;
         loop {
+            self.host_result_roots.truncate(element_roots);
             // Array iteration does NOT skip holes: it performs Get(array,
             // index), so an inherited numeric property or accessor may supply
             // the value (and an otherwise-empty hole yields `undefined`). The
@@ -2774,6 +2805,7 @@ impl<'p> Vm<'p> {
                         proto: self.array_iter_proto,
                         live: Some((iterable.heap_index(), 1)),
                     }));
+                    self.host_result_roots[iter_slot] = iter;
                     fast_pos = None;
                 }
             }
@@ -2799,13 +2831,15 @@ impl<'p> Vm<'p> {
                     }
                 }
             };
+            self.host_result_roots.push(val);
             native_work = native_work.saturating_add(1);
             if let Err(Thrown(msg)) = self.preflight_native_iteration_work(native_work) {
                 let err = self.alloc_error_from_message(&msg);
+                self.host_result_roots.push(err);
                 if fast_pos.is_none() {
                     self.iterator_close_quiet(iter);
                 }
-                self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
+                self.reject_capability_with(cap_reject, err)?;
                 return Ok(Value::heap(result));
             }
             // DEMOTE before any per-element path that could run user code: a
@@ -2827,6 +2861,7 @@ impl<'p> Vm<'p> {
                         proto: self.array_iter_proto,
                         live: Some((iterable.heap_index(), 1)),
                     }));
+                    self.host_result_roots[iter_slot] = iter;
                     fast_pos = None;
                 }
             }
@@ -2868,11 +2903,12 @@ impl<'p> Vm<'p> {
                         Ok(v) => v,
                         Err(Thrown(msg)) => {
                             let err = self.take_thrown(&msg);
+                            self.host_result_roots.push(err);
                             self.iterator_close_quiet(iter);
                             // IfAbruptRejectPromise: settle through the capability's
                             // observable [[Reject]] (a custom constructor's reject is
                             // visibly invoked), not the internal reject.
-                            self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
+                            self.reject_capability_with(cap_reject, err)?;
                             return Ok(Value::heap(result));
                         }
                     },
@@ -2880,6 +2916,7 @@ impl<'p> Vm<'p> {
                     None => Value::heap(self.to_promise(val)),
                 }
             };
+            self.host_result_roots.push(next);
             if fast_pos.is_some()
                 && matches!(kind, CombKind::All)
                 && index <= i32::MAX as u32
@@ -2920,6 +2957,7 @@ impl<'p> Vm<'p> {
                     element_resolver(self, true)
                 }
             };
+            self.host_result_roots.extend([res_f, res_r]);
             // Invoke(nextPromise, "then", «res_f, res_r») — OBSERVABLE; abrupt →
             // close + reject with the original error.
             let outcome = if fast_pos.is_some() {
@@ -2937,14 +2975,18 @@ impl<'p> Vm<'p> {
                 Ok(Value::UNDEFINED)
             } else {
                 match self.get_prop(next, "then") {
-                    Ok(then_fn) => self.call_value(then_fn, next, &[res_f, res_r]),
+                    Ok(then_fn) => {
+                        self.host_result_roots.push(then_fn);
+                        self.call_value(then_fn, next, &[res_f, res_r])
+                    }
                     Err(e) => Err(e),
                 }
             };
             if let Err(Thrown(msg)) = outcome {
                 let err = self.take_thrown(&msg);
+                self.host_result_roots.push(err);
                 self.iterator_close_quiet(iter);
-                self.call_value(cap_reject, Value::UNDEFINED, &[err])?;
+                self.reject_capability_with(cap_reject, err)?;
                 return Ok(Value::heap(result));
             }
         }
@@ -2981,7 +3023,13 @@ impl<'p> Vm<'p> {
     /// observable capability's reject function, and propagate a throw from it.
     fn reject_capability_with_thrown(&mut self, reject: Value, msg: &str) -> Result<(), Thrown> {
         let e = self.take_thrown(msg);
-        self.call_value(reject, Value::UNDEFINED, &[e])?;
+        self.reject_capability_with(reject, e)
+    }
+
+    /// Call a capability's `reject` with `err`, which is only a Rust local:
+    /// rooted across the call, since a custom capability's reject is guest code.
+    fn reject_capability_with(&mut self, reject: Value, err: Value) -> Result<(), Thrown> {
+        self.with_host_roots(&[err], |vm| vm.call_value(reject, Value::UNDEFINED, &[err]))?;
         Ok(())
     }
 
@@ -3714,9 +3762,41 @@ impl<'p> Vm<'p> {
                 }
             });
             fired.sort_unstable_by_key(|&(deadline, index, _)| (deadline, index));
-            for (_, _, cb) in fired {
-                let _gc = self.gc_lock_guard();
-                let _ = self.call_value(cb, Value::UNDEFINED, &[]);
+            // B214's rule for timers: the fired callbacks just left
+            // `timer_queue` (a traced root), so ROOT the batch rather than
+            // suspending collection for each callback's whole run — a
+            // `setTimeout(main)` program otherwise never collects until main
+            // returns. Every timer is its own task: a microtask checkpoint (and
+            // its between-jobs collection) follows each callback, and an
+            // uncaught throw ends the loop as the program's error, as in Node.
+            if self.host_result_roots.try_reserve(fired.len()).is_err() {
+                self.timer_queue.clear();
+                break;
+            }
+            let roots_base = self.host_result_roots.len();
+            self.host_result_roots
+                .extend(fired.iter().map(|&(_, _, cb)| cb).filter(|cb| cb.is_heap()));
+            let mut threw = false;
+            for &(_, _, cb) in &fired {
+                if let Err(Thrown(msg)) = self.call_value(cb, Value::UNDEFINED, &[]) {
+                    // Take the live throw: left in `pending_throw`, a later
+                    // entry's deopt check would read it as a throw in flight.
+                    let v = match self.pending_throw.take() {
+                        Some(v) => v,
+                        None => self.error_from_thrown(&msg),
+                    };
+                    if self.uncaught_timer_throw.is_none() {
+                        self.uncaught_timer_throw = Some(v);
+                    }
+                    threw = true;
+                    break;
+                }
+                self.drain_microtasks();
+            }
+            self.host_result_roots.truncate(roots_base);
+            if threw {
+                self.timer_queue.clear();
+                break;
             }
             // Resolve due waitAsync waiters "timed-out" — DEREGISTERING under
             // the registry lock first. An entry already gone means a notify

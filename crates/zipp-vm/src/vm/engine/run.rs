@@ -245,7 +245,25 @@ impl<'p> Vm<'p> {
         // before the embedding caller has a chance to marshal it.
         let root = main.as_ref().copied().unwrap_or(Value::UNDEFINED);
         self.with_host_roots(&[root], Self::run_event_loop);
+        if main.is_ok() {
+            if let Some(t) = self.take_uncaught_timer_throw() {
+                return Err(t);
+            }
+        }
+        // The main script's throw is the program's error; a timer throw
+        // after it is dropped rather than kept rooted for the VM's life.
+        self.uncaught_timer_throw = None;
         main
+    }
+
+    /// The first exception a timer callback let escape (see
+    /// `uncaught_timer_throw`), rethrown as the program's completion: the
+    /// value goes back into `pending_throw` so a host sees the real error.
+    pub(crate) fn take_uncaught_timer_throw(&mut self) -> Option<Thrown> {
+        let v = self.uncaught_timer_throw.take()?;
+        let msg = self.throw_message(v);
+        self.pending_throw = Some(v);
+        Some(Thrown(msg))
     }
 
     /// Run a MODULE as the program entry. The top-level body (func 0) is an async
@@ -295,6 +313,12 @@ impl<'p> Vm<'p> {
                 }
             }
         }
+        if r.is_ok() {
+            if let Some(t) = self.take_uncaught_timer_throw() {
+                return Err(t);
+            }
+        }
+        self.uncaught_timer_throw = None;
         r.map(|_| Value::UNDEFINED)
     }
 
@@ -398,8 +422,12 @@ impl<'p> Vm<'p> {
                 // Render the rejection like an uncaught throw ("Name: message")
                 // rather than display() (which gives "[object Object]" for an Error).
                 let msg = self.throw_message(reason);
+                self.uncaught_timer_throw = None;
                 return Err(Thrown(msg));
             }
+        }
+        if let Some(t) = self.take_uncaught_timer_throw() {
+            return Err(t);
         }
         Ok(Value::UNDEFINED)
     }

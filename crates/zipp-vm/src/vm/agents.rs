@@ -125,8 +125,10 @@ fn agent_worker(
             }
         }
         // Settle anything the callback queued (async callbacks, timers) with
-        // the same run-to-completion driver the script path uses.
+        // the same run-to-completion driver the script path uses. An uncaught
+        // timer throw ends this task only; do not keep it rooted.
         vm.run_event_loop();
+        vm.uncaught_timer_throw = None;
     }
 }
 

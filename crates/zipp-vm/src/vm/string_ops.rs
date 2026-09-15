@@ -985,6 +985,12 @@ impl<'p> Vm<'p> {
                 };
                 let arr = Value::heap(self.heap.alloc(HeapObj::Array(parts)));
                 self.heap.pretenure_end();
+                if sep_or.is_none() && lim != 0 {
+                    // The one element is the pre-existing receiver, not a part
+                    // allocated in the scope: an OLD-born array holding a
+                    // possibly-young string is an old->young edge no store saw.
+                    self.heap.write_barrier_val(arr.heap_index(), Value::heap(idx));
+                }
                 Ok(Some(arr))
             }
             // ECMAScript TrimString whitespace = Unicode White_Space + U+FEFF

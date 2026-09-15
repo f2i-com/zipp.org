@@ -242,7 +242,9 @@ impl<'p> Vm<'p> {
         };
         for k in keys {
             let desc = self.get_prop(props, &k)?;
-            self.object_define_property(obj, &k, desc)?;
+            // A getter on a later descriptor field may delete this one from
+            // `props`, leaving `desc` reachable only from this local.
+            self.with_host_roots(&[desc], |vm| vm.object_define_property(obj, &k, desc))?;
         }
         Ok(())
     }

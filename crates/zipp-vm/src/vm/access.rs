@@ -1419,6 +1419,8 @@ impl<'p> Vm<'p> {
             if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(idx) {
                 *last_index = val;
             }
+            // The RegExp is usually old by the time its lastIndex is assigned.
+            self.heap.write_barrier_val(idx, val);
             return Ok(true);
         }
         if key == "length"
@@ -2111,28 +2113,120 @@ impl<'p> Vm<'p> {
                     ProtoSet::Absorbed
                 });
             }
-            if let HeapObj::Object(m) = self.heap.get(cidx) {
-                if let Some(i) = m.pos(key) {
-                    let a = m.attr_at(i);
-                    if a.accessor {
-                        return Ok(if a.setter != Value::UNDEFINED {
-                            ProtoSet::Setter(a.setter)
-                        } else {
-                            ProtoSet::GetterOnly
-                        });
-                    }
-                    // An inherited WRITABLE data property is shadowed by an own
-                    // write; a NON-WRITABLE one rejects the write (OrdinarySet).
-                    return Ok(if a.writable {
-                        ProtoSet::DataWrite
+            let own = match self.heap.get(cidx) {
+                HeapObj::Object(m) => m.pos(key).map(|i| m.attr_at(i)),
+                // A function, class, array or other exotic chain node keeps its
+                // own properties in a side table or synthesizes them: its
+                // accessors and non-writable data properties govern the write
+                // exactly as an ordinary prototype's do.
+                _ => self.exotic_own_attr(cidx, key),
+            };
+            if let Some(a) = own {
+                if a.accessor {
+                    return Ok(if a.setter != Value::UNDEFINED {
+                        ProtoSet::Setter(a.setter)
                     } else {
-                        ProtoSet::NonWritable
+                        ProtoSet::GetterOnly
                     });
                 }
+                // An inherited WRITABLE data property is shadowed by an own
+                // write; a NON-WRITABLE one rejects the write (OrdinarySet).
+                return Ok(if a.writable {
+                    ProtoSet::DataWrite
+                } else {
+                    ProtoSet::NonWritable
+                });
             }
             cur = self.object_get_prototype_of(cur);
         }
         Ok(ProtoSet::DataWrite)
+    }
+
+    /// The attributes of the own property `key` of a NON-ordinary object
+    /// (anything but `HeapObj::Object`), classified as
+    /// `object_get_own_property_descriptor` classifies it — attributes only,
+    /// which is all the [[Set]] walk needs (an accessor's setter rides in
+    /// `PropAttr::setter`). Proxies and TypedArray indices are the walk's own
+    /// cases and never reach here.
+    fn exotic_own_attr(&mut self, idx: u32, key: &str) -> Option<PropAttr> {
+        let obj = Value::heap(idx);
+        let data = |writable: bool| PropAttr {
+            writable,
+            enumerable: false,
+            configurable: false,
+            accessor: false,
+            setter: Value::UNDEFINED,
+        };
+        // A callable's synthesized `name`/`length` and a legacy sloppy
+        // function's `caller`/`arguments` are non-writable.
+        if (key == "name" || key == "length") && self.callable_has_intrinsic(obj, key) {
+            return Some(data(false));
+        }
+        if self.fn_has_legacy_caller_prop(idx, key)
+            && self.fn_props.get(&idx).map_or(true, |m| m.pos(key).is_none())
+        {
+            return Some(data(false));
+        }
+        // `prototype`: writable on a function, non-writable on a class
+        // (`callable_has_prototype` is exactly when `prototype_of` would
+        // synthesize one, so it need not be materialized here).
+        if key == "prototype" && self.callable_has_prototype(obj) {
+            let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
+            return Some(data(!is_class || self.fn_proto_override.contains_key(&idx)));
+        }
+        // A String wrapper's index/`length` and a RegExp's `lastIndex`.
+        if let Some((_, len)) = self.string_exotic_chars(obj) {
+            if key == "length"
+                || key
+                    .parse::<usize>()
+                    .is_ok_and(|i| i.to_string() == key && i < len)
+            {
+                return Some(data(false));
+            }
+        }
+        if key == "lastIndex" && matches!(self.heap.get(idx), HeapObj::RegExp { .. }) {
+            return Some(data(self.regexp_last_index_writable(idx)));
+        }
+        let side = |m: &ObjMap| m.pos(key).map(|i| m.attr_at(i));
+        match self.heap.get(idx) {
+            HeapObj::Array(items) => {
+                if key == "length" && !self.arguments_objs.contains_key(&idx) {
+                    return Some(data(!self.array_length_nonwritable.contains(&idx)));
+                }
+                if let Some(a) = self.arr_props.get(&idx).and_then(side) {
+                    return Some(a);
+                }
+                match key.parse::<usize>() {
+                    Ok(i) if i.to_string() == key && i < items.len() && !items[i].is_hole() => {
+                        let frozen = self.arr_props.get(&idx).is_some_and(|m| m.frozen);
+                        Some(data(!frozen))
+                    }
+                    _ => None,
+                }
+            }
+            HeapObj::Class(_) if is_private_key(key) => None,
+            HeapObj::Class(c) => {
+                if let Some(a) = side(&c.statics) {
+                    return Some(a);
+                }
+                let getter = c.static_getters.iter().any(|(n, _)| n == key);
+                let setter = c.static_setters.iter().find(|(n, _)| n == key).map(|(_, s)| *s);
+                (getter || setter.is_some()).then(|| PropAttr {
+                    writable: false,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: true,
+                    setter: setter.unwrap_or(Value::UNDEFINED),
+                })
+            }
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => self.fn_props.get(&idx).and_then(side),
+            _ => self.arr_props.get(&idx).and_then(side),
+        }
     }
 
     /// Install an object-literal accessor (`{ get k(){…} }` / `{ set k(v){…} }`)

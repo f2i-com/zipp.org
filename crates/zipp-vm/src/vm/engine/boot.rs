@@ -392,8 +392,6 @@ impl<'p> Vm<'p> {
             from_async_fn: None,
             async_dispose_fn: None,
             sync_dispose_shim_fn: None,
-            using_resources: std::collections::HashMap::new(),
-            using_next_id: 0,
             weakref_ctor: 0,
             finreg_ctor: 0,
             weakmap_ctor: 0,
@@ -506,6 +504,7 @@ impl<'p> Vm<'p> {
             weak_containers: std::collections::HashSet::new(),
             kept_alive: std::collections::HashSet::new(),
             host_result_roots: Vec::new(),
+            uncaught_timer_throw: None,
         }
     }
 

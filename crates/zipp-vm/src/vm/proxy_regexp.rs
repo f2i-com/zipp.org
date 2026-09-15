@@ -3956,6 +3956,7 @@ impl<'p> Vm<'p> {
             if let HeapObj::RegExp { last_index, .. } = self.heap.get_mut(re_idx) {
                 *last_index = v;
             }
+            self.heap.write_barrier_val(re_idx, v);
             Ok(())
         } else {
             self.set_prop(Value::heap(re_idx), "lastIndex", v, true)?;

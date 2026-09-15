@@ -1925,7 +1925,9 @@ impl<'p> Vm<'p> {
                     self.proto_of.insert(o.heap_index(), a0);
                 }
                 if a1 != Value::UNDEFINED {
-                    self.object_define_properties(o, a1)?;
+                    // `o` is reachable from nothing but this local while the
+                    // descriptor getters run guest code: root it.
+                    self.with_host_roots(&[o], |vm| vm.object_define_properties(o, a1))?;
                 }
                 o
             }

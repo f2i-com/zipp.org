@@ -38,6 +38,12 @@ fn lexically_confined(root: &std::path::Path, raw_path: &std::path::Path) -> boo
     lexical_module_path(raw_path).is_some_and(|path| path.starts_with(root))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Loader canonicalize syscalls made on this thread (tests only).
+    static CANONICALIZE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn canonical_module_path(
     root: Option<&std::path::Path>,
     raw_path: &std::path::Path,
@@ -50,6 +56,8 @@ fn canonical_module_path(
             return Err(Thrown(MODULE_NOT_FOUND.into()));
         }
     }
+    #[cfg(test)]
+    CANONICALIZE_CALLS.with(|c| c.set(c.get() + 1));
     let path = std::fs::canonicalize(raw_path).map_err(|_| Thrown(MODULE_NOT_FOUND.into()))?;
     if root.is_some_and(|root| !path.starts_with(root)) {
         return Err(Thrown(MODULE_NOT_FOUND.into()));
@@ -1436,6 +1444,10 @@ impl<'p> Vm<'p> {
                 if let HeapObj::Object(slot) = self.heap.get_mut(idx) {
                     *slot = m;
                 }
+                // The deferred namespace was created at link time and is
+                // usually old by now: barrier the young tag (and any young
+                // snapshot value) the replaced map carries.
+                self.heap.write_barrier(idx);
                 // Whole-map replacement: invalidate any JIT inline cache that
                 // captured the old vals pointer.
                 self.heap.bump_version(idx);
@@ -1447,6 +1459,11 @@ impl<'p> Vm<'p> {
     /// compiles to an activation containing Await ops). Used by import.defer:
     /// the proposal evaluates a deferred graph's ASYNC modules eagerly.
     pub(crate) fn module_has_tla(&mut self, path: &std::path::Path) -> bool {
+        // Canonical keys: probe before the canonicalize syscall (see
+        // `module_requests`).
+        if let Some(&tla) = self.module_tla_cache.get(path) {
+            return tla;
+        }
         let Ok(path) = self.resolve_module_path(path) else {
             return false;
         };
@@ -1554,6 +1571,12 @@ impl<'p> Vm<'p> {
         &mut self,
         path: &std::path::PathBuf,
     ) -> Result<std::sync::Arc<Vec<(std::path::PathBuf, ModuleRequestPhase)>>, Thrown> {
+        // The graph walks pass the canonical paths this cache is keyed by, so
+        // probe it before canonicalizing: a hit skips a filesystem syscall per
+        // visited node (the deferred-import walks revisit whole graphs).
+        if let Some(cached) = self.module_requests_cache.get(path) {
+            return Ok(cached.clone());
+        }
         let path = self.resolve_module_path(path)?;
         if let Some(cached) = self.module_requests_cache.get(&path) {
             return Ok(cached.clone());
@@ -2188,6 +2211,43 @@ mod confined_budget_tests {
             assert_eq!(
                 vm.module_load_depth, 0,
                 "error path must unwind the counter"
+            );
+        });
+    }
+
+    #[test]
+    fn deferred_import_walks_hit_the_canonical_caches_before_canonicalizing() {
+        // Every deferred import re-walks the shared unevaluated graph; those
+        // revisits pass canonical paths, so they must be cache probes rather
+        // than a canonicalize syscall per visited node (K x G syscalls).
+        const K: usize = 20;
+        const G: usize = 20;
+        with_confined_vm(|vm, root| {
+            vm.run().expect("initialize host realm");
+            let mut entry_src = String::new();
+            for k in 0..K {
+                entry_src.push_str(&format!("import defer * as n{k} from './a{k}.mjs';\n"));
+                std::fs::write(root.join(format!("a{k}.mjs")), "import './c0.mjs';")
+                    .expect("write deferred fixture");
+            }
+            for g in 0..G {
+                let source = if g + 1 == G {
+                    String::new()
+                } else {
+                    format!("import './c{}.mjs';", g + 1)
+                };
+                std::fs::write(root.join(format!("c{g}.mjs")), source)
+                    .expect("write chain fixture");
+            }
+            std::fs::write(root.join("entry.mjs"), entry_src).expect("write entry");
+            let entry = std::fs::canonicalize(root.join("entry.mjs")).expect("canonical entry");
+            let before = CANONICALIZE_CALLS.with(|c| c.get());
+            vm.import_module(&entry, None)
+                .expect("deferred graph links");
+            let calls = CANONICALIZE_CALLS.with(|c| c.get()) - before;
+            assert!(
+                calls > 0 && calls < 8 * (K + G),
+                "{calls} canonicalize calls for {K} deferred imports over a {G}-module graph"
             );
         });
     }

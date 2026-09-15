@@ -1301,6 +1301,32 @@ impl<'p> Vm<'p> {
         ),
         Thrown,
     > {
+        // Every field read may run a guest getter, and the `value`/`get`/`set`
+        // already read are Rust locals by then (a getter may return a fresh
+        // object): keep them — and `desc` — rooted until the read finishes.
+        let base = self.host_result_roots.len();
+        if desc.is_heap() {
+            self.host_result_roots.push(desc);
+        }
+        let r = self.read_descriptor_fields(desc);
+        self.host_result_roots.truncate(base);
+        r
+    }
+
+    fn read_descriptor_fields(
+        &mut self,
+        desc: Value,
+    ) -> Result<
+        (
+            Option<Value>,
+            Option<Value>,
+            Option<Value>,
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
+        ),
+        Thrown,
+    > {
         // ToPropertyDescriptor only requires Type(Obj) is Object — a Function (or
         // any other object) carrying value/get/set/... own props is a valid
         // descriptor, so accept any object, not just a plain HeapObj::Object.
@@ -1338,7 +1364,11 @@ impl<'p> Vm<'p> {
             None
         };
         let value = if self.has_property_str_dyn(desc, "value")? {
-            Some(self.get_prop(desc, "value")?)
+            let v = self.get_prop(desc, "value")?;
+            if v.is_heap() {
+                self.host_result_roots.push(v);
+            }
+            Some(v)
         } else {
             None
         };
@@ -1354,6 +1384,9 @@ impl<'p> Vm<'p> {
             let g = self.get_prop(desc, "get")?;
             if g != Value::UNDEFINED && !self.is_callable(g) {
                 return Err(Thrown("TypeError: Getter must be a function".into()));
+            }
+            if g.is_heap() {
+                self.host_result_roots.push(g);
             }
             Some(g)
         } else {

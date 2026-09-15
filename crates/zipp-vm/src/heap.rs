@@ -91,8 +91,37 @@ pub(crate) fn prop_tag_of(key: &str) -> u32 {
     prop_tag(key)
 }
 
+/// A per-process random key folded into the ordinary profile's table hashes
+/// (this property tag and the Map/Set index's string hash and tag). The
+/// FNV-1a/splitmix construction is public, so without a key one collision
+/// family computed offline (keys sharing the low tag bits) degrades every VM's
+/// object, Map and Set indexes to linear probing. Tags are process-local
+/// acceleration — never serialized, and every hit is confirmed against the
+/// real key — so a fresh key per process changes no observable behaviour.
+#[inline]
+pub(crate) fn hash_seed() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEED: AtomicU64 = AtomicU64::new(0);
+    #[cold]
+    fn init(seed: &AtomicU64) -> u64 {
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(0x7a69_7070_5eed);
+        // Never 0, which marks "not yet drawn".
+        let v = h.finish() | 1;
+        match seed.compare_exchange(0, v, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => v,
+            Err(drawn) => drawn,
+        }
+    }
+    match SEED.load(Ordering::Relaxed) {
+        0 => init(&SEED),
+        s => s,
+    }
+}
+
 fn prop_tag(key: &str) -> u32 {
-    let mut h: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut h: u64 = 0xCBF2_9CE4_8422_2325 ^ hash_seed();
     for &b in key.as_bytes() {
         h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01B3);
     }

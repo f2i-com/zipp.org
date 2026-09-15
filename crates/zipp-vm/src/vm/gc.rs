@@ -376,6 +376,9 @@ impl Vm<'_> {
         if let Some(v) = self.pending_throw {
             root_val!(v);
         }
+        if let Some(v) = self.uncaught_timer_throw {
+            root_val!(v);
+        }
         for (v, _) in self.module_body_promise.values() {
             root_val!(*v);
         }
@@ -611,11 +614,6 @@ impl Vm<'_> {
             }
             if let Some(e) = st.error_chain {
                 root_val!(e);
-            }
-        }
-        for disposers in self.using_resources.values() {
-            for &v in disposers {
-                root_val!(v);
             }
         }
         for m in self.fn_props.values().chain(self.arr_props.values()) {
@@ -931,8 +929,11 @@ impl Vm<'_> {
     /// young referents. Root-like VM side tables are re-scanned by the shared
     /// `mark_roots`; keyed directed edges such as `closure_home` are traced
     /// from their reachable holder instead. Cost is O(roots + young live +
-    /// dirty edge lists), independent of the old heap — the term the stage-1
-    /// full mark
+    /// dirty edge lists + entries of every registered weak container),
+    /// otherwise independent of the old heap — the ephemeron fixpoint and the
+    /// weak sweep still visit each live WeakMap/WeakSet/FinalizationRegistry
+    /// in full, so a large long-lived WeakMap is paid for at every minor. The
+    /// term the stage-1 full mark
     /// still paid on every minor (B120's refutation), and the whole
     /// economics flip of stage 3: regex-log-scan's ~128ms/run of 95.8%-old
     /// trace work simply stops happening at minors.
@@ -1505,7 +1506,6 @@ impl Vm<'_> {
             | HeapObj::Func(_)
             | HeapObj::Native(_)
             | HeapObj::Date(_)
-            | HeapObj::RegExp { .. }
             | HeapObj::ArrayBuffer { .. }
             | HeapObj::Temporal { .. }
             // A BigInt (either representation) holds no heap references.
@@ -1544,6 +1544,9 @@ impl Vm<'_> {
                 }
             }
             HeapObj::Wrapped { target, .. } => m_val!(*target),
+            // `lastIndex` keeps the assigned Value as-is until exec applies
+            // ToLength, so an object (a `valueOf` carrier) or string lives here.
+            HeapObj::RegExp { last_index, .. } => m_val!(*last_index),
             HeapObj::Array(items) => {
                 for &v in items {
                     m_val!(v);

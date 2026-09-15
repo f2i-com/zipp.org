@@ -1471,7 +1471,31 @@ impl<'p> Vm<'p> {
                 },
             );
         }
+        // A `cause` getter that ran before this may have let a minor promote
+        // the error; the fresh array is then an old->young store.
+        self.heap.write_barrier_val(err.heap_index(), arr);
         Ok(())
+    }
+
+    /// InstallErrorCause's define: the non-enumerable, writable, configurable
+    /// own `cause`. Callers root `err` across the guest `has`/getter that
+    /// produced `cause`; a collection there may have promoted it, so the store
+    /// is barriered.
+    pub(crate) fn install_error_cause(&mut self, err: Value, cause: Value) {
+        if let HeapObj::Object(m) = self.heap.get_mut(err.heap_index()) {
+            m.define(
+                "cause",
+                cause,
+                PropAttr {
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                    accessor: false,
+                    setter: Value::UNDEFINED,
+                },
+            );
+        }
+        self.heap.write_barrier_val(err.heap_index(), cause);
     }
 
     /// Build the `arguments` object for a (non-arrow) function activation. The

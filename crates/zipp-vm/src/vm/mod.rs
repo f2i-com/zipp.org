@@ -2336,14 +2336,6 @@ pub struct Vm<'p> {
     disposablestack_ctor: u32,
     disposablestack_proto: u32,
     dispose_stacks: std::collections::HashMap<u32, (Vec<Value>, bool)>,
-    /// Per-block `using`-declaration resource scopes, keyed by a monotonic id
-    /// (`using_next_id`) that the `OpenUsingScope` op hands back in a register.
-    /// Each value is the scope's list of disposers (a @@dispose method bound to its
-    /// resource value), pushed by `RegisterDisposable` and drained LIFO by
-    /// `DisposeScope` on block exit. The disposers are GC roots (see gc.rs); the
-    /// entry is removed when its `DisposeScope` runs.
-    using_resources: std::collections::HashMap<u32, Vec<Value>>,
-    using_next_id: u32,
     /// `AsyncDisposableStack` ctor + prototype, and the set of dispose-stack
     /// instances that are ASYNC (their `use` prefers @@asyncDispose and their
     /// disposal goes through `disposeAsync`, which returns a Promise).
@@ -2651,6 +2643,10 @@ pub struct Vm<'p> {
     /// getters and queued jobs run (ZA-05 and the 12 September input-root
     /// regression). Nested entries preserve their caller's stack prefix.
     host_result_roots: Vec<Value>,
+    /// The first exception a `setTimeout` callback let escape. It ends the
+    /// event loop and becomes the program's error when the main job itself
+    /// completed normally (Node's uncaught-exception exit). Rooted.
+    uncaught_timer_throw: Option<Value>,
 }
 
 /// B191 memo widths (hot names; anything else takes the full per-call proof).

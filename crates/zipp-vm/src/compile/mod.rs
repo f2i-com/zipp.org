@@ -692,7 +692,7 @@ struct FnCompiler<'a> {
     /// to `JumpFinally` instead of `Jump`. Maintained across try/catch/finally
     /// regions (see `try_with_finally` / `try_catch_only`).
     handler_depth: usize,
-    /// Register holding the runtime resource-scope id of the innermost enclosing
+    /// Register holding the runtime resource-scope list of the innermost enclosing
     /// `using` block currently being compiled (set by `compile_using_block`), so a
     /// `using` declaration's `RegisterDisposable` knows which scope to push onto.
     /// `None` outside any `using` block; saved/restored across block nesting.

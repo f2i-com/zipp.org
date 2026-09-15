@@ -520,7 +520,7 @@ impl<'a> FnCompiler<'a> {
     /// Compile a statement list that contains `using` declarations: desugar it onto
     /// the existing `PushFinally`/`EndFinally` machinery so the registered resources
     /// are disposed (LIFO, SuppressedError-chained) on EVERY exit — normal, throw,
-    /// break, continue, return. A fresh runtime resource-scope id lives in
+    /// break, continue, return. A fresh runtime resource scope (an internal list object) lives in
     /// `scope_reg` and becomes `using_scope_reg` for the body, so each `using`'s
     /// `RegisterDisposable` pushes onto it. (Sync `using` only this iteration;
     /// `await using` still binds like `let` but is not yet disposed.)
@@ -1132,7 +1132,7 @@ impl<'a> FnCompiler<'a> {
         // `for (using x of it)` / `for (await using x of it)`: each iteration
         // disposes the loop variable's resource at the end of the iteration (a
         // per-iteration disposal scope). Allocate the scope/completion registers
-        // once (stable across iterations); OpenUsingScope writes a fresh scope id
+        // once (stable across iterations); OpenUsingScope writes a fresh scope list
         // each turn. Only a simple-identifier head is a using declaration.
         let using_async: Option<bool> = match left {
             ast::ForTarget::Var(d) => match d.kind {

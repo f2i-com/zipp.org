@@ -225,54 +225,60 @@ impl<'p> Vm<'p> {
         // `Reflect.construct(RangeError, [msg])`). Mirrors the compile-lowered
         // `new TypeError(msg)` path. AggregateError takes the message as arg[1].
         if let Some(k) = self.error_ctors.iter().position(|&c| c == cv.heap_index()) {
-            let over = self.newtarget_proto_override(new_target, cv, self.error_protos[k])?;
-            // AggregateError (k==7) takes its message as arg[1] and coerces it with a
-            // real ToString (observable / abrupt) before iterating arg[0] into `errors`.
-            let e = if k == 7 {
-                let msg = match args.get(1).copied() {
-                    Some(m) if m != Value::UNDEFINED => Some(self.to_str_value(m)?),
-                    _ => None,
-                };
-                let e = self.make_error(7, msg);
-                let errors_arg = args.first().copied().unwrap_or(Value::UNDEFINED);
-                self.install_agg_errors(e, errors_arg)?;
-                e
-            } else {
-                // Coerce `message` with a real ToString FIRST (observable / abrupt):
-                // a Symbol message throws TypeError, and a throwing toString /
-                // @@toPrimitive propagates — before the error object is allocated.
-                let msg = match args.first().copied() {
-                    Some(m) if m != Value::UNDEFINED => Some(self.to_str_value(m)?),
-                    _ => None,
-                };
-                self.make_error(k as u8, msg)
-            };
-            // InstallErrorCause: options (arg 1; arg 2 for AggregateError) with
-            // a `cause` (HasProperty: proto chain + has trap, observable) adds
-            // a non-enumerable own `cause` data property.
-            let options = args
-                .get(if k == 7 { 2 } else { 1 })
-                .copied()
-                .unwrap_or(Value::UNDEFINED);
-            if self.is_object_value(options) {
-                let kc = self.alloc_str("cause".to_string());
-                if self.has_property_dyn(options, kc)? {
-                    let cause = self.get_prop(options, "cause")?;
-                    if let HeapObj::Object(m) = self.heap.get_mut(e.heap_index()) {
-                        m.define(
-                            "cause",
-                            cause,
-                            PropAttr {
-                                writable: true,
-                                enumerable: false,
-                                configurable: true,
-                                accessor: false,
-                                setter: Value::UNDEFINED,
-                            },
-                        );
+            // The arguments may be a Rust copy of a Reflect.construct list and
+            // `over` a prototype a newTarget getter just produced; the error
+            // itself is a Rust local until returned. The prototype getter, the
+            // message ToString, the errors iteration, and the `has` trap /
+            // `cause` getter all run guest code that can collect, so keep every
+            // one of them rooted.
+            let (e, over) = self.with_host_roots(args, |vm| {
+                let over = vm.newtarget_proto_override(new_target, cv, vm.error_protos[k])?;
+                let over_root = over.unwrap_or(Value::UNDEFINED);
+                let e = vm.with_host_roots(&[over_root], |vm| -> Result<Value, Thrown> {
+                    // AggregateError (k==7) takes its message as arg[1] and coerces it
+                    // with a real ToString (observable / abrupt) before iterating
+                    // arg[0] into `errors`.
+                    let e = if k == 7 {
+                        let msg = match args.get(1).copied() {
+                            Some(m) if m != Value::UNDEFINED => Some(vm.to_str_value(m)?),
+                            _ => None,
+                        };
+                        let e = vm.make_error(7, msg);
+                        let errors_arg = args.first().copied().unwrap_or(Value::UNDEFINED);
+                        vm.with_host_roots(&[e], |vm| vm.install_agg_errors(e, errors_arg))?;
+                        e
+                    } else {
+                        // Coerce `message` with a real ToString FIRST (observable /
+                        // abrupt): a Symbol message throws TypeError, and a throwing
+                        // toString / @@toPrimitive propagates — before the error
+                        // object is allocated.
+                        let msg = match args.first().copied() {
+                            Some(m) if m != Value::UNDEFINED => Some(vm.to_str_value(m)?),
+                            _ => None,
+                        };
+                        vm.make_error(k as u8, msg)
+                    };
+                    // InstallErrorCause: options (arg 1; arg 2 for AggregateError)
+                    // with a `cause` (HasProperty: proto chain + has trap,
+                    // observable) adds a non-enumerable own `cause` data property.
+                    let options = args
+                        .get(if k == 7 { 2 } else { 1 })
+                        .copied()
+                        .unwrap_or(Value::UNDEFINED);
+                    if vm.is_object_value(options) {
+                        let kc = vm.alloc_str("cause".to_string());
+                        vm.with_host_roots(&[e, kc], |vm| -> Result<(), Thrown> {
+                            if vm.has_property_dyn(options, kc)? {
+                                let cause = vm.get_prop(options, "cause")?;
+                                vm.install_error_cause(e, cause);
+                            }
+                            Ok(())
+                        })?;
                     }
-                }
-            }
+                    Ok(e)
+                })?;
+                Ok::<_, Thrown>((e, over))
+            })?;
             return Ok(self.set_ctor_proto(e, over));
         }
         // ArrayBuffer / DataView / TypedArray constructors used as values.

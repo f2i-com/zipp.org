@@ -401,9 +401,14 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<Value>, Thrown> {
         // The drained disposer list and the running `completion` are Rust locals
         // (not in a register / map), so a GC during a disposer call could sweep
-        // them — suspend GC for the loop (the established hold-Values-across-a-
-        // callback pattern).
-        let _gc = self.gc_lock_guard();
+        // them. Root them (B214's rule) rather than suspending collection for
+        // the whole loop: a disposer is guest code and may allocate freely.
+        let base = self.host_result_roots.len();
+        self.host_result_roots.extend(disposers.iter().copied());
+        let completion_slot = self.host_result_roots.len();
+        self.host_result_roots
+            .push(completion.unwrap_or(Value::UNDEFINED));
+        let mut out = Ok(());
         for d in disposers.into_iter().rev() {
             if self.call_value(d, Value::UNDEFINED, &[]).is_err() {
                 // Thrown carries only a message; recapture the REAL thrown Value.
@@ -412,12 +417,43 @@ impl<'p> Vm<'p> {
                     .take()
                     .unwrap_or_else(|| self.make_error(1, None));
                 completion = Some(match completion {
-                    Some(prior) => self.build_suppressed_error(&[ev, prior, Value::UNDEFINED])?,
+                    Some(prior) => {
+                        match self.build_suppressed_error(&[ev, prior, Value::UNDEFINED]) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                out = Err(e);
+                                break;
+                            }
+                        }
+                    }
                     None => ev,
                 });
+                self.host_result_roots[completion_slot] = completion.unwrap_or(Value::UNDEFINED);
             }
         }
-        Ok(completion)
+        self.host_result_roots.truncate(base);
+        out.map(|()| completion)
+    }
+
+    /// The disposer list of a `using` scope: the internal Array that
+    /// `OpenUsingScope` put in the scope register.
+    pub(crate) fn using_scope_list(&mut self, scope: Value) -> Option<&mut Vec<Value>> {
+        if !scope.is_heap() {
+            return None;
+        }
+        match self.heap.get_mut(scope.heap_index()) {
+            HeapObj::Array(list) => Some(list),
+            _ => None,
+        }
+    }
+
+    /// Append a disposer (or an inert `undefined`) to a `using` scope's list.
+    /// The list is usually old by the time a later declaration registers.
+    pub(crate) fn using_scope_push(&mut self, scope: Value, disposer: Value) {
+        if let Some(list) = self.using_scope_list(scope) {
+            list.push(disposer);
+            self.heap.write_barrier_val(scope.heap_index(), disposer);
+        }
     }
 
     /// Allocate a promise rejected with a fresh TypeError — the async-method
@@ -731,6 +767,11 @@ impl<'p> Vm<'p> {
         if let HeapObj::Object(slot) = self.heap.get_mut(idx) {
             *slot = Box::new(m);
         }
+        // The namespace was allocated before the module body ran, so a minor
+        // during the body may already have promoted it: the fresh tag string
+        // and any young snapshot value are old->young edges no store barrier
+        // saw. Dirty the holder so the next minor re-traces the new map.
+        self.heap.write_barrier(idx);
         // The whole map (and its vals Vec) was replaced: invalidate any JIT
         // inline cache that captured the old vals pointer.
         self.heap.bump_version(idx);
@@ -835,7 +876,9 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 let disposer = if sync_fallback {
-                    let shim = self.sync_dispose_shim()?;
+                    // The first use compiles the shim by running an eval, and
+                    // `method` may be a getter's fresh function held only here.
+                    let shim = self.with_host_roots(&[method], Self::sync_dispose_shim)?;
                     Value::heap(self.heap.alloc(HeapObj::Bound {
                         target: shim,
                         this: method,
