@@ -3668,8 +3668,7 @@ impl<'p> Vm<'p> {
                                 {
                                     // `String(symbol)` is allowed (unlike ToString,
                                     // which throws) and yields "Symbol(desc)".
-                                    let s = self.symbol_descriptive_string(a0)?;
-                                    self.alloc_str(s)
+                                    self.symbol_descriptive_value(a0)?
                                 } else {
                                     // Proper ToString: routes objects/functions
                                     // through their `toString` (so a function yields
@@ -8617,7 +8616,9 @@ impl<'p> Vm<'p> {
                             continue;
                         }
                         let len = match self.heap.get(it.heap_index()) {
-                            HeapObj::Array(items) => items.len(),
+                            // The JS length: past the dense store for a
+                            // virtual array (the fast path above declined it).
+                            HeapObj::Array(_) => self.js_array_len(it.heap_index()),
                             HeapObj::Set(items) => items.len(),
                             HeapObj::Str(s) => s.units(),
                             HeapObj::Cons { len, .. } => *len,
@@ -8643,10 +8644,12 @@ impl<'p> Vm<'p> {
                             }
                         };
                         if cursor < len {
-                            let val = self.get_index(it, Value::int(cursor as i32))?;
+                            // `len_value`, not `Value::int`: a virtual array's
+                            // cursor can pass 2^31.
+                            let val = self.get_index(it, len_value(cursor))?;
                             self.set(base, value_dst, val);
                             self.set(base, done_dst, Value::bool(false));
-                            self.set(base, idx, Value::int((cursor + 1) as i32));
+                            self.set(base, idx, len_value(cursor + 1));
                         } else {
                             self.set(base, done_dst, Value::bool(true));
                         }

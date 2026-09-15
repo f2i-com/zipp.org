@@ -443,7 +443,7 @@
             if (Array.isArray(js)) { if (!js.length) return "[]"; if (indent === null) return "[" + js.map((x) => render(x, indent, level, sep, kv, sortKeys)).join(sep) + "]"; const pad = "\n" + " ".repeat(indent * (level + 1)); return "[" + pad + js.map((x) => render(x, indent, level + 1, sep, kv, sortKeys)).join("," + pad) + "\n" + " ".repeat(indent * level) + "]"; }
             if (js.__big !== undefined) return js.__big;
             if (js.__special !== undefined) return js.__special;
-            const keys = Object.keys(js); if (sortKeys) keys.sort();
+            const keys = Object.keys(js); if (sortKeys) keys.sort(rt.compareStrings);
             if (!keys.length) return "{}";
             const items = keys.map((k) => render(k, indent, level, sep, kv, sortKeys) + kv + render(js[k], indent, level + 1, sep, kv, sortKeys));
             if (indent === null) return "{" + items.join(sep) + "}";

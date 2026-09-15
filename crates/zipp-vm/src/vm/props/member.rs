@@ -1377,13 +1377,13 @@ impl<'p> Vm<'p> {
                     } else {
                         self.arraybuffer_proto
                     };
-                    let proto = self
-                        .proto_of
-                        .get(&ai)
-                        .copied()
-                        .filter(|p| p.is_heap())
-                        .map(|p| p.heap_index())
-                        .unwrap_or(default);
+                    // A NULL entry (`Object.setPrototypeOf(buf, null)`) means no
+                    // prototype: nothing is inherited, `buf.slice` included.
+                    let proto = match self.proto_of.get(&ai).copied() {
+                        Some(p) if p.is_heap() => p.heap_index(),
+                        Some(_) => return Ok(Value::UNDEFINED),
+                        None => default,
+                    };
                     // Accessor-aware (mirrors the TypedArray arm): an inherited
                     // getter like Object.prototype.__proto__ is INVOKED with the
                     // buffer as receiver, not returned as a raw function value.

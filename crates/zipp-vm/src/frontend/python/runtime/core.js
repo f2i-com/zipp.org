@@ -666,7 +666,7 @@ var __zipp_py = (function () {
                 if (f !== null && typeof f === "object" && f.isabstract) abstract.push(k);
             }
         }
-        return abstract.sort();
+        return abstract.sort(rt.compareStrings);
     }
     function constructDefault(cls, args, kwargs) {
         if (cls === TypeType) {
@@ -1170,7 +1170,7 @@ var __zipp_py = (function () {
             const n = vfsNorm(p), prefix = n === "" ? "" : n + "/", out = new Set();
             for (const k of vfs.keys()) if (k.startsWith(prefix)) { const rest = k.slice(prefix.length); const i = rest.indexOf("/"); out.add(i < 0 ? rest : rest.slice(0, i)); }
             for (const d of dirs) if (d.startsWith(prefix) && d !== n) { const rest = d.slice(prefix.length); const i = rest.indexOf("/"); out.add(i < 0 ? rest : rest.slice(0, i)); }
-            return Array.from(out).sort();
+            return Array.from(out).sort(rt.compareStrings);
         },
         mkdir: (p) => { dirs.add(vfsNorm(p)); },
         changed: () => { const out = Array.from(vfsChanged); vfsChanged.clear(); return out; },

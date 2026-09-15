@@ -220,18 +220,35 @@ impl TiercActivationState {
     };
 }
 
-/// Largest length zipp will EAGERLY materialize for a dense array (`Vec<Value>`).
-/// The spec allows up to 2^32-1, but a dense Vec of that many `Value`s would be
-/// 32 GB; real engines store such arrays sparsely. Until zipp has sparse arrays,
-/// a `new Array(n)` / `arr.length = n` / defineProperty('length') / large-index
-/// assignment / array-like materialization beyond this cap throws a RangeError
-/// instead of OOMing the host. 2^22 elements ≈ 32 MB per array — far larger than
-/// any realistic program needs, while keeping a 12-way-parallel test262 run (each
-/// process possibly building several arrays) comfortably bounded.
+/// Largest length a HOLE-extending operation materializes in an array's dense
+/// store (`Vec<Value>`). The spec allows lengths up to 2^32-1, and a dense Vec
+/// that long would be 32 GB, so past this cap `new Array(n)`, `arr.length = n`
+/// and a large-index write do not grow the Vec: the array becomes VIRTUAL — its
+/// JS length lives in the `array_js_len` side table and any element past the
+/// dense prefix in the `arr_props` sparse overlay. Nothing throws there. Every
+/// builtin sizes its work from `js_array_len`, never from the Vec: a virtual
+/// array takes the generic per-index Get/HasProperty protocol, and an operation
+/// that has to build a dense result from one (spread, `slice`, `Array.from`,
+/// `with`, `fill` materializing the store) may do so up to
+/// [`MAX_MATERIALIZED_ARRAY_LEN`] and throws a RangeError beyond it — it never
+/// truncates. Arrays grown element by element (`push`) are not capped.
 #[cfg(feature = "safe-sandbox")]
 pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 22;
 #[cfg(not(feature = "safe-sandbox"))]
 pub const MAX_DENSE_ARRAY_LEN: usize = 1 << 20;
+
+/// Largest dense array one native operation builds from a LENGTH rather than
+/// from elements that already exist: materializing a virtual array (see
+/// [`MAX_DENSE_ARRAY_LEN`]), draining an iterator eagerly, or copying an
+/// array-like by its `length`. Beyond it the operation throws a RangeError
+/// instead of attempting a multi-gigabyte allocation (`panic = "abort"` makes
+/// an allocation failure fatal). It is never below the dense cap, so any array
+/// the engine stores densely can still be copied.
+pub const MAX_MATERIALIZED_ARRAY_LEN: usize = if MAX_EAGER_ITER_RESULT > MAX_DENSE_ARRAY_LEN {
+    MAX_EAGER_ITER_RESULT
+} else {
+    MAX_DENSE_ARRAY_LEN
+};
 
 /// Maximum materialized string size. The hardened profile keeps a single
 /// allocation small enough that the periodic heap poll cannot overshoot a

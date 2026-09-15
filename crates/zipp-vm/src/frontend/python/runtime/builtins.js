@@ -60,7 +60,7 @@
         if (v !== null && typeof v === "object" && v.dict) for (const k of v.dict.keys()) names.add(k);
         if (v !== null && typeof v === "object" && v.isType) for (const c of v.mro) for (const k of c.dict.keys()) names.add(k);
         if (v !== null && typeof v === "object" && v.cls === T.module) for (const k of v.globals.keys()) names.add(k);
-        return Array.from(names).sort();
+        return Array.from(names).sort(rt.compareStrings);
     }
     // Exceptions: BaseException.__init__ stores args.
     method(E.BaseException, "__init__", -1, function (args) {

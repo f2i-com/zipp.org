@@ -241,17 +241,18 @@ impl<'p> Vm<'p> {
         let a0 = args.first().copied().unwrap_or(Value::UNDEFINED);
         if let Some(p) = proto {
             if p == self.str_proto && self.str_proto != 0 {
-                let s = if args.is_empty() {
-                    String::new()
+                return if args.is_empty() {
+                    Ok(self.alloc_str(String::new()))
                 } else if a0.is_heap()
                     && matches!(self.heap.get(a0.heap_index()), HeapObj::Symbol { .. })
                 {
                     // String(symbol) yields its "Symbol(desc)" text, not a TypeError.
-                    self.symbol_descriptive_string(a0)?
+                    self.symbol_descriptive_value(a0)
                 } else {
-                    self.to_js_string(a0)?
+                    // The string VALUE, as the direct `String(x)` form gives it:
+                    // `['\uD800'].map(String)` keeps the surrogate.
+                    self.to_str_value(a0)
                 };
-                return Ok(self.alloc_str(s));
             }
             if p == self.num_proto && self.num_proto != 0 {
                 let n = if args.is_empty() {
@@ -1249,6 +1250,21 @@ impl<'p> Vm<'p> {
     /// The scan is the whole cost in the common case: a dense array (no hole
     /// anywhere) clones and returns, exactly as before.
     pub(crate) fn spread_array_elements(&mut self, arr_idx: u32) -> Result<Vec<Value>, Thrown> {
+        // A VIRTUAL array's store is only a prefix of it: iterate its JS
+        // length, each index by Get (an overlay element, a hole's inherited
+        // value, or `undefined`). Cloning the store spread `new Array(2e6)` as
+        // an empty array.
+        if self.array_is_virtual(arr_idx) {
+            let len = self.js_array_len(arr_idx);
+            self.preflight_materialized_array(len)?;
+            let _gc = self.gc_lock_guard();
+            let arr = Value::heap(arr_idx);
+            let mut out = Vec::with_capacity(len.min(4096));
+            for i in 0..len {
+                out.push(self.get_index(arr, Value::num(i as f64))?);
+            }
+            return Ok(out);
+        }
         let items = match self.heap.get(arr_idx) {
             HeapObj::Array(items) => items.clone(),
             _ => return Ok(Vec::new()),
@@ -1264,8 +1280,7 @@ impl<'p> Vm<'p> {
         let mut out = Vec::with_capacity(items.len());
         for (i, x) in items.iter().enumerate() {
             out.push(if x.is_hole() {
-                // `i` is bounded by MAX_DENSE_ARRAY_LEN (2^20), so it fits an i32.
-                self.get_index(arr, Value::int(i as i32))?
+                self.get_index(arr, Value::num(i as f64))?
             } else {
                 *x
             });
@@ -1273,11 +1288,80 @@ impl<'p> Vm<'p> {
         Ok(out)
     }
 
+    /// Drain an iterator with collection RUNNING: the values collected so far
+    /// live in a rooted internal accumulator array, the iterator and its
+    /// `next` in root slots, and each step's result object in a scratch slot
+    /// while its `done` and `value` are read (either may be a getter). Holding
+    /// the GC lock for the drain instead kept every step's result object alive
+    /// until the drain ended — gigabytes for a drain near the materialization
+    /// cap. `next` is `None` for a generator, which is resumed directly.
+    fn drain_iterator_rooted(&mut self, iter: Value, next: Option<Value>) -> Result<Vec<Value>, Thrown> {
+        let acc = self.heap.alloc(HeapObj::Array(Vec::new()));
+        let base = self.host_result_roots.len();
+        self.host_result_roots.extend_from_slice(&[
+            iter,
+            next.unwrap_or(Value::UNDEFINED),
+            Value::heap(acc),
+            Value::UNDEFINED,
+        ]);
+        let r = self.drain_iterator_steps(iter, next, acc, base + 3);
+        let out = match self.heap.get_mut(acc) {
+            HeapObj::Array(items) => std::mem::take(items),
+            _ => Vec::new(),
+        };
+        self.host_result_roots.truncate(base);
+        r.map(|()| out)
+    }
+
+    fn drain_iterator_steps(
+        &mut self,
+        iter: Value,
+        next: Option<Value>,
+        acc: u32,
+        scratch: usize,
+    ) -> Result<(), Thrown> {
+        let mut n = 0usize;
+        loop {
+            let res = match next {
+                Some(f) => {
+                    let res = self.call_value(f, iter, &[])?;
+                    // IteratorNext step 3: a non-object result is a TypeError.
+                    if !self.is_object_value(res) {
+                        return Err(Thrown(
+                            "TypeError: iterator.next() returned a non-object".into(),
+                        ));
+                    }
+                    res
+                }
+                None => self
+                    .generator_method(iter.heap_index(), "next", &[])?
+                    .unwrap_or(Value::UNDEFINED),
+            };
+            self.host_result_roots[scratch] = res;
+            let done = self.get_prop(res, "done")?;
+            if self.truthy(done) {
+                return Ok(());
+            }
+            let value = self.get_prop(res, "value")?;
+            if let HeapObj::Array(items) = self.heap.get_mut(acc) {
+                items.push(value);
+            }
+            self.heap.write_barrier_val(acc, value);
+            n += 1;
+            if n > crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
+                return Err(Thrown(
+                    "RangeError: iterator produced more values than the engine's limit".into(),
+                ));
+            }
+            self.instrument_drain_heap_check(n)?;
+        }
+    }
+
     pub(crate) fn iterate_to_vec(&mut self, v: Value) -> Result<Vec<Value>, Thrown> {
-        // The accumulating result Vec holds values yielded by `.next()` that are
-        // not yet reachable from the GC roots, while `.next()` (user code) keeps
-        // re-entering the interpreter — suspend GC for the scope.
-        let _gc = self.gc_lock_guard();
+        // The positional plans below hold values in Rust Vecs that are not GC
+        // roots — suspend GC for them. The two `next()` drains release the
+        // lock and root their working set instead (`drain_iterator_rooted`).
+        let gc = self.gc_lock_guard();
         // A TypedArray iterates positionally over its elements.
         if let Some(ta) = self.as_typed_array(v) {
             let n = match self.heap.get(ta) {
@@ -1291,25 +1375,8 @@ impl<'p> Vm<'p> {
         // A generator is drained eagerly via repeated next() (spread / Array.from
         // produce a buffer; an infinite generator hangs here, matching V8).
         if v.is_heap() && matches!(self.heap.get(v.heap_index()), HeapObj::Generator { .. }) {
-            let gidx = v.heap_index();
-            let mut out = Vec::new();
-            loop {
-                let res = self
-                    .generator_method(gidx, "next", &[])?
-                    .unwrap_or(Value::UNDEFINED);
-                let done = self.get_prop(res, "done")?;
-                if self.truthy(done) {
-                    break;
-                }
-                out.push(self.get_prop(res, "value")?);
-                if out.len() > crate::vm::MAX_DENSE_ARRAY_LEN {
-                    return Err(Thrown(
-                        "RangeError: iterator produced more values than the engine's limit".into(),
-                    ));
-                }
-                self.instrument_drain_heap_check(out.len())?;
-            }
-            return Ok(out);
+            drop(gc);
+            return self.drain_iterator_rooted(v, None);
         }
         // A user iterator object (one with a `next()` method) or a built-in
         // Iterator: drain it. `HeapObj::Intl` is in the list for
@@ -1329,29 +1396,8 @@ impl<'p> Vm<'p> {
         {
             let next = self.get_prop(v, "next")?;
             if self.is_callable(next) {
-                let mut out = Vec::new();
-                loop {
-                    let res = self.call_value(next, v, &[])?;
-                    // IteratorNext step 3: a non-object result is a TypeError.
-                    if !self.is_object_value(res) {
-                        return Err(Thrown(
-                            "TypeError: iterator.next() returned a non-object".into(),
-                        ));
-                    }
-                    let done = self.get_prop(res, "done")?;
-                    if self.truthy(done) {
-                        break;
-                    }
-                    out.push(self.get_prop(res, "value")?);
-                    if out.len() > crate::vm::MAX_DENSE_ARRAY_LEN {
-                        return Err(Thrown(
-                            "RangeError: iterator produced more values than the engine's limit"
-                                .into(),
-                        ));
-                    }
-                    self.instrument_drain_heap_check(out.len())?;
-                }
-                return Ok(out);
+                drop(gc);
+                return self.drain_iterator_rooted(v, Some(next));
             }
         }
         enum Plan {
@@ -1413,9 +1459,10 @@ impl<'p> Vm<'p> {
         mapfn: Value,
         this_arg: Value,
     ) -> Result<Value, Thrown> {
-        // Holds an un-rooted `elems` Vec while the mapfn / iterator re-enters the
-        // interpreter — suspend GC for the scope.
-        let _gc = self.gc_lock_guard();
+        // The array-like path holds un-rooted Values while the mapfn and
+        // getters re-enter the interpreter — suspend GC for it. The iterator
+        // path releases the lock and roots its working set instead.
+        let gc = self.gc_lock_guard();
         // A given (non-undefined) mapfn must be callable; null/undefined source is
         // not coercible to an object (ToObject throws).
         if mapfn != Value::UNDEFINED && !self.is_callable(mapfn) {
@@ -1461,78 +1508,8 @@ impl<'p> Vm<'p> {
                 return Err(Thrown("TypeError: iterator is not an object".into()));
             }
             let next_fn = self.get_prop(iter, "next")?;
-            let mut out: Vec<Value> = Vec::new();
-            let mut k: usize = 0;
-            loop {
-                let result = self.call_value(next_fn, iter, &[])?;
-                if !self.is_object_value(result) {
-                    return Err(Thrown("TypeError: iterator result is not an object".into()));
-                }
-                let done = self.get_prop(result, "done")?;
-                if self.truthy(done) {
-                    break;
-                }
-                let k_value = self.get_prop(result, "value")?;
-                // IteratorClose(iteratorRecord, throwCompletion) discards ANY
-                // completion the close produces — including the one from
-                // GetMethod(iterator, "return") — and rethrows the original. The
-                // thrown VALUE lives in `pending_throw`, so it has to be banked
-                // across the close: without that, a `return` accessor that itself
-                // throws overwrote it and `Array.from` reported "return getter
-                // throws" instead of the defineProperty failure that actually
-                // aborted the loop (staging/sm/Array/from-iterator-close.js).
-                macro_rules! close_and_throw {
-                    ($e:expr) => {{
-                        let saved = self.pending_throw;
-                        let _ = self.iterator_close(iter);
-                        self.pending_throw = saved;
-                        return Err($e);
-                    }};
-                }
-                let mapped = if mapping {
-                    match self.call_value(mapfn, this_arg, &[k_value, Value::num(k as f64)]) {
-                        Ok(v) => v,
-                        Err(e) => close_and_throw!(e),
-                    }
-                } else {
-                    k_value
-                };
-                match dest {
-                    Some(a) => {
-                        if let Err(e) =
-                            self.preflight_native_iteration_work((k as u64).saturating_add(1))
-                        {
-                            close_and_throw!(e);
-                        }
-                        if let Err(e) = self.create_data_property_or_throw(a, k, mapped) {
-                            close_and_throw!(e);
-                        }
-                    }
-                    None => {
-                        if out.len() >= crate::vm::MAX_DENSE_ARRAY_LEN {
-                            return Err(Thrown(
-                                "RangeError: iterator produced more values than the engine's limit"
-                                    .into(),
-                            ));
-                        }
-                        out.push(mapped);
-                        if let Err(e) = self.instrument_drain_heap_check(out.len()) {
-                            close_and_throw!(e);
-                        }
-                    }
-                }
-                k += 1;
-            }
-            return match dest {
-                Some(a) => {
-                    self.set_prop(a, "length", Value::num(k as f64), true)?;
-                    Ok(a)
-                }
-                // No constructor receiver → ArrayCreate(0) in the realm of the
-                // `from` built-in running now: `var f = other.Array.from; f([1])`
-                // yields an array whose prototype is the OTHER realm's.
-                None => Ok(self.alloc_array_current_realm(out)),
-            };
+            drop(gc);
+            return self.array_from_iterator(dest, iter, next_fn, mapfn, this_arg);
         }
         // NOTE: reaching here means GetMethod(items, @@iterator) was UNDEFINED, so
         // the array-like path below is the only one the spec allows — even for a
@@ -1581,11 +1558,7 @@ impl<'p> Vm<'p> {
             self.set_prop(a, "length", Value::num(n as f64), true)?;
             return Ok(a);
         }
-        if n > crate::vm::MAX_DENSE_ARRAY_LEN {
-            return Err(Thrown(
-                "RangeError: array length exceeds the engine's dense-array limit".into(),
-            ));
-        }
+        self.preflight_materialized_array(n)?;
         let mut out = Vec::with_capacity(n.min(4096));
         for i in 0..n {
             let v = self.get_index(obj, Value::num(i as f64))?;
@@ -1597,5 +1570,133 @@ impl<'p> Vm<'p> {
             out.push(mapped);
         }
         Ok(self.alloc_array_current_realm(out))
+    }
+
+    /// `Array.from`'s iterator loop, with collection running: the
+    /// receiver-constructed `dest`, the iterator, `next`, the mapping function
+    /// and its `this`, the dense accumulator and the current step's result and
+    /// value live in root slots (see `drain_iterator_rooted`).
+    fn array_from_iterator(
+        &mut self,
+        dest: Option<Value>,
+        iter: Value,
+        next_fn: Value,
+        mapfn: Value,
+        this_arg: Value,
+    ) -> Result<Value, Thrown> {
+        let acc = self.heap.alloc(HeapObj::Array(Vec::new()));
+        let base = self.host_result_roots.len();
+        self.host_result_roots.extend_from_slice(&[
+            dest.unwrap_or(Value::UNDEFINED),
+            iter,
+            next_fn,
+            mapfn,
+            this_arg,
+            Value::heap(acc),
+            Value::UNDEFINED,
+            Value::UNDEFINED,
+        ]);
+        let r = self
+            .array_from_iterator_steps(dest, iter, next_fn, mapfn, this_arg, acc, base + 6)
+            .and_then(|k| match dest {
+                Some(a) => {
+                    self.set_prop(a, "length", Value::num(k as f64), true)?;
+                    Ok(a)
+                }
+                // No constructor receiver → ArrayCreate(0) in the realm of the
+                // `from` built-in running now: `var f = other.Array.from; f([1])`
+                // yields an array whose prototype is the OTHER realm's.
+                None => {
+                    let out = match self.heap.get_mut(acc) {
+                        HeapObj::Array(items) => std::mem::take(items),
+                        _ => Vec::new(),
+                    };
+                    Ok(self.alloc_array_current_realm(out))
+                }
+            });
+        self.host_result_roots.truncate(base);
+        r
+    }
+
+    /// The steps of [`Self::array_from_iterator`]; returns the element count.
+    #[allow(clippy::too_many_arguments)]
+    fn array_from_iterator_steps(
+        &mut self,
+        dest: Option<Value>,
+        iter: Value,
+        next_fn: Value,
+        mapfn: Value,
+        this_arg: Value,
+        acc: u32,
+        scratch: usize,
+    ) -> Result<usize, Thrown> {
+        let mapping = mapfn != Value::UNDEFINED;
+        let mut k: usize = 0;
+        loop {
+            let result = self.call_value(next_fn, iter, &[])?;
+            if !self.is_object_value(result) {
+                return Err(Thrown("TypeError: iterator result is not an object".into()));
+            }
+            self.host_result_roots[scratch] = result;
+            let done = self.get_prop(result, "done")?;
+            if self.truthy(done) {
+                return Ok(k);
+            }
+            let k_value = self.get_prop(result, "value")?;
+            self.host_result_roots[scratch + 1] = k_value;
+            // IteratorClose(iteratorRecord, throwCompletion) discards ANY
+            // completion the close produces — including the one from
+            // GetMethod(iterator, "return") — and rethrows the original. The
+            // thrown VALUE lives in `pending_throw`, so it has to be banked
+            // across the close: without that, a `return` accessor that itself
+            // throws overwrote it and `Array.from` reported "return getter
+            // throws" instead of the defineProperty failure that actually
+            // aborted the loop (staging/sm/Array/from-iterator-close.js).
+            macro_rules! close_and_throw {
+                ($e:expr) => {{
+                    let saved = self.pending_throw;
+                    let _ = self.iterator_close(iter);
+                    self.pending_throw = saved;
+                    return Err($e);
+                }};
+            }
+            let mapped = if mapping {
+                match self.call_value(mapfn, this_arg, &[k_value, Value::num(k as f64)]) {
+                    Ok(v) => v,
+                    Err(e) => close_and_throw!(e),
+                }
+            } else {
+                k_value
+            };
+            self.host_result_roots[scratch + 1] = mapped;
+            match dest {
+                Some(a) => {
+                    if let Err(e) =
+                        self.preflight_native_iteration_work((k as u64).saturating_add(1))
+                    {
+                        close_and_throw!(e);
+                    }
+                    if let Err(e) = self.create_data_property_or_throw(a, k, mapped) {
+                        close_and_throw!(e);
+                    }
+                }
+                None => {
+                    if k >= crate::vm::MAX_MATERIALIZED_ARRAY_LEN {
+                        return Err(Thrown(
+                            "RangeError: iterator produced more values than the engine's limit"
+                                .into(),
+                        ));
+                    }
+                    if let HeapObj::Array(items) = self.heap.get_mut(acc) {
+                        items.push(mapped);
+                    }
+                    self.heap.write_barrier_val(acc, mapped);
+                    if let Err(e) = self.instrument_drain_heap_check(k + 1) {
+                        close_and_throw!(e);
+                    }
+                }
+            }
+            k += 1;
+        }
     }
 }

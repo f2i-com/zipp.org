@@ -8,18 +8,6 @@ use crate::heap::{
 use crate::value::Value;
 
 impl<'p> Vm<'p> {
-    /// If `idx` is an Error-like object — an object whose `name` is one of the
-    /// engine's error kinds — return that name, else `None`.
-    pub(crate) fn error_name(&self, idx: u32) -> Option<String> {
-        let map = match self.heap.get(idx) {
-            HeapObj::Object(m) => m,
-            _ => return None,
-        };
-        let nv = map.get("name")?;
-        let name = self.display(nv);
-        native::ERROR_NAMES.contains(&name.as_str()).then_some(name)
-    }
-
     /// Whether `idx`'s prototype chain reaches one of the error prototypes — i.e.
     /// it's a real error instance (created via `new TypeError` or an internal
     /// throw), as opposed to a plain object that merely has a `name` property.

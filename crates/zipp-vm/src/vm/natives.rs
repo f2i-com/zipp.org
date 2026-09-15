@@ -1980,44 +1980,39 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 // `name` (default "Error") + ": " + `message` (default ""), dropping
-                // the separator when either part is empty.
+                // the separator when either part is empty. Both parts are WTF-8,
+                // so a lone surrogate in either survives.
                 let nv = self.get_prop(this, "name")?;
                 let name = if nv == Value::UNDEFINED {
-                    "Error".to_string()
+                    b"Error".to_vec()
                 } else {
-                    self.to_js_string(nv)?
+                    self.to_wtf8_string(nv)?
                 };
                 let mv = self.get_prop(this, "message")?;
                 let msg = if mv == Value::UNDEFINED {
-                    String::new()
+                    Vec::new()
                 } else {
-                    self.to_js_string(mv)?
+                    self.to_wtf8_string(mv)?
                 };
-                let s = if name.is_empty() {
-                    self.preflight_guest_string_size(msg.len())?;
-                    msg
-                } else if msg.is_empty() {
-                    self.preflight_guest_string_size(name.len())?;
-                    name
+                let sep: &[u8] = if name.is_empty() || msg.is_empty() {
+                    b""
                 } else {
-                    let total = name
-                        .len()
-                        .checked_add(2)
-                        .and_then(|n| n.checked_add(msg.len()))
-                        .ok_or_else(invalid_native_string_length)?;
-                    let mut out = self.guest_string_with_capacity(total)?;
-                    out.push_str(&name);
-                    out.push_str(": ");
-                    out.push_str(&msg);
-                    out
+                    b": "
                 };
-                self.alloc_str(s)
+                let mut out = Vec::new();
+                self.reserve_guest_wtf8(
+                    &mut out,
+                    name.len().saturating_add(sep.len()).saturating_add(msg.len()),
+                )?;
+                out.extend_from_slice(&name);
+                out.extend_from_slice(sep);
+                crate::heap::wtf8_push(&mut out, &msg);
+                self.alloc_wtf8_str(out)
             }
             SYMBOL_TO_STRING => {
                 // `Symbol.prototype.toString` → "Symbol(description)".
                 let sym = self.this_symbol_value(this, "toString")?;
-                let descriptive = self.symbol_descriptive_string(sym)?;
-                self.alloc_str(descriptive)
+                self.symbol_descriptive_value(sym)?
             }
             SYMBOL_VALUE_OF => {
                 // `Symbol.prototype.valueOf` → the Symbol primitive itself.
@@ -4823,11 +4818,7 @@ impl<'p> Vm<'p> {
             // test262 `$262.detachArrayBuffer(ab)` / `$262.gc()`.
             DOLLAR262_DETACH => {
                 if let Some(buf) = self.as_array_buffer(a0) {
-                    if self.pinned_buffers.contains(&buf) {
-                        return Err(Thrown(
-                            "TypeError: Cannot detach an ArrayBuffer the host has pinned".into(),
-                        ));
-                    }
+                    self.require_buffer_unpinned(buf, "detach")?;
                     if let HeapObj::ArrayBuffer { data, detached } = self.heap.get_mut(buf) {
                         *detached = true;
                         // resize_bytes(0) == clear for a Local Vec; a (harness-
@@ -5201,7 +5192,9 @@ impl<'p> Vm<'p> {
                 Value::heap(self.heap.alloc_js(r))
             }
             GLOBAL_ESCAPE => {
-                let s = self.to_js_string(a0)?;
+                // The argument's code units, lone surrogates included (a Rust
+                // `String` turned each one into `%uFFFD`).
+                let s = self.to_wtf8_string(a0)?;
                 self.preflight_native_iteration_work((s.len() as u64).saturating_mul(2))?;
                 let out_len = escape_output_len(&s)?;
                 let mut out = self.guest_string_with_capacity(out_len)?;
@@ -5508,20 +5501,25 @@ impl<'p> Vm<'p> {
                 };
                 self.preflight_native_iteration_work(raw_len as u64)?;
                 let subs = args.get(1..).unwrap_or(&[]);
-                let mut out = String::new();
+                // WTF-8 parts joined as `+` joins them: lone surrogates kept,
+                // and a high half ending one part pairs with a low half
+                // starting the next.
+                let mut out: Vec<u8> = Vec::new();
                 for i in 0..raw_len {
-                    let seg = self.get_index(raw, Value::int(i as i32))?;
-                    let seg = self.to_js_string(seg)?;
-                    self.append_guest_string(&mut out, &seg)?;
+                    let seg = self.get_index(raw, Value::num(i as f64))?;
+                    let seg = self.to_wtf8_string(seg)?;
+                    self.reserve_guest_wtf8(&mut out, seg.len())?;
+                    crate::heap::wtf8_push(&mut out, &seg);
                     if i + 1 == raw_len {
                         break;
                     }
                     if let Some(sub) = subs.get(i) {
-                        let sub = self.to_js_string(*sub)?;
-                        self.append_guest_string(&mut out, &sub)?;
+                        let sub = self.to_wtf8_string(*sub)?;
+                        self.reserve_guest_wtf8(&mut out, sub.len())?;
+                        crate::heap::wtf8_push(&mut out, &sub);
                     }
                 }
-                self.alloc_str(out)
+                self.alloc_wtf8_str(out)
             }
             // Object.prototype.toLocaleString() → this.toString().
             PROTO_TO_LOCALE_STRING => {
@@ -7409,12 +7407,13 @@ fn to_base64_into(bytes: &[u8], url: bool, omit_padding: bool, out: &mut String)
 }
 
 /// `escape(string)` (Annex B B.2.1.1): keep `A-Za-z0-9@*_+-./`, encode any
-/// other UTF-16 code unit as `%XX` (unit < 256) or `%uXXXX`. Iterates code
-/// units (not chars) so an astral char yields its two surrogate `%uXXXX`s.
-fn escape_output_len(s: &str) -> Result<usize, Thrown> {
+/// other UTF-16 code unit as `%XX` (unit < 256) or `%uXXXX`. Iterates the
+/// WTF-8 string's code units (not chars) so an astral char yields its two
+/// surrogate `%uXXXX`s and a lone surrogate its own.
+fn escape_output_len(s: &[u8]) -> Result<usize, Thrown> {
     const KEEP: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
     let mut total = 0usize;
-    for u in s.encode_utf16() {
+    for u in crate::heap::wtf8_units_iter(s) {
         let additional = if u < 0x80 && KEEP.contains(&(u as u8)) {
             1
         } else if u < 0x100 {
@@ -7427,10 +7426,10 @@ fn escape_output_len(s: &str) -> Result<usize, Thrown> {
     Ok(total)
 }
 
-fn escape_str_into(s: &str, out: &mut String) {
+fn escape_str_into(s: &[u8], out: &mut String) {
     // A-Za-z0-9 and @ * _ + - . /
     const KEEP: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
-    for u in s.encode_utf16() {
+    for u in crate::heap::wtf8_units_iter(s) {
         if u < 0x80 && KEEP.contains(&(u as u8)) {
             out.push(u as u8 as char);
         } else if u < 0x100 {
