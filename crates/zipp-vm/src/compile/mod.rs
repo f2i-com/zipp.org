@@ -727,6 +727,10 @@ struct LoopCtx {
     /// inline `IterClose` for this frame or the iterator closes twice. False for
     /// `for await`, whose inline close is still the only one.
     close_via_finally: bool,
+    /// A label frame whose statement is itself a label chain ending in an
+    /// iteration statement (`a: b: for …`): `a` is in that loop's label set, so
+    /// `continue a` targets the loop (see `continue_through_label_set`).
+    labels_iteration: bool,
 }
 
 /// A pre-evaluated destructuring member-target key (see `pre_member_ref`).
@@ -764,6 +768,7 @@ impl LoopCtx {
             handler_depth,
             iter_close: None,
             close_via_finally: false,
+            labels_iteration: false,
         }
     }
     fn switch_frame(label: Option<String>, handler_depth: usize) -> LoopCtx {
@@ -776,6 +781,7 @@ impl LoopCtx {
             handler_depth,
             iter_close: None,
             close_via_finally: false,
+            labels_iteration: false,
         }
     }
     /// The frame a LABELLED non-loop/non-switch statement pushes so `break
@@ -790,6 +796,7 @@ impl LoopCtx {
             handler_depth,
             iter_close: None,
             close_via_finally: false,
+            labels_iteration: false,
         }
     }
 }

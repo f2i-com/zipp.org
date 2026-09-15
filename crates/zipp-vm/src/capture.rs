@@ -15,10 +15,14 @@
 //!   at declaration so the closure and the defining scope share one mutable
 //!   slot. Bindings not captured stay in plain registers (the fast path).
 //!
-//! The walk covers the compiled subset; an unknown node simply contributes no
-//! bindings/refs, which is conservative-safe (a missed capture would surface as
-//! a failing test, not silent corruption, because resolution falls back to a
-//! global lookup).
+//! A MISSED reference is not conservative: the enclosing local stays a plain
+//! register, the nested function has no cell to capture, and its reference
+//! falls back to a global lookup — a ReferenceError, or a silent read or write
+//! of a same-named global. So every expression position is walked (the
+//! expression matches below are exhaustive), and free-variable analysis honours
+//! block scoping: a `let`/`const`/`class`/catch-parameter/`for`-head binding
+//! hides only the references inside its own block. Over-inclusion is the safe
+//! direction — it at most boxes a local that did not need a cell.
 
 use std::collections::HashSet;
 
@@ -53,13 +57,166 @@ pub fn free_vars(params: &[String], body: &[Stmt]) -> HashSet<String> {
 
 fn free_vars_in<'a>(params: &[&'a str], body: &'a [Stmt]) -> Names<'a> {
     let mut refs = Names::default();
+    // Only FUNCTION-scoped bindings are subtracted here: parameters, every
+    // `var` (wherever it is written), and the body's own top-level
+    // declarations. A block-scoped binding hides references only inside its
+    // block, which `stmt_refs` (scoped) handles as it walks. Subtracting every
+    // nested `let`/`catch (e)`/`for (let i …)` name at function level made
+    // `() => { { let x; } return x; }` look closed, so the enclosing `x` was
+    // never boxed and the arrow read (or wrote) a global instead.
     let mut bound: Names<'a> = params.iter().copied().collect();
-    collect_bound_in_body(body, &mut bound);
+    collect_function_scoped_bound(body, &mut bound);
     for s in body {
-        stmt_refs(s, &mut refs);
+        stmt_refs(s, &mut refs, true);
     }
     refs.retain(|n| !bound.contains(n));
     refs
+}
+
+/// The bindings a function body creates at FUNCTION scope: its top-level
+/// declarations of every kind, plus `var` declarations at any depth (they
+/// hoist out of blocks, loops, `try`, `switch`, labels and `with`).
+fn collect_function_scoped_bound<'a>(body: &'a [Stmt], out: &mut Names<'a>) {
+    for s in body {
+        match s {
+            Stmt::VarDecl(d) => {
+                for decl in &d.decls {
+                    pattern_names(&decl.id, out);
+                }
+            }
+            Stmt::ClassDecl(c) => {
+                if let Some(n) = &c.name {
+                    out.insert(&**n);
+                }
+            }
+            _ => {
+                if let Some(n) = labelled_fn_decl_name(s) {
+                    out.insert(n);
+                } else {
+                    collect_var_names_stmt(s, out);
+                }
+            }
+        }
+    }
+}
+
+/// The name of a (possibly labelled) function declaration statement.
+fn labelled_fn_decl_name(s: &Stmt) -> Option<&str> {
+    match s {
+        Stmt::FnDecl(f) => f.name.as_deref(),
+        Stmt::Labeled { body, .. } => labelled_fn_decl_name(body),
+        _ => None,
+    }
+}
+
+/// `var`-declared names at any statement depth (not inside nested functions).
+fn collect_var_names_stmt<'a>(s: &'a Stmt, out: &mut Names<'a>) {
+    let var_decl = |d: &'a crate::parse::ast::VarDecl, out: &mut Names<'a>| {
+        if !d.kind.is_lexical() {
+            for decl in &d.decls {
+                pattern_names(&decl.id, out);
+            }
+        }
+    };
+    match s {
+        Stmt::VarDecl(d) => var_decl(d, out),
+        Stmt::Block(b) => {
+            for st in b {
+                collect_var_names_stmt(st, out);
+            }
+        }
+        Stmt::If { cons, alt, .. } => {
+            collect_var_names_stmt(cons, out);
+            if let Some(a) = alt {
+                collect_var_names_stmt(a, out);
+            }
+        }
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } => collect_var_names_stmt(body, out),
+        Stmt::For { init, body, .. } => {
+            if let Some(ForInit::Var(d)) = init {
+                var_decl(d, out);
+            }
+            collect_var_names_stmt(body, out);
+        }
+        Stmt::ForOf { left, body, .. } | Stmt::ForIn { left, body, .. } => {
+            if let ForTarget::Var(d) = left {
+                var_decl(d, out);
+            }
+            collect_var_names_stmt(body, out);
+        }
+        Stmt::Try {
+            block,
+            handler,
+            finalizer,
+        } => {
+            for st in block {
+                collect_var_names_stmt(st, out);
+            }
+            if let Some(h) = handler {
+                for st in &h.body {
+                    collect_var_names_stmt(st, out);
+                }
+            }
+            if let Some(f) = finalizer {
+                for st in f {
+                    collect_var_names_stmt(st, out);
+                }
+            }
+        }
+        Stmt::Switch { cases, .. } => {
+            for case in cases {
+                for st in &case.body {
+                    collect_var_names_stmt(st, out);
+                }
+            }
+        }
+        Stmt::Labeled { body, .. } | Stmt::With { body, .. } => collect_var_names_stmt(body, out),
+        _ => {}
+    }
+}
+
+/// The names a statement list declares LEXICALLY in its own scope: `let`,
+/// `const`, `using`, classes, and (possibly labelled) function declarations
+/// — a block function is block-scoped; its Annex B var copy is left free,
+/// which only over-approximates.
+fn block_lexical_names<'a>(stmts: &'a [Stmt], out: &mut Names<'a>) {
+    for s in stmts {
+        match s {
+            Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                for decl in &d.decls {
+                    pattern_names(&decl.id, out);
+                }
+            }
+            Stmt::ClassDecl(c) => {
+                if let Some(n) = &c.name {
+                    out.insert(&**n);
+                }
+            }
+            _ => {
+                if let Some(n) = labelled_fn_decl_name(s) {
+                    out.insert(n);
+                }
+            }
+        }
+    }
+}
+
+/// Run `walk` for a scope binding `hidden`: the references it collects are
+/// added to `out` except those naming a binding of that scope.
+fn in_scope<'a>(hidden: &Names<'a>, out: &mut Names<'a>, walk: impl FnOnce(&mut Names<'a>)) {
+    if hidden.is_empty() {
+        walk(out);
+        return;
+    }
+    // Walk straight into `out`, then drop the scope's own names again —
+    // except any `out` already held from a reference OUTSIDE the scope.
+    let outer: Vec<&'a str> = hidden.iter().copied().filter(|n| out.contains(n)).collect();
+    walk(out);
+    for n in hidden {
+        if !outer.contains(n) {
+            out.remove(n);
+        }
+    }
 }
 
 /// The same, for an ARROW body, which may be a bare expression.
@@ -104,7 +261,77 @@ pub fn expr_refs_all(e: &Expr) -> HashSet<String> {
 pub fn stmts_refs_all(body: &[Stmt]) -> HashSet<String> {
     let mut refs = Names::default();
     for s in body {
-        stmt_refs(s, &mut refs);
+        stmt_refs(s, &mut refs, false);
+    }
+    owned(refs)
+}
+
+/// The lexical names a statement list declares at its own level (`let`,
+/// `const`, `using`, classes) that some EARLIER code of the same list — an
+/// earlier statement, or an earlier declarator of the same declaration —
+/// references. Such a name can be reached in its Temporal Dead Zone, so the
+/// compiler must bind it at scope entry (a TDZ cell) rather than at its
+/// textual declaration, where a forward reference would resolve past it to an
+/// outer or global binding. References hidden by a nested block's own binding
+/// of the name do not count.
+pub fn lexical_forward_refs(stmts: &[Stmt]) -> HashSet<String> {
+    let mut found = HashSet::new();
+    // The common shapes — no lexical declaration after the first statement,
+    // and no multi-declarator one — need no walk at all.
+    let needs_walk = stmts.iter().enumerate().any(|(i, s)| match s {
+        Stmt::VarDecl(d) if d.kind.is_lexical() => i > 0 || d.decls.len() > 1,
+        Stmt::ClassDecl(_) => i > 0,
+        _ => false,
+    });
+    if !needs_walk {
+        return found;
+    }
+    // Code after the LAST lexical declaration cannot reference one before it.
+    let last = stmts
+        .iter()
+        .rposition(|s| {
+            matches!(s, Stmt::VarDecl(d) if d.kind.is_lexical()) || matches!(s, Stmt::ClassDecl(_))
+        })
+        .map_or(0, |i| i + 1);
+    let mut seen = Names::default();
+    for s in &stmts[..last] {
+        match s {
+            Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                for decl in &d.decls {
+                    let mut names = Names::default();
+                    pattern_names(&decl.id, &mut names);
+                    found.extend(
+                        names
+                            .iter()
+                            .filter(|n| seen.contains(*n))
+                            .map(|n| n.to_string()),
+                    );
+                    if let Some(init) = &decl.init {
+                        expr_refs(init, &mut seen);
+                    }
+                    pattern_init_refs(&decl.id, &mut seen);
+                }
+            }
+            Stmt::ClassDecl(c) => {
+                if let Some(n) = &c.name {
+                    if seen.contains(&**n) {
+                        found.insert(n.to_string());
+                    }
+                }
+                stmt_refs(s, &mut seen, true);
+            }
+            _ => stmt_refs(s, &mut seen, true),
+        }
+    }
+    found
+}
+
+/// The names each statement list references (block scoping honoured), one set
+/// per list — the switch CaseBlock's cross-clause TDZ test.
+pub fn stmts_refs_scoped(body: &[Stmt]) -> HashSet<String> {
+    let mut refs = Names::default();
+    for s in body {
+        stmt_refs(s, &mut refs, true);
     }
     owned(refs)
 }
@@ -221,12 +448,23 @@ fn params_free<'a>(p: &'a Params, bound: &[&str], out: &mut Names<'a>) {
 }
 
 /// The function's own bindings that some directly-nested function captures.
-pub fn captured_locals(params: &[String], body: &[Stmt]) -> HashSet<String> {
+///
+/// `params_ast` is the function's parameter list: a closure written in a
+/// parameter DEFAULT (`function f(x, cb = () => x)`) is nested in this
+/// function just as surely as one in the body, and the parameter it names has
+/// to be boxed before `bind_params` creates the closure. Scanning only the body
+/// left `x` a plain register, so the default's closure resolved it as a global.
+pub fn captured_locals(
+    params: &[String],
+    params_ast: Option<&Params>,
+    body: &[Stmt],
+) -> HashSet<String> {
     let mut bound: Names<'_> = params.iter().map(String::as_str).collect();
     collect_bound_in_body(body, &mut bound);
 
     // Union of free vars of each directly-nested function.
     let mut nested_free = Names::default();
+    params_nested_free(params_ast, &mut nested_free);
     for s in body {
         collect_nested_free(s, &mut nested_free);
     }
@@ -234,14 +472,29 @@ pub fn captured_locals(params: &[String], body: &[Stmt]) -> HashSet<String> {
 }
 
 /// The same, for an ARROW body — see [`free_vars_arrow`] for why this exists.
-pub fn captured_locals_arrow(params: &[String], body: &ArrowBody) -> HashSet<String> {
+pub fn captured_locals_arrow(
+    params: &[String],
+    params_ast: &Params,
+    body: &ArrowBody,
+) -> HashSet<String> {
     match body {
-        ArrowBody::Block(b) => captured_locals(params, &b.stmts),
+        ArrowBody::Block(b) => captured_locals(params, Some(params_ast), &b.stmts),
         ArrowBody::Expr(e) => {
             let bound: Names<'_> = params.iter().map(String::as_str).collect();
             let mut nested_free = Names::default();
+            params_nested_free(Some(params_ast), &mut nested_free);
             collect_nested_free_expr(e, &mut nested_free);
             bound.intersection(&nested_free).map(|n| n.to_string()).collect()
+        }
+    }
+}
+
+/// Free names of the functions nested in a parameter list's defaults and
+/// computed pattern keys.
+fn params_nested_free<'a>(params_ast: Option<&'a Params>, out: &mut Names<'a>) {
+    if let Some(pa) = params_ast {
+        for item in &pa.items {
+            collect_nested_free_pattern(item, out);
         }
     }
 }
@@ -264,10 +517,16 @@ pub fn nested_uses_arguments(body: &[Stmt]) -> bool {
 /// before `bind_params` — the body-only scan above never sees it.
 pub fn params_nested_use_arguments(params: &Params) -> bool {
     let mut nested_free = Names::default();
-    for item in &params.items {
-        collect_nested_free_pattern(item, &mut nested_free);
-    }
+    params_nested_free(Some(params), &mut nested_free);
     nested_free.contains("arguments")
+}
+
+/// The free names of the functions nested in a parameter list — the bindings
+/// a closure created by a parameter default can observe.
+pub fn params_closure_refs(params: &Params) -> HashSet<String> {
+    let mut nested_free = Names::default();
+    params_nested_free(Some(params), &mut nested_free);
+    owned(nested_free)
 }
 
 // ── bound-name collection (this scope only; does NOT descend into nested fns) ──
@@ -408,45 +667,45 @@ fn pattern_names<'a>(pat: &'a Pattern, out: &mut Names<'a>) {
 
 // ── reference collection (descends into nested functions) ──
 
-fn stmt_refs<'a>(s: &'a Stmt, out: &mut Names<'a>) {
+/// The names `s` references. With `scoped`, a reference inside a block-like
+/// scope to one of that scope's own lexical bindings is dropped (free-variable
+/// analysis); without it every mentioned name is kept (`stmts_refs_all`, whose
+/// direct-eval guard must see a block-local `eval` too).
+fn stmt_refs<'a>(s: &'a Stmt, out: &mut Names<'a>, scoped: bool) {
+    // The lexical bindings of a scope, when the walk honours scoping.
+    let hidden = |f: &dyn Fn(&mut Names<'a>)| -> Names<'a> {
+        let mut names = Names::default();
+        if scoped {
+            f(&mut names);
+        }
+        names
+    };
     match s {
         Stmt::Expr(e) => expr_refs(e, out),
         // The with OBJECT expression and every reference in the body count
         // (an outer local referenced only inside a with body must be captured).
         Stmt::With { object, body } => {
             expr_refs(object, out);
-            stmt_refs(body, out);
+            stmt_refs(body, out, scoped);
         }
-        Stmt::VarDecl(d) => {
-            for decl in &d.decls {
-                if let Some(init) = &decl.init {
-                    expr_refs(init, out);
-                }
-                // Destructuring DEFAULTS read names too: `const {bgColor:m=Cb}=o`
-                // references `Cb`. Walking only the initializer missed them, so a
-                // name used solely as a pattern default was never captured and
-                // threw "not defined" — the same gap parameter defaults had.
-                pattern_init_refs(&decl.id, out);
-            }
-        }
+        Stmt::VarDecl(d) => var_decl_refs(d, out),
         Stmt::Block(b) => {
-            for st in b {
-                stmt_refs(st, out);
-            }
+            let lex = hidden(&|n| block_lexical_names(b, n));
+            scoped_stmts(b, &lex, out, scoped);
         }
         Stmt::If { test, cons, alt } => {
             expr_refs(test, out);
-            stmt_refs(cons, out);
+            stmt_refs(cons, out, scoped);
             if let Some(a) = alt {
-                stmt_refs(a, out);
+                stmt_refs(a, out, scoped);
             }
         }
         Stmt::While { test, body } => {
             expr_refs(test, out);
-            stmt_refs(body, out);
+            stmt_refs(body, out, scoped);
         }
         Stmt::DoWhile { body, test } => {
-            stmt_refs(body, out);
+            stmt_refs(body, out, scoped);
             expr_refs(test, out);
         }
         Stmt::For {
@@ -455,25 +714,33 @@ fn stmt_refs<'a>(s: &'a Stmt, out: &mut Names<'a>) {
             update,
             body,
         } => {
-            if let Some(init) = init {
-                match init {
-                    ForInit::Var(d) => {
+            // A `let`/`const` head scopes the whole loop.
+            let lex = hidden(&|n| {
+                if let Some(ForInit::Var(d)) = init {
+                    if d.kind.is_lexical() {
                         for decl in &d.decls {
-                            if let Some(i) = &decl.init {
-                                expr_refs(i, out);
-                            }
+                            pattern_names(&decl.id, n);
                         }
                     }
-                    ForInit::Expr(e) => expr_refs(e, out),
                 }
-            }
-            if let Some(t) = test {
-                expr_refs(t, out);
-            }
-            if let Some(u) = update {
-                expr_refs(u, out);
-            }
-            stmt_refs(body, out);
+            });
+            in_scope(&lex, out, |out| {
+                if let Some(init) = init {
+                    match init {
+                        // The declarator PATTERN's defaults read names as well
+                        // (`for (let {a = x} = o; …)`), as for any declaration.
+                        ForInit::Var(d) => var_decl_refs(d, out),
+                        ForInit::Expr(e) => expr_refs(e, out),
+                    }
+                }
+                if let Some(t) = test {
+                    expr_refs(t, out);
+                }
+                if let Some(u) = update {
+                    expr_refs(u, out);
+                }
+                stmt_refs(body, out, scoped);
+            });
         }
         Stmt::Return(r) => {
             if let Some(a) = r {
@@ -487,55 +754,110 @@ fn stmt_refs<'a>(s: &'a Stmt, out: &mut Names<'a>) {
         }
         Stmt::ForOf {
             left, right, body, ..
-        } => {
-            for_head_refs(left, out);
-            expr_refs(right, out);
-            stmt_refs(body, out);
         }
-        Stmt::ForIn { left, right, body } => {
-            for_head_refs(left, out);
-            expr_refs(right, out);
-            stmt_refs(body, out);
+        | Stmt::ForIn { left, right, body } => {
+            // The head's lexical names are in scope (in their TDZ) for the
+            // iterated expression too.
+            let lex = hidden(&|n| {
+                if let ForTarget::Var(d) = left {
+                    if d.kind.is_lexical() {
+                        for decl in &d.decls {
+                            pattern_names(&decl.id, n);
+                        }
+                    }
+                }
+            });
+            in_scope(&lex, out, |out| {
+                for_head_refs(left, out);
+                expr_refs(right, out);
+                stmt_refs(body, out, scoped);
+            });
         }
         Stmt::Try {
             block,
             handler,
             finalizer,
         } => {
-            for st in block {
-                stmt_refs(st, out);
-            }
+            let lex = hidden(&|n| block_lexical_names(block, n));
+            scoped_stmts(block, &lex, out, scoped);
             if let Some(h) = handler {
-                for st in &h.body {
-                    stmt_refs(st, out);
-                }
+                let lex = hidden(&|n| {
+                    if let Some(p) = &h.param {
+                        pattern_names(p, n);
+                    }
+                    block_lexical_names(&h.body, n);
+                });
+                in_scope(&lex, out, |out| {
+                    if let Some(p) = &h.param {
+                        pattern_init_refs(p, out);
+                    }
+                    for st in &h.body {
+                        stmt_refs(st, out, scoped);
+                    }
+                });
             }
             if let Some(f) = finalizer {
-                for st in f {
-                    stmt_refs(st, out);
-                }
+                let lex = hidden(&|n| block_lexical_names(f, n));
+                scoped_stmts(f, &lex, out, scoped);
             }
         }
         Stmt::Switch { disc, cases } => {
             expr_refs(disc, out);
-            for case in cases {
-                if let Some(t) = &case.test {
-                    expr_refs(t, out);
+            // One CaseBlock scope holds every clause's declarations, and the
+            // case tests evaluate inside it.
+            let lex = hidden(&|n| {
+                for case in cases {
+                    block_lexical_names(&case.body, n);
                 }
-                for st in &case.body {
-                    stmt_refs(st, out);
+            });
+            in_scope(&lex, out, |out| {
+                for case in cases {
+                    if let Some(t) = &case.test {
+                        expr_refs(t, out);
+                    }
+                    for st in &case.body {
+                        stmt_refs(st, out, scoped);
+                    }
                 }
-            }
+            });
         }
         Stmt::Throw(t) => expr_refs(t, out),
-        Stmt::Labeled { body, .. } => stmt_refs(body, out),
+        Stmt::Labeled { body, .. } => stmt_refs(body, out, scoped),
         Stmt::ClassDecl(c) => class_free(c, out),
         // NOTE: `Stmt::Import`/`Stmt::Export` fall here and contribute nothing.
         // That is unchanged by the port — oxc flattened the module declarations
         // into `Statement` and they hit the same catch-all, so `export function
         // f(){ … }` never contributed its free vars before either. Preserved
         // deliberately: the gate is byte-identical bytecode.
-        _ => {}
+        Stmt::Empty
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
+        | Stmt::Debugger
+        | Stmt::Import(_)
+        | Stmt::Export(_) => {}
+    }
+}
+
+/// A statement list forming one scope that binds `lex`.
+fn scoped_stmts<'a>(stmts: &'a [Stmt], lex: &Names<'a>, out: &mut Names<'a>, scoped_walk: bool) {
+    in_scope(lex, out, |out| {
+        for st in stmts {
+            stmt_refs(st, out, scoped_walk);
+        }
+    });
+}
+
+/// A declaration's initializers and its pattern's default expressions.
+fn var_decl_refs<'a>(d: &'a crate::parse::ast::VarDecl, out: &mut Names<'a>) {
+    for decl in &d.decls {
+        if let Some(init) = &decl.init {
+            expr_refs(init, out);
+        }
+        // Destructuring DEFAULTS read names too: `const {bgColor:m=Cb}=o`
+        // references `Cb`. Walking only the initializer missed them, so a
+        // name used solely as a pattern default was never captured and
+        // threw "not defined" — the same gap parameter defaults had.
+        pattern_init_refs(&decl.id, out);
     }
 }
 
@@ -678,9 +1000,26 @@ fn expr_refs<'a>(e: &'a Expr, out: &mut Names<'a>) {
         // storage adapter whose methods all reached their captured accessor
         // through `?.`.
         Expr::Chain(inner) => expr_refs(inner, out),
-        // NOTE: `Expr::PrivateIn` (`#x in o`) and `Expr::ImportCall` still fall
-        // into this catch-all, as they did pre-port.
-        _ => {}
+        // `#x in o` reads `o`; `import(spec, options)` reads both operands.
+        Expr::PrivateIn { object, .. } => expr_refs(object, out),
+        Expr::ImportCall { spec, options, .. } => {
+            expr_refs(spec, out);
+            if let Some(o) = options {
+                expr_refs(o, out);
+            }
+        }
+        // Leaves reference no binding. Listed rather than caught by `_` so a
+        // new variant cannot silently drop its references.
+        Expr::This
+        | Expr::Super
+        | Expr::Null
+        | Expr::Bool(_)
+        | Expr::Num(_)
+        | Expr::BigInt(_)
+        | Expr::Str(_)
+        | Expr::Regex { .. }
+        | Expr::NewTarget
+        | Expr::ImportMeta => {}
     }
 }
 
@@ -862,16 +1201,28 @@ fn arrow_free<'a>(a: &'a Arrow, out: &mut Names<'a>) {
 /// inclusion is harmless: it at most boxes an enclosing local used only
 /// directly, which is transparent.
 fn class_free<'a>(class: &'a Class, out: &mut Names<'a>) {
+    // Decorator expressions evaluate in the enclosing scope, and an inline
+    // decorator (`@((v, ctx) => { local = v })`) is a nested function whose
+    // free names must reach the enclosing function's capture set.
+    for d in &class.decorators {
+        expr_refs(d, out);
+    }
     if let Some(sc) = &class.superclass {
         expr_refs(sc, out);
     }
     for el in &class.body {
         match el {
             ClassMember::Method(m) => {
+                for d in &m.decorators {
+                    expr_refs(d, out);
+                }
                 fn_node_free(&m.func, out);
                 prop_key_refs(&m.key, out);
             }
             ClassMember::Field(p) => {
+                for d in &p.decorators {
+                    expr_refs(d, out);
+                }
                 if let Some(v) = &p.value {
                     expr_refs(v, out);
                 }
@@ -937,6 +1288,9 @@ fn collect_nested_free<'a>(s: &'a Stmt, out: &mut Names<'a>) {
                             if let Some(i) = &decl.init {
                                 collect_nested_free_expr(i, out);
                             }
+                            // …and a function in a declarator pattern's default
+                            // (`for (let {f = () => x} = o; …)`).
+                            collect_nested_free_pattern(&decl.id, out);
                         }
                     }
                     ForInit::Expr(e) => collect_nested_free_expr(e, out),
@@ -977,6 +1331,9 @@ fn collect_nested_free<'a>(s: &'a Stmt, out: &mut Names<'a>) {
                 collect_nested_free(st, out);
             }
             if let Some(h) = handler {
+                if let Some(p) = &h.param {
+                    collect_nested_free_pattern(p, out);
+                }
                 for st in &h.body {
                     collect_nested_free(st, out);
                 }
@@ -1035,21 +1392,20 @@ fn collect_nested_free_expr<'a>(e: &'a Expr, out: &mut Names<'a>) {
         Expr::Call(c) => {
             collect_nested_free_expr(&c.callee, out);
             for arg in &c.args {
-                // NOTE: a SPREAD argument is skipped, unlike in `expr_refs` where
-                // it is walked. That asymmetry predates the port (this walk used
-                // oxc's `Argument::as_expression`, which returns `None` for a
-                // spread, while `expr_refs` used a helper that unwrapped it), and
-                // widening it here would box additional locals.
-                if let Arg::Expr(e) = arg {
-                    collect_nested_free_expr(e, out);
+                // A SPREAD operand is walked like any argument: a closure in it
+                // (`Math.max(...xs.map(o => o[key]))`) captures `key` all the
+                // same. Skipping it (a pre-port asymmetry with `expr_refs`) left
+                // `key` a register and the closure read a global.
+                match arg {
+                    Arg::Expr(e) | Arg::Spread(e) => collect_nested_free_expr(e, out),
                 }
             }
         }
         Expr::New { callee, args } => {
             collect_nested_free_expr(callee, out);
             for arg in args {
-                if let Arg::Expr(e) = arg {
-                    collect_nested_free_expr(e, out);
+                match arg {
+                    Arg::Expr(e) | Arg::Spread(e) => collect_nested_free_expr(e, out),
                 }
             }
         }
@@ -1083,10 +1439,9 @@ fn collect_nested_free_expr<'a>(e: &'a Expr, out: &mut Names<'a>) {
         }
         Expr::Array(els, _) => {
             for el in els.iter().flatten() {
-                // Spread skipped, as for a call argument — same pre-port
-                // asymmetry, same reason.
-                if let ArrayElem::Expr(e) = el {
-                    collect_nested_free_expr(e, out);
+                // Spread walked, as for a call argument.
+                match el {
+                    ArrayElem::Expr(e) | ArrayElem::Spread(e) => collect_nested_free_expr(e, out),
                 }
             }
         }
@@ -1116,9 +1471,28 @@ fn collect_nested_free_expr<'a>(e: &'a Expr, out: &mut Names<'a>) {
         // Same as in `expr_refs`: a nested function inside an optional chain
         // must still be scanned, or the names it captures go unseen.
         Expr::Chain(inner) => collect_nested_free_expr(inner, out),
-        // NOTE: `Expr::PrivateIn` / `Expr::ImportCall` still fall into this
-        // catch-all, as they did pre-port.
-        _ => {}
+        // An update target's base and computed key (`o[(() => k)()]++`).
+        Expr::Update { target, .. } => target_nested_free(target, out),
+        Expr::PrivateIn { object, .. } => collect_nested_free_expr(object, out),
+        Expr::ImportCall { spec, options, .. } => {
+            collect_nested_free_expr(spec, out);
+            if let Some(o) = options {
+                collect_nested_free_expr(o, out);
+            }
+        }
+        // No nested function can hide in a leaf. Listed rather than caught by
+        // `_` so a new variant has to decide.
+        Expr::Ident(_)
+        | Expr::This
+        | Expr::Super
+        | Expr::Null
+        | Expr::Bool(_)
+        | Expr::Num(_)
+        | Expr::BigInt(_)
+        | Expr::Str(_)
+        | Expr::Regex { .. }
+        | Expr::NewTarget
+        | Expr::ImportMeta => {}
     }
 }
 

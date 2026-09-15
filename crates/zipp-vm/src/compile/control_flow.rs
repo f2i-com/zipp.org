@@ -31,6 +31,71 @@ use super::*;
 // for-in/for-of assignment head is handed straight to `assign_target`, which
 // owns the Annex B `f() = 1` arm. Nothing to add here.
 
+/// The lexical names (`let`/`const`/`using` leaves, classes) of a switch
+/// CaseBlock that can be reached in their Temporal Dead Zone. All the
+/// clauses share one scope, every case selector runs before any clause body,
+/// and a clause is entered by a jump past the earlier ones — so a name one
+/// clause declares needs a block-entry binding when a selector, a DIFFERENT
+/// clause, or earlier code of its own clause references it. Without one it
+/// was a plain register that nothing initialized on the jump, and the read
+/// returned whatever temporary last used it.
+fn switch_tdz_names(cases: &[ast::SwitchCase]) -> std::collections::HashSet<String> {
+    let mut early = std::collections::HashSet::new();
+    let declared: Vec<std::collections::HashSet<String>> = cases
+        .iter()
+        .map(|c| {
+            let mut names = std::collections::HashSet::new();
+            for st in &c.body {
+                match st {
+                    ast::Stmt::VarDecl(d) if d.kind.is_lexical() => {
+                        for decl in &d.decls {
+                            capture::collect_pattern_names(&decl.id, &mut names);
+                        }
+                    }
+                    ast::Stmt::ClassDecl(c) => {
+                        if let Some(id) = &c.name {
+                            names.insert(id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            names
+        })
+        .collect();
+    if declared.iter().all(|d| d.is_empty()) {
+        return early;
+    }
+    let mut selector_refs = std::collections::HashSet::new();
+    for c in cases {
+        if let Some(t) = &c.test {
+            selector_refs.extend(capture::expr_refs_all(t));
+        }
+    }
+    let clause_refs: Vec<_> = cases
+        .iter()
+        .map(|c| capture::stmts_refs_scoped(&c.body))
+        .collect();
+    for (i, names) in declared.iter().enumerate() {
+        if names.is_empty() {
+            continue;
+        }
+        let forward = capture::lexical_forward_refs(&cases[i].body);
+        for n in names {
+            if selector_refs.contains(n)
+                || forward.contains(n)
+                || clause_refs
+                    .iter()
+                    .enumerate()
+                    .any(|(j, refs)| j != i && refs.contains(n))
+            {
+                early.insert(n.clone());
+            }
+        }
+    }
+    early
+}
+
 impl<'a> FnCompiler<'a> {
     /// Compile an `if`/`else` BRANCH. Annex B B.3.3: a bare FunctionDeclaration
     /// used directly as a branch (not inside a `{ }` block) is block-scoped to
@@ -82,6 +147,12 @@ impl<'a> FnCompiler<'a> {
             for jf in jfs {
                 self.patch_jump(jf, else_start);
             }
+            // The two arms are siblings in the compile order but not on one
+            // path: a `typeof` alias the consequent declared
+            // (`if (c) var t = typeof v; else …`) does not hold in the
+            // alternate, where `t` is still the hoisted `undefined`.
+            let if_depth = self.typeof_alias_depth;
+            self.typeof_alias.retain(|a| a.depth <= if_depth);
             self.branch_stmt(alt)?;
             let end = self.here();
             self.patch_jump(jmp, end);
@@ -401,6 +472,21 @@ impl<'a> FnCompiler<'a> {
     /// (a switch's CaseBlock calls it once per clause — the in-scope dedup makes
     /// the clauses share one block-level binding).
     pub(crate) fn predeclare_lexical_tdz(&mut self, stmts: &[ast::Stmt]) {
+        // A lexical referenced by EARLIER code of the block is reachable in its
+        // TDZ (`{ var r = y; let y = 1; }` must throw, not read an outer `y`),
+        // so it needs the block-entry binding too (see `lexical_forward_refs`).
+        let forward = capture::lexical_forward_refs(stmts);
+        self.predeclare_lexical_tdz_with(stmts, &forward);
+    }
+
+    /// `predeclare_lexical_tdz` with the set of uncaptured names that need a
+    /// block-entry TDZ binding supplied by the caller (a switch CaseBlock
+    /// decides it across all of its clauses).
+    pub(crate) fn predeclare_lexical_tdz_with(
+        &mut self,
+        stmts: &[ast::Stmt],
+        early: &std::collections::HashSet<String>,
+    ) {
         // Every block-like scope funnels through here right after `push_scope`,
         // so this is also where the scope's lexical NAMES are recorded for the
         // Annex B B.3.3 blocker test — which must see a `let` written below a
@@ -414,7 +500,9 @@ impl<'a> FnCompiler<'a> {
                 // incorrectly takes the compiler's constant fallback.  These
                 // declarations are rare, so giving just them the cell-backed
                 // TDZ path has no cost for ordinary blocks.
-                if (fc.captured.contains(name) || matches!(name, "undefined" | "NaN" | "Infinity"))
+                if (fc.captured.contains(name)
+                    || early.contains(name)
+                    || matches!(name, "undefined" | "NaN" | "Infinity"))
                     && !fc.scopes.last().unwrap().iter().any(|(n, _)| n == name)
                 {
                     let r = fc.alloc_reg();
@@ -429,6 +517,17 @@ impl<'a> FnCompiler<'a> {
                     for decl in &d.decls {
                         if let ast::Pattern::Ident(id) = &decl.id {
                             pre(self, id);
+                        } else {
+                            // A destructuring declaration's leaves are block
+                            // bindings all the same: a closure written above
+                            // `let {p} = o` must capture the block's `p`, not
+                            // resolve past it. `declare_pattern` reuses the
+                            // cell. Sorted, as `pre` allocates registers.
+                            let mut leaves = std::collections::HashSet::new();
+                            capture::collect_pattern_names(&decl.id, &mut leaves);
+                            for name in crate::compile::helpers::sorted_name_vec(&leaves) {
+                                pre(self, &name);
+                            }
                         }
                     }
                 }
@@ -462,13 +561,14 @@ impl<'a> FnCompiler<'a> {
     }
 
     /// Emit the async-disposal epilogue (the finally body for an `await using`
-    /// scope): a loop that pops each disposer LIFO, calls it, and AWAITs the result,
-    /// catching a sync throw or an awaited rejection and merging it into the
-    /// completion (`kind_reg`/`val_reg`) as a SuppressedError chain. An inert
-    /// (null-initializer) record still performs one `Await(undefined)`, so an
-    /// evaluated `await using x = null` yields a microtask tick; a scope that was
-    /// opened but registered nothing (a `break` before the declaration) runs the
-    /// loop zero times and awaits nothing.
+    /// scope): a loop that pops the disposers LIFO and AWAITs each value
+    /// `AsyncDisposeNext` hands back, catching a sync throw or an awaited
+    /// rejection and merging it into the completion (`kind_reg`/`val_reg`) as a
+    /// SuppressedError chain. Inert (null-initializer) records owe ONE
+    /// `Await(undefined)` between them, so an evaluated `await using x = null`
+    /// yields a microtask tick; a sync `using` result is not awaited; a scope
+    /// that was opened but registered nothing (a `break` before the
+    /// declaration) awaits nothing.
     pub(crate) fn emit_async_dispose_loop(&mut self, scope_reg: Reg, kind_reg: Reg, val_reg: Reg) {
         let save = self.next_reg;
         let res = self.alloc_reg();
@@ -839,7 +939,13 @@ impl<'a> FnCompiler<'a> {
         // CaseBlock's block scope opens (NewDeclarativeEnvironment happens after
         // GetValue(exprRef)), so a closure in the discriminant captures outer
         // bindings, not the case-block's.
-        let disc = self.expr(disc)?;
+        let disc_reg = self.expr(disc)?;
+        // Every case selector runs before the discriminant is compared with
+        // it, so a selector that assigns a register-local discriminant must not
+        // be seen (`switch (x) { case (x = 2, 2): … case 1: … }` takes case 1).
+        let selectors: Vec<&ast::Expr> = cases.iter().filter_map(|c| c.test.as_ref()).collect();
+        let disc = self.pin_operand(disc, disc_reg, &selectors);
+        let early = switch_tdz_names(cases);
         self.push_scope();
         // A switch CaseBlock is one block scope. Pre-declare its lexically-scoped
         // declarations as block-local so they don't leak past the switch:
@@ -872,7 +978,11 @@ impl<'a> FnCompiler<'a> {
                     }
                     ast::Stmt::ClassDecl(cd) => {
                         if let Some(id) = &cd.name {
-                            self.declare_local(id);
+                            // A class that needs a TDZ binding gets the cell
+                            // below instead of a plain (initialized) local.
+                            if !self.captured.contains(&**id) && !early.contains(&**id) {
+                                self.declare_local(id);
+                            }
                         }
                     }
                     _ => {}
@@ -883,8 +993,19 @@ impl<'a> FnCompiler<'a> {
         // clause get block-entry TDZ cells, so a closure in a case selector or an
         // earlier clause captures the CaseBlock's binding, not an outer one.
         for c in cases {
-            self.predeclare_lexical_tdz(&c.body);
+            self.predeclare_lexical_tdz_with(&c.body, &early);
         }
+        // The TDZ cells of THIS CaseBlock. Each clause below re-arms them: a
+        // clause is entered by a jump that skips every earlier clause, so a
+        // declaration compiled above it is no proof its binding is initialized.
+        let case_tdz: Vec<Reg> = self
+            .scopes
+            .last()
+            .unwrap()
+            .iter()
+            .map(|(_, r)| *r)
+            .filter(|r| self.block_tdz_cells.contains(r))
+            .collect();
 
         // Pass 1: comparison jumps (strict `===`, like JS). `default` is recorded
         // and dispatched after the others fail.
@@ -924,6 +1045,7 @@ impl<'a> FnCompiler<'a> {
             // A case can be entered directly, without an earlier case's
             // declarations having run: no `typeof` alias crosses this line.
             self.typeof_alias_clear();
+            self.block_tdz_cells.extend(case_tdz.iter().copied());
             for st in &c.body {
                 self.stmt(st)?;
             }

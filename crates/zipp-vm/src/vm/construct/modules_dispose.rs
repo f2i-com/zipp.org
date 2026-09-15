@@ -435,24 +435,66 @@ impl<'p> Vm<'p> {
         out.map(|()| completion)
     }
 
-    /// The disposer list of a `using` scope: the internal Array that
-    /// `OpenUsingScope` put in the scope register.
-    pub(crate) fn using_scope_list(&mut self, scope: Value) -> Option<&mut Vec<Value>> {
+    /// A fresh `using` resource scope: an internal Array held in a register,
+    /// so it rides the frame across suspensions and lives exactly as long as
+    /// the frame does. Slot 0 holds DisposeResources' needsAwait (bit 0) and
+    /// hasAwaited (bit 1) flags; then one (disposer, hint) pair per
+    /// declaration in registration order, the hint `true` for an async-dispose
+    /// entry. An `await using` of null/undefined is an async entry holding
+    /// `undefined` (awaited, nothing called).
+    pub(crate) fn using_scope_new(&mut self) -> Value {
+        Value::heap(self.heap.alloc(HeapObj::Array(vec![Value::int(0)])))
+    }
+
+    fn using_scope_list(&mut self, scope: Value) -> Option<&mut Vec<Value>> {
         if !scope.is_heap() {
             return None;
         }
         match self.heap.get_mut(scope.heap_index()) {
-            HeapObj::Array(list) => Some(list),
+            HeapObj::Array(list) if !list.is_empty() => Some(list),
             _ => None,
         }
     }
 
-    /// Append a disposer (or an inert `undefined`) to a `using` scope's list.
-    /// The list is usually old by the time a later declaration registers.
-    pub(crate) fn using_scope_push(&mut self, scope: Value, disposer: Value) {
+    /// Append a disposer (or an inert `undefined`) to a `using` scope. The
+    /// list is usually old by the time a later declaration registers.
+    pub(crate) fn using_scope_push(&mut self, scope: Value, disposer: Value, is_async: bool) {
         if let Some(list) = self.using_scope_list(scope) {
             list.push(disposer);
+            list.push(Value::bool(is_async));
             self.heap.write_barrier_val(scope.heap_index(), disposer);
+        }
+    }
+
+    /// Remove and return the most recently registered (disposer, hint).
+    pub(crate) fn using_scope_pop(&mut self, scope: Value) -> Option<(Value, bool)> {
+        let list = self.using_scope_list(scope)?;
+        if list.len() < 3 {
+            return None;
+        }
+        let is_async = list.pop()?.as_bool();
+        Some((list.pop()?, is_async))
+    }
+
+    /// Every disposer in registration order, leaving the scope empty.
+    pub(crate) fn using_scope_take(&mut self, scope: Value) -> Vec<Value> {
+        match self.using_scope_list(scope) {
+            Some(list) => list.drain(1..).step_by(2).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// DisposeResources' (needsAwait, hasAwaited) flags of a scope.
+    pub(crate) fn using_scope_flags(&mut self, scope: Value) -> (bool, bool) {
+        let bits = self
+            .using_scope_list(scope)
+            .map_or(0, |list| list[0].as_int());
+        (bits & 1 != 0, bits & 2 != 0)
+    }
+
+    pub(crate) fn set_using_scope_flags(&mut self, scope: Value, needs_await: bool, has_awaited: bool) {
+        if let Some(list) = self.using_scope_list(scope) {
+            list[0] = Value::int(needs_await as i32 | (has_awaited as i32) << 1);
         }
     }
 

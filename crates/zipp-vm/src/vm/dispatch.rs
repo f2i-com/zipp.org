@@ -5737,15 +5737,17 @@ impl<'p> Vm<'p> {
                         let vv = self.get(base, val);
                         // ToPropertyKey ONCE (the key expression was already evaluated).
                         let k = self.coerce_index_key(kv)?;
-                        if self.key_of(k) == "prototype" {
+                        let key = self.key_of(k);
+                        if key == "prototype" {
                             return Err(Thrown(
                                 "TypeError: Classes may not have a static property named 'prototype'"
                                     .into(),
                             ));
                         }
-                        // The resolved key is a string/symbol, so set_index's own
-                        // ToPropertyKey is idempotent (no user code runs twice).
-                        self.set_index(cv, k, vv, true)?;
+                        // DefineField (CreateDataPropertyOrThrow), not [[Set]]:
+                        // `static ['name'] = v` replaces the constructor's own
+                        // read-only `name`, and no inherited setter runs.
+                        self.define_field(cv, &key, vv)?;
                         ip += 1;
                     }
                     Instr::DefineAccessor {
@@ -7629,13 +7631,12 @@ impl<'p> Vm<'p> {
                         }
                     }
                     Instr::OpenUsingScope { dst } => {
-                        // Allocate a fresh `using` resource scope: an internal
-                        // Array of disposers held in a register, so it rides the
-                        // frame across suspensions AND lives exactly as long as
-                        // the frame does — a generator abandoned mid-block takes
+                        // Allocate a fresh `using` resource scope (see
+                        // `using_scope_new`): it lives exactly as long as the
+                        // frame does, so a generator abandoned mid-block takes
                         // its resources with it instead of rooting them forever.
-                        let list = self.heap.alloc(HeapObj::Array(Vec::new()));
-                        self.set(base, dst, Value::heap(list));
+                        let list = self.using_scope_new();
+                        self.set(base, dst, list);
                         ip += 1;
                     }
                     Instr::RegisterDisposable { scope, val } => {
@@ -7667,7 +7668,7 @@ impl<'p> Vm<'p> {
                                 args: Vec::new(),
                             }));
                             let list = self.get(base, scope);
-                            self.using_scope_push(list, disposer);
+                            self.using_scope_push(list, disposer, false);
                             ip += 1;
                         }
                     }
@@ -7681,10 +7682,7 @@ impl<'p> Vm<'p> {
                         // block already threw) into a SuppressedError chain; rewrite
                         // kind/val so the following EndFinally re-raises the merge.
                         let list = self.get(base, scope);
-                        let disposers = self
-                            .using_scope_list(list)
-                            .map(std::mem::take)
-                            .unwrap_or_default();
+                        let disposers = self.using_scope_take(list);
                         let raw = self.regs[base + kind_reg as usize].as_int();
                         let incoming = if raw & 3 == 2 {
                             Some(self.regs[base + val_reg as usize])
@@ -7706,8 +7704,8 @@ impl<'p> Vm<'p> {
                         let v = self.get(base, val);
                         let list = self.get(base, scope);
                         if v.is_nullish() {
-                            // Inert: awaited, not called.
-                            self.using_scope_push(list, Value::UNDEFINED);
+                            // Inert: sets needsAwait at disposal, calls nothing.
+                            self.using_scope_push(list, Value::UNDEFINED, true);
                             ip += 1;
                         } else {
                             if !self.is_object_value(v) {
@@ -7746,7 +7744,7 @@ impl<'p> Vm<'p> {
                                     args: Vec::new(),
                                 }))
                             };
-                            self.using_scope_push(list, disposer);
+                            self.using_scope_push(list, disposer, true);
                             ip += 1;
                         }
                     }
@@ -7756,25 +7754,48 @@ impl<'p> Vm<'p> {
                         // A real bound disposer is CALLED here (carrying its `this`);
                         // its result is left in `res` for the caller to Await. A sync
                         // throw propagates (caught by the loop's handler).
+                        //
+                        // DisposeResources' await economy: an inert entry only
+                        // sets needsAwait, a sync-hint entry's result is not
+                        // awaited, and the one Await(undefined) a nullish entry
+                        // owes is paid before the next sync call or at the end,
+                        // and only when no async result was awaited. Each step
+                        // runs until it has a value to Await (done=false) or the
+                        // list is spent (done=true). Awaiting every entry cost a
+                        // microtask tick per null and per sync `using`.
                         let list = self.get(base, scope);
-                        let entry = self.using_scope_list(list).and_then(|d| d.pop());
-                        match entry {
-                            None => {
-                                self.set(base, done, Value::bool(true));
-                                self.set(base, res, Value::UNDEFINED);
-                                ip += 1;
+                        let r = loop {
+                            let (needs_await, has_awaited) = self.using_scope_flags(list);
+                            let owed = needs_await && !has_awaited;
+                            match self.using_scope_pop(list) {
+                                None if owed => {
+                                    self.set_using_scope_flags(list, false, has_awaited);
+                                    break Some(Value::UNDEFINED);
+                                }
+                                None => break None,
+                                Some((d, false)) if owed => {
+                                    // Await(undefined) BEFORE this sync disposer.
+                                    self.set_using_scope_flags(list, false, has_awaited);
+                                    self.using_scope_push(list, d, false);
+                                    break Some(Value::UNDEFINED);
+                                }
+                                Some((d, false)) => {
+                                    self.call_value(d, Value::UNDEFINED, &[])?;
+                                }
+                                Some((d, true)) if d.is_nullish() => {
+                                    self.set_using_scope_flags(list, true, has_awaited);
+                                }
+                                Some((d, true)) => {
+                                    let r = self.call_value(d, Value::UNDEFINED, &[])?;
+                                    let (needs_await, _) = self.using_scope_flags(list);
+                                    self.set_using_scope_flags(list, needs_await, true);
+                                    break Some(r);
+                                }
                             }
-                            Some(d) => {
-                                self.set(base, done, Value::bool(false));
-                                let r = if d.is_nullish() {
-                                    Value::UNDEFINED
-                                } else {
-                                    self.call_value(d, Value::UNDEFINED, &[])?
-                                };
-                                self.set(base, res, r);
-                                ip += 1;
-                            }
-                        }
+                        };
+                        self.set(base, done, Value::bool(r.is_none()));
+                        self.set(base, res, r.unwrap_or(Value::UNDEFINED));
+                        ip += 1;
                     }
                     Instr::MergeDispose {
                         kind_reg,

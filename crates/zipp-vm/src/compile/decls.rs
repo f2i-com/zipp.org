@@ -7,6 +7,18 @@ use super::*;
 
 use crate::parse::ast;
 
+/// Whether a labelled statement's BODY is a further label chain ending in an
+/// iteration statement, so the outer label belongs to that loop's label set.
+fn labels_iteration(body: &ast::Stmt) -> bool {
+    match body {
+        ast::Stmt::Labeled { body, .. } => match &**body {
+            ast::Stmt::Labeled { .. } => labels_iteration(body),
+            inner => stmt_takes_label(inner) && !matches!(inner, ast::Stmt::Switch { .. }),
+        },
+        _ => false,
+    }
+}
+
 /// Recognise only `return x <int-literal> ? x : alt` (and `<=`). Keeping this
 /// deliberately narrower than a general conditional return leaves specialised
 /// expression lowering such as `Pad2Conditional` untouched. The consequent is
@@ -257,7 +269,8 @@ impl<'a> FnCompiler<'a> {
                     Some(lbl) => self
                         .loop_ctx
                         .iter()
-                        .rposition(|ctx| ctx.is_loop && ctx.label.as_deref() == Some(&**lbl)),
+                        .rposition(|ctx| ctx.is_loop && ctx.label.as_deref() == Some(&**lbl))
+                        .or_else(|| self.continue_through_label_set(lbl)),
                     None => self.loop_ctx.iter().rposition(|ctx| ctx.is_loop),
                 };
                 let idx = match idx {
@@ -294,18 +307,17 @@ impl<'a> FnCompiler<'a> {
                     // (the case this replaced a compile error) `L: try { return
                     // 42; } finally { break L; }`. The frame is NOT
                     // bare-breakable, so an unlabelled `break` inside still fails.
-                    self.loop_ctx
-                        .push(LoopCtx::label_frame(label.to_string(), self.handler_depth));
-                    if let S::Block(stmts) = &**body {
-                        // A labelled block keeps its own lexical scope.
-                        self.push_scope();
-                        for s in stmts {
-                            self.stmt(s)?;
-                        }
-                        self.pop_scope();
-                    } else {
-                        self.stmt(body)?;
-                    }
+                    let mut frame = LoopCtx::label_frame(label.to_string(), self.handler_depth);
+                    frame.labels_iteration = labels_iteration(body);
+                    self.loop_ctx.push(frame);
+                    // A labelled BLOCK is an ordinary block: it goes through the
+                    // `S::Block` arm for BlockDeclarationInstantiation (entry-time
+                    // function declarations, TDZ cells) and for `using` disposal.
+                    // Hand-rolling just its scope here skipped all three —
+                    // `L: { f(); function f(){} }` threw and a `using` in it was
+                    // never disposed. The label frame is pushed first, so a
+                    // `break L` unwinds through the block's disposal finally.
+                    self.stmt(body)?;
                     let ctx = self.loop_ctx.pop().unwrap();
                     let end = self.here();
                     for j in ctx.break_jumps {
@@ -671,6 +683,23 @@ impl<'a> FnCompiler<'a> {
         }
     }
 
+    /// `continue lbl` where `lbl` is an OUTER label of a label set — `a: b:
+    /// for (…) { continue a; }`. Only the innermost label rides the loop frame;
+    /// each outer one pushed a label frame marked `labels_iteration`, and the
+    /// frames that directly follow it are the rest of the chain and then the
+    /// loop itself.
+    fn continue_through_label_set(&self, lbl: &str) -> Option<usize> {
+        let at = self
+            .loop_ctx
+            .iter()
+            .rposition(|c| c.labels_iteration && c.label.as_deref() == Some(lbl))?;
+        let mut i = at + 1;
+        while self.loop_ctx.get(i).is_some_and(|c| c.labels_iteration) {
+            i += 1;
+        }
+        self.loop_ctx.get(i).filter(|c| c.is_loop).map(|_| i)
+    }
+
     pub(crate) fn var_decl(&mut self, d: &ast::VarDecl) -> R<()> {
         // A `const` binding is immutable: record its slot/register so a later
         // assignment throws a TypeError (initialization below never goes through
@@ -993,9 +1022,24 @@ impl<'a> FnCompiler<'a> {
                         self.emit(Instr::CellSet { cell: reg, src: v });
                         self.dec_next_reg(1);
                     } else {
-                        let v = self.compile_named_init(reg, init, name)?;
+                        // A `var` binding already holds a value (hoisting, a
+                        // redeclaration, an earlier loop iteration), so an
+                        // initializer that fills its destination before reading
+                        // the name must build elsewhere — the plain-assignment
+                        // rule (`var a = [...a, 2]`, `var s = m.get(s) || s`).
+                        let into = if super::assign::builds_into_dst_incrementally(init, name)
+                            && crate::capture::references_name(init, name)
+                        {
+                            self.temp()
+                        } else {
+                            reg
+                        };
+                        let v = self.compile_named_init(into, init, name)?;
                         if v != reg {
                             self.emit(Instr::Move { dst: reg, src: v });
+                        }
+                        if into != reg {
+                            self.set_next_reg(save);
                         }
                         self.typeof_alias_record(name, init, reg);
                     }
@@ -1206,6 +1250,20 @@ impl<'a> FnCompiler<'a> {
                     {
                         self.entry_tdz_cells.remove(&r);
                     }
+                } else if let Some(r) = self
+                    .scopes
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .find(|(n, _)| n == &**id)
+                    .map(|(_, r)| *r)
+                    .filter(|r| self.block_tdz_cells.contains(r))
+                {
+                    // The block-entry TDZ cell of this leaf (captured, or
+                    // referenced before the declaration): reuse it, as the
+                    // simple-identifier declaration does, ending its TDZ for
+                    // the extraction's stores.
+                    self.block_tdz_cells.remove(&r);
                 } else {
                     self.declare_local(id);
                 }
@@ -1414,13 +1472,12 @@ impl<'a> FnCompiler<'a> {
                     // Lay the excluded (sibling) names out contiguously so the op
                     // can reference them by index range.
                     let exclude_start = self.string_constants.len() as u32;
-                    let mut exclude_count = 0u16;
+                    let exclude_count = super::assign::object_rest_exclude_count(props.len())?;
                     for prop in props {
                         let key = class_key_name(&prop.key).map_err(|_| {
                             "object-rest with a computed sibling key is not in the subset"
                         })?;
                         self.string_name(&key);
-                        exclude_count += 1;
                     }
                     let save = self.next_reg;
                     let val = self.alloc_reg();

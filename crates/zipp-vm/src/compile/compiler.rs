@@ -272,7 +272,7 @@ impl Compiler {
         // `let`/`var`/function declarations to GLOBALS, but for-of/for-in loop
         // variables and catch params are true locals — so it still needs a
         // captured set, or a closure over such a local can't box it.
-        let captured = capture::captured_locals(&[], &prog.body);
+        let captured = capture::captured_locals(&[], None, &prog.body);
         // A MODULE entry's top level is an async context (top-level `await`).
         let top_async = self.module_mode;
         let top = self.compile_function_body(
@@ -560,6 +560,11 @@ impl Compiler {
         // for each defaulted param, `if (x === undefined) x = expr`.
         if let Some(pa) = params_ast {
             fc.bind_params(pa)?;
+        }
+        // The body's copies of parameter-scope names belong to the call-time
+        // prologue too, so they run before a generator suspends below.
+        if !is_script || !fc.cx.script_binds_globals {
+            fc.split_param_scope_vars(params_ast, body);
         }
         // A generator (sync OR async) runs its parameter prologue eagerly at call
         // time and is then created suspended here; mark the body entry.
@@ -1155,7 +1160,7 @@ impl Compiler {
             names.extend(param_pattern_leaves(pa));
         }
         names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
-        let mut captured = capture::captured_locals(&names, body);
+        let mut captured = capture::captured_locals(&names, params_ast, body);
         let cls_body_refs_eval = capture::free_vars(&[], body).contains("eval")
             || params_ast.is_some_and(|pa| capture::params_reference("eval", pa));
         let saved_dyn_zone_cls = self.dyn_global_zone;
@@ -1242,6 +1247,8 @@ impl Compiler {
             if let Some(pa) = params_ast {
                 fc.bind_params(pa)?;
             }
+            // Before `GenStart`: the body copies are part of the prologue.
+            fc.split_param_scope_vars(params_ast, body);
         }
         // A generator method (sync OR async) runs its parameter prologue eagerly at
         // call and is created suspended here (a constructor is never a generator, so
@@ -1376,6 +1383,7 @@ impl Compiler {
             if let Some(pa) = params_ast {
                 fc.bind_params(pa)?;
             }
+            fc.split_param_scope_vars(params_ast, body);
         }
         // Hoisted declarations must capture the method/constructor's own
         // bindings even when their textual declarations appear later.
@@ -1606,6 +1614,7 @@ impl Compiler {
                             fc.declare_local(name);
                         }
                     }
+                    fc.split_param_scope_vars(Some(&a.params), &b.stmts);
                 }
                 // Pre-create cells for body-level lexical (`let`/`const`/`class`)
                 // bindings, exactly as a function body does — an arrow body is a
@@ -1689,11 +1698,20 @@ impl Compiler {
                         fc.func_decl(f)?;
                     }
                 }
-                for s in &b.stmts {
-                    if let ast::Stmt::FnDecl(_) = s {
-                        continue;
+                if FnCompiler::block_has_using(&b.stmts) {
+                    // A top-level `using` / `await using` disposes on every
+                    // exit, as in any function body. Compiling the statements
+                    // one by one registered the resource into no scope, so an
+                    // arrow's resources were never disposed (and an async
+                    // arrow never awaited its `await using`).
+                    fc.compile_using_block(&b.stmts, true)?;
+                } else {
+                    for s in &b.stmts {
+                        if let ast::Stmt::FnDecl(_) = s {
+                            continue;
+                        }
+                        fc.stmt(s)?;
                     }
-                    fc.stmt(s)?;
                 }
                 fc.emit(Instr::ReturnUndefined);
             }
@@ -1839,6 +1857,76 @@ mod m1_tests {
 }
 
 impl<'a> FnCompiler<'a> {
+    /// FunctionDeclarationInstantiation step 28: a parameter list with
+    /// expressions gives the body a SEPARATE var environment, where a `var`
+    /// (or top-level function) re-declaring a parameter is a new binding that
+    /// starts as the parameter's value. Sharing the parameter's binding let the
+    /// body's `var x = 2` rewrite what a default's closure reads
+    /// (`function f(x = 1, g = () => x) { var x = 2; return g(); }` gave 2).
+    /// Only a closure created in the parameter list can tell the two apart,
+    /// so only the names such a closure references get the body binding;
+    /// every other function keeps one binding per name. (`arguments` has its
+    /// own split in `compile_function_body`; a direct eval keeps the shared
+    /// binding its site map was built for.)
+    fn split_param_scope_vars(&mut self, params_ast: Option<&ast::Params>, body: &[ast::Stmt]) {
+        let Some(pa) = params_ast else {
+            return;
+        };
+        if pa.simple || self.box_all_locals {
+            return;
+        }
+        let seen = capture::params_closure_refs(pa);
+        if seen.is_empty() {
+            return;
+        }
+        let mut names = std::collections::HashSet::new();
+        for s in body {
+            collect_hoisted_vars(s, &mut names);
+            if let ast::Stmt::FnDecl(f) = s {
+                if let Some(n) = &f.name {
+                    names.insert(n.to_string());
+                }
+            }
+        }
+        for name in &sorted_name_vec(&names) {
+            if name == "arguments" || !seen.contains(name) {
+                continue;
+            }
+            let Some(preg) = self.scopes[0]
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .map(|(_, r)| *r)
+            else {
+                continue;
+            };
+            let breg = self.declare_local(name);
+            match (
+                self.cell_regs.contains(&preg),
+                self.cell_regs.contains(&breg),
+            ) {
+                (false, false) => self.emit(Instr::Move {
+                    dst: breg,
+                    src: preg,
+                }),
+                (false, true) => self.emit(Instr::CellSet {
+                    cell: breg,
+                    src: preg,
+                }),
+                (true, false) => self.emit(Instr::CellGet {
+                    dst: breg,
+                    cell: preg,
+                }),
+                (true, true) => {
+                    let t = self.temp();
+                    self.emit(Instr::CellGet { dst: t, cell: preg });
+                    self.emit(Instr::CellSet { cell: breg, src: t });
+                    self.dec_next_reg(1);
+                }
+            }
+        }
+    }
+
     /// Allocate function-body lexical cells before hoisted closures capture them.
     fn predeclare_body_lexicals(&mut self, body: &[ast::Stmt]) {
         let mut lex = std::collections::HashSet::new();
@@ -1857,6 +1945,12 @@ impl<'a> FnCompiler<'a> {
                 _ => {}
             }
         }
+        // A lexical that earlier code of the body references can be reached in
+        // its TDZ. Without a binding from entry, that reference resolved past it
+        // (`q = 1; let q;` wrote, and `typeof c; let c;` read, an outer or
+        // global binding instead of throwing), so it takes the same TDZ cell a
+        // captured lexical does. Code without such a reference is unaffected.
+        let forward = capture::lexical_forward_refs(body);
         // Sorted: this loop calls alloc_reg(), so raw HashSet order would
         // hand out CELL REGISTERS in a different order per compile.
         for name in &crate::compile::helpers::sorted_name_vec(&lex) {
@@ -1876,6 +1970,7 @@ impl<'a> FnCompiler<'a> {
             // declaration, with `C` a lexical of the enclosing IIFE).
             if (self.captured.contains(name)
                 || self.box_all_locals
+                || forward.contains(name)
                 || matches!(name.as_str(), "undefined" | "NaN" | "Infinity"))
                 && !self.scopes[0].iter().any(|(n, _)| n == name)
             {
@@ -1887,6 +1982,9 @@ impl<'a> FnCompiler<'a> {
                 self.emit(Instr::MakeCellTdz { reg: r });
                 self.cell_regs.insert(r);
                 self.entry_lexicals.insert(name.clone());
+                // A WRITE before the declaration takes the checked store, as
+                // in an arrow body (`entry_tdz_cells`); the declaration clears it.
+                self.entry_tdz_cells.insert(r);
                 // `const`-ness is recorded by the textual declaration (which
                 // reuses this reg), so an assignment after it still TypeErrors.
             }

@@ -117,7 +117,7 @@ impl<'a> FnCompiler<'a> {
         let mut names = with_rest(&params, &rest);
         names.extend(param_pattern_leaves(&f.params));
         names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
-        let captured = capture::captured_locals(&names, body);
+        let captured = capture::captured_locals(&names, Some(&f.params), body);
         self.stash_child_with_shadows(&names, body);
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_function_body(
@@ -716,12 +716,25 @@ impl<'a> FnCompiler<'a> {
                         None => v,
                     };
                     let name_idx = self.string_name(fname);
-                    self.emit(Instr::SetProp {
-                        obj: cls,
-                        name: name_idx,
-                        val: v,
-                        strict: false,
-                    });
+                    // DefineField (CreateDataPropertyOrThrow), exactly as for an
+                    // instance field: a [[Set]] was rejected by the constructor's
+                    // own non-writable `name`/`length` (a TypeError in modules),
+                    // ran an inherited static setter, and lost to an own static
+                    // getter. A private `#field` keeps the private store.
+                    if fname.starts_with('#') {
+                        self.emit(Instr::SetProp {
+                            obj: cls,
+                            name: name_idx,
+                            val: v,
+                            strict: false,
+                        });
+                    } else {
+                        self.emit(Instr::DefineField {
+                            obj: cls,
+                            name: name_idx,
+                            val: v,
+                        });
+                    }
                     // InitializeFieldOrAccessor: this element's OWN
                     // `addInitializer` callbacks run once it is defined and
                     // before the next static element, so `this[name]` is already
@@ -804,10 +817,12 @@ impl<'a> FnCompiler<'a> {
                     let fid = static_block_fns[idx];
                     let save = self.next_reg;
                     let f = self.temp();
-                    self.emit(Instr::MakeFunc {
-                        dst: f,
-                        func_id: fid,
-                    });
+                    // A block that uses a local of the enclosing function has
+                    // upvalues, and only `MakeClosure` gives it the captured
+                    // environment: a bare `MakeFunc` left its first `UpvalGet`
+                    // indexing a missing upvalue, which panicked the engine.
+                    let has_upvalues = !self.cx.functions[fid as usize].upvalues.is_empty();
+                    self.emit_make_callable(f, fid, has_upvalues);
                     let trash = self.temp();
                     // A static block executes the compiler-created function
                     // with the class as its this-value; it must not perform an
@@ -1973,7 +1988,7 @@ impl<'a> FnCompiler<'a> {
             names.push(sn.clone());
         }
         names.extend(hoisted_var_names(body)); // function-scoped `var`s (capture)
-        let captured = capture::captured_locals(&names, body);
+        let captured = capture::captured_locals(&names, Some(&f.params), body);
         self.stash_child_with_shadows(&names, body);
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_function_body(
@@ -2010,7 +2025,7 @@ impl<'a> FnCompiler<'a> {
         if let ast::ArrowBody::Block(b) = &a.body {
             names.extend(hoisted_var_names(&b.stmts));
         }
-        let captured = capture::captured_locals_arrow(&names, &a.body);
+        let captured = capture::captured_locals_arrow(&names, &a.params, &a.body);
         self.stash_arrow_child_with_shadows(&names, &a.body);
         let enclosing = self.child_enclosing();
         let mut proto = self.cx.compile_arrow_body(

@@ -83,6 +83,16 @@ fn add_right_pair_parts(value: &Expr) -> Option<(&Expr, &Expr)> {
 // the `Expr::Assign { op, target, value }` arm of `expr_into` — the struct node
 // is gone and its three fields arrive separately.
 
+/// `ObjectRest.exclude_count` for a rest pattern with `siblings` named
+/// properties. The field is a `u16`; counting into it unchecked wrapped at
+/// 65,536 siblings and leaked the excluded keys into the rest object (and
+/// panicked where overflow checks are on), so a wider pattern is refused.
+pub(crate) fn object_rest_exclude_count(siblings: usize) -> R<u16> {
+    u16::try_from(siblings).map_err(|_| {
+        "SyntaxError: object rest pattern has too many sibling properties (limit 65535)".into()
+    })
+}
+
 /// Does compiling this expression into a destination register WRITE that
 /// register before it has finished READING its operands?
 ///
@@ -105,14 +115,20 @@ fn add_right_pair_parts(value: &Expr) -> Option<(&Expr, &Expr)> {
 /// null on re-render: the first click of any control worked and the second
 /// threw "null is not a function".
 ///
+/// An array literal on its INCREMENTAL path (any spread element, or more
+/// elements than one `NewArray` block holds) is the fourth: `NewArray{dst}`
+/// runs before the first element is evaluated, so `items = [...items, x]`
+/// spread the fresh empty array and produced `[x]`.
+///
 /// Conditionals, logicals and sequences are transparent: their value comes from
 /// a sub-expression compiled into the same destination, so they inherit the
 /// property. This is deliberately a whitelist of what is SAFE-by-omission — a
 /// new in-place-building form must be added here, and `assign_reads_target` in
 /// the tests covers each shape.
-fn builds_into_dst_incrementally(e: &Expr, target: &str) -> bool {
+pub(crate) fn builds_into_dst_incrementally(e: &Expr, target: &str) -> bool {
     match e {
         Expr::Object(..) => true,
+        Expr::Array(elems, _) => super::exprs::array_literal_is_incremental(elems),
         // A template with no interpolations is a plain constant string.
         Expr::Template(t) => !t.exprs.is_empty(),
         Expr::Cond { cons, alt, .. } => {
@@ -190,6 +206,7 @@ impl<'a> FnCompiler<'a> {
                 MemberProp::Computed(key_expr) => {
                     let save = self.next_reg;
                     let obj = self.recv_expr(&m.object)?;
+                    let obj = self.pin_operand(&m.object, obj, &[key_expr]);
                     // Fuse `obj[<plain string literal> + e] = v` → SetIndexConcat
                     // (no throwaway concat-key allocation; see GetIndexConcat).
                     if let Some((name, rhs)) = concat_key_literal_prefix(key_expr) {
@@ -906,7 +923,7 @@ impl<'a> FnCompiler<'a> {
         // siblings, assigned to the rest target (mirrors the declaration form).
         if let Some(rest_target) = rest {
             let exclude_start = self.string_constants.len() as u32;
-            let mut exclude_count = 0u16;
+            let exclude_count = object_rest_exclude_count(props.len())?;
             for prop in props {
                 let key = match (&prop.target, prop.shorthand) {
                     (Target::Ident { name, .. }, true) => name.to_string(),
@@ -915,7 +932,6 @@ impl<'a> FnCompiler<'a> {
                     })?,
                 };
                 self.string_name(&key);
-                exclude_count += 1;
             }
             let save = self.next_reg;
             let val = self.alloc_reg();
@@ -1048,7 +1064,10 @@ impl<'a> FnCompiler<'a> {
                     return Ok(dst);
                 }
                 MemberProp::Ident(prop) => {
+                    // The reference's base is fixed before the RHS runs:
+                    // `o.x = (o = next, v)` stores on the OLD object.
                     let obj = self.recv_expr(&m.object)?; // evaluate the receiver once
+                    let obj = self.pin_operand(&m.object, obj, &[value]);
                     let name = self.string_name(prop);
                     if is_logical {
                         // `obj.x ??= v` etc: read current; skip the store on short-circuit.
@@ -1102,6 +1121,7 @@ impl<'a> FnCompiler<'a> {
                 MemberProp::Private(field) => {
                     self.check_private_declared(field)?;
                     let obj = self.recv_expr(&m.object)?;
+                    let obj = self.pin_operand(&m.object, obj, &[value]);
                     let name = self.string_name(&private_key(field));
                     if is_logical {
                         self.emit(Instr::GetProp { dst, obj, name });
@@ -1239,6 +1259,7 @@ impl<'a> FnCompiler<'a> {
                                                      // (`||=`) assignments read and write through ONE
                                                      // ToPropKey-coerced key so a user coercion runs exactly
                                                      // once, and the fused op exposes no such key.
+                    let obj = self.pin_operand(&m.object, obj, &[key_expr, value]);
                     if !is_logical && matches!(op, AssignOp::Assign) {
                         if let Some((name, rhs)) = concat_key_literal_prefix(key_expr) {
                             let nidx = self.string_name(name);
@@ -1262,6 +1283,10 @@ impl<'a> FnCompiler<'a> {
                         }
                     }
                     let key = self.expr(key_expr)?;
+                    // A plain store consumes the key register after the RHS
+                    // (`a[i] = i++` writes `a[0]`); the read-modify-write forms
+                    // snapshot it through ToPropKey first.
+                    let key = self.pin_operand(key_expr, key, &[value]);
                     if is_logical {
                         // A read-modify-write reuses the SAME property key for the load
                         // and the store: coerce ToPropertyKey ONCE (its toString/valueOf
@@ -1498,9 +1523,19 @@ impl<'a> FnCompiler<'a> {
                         // that Add here would silently discard the stronger
                         // no-result-allocation licence. The motivating top-level
                         // `var path` is a Global and takes the branch below.
-                        // Plain mutable local: compute in place.
+                        // Plain mutable local: compute in place. GetValue of
+                        // the target precedes the RHS, so an RHS that assigns
+                        // it (`x += (x = 10, 5)`, `x += x++`) combines the value
+                        // read first, parked in a temp.
+                        let cur = if super::calls::expr_may_assign_name(value, &name) {
+                            let t = self.temp();
+                            self.emit(Instr::Move { dst: t, src: r });
+                            t
+                        } else {
+                            r
+                        };
                         let rhs = self.expr(value)?;
-                        let instr = compound_assign_instr(other, r, r, rhs)
+                        let instr = compound_assign_instr(other, r, cur, rhs)
                             .ok_or("unsupported assignment operator (zipp-vm v1)")?;
                         self.emit(instr);
                         if r != dst {

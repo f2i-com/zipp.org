@@ -1921,19 +1921,22 @@ pub enum Instr {
     /// FIRST, read once), falling back to `@@dispose` only when `@@asyncDispose` is
     /// nullish; both nullish/non-callable on a non-null object → TypeError. A
     /// null/undefined value still pushes an INERT record (a plain `undefined`) — so
-    /// the disposal still performs one `Await` (the spec's async asymmetry), unlike
-    /// sync where nullish adds nothing.
+    /// the disposal owes one `Await` (the spec's needsAwait), unlike sync where
+    /// nullish adds nothing.
     RegisterAsyncDisposable {
         scope: Reg,
         val: Reg,
     },
-    /// Async-disposal step: pop the LAST (LIFO) entry of `scope`'s disposer list. If
-    /// the list is empty, set `done` true. An inert `undefined` entry → `res` =
-    /// undefined (nothing called). A real disposer (a bound `@@asyncDispose`/
-    /// `@@dispose`) is CALLED here (may throw synchronously) and its result lands in
-    /// `res` for the caller to `Await`. The compiler emits this under a handler that
-    /// spans the following `Await`, so a sync throw or an awaited rejection both
-    /// route to the merge step.
+    /// Async-disposal step (DisposeResources): pop `scope`'s disposers LIFO until
+    /// one yields a value to `Await` (`done` false, value in `res`) or the list is
+    /// spent (`done` true). An async-hint disposer (a bound `@@asyncDispose` or the
+    /// `@@dispose` fallback) is CALLED here (may throw synchronously) and its
+    /// result is awaited; a sync-hint (`using`) disposer is called and its result
+    /// discarded; an inert `undefined` entry calls nothing and only sets
+    /// needsAwait, whose single `Await(undefined)` is yielded before the next sync
+    /// disposer or at the end, unless an async result was already awaited. The
+    /// compiler emits this under a handler that spans the following `Await`, so a
+    /// sync throw or an awaited rejection both route to the merge step.
     AsyncDisposeNext {
         scope: Reg,
         res: Reg,

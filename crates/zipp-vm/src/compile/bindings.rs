@@ -176,6 +176,20 @@ impl<'a> FnCompiler<'a> {
             Binding::ClassName(_) => true, // the inner class-name binding is immutable
         };
         if is_const {
+            // A const that may still be in its TDZ (a later switch clause's
+            // write to an earlier clause's `const`): SetMutableBinding throws
+            // the uninitialized ReferenceError before the immutability
+            // TypeError, and `CellGet` performs exactly that check.
+            if let Binding::LocalCell(cell) = b {
+                if self.block_tdz_cells.contains(cell) || self.entry_tdz_cells.contains(cell) {
+                    let t = self.alloc_reg();
+                    self.emit(Instr::CellGet {
+                        dst: t,
+                        cell: *cell,
+                    });
+                    self.dec_next_reg(1);
+                }
+            }
             let e = self.alloc_reg();
             self.emit(Instr::NewError {
                 dst: e,
