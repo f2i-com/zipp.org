@@ -1,0 +1,50 @@
+$123.45|Money-str|Money-repr|$       123.5|$123.450
+<only repr>|<only repr>|only-str|only-str
+plain:0 str:0 repr:0 ascii:0 len-1
+plain:-7 str:-7 repr:-7 ascii:-7 len-2
+plain:42 str:42 repr:42 ascii:42 len-2
+plain:3.5 str:3.5 repr:3.5 ascii:3.5 len-3
+plain:-0.25 str:-0.25 repr:-0.25 ascii:-0.25 len-5
+plain:txt str:txt repr:'txt' ascii:'txt' len-3
+plain: str: repr:'' ascii:'' len-0
+plain:None str:None repr:None ascii:None len-4
+plain:True str:True repr:True ascii:True len-4
+plain:False str:False repr:False ascii:False len-5
+plain:[1, 'a'] str:[1, 'a'] repr:[1, 'a'] ascii:[1, 'a'] len-8
+plain:(1,) str:(1,) repr:(1,) ascii:(1,) len-4
+plain:{'k': 2} str:{'k': 2} repr:{'k': 2} ascii:{'k': 2} len-8
+plain:{3} str:{3} repr:{3} ascii:{3} len-3
+plain:b'by' str:b'by' repr:b'by' ascii:b'by' len-5
+plain:100000000000000000000 str:100000000000000000000 repr:100000000000000000000 ascii:100000000000000000000 len-21
+plain:1e-09 str:1e-09 repr:1e-09 ascii:1e-09 len-5
+plain:range(0, 3) str:range(0, 3) repr:range(0, 3) ascii:range(0, 3) len-11
+[       0] [0       ] [   0    ] [****0****] [+0] [ 0] [00000000] [+      0]
+[       1] [1       ] [   1    ] [****1****] [+1] [ 1] [00000001] [+      1]
+[      -1] [-1      ] [   -1   ] [***-1****] [-1] [-1] [-0000001] [-      1]
+[     255] [255     ] [  255   ] [***255***] [+255] [ 255] [00000255] [+    255]
+[ 3.14159] [3.14159 ] [3.14159 ] [*3.14159*] [+3.14159] [ 3.14159] [03.14159] [+3.14159]
+[    -2.5] [-2.5    ] [  -2.5  ] [**-2.5***] [-2.5] [-2.5] [-00002.5] [-    2.5]
+[       1] [1       ] [   1    ] [****1****] [+1] [ 1] [00000001] [+      1]
+[      ] [      ] [      ] [......] [] [        '']
+[     a] [a     ] [  a   ] [.....a] [a] [       'a']
+[ héllo] [héllo ] [héllo ] [.héllo] [hé] [   'héllo']
+[    日本] [日本    ] [  日本  ] [....日本] [日本] [      '日本']
+     0.333|3.33333e-01|       0.333        |0.3333333333333333
+  1234.568|1.23457e+03|      1.23e+03      | 1234.5678
+    -0.001|-1.00000e-03|       -0.001       |    -0.001
+###mid#### ########42 0xff 0b11111111
+x=3 x + y=7 name=val name=   val x * y = 12 [x, y]=[3, 4]
+quoted double nested 3 {braces} {3}    3
+4 6 0, 1, 2, 3 1
+3.0 1e+16 1.5e-07 1180591620717411303424 -0.0 inf 0.30000000000000004
+apple   |    3|  0.500|     1.50|
+kiwi    |   12|  0.250|     3.00|
+fig     |  100|  2.125|   212.50|
+TOTAL   |  115|       |   217.00|
+00:  0:0.00 01:  1:0.14 02:  4:0.29 03:  9:0.43 04: 16:0.57 05: 25:0.71 06: 36:0.86 07: 49:1.00 08: 64:1.14 09: 81:1.29 10:100:1.43 11:121:1.57
+12,345,678 12_345_678 1,234.5 0.01% 173 7B -0o173 A
+left    |    right|  a | b | c 
+Ada knows 2: py, rs
+line1 3
+line2 4
+$    123.45 only-str 7     a|'b'|  1   3.14

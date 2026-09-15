@@ -1,0 +1,31 @@
+freq 54 18 [('it', 9), ('of', 9), ('the', 9), ('was', 9), ('age', 2), ('epoch', 2)]
+lengths {5: ['epoch', 'light', 'times', 'worst'], 6: ['belief', 'season', 'spring', 'wisdom'], 7: []}
+lines [78, 91, 85] [2, 3, 3] it was the age of fo
+rle ['3a1b2c5d1e', '1a1b1c', '', '12z', '2a2b2a'] True
+caesar Vg jnf gur orfg bs gvzrf, vg j True uvw XYZ
+eval 1 + 2 * 3 = 7
+eval (1 + 2) * 3 = 9
+eval 10 / 4 - 1 = 1.5
+eval 2 * (3 + 4) * -1 = -14
+eval 1.5 * 4 + 0.25 = 6.25
+eval ((7)) = 7
+eval 100 - 99 - 1 = 0
+{
+  'name': "zipp",
+  'tags': ["py", "js"],
+  'meta': {
+    'stars': 42,
+    'ratio': 0.75,
+    'ok': true,
+    'none': null,
+    'empty': {}
+  },
+  'quote': "say \"hi\""
+}
+| alpha |   1 |    0.500 |
+| beta  |  22 |   12.250 |
+| gamma | 333 |   -3.125 |
+acrostic www ti-saw-eht-tseb-fo The Spring Of Hope
+vowels 75 0.293 ['\n', ' ', ',', '.']
+builder 0:it,1:was,2:the,3:bes,4:of,5:tim,6:it,7:was,8:the,9:wor,10:of,11:tim 69
+anagrams [['cat', 'act', 'tac'], ['google', 'gooegl'], ['listen', 'silent', 'enlist']]

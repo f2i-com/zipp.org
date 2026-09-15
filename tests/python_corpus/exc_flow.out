@@ -1,0 +1,20 @@
+loop-catch ([2, '|', '|', '|', 8, '|', '|', -6, '|'], 102)
+hot-raise 94
+finally-return finally swallowed ['try', 'finally-mutated'] ['inner-try', 'inner-finally', 'outer-finally']
+finally-break-continue 1 [0, 0, -1, 2, -2, -3]
+while-try ['f', 4, 'f', 'f', 2, 'f', 'f', 'f']
+chain RuntimeError('outer') AppError('wrapped') KeyError('root') None False True
+from-none ValueError('a') None True
+implicit-context ZeroDivisionError True
+bare-reraise original
+except-name-cleared OSError('bound')
+same-object True
+  generator finally
+  generator finally
+gen-closed
+exc-in-except 'second' KeyError('first')
+dispatch ['inner:ValueError', 'outer:ValueError', 'inner:TypeError', 'outer:TypeError', 'outer:KeyError', 'arith', 'outer:StopIteration', 'outer:Exception']
+args ('args', 1, None) ('args', 1, None) Exception('args', 1, None)
+exc-attrs ()  KeyError('k') 'k'  ('i',)
+custom-str custom(1, 2) WithNotes(1, 2) (1, 2)
+nested-hot 220

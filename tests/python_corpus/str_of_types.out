@@ -1,0 +1,70 @@
+str: 0 | repr: 0
+str: -1 | repr: -1
+str: 10000000000000000000000000 | repr: 10000000000000000000000000
+str: True | repr: True
+str: False | repr: False
+str: None | repr: None
+str: 0.5 | repr: 0.5
+str: -1e+100 | repr: -1e+100
+str: nan | repr: nan
+str:  | repr: ''
+str: plain | repr: 'plain'
+str: it's | repr: "it's"
+str: say "hi" | repr: 'say "hi"'
+str: both ' and " | repr: 'both \' and "'
+str: tab	new
+line\ | repr: 'tab\tnew\nline\\'
+str: é ü ß | repr: 'é ü ß'
+str: 日本語 | repr: '日本語'
+str: 😀 | repr: '😀'
+str: b'' | repr: b''
+str: b'bytes' | repr: b'bytes'
+str: b'\x00\xff\'"' | repr: b'\x00\xff\'"'
+str: bytearray(b'ba') | repr: bytearray(b'ba')
+str: [] | repr: []
+str: [1, [2, [3]]] | repr: [1, [2, [3]]]
+str: () | repr: ()
+str: (1,) | repr: (1,)
+str: (1, 2) | repr: (1, 2)
+str: {} | repr: {}
+str: {'a': [1, {'b': None}]} | repr: {'a': [1, {'b': None}]}
+str: set() | repr: set()
+str: {1} | repr: {1}
+str: frozenset() | repr: frozenset()
+str: frozenset({2}) | repr: frozenset({2})
+str: range(0, 0) | repr: range(0, 0)
+str: range(1, 10, 2) | repr: range(1, 10, 2)
+str: slice(1, 2, None) | repr: slice(1, 2, None)
+str: slice(None, None, None) | repr: slice(None, None, None)
+str: no-ellipsis | repr: 'no-ellipsis'
+str: OrderedDict({'a': 1}) | repr: OrderedDict({'a': 1})
+str: defaultdict(<class 'list'>, {'k': [1]}) | repr: defaultdict(<class 'list'>, {'k': [1]})
+str: deque([1, 2], maxlen=3) | repr: deque([1, 2], maxlen=3)
+str: Counter({'a': 2, 'b': 1}) | repr: Counter({'a': 2, 'b': 1})
+str: Pt(x=1, y=2) | repr: Pt(x=1, y=2)
+str: Custom() | repr: Custom()
+str: [Custom(), Custom()] | repr: [Custom(), Custom()]
+str: {'c': Custom()} | repr: {'c': Custom()}
+str: <class 'int'> | repr: <class 'int'>
+str: <class 'str'> | repr: <class 'str'>
+str: <class 'list'> | repr: <class 'list'>
+str: <class 'type'> | repr: <class 'type'>
+str: <class 'object'> | repr: <class 'object'>
+str: <class 'ValueError'> | repr: <class 'ValueError'>
+str: msg | repr: ValueError('msg')
+str: 'key' | repr: KeyError('key')
+str:  | repr: KeyError()
+str: 5 | repr: StopIteration(5)
+str: ('a', 1) | repr: Exception('a', 1)
+control-repr '\x00\x07\x1b\x7f' '\x00\x1f' ['\r\n', '\t'] '\\x41'
+str-only str-only ['str-only'] str-only
+recursive [1, 2, [...]] {'self': {...}} [1, 2, [...]]
+nested-strs ["a'b", 'c"d', 'e\nf'] ('\\',) {"k'": 'v"'}
+print-sep ~ 1 ~ two ~ 3.0 ~ None ~ [4]
+print-end no newline <end>
+str-of-str x "'x'" '5' '\xf1\xe9\u4e2d' ['\xe9']
+int-bases 10 511 57005 0 1000
+float-strs 1.0 1e+16 1.5e-05 123456789.12345679 1.4142135623730951
+bool-ops-str True False None {}
+bytes-repr b'\x00%Jo\x94\xb9\xde' b'\\n' b'aaa' b'\x00\x00'
+type-names ['int', 'bool', 'float', 'str', 'bytes', 'list', 'tuple', 'dict', 'set', 'frozenset', 'range', 'NoneType']

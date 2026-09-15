@@ -1,0 +1,38 @@
+created, nothing ran
+  start
+  yield 0
+first 0
+  yield 1
+second 1
+  end
+stop-value result
+  start
+  yield 0
+  end
+rest [0] []
+send 0 5 15 12
+send-return 12
+throw ok handled bad ok ok
+throw-propagates KeyError('unhandled')
+  cleanup
+closed []
+yield-from inner-1 inner-2 outer saw inner-return [10, 20, 'a', 'b']
+recursive-yield-from [1, 2, 3, 4, 5, 6]
+infinite [0, 1, 2, 3, 4] [9, 16, 25]
+infinite-filter [0, 2, 4, 6]
+builtins 45 6 1 True False
+builtins2 ['a', 'a', 'a', 'b', 'n', 'n'] {0, 1, 2} {0: 0, 1: 1, 2: 4} ('a', 'b') ABC
+builtins3 [(0, 'x'), (1, 'y')] [(0, 'a'), (1, 'b'), (2, 'c')] ['0', '1', '2'] 106
+single-use [0, 1, 2] [] 0
+late-source [10, 6, 16, 2, 200]
+bound-iterable [5, 3]
+pipeline {'a': '1', 'b': '2', 'c': 'x = y'}
+interleave [1, 1, 1] [2, 2, 2] [[3], [3], [3]]
+gen-type generator True True
+fib [0, 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233, 377, 610, 987] 2178308
+windows [[1, 2, 3], [2, 3, 4], [3, 4, 5]] [6, 10, 14, 18, 22, 26, 30]
+got 1
+gen-exception inside generator
+early-return [1]
+lazy-chain [0, 1, 'a', 'b', 9]
+gen-in-dict {0: [0, 0], 1: [1, 1], 2: [4, 4]}

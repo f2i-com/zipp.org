@@ -1,0 +1,6 @@
+inventory 26 [('fig', 38), ('pear', 40)] 14 ['t=0 short apple: 0<1', 't=1 short apple: 0<4']
+stackvm [7, 26] 1180591620717411303424
+bfs [1, 8, 15, 22, 29] [0, 7, 19, 26, 3, 6, 13] 4
+dijkstra 30 210 13 [0, 11, 4, 10, 6]
+linear 0.7192657974 0.0060053883 [1.833684, -1.405794, 0.338909] 0.344521
+accounts [('ann', 37, 30), ('bob', 914.28, 33), ('cy', 123.63, 30)] 3 ['insufficient funds for cy', 'insufficient funds for cy']

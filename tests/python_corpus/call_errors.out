@@ -1,0 +1,30 @@
+missing-1 TypeError: pos() missing 1 required positional argument: 'c'
+missing-2 TypeError: pos() missing 2 required positional arguments: 'b' and 'c'
+missing-3 TypeError: pos() missing 3 required positional arguments: 'a', 'b', and 'c'
+too-many TypeError: pos() takes 3 positional arguments but 4 were given
+too-many-none TypeError: noargs() takes 0 positional arguments but 1 was given
+dup-kw TypeError: pos() got multiple values for argument 'a'
+dup-kw-2 TypeError: dflt() got multiple values for argument 'a'
+unexpected-kw TypeError: pos() got an unexpected keyword argument 'd'
+unexpected-kw-none TypeError: noargs() got an unexpected keyword argument 'x'
+kwo-missing TypeError: kwo() missing 1 required keyword-only argument: 'k'
+kwo-missing-2 TypeError: kwo2() missing 2 required keyword-only arguments: 'x' and 'y'
+kwo-missing-1 TypeError: kwo2() missing 1 required keyword-only argument: 'y'
+kwo-positional TypeError: kwo() takes 1 positional argument but 2 were given
+kwo2-positional TypeError: kwo2() takes 0 positional arguments but 2 were given
+posonly-missing TypeError: posonly() missing 2 required positional arguments: 'b' and 'c'
+varargs-missing TypeError: varargs() missing 1 required positional argument: 'a'
+varkw-positional TypeError: varkw() takes 1 positional argument but 2 were given
+varkw-dup TypeError: varkw() got multiple values for argument 'a'
+call-int TypeError: 'int' object is not callable
+call-str TypeError: 'str' object is not callable
+call-none TypeError: 'NoneType' object is not callable
+call-list TypeError: 'list' object is not callable
+call-instance TypeError: 'K' object is not callable
+builtin-len TypeError: len() takes exactly one argument (0 given)
+builtin-len-2 TypeError: len() takes exactly one argument (2 given)
+builtin-abs TypeError: bad operand type for abs(): 'str'
+builtin-int TypeError: int() argument must be a string, a bytes-like object or a real number, not 'list'
+object-init TypeError: object() takes no arguments
+loop-errors 20
+safe ('ok', (1, 2, 3)) ('err', 'pos') ('ok', (1, 2)) ('ok', (2, 1, 0))

@@ -1,0 +1,29 @@
+no-leak outer-x [0, 1, 4, 9]
+gen-no-leak [0, 1, 2] False
+late-binding [2, 2, 2]
+default-binding [0, 1, 2]
+factory-binding [0, 1, 2]
+loop-late-binding [12, 12, 12]
+multipliers [5, 10, 15]
+enclosing ([100, 101, 102], {0: 100, 1: 99}, [0, 100])
+class-scope ['A', 'B'] [('a', 0), ('b', 1)] NameError
+nested [[], [(1, 0)], [(2, 0), (2, 1)], [(3, 0), (3, 1), (3, 2)]]
+flatten [1, 2, 3]
+multi-if [1, 5, 7, 11, 13, 17, 19]
+dependent-inner [('x', 1), ('x', 2), ('y', 0), ('y', 1), ('y', 2)]
+walrus [0, 1, 3, 6, 10] 10
+walrus-any 5
+dict-comp {'a': 2, 'c': 1} {1: 'a', 2: 'a', 3: 'c'}
+set-comp ['d', 'e', 'h', 'l', 'o', 'r', 'w'] {0, 1, 2, 3}
+transpose [[1, 4], [2, 5], [3, 6]] [[1, 4], [2, 5], [3, 6]]
+outer-iterable [20, 30, 30, 40]
+param-shadow ('param', [0, 1, 2])
+global-in-comp [2, 3]
+side-effects [1, 2, 3] 3 {4: 5, 6: 7} 7
+shared-iterator [(0, 1), (2, 3), (4, 5)]
+palindromes ['bob', 'kayak', 'level'] {'apple': False, 'bob': True, 'kayak': True, 'level': True, 'zipp': False}
+grid [[0, 1, 2, 3], [3, 0, 1, 2], [2, 3, 0, 1], [1, 2, 3, 0]] 24 [3, 3, 3, 3]
+gen-scope [(1, 0)] 7
+genexp-in-loop [0, 3, 6]
+lambda-comp-late [[0, 1], [0, 1], [0, 1]]
+nested-lambda-comp [[0, 0], [0, 1], [0, 2]]

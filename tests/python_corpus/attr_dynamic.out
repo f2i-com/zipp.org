@@ -1,0 +1,21 @@
+proxy 1 2 hello from target 2 ['a', 'b', 'hello'] ['a', 'b']
+AttributeError 'Target' object has no attribute 'missing'
+getattr-fallback class-x inst-y thing z dflt True False
+hasattr-attributeerror False default
+propagated ValueError exploded while looking up boom
+propagated ValueError exploded while looking up boom
+propagated KeyError 'key'
+propagated ValueError exploded while looking up boom
+recorder [('set', 'a', 1), ('set', 'a', 2), ('set', 'b', [2]), ('del', 'a')] ['b', 'events']
+AttributeError cannot set 'x': frozen
+slots 1 2 ('x', 'y')
+slots-AttributeError AttributeError
+slots-del False unset
+slots-unset AttributeError
+slot-child 5 7 6
+slot-subclass-dict has dict 1 True
+attrdict 1 2 [('a', 1), ('b', 2)] False True
+chain a.b.c(1, 2) x()
+setattr-loop [0, 1, 4] 5
+delattr-loop [False, False, True]
+getattr-special Target 5 S True False

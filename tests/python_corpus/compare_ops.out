@@ -1,0 +1,50 @@
+num 1 2 True True False True False False
+num 2 1 False False False True True True
+num 1 1 False True True False False True
+num 1 1.0 False True True False False True
+num True 1 False True True False False True
+num False 0.0 False True True False False True
+num -1 -1.5 False False False True True True
+num 18446744073709551616 1.8446744073709552e+19 False True True False False True
+num 3 2.9999999 False False False True True True
+str 'a' 'b' True True False False False
+str 'abc' 'abd' True True False False False
+str 'abc' 'ab' False False False True True
+str '' 'a' True True False False False
+str 'Z' 'a' True True False False False
+str 'é' 'z' False False False True True
+str '10' '9' True True False False False
+str 'a' 'a' False True True False True
+bytes True True True True False
+seq (1, 2) (1, 3) True True False False
+seq (1, 2) (1, 2, 0) True True False False
+seq () () False True True False
+seq (2,) (1, 9) False False False True
+seq [1, 'a'] [1, 'b'] True True False False
+seq [1, [2, 3]] [1, [2, 4]] True True False False
+seq [0.5] [0] False False False True
+seq ('a', 1) ('a', 1.0) False True True False
+list-tuple-eq False True False True
+TypeError '<' not supported between instances of 'tuple' and 'list'
+TypeError '<' not supported between instances of 'str' and 'int'
+TypeError '<' not supported between instances of 'NoneType' and 'int'
+TypeError '<' not supported between instances of 'str' and 'int'
+TypeError '<' not supported between instances of 'set' and 'list'
+TypeError '<' not supported between instances of 'dict' and 'dict'
+sets True True False True True False False
+dicts True True True True
+none-bool True True False True True True True
+chained True True True False False True True True
+identity-vs-eq True False True True
+sort-tuples [('amy', 19, 9.0), ('amy', 25, 2.5), ('bob', 25, 0.5), ('bob', 25, 1.5), ('cid', 19, 1.5)]
+sort-key [('cid', 19, 1.5), ('amy', 19, 9.0), ('bob', 25, 1.5), ('amy', 25, 2.5), ('bob', 25, 0.5)] [('amy', 25, 2.5), ('bob', 25, 1.5), ('bob', 25, 0.5), ('amy', 19, 9.0), ('cid', 19, 1.5)]
+sort-stable ['bob', 'bob', 'cid', 'amy', 'amy'] [1.5, 1.5, 0.5, 2.5, 9.0]
+sort-mixed-num [-2, -0.5, 0.0, True, 1.5, 3, 1180591620717411303424] 1 1.0 [1, True, 1.0]
+sort-strs ['1', 'A', 'B', '_', 'a', 'aa', 'b', 'é'] ['a', 'b', 'B'] xy
+sort-lists [[], [1], [1, 4, 0], [1, 5], [2]] [(1, 'b'), (1, 'a'), (0, 'z')]
+sort-error TypeError
+user-lt-only [R1, R2, R3] R5 R2 True
+TypeError '<=' not supported between instances of 'Rank' and 'Rank'
+hot-compare 187
+tuple-compare-loop banana fig
+in-ops True True True True True True True True

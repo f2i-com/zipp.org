@@ -1,0 +1,21 @@
+bound hello ann! hello ann? greet True True
+bound-late-state hello bob!
+bound-class-change hi bob! hi bob!
+stored ['hi bob!', 'hi cy!', 'hi dee!'] ['hi bob.', 'hi cy.', 'hi dee.']
+bound-eq False False True
+unbound hi bob! hi bob... function method
+classmethod e f Greeter Greeter True
+staticmethod 8 abab [0, 2, 4]
+subclass Loud HEY GUS!! Loud 10 HEY gus!
+stored-classmethod Loud Loud
+mro-super ['D', 'B', 'C', 'A'] DBCA3 ['D', 'B', 'C', 'A', 'object']
+explicit-super ['C', 'A'] ['A'] BCA12
+init-chain ['Init1', 'Init2', 'Init3(x)']
+registry {'double': 14, 'neg': -7}
+hot-bound [0, 1, 2, 3, 4, 9, 10] [9, 10]
+builtin-bound ['x', 'y', 'z']
+getattr-bound 42
+callable-mix [1, None, 1] 1
+attached ('Counter', 1) ('Counter', 2)
+attached-descriptors 2 3 ('Counter', 3) ('Counter', 4)
+dunder-bound 2 3 3
