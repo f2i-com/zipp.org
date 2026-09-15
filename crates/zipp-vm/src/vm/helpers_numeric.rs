@@ -179,10 +179,24 @@ pub(crate) fn parse_int(s: &str, radix: i32) -> f64 {
         i += 1;
     }
     if i == start {
-        f64::NAN
-    } else {
-        sign * val
+        return f64::NAN;
     }
+    // The spec leaves the value implementation-approximated ONLY for radixes
+    // other than 2, 4, 8, 10, 16 and 32 (and past a radix-10 literal's 20th
+    // digit); for those six the result is 𝔽(mathInt), correctly rounded.
+    // The f64 accumulation above is exact below 2^53 but rounds at every
+    // step past it, so a wider run is recomputed exactly.
+    let pow2 = (radix as u32).is_power_of_two();
+    if pow2 && (i - start) as u64 * (radix as u32).trailing_zeros() as u64 > 53 {
+        val = crate::parse::lexer::non_decimal_digits_to_f64(&b[start..i], radix as u32);
+    } else if radix == 10 && i - start > 15 {
+        // Every run of ASCII digits is a valid Rust float literal.
+        val = std::str::from_utf8(&b[start..i])
+            .ok()
+            .and_then(|d| d.parse::<f64>().ok())
+            .unwrap_or(val);
+    }
+    sign * val
 }
 
 /// JS `parseFloat(s)`: skip leading whitespace, then parse the longest leading

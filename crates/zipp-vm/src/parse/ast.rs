@@ -210,8 +210,8 @@ pub enum ForTarget {
 // Expressions
 // ============================================================================
 
-/// The two facts about an ObjectLiteral / ArrayLiteral that the tree cannot
-/// otherwise recover, both of which decide an early error when the literal is
+/// The facts about an ObjectLiteral / ArrayLiteral that the tree cannot
+/// otherwise recover, each of which decides an early error when the literal is
 /// reinterpreted as a destructuring pattern in `cover.rs`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LiteralFlags {
@@ -230,6 +230,12 @@ pub struct LiteralFlags {
     /// in the tree (there is deliberately no paren node), so it is recorded here
     /// for the two literals where it changes the answer.
     pub parenthesized: bool,
+    /// An element, property value or spread operand is a PARENTHESIZED
+    /// identifier — `[(a)]`, `{k: (a)}`, `{...(a)}`. Fine in an assignment
+    /// pattern (a parenthesized simple target is still a simple target), but
+    /// no BindingElement admits one, so `([(a)]) => 1` is an early error when
+    /// the literal becomes arrow parameters.
+    pub paren_name: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -386,7 +392,9 @@ pub struct TemplateElement {
     /// template (the cooked value is `undefined`); a SyntaxError otherwise, so
     /// the distinction has to survive to whoever knows which this is.
     pub cooked: Option<StrVal>,
-    pub raw: Box<str>,
+    /// The chunk's source text (`strings.raw`). Well-formed except for eval'd
+    /// or `Function` source holding a raw lone surrogate.
+    pub raw: StrVal,
 }
 
 // ============================================================================

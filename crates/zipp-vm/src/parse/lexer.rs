@@ -60,6 +60,11 @@ pub struct Lexer<'s> {
     /// The EXACT WTF-8 source, when `src` is a lossy view of it. See
     /// [`Lexer::set_exact_src`].
     exact: Option<&'s [u8]>,
+    /// Where the input proper begins: 3 after a skipped byte-order mark, 0
+    /// otherwise. A U+FEFF is WhiteSpace, so a `-->` that only trivia precedes
+    /// still sits at the start of the input — see the `-->` arm of
+    /// `skip_trivia`.
+    input_start: usize,
 }
 
 impl<'s> Lexer<'s> {
@@ -69,10 +74,12 @@ impl<'s> Lexer<'s> {
     }
 
     /// Hand the lexer the EXACT WTF-8 bytes of a source `str` that could not
-    /// hold them: `eval` of a code string containing a lone surrogate arrives
-    /// as `src` with U+FFFD in its place. Both encodings are three bytes, so
-    /// the two buffers index identically and only the token readers that must
-    /// reproduce source text verbatim consult this one.
+    /// hold them: `eval` or `Function` of a code string containing a lone
+    /// surrogate arrives as `src` with U+FFFD in its place. Both encodings are
+    /// three bytes, so the two buffers index identically and only the token
+    /// readers whose VALUE carries source code units verbatim consult this
+    /// one — string literals, both halves of a template chunk, and a regex
+    /// pattern (see [`Lexer::exact_surrogate_at`]).
     ///
     /// Must be set before the first token is read (a program may open with a
     /// regex literal), and the slice must be the same length as `src`.
@@ -89,10 +96,12 @@ impl<'s> Lexer<'s> {
             legacy_escape: false,
             html_comments: true,
             exact: None,
+            input_start: 0,
         };
         // A leading BOM is whitespace, not part of the first token.
         if lx.src.starts_with(&[0xEF, 0xBB, 0xBF]) {
             lx.pos = 3;
+            lx.input_start = 3;
         }
         // A hashbang (`#!...`) is a comment, but ONLY as the very first bytes —
         // anywhere else `#` starts a private name.
@@ -127,6 +136,20 @@ impl<'s> Lexer<'s> {
     #[inline]
     fn at_end(&self) -> bool {
         self.pos >= self.src.len()
+    }
+
+    /// The lone surrogate the EXACT source holds at `pos`, where the lossy
+    /// `src` has the U+FFFD standing in for it — `None` when there is no exact
+    /// source (every well-formed program) or no surrogate there. A WTF-8
+    /// surrogate is `ED A0..BF 80..BF`.
+    #[inline]
+    fn exact_surrogate_at(&self, pos: usize) -> Option<u16> {
+        match self.exact?.get(pos..pos + 3)? {
+            &[0xED, b1, b2] if b1 >= 0xA0 => {
+                Some(0xD000 | ((b1 as u16 & 0x3F) << 6) | (b2 as u16 & 0x3F))
+            }
+            _ => None,
+        }
     }
 
     /// Decode the char at `pos` (which must be a UTF-8 boundary), and its width.
@@ -291,9 +314,11 @@ impl<'s> Lexer<'s> {
                     // are comments too. Testing `self.pos == 0` demanded the
                     // `-->` be the source's very first byte; what actually
                     // matters is that only trivia has been crossed since the
-                    // start, which is exactly "this trivia run began at 0".
+                    // start, which is exactly "this trivia run began at 0" —
+                    // or right after a byte-order mark, which is WhiteSpace
+                    // the constructor has already stepped over.
                     b'-' if self.html_comments
-                        && (self.saw_newline || run_start == 0)
+                        && (self.saw_newline || run_start == self.input_start)
                         && self.peek_at(1) == b'-'
                         && self.peek_at(2) == b'>' =>
                     {
@@ -564,6 +589,11 @@ impl<'s> Lexer<'s> {
             if b < 0x80 {
                 units.push(b as u16);
                 self.pos += 1;
+            } else if let Some(u) = self.exact_surrogate_at(self.pos) {
+                // A raw lone surrogate in eval/Function source: the code unit
+                // itself, not the U+FFFD the lossy view holds.
+                units.push(u);
+                self.pos += 3;
             } else {
                 let (c, w) = self.char_at(self.pos);
                 // U+2028/U+2029 ARE permitted directly in string literals
@@ -687,6 +717,13 @@ impl<'s> Lexer<'s> {
                 self.pos += 1;
             }
             _ => {
+                // `\` before a raw lone surrogate: a NonEscapeCharacter, so
+                // the code unit itself (see `read_string`).
+                if let Some(u) = self.exact_surrogate_at(self.pos) {
+                    out.push(u);
+                    self.pos += 3;
+                    return Ok(());
+                }
                 let (c, w) = if b < 0x80 {
                     (b as char, 1)
                 } else {
@@ -756,6 +793,10 @@ impl<'s> Lexer<'s> {
             if b < 0x80 {
                 units.push(b as u16);
                 self.pos += 1;
+            } else if let Some(u) = self.exact_surrogate_at(self.pos) {
+                // See `read_string`.
+                units.push(u);
+                self.pos += 3;
             } else {
                 let (c, w) = self.char_at(self.pos);
                 let mut buf = [0u16; 2];
@@ -766,9 +807,30 @@ impl<'s> Lexer<'s> {
         let raw_end = self.pos;
         // Consume the terminator: ` for a tail, ${ otherwise.
         self.pos += if tail { 1 } else { 2 };
-        let raw = String::from_utf8_lossy(&self.src[raw_start..raw_end])
-            .replace("\r\n", "\n")
-            .replace('\r', "\n");
+        // The raw value is source text too, so it is read from the EXACT
+        // bytes when a lone surrogate sits in them (`String.raw` of one).
+        let raw = match self.exact.and_then(|e| e.get(raw_start..raw_end)) {
+            Some(exact) if exact != &self.src[raw_start..raw_end] => {
+                let mut raw_units = Vec::with_capacity(exact.len());
+                let mut it = crate::heap::wtf8_units_iter(exact).peekable();
+                while let Some(u) = it.next() {
+                    if u == 0x0D {
+                        if it.peek() == Some(&0x0A) {
+                            it.next();
+                        }
+                        raw_units.push(0x0A);
+                    } else {
+                        raw_units.push(u);
+                    }
+                }
+                StrVal::from_utf16(raw_units)
+            }
+            _ => StrVal::Utf8(
+                String::from_utf8_lossy(&self.src[raw_start..raw_end])
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n"),
+            ),
+        };
         Ok(TokenKind::Template {
             cooked: if bad_escape {
                 None
@@ -912,13 +974,15 @@ impl<'s> Lexer<'s> {
                     }
                     p += 1;
                 }
-                // A `.` or exponent after the digits makes it an ordinary
-                // decimal (`08.5`), not a legacy octal.
-                let followed_by_dec =
-                    p < self.src.len() && (self.src[p] == b'.' || (self.src[p] | 0x20) == b'e');
-                if all_octal && !followed_by_dec {
-                    let text = std::str::from_utf8(&self.src[self.pos + 1..p]).unwrap_or("0");
-                    let v = u64::from_str_radix(text, 8).unwrap_or(0) as f64;
+                // An all-octal run IS a LegacyOctalIntegerLiteral whatever
+                // follows it. That production is not a DecimalIntegerLiteral,
+                // so it takes no fraction or exponent: `07.5` is `07` then
+                // `.5` (a SyntaxError), `07e1` puts an identifier right after
+                // a number, and `07.toString()` is a member call on 7. Only a
+                // run holding an 8 or 9 (`08.5`, NonOctalDecimalIntegerLiteral)
+                // continues as a decimal below.
+                if all_octal {
+                    let v = non_decimal_digits_to_f64(&self.src[self.pos + 1..p], 8);
                     self.pos = p;
                     self.reject_ident_after(start)?;
                     return Ok(TokenKind::Num(NumLit {
@@ -997,14 +1061,8 @@ impl<'s> Lexer<'s> {
             return Ok(TokenKind::BigInt(v));
         }
         self.reject_ident_after(start)?;
-        // Exact for values within f64's integer range; beyond that the
-        // accumulate-in-f64 loop is what the spec's MV mandates anyway.
-        let mut v = 0f64;
-        for c in text.bytes() {
-            v = v * radix as f64 + hex_val(c).unwrap_or(0) as f64;
-        }
         Ok(TokenKind::Num(NumLit {
-            value: v,
+            value: non_decimal_digits_to_f64(text.as_bytes(), radix),
             kind: NumKind::Prefixed,
         }))
     }
@@ -1190,6 +1248,67 @@ fn hex_val(b: u8) -> Option<u32> {
         b'A'..=b'F' => Some((b - b'A' + 10) as u32),
         _ => None,
     }
+}
+
+/// The Number value of a run of ASCII digits in a power-of-two `radix` (2, 4,
+/// 8, 16 or 32; every digit already validated, no separators), CORRECTLY
+/// rounded — round-half-even to the nearest double, which is what
+/// `RoundMVResult` requires of every literal with at most 20 significant
+/// digits and what `parseInt`/`Number()` require of these radixes outright.
+///
+/// Accumulating `v = v * radix + digit` in f64 rounds at every step and
+/// discards the sticky bits below the 53rd, so it was a wrong constant for
+/// one 64-bit hex literal in ten (`0x2000000000000101` came out one ulp low),
+/// and the legacy-octal path's `u64` parse turned 22+ digit literals into 0.
+/// Here the value is exact in a `u128` when it fits (the `as f64` cast rounds
+/// half-even); otherwise the top 64 significant bits are kept with a sticky
+/// bit for everything below them, which rounds identically, and scaled by an
+/// exact power of two (overflowing to Infinity as the spec does).
+pub(crate) fn non_decimal_digits_to_f64(digits: &[u8], radix: u32) -> f64 {
+    debug_assert!(radix.is_power_of_two() && (2..=32).contains(&radix));
+    let bits = radix.trailing_zeros();
+    let digit = |b: u8| (b as char).to_digit(radix).unwrap_or(0) as u128;
+    let first = digits.iter().position(|&b| b != b'0').unwrap_or(digits.len());
+    let digits = &digits[first..];
+    if digits.len() <= (128 / bits) as usize {
+        let mut v = 0u128;
+        for &b in digits {
+            v = (v << bits) | digit(b);
+        }
+        return v as f64;
+    }
+    // Too wide for u128: the leading digit may not use all `bits` bits, so
+    // count significant bits exactly.
+    let lead = digit(digits[0]);
+    let total_bits = (128 - lead.leading_zeros()) + (digits.len() as u32 - 1) * bits;
+    let mut top = 0u64; // the leading 64 significant bits
+    let mut taken = 0u32;
+    let mut sticky = false;
+    for (i, &b) in digits.iter().enumerate() {
+        if sticky {
+            break; // nothing further down can change the rounding
+        }
+        let d = digit(b) as u64;
+        let width = if i == 0 { 64 - d.leading_zeros() } else { bits };
+        for k in (0..width).rev() {
+            let bit = (d >> k) & 1;
+            if taken < 64 {
+                top = (top << 1) | bit;
+                taken += 1;
+            } else if bit != 0 {
+                sticky = true;
+            }
+        }
+    }
+    let exp = total_bits - 64;
+    if exp > 1023 {
+        return f64::INFINITY;
+    }
+    // `top` has its high bit set, so the u64 → f64 conversion rounds at bit 11
+    // and the sticky bit in bit 0 only ever breaks a tie, exactly as the
+    // discarded bits would have.
+    let scale = f64::from_bits((1023 + exp as u64) << 52);
+    (top | sticky as u64) as f64 * scale
 }
 
 /// Decimal string for a radix literal too large for `u128` (`0x1ffff...n`).

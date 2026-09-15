@@ -37,6 +37,14 @@ pub fn parse_exact(src: &str, exact: Option<&[u8]>, opts: ParseOptions) -> PResu
     let goal = opts.goal;
     let mut p = Parser::new_exact(src, exact, opts)?;
     let program = p.parse_program(goal)?;
+    // The parser's running bound on the tree's height settles ordinary code
+    // without a second walk over the whole tree. The hardened profile keeps
+    // the unconditional walk: it is a security boundary, and its programs are
+    // small enough that the walk is not worth a proof obligation.
+    #[cfg(not(feature = "safe-sandbox"))]
+    if super::limits::nesting_bound_is_safe(&program, p.tree_depth_bound()) {
+        return Ok(program);
+    }
     super::limits::validate_program_nesting(&program)?;
     Ok(program)
 }
@@ -54,7 +62,14 @@ pub fn parse_standalone_params(src: &str) -> PResult<()> {
     // The trailing newline defends against a `//` comment in the last
     // parameter (same trick as the Function-constructor wrapper itself).
     let wrapped = format!("({src}\n)");
-    let mut p = Parser::new_exact(&wrapped, None, ParseOptions::default())?;
+    // A dynamic function's parameters are ordinary FUNCTION code, where
+    // NewTarget is legal: `new Function('a = new.target', 'return a')` is
+    // valid. The assembled parse enforces the real context rules.
+    let opts = ParseOptions {
+        allow_new_target: true,
+        ..ParseOptions::default()
+    };
+    let mut p = Parser::new_exact(&wrapped, None, opts)?;
     p.parse_params()?;
     if !p.at_eof() {
         return Err(SyntaxError::new(
@@ -336,8 +351,9 @@ impl<'s> Parser<'s> {
         }
         self.bump_after_operand()?;
         self.expect(Punct::LBrace, false)?;
-        let mut out = Vec::new();
+        let mut out: Vec<ImportAttribute> = Vec::new();
         while !self.at(Punct::RBrace) {
+            let key_pos = self.cur().span.start;
             let key = match self.cur().kind.clone() {
                 TokenKind::Str(s) => {
                     self.bump_after_operand()?;
@@ -346,6 +362,14 @@ impl<'s> Parser<'s> {
                 TokenKind::Ident { .. } => StrVal::Utf8(self.ident_name()?.to_string()),
                 _ => return Err(self.err_here("SyntaxError: expected an attribute key")),
             };
+            // WithClause early error: no two entries may share a key, compared
+            // by VALUE (`type` and `"type"` are the same key).
+            if out.iter().any(|a| a.key == key) {
+                return Err(SyntaxError::new(
+                    format!("SyntaxError: import attribute has duplicate key '{key}'"),
+                    key_pos,
+                ));
+            }
             self.expect(Punct::Colon, false)?;
             let TokenKind::Str(value) = self.cur().kind.clone() else {
                 return Err(
@@ -413,10 +437,20 @@ impl<'s> Parser<'s> {
             // first token (`function`, `async`, `class`) — `export default`
             // belongs to the export statement, not to the function whose
             // `toString` must reproduce the source.
+            // A NAMED default-exported declaration still declares its name in
+            // the module scope, exactly as the plain declaration arms of
+            // `parse_stmt_list_item_inner` do: `export default function App(){}`
+            // followed by `export { App as NamedApp }` must resolve, and
+            // `import f from "x"; export default function f(){}` is a
+            // duplicate. Only the anonymous forms bind nothing but
+            // `*default*`.
             if self.at_kw(Keyword::Function) {
                 let fstart = self.cur().span.start;
                 self.bump_after_operand()?;
                 let f = self.parse_function_rest(false, false, fstart)?;
+                if let Some(n) = &f.name {
+                    self.declare(&n.clone(), fn_bind_kind(&f), fstart)?;
+                }
                 return Ok(ExportDecl::Default(ExportDefault::Function(Box::new(f))));
             }
             if self.at_kw(Keyword::Async) {
@@ -426,6 +460,9 @@ impl<'s> Parser<'s> {
                 if self.at_kw(Keyword::Function) && !self.cur().newline_before {
                     self.bump_after_operand()?;
                     let f = self.parse_function_rest(true, false, fstart)?;
+                    if let Some(n) = &f.name {
+                        self.declare(&n.clone(), BindKind::GenFunction, fstart)?;
+                    }
                     return Ok(ExportDecl::Default(ExportDefault::Function(Box::new(f))));
                 }
                 self.restore(save);
@@ -438,6 +475,9 @@ impl<'s> Parser<'s> {
                     let cstart = cstart.unwrap_or_else(|| self.cur().span.start);
                     self.bump_after_operand()?;
                     let c = self.parse_class_rest_dec(cstart, decorators)?;
+                    if let Some(n) = &c.name {
+                        self.declare(&n.clone(), BindKind::Class, cstart)?;
+                    }
                     return Ok(ExportDecl::Default(ExportDefault::Class(Box::new(c))));
                 }
                 return Err(self.err_here("SyntaxError: decorators must precede a class"));
@@ -1233,9 +1273,11 @@ impl<'s> Parser<'s> {
                     Stmt::ForIn { left, right, body }
                 }
             } else {
-                // A classic head that began with a declaration.
+                // A classic head that began with a declaration. Its
+                // Initializers are plain expressions (still `[~In]`), so a
+                // CoverInitializedName in one is final.
                 let init = if self.eat(Punct::Eq, true)? {
-                    Some(self.parse_assign()?)
+                    Some(self.parse_assign_full()?)
                 } else if kind == VarKind::Const {
                     return Err(SyntaxError::new(
                         "SyntaxError: missing initializer in const declaration",
@@ -1276,7 +1318,7 @@ impl<'s> Parser<'s> {
                         let id = self.parse_binding_pattern()?;
                         self.declare_pattern(&id, kind, p2)?;
                         let init = if self.eat(Punct::Eq, true)? {
-                            Some(self.parse_assign()?)
+                            Some(self.parse_assign_full()?)
                         } else if kind == VarKind::Const {
                             // 14.3.1.1: the initializer requirement is per
                             // LexicalBinding, not per declaration — the FIRST
@@ -1318,9 +1360,20 @@ impl<'s> Parser<'s> {
             // from the token, not the parsed expression: an escaped
             // `async` is not the contextual `async` and stays legal.
             let head_bare_async = self.at_contextual("async");
+            // `let` is the other half of that lookahead set, and it binds in
+            // BOTH for-of productions (`for await` included): `for (let.x of
+            // [])` is an error, while `for (let.x in {})` and `for ((let).x
+            // of [])` are not.
+            let head_bare_let = self.at_contextual("let");
             let e = self.parse_expr()?;
             if self.at_kw(Keyword::In) || self.at_kw(Keyword::Of) {
                 let of = self.at_kw(Keyword::Of);
+                if of && head_bare_let {
+                    return Err(SyntaxError::new(
+                        "SyntaxError: the left-hand side of a for-of loop may not start with 'let'",
+                        pos,
+                    ));
+                }
                 // `for ( [lookahead ∉ { let [, async of }] LHS of …)`. Three
                 // things narrow it, each with its own test262 file: it does NOT
                 // apply to `for await (async of …)` (no ambiguity to resolve

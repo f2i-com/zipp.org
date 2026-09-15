@@ -131,6 +131,16 @@ pub mod safe_syntax_limits {
     pub use crate::parse::parser::{MAX_SAFE_SYNTAX_CHAIN, MAX_SAFE_SYNTAX_RECURSION};
 }
 
+/// The default profile's counterparts of [`safe_syntax_limits`], exported for
+/// the same reason.
+#[cfg(not(feature = "safe-sandbox"))]
+pub mod native_syntax_limits {
+    pub use crate::parse::limits::MAX_NATIVE_AST_NESTING;
+    pub use crate::parse::parser::{
+        MAX_NATIVE_SYNTAX_CHAIN, MAX_NATIVE_SYNTAX_RECURSION, MAX_NATIVE_TREE_DEPTH_BOUND,
+    };
+}
+
 /// The hardened profile's native-work and size ceilings, for the same reason
 /// as [`safe_syntax_limits`]: v0.0.10 raised every one of these and the tests
 /// that had copied the old numbers kept passing while exercising nothing.

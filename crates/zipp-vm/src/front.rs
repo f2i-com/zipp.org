@@ -22,6 +22,12 @@ use crate::parse::parser::{ParseOptions, Parser};
 use crate::parse::stmt::{parse, parse_exact};
 
 fn err_str(e: crate::parse::parser::SyntaxError) -> String {
+    // The default profile reports source nesting past its budget as the
+    // resource limit it is, the way node does — see
+    // `parse::parser::MAX_NATIVE_SYNTAX_RECURSION`.
+    if e.msg.starts_with("RangeError: ") {
+        return e.msg;
+    }
     format!(
         "SyntaxError: {}",
         e.msg.strip_prefix("SyntaxError: ").unwrap_or(&e.msg)
@@ -140,9 +146,9 @@ pub(crate) struct EvalFlags {
 }
 
 /// `exact` is the WTF-8 original of `src` when the code STRING held a lone
-/// surrogate — `src` is then the lossy view of it, and only a regex literal
-/// can carry such a code unit through to runtime (see
-/// [`crate::parse::lexer::Lexer::set_exact_src`]).
+/// surrogate — `src` is then the lossy view of it, and the string, template
+/// and regex literals that carry such a code unit through to runtime read it
+/// from `exact` (see [`crate::parse::lexer::Lexer::set_exact_src`]).
 pub(crate) fn parse_eval(
     src: &str,
     exact: Option<&[u8]>,

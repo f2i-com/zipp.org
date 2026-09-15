@@ -1160,8 +1160,8 @@ impl<'a> FnCompiler<'a> {
             match q.cooked.as_ref() {
                 Some(s) => {
                     // A cooked value holding a lone surrogate goes to the
-                    // WTF-8-decoding constant slot. (Raw parts below are source
-                    // text — never markers.)
+                    // WTF-8-decoding constant slot — as does a raw part below,
+                    // when eval'd source carried one verbatim.
                     let idx = self.str_const(s);
                     self.emit(Instr::LoadConst { dst: r, idx });
                 }
@@ -1179,7 +1179,7 @@ impl<'a> FnCompiler<'a> {
         let raw_base = self.next_reg;
         for q in &quasi.quasis {
             let r = self.alloc_reg();
-            let idx = self.add_string_const(&q.raw);
+            let idx = self.str_const(&q.raw);
             self.emit(Instr::LoadConst { dst: r, idx });
         }
         self.emit(Instr::NewArray {

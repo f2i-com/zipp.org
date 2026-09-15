@@ -476,8 +476,8 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
         return 0.0;
     }
     // Non-decimal integer literals `0x…`/`0o…`/`0b…`
-    // (StringNumericLiteral; no sign allowed). Fold digits into an f64 so
-    // arbitrarily long literals don't overflow.
+    // (StringNumericLiteral; no sign allowed), correctly rounded exactly as
+    // the same literal in source is — see `non_decimal_digits_to_f64`.
     let radix = match t.as_bytes() {
         [b'0', b'x' | b'X', ..] => Some((16u32, &t[2..])),
         [b'0', b'o' | b'O', ..] => Some((8, &t[2..])),
@@ -485,14 +485,10 @@ pub(crate) fn string_to_number(s: &str) -> f64 {
         _ => None,
     };
     if let Some((base, digits)) = radix {
-        let mut acc = 0.0f64;
-        for c in digits.chars() {
-            match c.to_digit(base) {
-                Some(d) => acc = acc * base as f64 + d as f64,
-                None => return f64::NAN,
-            }
+        if digits.is_empty() || !digits.chars().all(|c| c.is_digit(base)) {
+            return f64::NAN;
         }
-        return if digits.is_empty() { f64::NAN } else { acc };
+        return crate::parse::lexer::non_decimal_digits_to_f64(digits.as_bytes(), base);
     }
     // The only Infinity spellings a StringNumericLiteral accepts are these
     // exact capital-I forms.

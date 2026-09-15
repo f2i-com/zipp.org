@@ -60,6 +60,27 @@ fn binary_prec(p: Punct, ctx: &Ctx) -> Option<(u8, BinaryOp)> {
     Some(v)
 }
 
+/// `e` is an ArrowFunction whose own text begins at `start`, the first token of
+/// the operand it was parsed as — i.e. NOT parenthesized. Parentheses leave no
+/// trace in the AST, so the span is what tells the legal `(() => {}) + 1`
+/// from the out-of-grammar `() => {} + 1`.
+fn is_bare_arrow(e: &Expr, start: u32) -> bool {
+    matches!(e, Expr::Arrow(a) if a.span.start == start)
+}
+
+/// An ArrowFunction is an AssignmentExpression, never an operand: no unary,
+/// binary, logical or `new` operator may take a bare one (`!() => 1`,
+/// `y || () => 1`, `1 + () => 1` are all SyntaxErrors).
+fn reject_bare_arrow_operand(e: &Expr, start: u32) -> PResult<()> {
+    if is_bare_arrow(e, start) {
+        return Err(SyntaxError::new(
+            "SyntaxError: an arrow function cannot be an operand without parentheses",
+            start,
+        ));
+    }
+    Ok(())
+}
+
 fn assign_op(p: Punct) -> Option<AssignOp> {
     use AssignOp as A;
     Some(match p {
@@ -176,6 +197,14 @@ impl<'s> Parser<'s> {
             }
         }
 
+        // An ArrowFunction is never an assignment target, so no `=`-family
+        // operator binds to one. Without this, a following regex literal that
+        // starts with `=` was read as the `/=` operator: `f = () => {}` and
+        // then `/=/.test("=")` on the next line reported an unterminated regex.
+        if is_bare_arrow(&lhs, start) {
+            self.cover.pattern_only = outer_po.or(self.cover.pattern_only.take());
+            return Ok(lhs);
+        }
         let Some(op) = self.cur().kind.as_punct().and_then(assign_op) else {
             // No `=` follows here — but the expression may STILL become a
             // pattern in an enclosing context (`({style = ''}) => …` reaches
@@ -211,7 +240,13 @@ impl<'s> Parser<'s> {
                 start,
             ));
         }
-        let value = self.parse_assign()?;
+        // The VALUE of an assignment is an expression in every reading: no
+        // enclosing conversion ever refines it into a pattern, so a
+        // CoverInitializedName inside it is final HERE. Left to propagate, it
+        // was wiped by the next enclosing `=` (which discharges its own LHS's
+        // records): `({a = {b = 1}} = {})` and `[a = {b = 1}] = []` ran with
+        // the inner initializer silently dropped.
+        let value = self.parse_assign_full()?;
         Ok(Expr::Assign {
             op,
             target,
@@ -334,8 +369,13 @@ impl<'s> Parser<'s> {
     // ---- conditional / binary ---------------------------------------------
 
     fn parse_conditional(&mut self) -> PResult<Expr> {
+        let start = self.cur().span.start;
         let test = self.parse_nullish(0)?;
-        if !self.at(Punct::Question) {
+        // A bare arrow ends the AssignmentExpression it heads: no `?` may
+        // follow one (`(a) => {} ? 1 : 2` has no parse), and a `?` on the next
+        // line is left to ASI. Every operator loop below stops the same way —
+        // see `parse_binary_inner`.
+        if !self.at(Punct::Question) || is_bare_arrow(&test, start) {
             return Ok(test);
         }
         self.bump_before_operand()?;
@@ -365,8 +405,9 @@ impl<'s> Parser<'s> {
     /// NEXT token (the previous implementation) got the parenthesized case
     /// wrong, because by then the parens were invisible.
     fn parse_nullish(&mut self, _min: u8) -> PResult<Expr> {
+        let start = self.cur().span.start;
         let (mut left, saw_logical) = self.parse_or_chain()?;
-        if !self.at(Punct::QuestionQuestion) {
+        if !self.at(Punct::QuestionQuestion) || is_bare_arrow(&left, start) {
             return Ok(left);
         }
         if saw_logical {
@@ -379,7 +420,9 @@ impl<'s> Parser<'s> {
             self.check_syntax_chain(links)?;
             links += 1;
             self.bump_before_operand()?;
+            let right_start = self.cur().span.start;
             let (right, saw) = self.parse_or_chain()?;
+            reject_bare_arrow_operand(&right, right_start)?;
             if saw {
                 return Err(self.err_here(
                     "SyntaxError: '??' cannot be mixed with '||' or '&&' without parentheses",
@@ -395,14 +438,21 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_or_chain(&mut self) -> PResult<(Expr, bool)> {
+        let start = self.cur().span.start;
         let (mut left, mut saw) = self.parse_and_chain()?;
+        if is_bare_arrow(&left, start) {
+            return Ok((left, saw));
+        }
         let mut links = 0usize;
         while self.at(Punct::PipePipe) {
             self.check_syntax_chain(links)?;
             links += 1;
             saw = true;
             self.bump_before_operand()?;
-            let (right, _) = self.parse_and_chain()?;
+            let right_start = self.cur().span.start;
+            // An `&&` arm is a sibling subtree, not more links of this spine.
+            let (right, _) = self.with_operand_height(|p| p.parse_and_chain())?;
+            reject_bare_arrow_operand(&right, right_start)?;
             left = Expr::Logical {
                 op: LogicalOp::Or,
                 left: Box::new(left),
@@ -413,15 +463,21 @@ impl<'s> Parser<'s> {
     }
 
     fn parse_and_chain(&mut self) -> PResult<(Expr, bool)> {
+        let start = self.cur().span.start;
         let mut left = self.parse_binary(4)?;
         let mut saw = false;
+        if is_bare_arrow(&left, start) {
+            return Ok((left, saw));
+        }
         let mut links = 0usize;
         while self.at(Punct::AmpAmp) {
             self.check_syntax_chain(links)?;
             links += 1;
             saw = true;
             self.bump_before_operand()?;
+            let right_start = self.cur().span.start;
             let right = self.parse_binary(4)?;
+            reject_bare_arrow_operand(&right, right_start)?;
             left = Expr::Logical {
                 op: LogicalOp::And,
                 left: Box::new(left),
@@ -443,6 +499,7 @@ impl<'s> Parser<'s> {
         // relational's own precedence) and only with `[+In]`. Parsing it as a
         // primary let `typeof #f in o`, `-#f in o`, `1 + #f in o` and
         // `for (#f in o;;)` through.
+        let start = self.cur().span.start;
         let mut left = if min <= 9 && self.ctx.in_ {
             match self.try_parse_private_in()? {
                 Some(e) => e,
@@ -451,6 +508,15 @@ impl<'s> Parser<'s> {
         } else {
             self.parse_unary()?
         };
+        // `AssignmentExpression : ArrowFunction` — a bare arrow is no operand,
+        // so it takes no operator either. Stopping here hands the next token
+        // back to the statement: on a new line ASI applies (`var f = () =>
+        // {}` then a line starting `-1` or `/re/` is two statements, and the
+        // `-1` was silently making `f` the number NaN), and on the same line
+        // the terminator check rejects it (`() => {} + 1`).
+        if is_bare_arrow(&left, start) {
+            return Ok(left);
+        }
         let mut links = 0usize;
         loop {
             // `in` and `instanceof` are keywords at binary precedence, and `in`
@@ -479,7 +545,9 @@ impl<'s> Parser<'s> {
             // `**` is RIGHT-associative, so its right operand accepts the same
             // precedence rather than one higher.
             let next_min = if op == BinaryOp::Exp { prec } else { prec + 1 };
+            let right_start = self.cur().span.start;
             let right = self.parse_binary(next_min)?;
+            reject_bare_arrow_operand(&right, right_start)?;
             left = Expr::Binary {
                 op,
                 left: Box::new(left),
@@ -549,7 +617,9 @@ impl<'s> Parser<'s> {
         };
         if let Some(op) = op {
             self.bump_before_operand()?;
+            let arg_start = self.cur().span.start;
             let arg = self.parse_unary()?;
+            reject_bare_arrow_operand(&arg, arg_start)?;
             // `-a ** b` is a SyntaxError: the operand of `**` may not be an
             // unparenthesized unary expression.
             if self.at(Punct::StarStar) {
@@ -570,7 +640,9 @@ impl<'s> Parser<'s> {
             if self.at_kw(kw) {
                 let pos = self.cur().span.start;
                 self.bump_before_operand()?;
+                let arg_start = self.cur().span.start;
                 let arg = self.parse_unary()?;
+                reject_bare_arrow_operand(&arg, arg_start)?;
                 if self.at(Punct::StarStar) {
                     return Err(self
                         .err_here("SyntaxError: unary operator before '**' requires parentheses"));
@@ -584,8 +656,16 @@ impl<'s> Parser<'s> {
                             pos,
                         ));
                     }
-                    // `delete this.#x` is always a SyntaxError.
-                    if let Expr::Member(m) = &arg {
+                    // `delete this.#x` is always a SyntaxError, and so is
+                    // `OptionalExpression … . PrivateIdentifier`: the chain
+                    // wrapper holds the whole chain, whose OUTERMOST link is
+                    // what `delete` would remove (`delete this?.#x.y` deletes
+                    // a public `y` and is fine).
+                    let deleted = match &arg {
+                        Expr::Chain(inner) => &**inner,
+                        other => other,
+                    };
+                    if let Expr::Member(m) = deleted {
                         if matches!(m.prop, MemberProp::Private(_)) {
                             return Err(SyntaxError::new(
                                 "SyntaxError: private fields cannot be deleted",
@@ -603,7 +683,9 @@ impl<'s> Parser<'s> {
         if self.ctx.await_ && self.at_kw(Keyword::Await) {
             let pos = self.cur().span.start;
             self.bump_before_operand()?;
+            let arg_start = self.cur().span.start;
             let arg = self.parse_unary()?;
+            reject_bare_arrow_operand(&arg, arg_start)?;
             // `ExponentiationExpression : UpdateExpression ** …` — an
             // AwaitExpression is a UnaryExpression, so it is no more legal as an
             // unparenthesized `**` base than `-a ** b` is.
@@ -687,6 +769,18 @@ impl<'s> Parser<'s> {
         // (staging/sm/Function/function-name-computed-01.js).
         if matches!(&e, Expr::Arrow(a) if a.span.start == lhs_start) {
             return Ok(e);
+        }
+        // `super` is no PrimaryExpression: it exists only as the head of a
+        // SuperProperty (`super.x`, `super[x]`) or a SuperCall (`super(…)`).
+        // A bare one — `(super).x`, `super + 1`, `` super`t` `` — has no
+        // parse. (`super?.x` keeps its own message in the loop below.)
+        if matches!(&e, Expr::Super)
+            && !(self.at(Punct::Dot)
+                || self.at(Punct::LBracket)
+                || self.at(Punct::LParen)
+                || self.at(Punct::QuestionDot))
+        {
+            return Err(self.err_here("SyntaxError: 'super' keyword unexpected here"));
         }
         // A CoverInitializedName (`{a = 1}`) and a duplicate `__proto__` are legal
         // only while the literal holding them may still be REFINED into a
@@ -872,6 +966,7 @@ impl<'s> Parser<'s> {
         // there the ImportCall is a PrimaryExpression, hence a MemberExpression,
         // and the failure is a runtime TypeError.
         let bare_import = self.at_kw(Keyword::Import);
+        let callee_start = self.cur().span.start;
         // The callee is a MemberExpression — it takes member accesses but NOT
         // calls, so `new a.b()` applies `new` to `a.b`, not to `a.b()`.
         let mut callee = if self.at_kw(Keyword::New) {
@@ -879,6 +974,15 @@ impl<'s> Parser<'s> {
         } else {
             self.parse_primary()?
         };
+        // A bare parenthesized arrow is an AssignmentExpression, never a
+        // MemberExpression: `new () => {}` has no parse, with or without a
+        // member suffix (`new (() => {})` is a runtime TypeError).
+        if matches!(&callee, Expr::Arrow(a) if a.span.start == callee_start) {
+            return Err(SyntaxError::new(
+                "SyntaxError: an arrow function cannot be the target of 'new'",
+                callee_start,
+            ));
+        }
         // `new import(…)` / `new import.defer(…)`: an ImportCall is a
         // CallExpression, and `new` takes a MemberExpression, so it can never be
         // the callee. Checked BEFORE the member loop so `new import('m').p` is
@@ -909,7 +1013,9 @@ impl<'s> Parser<'s> {
                 self.check_syntax_chain(links)?;
                 links += 1;
                 self.bump_before_operand()?;
-                let idx = self.parse_expr()?;
+                // `[ Expression[+In] ]`, finalized like every other computed
+                // member: `for (var x = new a['b' in c];;)` is legal.
+                let idx = self.with_in(|p| p.parse_expr_full())?;
                 self.expect(Punct::RBracket, false)?;
                 callee = Expr::Member(Box::new(Member {
                     object: callee,
@@ -930,6 +1036,14 @@ impl<'s> Parser<'s> {
             } else {
                 break;
             }
+        }
+        // `new super` / `new super()`: a bare `super` is no MemberExpression
+        // (only `super.x` / `super[x]` are), and `new` cannot take a SuperCall.
+        if matches!(&callee, Expr::Super) {
+            return Err(SyntaxError::new(
+                "SyntaxError: 'super' keyword unexpected here",
+                pos,
+            ));
         }
         // `new a?.b()` is a SyntaxError — an optional chain is not a valid
         // constructor.
@@ -1363,10 +1477,7 @@ impl<'s> Parser<'s> {
         else {
             return Err(self.err_here("SyntaxError: expected a template literal"));
         };
-        quasis.push(TemplateElement {
-            cooked,
-            raw: raw.into_boxed_str(),
-        });
+        quasis.push(TemplateElement { cooked, raw });
         let mut done = tail;
         // A head chunk ending in `${` is followed by an Expression, so a `/`
         // there is a regex; a TemplateTail is an operand, so it is division.
@@ -1389,10 +1500,7 @@ impl<'s> Parser<'s> {
             else {
                 return Err(self.err_here("SyntaxError: malformed template literal"));
             };
-            quasis.push(TemplateElement {
-                cooked,
-                raw: raw.into_boxed_str(),
-            });
+            quasis.push(TemplateElement { cooked, raw });
             done = tail;
         }
         self.ctx.in_ = saved_in;
@@ -1406,6 +1514,7 @@ impl<'s> Parser<'s> {
         self.ctx.in_ = true;
         let mut items: Vec<Option<ArrayElem>> = Vec::new();
         let mut rest_comma = false;
+        let mut paren_name = false;
         loop {
             if self.at(Punct::RBracket) {
                 break;
@@ -1416,7 +1525,7 @@ impl<'s> Parser<'s> {
                 items.push(None);
                 continue;
             }
-            if self.at(Punct::DotDotDot) {
+            let e = if self.at(Punct::DotDotDot) {
                 let pos = self.cur().span.start;
                 self.bump_before_operand()?;
                 let _ = pos;
@@ -1425,10 +1534,16 @@ impl<'s> Parser<'s> {
                 // PATTERN reading, and `expr_to_target`/`expr_to_pattern`
                 // enforce it during conversion — recording it here as a cover
                 // error rejected valid literals.
-                items.push(Some(ArrayElem::Spread(self.parse_assign()?)));
+                ArrayElem::Spread(self.parse_assign()?)
             } else {
-                items.push(Some(ArrayElem::Expr(self.parse_assign()?)));
+                ArrayElem::Expr(self.parse_assign()?)
+            };
+            // The flag still describes the element just parsed: the primary
+            // that produced a lone identifier is the last thing it consumed.
+            if let ArrayElem::Expr(Expr::Ident(_)) | ArrayElem::Spread(Expr::Ident(_)) = &e {
+                paren_name |= self.parenthesized;
             }
+            items.push(Some(e));
             if !self.eat(Punct::Comma, true)? {
                 break;
             }
@@ -1447,6 +1562,7 @@ impl<'s> Parser<'s> {
             LiteralFlags {
                 rest_comma,
                 parenthesized: false,
+                paren_name,
             },
         ))
     }
@@ -1460,10 +1576,14 @@ impl<'s> Parser<'s> {
         let mut rest_comma = false;
         let mut proto_count = 0usize;
         let mut proto_pos = 0u32;
+        let mut paren_name = false;
         while !self.at(Punct::RBrace) {
             if self.at(Punct::DotDotDot) {
                 self.bump_before_operand()?;
-                members.push(ObjectMember::Spread(self.parse_assign()?));
+                let e = self.parse_assign()?;
+                // See `parse_array_literal`.
+                paren_name |= matches!(e, Expr::Ident(_)) && self.parenthesized;
+                members.push(ObjectMember::Spread(e));
             } else {
                 let (m, is_proto, pos) = self.parse_object_member()?;
                 if is_proto {
@@ -1471,6 +1591,17 @@ impl<'s> Parser<'s> {
                     if proto_count == 2 {
                         proto_pos = pos;
                     }
+                }
+                // Only a `k: v` value was just parsed as an expression; a
+                // shorthand name is re-read from the key and never clears the
+                // flag, so it must not consult it.
+                if let ObjectMember::Prop {
+                    value: Expr::Ident(_),
+                    shorthand: false,
+                    ..
+                } = &m
+                {
+                    paren_name |= self.parenthesized;
                 }
                 members.push(m);
             }
@@ -1501,6 +1632,7 @@ impl<'s> Parser<'s> {
             LiteralFlags {
                 rest_comma,
                 parenthesized: false,
+                paren_name,
             },
         ))
     }
@@ -1631,7 +1763,10 @@ impl<'s> Parser<'s> {
         let mut init = None;
         if self.at(Punct::Eq) {
             self.bump_before_operand()?;
-            init = Some(self.parse_assign()?);
+            // The Initializer is an expression whether or not this literal
+            // becomes a pattern, so its own records are final (see the
+            // assignment VALUE in `parse_assign_inner`).
+            init = Some(self.parse_assign_full()?);
             // Legal ONLY if this literal turns out to be a destructuring
             // target, so it fires when the region resolves to an EXPRESSION —
             // in arrow params (`({a = 1}) => …`) it is a default and fine.
@@ -1715,7 +1850,12 @@ impl<'s> Parser<'s> {
             }
             TokenKind::Punct(Punct::LBracket) => {
                 self.bump_before_operand()?;
-                let e = self.parse_assign()?;
+                // `ComputedPropertyName : [ AssignmentExpression[+In] ]`. It
+                // is an expression in every reading — a destructuring
+                // conversion keeps the key as it is — so a CoverInitializedName
+                // inside it can never be discharged and is finalized here:
+                // `({[{a = 1}]: x} = {})` is an error.
+                let e = self.with_in(|p| p.parse_assign_full())?;
                 self.expect(Punct::RBracket, false)?;
                 Ok(PropKey::Computed(e))
             }

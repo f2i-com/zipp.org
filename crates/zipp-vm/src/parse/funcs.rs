@@ -337,9 +337,10 @@ impl<'s> Parser<'s> {
             } else {
                 let p = self.parse_binding_pattern()?;
                 if self.eat(Punct::Eq, true)? {
+                    // An Initializer is `[+In]` even inside a `for` head.
                     Pattern::Assign {
                         left: Box::new(p),
-                        right: Box::new(self.parse_assign_full()?),
+                        right: Box::new(self.with_in(|p| p.parse_assign_full())?),
                     }
                 } else {
                     p
@@ -411,7 +412,7 @@ impl<'s> Parser<'s> {
             let value = if self.eat(Punct::Eq, true)? {
                 Pattern::Assign {
                     left: Box::new(value),
-                    right: Box::new(self.parse_assign_full()?),
+                    right: Box::new(self.with_in(|p| p.parse_assign_full())?),
                 }
             } else {
                 value
@@ -438,7 +439,8 @@ impl<'s> Parser<'s> {
         let mut out = Vec::new();
         while self.at(Punct::At) {
             self.bump_before_operand()?; // `@` — an operand follows
-            out.push(self.parse_decorator()?);
+            // Each decorator is a sibling, not a link of one spine.
+            out.push(self.with_operand_height(|p| p.parse_decorator())?);
         }
         Ok(out)
     }
@@ -471,7 +473,8 @@ impl<'s> Parser<'s> {
             self.bump_before_operand()?;
             let saved_in = self.ctx.in_;
             self.ctx.in_ = true;
-            let e = self.parse_expr()?;
+            // Never a pattern, so finalized like any full Expression.
+            let e = self.parse_expr_full()?;
             self.ctx.in_ = saved_in;
             self.expect(Punct::RParen, false)?;
             return Ok(e);
@@ -480,7 +483,11 @@ impl<'s> Parser<'s> {
         // number of `.IdentifierName` / `.PrivateIdentifier` hops.
         let (name, _) = self.binding_ident_or_reference()?;
         let mut e = Expr::Ident(name);
+        // A left-deep spine like any member chain, so it is bounded like one.
+        let mut links = 0usize;
         while self.at(Punct::Dot) {
+            self.check_syntax_chain(links)?;
+            links += 1;
             self.bump_after_operand()?;
             let prop = self.member_prop_public()?;
             e = Expr::Member(Box::new(Member {
@@ -527,7 +534,15 @@ impl<'s> Parser<'s> {
             None
         };
         let superclass = if self.eat_kw(Keyword::Extends, true)? {
+            // The heritage is an expression whatever the class sits in, so a
+            // CoverInitializedName inside it (`class extends {b = 1} {}`) is
+            // final here rather than left for an enclosing `=` to discharge.
+            let outer_po = self.cover.pattern_only.take();
             let sup = self.parse_lhs_public()?;
+            if let Some(err) = self.cover.pattern_only.take() {
+                return Err(err);
+            }
+            self.cover.pattern_only = outer_po;
             // `ClassHeritage : extends LeftHandSideExpression`. An ArrowFunction
             // is an AssignmentExpression and no LHS, so `class extends () => {}
             // {}` has no parse at all — but the LHS parser reaches one anyway,
@@ -700,8 +715,13 @@ impl<'s> Parser<'s> {
     /// member, while `extends a + b` and `extends a => a` are syntax errors.
     /// Parsing it as an AssignmentExpression accepted both, and turned
     /// `class C extends () => {} {}` into a runtime TypeError instead.
+    ///
+    /// Counted as a recursive production: a ClassExpression is itself a
+    /// LeftHandSideExpression, so `class extends class extends … {} {}` nests
+    /// through `parse_primary` without passing any other guarded entry point,
+    /// and 100,000 of them overflowed the native stack.
     fn parse_lhs_public(&mut self) -> PResult<Expr> {
-        self.parse_lhs()
+        self.with_syntax_recursion(|p| p.parse_lhs())
     }
 
     fn parse_class_member(&mut self, derived: bool) -> PResult<ClassMember> {

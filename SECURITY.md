@@ -100,6 +100,13 @@ or unsafe-code trust boundary.
 Treat those aliases as defense in depth, not as substitutes for the separately
 built `zipp-sandbox` artifact.
 
+The default (JIT) profile bounds source nesting as well — parser recursion,
+expression chains and the finished tree's depth — so a deeply nested script,
+`eval` or `Function` source fails with a catchable RangeError instead of
+overflowing the native stack. Those bounds are sized for the CLI's 256 MiB
+interpreter thread: an embedder that compiles guest-supplied source with the
+default features should run the engine on a thread with a comparable stack.
+
 ### WebAssembly embedding
 
 For deployments that cannot use an OS VM, the recommended boundary is

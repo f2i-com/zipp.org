@@ -35,6 +35,21 @@ impl<'p> Vm<'p> {
         // release-PGO execution mode.
         self.require_external_code_enabled()?;
         self.preflight_native_iteration_work(args.len() as u64)?;
+        // A piece that is a string holding a lone surrogate also contributes
+        // its EXACT WTF-8 bytes, so the assembled source parses exactly — the
+        // same side channel a direct `eval` passes (`do_eval`'s `exact_src`).
+        // `to_js_string` is lossy, but only at those code units: U+FFFD and a
+        // WTF-8 surrogate are both three bytes, so the two stay aligned.
+        // `None` (nothing allocated) for every well-formed piece.
+        let exact_of = |vm: &Self, v: Value| -> Option<Vec<u8>> {
+            if v.is_heap() {
+                vm.heap.str_exact_if_not_wellformed(v.heap_index())
+            } else {
+                None
+            }
+        };
+        let mut exact_params: Option<Vec<u8>> = None;
+        let mut exact_body: Option<Vec<u8>> = None;
         let (params, body) = if args.is_empty() {
             (String::new(), String::new())
         } else {
@@ -48,11 +63,26 @@ impl<'p> Vm<'p> {
             for (i, a) in args[..args.len() - 1].iter().enumerate() {
                 if i != 0 {
                     self.append_guest_string(&mut params, ",")?;
+                    if let Some(e) = exact_params.as_mut() {
+                        e.push(b',');
+                    }
                 }
                 let part = self.to_js_string(*a)?;
+                match (exact_of(self, *a), exact_params.as_mut()) {
+                    (Some(x), Some(e)) => e.extend_from_slice(&x),
+                    (Some(x), None) => {
+                        let mut e = params.as_bytes().to_vec();
+                        e.extend_from_slice(&x);
+                        exact_params = Some(e);
+                    }
+                    (None, Some(e)) => e.extend_from_slice(part.as_bytes()),
+                    (None, None) => {}
+                }
                 self.append_guest_string(&mut params, &part)?;
             }
-            let body = self.to_js_string(args[args.len() - 1])?;
+            let last = args[args.len() - 1];
+            let body = self.to_js_string(last)?;
+            exact_body = exact_of(self, last);
             (params, body)
         };
         let prefix = match kind {
@@ -94,7 +124,7 @@ impl<'p> Vm<'p> {
         // (invalid-parameter-list.js). Lexer-level messages carry no
         // "SyntaxError:" prefix — add it so the error classifies correctly.
         crate::parse::stmt::parse_standalone_params(&params).map_err(|e| {
-            Thrown(if e.msg.starts_with("SyntaxError") {
+            Thrown(if e.msg.starts_with("SyntaxError") || e.msg.starts_with("RangeError") {
                 e.msg
             } else {
                 format!("SyntaxError: {}", e.msg)
@@ -112,6 +142,18 @@ impl<'p> Vm<'p> {
         source.push_str(&body);
         source.push_str(SOURCE_CLOSE);
         debug_assert_eq!(source.len(), source_len);
+        let exact_source = (exact_params.is_some() || exact_body.is_some()).then(|| {
+            let mut e = Vec::with_capacity(source_len);
+            e.extend_from_slice(SOURCE_OPEN.as_bytes());
+            e.extend_from_slice(prefix.as_bytes());
+            e.extend_from_slice(NAME_OPEN.as_bytes());
+            e.extend_from_slice(exact_params.as_deref().unwrap_or(params.as_bytes()));
+            e.extend_from_slice(PARAM_BODY_SEP.as_bytes());
+            e.extend_from_slice(exact_body.as_deref().unwrap_or(body.as_bytes()));
+            e.extend_from_slice(SOURCE_CLOSE.as_bytes());
+            debug_assert_eq!(e.len(), source.len());
+            e
+        });
         // CreateDynamicFunction builds the function from the separately-parsed
         // params/body, so the "anonymous" name is SetFunctionName only — NO
         // self-name binding (`typeof anonymous` inside is "undefined",
@@ -135,7 +177,7 @@ impl<'p> Vm<'p> {
             Vec::new(),
             None,
             None,
-            None,
+            exact_source.as_deref(),
         )
     }
 
