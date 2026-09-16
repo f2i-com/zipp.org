@@ -1040,6 +1040,14 @@ def _finite(values):
     return all(math.isfinite(v) for v in values)
 
 
+def _length(values):
+    return _k.size(values) if _k is not None and isinstance(values, _k.Storage) else len(values)
+
+
+def _as_list(values):
+    return _k.to_list(values) if _k is not None and isinstance(values, _k.Storage) else list(values)
+
+
 class Session:
     """A prepared program whose tensors stay on the device between runs (see `Graph.prepare`)."""
 
@@ -1161,7 +1169,12 @@ class Session:
             if _k is not None and isinstance(value, _k.Storage):
                 if _k.dtype(value) != "float32":
                     raise GraphError("Tensor storage must be float32")
-                if not _k.all_finite(value):
+                # A host checks every fed value before any device work (a
+                # non-finite one fails the run with NUMBER); the reference
+                # checks here, as its carried tensors would otherwise take
+                # the poison. Scanning 50k floats costs milliseconds in the
+                # guest, so a hosted step does not scan twice.
+                if not self._hosted and not _k.all_finite(value):
                     raise GraphError("Only finite float32 values are supported")
                 flat, count = value, _k.size(value)
             else:
@@ -1191,6 +1204,12 @@ class Session:
         for this run (Adam's bias correction follows it). A host failure calls
         `on_error(ComputeError)` when given and otherwise raises it.
         """
+        return self._run_steps(callback, steps, on_error, readback, step, False)
+
+    def _run_steps(self, callback, steps, on_error, readback, step, storage):
+        # `storage` (Zipp only): each read-back output's `data` is float32
+        # tensor storage instead of a list (how torch.compile takes a step's
+        # result, with no Python float per element).
         self._live()
         if not callable(callback):
             raise TypeError("run() needs a callable to receive the result")
@@ -1217,17 +1236,17 @@ class Session:
             def convert(value):
                 for entry in value["steps"]:
                     for out in entry["outputs"].values():
-                        out["data"] = _host_data(out["data"], False)
+                        out["data"] = _host_data(out["data"], storage)
                 value["outputs"] = value["steps"][-1]["outputs"]
                 self.step = int(value.get("step", self.step + len(steps)))
                 return value
 
             self._request("gpu.session.run", body, lambda reply: self._reply(reply, callback, on_error, convert))
             return None
-        callback(self._run_locally(payload_steps, names, step))
+        callback(self._run_locally(payload_steps, names, step, storage))
         return None
 
-    def _run_locally(self, payload_steps, names, step):
+    def _run_locally(self, payload_steps, names, step, storage=False):
         first = self.step if step is None else step
         base = self._program
         carries = {node["carry"]: node["id"] for node in base["nodes"] if node.get("carry") is not None}
@@ -1250,7 +1269,10 @@ class Session:
                     node["step"] = node["step"] + step_no - 1
                 nodes.append(node)
             program = dict(base, nodes=nodes)
-            result = execute_locally(program, False) if _k is None else _execute_kernels(program, False, False)
+            # Under Zipp the kernels keep every output as tensor storage, so a
+            # carried value enters the next step as it came out (no list in
+            # between); the numbers are the reference's bit for bit.
+            result = execute_locally(program, False) if _k is None else _execute_kernels(program, True, False)
             outputs = result["outputs"]
             for name, node_id in carries.items():
                 self._values[node_id] = outputs[name]["data"]
@@ -1258,17 +1280,23 @@ class Session:
                 self._residents[name] = outputs[name]
             read = {}
             for name in names:
-                if not _finite(outputs[name]["data"]):
+                out = outputs[name]
+                if not _finite(out["data"]):
                     raise ComputeError("NUMBER", "Output contains non-finite values")
-                read[name] = outputs[name]
+                # Read-back data is a list unless the caller takes storage.
+                read[name] = out if storage or _k is None else dict(out, data=_as_list(out["data"]))
             results.append({"step": step_no, "outputs": read})
         self.step = first + len(payload_steps)
         return {"version": 1, "backend": "cpu-python", "steps": results, "outputs": results[-1]["outputs"], "step": self.step,
                 "stats": {"steps": len(results), "nodes": len(base["nodes"]),
-                          "readbackElements": sum(len(o["data"]) for r in results for o in r["outputs"].values())}}
+                          "readbackElements": sum(_length(o["data"]) for r in results for o in r["outputs"].values())}}
 
     def download(self, callback, *names, on_error=None):
         """Read resident outputs (tensors or names) into `callback(result)`, `result["outputs"][name]["data"]` a flat list."""
+        return self._download(callback, names, on_error, False)
+
+    def _download(self, callback, names, on_error, storage):
+        # `storage` (Zipp only): each output's `data` as float32 tensor storage the caller owns.
         self._live()
         if not callable(callback):
             raise TypeError("download() needs a callable to receive the result")
@@ -1281,7 +1309,7 @@ class Session:
         if self._hosted:
             def convert(value):
                 for out in value["outputs"].values():
-                    out["data"] = _host_data(out["data"], False)
+                    out["data"] = _host_data(out["data"], storage)
                 return value
 
             self._request("gpu.session.download", {"names": wanted}, lambda reply: self._reply(reply, callback, on_error, convert))
@@ -1296,8 +1324,12 @@ class Session:
                 return None
             out = self._residents[name]
             data = out["data"]
-            outputs[name] = {"shape": list(out["shape"]), "dtype": "float32",
-                             "data": _k.to_list(data) if _k is not None and isinstance(data, _k.Storage) else list(data)}
+            if storage:
+                # A copy: the session keeps carrying its own storage.
+                data = _k.copy(data) if isinstance(data, _k.Storage) else _k.from_flat("float32", data)
+            else:
+                data = _as_list(data)
+            outputs[name] = {"shape": list(out["shape"]), "dtype": "float32", "data": data}
         callback({"version": 1, "backend": "cpu-python", "outputs": outputs})
         return None
 

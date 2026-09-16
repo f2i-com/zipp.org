@@ -1,18 +1,33 @@
 """Bounded asynchronous inference and first-order training graphs.
 
-The host executes float32 forward, backward and update nodes. Parameters and
-optimizer state live on the CPU between submissions; this is not TorchInductor
-or a CUDA device.
+The host executes float32 forward, backward and update nodes. A compiled call
+(`compiled(x, y).submit(cb)`) records a graph per call and keeps parameters
+and optimizer state on the CPU between submissions; a prepared step
+(`compiled.prepare(x, y)`) records once and keeps them on the device between
+steps until `sync()` copies them back. This is not TorchInductor or a CUDA
+device.
 """
 import torch
 import _zipp_tensor as _k
-from zipp_gpu import Graph
+from zipp_gpu import Graph, ComputeError
 
 _active = None
+# Parameters held by a live prepared session, by id: while one holds a
+# parameter, compiled calls and eager optimizer steps on it are refused.
+_resident = {}
 
 
 def active_capture():
     return _active
+
+
+def eager_step(optimizer):
+    """Refuse an eager `optimizer.step()` on parameters a prepared session holds."""
+    if _resident:
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                if id(parameter) in _resident:
+                    raise RuntimeError("Parameter is resident in a prepared GPU session; sync() and dispose() it before an eager optimizer step")
 
 
 def _snapshot(tensor):
@@ -71,9 +86,13 @@ def _step_count(optimizer, parameter):
 
 
 class _Capture:
-    def __init__(self, training=False):
+    def __init__(self, training=False, prepared=False):
         self.graph = Graph()
         self.training = training
+        # A prepared capture records one step that runs many times: optimizer
+        # state that does not exist yet is recorded as zero inputs (so it can
+        # carry), and every state buffer's input is kept for the carry map.
+        self.prepared = prepared
         self.inputs = {}
         self.targets = {}
         self.tape = []
@@ -82,6 +101,7 @@ class _Capture:
         self.grads = {}
         self.updates = []
         self.state_updates = []
+        self.state_inputs = []
         self.state_snapshots = []
         self.step_counts = {}
         self.optimizer = None
@@ -102,6 +122,8 @@ class _Capture:
             if value.dtype != torch.float32:
                 raise TypeError("GPU compilation requires float32 tensors; integer tensors are accepted only as cross_entropy class targets")
             key = id(value)
+            if _resident and key in _resident:
+                raise RuntimeError("Parameter is resident in a prepared GPU session; sync() and dispose() it before recording another step")
             shape = (1, value.shape[0]) if row else tuple(value.shape)
             if key not in self.inputs:
                 # The graph copies the storage (one pass, no Python floats);
@@ -207,7 +229,17 @@ class _Capture:
                                    or tuple(buffer.shape) != tuple(parameter.shape)):
             raise NotImplementedError("GPU optimizer state %r must be a float32 tensor shaped like its parameter" % key)
         self.state_snapshots.append((parameter, key, _snapshot(buffer)))
-        return None if buffer is None else self.graph.tensor(buffer._s, tuple(leaf.shape))
+        if buffer is None and self.prepared:
+            # A prepared step is one program for every step: a buffer that
+            # does not exist yet starts as zeros, recorded as an input so the
+            # step's output can carry into it.
+            symbolic = self.graph.tensor(_k.full("float32", parameter.shape.numel(), 0.0), tuple(leaf.shape))
+        elif buffer is None:
+            return None
+        else:
+            symbolic = self.graph.tensor(buffer._s, tuple(leaf.shape))
+        self.state_inputs.append((parameter, key, symbolic))
+        return symbolic
 
     def _end_step(self):
         if not self.updates:
@@ -223,6 +255,11 @@ class _Capture:
                 # Plain SGD stays within protocol version 1 (see zipp_gpu).
                 self.updates.append((parameter, leaf._value - gradient * group["lr"]))
                 continue
+            had_buffer = (optimizer.state.get(id(parameter)) or {}).get("momentum_buffer") is not None
+            if self.prepared and not had_buffer and group["dampening"]:
+                # A zero buffer reproduces PyTorch's first step (buffer = grad)
+                # only without dampening: momentum * 0 + (1 - 0) * grad is grad.
+                raise NotImplementedError("A prepared SGD step with dampening needs an existing momentum buffer; run one eager or compiled step first")
             buffer = self._state_tensor(optimizer, parameter, leaf, "momentum_buffer")
             # PyTorch clones the first gradient into the buffer; the momentum
             # and dampening weights apply from the second step on.
@@ -537,6 +574,323 @@ class GPUResult:
         raise NotImplementedError("Call loss.backward() inside a torch.compile(training=True) function")
 
 
+def _record(model, training, args, kwargs, prepared=False):
+    """Run `model` once with graph tensors in place of its float tensor arguments."""
+    global _active
+    if _active is not None:
+        raise RuntimeError("Nested compiled training calls are unsupported")
+    capture = _Capture(training, prepared)
+    # Float tensors become graph leaves; integer tensors stay on the CPU
+    # (cross_entropy records its class targets from there).
+    convert = lambda value: capture.tensor(value) if isinstance(value, torch.Tensor) and value.dtype.is_floating_point else value
+    # Eager ops look for graph tensors only while a call records.
+    torch._recording(1)
+    try:
+        _active = capture if training else None
+        with torch.enable_grad() if training else torch.no_grad():
+            output = model(*[convert(value) for value in args], **{key: convert(value) for key, value in kwargs.items()})
+        if not isinstance(output, _Tensor):
+            raise TypeError("Compiled GPU calls must return one supported graph tensor")
+        if training and not capture.did_step:
+            raise RuntimeError("Compiled GPU training must call zero_grad(), backward() and optimizer.step()")
+        return capture, output
+    finally:
+        _active = None
+        torch._recording(-1)
+
+
+class Compiled:
+    """What `torch.compile` returns: call it to record and submit one step, or `prepare` it."""
+
+    def __init__(self, model, training):
+        self._model = model
+        self.training = training
+
+    def __call__(self, *args, **kwargs):
+        capture, output = _record(self._model, self.training, args, kwargs)
+        return GPUResult(output)
+
+    def prepare(self, *args, backend=None, on_ready=None, on_error=None, **kwargs):
+        """Record the step once from this example call and keep it on the device.
+
+        Returns a `Prepared` session. The float tensor arguments and the
+        integer class targets among the arguments are the feeds each step
+        supplies (in the recorded shapes and dtypes); every other tensor the
+        call reads (parameters, constants) is uploaded now. For a training
+        step the parameters, momentum buffers and Adam moments then stay on
+        the device and carry from step to step, and the optimizer's step
+        count advances per executed step; `sync()` copies them back into the
+        model and `optimizer.state`. Non-tensor arguments are recorded as
+        constants and must be passed unchanged to every step.
+
+        `backend` names the backend the host must be running (`"webgpu"`,
+        `"webgl2"`, `"wasm"`, `"cpu-js"`; `"cpu-python"` is the reference
+        without a host), otherwise whatever it has serves. In the playground
+        the host creates the session after the current call returns
+        (`on_ready(prepared)` runs then; steps requested meanwhile are queued
+        behind it); without a host it is ready at once.
+        """
+        return Prepared(self._model, self.training, args, kwargs, backend, on_ready, on_error)
+
+
+class Prepared:
+    """A training (or inference) step recorded once, with its tensors resident on the device.
+
+    `step(callback, *args)` runs one step, `steps(callback, [args, ...])`
+    several in one submission; each callback receives the returned tensor(s)
+    read back. `sync(callback)` downloads weights, optimizer state and the last
+    gradients into the eager model; `dispose()` frees the device tensors.
+    While a session is live its parameters are refused to compiled calls and
+    eager `optimizer.step()`: sync and dispose first. A step that fails on
+    the device poisons the session (only `dispose` remains), since the
+    resident state may have advanced partially.
+    """
+
+    def __init__(self, model, training, args, kwargs, backend, on_ready, on_error):
+        capture, output = _record(model, training, args, kwargs, True)
+        self._capture = capture
+        self.training = training
+        self.shape = output.shape
+        self.backend = None
+        self.stats = None
+        self.executed = 0
+        self._since_sync = 0
+        self._failed = None
+        self._disposed = False
+        self._session = None
+        # The feeds: each float tensor argument and each integer class-target
+        # argument that the recorded step reads, by position or keyword.
+        self._feeds = []
+        self._constants = []
+        feeds = {}
+        optimizer_ids = set(id(p) for p in capture.optimizer_params)
+        for position, value in list(enumerate(args)) + list(kwargs.items()):
+            if not isinstance(value, torch.Tensor):
+                self._constants.append((position, value))
+                continue
+            key = id(value)
+            if value.dtype.is_floating_point:
+                entry = capture.inputs.get(key)
+                if entry is None:
+                    continue
+                if key in optimizer_ids:
+                    raise ValueError("A step argument cannot also be an optimizer parameter")
+                name, node = "f%d" % len(feeds), entry[1]._value
+            else:
+                entry = capture.targets.get(key)
+                if entry is None:
+                    continue
+                name, node = "t%d" % len(feeds), entry[1]
+            feeds[name] = node
+            self._feeds.append((position, name, tuple(value.shape), value.dtype))
+        # Outputs: the result read back each step; per parameter its weight,
+        # optimizer buffers and gradient resident, carried into their inputs.
+        self._leaves = [entry for entry in capture.inputs.values() if id(entry[1]) in capture.grads]
+        for entry in self._leaves:
+            if id(entry[0]) not in optimizer_ids:
+                raise NotImplementedError("A prepared step computes gradients for the optimizer's parameters only; a captured tensor outside the optimizer requires grad")
+        outputs = {"result": output._value}
+        carry = {}
+        for i, entry in enumerate(self._leaves):
+            outputs["grad" + str(i)] = capture.grads[id(entry[1])]
+        for i, (parameter, new_value) in enumerate(capture.updates):
+            outputs["weight" + str(i)] = new_value
+            carry[capture.inputs[id(parameter)][1]._value] = "weight" + str(i)
+        state_inputs = dict(((id(p), key), symbolic) for p, key, symbolic in capture.state_inputs)
+        for i, (parameter, key, new_value) in enumerate(capture.state_updates):
+            outputs["state" + str(i)] = new_value
+            carry[state_inputs[(id(parameter), key)]] = "state" + str(i)
+        if len(outputs) > 64:
+            per_parameter = 2 + len(capture.state_updates) // max(len(capture.updates), 1)
+            raise NotImplementedError(
+                "A prepared %s step needs %d graph outputs (the result, then the weight, gradient and %d optimizer buffer(s) of each of %d parameter tensors); "
+                "the graph protocol allows 64, so prepare() holds at most %d parameter tensors with this optimizer"
+                % (capture.optimizer_kind, len(outputs), per_parameter - 2, len(capture.updates), 63 // per_parameter))
+        self._resident = [name for name in outputs if name != "result"]
+        self._snapshot = None if capture.optimizer is None else _optimizer_configuration(capture.optimizer, capture.optimizer_kind)
+        for parameter in capture.optimizer_params:
+            _resident[id(parameter)] = self
+
+        def ready(session):
+            # Without a host this runs inside `Graph.prepare`, before it returns.
+            self._session = session
+            self.backend = session.backend
+            if on_ready is not None:
+                on_ready(self)
+
+        def failed(error):
+            self._failed = error
+            self._release()
+            if on_error is None:
+                raise error
+            on_error(error)
+
+        try:
+            self._session = capture.graph.prepare(feeds=feeds, carry=carry, resident=self._resident, backend=backend,
+                                                  on_ready=ready, on_error=failed, **outputs)
+        except BaseException:
+            self._release()
+            raise
+
+    @property
+    def feeds(self):
+        """The recorded (shape, dtype) of each fed argument, by position or keyword."""
+        return tuple((position, shape, dtype) for position, name, shape, dtype in self._feeds)
+
+    @property
+    def session(self):
+        return self._session
+
+    def _release(self):
+        for parameter in self._capture.optimizer_params:
+            if _resident.get(id(parameter)) is self:
+                del _resident[id(parameter)]
+
+    def _live(self):
+        if self._disposed:
+            raise RuntimeError("Prepared GPU session has been disposed")
+        if self._failed is not None:
+            raise RuntimeError("Prepared GPU session failed (%s); dispose() it and prepare again" % self._failed)
+        capture = self._capture
+        if capture.optimizer is not None:
+            try:
+                changed = _optimizer_configuration(capture.optimizer, capture.optimizer_kind) != self._snapshot
+            except Exception:
+                changed = True
+            if changed:
+                raise RuntimeError("Optimizer changed since prepare(); sync(), dispose() and prepare again")
+
+    def _step_feeds(self, args, kwargs, index):
+        # A step passes the recorded arguments: tensors of the recorded
+        # shape and dtype where the example had them, constants unchanged.
+        given = {}
+        for position, value in list(enumerate(args)) + list(kwargs.items()):
+            given[position] = value
+        for position, value in self._constants:
+            if position not in given or given[position] != value:
+                raise ValueError("Step %d must pass the recorded non-tensor argument %r unchanged" % (index, position))
+        feeds = {}
+        for position, name, shape, dtype in self._feeds:
+            value = given.get(position)
+            if not isinstance(value, torch.Tensor) or tuple(value.shape) != shape or value.dtype != dtype:
+                raise ValueError("Step %d argument %r must be a %s tensor of shape %s" % (index, position, dtype, list(shape)))
+            feeds[name] = value._s if dtype == torch.float32 else _k.astype(value._s, "float32")
+        return feeds
+
+    def _fail(self, error, on_error):
+        self._failed = error
+        self._release()
+        if on_error is None:
+            raise error
+        on_error(error)
+
+    def _read(self, result_step, index):
+        data = result_step["outputs"]["result"]["data"]
+        if _k.size(data) != torch._numel(self.shape):
+            raise RuntimeError("GPU output of step %d has %d elements, expected shape %s" % (index, _k.size(data), self.shape))
+        return torch.Tensor(data, self.shape, torch.float32)
+
+    def _run(self, callback, batches, on_error, many):
+        if not callable(callback) or (on_error is not None and not callable(on_error)):
+            raise TypeError("step requires a callback and optional error callback")
+        self._live()
+        if not 1 <= len(batches) <= 64:
+            raise ValueError("steps() submits between 1 and 64 steps in one run")
+        feeds = [self._step_feeds(args, kwargs, i) for i, (args, kwargs) in enumerate(batches)]
+        count = len(batches)
+
+        def arrived(result):
+            self.executed += count
+            self._since_sync += count
+            self.backend = result["backend"]
+            self.stats = result.get("stats")
+            try:
+                values = [self._read(entry, i) for i, entry in enumerate(result["steps"])]
+            except Exception as error:
+                self._fail(error, on_error)
+                return
+            callback(values if many else values[0])
+
+        try:
+            self._session._run_steps(arrived, feeds, lambda error: self._fail(error, on_error), None, None, True)
+        except ComputeError as error:
+            self._fail(error, on_error)
+
+    def step(self, callback, *args, on_error=None, **kwargs):
+        """Run one step with these arguments; `callback(result)` receives the returned tensor read back."""
+        return self._run(callback, [(args, kwargs)], on_error, False)
+
+    def steps(self, callback, batches, on_error=None):
+        """Run several steps in one submission: `batches` is a list of argument tuples
+        (or `(args, kwargs)` pairs); `callback(results)` receives one tensor per step."""
+        if not isinstance(batches, (list, tuple)) or not batches:
+            raise TypeError("steps() takes a non-empty list of argument tuples")
+        normalized = []
+        for batch in batches:
+            if isinstance(batch, tuple) and len(batch) == 2 and isinstance(batch[0], tuple) and isinstance(batch[1], dict):
+                normalized.append(batch)
+            elif isinstance(batch, (tuple, list)):
+                normalized.append((tuple(batch), {}))
+            else:
+                normalized.append(((batch,), {}))
+        return self._run(callback, normalized, on_error, True)
+
+    def sync(self, callback, on_error=None):
+        """Download the resident weights, optimizer state and last gradients into the eager tensors.
+
+        Afterwards the model and `optimizer.state` are what the same number of
+        eager `optimizer.step()` calls would have left; the session stays
+        live and keeps training from the same values.
+        """
+        if not callable(callback) or (on_error is not None and not callable(on_error)):
+            raise TypeError("sync requires a callback and optional error callback")
+        self._live()
+        capture = self._capture
+        if capture.optimizer is None or not self._since_sync:
+            callback(self)
+            return None
+
+        def arrived(result):
+            outputs = result["outputs"]
+            try:
+                for name in self._resident:
+                    if not _k.all_finite(outputs[name]["data"]):
+                        raise RuntimeError("GPU training produced non-finite values; parameters were not updated")
+                read = lambda name, shape: torch.Tensor(outputs[name]["data"], shape, torch.float32)
+                for i, (parameter, new_value) in enumerate(capture.updates):
+                    parameter.data = read("weight" + str(i), parameter.shape)
+                for i, (parameter, key, new_value) in enumerate(capture.state_updates):
+                    capture.optimizer.state.setdefault(id(parameter), {})[key] = read("state" + str(i), parameter.shape)
+                for parameter, step in capture.step_counts.items():
+                    # Recorded as the count after one step; the device advanced it per executed step.
+                    capture.optimizer.state[parameter]["step"] = step + self.executed - 1
+                for parameter in capture.optimizer_params:
+                    parameter.grad = None
+                for i, entry in enumerate(self._leaves):
+                    entry[0].grad = read("grad" + str(i), entry[0].shape)
+            except Exception as error:
+                self._fail(error, on_error)
+                return
+            self._since_sync = 0
+            self._snapshot = _optimizer_configuration(capture.optimizer, capture.optimizer_kind)
+            callback(self)
+
+        try:
+            self._session._download(arrived, self._resident, lambda error: self._fail(error, on_error), True)
+        except ComputeError as error:
+            self._fail(error, on_error)
+        return None
+
+    def dispose(self):
+        """Free the device tensors and release the parameters; what was not synced is lost."""
+        if self._disposed:
+            return
+        self._disposed = True
+        self._release()
+        if self._session is not None:
+            self._session.dispose()
+
+
 def compile(model=None, *, backend="zipp_gpu", training=False):
     if backend != "zipp_gpu":
         raise ValueError("The Zipp compile extension supports only backend='zipp_gpu'")
@@ -544,26 +898,4 @@ def compile(model=None, *, backend="zipp_gpu", training=False):
         return lambda fn: compile(fn, backend=backend, training=training)
     if not callable(model):
         raise TypeError("torch.compile requires a callable or nn.Module")
-    def invoke(*args, **kwargs):
-        global _active
-        if _active is not None:
-            raise RuntimeError("Nested compiled training calls are unsupported")
-        capture = _Capture(training)
-        # Float tensors become graph leaves; integer tensors stay on the CPU
-        # (cross_entropy records its class targets from there).
-        convert = lambda value: capture.tensor(value) if isinstance(value, torch.Tensor) and value.dtype.is_floating_point else value
-        # Eager ops look for graph tensors only while a call records.
-        torch._recording(1)
-        try:
-            _active = capture if training else None
-            with torch.enable_grad() if training else torch.no_grad():
-                output = model(*[convert(value) for value in args], **{key: convert(value) for key, value in kwargs.items()})
-            if not isinstance(output, _Tensor):
-                raise TypeError("Compiled GPU calls must return one supported graph tensor")
-            if training and not capture.did_step:
-                raise RuntimeError("Compiled GPU training must call zero_grad(), backward() and optimizer.step()")
-            return GPUResult(output)
-        finally:
-            _active = None
-            torch._recording(-1)
-    return invoke
+    return Compiled(model, training)
