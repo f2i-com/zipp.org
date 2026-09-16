@@ -274,6 +274,55 @@ print("prepared", session.backend)
     runtime.dispose();
     e2.dispose();
   }
+
+  // ---- a poisoned hosted session is still disposed on the host -----------------------------
+  // The second run's second step fails inside the backend after its first step advanced the
+  // carry: the host poisons the session and says so in the reply; Python's wrapper refuses
+  // further runs with STATE, and its dispose() must still reach the host, or the handler
+  // keeps the session (and its resident tensors) until the whole generation is torn down.
+  {
+    const { ComputeRuntime } = await import(pathToFileURL(path.join(gpuLab, "src", "runtime.mjs")).href);
+    const { CPUBackend } = await import(pathToFileURL(path.join(gpuLab, "src", "backends", "cpu.mjs")).href);
+    const { ComputeError } = await import(pathToFileURL(path.join(gpuLab, "src", "graph.mjs")).href);
+    class Fail extends CPUBackend {
+      constructor() { super(); this.adds = 0; }
+      async run(n, r) { if (n.op === "add" && ++this.adds === 3) throw new ComputeError("BACKEND", "device lost"); return super.run(n, r); }
+    }
+    const e = new Engine();
+    const runtime = new ComputeRuntime(new Fail());
+    const adapter = createPythonGPUAdapter(e, runtime, { allowExecute: true, maxSessions: 2 });
+    e.initPythonProject({ main: `from zipp_gpu import Graph, ComputeError
+g = Graph(); a = g.tensor([1.0, 1.0]); x = g.tensor([0.0, 0.0]); nxt = a + x
+events = []
+s = g.prepare(feeds={"x": x}, carry={a: nxt}, on_ready=lambda s: events.append("ready " + s.backend),
+              on_error=lambda e: events.append("create failed " + e.code), next=nxt)
+s.run(lambda r: events.append("step 1 " + str(r["outputs"]["next"]["data"])), on_error=lambda e: events.append("run 1 failed " + e.code), x=[1.0, 1.0])
+def failed(e):
+    events.append("run 2 failed " + e.code)
+    try:
+        s.run(print, x=[1.0, 1.0])
+    except ComputeError as err:
+        events.append("then " + err.code)
+    s.dispose()
+    events.append("disposed")
+s.run_steps(lambda r: events.append("run 2 succeeded?!"), [{"x": [1.0, 1.0]}, {"x": [1.0, 1.0]}], on_error=failed)
+def report():
+    print(*events, sep="; ")
+` }, "main");
+    const kinds = [];
+    for (let i = 0; i < 12 && (adapter.pending || i === 0 || e.pythonCall("__zipp_py_pending_host", []) > 0); i++) {
+      for (const r of e.takeHostRequests()) { kinds.push(r.kind); adapter.admit(r).catch(() => {}); }
+      await adapter.idle();
+    }
+    e.pythonCall("report", []);
+    eq("poisoned host session: the failed run says BACKEND, the next run is refused with STATE, dispose completes", e.takeOutput(),
+      ["ready cpu-js; step 1 [2.0, 2.0]; run 2 failed BACKEND; then STATE; disposed"]);
+    eq("poisoned host session: create, two runs and the dispose reached the host", kinds,
+      ["gpu.session.create", "gpu.session.run", "gpu.session.run", "gpu.session.dispose"]);
+    ok("poisoned host session: the handler and the runtime hold no session after Python's dispose()",
+      adapter.sessions === 0 && runtime.sessions.size === 0, ` adapter ${adapter.sessions} runtime ${runtime.sessions.size}`);
+    adapter.invalidate(); runtime.dispose(); e.dispose();
+  }
 }
 
 main().then(() => {

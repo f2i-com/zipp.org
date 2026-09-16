@@ -1361,7 +1361,11 @@ class Session:
             return
         self._disposed = True
         if self._hosted:
-            if self._failed is None:
+            # Creation pending: the dispose queues behind the create reply.
+            # Created, healthy or poisoned: the host session and its resident
+            # tensors exist and must be released. Only a failed creation left
+            # nothing on the host to dispose.
+            if self._id is not None or self._failed is None:
                 self._request("gpu.session.dispose", {}, lambda reply: None)
             return
         self._values = {}
