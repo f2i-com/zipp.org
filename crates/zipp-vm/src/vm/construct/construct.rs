@@ -1000,11 +1000,13 @@ impl<'p> Vm<'p> {
         if new_target.is_heap() && new_target != cv {
             let p = self.get_prop(new_target, "prototype")?;
             if self.is_object_value(p) {
+                self.note_class_instance_reproto(obj.heap_index());
                 self.proto_of.insert(obj.heap_index(), p);
             } else if let Some(rp) = self.realm_proto_fallback(new_target, self.obj_proto) {
                 // GetPrototypeFromConstructor: a createRealm-child newTarget
                 // with a non-object `prototype` falls back to ITS realm's
                 // %Object.prototype% (None for a main-realm newTarget).
+                self.note_class_instance_reproto(obj.heap_index());
                 self.proto_of.insert(obj.heap_index(), Value::heap(rp));
             }
         }

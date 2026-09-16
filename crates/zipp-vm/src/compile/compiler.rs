@@ -1309,7 +1309,10 @@ impl Compiler {
             if let Some(fname) = fname {
                 if matches!(finit, Some(e) if is_anonymous_fn_def(e)) {
                     let kr = fc.temp();
-                    let idx = fc.add_string_const(fname);
+                    // The key as a guest string VALUE (an escaped "@@…" name
+                    // reads back as its text).
+                    let idx =
+                        fc.add_string_const(crate::vm::helpers_numeric::guest_key_text(fname));
                     fc.emit(Instr::LoadConst { dst: kr, idx });
                     fc.emit(Instr::SetFnNameFromKey {
                         func: v,

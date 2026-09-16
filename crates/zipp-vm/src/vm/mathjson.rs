@@ -512,7 +512,8 @@ impl<'p> Vm<'p> {
                 json_push_char_bounded(out, '\n')?;
                 json_push_str_bounded(out, pad)?;
             }
-            json_quote_bounded(out, key)?;
+            // (A key's guest text: an escaped "@@…" key loses its extra '@'.)
+            json_quote_bounded(out, guest_key_text(key))?;
             json_push_str_bounded(out, separator)
         })();
         self.json_commit_output(out, prior_capacity, appended)
@@ -540,7 +541,7 @@ impl<'p> Vm<'p> {
                         json_push_char_bounded(out, '\n')?;
                         json_push_str_bounded(out, pad)?;
                     }
-                    json_quote_bounded(out, &map.keys[slot])?;
+                    json_quote_bounded(out, guest_key_text(&map.keys[slot]))?;
                     json_push_str_bounded(out, separator)
                 })();
                 (map.val_at(slot), appended)
@@ -724,7 +725,7 @@ impl<'p> Vm<'p> {
                         active.pop();
                         return false;
                     }
-                    if json_quote_bounded(out, key).is_err()
+                    if json_quote_bounded(out, guest_key_text(key)).is_err()
                         || json_push_char_bounded(out, ':').is_err()
                     {
                         active.pop();
@@ -1179,6 +1180,8 @@ impl<'p> Vm<'p> {
                 } else {
                     None
                 };
+                // The list holds property KEYS (escaped like any "@@…" key).
+                let item = item.map(escape_guest_key);
                 if let Some(s) = item {
                     // Count every temporary conversion, including duplicates
                     // that are dropped. Otherwise `[huge, huge, ...]` can
@@ -1540,7 +1543,7 @@ impl<'p> Vm<'p> {
             } else {
                 let tj = self.get_prop(v, "toJSON")?;
                 if self.is_callable(tj) {
-                    let kv = self.alloc_str(key.to_string());
+                    let kv = self.alloc_key_str(key.to_string());
                     self.call_value(tj, v, &[kv])?
                 } else {
                     v
@@ -1552,7 +1555,7 @@ impl<'p> Vm<'p> {
         // A function `replacer` is applied after `toJSON`: replacer(key, value)
         // with `this` = the holder. Its result is what gets serialized.
         let v = if self.is_callable(replacer) {
-            let kv = self.alloc_str(key.to_string());
+            let kv = self.alloc_key_str(key.to_string());
             self.call_value(replacer, holder, &[kv, v])?
         } else {
             v
@@ -1951,8 +1954,13 @@ impl<'p> Vm<'p> {
                                 return Err(e);
                             }
                         };
-                        owned_keys =
-                            self.json_clone_heap_key_values(kv, snapshot_budget, out.capacity())?;
+                        // Guest key TEXT back to the internal key form the
+                        // reads below (and the output's unescape) expect.
+                        owned_keys = self
+                            .json_clone_heap_key_values(kv, snapshot_budget, out.capacity())?
+                            .into_iter()
+                            .map(escape_guest_key)
+                            .collect();
                         &owned_keys
                     }
                 };
@@ -2160,6 +2168,9 @@ impl<'p> Vm<'p> {
                     Some(name) => name.to_string(),
                     None => json_parse_string(src, i)?.to_lossy_string(),
                 };
+                // A member name is a guest string key: "@@…" is escaped out of
+                // the symbol-key space (`escape_guest_key`).
+                let key = escape_guest_key(key);
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b':') {
                     return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));
@@ -2327,8 +2338,10 @@ impl<'p> Vm<'p> {
                     // 2.c  keys = ? EnumerableOwnPropertyNames(val, key)  — proxy-aware
                     // (the ownKeys trap may throw), in integer-then-insertion order.
                     let keys_v = self.object_enum_own(val, crate::vm::EnumWhat::Keys)?;
+                    // Property KEYS (the walk's Get/Delete/CreateDataProperty and
+                    // the source map all use the internal form).
                     let keys: Vec<String> = match self.heap.get(keys_v.heap_index()) {
-                        HeapObj::Array(a) => a.iter().map(|&k| self.display(k)).collect(),
+                        HeapObj::Array(a) => a.iter().map(|&k| self.key_of(k)).collect(),
                         _ => Vec::new(),
                     };
                     for k in keys {
@@ -2353,7 +2366,7 @@ impl<'p> Vm<'p> {
             walk?;
         }
         let context = self.make_json_context(src);
-        let kv = self.alloc_str(key.to_string());
+        let kv = self.alloc_key_str(key.to_string());
         self.call_value(reviver, holder, &[kv, val, context])
     }
 
@@ -2489,6 +2502,9 @@ impl<'p> Vm<'p> {
                     Some(name) => name.to_string(),
                     None => json_parse_string(src, i)?.to_lossy_string(),
                 };
+                // A member name is a guest string key: "@@…" is escaped out of
+                // the symbol-key space (`escape_guest_key`).
+                let key = escape_guest_key(key);
                 json_skip_ws(b, i);
                 if b.get(*i) != Some(&b':') {
                     return Err(Thrown("SyntaxError: Expected ':' in JSON object".into()));

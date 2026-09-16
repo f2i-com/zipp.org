@@ -785,7 +785,7 @@ impl<'p> Vm<'p> {
                 }
             }
         }
-        let names: Vec<Value> = keys.into_iter().map(|k| self.alloc_str(k)).collect();
+        let names: Vec<Value> = keys.into_iter().map(|k| self.alloc_key_str(k)).collect();
         Ok(self.alloc_array_current_realm(names))
     }
 
@@ -1108,6 +1108,16 @@ impl<'p> Vm<'p> {
                 break;
             }
             p = next;
+        }
+        // Class member tables describe a fixed chain: re-prototyping a class's
+        // prototype object retires its tables, and re-prototyping an instance
+        // makes its class's instances consult `proto_of` first.
+        if let HeapObj::Object(m) = self.heap.get(o.heap_index()) {
+            if m.class_proto {
+                self.note_class_proto_mutation(o.heap_index(), None);
+            } else if m.class.is_some() {
+                self.note_class_instance_reproto(o.heap_index());
+            }
         }
         self.proto_of.insert(o.heap_index(), proto);
         // Replacing a live object's [[Prototype]] changes what every chain

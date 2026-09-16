@@ -114,8 +114,48 @@ pub(crate) fn bigint_as_intn(bits: u32, x: i128) -> i128 {
 /// `@@sym:N`) — still reachable by getOwnPropertyDescriptor and surfaced by
 /// getOwnPropertySymbols. Real private FIELDS live in the side table (never
 /// own props), so a "#..." STRING key is an ordinary enumerable property.
+///
+/// Symbol keys are "@@" followed by anything but '@'; a guest STRING key
+/// that itself begins with "@@" is stored one '@' longer (see
+/// [`escape_guest_key`]), so it is never mistaken for one.
 pub(crate) fn is_hidden_key(k: &str) -> bool {
-    k.starts_with("@@")
+    let b = k.as_bytes();
+    b.len() >= 2 && b[0] == b'@' && b[1] == b'@' && b.get(2) != Some(&b'@')
+}
+
+/// Does guest string `s`, used as a property key, need the escape that keeps
+/// it out of the symbol-key space (it begins with "@@")?
+#[inline]
+pub(crate) fn guest_key_needs_escape(s: &str) -> bool {
+    s.as_bytes().starts_with(b"@@")
+}
+
+/// The internal property key for guest string `s` (ToPropertyKey of a
+/// String): `s` itself, except that one beginning with "@@" — the spelling
+/// of the engine's symbol keys (`@@iterator`, `@@sym:N`, `@@for:k`) — gains a
+/// leading '@'. Without it `o["@@iterator"]` WAS `o[Symbol.iterator]`, and
+/// such keys vanished from enumeration and JSON. [`guest_key_text`] undoes it.
+#[inline]
+pub(crate) fn escape_guest_key(s: String) -> String {
+    if guest_key_needs_escape(&s) {
+        let mut e = String::with_capacity(s.len() + 1);
+        e.push('@');
+        e.push_str(&s);
+        e
+    } else {
+        s
+    }
+}
+
+/// The guest-visible text of a (non-symbol) internal property key: the
+/// inverse of [`escape_guest_key`].
+#[inline]
+pub(crate) fn guest_key_text(k: &str) -> &str {
+    if k.as_bytes().starts_with(b"@@@") {
+        &k[1..]
+    } else {
+        k
+    }
 }
 
 pub(crate) fn len_value(n: usize) -> Value {
@@ -131,7 +171,7 @@ pub(crate) fn len_value(n: usize) -> Value {
 /// characters: it omits U+FEFF (ZWNBSP), leaving
 /// `parseInt("\u{FEFF}8675309")` at NaN, and it includes U+0085 (NEL), which
 /// is not JS whitespace at all (`parseInt("\u{85}8")` must be NaN).
-fn str_white_space(c: char) -> bool {
+pub(crate) fn str_white_space(c: char) -> bool {
     (c.is_whitespace() && c != '\u{85}') || c == '\u{FEFF}'
 }
 

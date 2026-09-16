@@ -690,7 +690,10 @@ impl<'a> FnCompiler<'a> {
                     // the field name (incl. the literal "#field" for privates).
                     if matches!(finit, Some(e) if is_anonymous_fn_def(e)) {
                         let kr = self.temp();
-                        let cidx = self.add_string_const(fname);
+                        // The key as a guest string VALUE (an escaped "@@…"
+                        // name reads back as its text).
+                        let cidx = self
+                            .add_string_const(crate::vm::helpers_numeric::guest_key_text(fname));
                         self.emit(Instr::LoadConst { dst: kr, idx: cidx });
                         self.emit(Instr::SetFnNameFromKey {
                             func: v,
@@ -1098,7 +1101,9 @@ impl<'a> FnCompiler<'a> {
                 if $decs.is_empty() {
                     None
                 } else {
-                    let (nm, computed) = match class_key_name($key) {
+                    let (nm, computed) = match class_key_name($key)
+                        .map(crate::vm::helpers_numeric::escape_guest_key)
+                    {
                         Ok(n) if computed_key($key).is_none() => (n, false),
                         _ => (String::new(), true),
                     };
@@ -1128,7 +1133,9 @@ impl<'a> FnCompiler<'a> {
             ($de:expr, $key:expr, $went:expr) => {
                 if let Some(ix) = $de {
                     if !$went {
-                        let nm = class_key_name($key).unwrap_or_default();
+                        let nm = class_key_name($key)
+                            .map(crate::vm::helpers_numeric::escape_guest_key)
+                            .unwrap_or_default();
                         let e = &mut plan.elements[ix as usize];
                         e.is_private = nm.starts_with('#');
                         // Only `[Symbol.x]` — a computed MEMBER expression —
@@ -1175,7 +1182,7 @@ impl<'a> FnCompiler<'a> {
                     };
                     let de = dec_elem!(dkind, m.is_static, &m.key, m.decorators, String::new());
                     let computed_before = computed.len();
-                    match class_key_name(&m.key) {
+                    match class_key_name(&m.key).map(crate::vm::helpers_numeric::escape_guest_key) {
                         Ok(name) => {
                             // A public INSTANCE member takes (or keeps) its
                             // source position on the prototype; a later
@@ -1300,7 +1307,7 @@ impl<'a> FnCompiler<'a> {
                         dec_named.push(de);
                         instance_order.push((0, fields.len() - 1));
                     }
-                    match class_key_name(&p.key) {
+                    match class_key_name(&p.key).map(crate::vm::helpers_numeric::escape_guest_key) {
                         Ok(name) => {
                             if !p.is_static
                                 && !name.starts_with('#')
@@ -1367,7 +1374,7 @@ impl<'a> FnCompiler<'a> {
                         String::new()
                     );
                     let cf_before = computed_fields_ordered.len();
-                    match class_key_name(&p.key) {
+                    match class_key_name(&p.key).map(crate::vm::helpers_numeric::escape_guest_key) {
                         // A COMPUTED key whose literal folds to a "#..." STRING
                         // is a PUBLIC property that merely looks private — route it
                         // through the computed path (define_field → an ordinary,

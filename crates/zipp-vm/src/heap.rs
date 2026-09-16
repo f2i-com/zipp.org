@@ -1192,6 +1192,14 @@ pub struct ObjMap {
     /// rather than the compiler-proof-only unchecked push. Fits existing bool
     /// padding, preserving ObjMap's pinned size.
     planned_append_failed: bool,
+    /// This map is a class's materialized `C.prototype` (`Vm::prototype_of`).
+    /// Instances resolve declared members through the `ClassData` member
+    /// tables for as long as those tables still describe this object, so every
+    /// mutation of it must reach a slow path that can record the divergence
+    /// (`Vm::note_class_proto_mutation`): the in-place data-store fast paths
+    /// decline such a map, and `mark_class_proto` pins its shape to DICT so no
+    /// shape-keyed way can serve it. Fits existing bool padding.
+    pub class_proto: bool,
     /// This object's hidden class — see [`crate::shape`]. A redundant summary of
     /// `keys` + `attrs`, maintained by the same methods that mutate them, so an
     /// inline cache can ask "same layout?" with one integer compare instead of
@@ -2145,6 +2153,7 @@ impl ObjMap {
             numeric_index,
             has_element_key,
             planned_append_failed,
+            class_proto,
             shape: shape_slot,
         } = self;
         match keys {
@@ -2170,6 +2179,7 @@ impl ObjMap {
         *numeric_index = None;
         *has_element_key = plan.has_element_key();
         *planned_append_failed = false;
+        *class_proto = false;
         *shape_slot = shape;
         // The same cold tails `finalized_from_store` builds, on the same
         // conditions.
@@ -2298,8 +2308,17 @@ impl ObjMap {
             numeric_index: None,
             has_element_key: false,
             planned_append_failed: false,
+            class_proto: false,
             shape: crate::shape::EMPTY,
         }
+    }
+
+    /// Flag this map as a class's materialized prototype (see
+    /// [`ObjMap::class_proto`]) and drop it to dictionary mode for good, so no
+    /// shape-keyed cache way can ever write through it.
+    pub fn mark_class_proto(&mut self) {
+        self.class_proto = true;
+        self.shape_to_dict();
     }
 
     /// Can this side table shadow, hide, or constrain an ELEMENT (or `length`)
@@ -3709,6 +3728,19 @@ pub struct ClassData {
     /// `ClassDef` carries a decorator plan. `None` for every undecorated class
     /// (i.e. all of them today), so nothing on the hot class path pays for it.
     pub dec: Option<Box<DecState>>,
+    /// Sticky: `C.prototype` was mutated in a way `methods`/`getters`/
+    /// `setters` no longer describe (a declared member — this level's or an
+    /// ancestor's — was assigned, redefined or deleted on it, or the object was
+    /// frozen/sealed/re-prototyped). Member lookups that reach this level stop
+    /// trusting the tables and continue on the live prototype object instead.
+    /// Set only by `Vm::note_class_proto_mutation`, which also advances
+    /// `Vm::class_proto_epoch` so class-keyed caches filled from the tables miss.
+    pub proto_dirty: bool,
+    /// Sticky: some instance of this class carries an explicit `[[Prototype]]`
+    /// (`Object.setPrototypeOf(instance, …)`, or `Reflect.construct` with a
+    /// foreign newTarget). Lookups on this class's instances must then consult
+    /// the instance's `proto_of` entry before the member tables.
+    pub reproto_instances: bool,
 }
 
 /// The per-EVALUATION decoration state of a decorated class: what the decorator

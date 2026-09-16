@@ -130,8 +130,11 @@ impl<'p> Vm<'p> {
                 && !(!self.deferred_ns_state.is_empty()
                     && self.deferred_ns_state.contains_key(&oidx))
             {
-                if let Some(std::borrow::Cow::Borrowed(b)) =
-                    self.heap.str_wtf8_cow(key.heap_index())
+                // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
+                if let Some(std::borrow::Cow::Borrowed(b)) = self
+                    .heap
+                    .str_wtf8_cow(key.heap_index())
+                    .filter(|b| !b.starts_with(b"@@"))
                 {
                     if let (Ok(k), HeapObj::Object(m)) =
                         (std::str::from_utf8(b), self.heap.get(oidx))
@@ -476,21 +479,26 @@ impl<'p> Vm<'p> {
         {
             // hit: own writable data slot; add: proven-clean new key.
             let (hit, add) = match self.heap.str_wtf8_cow(key.heap_index()) {
-                Some(std::borrow::Cow::Borrowed(b)) => {
+                // ("@@…" is escaped as a key — `key_of` — so it takes the slow path.)
+                Some(std::borrow::Cow::Borrowed(b)) if !b.starts_with(b"@@") => {
                     match (std::str::from_utf8(b), self.heap.get(idx)) {
-                        (Ok(k), HeapObj::Object(m)) if k != "__proto__" => match m.pos(k) {
-                            Some(i) if !m.attr_at(i).accessor && m.attr_at(i).writable => {
-                                (Some(i), false)
+                        // (A class prototype's writes must reach `set_prop`,
+                        // which records when they retire its member tables.)
+                        (Ok(k), HeapObj::Object(m)) if k != "__proto__" && !m.class_proto => {
+                            match m.pos(k) {
+                                Some(i) if !m.attr_at(i).accessor && m.attr_at(i).writable => {
+                                    (Some(i), false)
+                                }
+                                Some(_) => (None, false),
+                                None => (
+                                    None,
+                                    m.extensible
+                                        && m.class.is_none()
+                                        && !m.is_ctor
+                                        && self.plain_add_chain_clear(idx, k),
+                                ),
                             }
-                            Some(_) => (None, false),
-                            None => (
-                                None,
-                                m.extensible
-                                    && m.class.is_none()
-                                    && !m.is_ctor
-                                    && self.plain_add_chain_clear(idx, k),
-                            ),
-                        },
+                        }
                         _ => (None, false),
                     }
                 }
@@ -623,14 +631,15 @@ impl<'p> Vm<'p> {
             self.reject_write(&self.key_of(key), strict)?;
             return Ok(());
         }
-        // A NEW index (past the current length) on a non-extensible array adds an own
-        // property → rejected (sloppy no-op / strict TypeError). An in-range index is
-        // already present and stays writable. Likewise, extending past the current
-        // length grows `length`, so a non-writable `length` (defineProperty / freeze)
-        // rejects it — Array [[DefineOwnProperty]]: index >= oldLen && length
-        // non-writable → false. (Checked before the &mut borrow below.)
+        // A NEW index (past the current length, or a HOLE — a hole is not an own
+        // property) on a non-extensible array adds an own property → rejected
+        // (sloppy no-op / strict TypeError). A present element stays writable.
+        // Likewise, extending past the current length grows `length`, so a
+        // non-writable `length` (defineProperty / freeze) rejects it — Array
+        // [[DefineOwnProperty]]: index >= oldLen && length non-writable → false.
+        // (Checked before the &mut borrow below.)
         if let Some(i) = array_index(key) {
-            let present = matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len());
+            let present = matches!(self.heap.get(idx), HeapObj::Array(items) if i < items.len() && !items[i].is_hole());
             if !present
                 && matches!(self.heap.get(idx), HeapObj::Array(_))
                 && (self.arr_props.get(&idx).map_or(false, |m| !m.extensible)
@@ -800,7 +809,7 @@ impl<'p> Vm<'p> {
         let once = crate::heap::hash_once_enabled();
         let tag = crate::heap::prop_tag_of(key);
         let (hit, add) = match self.heap.get(idx) {
-            HeapObj::Object(m) if key != "__proto__" => match if once {
+            HeapObj::Object(m) if key != "__proto__" && !m.class_proto => match if once {
                 m.pos_tagged(key, tag)
             } else {
                 m.pos(key)

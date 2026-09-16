@@ -470,8 +470,9 @@ impl<'p> Vm<'p> {
 /// allocating the capture string. `Vm::to_number` delegates its ordinary
 /// string arm here, so the two paths cannot drift.
 pub(crate) fn string_to_number(s: &str) -> f64 {
-    // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not.
-    let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
+    // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not — and
+    // excludes U+0085 (NEL), which Rust's does.
+    let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
     if t.is_empty() {
         return 0.0;
     }
@@ -1393,8 +1394,9 @@ impl<'p> Vm<'p> {
         }
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
-                // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not.
-                let t = s.trim_matches(|c: char| c.is_whitespace() || c == '\u{FEFF}');
+                // StrWhiteSpace: U+FEFF (BOM) yes, U+0085 (NEL) no — unlike
+                // Rust's trim.
+                let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
                 if t.is_empty() {
                     return *x == BigVal::Small(0);
                 }
@@ -2386,7 +2388,10 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<std::cmp::Ordering>, Thrown> {
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
-                let y = if s.trim().is_empty() {
+                let y = if s
+                    .trim_matches(crate::vm::helpers_numeric::str_white_space)
+                    .is_empty()
+                {
                     Some(BigVal::Small(0))
                 } else {
                     parse_bigint_str(&s)
@@ -3386,7 +3391,7 @@ impl<'p> Vm<'p> {
                     if i != 0 {
                         out.push_str(", ");
                     }
-                    out.push_str(key);
+                    out.push_str(guest_key_text(key));
                     out.push_str(": ");
                     self.inspect_value_into(out, *value, true, depth + 1);
                     if out.truncated {

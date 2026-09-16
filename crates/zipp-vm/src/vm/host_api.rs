@@ -33,6 +33,7 @@
 use crate::bytecode::Program;
 use crate::heap::{HeapObj, ObjMap, PropAttr};
 use crate::value::Value;
+use crate::vm::helpers_numeric::{escape_guest_key, guest_key_text, is_hidden_key};
 use crate::vm::Vm;
 use rustc_hash::FxHashMap;
 use std::borrow::Cow;
@@ -119,6 +120,9 @@ pub(crate) const JIT_GLOBAL_ROUTE_EPOCH_OFFSET: usize =
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 pub(crate) const JIT_MI_CLASS_EPOCH_OFFSET: usize =
     core::mem::offset_of!(Vm<'static>, mi_class_epoch);
+#[cfg(all(feature = "jit", target_arch = "x86_64"))]
+pub(crate) const JIT_CLASS_PROTO_EPOCH_OFFSET: usize =
+    core::mem::offset_of!(Vm<'static>, class_proto_epoch);
 /// Exact `[[IsHTMLDDA]]` singleton mirror used by call-free loose-null
 /// comparisons. The companion byte preserves `ZIPP_NO_HTMLDDA_SCALAR`'s
 /// HashSet/counter ablation by routing heap operands back to the helper when
@@ -1068,7 +1072,7 @@ impl<'p> Vm<'p> {
                 visible: (0..m.keys.len())
                     .filter(|&i| {
                         let a = m.attr_at(i);
-                        a.enumerable && !a.accessor
+                        a.enumerable && !a.accessor && !is_hidden_key(&m.keys[i])
                     })
                     .count(),
             },
@@ -1162,10 +1166,10 @@ impl<'p> Vm<'p> {
                     let val = match self.heap.get(idx) {
                         HeapObj::Object(m) if i < m.keys.len() => {
                             let a = m.attr_at(i);
-                            if !a.enumerable || a.accessor {
+                            if !a.enumerable || a.accessor || is_hidden_key(&m.keys[i]) {
                                 continue;
                             }
-                            let key = m.keys[i].as_bytes();
+                            let key = guest_key_text(&m.keys[i]).as_bytes();
                             if !budget.charge_string_bytes(key.len()) {
                                 ok = false;
                                 break;
@@ -1547,8 +1551,15 @@ impl<'p> Vm<'p> {
                 // Two scans of every entry, visible or not: inspected work,
                 // charged before either (ZA-07).
                 budget.charge_work(m.keys.len().saturating_mul(2))?;
+                // Symbol-keyed entries (`is_hidden_key`) are not string keys:
+                // the host's object model has no symbols, so they are not
+                // exported (they used to leak out as "@@…" names).
                 let count = (0..m.keys.len())
-                    .filter(|&i| m.attr_at(i).enumerable && !m.attr_at(i).accessor)
+                    .filter(|&i| {
+                        m.attr_at(i).enumerable
+                            && !m.attr_at(i).accessor
+                            && !is_hidden_key(&m.keys[i])
+                    })
                     .count();
                 budget.ensure_nodes(count)?;
                 let mut pairs = Vec::with_capacity(count);
@@ -1556,11 +1567,11 @@ impl<'p> Vm<'p> {
                     let a = &m.attr_at(i);
                     // Accessors are not invoked: running user code in the middle
                     // of a marshal would let a getter mutate the graph being walked.
-                    if !a.enumerable || a.accessor {
+                    if !a.enumerable || a.accessor || is_hidden_key(&m.keys[i]) {
                         continue;
                     }
                     budget.charge_string(&m.keys[i])?;
-                    pairs.push((m.keys[i].clone(), m.val_at(i)));
+                    pairs.push((guest_key_text(&m.keys[i]).to_string(), m.val_at(i)));
                 }
                 Shape::Object(pairs)
             }
@@ -1767,6 +1778,9 @@ impl<'p> Vm<'p> {
 
         let mut m = ObjMap::with_capacity(pairs.len().max(old_props.len()));
         for (k, val) in pairs {
+            // A host name is a guest string key (`escape_guest_key`).
+            let k_key = escape_guest_key(k.clone());
+            let k = &k_key;
             let prev = find_old(k).map(|i| {
                 sent[i] = true;
                 (old_props[i].1, old_props[i].2)
@@ -1875,7 +1889,8 @@ impl<'p> Vm<'p> {
                 let mut m = ObjMap::with_capacity(pairs.len());
                 for (k, val) in pairs {
                     let v = self.host_in(val, depth + 1);
-                    m.set(k, v);
+                    // A host name is a guest string key (`escape_guest_key`).
+                    m.set(&escape_guest_key(k.clone()), v);
                 }
                 Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))))
             }

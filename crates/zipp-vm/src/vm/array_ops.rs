@@ -2675,11 +2675,14 @@ impl<'p> Vm<'p> {
         // generic array-like helpers, which go through the observable
         // Get/Set/HasProperty path and throw where the spec says to. The dense
         // arms stay for the overwhelmingly common unconstrained array.
+        // (Likewise an element carrying a defineProperty'd override — a
+        // non-writable one must make the Set throw, which a raw store skips.)
         if matches!(name, "fill" | "copyWithin")
-            && self
+            && (self
                 .arr_props
                 .get(&idx)
                 .map_or(false, |m| m.is_frozen() || m.is_sealed() || !m.extensible)
+                || self.array_elements_overlaid(idx))
         {
             let this = Value::heap(idx);
             return if name == "fill" {
@@ -2688,13 +2691,21 @@ impl<'p> Vm<'p> {
                 self.array_like_copy_within(this, args)
             };
         }
+        // (The explicit `frozen` flag, not the vacuous `is_frozen()`: a merely
+        // non-extensible array's empty side table has no attrs to disprove it,
+        // yet its `length` stays writable and its elements deletable.)
         if matches!(name, "push" | "pop" | "shift" | "unshift" | "splice")
-            && (self.arr_props.get(&idx).map_or(false, |m| m.is_frozen())
+            && (self.arr_props.get(&idx).map_or(false, |m| m.frozen)
                 || self.array_length_nonwritable.contains(&idx))
         {
             return Err(Thrown(
                 "TypeError: Cannot assign to read only property 'length' of object '[object Array]'".into(),
             ));
+        }
+        // A push onto a sealed or non-extensible array Sets a NEW index, which
+        // must be rejected: the generic protocol performs (and fails) that Set.
+        if name == "push" && self.arr_props.get(&idx).is_some_and(|m| !m.extensible) {
+            return self.array_like_mutate(Value::heap(idx), name, args);
         }
         // pop/shift read an element via the spec Get. When that element is a HOLE in
         // the array's own storage, Get defers to the prototype chain — a prototype

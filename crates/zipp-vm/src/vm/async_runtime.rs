@@ -3223,8 +3223,7 @@ impl<'p> Vm<'p> {
             setter: Value::UNDEFINED,
         };
         let mut map = ObjMap::new();
-        let name = self.alloc_str("AggregateError".to_string());
-        map.define("name", name, attr);
+        // (`name` is inherited from %AggregateError.prototype%, linked below.)
         let msg = self.alloc_str("All promises were rejected".to_string());
         map.define("message", msg, attr);
         let errs = Value::heap(self.heap.alloc(HeapObj::Array(errors)));

@@ -1477,7 +1477,8 @@ impl<'a> FnCompiler<'a> {
                         let key = class_key_name(&prop.key).map_err(|_| {
                             "object-rest with a computed sibling key is not in the subset"
                         })?;
-                        self.string_name(&key);
+                        // Compared against the source's internal keys.
+                        self.string_name(&crate::vm::helpers_numeric::escape_guest_key(key));
                     }
                     let save = self.next_reg;
                     let val = self.alloc_reg();
@@ -1584,7 +1585,10 @@ impl<'a> FnCompiler<'a> {
         }
         let name = match key {
             ast::PropKey::Ident(id) => id.to_string(),
-            ast::PropKey::Str(s) => string_literal_key(s),
+            // A GetProp NAME is the internal key form (`escape_guest_key`).
+            ast::PropKey::Str(s) => {
+                crate::vm::helpers_numeric::escape_guest_key(string_literal_key(s))
+            }
             ast::PropKey::Num(n) => fmt_key_num(*n),
             // NOTE: the former `PropertyKey::BigIntLiteral` arm (`b.value
             // .to_string()`) has no counterpart — `ast::PropKey` has no BigInt

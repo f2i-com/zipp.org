@@ -43,7 +43,12 @@ impl<'p> Vm<'p> {
                 if !(k.is_heap() && self.heap.is_str_like(k.heap_index())) {
                     continue; // Object.keys/values/entries skip Symbol keys
                 }
-                let ks = self.display(k);
+                // `key_of`, not `display`: the gopd trap and the Get below take
+                // the INTERNAL key form, so a guest key spelled "@@…" must
+                // carry its escape (`escape_guest_key`) — the sibling proxy
+                // walks in `descriptors.rs` do the same. `k` itself stays the
+                // guest string this reports.
+                let ks = self.key_of(k);
                 let desc = match self.proxy_gopd(obj, &ks)? {
                     Some(d) => d,
                     None => Value::UNDEFINED,
@@ -91,10 +96,10 @@ impl<'p> Vm<'p> {
             let out: Vec<Value> = pairs
                 .into_iter()
                 .map(|(k, v)| match what {
-                    EnumWhat::Keys => self.alloc_str(k),
+                    EnumWhat::Keys => self.alloc_key_str(k),
                     EnumWhat::Values => v,
                     EnumWhat::Entries => {
-                        let ks = self.alloc_str(k);
+                        let ks = self.alloc_key_str(k);
                         self.alloc_array_current_realm(vec![ks, v])
                     }
                 })
@@ -193,7 +198,7 @@ impl<'p> Vm<'p> {
             let mut out: Vec<Value> = Vec::with_capacity(ks.len());
             for k in ks {
                 if matches!(what, EnumWhat::Keys) {
-                    let kv = self.alloc_str(k);
+                    let kv = self.alloc_key_str(k);
                     out.push(kv);
                     continue;
                 }
@@ -206,7 +211,7 @@ impl<'p> Vm<'p> {
                 match what {
                     EnumWhat::Values => out.push(v),
                     EnumWhat::Entries => {
-                        let kv = self.alloc_str(k);
+                        let kv = self.alloc_key_str(k);
                         out.push(self.alloc_array_current_realm(vec![kv, v]));
                     }
                     EnumWhat::Keys => {}
@@ -248,7 +253,7 @@ impl<'p> Vm<'p> {
             };
             for k in extra {
                 let v = self.get_member(obj, &k, obj)?;
-                let kv = self.alloc_str(k);
+                let kv = self.alloc_key_str(k);
                 match what {
                     EnumWhat::Keys => out.push(kv),
                     EnumWhat::Values => out.push(v),
@@ -303,7 +308,7 @@ impl<'p> Vm<'p> {
                     }
                     match what {
                         EnumWhat::Keys => {
-                            let kv = self.alloc_str(k);
+                            let kv = self.alloc_key_str(k);
                             out.push(kv);
                         }
                         EnumWhat::Values => {
@@ -312,7 +317,7 @@ impl<'p> Vm<'p> {
                         }
                         EnumWhat::Entries => {
                             let v = self.get_member(obj, &k, obj)?;
-                            let kv = self.alloc_str(k);
+                            let kv = self.alloc_key_str(k);
                             out.push(self.alloc_array_current_realm(vec![kv, v]));
                         }
                     }
@@ -342,8 +347,10 @@ impl<'p> Vm<'p> {
             let names: Vec<String> = self
                 .array_snapshot(names_v.heap_index())
                 .into_iter()
+                // (`key_of`: the names are guest text; the lookups below want
+                // the internal key form.)
                 .filter_map(|k| {
-                    (k.is_heap() && self.heap.is_str_like(k.heap_index())).then(|| self.display(k))
+                    (k.is_heap() && self.heap.is_str_like(k.heap_index())).then(|| self.key_of(k))
                 })
                 .collect();
             let mut out: Vec<Value> = Vec::new();
@@ -358,7 +365,7 @@ impl<'p> Vm<'p> {
                 }
                 match what {
                     EnumWhat::Keys => {
-                        let kv = self.alloc_str(k);
+                        let kv = self.alloc_key_str(k);
                         out.push(kv);
                     }
                     EnumWhat::Values => {
@@ -367,7 +374,7 @@ impl<'p> Vm<'p> {
                     }
                     EnumWhat::Entries => {
                         let v = self.get_member(obj, &k, obj)?;
-                        let kv = self.alloc_str(k);
+                        let kv = self.alloc_key_str(k);
                         out.push(self.alloc_array_current_realm(vec![kv, v]));
                     }
                 }
@@ -397,7 +404,7 @@ impl<'p> Vm<'p> {
             for k in names {
                 match what {
                     EnumWhat::Keys => {
-                        let kv = self.alloc_str(k);
+                        let kv = self.alloc_key_str(k);
                         out.push(kv);
                     }
                     EnumWhat::Values => {
@@ -406,7 +413,7 @@ impl<'p> Vm<'p> {
                     }
                     EnumWhat::Entries => {
                         let v = self.get_member(obj, &k, obj)?;
-                        let kv = self.alloc_str(k);
+                        let kv = self.alloc_key_str(k);
                         out.push(self.alloc_array_current_realm(vec![kv, v]));
                     }
                 }
@@ -467,10 +474,10 @@ impl<'p> Vm<'p> {
         let out: Vec<Value> = pairs
             .into_iter()
             .map(|(k, v)| match what {
-                EnumWhat::Keys => self.alloc_str(k),
+                EnumWhat::Keys => self.alloc_key_str(k),
                 EnumWhat::Values => v,
                 EnumWhat::Entries => {
-                    let ks = self.alloc_str(k);
+                    let ks = self.alloc_key_str(k);
                     self.alloc_array_current_realm(vec![ks, v])
                 }
             })
@@ -593,12 +600,14 @@ impl<'p> Vm<'p> {
                         },
                         _ => continue,
                     };
+                    // (The shadow set holds guest key TEXT, which is what the
+                    // generic levels below compare.)
                     if let Some(s) = &mut seen {
-                        if !s.insert(k.clone()) {
+                        if !s.insert(guest_key_text(&k).to_string()) {
                             continue;
                         }
                     }
-                    let kv = self.alloc_str(k);
+                    let kv = self.alloc_key_str(k);
                     out.push(kv);
                 }
                 // With the shadow set live, this level's NON-emitted own keys
@@ -611,7 +620,7 @@ impl<'p> Vm<'p> {
                                 .keys
                                 .iter()
                                 .filter(|k| !is_hidden_key(k))
-                                .cloned()
+                                .map(|k| guest_key_text(k).to_string())
                                 .collect(),
                             _ => Vec::new(),
                         };
@@ -699,12 +708,22 @@ impl<'p> Vm<'p> {
             if let HeapObj::Object(m) = self.heap.get(pl) {
                 for k in &m.keys {
                     if !is_hidden_key(k) {
-                        s.insert(k.clone());
+                        s.insert(guest_key_text(k).to_string());
                     }
                 }
             }
         }
         s
+    }
+
+    /// Allocate property key `k` as the guest STRING it spells: an escaped
+    /// "@@…" key (`escape_guest_key`) reads back without its extra '@'.
+    pub(crate) fn alloc_key_str(&mut self, k: String) -> Value {
+        if k.as_bytes().starts_with(b"@@@") {
+            self.alloc_str(k[1..].to_string())
+        } else {
+            self.alloc_str(k)
+        }
     }
 
     /// Build a data property descriptor object `{value, writable, enumerable,

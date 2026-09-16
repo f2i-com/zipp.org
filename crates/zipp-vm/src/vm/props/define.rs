@@ -284,16 +284,26 @@ impl<'p> Vm<'p> {
                             "TypeError: Cannot define property {i}: array length is not writable"
                         )));
                     }
+                    // A dense element's descriptor is the default data one, as
+                    // adjusted by the array's integrity level (seal: every
+                    // element non-configurable; freeze: also non-writable) —
+                    // what getOwnPropertyDescriptor reports. A HOLE is no
+                    // property at all, so defining it on a non-extensible
+                    // array is rejected like any new property.
+                    let (sealed, frozen) = self
+                        .arr_props
+                        .get(&idx)
+                        .map_or((false, false), |m| (m.sealed || m.frozen, m.frozen));
                     let plain = PropAttr {
-                        writable: true,
+                        writable: !frozen,
                         enumerable: true,
-                        configurable: true,
+                        configurable: !sealed,
                         accessor: false,
                         setter: Value::UNDEFINED,
                     };
                     let existing = self
                         .array_index_override(idx, i)
-                        .or_else(|| dense_val.map(|v| (plain, v)));
+                        .or_else(|| dense_val.filter(|v| !v.is_hole()).map(|v| (plain, v)));
                     // ArgumentsObject [[DefineOwnProperty]] on a LIVE-mapped
                     // index: the formal's register is the property's CURRENT
                     // value (validation against a non-configurable existing
@@ -338,8 +348,13 @@ impl<'p> Vm<'p> {
                             }
                         }
                     }
-                    let is_default_data =
-                        !attr.accessor && attr.writable && attr.enumerable && attr.configurable;
+                    // "Default" relative to the integrity level: a sealed or
+                    // frozen array's flags already imply the element's
+                    // non-configurable (non-writable) bits.
+                    let is_default_data = !attr.accessor
+                        && attr.writable == plain.writable
+                        && attr.enumerable
+                        && attr.configurable == plain.configurable;
                     // An ARGUMENTS object: an index define past the dense
                     // window is an ordinary named own property — `length`
                     // (items.len()) must stay argc, so never grow the Vec.
@@ -640,11 +655,36 @@ impl<'p> Vm<'p> {
             // configurable:false}: converting it to an ACCESSOR — or making it
             // configurable/enumerable — is an illegal non-configurable
             // redefinition (a data-value redefine stays accepted-but-unmodelled).
-            let (_v, get, set, _wr, d_en, d_cf) = self.read_descriptor(desc)?;
+            let (v, get, set, wr, d_en, d_cf) = self.read_descriptor(desc)?;
             if get.is_some() || set.is_some() || d_cf == Some(true) || d_en == Some(true) {
                 return Err(Thrown(
                     "TypeError: Cannot redefine property: prototype".into(),
                 ));
+            }
+            let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
+            // A class's `prototype` is also non-writable: it cannot become
+            // writable, and only the same value may be restated.
+            if is_class && wr == Some(true) {
+                return Err(Thrown(
+                    "TypeError: Cannot redefine property: prototype".into(),
+                ));
+            }
+            if let Some(v) = v {
+                if is_class {
+                    let cur = self.prototype_of(obj).unwrap_or(Value::UNDEFINED);
+                    if !self.same_value(v, cur) {
+                        return Err(Thrown(
+                            "TypeError: Cannot redefine property: prototype".into(),
+                        ));
+                    }
+                } else {
+                    // A function's writable `prototype`: a value redefinition
+                    // lands exactly where `fn.prototype = v` does.
+                    self.fn_proto_override.insert(idx, v);
+                    if v.is_heap() {
+                        self.prototypes.insert(idx, v.heap_index());
+                    }
+                }
             }
             return Ok(());
         }
@@ -700,11 +740,17 @@ impl<'p> Vm<'p> {
             && self.callable_has_intrinsic(obj, key)
         {
             if let Some(v) = self.callable_intrinsic_value(obj, key) {
+                // Sealing/freezing the callable made it non-configurable (the
+                // flags live in arr_props; getOwnPropertyDescriptor reads them).
+                let sealed = self
+                    .arr_props
+                    .get(&idx)
+                    .is_some_and(|m| m.sealed || m.frozen);
                 existing = Some((
                     PropAttr {
                         writable: false,
                         enumerable: false,
-                        configurable: true,
+                        configurable: !sealed,
                         accessor: false,
                         setter: Value::UNDEFINED,
                     },
@@ -742,6 +788,14 @@ impl<'p> Vm<'p> {
         self.heap.write_barrier_val(idx, attr.setter);
         match target {
             0 => {
+                // On a class's prototype, redefining a declared member — or
+                // installing ANY accessor or non-writable property, which would
+                // govern an instance's [[Set]] — retires its member tables.
+                if matches!(self.heap.get(idx), HeapObj::Object(m) if m.class_proto) {
+                    let blocking = attr.accessor || !attr.writable;
+                    self.note_class_proto_mutation(idx, (!blocking).then_some(key));
+                }
+                self.note_ctor_name_mutation(idx, key);
                 if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                     m.define(key, stored, attr);
                 }

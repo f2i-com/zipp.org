@@ -818,6 +818,8 @@ impl Vm<'_> {
         self.super_called.retain(|&k| marks[k as usize]);
         self.super_this.retain(|&k, _| marks[k as usize]);
         self.prototypes.retain(|&k, _| marks[k as usize]);
+        self.class_proto_owner.retain(|&k, _| marks[k as usize]);
+        self.ctor_initial_name.retain(|&k, _| marks[k as usize]);
         self.fn_props.retain(|&k, _| marks[k as usize]);
         self.arr_props.retain(|&k, _| marks[k as usize]);
         self.regexp_result_props.retain(|&k, _| marks[k as usize]);
@@ -1159,6 +1161,8 @@ impl Vm<'_> {
         prune_set!(self.super_called);
         prune_map!(self.super_this);
         prune_map!(self.prototypes);
+        prune_map!(self.class_proto_owner);
+        prune_map!(self.ctor_initial_name);
         prune_slots!(self.fn_props);
         prune_slots!(self.arr_props);
         prune_slots!(self.regexp_result_props);

@@ -2273,6 +2273,8 @@ impl<'p> Vm<'p> {
                             private_brand,
                             class_id,
                             dec: None,
+                            proto_dirty: false,
+                            reproto_instances: false,
                         }))));
                         self.brand_owner.insert(private_brand, v.heap_index());
                         // Remember it so `super` in a derived class can reach it.
@@ -4020,7 +4022,14 @@ impl<'p> Vm<'p> {
                                 self.promise_combine(crate::heap::CombKind::Any, a0, c)?
                             }
                             S::ObjectDefineProperty => {
-                                self.require_object_coercible(a0)?; // Type(O) must be Object
+                                // Type(O) must be Object — checked BEFORE
+                                // ToPropertyKey(P), whose toString may run.
+                                if !self.is_object_value(a0) {
+                                    return Err(Thrown(
+                                        "TypeError: Object.defineProperty called on non-object"
+                                            .into(),
+                                    ));
+                                }
                                 let key = self.to_property_key(
                                     args.get(1).copied().unwrap_or(Value::UNDEFINED),
                                 )?;
@@ -9710,7 +9719,9 @@ impl<'p> Vm<'p> {
         let own_hit = o.is_heap()
             && kv.is_heap()
             && match self.heap.str_wtf8_cow(kv.heap_index()) {
-                Some(std::borrow::Cow::Borrowed(b)) => {
+                // ("@@…" is escaped as a key — `key_of` — so the generic path
+                // below decides it.)
+                Some(std::borrow::Cow::Borrowed(b)) if !b.starts_with(b"@@") => {
                     let oidx = o.heap_index();
                     match (std::str::from_utf8(b), self.heap.get(oidx)) {
                         (Ok(k), HeapObj::Object(m)) => m.pos(k).is_some(),

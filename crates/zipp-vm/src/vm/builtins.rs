@@ -470,14 +470,16 @@ impl<'p> Vm<'p> {
         if !recv.is_heap()
             || !self.array_method_is_intrinsic("push")
             || self.array_proto_has_index
-            // Frozen, or carrying an OWN `push` (B289: `arr.push = fn;
-            // arr.push(1)` must call `fn` — a real Get finds the own
-            // property before the prototype intrinsic).
+            // Non-extensible (a push always adds an index, so frozen, sealed
+            // and preventExtensions'd arrays all reject it — `is_frozen()` let
+            // a sealed array with a named own prop through), or carrying an
+            // OWN `push` (B289: `arr.push = fn; arr.push(1)` must call `fn` — a
+            // real Get finds the own property before the prototype intrinsic).
             || (!self.arr_props.is_empty()
                 && self
                     .arr_props
                     .get(&recv.heap_index())
-                    .map_or(false, |m| m.is_frozen() || m.pos("push").is_some()))
+                    .map_or(false, |m| !m.extensible || m.pos("push").is_some()))
             // A subclass instance or a replaced/null [[Prototype]] does not
             // inherit %Array.prototype%'s push (B289).
             || (!self.proto_of.is_empty()

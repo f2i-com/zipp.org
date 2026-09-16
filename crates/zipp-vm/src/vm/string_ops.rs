@@ -993,23 +993,24 @@ impl<'p> Vm<'p> {
                 }
                 Ok(Some(arr))
             }
-            // ECMAScript TrimString whitespace = Unicode White_Space + U+FEFF
-            // (ZWNBSP/BOM), which Rust's char::is_whitespace excludes. The trim
+            // ECMAScript TrimString whitespace = WhiteSpace + LineTerminator:
+            // U+FEFF (ZWNBSP/BOM) yes and U+0085 (NEL) no, the two places
+            // Rust's char::is_whitespace differs (`str_white_space`). The trim
             // is computed on the lossy view (U+FFFD is not whitespace, neither
             // are surrogates) and the result sliced from the EXACT bytes at the
             // same offsets.
             "trim" => {
-                let w = |c: char| c == '\u{FEFF}' || c.is_whitespace();
+                let w = crate::vm::helpers_numeric::str_white_space;
                 let t = s.trim_matches(w);
                 Ok(Some(self.alloc_recv_slice(&js_recv, &s, t)))
             }
             "trimStart" => {
-                let w = |c: char| c == '\u{FEFF}' || c.is_whitespace();
+                let w = crate::vm::helpers_numeric::str_white_space;
                 let t = s.trim_start_matches(w);
                 Ok(Some(self.alloc_recv_slice(&js_recv, &s, t)))
             }
             "trimEnd" => {
-                let w = |c: char| c == '\u{FEFF}' || c.is_whitespace();
+                let w = crate::vm::helpers_numeric::str_white_space;
                 let t = s.trim_end_matches(w);
                 Ok(Some(self.alloc_recv_slice(&js_recv, &s, t)))
             }

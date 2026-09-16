@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+use super::props::ClassLookup;
 use super::*;
 use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{
@@ -123,14 +124,17 @@ impl<'p> Vm<'p> {
     /// The key's text viewed IN PLACE: `Some` iff `key` is a flat string
     /// whose WTF-8 bytes are valid UTF-8 — byte-identical to what `key_of`
     /// would allocate. A rope / lone-surrogate / Symbol / non-string key is
-    /// `None`; the caller falls back to `key_of`.
+    /// `None`; the caller falls back to `key_of`. So is a string `key_of`
+    /// would escape ("@@…", see `escape_guest_key`).
     #[inline]
     pub(crate) fn flat_key_str(&self, key: Value) -> Option<&str> {
         if !key.is_heap() {
             return None;
         }
         match self.heap.str_wtf8_cow(key.heap_index()) {
-            Some(std::borrow::Cow::Borrowed(b)) => std::str::from_utf8(b).ok(),
+            Some(std::borrow::Cow::Borrowed(b)) if !b.starts_with(b"@@") => {
+                std::str::from_utf8(b).ok()
+            }
             _ => None,
         }
     }
@@ -210,28 +214,26 @@ impl<'p> Vm<'p> {
                     {
                         return true;
                     }
-                    // Inherited method/getter/setter through the class chain.
-                    let class = map.class;
-                    let mut cur = class;
-                    while let Some(cidx) = cur {
-                        match self.heap.get(cidx) {
-                            HeapObj::Class(c) => {
-                                if c.methods.iter().any(|(n, _)| *n == k)
-                                    || c.getters.iter().any(|(n, _)| *n == k)
-                                    || c.setters.iter().any(|(n, _)| *n == k)
-                                {
-                                    return true;
-                                }
-                                cur = c.parent;
-                            }
-                            _ => break,
+                    // A class instance: its class chain's member tables answer for
+                    // the levels that still match their prototype objects; past
+                    // them (or for a key no table declares) the live chain does —
+                    // `C.prototype.z = 1` / `delete C.prototype.m` are visible.
+                    if let Some(cidx) = map.class {
+                        let next = match self.class_member_lookup(idx, cidx, &k) {
+                            ClassLookup::Method(_) | ClassLookup::Accessor { .. } => return true,
+                            ClassLookup::Live(p) => p,
+                            ClassLookup::Miss => self.class_instance_live_proto(idx, cidx),
+                        };
+                        if !next.is_heap() {
+                            return false;
                         }
+                        obj = next;
+                        continue 'prototype_chain;
                     }
                     // [[HasProperty]] continues up the prototype chain: an explicit
                     // `Object.create` proto, then the base Object.prototype (which
                     // carries toString/hasOwnProperty/valueOf/…). Mirrors get_member's
-                    // proto resolution, minus class-instance C.prototype (its methods
-                    // are already covered by the class-chain walk above).
+                    // proto resolution.
                     let proto = if let Some(&p) = self.proto_of.get(&idx) {
                         p.is_heap().then_some(p)
                     } else if self.obj_proto != 0 && idx != self.obj_proto {
@@ -1032,33 +1034,28 @@ impl<'p> Vm<'p> {
             {
                 return Ok(true);
             }
-            let mut cur = match self.heap.get(idx) {
+            let class = match self.heap.get(idx) {
                 HeapObj::Object(m) => m.class,
                 _ => None,
             };
-            // PRIVATE members are not observable via the ordinary
-            // [[HasProperty]] (`in` / Reflect.has): skip the class-member
-            // extension for "#..." keys. (has_property_str keeps it — the
-            // legacy textual private brand checks rely on it.)
-            let skip_members = k.starts_with('#');
-            while let Some(cidx) = cur {
-                let step = match self.heap.get(cidx) {
-                    HeapObj::Class(c) => Some((
-                        !skip_members
-                            && (c.methods.iter().any(|(n, _)| *n == k)
-                                || c.getters.iter().any(|(n, _)| *n == k)
-                                || c.setters.iter().any(|(n, _)| *n == k)),
-                        c.parent,
-                    )),
-                    _ => None,
+            let proto = if let Some(cidx) = class {
+                // A class instance: the member tables answer while they still
+                // describe their prototype objects, the live chain otherwise
+                // (see `has_property`). PRIVATE members are not observable via
+                // the ordinary [[HasProperty]] (`in` / Reflect.has): a "#..."
+                // key skips the tables. (has_property_str keeps them — the
+                // legacy textual private brand checks rely on it.)
+                let next = if k.starts_with('#') {
+                    self.class_instance_live_proto(idx, cidx)
+                } else {
+                    match self.class_member_lookup(idx, cidx, &k) {
+                        ClassLookup::Method(_) | ClassLookup::Accessor { .. } => return Ok(true),
+                        ClassLookup::Live(p) => p,
+                        ClassLookup::Miss => self.class_instance_live_proto(idx, cidx),
+                    }
                 };
-                match step {
-                    Some((true, _)) => return Ok(true),
-                    Some((false, parent)) => cur = parent,
-                    None => break,
-                }
-            }
-            let proto = if let Some(&p) = self.proto_of.get(&idx) {
+                next.is_heap().then_some(next)
+            } else if let Some(&p) = self.proto_of.get(&idx) {
                 p.is_heap().then_some(p)
             } else if self.obj_proto != 0 && idx != self.obj_proto {
                 Some(Value::heap(self.obj_proto))
@@ -1414,15 +1411,15 @@ impl<'p> Vm<'p> {
 
     pub(crate) fn make_error(&mut self, kind: u8, msg: Option<Value>) -> Value {
         let k = (kind as usize).min(7);
-        let name_v = self.alloc_str(native::ERROR_NAMES[k].to_string());
         let msg_idx = match msg {
             Some(m) if m != Value::UNDEFINED => Some(self.to_str_idx(m)),
             _ => None,
         };
         // `message` is a non-enumerable own data property (ES: CreateNonEnumerable-
-        // DataPropertyOrThrow). `name` is normally inherited from the prototype, but
-        // zipp keeps it own for the structural error_name/instanceof path — also
-        // non-enumerable, so `Object.keys(err)` is `[]` as the spec requires.
+        // DataPropertyOrThrow). `name` is NOT own: it is inherited from the
+        // prototype, so `Error.prototype.name = …` and a newTarget prototype's
+        // `name` are what `e.name` / `String(e)` see. The kind lives in the
+        // prototype link and [[ErrorData]] (`error_data`).
         let attr = PropAttr {
             writable: true,
             enumerable: false,
@@ -1431,7 +1428,6 @@ impl<'p> Vm<'p> {
             setter: Value::UNDEFINED,
         };
         let mut map = ObjMap::new();
-        map.define("name", name_v, attr);
         if let Some(mi) = msg_idx {
             map.define("message", Value::heap(mi), attr);
         }
@@ -1558,6 +1554,7 @@ impl<'p> Vm<'p> {
             base,
             mapped_count: param_count.min(argc),
             unmapped: 0,
+            unmapped_hi: Vec::new(),
         });
         self.arguments_objs.insert(idx, map);
         if obj_proto != 0 {
@@ -1646,7 +1643,7 @@ impl<'p> Vm<'p> {
     /// severed / frame dead → ordinary (dense-store) semantics apply.
     pub(crate) fn args_mapped_get(&self, idx: u32, i: usize) -> Option<Value> {
         let m = self.arguments_objs.get(&idx)?.as_ref()?;
-        if i >= m.mapped_count || i >= 64 || (m.unmapped >> i) & 1 == 1 {
+        if i >= m.mapped_count || m.is_unmapped(i) {
             return None;
         }
         let f = self.frames.get(m.frame_idx)?;
@@ -1670,7 +1667,7 @@ impl<'p> Vm<'p> {
         let Some(Some(m)) = self.arguments_objs.get(&idx) else {
             return false;
         };
-        if i >= m.mapped_count || i >= 64 || (m.unmapped >> i) & 1 == 1 {
+        if i >= m.mapped_count || m.is_unmapped(i) {
             return false;
         }
         let (frame_idx, base) = (m.frame_idx, m.base);
@@ -1710,8 +1707,10 @@ impl<'p> Vm<'p> {
             None
         };
         if let Some(Some(m)) = self.arguments_objs.get_mut(&idx) {
-            if i < 64 {
-                m.unmapped |= 1 << i;
+            // (An index past the formals was never mapped: nothing to record,
+            // and no bitset sized by an arbitrary index.)
+            if i < m.mapped_count {
+                m.set_unmapped(i);
             }
         }
         if let Some(v) = cur {
@@ -1732,7 +1731,7 @@ impl<'p> Vm<'p> {
     /// [[Get]] hooks; a no-op for everything else.
     pub(crate) fn args_sync_dense(&mut self, idx: u32) {
         let count = match self.arguments_objs.get(&idx) {
-            Some(Some(m)) => m.mapped_count.min(64),
+            Some(Some(m)) => m.mapped_count,
             _ => return,
         };
         for i in 0..count {
@@ -1781,7 +1780,9 @@ impl<'p> Vm<'p> {
                 return prop_key.clone();
             }
         }
-        self.display(key)
+        // A string spelled like a symbol key ("@@…") is escaped out of that
+        // space (`escape_guest_key`).
+        escape_guest_key(self.display(key))
     }
 
     /// `ToPropertyKey(key)` (7.1.19): a Symbol maps to its registry key; anything
@@ -1801,7 +1802,7 @@ impl<'p> Vm<'p> {
                 return Ok(prop_key.clone());
             }
         }
-        self.to_js_string(prim)
+        self.to_js_string(prim).map(escape_guest_key)
     }
 
     /// Allocate a BigInt value.
@@ -1836,7 +1837,8 @@ impl<'p> Vm<'p> {
         }
         if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
             let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
-            let t = s.trim();
+            // StringToBigInt trims StrWhiteSpaceChar (U+FEFF yes, U+0085 no).
+            let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
             if t.is_empty() {
                 return Ok(BigVal::Small(0));
             }

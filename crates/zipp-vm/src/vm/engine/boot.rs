@@ -153,6 +153,7 @@ impl<'p> Vm<'p> {
             math_bare_memo: [(u32::MAX, u32::MAX); crate::bytecode::MATH_FN_COUNT],
             class_values: vec![None; program.classes.len()],
             mi_class_epoch: 0,
+            class_proto_epoch: 0,
             #[cfg(all(feature = "jit", target_arch = "x86_64"))]
             mi_recv: rustc_hash::FxHashMap::default(),
             idx_key_scratch: String::new(),
@@ -238,6 +239,8 @@ impl<'p> Vm<'p> {
             brand_private_names: std::collections::HashMap::new(),
             brand_owner: std::collections::HashMap::new(),
             prototypes: std::collections::HashMap::new(),
+            class_proto_owner: rustc_hash::FxHashMap::default(),
+            ctor_initial_name: rustc_hash::FxHashMap::default(),
             proto_of: crate::slot_table::SlotTable::default(),
             ctor_field_hint: Vec::new(),
             fn_props: crate::slot_table::SlotTable::default(),

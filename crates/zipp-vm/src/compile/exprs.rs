@@ -1556,7 +1556,9 @@ impl<'a> FnCompiler<'a> {
         is_method: bool,
     ) -> R<u32> {
         let key = static_key_text(key).ok_or("unsupported object key in the zipp-vm subset")?;
-        let name = self.string_name(&key);
+        // The property NAME is the internal key form; `key` stays the guest
+        // text (NamedEvaluation below).
+        let name = self.string_name(&crate::vm::helpers_numeric::escape_guest_key(key.clone()));
         // A concise method gets a [[HomeObject]] (for `super`); the flag scopes
         // exactly the value compilation, as in `object_data_prop`.
         if is_method {
@@ -1785,7 +1787,9 @@ impl<'a> FnCompiler<'a> {
         }
         // Static identifier / string / number literal key.
         let key = static_key_text(key).ok_or("unsupported object key in the zipp-vm subset")?;
-        let name = self.string_name(&key);
+        // The property NAME is the internal key form; `key` stays the guest
+        // text (NamedEvaluation below).
+        let name = self.string_name(&crate::vm::helpers_numeric::escape_guest_key(key.clone()));
         // `{ fn: function(){}, m(){}, C: class{} }` — an anonymous
         // value function/class takes the property key as its name,
         // EXCEPT `{ __proto__: fn }` (a proto-setter, not a data

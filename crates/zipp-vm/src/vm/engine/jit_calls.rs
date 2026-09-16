@@ -1616,7 +1616,8 @@ impl<'p> Vm<'p> {
         self.heap.write_barrier_val(idx, stored);
         // Re-borrow mutably and verify the field is an own writable data slot.
         match self.heap.get_mut(idx) {
-            HeapObj::Object(m) if !m.is_ctor => {
+            // (A class prototype's writes must reach `set_prop`.)
+            HeapObj::Object(m) if !m.is_ctor && !m.class_proto => {
                 let s = m.pos(field)?;
                 if m.attr_at(s).accessor || !m.attr_at(s).writable {
                     return None;

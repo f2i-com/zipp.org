@@ -64,8 +64,9 @@ impl<'p> Vm<'p> {
         // A derived class's prototype chains to its parent's prototype (so a
         // subclass instance is `instanceof` the parent — including built-in
         // parents like Error/Array — and inherits the parent's prototype methods
-        // through the chain). Method/getter resolution itself still uses the
-        // class `extends` chain; this only extends the prototype fallback.
+        // through the chain). Member resolution uses the class `extends` chain's
+        // tables only while they still describe these objects
+        // (`ClassData::proto_dirty`), and this chain otherwise.
         let parent: Option<u32> = match self.heap.get(idx) {
             HeapObj::Class(c) => c.parent,
             _ => None,
@@ -152,8 +153,17 @@ impl<'p> Vm<'p> {
             done.push(k.as_str());
             define_key(&mut map, k);
         }
+        let is_class = matches!(self.heap.get(idx), HeapObj::Class(_));
+        if is_class {
+            // The class's member tables describe this object only until it is
+            // mutated; flag it so every mutation reaches a path that can say so.
+            map.mark_class_proto();
+        }
         let p = self.heap.alloc(HeapObj::Object(Box::new(map)));
         self.prototypes.insert(idx, p);
+        if is_class {
+            self.class_proto_owner.insert(p, idx);
+        }
         // A function born in a $262.createRealm child gets a `.prototype` whose
         // [[Prototype]] is the CHILD's %Object.prototype% (OrdinaryFunctionCreate
         // runs in the function's realm) — `new fn() instanceof other.Object`.

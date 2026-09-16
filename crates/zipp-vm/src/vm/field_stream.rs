@@ -835,7 +835,7 @@ impl<'p> Vm<'p> {
             return None;
         }
         let map = match self.heap.get(idx) {
-            HeapObj::Object(map) if !map.is_ctor && map.class.is_none() => map,
+            HeapObj::Object(map) if !map.is_ctor && map.class.is_none() && !map.class_proto => map,
             _ => return None,
         };
         let slot = map.pos(key)?;

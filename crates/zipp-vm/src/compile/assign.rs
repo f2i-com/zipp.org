@@ -899,7 +899,10 @@ impl<'a> FnCompiler<'a> {
                                 key: k,
                             }),
                             None => {
-                                let name = class_key_name(&prop.key)?;
+                                // A GetProp NAME is the internal key form.
+                                let name = crate::vm::helpers_numeric::escape_guest_key(
+                                    class_key_name(&prop.key)?,
+                                );
                                 let nidx = self.string_name(&name);
                                 self.emit(Instr::GetProp {
                                     dst: val,
@@ -931,7 +934,8 @@ impl<'a> FnCompiler<'a> {
                         "object-rest with a computed sibling key is not in the subset"
                     })?,
                 };
-                self.string_name(&key);
+                // Compared against the source's internal keys.
+                self.string_name(&crate::vm::helpers_numeric::escape_guest_key(key));
             }
             let save = self.next_reg;
             let val = self.alloc_reg();

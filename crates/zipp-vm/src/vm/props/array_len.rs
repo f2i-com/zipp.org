@@ -88,23 +88,38 @@ impl<'p> Vm<'p> {
 
     /// ArraySetLength truncation blocker: the highest NON-configurable own array
     /// index `>= new_len` (it survives the shrink and the final length becomes
-    /// blocker + 1). Only a defineProperty'd override in `arr_props` can be
-    /// non-configurable, so a scan of its keys covers every candidate — including
+    /// blocker + 1). A defineProperty'd override in `arr_props` can be
+    /// non-configurable, so a scan of its keys covers those — including
     /// sparse-overlay indices far past the dense prefix (never walk the integer
-    /// RANGE here: a virtual length can be 2^32-1).
+    /// RANGE here: a virtual length can be 2^32-1). A SEALED (or frozen) array
+    /// makes every element non-configurable through its flag alone, so there
+    /// the highest present dense element blocks too.
     pub(crate) fn array_shrink_blocker(&self, arr_idx: u32, new_len: usize) -> Option<usize> {
         let m = self.arr_props.get(&arr_idx)?;
-        m.keys
+        let sealed = m.sealed || m.frozen;
+        let keyed = m
+            .keys
             .iter()
             .enumerate()
             .filter_map(|(i, k)| {
                 // A spec array index is < 2^32-1: "4294967295"/"4294967296"
                 // are ORDINARY named properties — they never block a shrink.
                 canonical_index_str(k).filter(|ki| {
-                    *ki < 4_294_967_295 && *ki >= new_len && !m.attr_at(i).configurable
+                    *ki < 4_294_967_295 && *ki >= new_len && (sealed || !m.attr_at(i).configurable)
                 })
             })
-            .max()
+            .max();
+        if !sealed {
+            return keyed;
+        }
+        let dense = match self.heap.get(arr_idx) {
+            HeapObj::Array(items) if items.len() > new_len => items[new_len..]
+                .iter()
+                .rposition(|v| !v.is_hole())
+                .map(|p| new_len + p),
+            _ => None,
+        };
+        keyed.max(dense)
     }
 
     /// Apply a VALIDATED new `length` to a real array: drop the (configurable)
@@ -204,8 +219,9 @@ impl<'p> Vm<'p> {
                     continue;
                 }
                 let desc_obj = self.get_prop(props, &k)?;
-                self.read_descriptor(desc_obj)?; // ToPropertyDescriptor (validation)
-                pending.push((k, desc_obj));
+                // ToPropertyDescriptor (validation), its getters run once.
+                let record = self.descriptor_record(desc_obj)?;
+                pending.push((k, record));
             }
             for (k, d) in pending {
                 self.object_define_property(obj, &k, d)?;
@@ -240,13 +256,76 @@ impl<'p> Vm<'p> {
             }
             _ => self.arr_props.get(&pidx).map(enum_keys).unwrap_or_default(),
         };
+        // Same two-phase protocol as the Proxy branch: every descriptor is read
+        // and validated (ToPropertyDescriptor) BEFORE any define lands, so a
+        // later invalid or throwing descriptor leaves `obj` untouched. A key an
+        // earlier getter deleted (or made non-enumerable) is skipped — the
+        // spec re-reads [[GetOwnProperty]] per key.
+        let _gc = self.gc_lock_guard(); // `pending` holds descriptor Values
+        let mut pending: Vec<(String, Value)> = Vec::with_capacity(keys.len());
         for k in keys {
+            if !self.own_enumerable_now(pidx, &k) {
+                continue;
+            }
             let desc = self.get_prop(props, &k)?;
-            // A getter on a later descriptor field may delete this one from
-            // `props`, leaving `desc` reachable only from this local.
-            self.with_host_roots(&[desc], |vm| vm.object_define_property(obj, &k, desc))?;
+            let record = self.descriptor_record(desc)?;
+            pending.push((k, record));
+        }
+        for (k, desc) in pending {
+            self.object_define_property(obj, &k, desc)?;
         }
         Ok(())
+    }
+
+    /// ToPropertyDescriptor(`desc`) — running its field getters exactly once —
+    /// captured as a fresh plain object holding just the present fields, so
+    /// the later [[DefineOwnProperty]] re-reads the record, not user code.
+    fn descriptor_record(&mut self, desc: Value) -> Result<Value, Thrown> {
+        let (value, get, set, wr, en, cf) = self.read_descriptor(desc)?;
+        let mut m = ObjMap::new();
+        if let Some(v) = value {
+            m.set("value", v);
+        }
+        if let Some(w) = wr {
+            m.set("writable", Value::bool(w));
+        }
+        if let Some(g) = get {
+            m.set("get", g);
+        }
+        if let Some(s) = set {
+            m.set("set", s);
+        }
+        if let Some(e) = en {
+            m.set("enumerable", Value::bool(e));
+        }
+        if let Some(c) = cf {
+            m.set("configurable", Value::bool(c));
+        }
+        Ok(Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m)))))
+    }
+
+    /// Is `key` still an own ENUMERABLE property of the descriptor bag `pidx`
+    /// (an ordinary object, a callable, a String wrapper or another exotic —
+    /// the same stores `object_define_properties` collected its keys from)?
+    fn own_enumerable_now(&self, pidx: u32, key: &str) -> bool {
+        let side = |m: Option<&ObjMap>| {
+            m.and_then(|m| m.pos(key).map(|i| m.attr_at(i).enumerable))
+                .unwrap_or(false)
+        };
+        match self.heap.get(pidx) {
+            HeapObj::Object(m) => side(Some(m)),
+            HeapObj::Func(_)
+            | HeapObj::Closure { .. }
+            | HeapObj::Bound { .. }
+            | HeapObj::Wrapped { .. }
+            | HeapObj::Native(_)
+            | HeapObj::NativeClosure { .. } => side(self.fn_props.get(&pidx)),
+            HeapObj::Boxed { kind: 0, value } => {
+                let n = self.heap.str_units(value.heap_index()).unwrap_or(0);
+                canonical_index_str(key).is_some_and(|i| i < n) || side(self.arr_props.get(&pidx))
+            }
+            _ => side(self.arr_props.get(&pidx)),
+        }
     }
 
     /// The `(name, length)` of a callable value (function, closure, or class) for
@@ -433,9 +512,11 @@ impl<'p> Vm<'p> {
             self.invalidate_indexed_proto_protector();
             // %Array.prototype% is an Array exotic: an index definition on it
             // grows its own `length` (ArraySetLength step for index defines).
+            // Only a true array index (< 2^32-1) does: "4294967295" and beyond
+            // are ordinary named properties.
             if obj_idx == self.arr_proto {
-                if let Some(i) = canonical_index_str(key) {
-                    let want = (i as u64 + 1).min(u32::MAX as u64) as u32;
+                if let Some(i) = canonical_index_str(key).filter(|&i| i < 4_294_967_295) {
+                    let want = (i as u64 + 1) as u32;
                     if want > self.arr_proto_len {
                         self.arr_proto_len = want;
                     }

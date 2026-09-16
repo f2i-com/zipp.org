@@ -27,15 +27,19 @@
 //!   ways validate `keys[slot] == key`. Every usable hit re-reads
 //!   `attrs[slot]` — so in-place value writes, `freeze`, and data⇄accessor
 //!   redefinition are all observed fresh. Nothing cached can go stale.
-//! * `Class*` entries rely on ClassData being IMMUTABLE after class
-//!   definition (methods/getters/setters/parent are only written by the
-//!   MakeClass / computed-member ops; `C.prototype.m = …` does not feed back
-//!   into ClassData in this engine). The guard is `m.class == class` plus
-//!   `heap.version_of(class)` (a swept-and-reused class slot bumps the
-//!   version), plus an own-shadow `pos(key)` miss. A live receiver whose
-//!   `class` link matches keeps the class — and through `trace_edges`, the
-//!   cached method/accessor Values — alive, so the cached Values can never be
-//!   used after a sweep.
+//! * `Class*` entries rely on ClassData's member tables being IMMUTABLE after
+//!   class definition (methods/getters/setters/parent are only written by the
+//!   MakeClass / computed-member ops) and on the tables still describing the
+//!   live prototype objects. The latter stops holding exactly when
+//!   `note_class_proto_mutation` retires a level (`C.prototype.m = …`,
+//!   defineProperty/delete of a declared member, freeze, setPrototypeOf) or
+//!   `note_class_instance_reproto` flags a class — both advance
+//!   `class_proto_epoch`, which every entry bakes. The guard is
+//!   `m.class == class` plus `heap.version_of(class)` (a swept-and-reused class
+//!   slot bumps the version) plus that epoch, plus an own-shadow `pos(key)`
+//!   miss. A live receiver whose `class` link matches keeps the class — and
+//!   through `trace_edges`, the cached method/accessor Values — alive, so the
+//!   cached Values can never be used after a sweep.
 //! * `Proto*` entries guard the receiver by an own-`pos` miss plus a re-read
 //!   of its FIRST proto link, and every chain object by its heap VERSION.
 //!   Every mutation that can change chain resolution bumps a guarded
@@ -57,6 +61,7 @@
 //! value from a live, guard-validated holder — a stale entry can be PRESENT
 //! but never USED.
 
+use super::props::ClassLookup;
 use super::*;
 use crate::bytecode::{Instr, Program, UpvalSource};
 use crate::heap::{ClassData, Handler, Heap, HeapObj, ObjMap, PropAttr};
@@ -124,9 +129,12 @@ pub(crate) enum IcEntry {
     /// Method (`is_getter == false`) or getter resolved on the receiver's
     /// class chain. `callee` is the materialized member function (stable for
     /// the life of the class — ClassData is immutable post-definition).
+    /// `epoch` is `class_proto_epoch` at fill: the tables it was read from
+    /// still described the prototype chain then.
     ClassMethod {
         class: u32,
         ver: u32,
+        epoch: u32,
         callee: Value,
         fid: u32,
         closure: u32,
@@ -134,12 +142,14 @@ pub(crate) enum IcEntry {
     ClassGetter {
         class: u32,
         ver: u32,
+        epoch: u32,
         getter: Value,
     },
     /// `set key(v)` resolved on the receiver's class chain (SetProp sites).
     ClassSetter {
         class: u32,
         ver: u32,
+        epoch: u32,
         setter: Value,
     },
     /// Data property / accessor found on the proto_of chain at
@@ -533,22 +543,22 @@ impl<'p> Vm<'p> {
             // Class-instance own miss: the inline class-chain walk
             // (methods before getters per level; a non-Class link breaks to
             // the slow path → not cacheable).
-            let mut c2 = Some(class);
-            while let Some(cidx) = c2 {
-                match self.heap.get(cidx) {
-                    HeapObj::Class(c) => {
-                        if let Some((_, v)) = c.methods.iter().find(|(k, _)| k == key) {
-                            return Walked::ClassMethod { class, callee: *v };
-                        }
-                        if let Some((_, v)) = c.getters.iter().find(|(k, _)| k == key) {
-                            return Walked::ClassGetter { class, getter: *v };
-                        }
-                        c2 = c.parent;
-                    }
-                    _ => break,
-                }
+            //
+            // A class whose instances may carry their own [[Prototype]] is not
+            // cacheable by class: an entry filled from one instance would also
+            // serve a re-prototyped sibling, and the hit guard does not read
+            // `proto_of`. A retired table level (`Live`) resolves on the live
+            // chain, which the slow path walks.
+            if matches!(self.heap.get(class), HeapObj::Class(c) if c.reproto_instances) {
+                return Walked::No;
             }
-            return Walked::No; // chain miss → slow path
+            return match self.class_member_lookup(idx, class, key) {
+                ClassLookup::Method(callee) => Walked::ClassMethod { class, callee },
+                ClassLookup::Accessor { getter, .. } if getter != Value::UNDEFINED => {
+                    Walked::ClassGetter { class, getter }
+                }
+                _ => Walked::No, // chain miss / live level → slow path
+            };
         }
         // Plain-object proto_of chain, recording (idx, version) per hop.
         self.ic_walk_chain(idx, key)
@@ -930,6 +940,7 @@ impl<'p> Vm<'p> {
                         IcEntry::ClassMethod {
                             class,
                             ver: self.heap.version_of(class),
+                            epoch: self.class_proto_epoch,
                             callee,
                             fid,
                             closure,
@@ -943,8 +954,18 @@ impl<'p> Vm<'p> {
             }
             Walked::ClassGetter { class, getter } => {
                 let ver = self.heap.version_of(class);
+                let epoch = self.class_proto_epoch;
                 self.mi_record_recv(func_id, ip, recv);
-                self.ic_install(func_id, ip, IcEntry::ClassGetter { class, ver, getter });
+                self.ic_install(
+                    func_id,
+                    ip,
+                    IcEntry::ClassGetter {
+                        class,
+                        ver,
+                        epoch,
+                        getter,
+                    },
+                );
                 match self.ic_plain_fn(getter) {
                     Some((fid, closure)) => GetAct::Accessor {
                         fid,
@@ -1025,16 +1046,33 @@ impl<'p> Vm<'p> {
                 }
             }
             IcEntry::ClassMethod {
-                class, ver, callee, ..
+                class,
+                ver,
+                epoch,
+                callee,
+                ..
             } => {
-                if own.is_none() && m.class == Some(class) && self.heap.version_of(class) == ver {
+                if own.is_none()
+                    && m.class == Some(class)
+                    && self.heap.version_of(class) == ver
+                    && self.class_proto_epoch == epoch
+                {
                     GetAct::Value(callee)
                 } else {
                     GetAct::None
                 }
             }
-            IcEntry::ClassGetter { class, ver, getter } => {
-                if own.is_none() && m.class == Some(class) && self.heap.version_of(class) == ver {
+            IcEntry::ClassGetter {
+                class,
+                ver,
+                epoch,
+                getter,
+            } => {
+                if own.is_none()
+                    && m.class == Some(class)
+                    && self.heap.version_of(class) == ver
+                    && self.class_proto_epoch == epoch
+                {
                     match self.ic_plain_fn(getter) {
                         Some((fid, closure)) => GetAct::Accessor {
                             fid,
@@ -1256,16 +1294,26 @@ impl<'p> Vm<'p> {
             Walked::ClassMethod { .. } | Walked::ClassGetter { .. } => {
                 // A write to a class-resolved member: only a SETTER on the
                 // chain is cacheable (set_prop's class arm).
-                let (_, m) = match self.ic_recv_map(recv) {
+                let (ridx, m) = match self.ic_recv_map(recv) {
                     Some(x) => x,
                     None => return SetAct::None,
                 };
                 let class = m.class.expect("class walk provenance");
-                match self.lookup_setter(Some(class), key) {
+                match self.ic_class_setter(ridx, class, key) {
                     Some(setter) => {
                         let ver = self.heap.version_of(class);
+                        let epoch = self.class_proto_epoch;
                         self.mi_record_recv(func_id, ip, recv);
-                        self.ic_install(func_id, ip, IcEntry::ClassSetter { class, ver, setter });
+                        self.ic_install(
+                            func_id,
+                            ip,
+                            IcEntry::ClassSetter {
+                                class,
+                                ver,
+                                epoch,
+                                setter,
+                            },
+                        );
                         match self.ic_plain_fn(setter) {
                             Some((fid, closure)) => SetAct::Setter {
                                 fid,
@@ -1286,16 +1334,22 @@ impl<'p> Vm<'p> {
             // But a class instance with NO method/getter hit may still have a
             // chain SETTER; resolve it directly.
             Walked::No | Walked::ChainData { .. } | Walked::ChainMiss { .. } => {
-                if let Some((_, m)) = self.ic_recv_map(recv) {
+                if let Some((ridx, m)) = self.ic_recv_map(recv) {
                     if let Some(class) = m.class {
                         if m.pos(key).is_none() {
-                            if let Some(setter) = self.lookup_setter(Some(class), key) {
+                            if let Some(setter) = self.ic_class_setter(ridx, class, key) {
                                 let ver = self.heap.version_of(class);
+                                let epoch = self.class_proto_epoch;
                                 self.mi_record_recv(func_id, ip, recv);
                                 self.ic_install(
                                     func_id,
                                     ip,
-                                    IcEntry::ClassSetter { class, ver, setter },
+                                    IcEntry::ClassSetter {
+                                        class,
+                                        ver,
+                                        epoch,
+                                        setter,
+                                    },
                                 );
                                 return match self.ic_plain_fn(setter) {
                                     Some((fid, closure)) => SetAct::Setter {
@@ -1334,7 +1388,13 @@ impl<'p> Vm<'p> {
         match *e {
             IcEntry::OwnData { slot, .. } => {
                 let s = slot as usize;
-                if own == Some(s) && !m.attr_at(s).accessor && m.attr_at(s).writable {
+                // A class prototype's writes must reach `set_prop`, which
+                // records a divergence from its class's member tables.
+                if own == Some(s)
+                    && !m.attr_at(s).accessor
+                    && m.attr_at(s).writable
+                    && !m.class_proto
+                {
                     Some(SetPlan::WriteOwn { idx, slot })
                 } else {
                     None
@@ -1354,8 +1414,17 @@ impl<'p> Vm<'p> {
                     None
                 }
             }
-            IcEntry::ClassSetter { class, ver, setter } => {
-                if own.is_none() && m.class == Some(class) && self.heap.version_of(class) == ver {
+            IcEntry::ClassSetter {
+                class,
+                ver,
+                epoch,
+                setter,
+            } => {
+                if own.is_none()
+                    && m.class == Some(class)
+                    && self.heap.version_of(class) == ver
+                    && self.class_proto_epoch == epoch
+                {
                     let (fid, closure) = self.ic_plain_fn(setter)?;
                     Some(SetPlan::Setter {
                         fid,
@@ -1426,10 +1495,28 @@ impl<'p> Vm<'p> {
     fn ic_own_set_plan(&self, recv: Value, key: &str, slot: u32) -> Option<SetPlan> {
         let (idx, m) = self.ic_recv_map(recv)?;
         let s = slot as usize;
-        if s < m.keys.len() && m.keys[s] == key && !m.attr_at(s).accessor && m.attr_at(s).writable {
+        if s < m.keys.len()
+            && m.keys[s] == key
+            && !m.attr_at(s).accessor
+            && m.attr_at(s).writable
+            && !m.class_proto
+        {
             Some(SetPlan::WriteOwn { idx, slot })
         } else {
             None
+        }
+    }
+
+    /// The SETTER a write of `key` on class instance `idx` resolves to through
+    /// its class's member tables, when that resolution may be cached by class
+    /// (see `ic_walk` for why a class with re-prototyped instances may not).
+    fn ic_class_setter(&self, idx: u32, class: u32, key: &str) -> Option<Value> {
+        if matches!(self.heap.get(class), HeapObj::Class(c) if c.reproto_instances) {
+            return None;
+        }
+        match self.class_member_lookup(idx, class, key) {
+            ClassLookup::Accessor { setter, .. } if setter != Value::UNDEFINED => Some(setter),
+            _ => None,
         }
     }
 
@@ -1544,6 +1631,7 @@ impl<'p> Vm<'p> {
             Walked::ClassMethod { class, callee } => match self.ic_plain_fn(callee) {
                 Some((fid, closure)) => {
                     let ver = self.heap.version_of(class);
+                    let epoch = self.class_proto_epoch;
                     self.mi_record_recv(func_id, ip, recv);
                     self.ic_install(
                         func_id,
@@ -1551,6 +1639,7 @@ impl<'p> Vm<'p> {
                         IcEntry::ClassMethod {
                             class,
                             ver,
+                            epoch,
                             callee,
                             fid,
                             closure,
@@ -1684,11 +1773,16 @@ impl<'p> Vm<'p> {
             IcEntry::ClassMethod {
                 class,
                 ver,
+                epoch,
                 callee,
                 fid,
                 closure,
             } => {
-                if own.is_none() && m.class == Some(class) && self.heap.version_of(class) == ver {
+                if own.is_none()
+                    && m.class == Some(class)
+                    && self.heap.version_of(class) == ver
+                    && self.class_proto_epoch == epoch
+                {
                     Some((fid, closure, callee))
                 } else {
                     None
@@ -1841,12 +1935,14 @@ impl<'p> Vm<'p> {
         for e in &site.entries[..site.n as usize] {
             if let IcEntry::ClassMethod {
                 class: c,
+                ver,
+                epoch,
                 fid,
                 callee,
                 ..
             } = *e
             {
-                if c == class {
+                if c == class && self.ic_class_way_live(c, ver, epoch) {
                     return Some((fid, callee));
                 }
             }
@@ -1854,21 +1950,33 @@ impl<'p> Vm<'p> {
         None
     }
 
+    /// Whether a `Class*` way filled against `class` at (`ver`, `epoch`) would
+    /// still validate now. The JIT planners bake a way's member only when it
+    /// does, and guard the arm on the current `class_proto_epoch`.
+    #[cfg(all(feature = "jit", target_arch = "x86_64"))]
+    #[inline]
+    fn ic_class_way_live(&self, class: u32, ver: u32, epoch: u32) -> bool {
+        self.heap.version_of(class) == ver && self.class_proto_epoch == epoch
+    }
+
     /// Read-only: the trivial class GETTER `fid` for a `GetProp` site whose
     /// receiver belongs to `class` (Stage 5 accessor inlining), from a filled
-    /// `ClassGetter` IC way. zipp resolves class accessors via the class id
-    /// (prototype-accessor reassignment ignored — verified JIT==NOJIT), so an arm
-    /// baked off this fid + the receiver identity/version guard matches the
-    /// interpreter. `None` if no such way / not a plain user fn.
+    /// `ClassGetter` IC way that still validates. An arm baked off this fid
+    /// guards the receiver's identity/version and `class_proto_epoch`, which
+    /// together match the interpreter's `ClassGetter` hit. `None` if no such
+    /// way / not a plain user fn.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_class_getter_fid(&self, func_id: u32, ip: usize, class: u32) -> Option<u32> {
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
             if let IcEntry::ClassGetter {
-                class: c, getter, ..
+                class: c,
+                ver,
+                epoch,
+                getter,
             } = *e
             {
-                if c == class {
+                if c == class && self.ic_class_way_live(c, ver, epoch) {
                     return self.ic_plain_fn(getter).map(|(fid, _)| fid);
                 }
             }
@@ -1877,16 +1985,20 @@ impl<'p> Vm<'p> {
     }
 
     /// Read-only: the trivial class SETTER `fid` for a `SetProp` site whose
-    /// receiver belongs to `class` (Stage 5), from a filled `ClassSetter` IC way.
+    /// receiver belongs to `class` (Stage 5), from a filled `ClassSetter` IC way
+    /// that still validates.
     #[cfg(all(feature = "jit", target_arch = "x86_64"))]
     pub(crate) fn ic_class_setter_fid(&self, func_id: u32, ip: usize, class: u32) -> Option<u32> {
         let site = self.ic_site(func_id, ip)?;
         for e in &site.entries[..site.n as usize] {
             if let IcEntry::ClassSetter {
-                class: c, setter, ..
+                class: c,
+                ver,
+                epoch,
+                setter,
             } = *e
             {
-                if c == class {
+                if c == class && self.ic_class_way_live(c, ver, epoch) {
                     return self.ic_plain_fn(setter).map(|(fid, _)| fid);
                 }
             }

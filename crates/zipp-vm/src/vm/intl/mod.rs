@@ -645,7 +645,13 @@ impl<'p> Vm<'p> {
                 }
                 self.store_digit_options(&mut r, &digits);
                 // PluralRules has no `numberingSystem` in its resolvedOptions table.
-                let cats = ["one", "other"]
+                // The English categories `select` can answer, per type.
+                let cats: &[&str] = if self.display(tv) == "ordinal" {
+                    &["one", "two", "few", "other"]
+                } else {
+                    &["one", "other"]
+                };
+                let cats = cats
                     .iter()
                     .map(|c| self.alloc_str(c.to_string()))
                     .collect::<Vec<_>>();

@@ -31,7 +31,121 @@ fn timer_queue_work_bound(len: usize) -> u64 {
     n.saturating_mul(sort_levels.saturating_add(2))
 }
 
+/// The element source of one `Object.groupBy`/`Map.groupBy` call: either a
+/// pristine-iteration Array walked in place, or a real iterator stepped with
+/// IteratorStepValue (and closed on an abrupt callback / key coercion).
+struct GroupByWalk {
+    array: Option<Value>,
+    iter: Value,
+}
+
+impl GroupByWalk {
+    fn new(vm: &mut Vm<'_>, src: Value) -> Result<GroupByWalk, Thrown> {
+        if matches!(vm.heap.get(src.heap_index()), HeapObj::Array(_)) {
+            // `get_iterator` answers the array itself only while its
+            // @@iterator and %ArrayIteratorPrototype%.next are pristine.
+            let it = vm.get_iterator(src)?;
+            return Ok(if it == src {
+                GroupByWalk {
+                    array: Some(src),
+                    iter: Value::UNDEFINED,
+                }
+            } else {
+                GroupByWalk {
+                    array: None,
+                    iter: it,
+                }
+            });
+        }
+        let iter = vm.get_iterator_object(src)?;
+        if !vm.is_object_value(iter) {
+            return Err(Thrown(
+                "TypeError: Result of the Symbol.iterator method is not an object".into(),
+            ));
+        }
+        Ok(GroupByWalk { array: None, iter })
+    }
+
+    /// The `k`-th element, or `None` once the source is exhausted.
+    fn step(&mut self, vm: &mut Vm<'_>, k: usize) -> Result<Option<Value>, Thrown> {
+        match self.array {
+            Some(arr) => {
+                if k >= vm.js_array_len(arr.heap_index()) {
+                    return Ok(None);
+                }
+                vm.get_index(arr, Value::num(k as f64)).map(Some)
+            }
+            None => vm.iterator_step(self.iter),
+        }
+    }
+
+    /// Run `f`; on an abrupt completion close the iterator first
+    /// (IfAbruptCloseIterator), keeping the original error.
+    fn close_on_err<T>(
+        &mut self,
+        vm: &mut Vm<'_>,
+        f: impl FnOnce(&mut Vm<'_>) -> Result<T, Thrown>,
+    ) -> Result<T, Thrown> {
+        let r = f(vm);
+        if r.is_err() && self.array.is_none() {
+            vm.iterator_close_quiet(self.iter);
+        }
+        r
+    }
+}
+
 impl<'p> Vm<'p> {
+    /// ResolvePlural for the English plural rules (the locale data this engine
+    /// ships): the CLDR operands come from `n` as FORMATTED with the rules'
+    /// digit options — so `maximumFractionDigits: 0` makes 1.2 "one" and
+    /// `minimumFractionDigits: 1` makes 1 "other" — of its absolute value.
+    /// Cardinal: `one` iff i = 1 and v = 0. Ordinal: n % 10 = 1/2/3 (and
+    /// n % 100 not 11/12/13) → one/two/few. Compact and scientific notation
+    /// take the operands from the unrounded value, as ICU reports the full
+    /// magnitude there (1000 → "1K" is `other`).
+    fn plural_category_en(&mut self, resolved: u32, n: f64) -> Result<&'static str, Thrown> {
+        if !n.is_finite() {
+            return Ok("other");
+        }
+        let ordinal = self.display(self.intl_slot(resolved, "type")) == "ordinal";
+        let standard = self.display(self.intl_slot(resolved, "notation")) == "standard";
+        let text = if standard {
+            self.intl_number_format_str(resolved, n.abs())?
+        } else {
+            // Shortest round-trip form; Rust never uses exponent notation here.
+            format!("{}", n.abs())
+        };
+        let digits: String = text
+            .chars()
+            .filter(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let (int_part, frac_part) = digits.split_once('.').unwrap_or((&digits, ""));
+        let int_part = int_part.trim_start_matches('0');
+        let v = frac_part.len();
+        if !ordinal {
+            return Ok(if int_part == "1" && v == 0 {
+                "one"
+            } else {
+                "other"
+            });
+        }
+        if frac_part.bytes().any(|b| b != b'0') {
+            return Ok("other"); // n % 10 of a non-integer is never 1, 2 or 3
+        }
+        let b = int_part.as_bytes();
+        let m100 = match b.len() {
+            0 => 0,
+            1 => (b[0] - b'0') as u32,
+            k => ((b[k - 2] - b'0') * 10 + (b[k - 1] - b'0')) as u32,
+        };
+        Ok(match (m100 % 10, m100) {
+            (1, m) if m != 11 => "one",
+            (2, m) if m != 12 => "two",
+            (3, m) if m != 13 => "few",
+            _ => "other",
+        })
+    }
+
     /// IteratorToList with a PRE-FETCHED @@iterator method (the observable
     /// trace: no second @@iterator get; `next` fetched once and cached; per
     /// step `done` is read BEFORE `value`, and `value` is skipped once done).
@@ -213,16 +327,21 @@ impl<'p> Vm<'p> {
             // at a non-configurable index, sweep the doomed arr_props
             // entries, and keep the virtual (sparse) length consistent.
             let mut final_len = u as usize;
-            if let Some(ki) = self.array_shrink_blocker(aidx, final_len) {
+            let blocked = self.array_shrink_blocker(aidx, final_len);
+            if let Some(ki) = blocked {
                 final_len = ki + 1;
             }
             self.array_apply_length(aidx, final_len);
-            return Ok(true);
+            // A blocked shrink applies the partial truncation and reports
+            // FALSE (ArraySetLength step 17.b.iii).
+            return Ok(blocked.is_none());
         }
         // OrdinarySet([[Set]](P,V,Receiver)): find the governing descriptor
         // (target's own, then up the prototype chain). Only ordinary Object
-        // links carry inline descriptors here; a class-instance/exotic link
-        // falls back to the simpler target-write below.
+        // links carry inline descriptors here; an exotic link falls back to
+        // the simpler target-write below. A class instance's inherited members
+        // are real properties of its (materialized) prototype objects, which
+        // `object_get_prototype_of` walks into like any other chain.
         let mut governing: Option<(bool, bool, Value)> = None; // (accessor, writable, setter)
         let mut fell_back = false;
         let mut ta_chain_node: Option<u32> = None;
@@ -239,8 +358,10 @@ impl<'p> Vm<'p> {
                         ));
                         break;
                     }
-                    if m.class.is_some() {
-                        fell_back = true; // class-chain members aren't inline attrs
+                    // A private name is never a prototype property: keep the
+                    // class-aware target write for it.
+                    if m.class.is_some() && key.starts_with('#') {
+                        fell_back = true;
                         break;
                     }
                 }
@@ -328,6 +449,21 @@ impl<'p> Vm<'p> {
                     .unwrap_or(false)
             }
         };
+        // A class constructor's static properties (and any accessor defined on
+        // it, which lives among them) are resolved by the static-accessor walk:
+        // its setter runs with the receiver, a getter-only accessor or a
+        // non-writable static rejects, anything else is an ordinary write.
+        if fell_back && matches!(self.heap.get(a0.heap_index()), HeapObj::Class(_)) {
+            return match self.lookup_static_accessor(Some(a0.heap_index()), &key) {
+                Some(Some(setter)) => {
+                    self.call_value(setter, receiver, &[value])?;
+                    Ok(true)
+                }
+                Some(None) => Ok(false),
+                None if self.same_value(a0, receiver) => self.set_prop(a0, &key, value, false),
+                None => self.reflect_set_on_receiver(receiver, kv, value),
+            };
+        }
         let result = if fell_back {
             let ok = match self.heap.get(a0.heap_index()) {
                 HeapObj::Object(m) => match m.pos(&key) {
@@ -365,13 +501,24 @@ impl<'p> Vm<'p> {
                     }) {
                         Some((true, _, setter)) => setter != Value::UNDEFINED,
                         Some((_, w, _)) => w,
-                        None => {
-                            if canonical_index_str(&key).is_some() {
-                                true
-                            } else {
-                                side.map_or(true, |m| m.extensible)
+                        None => match (canonical_index_str(&key), self.heap.get(h)) {
+                            // An Array element: a present one is writable unless
+                            // the array is frozen; an absent one (a hole or past
+                            // the end) is a NEW property, which a non-extensible
+                            // array — or a non-writable `length` it would grow —
+                            // rejects.
+                            (Some(i), HeapObj::Array(items)) => {
+                                if items.get(i).is_some_and(|v| !v.is_hole()) {
+                                    !side.is_some_and(|m| m.frozen)
+                                } else {
+                                    side.map_or(true, |m| m.extensible)
+                                        && !(self.array_length_nonwritable.contains(&h)
+                                            && i >= self.js_array_len(h))
+                                }
                             }
-                        }
+                            (Some(_), _) => true,
+                            (None, _) => side.map_or(true, |m| m.extensible),
+                        },
                     }
                 }
             };
@@ -489,39 +636,27 @@ impl<'p> Vm<'p> {
                 None => Ok(false),
             };
         }
-        let own = match self.heap.get(ridx) {
+        // Receiver.[[GetOwnProperty]](P). An ordinary object's own properties
+        // are its map; every other receiver answers through the general
+        // descriptor routine, which also SYNTHESIZES the exotic own properties
+        // no side table stores — an Array's `length` and dense elements (with
+        // the integrity level's writability), a function's `name`/`length`/
+        // `prototype`, a RegExp's `lastIndex`, a String wrapper's `length` and
+        // indices. Probing only the side tables reported those "absent", so a
+        // full CreateDataProperty descriptor then collided with them.
+        let own: Option<(bool, bool)> = match self.heap.get(ridx) {
             HeapObj::Object(m) => m
                 .pos(&key)
                 .map(|i| (m.attr_at(i).accessor, m.attr_at(i).writable)),
-            HeapObj::Func(_)
-            | HeapObj::Closure { .. }
-            | HeapObj::Bound { .. }
-            | HeapObj::Wrapped { .. }
-            | HeapObj::Native(_)
-            | HeapObj::NativeClosure { .. } => self.fn_props.get(&ridx).and_then(|m| {
-                m.pos(&key)
-                    .map(|i| (m.attr_at(i).accessor, m.attr_at(i).writable))
-            }),
-            _ => self.arr_props.get(&ridx).and_then(|m| {
-                m.pos(&key)
-                    .map(|i| (m.attr_at(i).accessor, m.attr_at(i).writable))
-            }),
-        };
-        // An Array's dense elements are not in `arr_props`, so an in-range index
-        // looks "absent" above and would then be rejected by the extensibility
-        // test below. It IS an own data property; its writability follows the
-        // array's integrity level (frozen ⇒ non-writable, sealed ⇒ still
-        // writable), which is exactly what separates
-        // `Reflect.set({}, "0", 9, Object.freeze([1]))` → false from
-        // `Reflect.set({}, "0", 9, Object.seal([1]))` → true.
-        let own = match own {
-            Some(o) => Some(o),
-            None => match self.heap.get(ridx) {
-                HeapObj::Array(items) => canonical_index_str(&key)
-                    .filter(|i| items.get(*i).is_some_and(|v| !v.is_hole()))
-                    .map(|_| (false, !self.arr_props.get(&ridx).is_some_and(|m| m.frozen))),
-                _ => None,
-            },
+            _ => {
+                let d = self.object_get_own_property_descriptor(receiver, &key);
+                if d.is_undefined() {
+                    None
+                } else {
+                    let (_, get, set, wr, _, _) = self.read_descriptor(d)?;
+                    Some((get.is_some() || set.is_some(), wr.unwrap_or(false)))
+                }
+            }
         };
         match own {
             Some((true, _)) => Ok(false),
@@ -556,9 +691,30 @@ impl<'p> Vm<'p> {
                 self.object_define_property(receiver, &key, desc)?;
                 Ok(true)
             }
+            // A writable own data property. On an ordinary object the value is
+            // replaced in place; an exotic receiver takes the spec's
+            // DefineOwnProperty({[[Value]]: V}) — ArraySetLength for an Array's
+            // `length` (a blocked shrink reports false), a plain value swap for
+            // the rest. Only a rejection maps to false; an abrupt coercion
+            // (the length's ToNumber, say) still propagates.
             _ => {
-                self.set_index(receiver, kv, value, false)?;
-                Ok(true)
+                if matches!(self.heap.get(ridx), HeapObj::Object(_)) {
+                    self.set_index(receiver, kv, value, false)?;
+                    return Ok(true);
+                }
+                let mut m = crate::heap::ObjMap::new();
+                m.set("value", value);
+                let desc = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
+                match self.object_define_property(receiver, &key, desc) {
+                    Ok(()) => Ok(true),
+                    Err(e)
+                        if e.0.starts_with("TypeError: Cannot redefine property")
+                            || e.0.starts_with("TypeError: Cannot define property") =>
+                    {
+                        Ok(false)
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
     }
@@ -588,11 +744,16 @@ impl<'p> Vm<'p> {
             HeapObj::NativeClosure { name, .. } => (*name).to_string(),
             // A constructor global (Array, Date, …) is modelled as an is_ctor
             // Object whose `name` is a real own property — same omission as above.
-            HeapObj::Object(m) if m.is_ctor => m
-                .get("name")
-                .filter(|v| v.is_heap() && self.heap.is_str_like(v.heap_index()))
-                .map(|v| self.display(v))
-                .unwrap_or_default(),
+            // A redefined/deleted `name` does not change the rendered
+            // NativeFunction: the initial name was captured before it went.
+            HeapObj::Object(m) if m.is_ctor => match self.ctor_initial_name.get(&v.heap_index()) {
+                Some(n) => n.clone(),
+                None => m
+                    .get("name")
+                    .filter(|v| v.is_heap() && self.heap.is_str_like(v.heap_index()))
+                    .map(|v| self.display(v))
+                    .unwrap_or_default(),
+            },
             _ => String::new(),
         };
         if raw.is_empty() || raw.starts_with('<') {
@@ -1858,6 +2019,13 @@ impl<'p> Vm<'p> {
         }
         Ok(match id {
             OBJ_DEFINE_PROPERTY => {
+                // Step 1 (O must be an Object) precedes ToPropertyKey(P): a
+                // primitive target throws before the key's toString can run.
+                if !self.is_object_value(a0) {
+                    return Err(Thrown(
+                        "TypeError: Object.defineProperty called on non-object".into(),
+                    ));
+                }
                 let key = self.to_property_key(a1)?;
                 self.object_define_property(
                     a0,
@@ -2782,13 +2950,8 @@ impl<'p> Vm<'p> {
                         return Ok(Value::heap(it));
                     }
                 }
-                let flags_v = self.get_prop(this, "flags")?;
-                let flags = self.to_js_string(flags_v)?;
-                let global = flags.contains('g');
-                // fullUnicode is captured HERE per CreateRegExpStringIterator —
-                // it drives the driver's AdvanceStringIndex on empty matches.
-                let full_unicode = flags.contains('u') || flags.contains('v');
-                // C = SpeciesConstructor(R, %RegExp%).
+                // Step 4, C = SpeciesConstructor(R, %RegExp%), precedes step 5's
+                // Get(R, "flags"): the `constructor` read is observed first.
                 let default_ctor = Value::heap(self.regexp_ctor);
                 let c = {
                     let ctor = self.get_prop(this, "constructor")?;
@@ -2811,6 +2974,12 @@ impl<'p> Vm<'p> {
                         }
                     }
                 };
+                let flags_v = self.get_prop(this, "flags")?;
+                let flags = self.to_js_string(flags_v)?;
+                let global = flags.contains('g');
+                // fullUnicode is captured HERE per CreateRegExpStringIterator —
+                // it drives the driver's AdvanceStringIndex on empty matches.
+                let full_unicode = flags.contains('u') || flags.contains('v');
                 // matcher = Construct(C, «R, flags») — `flags` is the ALREADY
                 // ToString'd string (a user flags.toString must not run twice).
                 let flags_str = self.alloc_str(flags.clone());
@@ -2969,11 +3138,6 @@ impl<'p> Vm<'p> {
                     }
                     _ => 0.0,
                 };
-                let tname = if name_get.is_heap() && self.heap.is_str_like(name_get.heap_index()) {
-                    self.to_js_string(name_get)?
-                } else {
-                    String::new()
-                };
                 let attr = PropAttr {
                     writable: false,
                     enumerable: false,
@@ -2981,14 +3145,33 @@ impl<'p> Vm<'p> {
                     accessor: false,
                     setter: Value::UNDEFINED,
                 };
-                let name_len = tname
-                    .len()
-                    .checked_add("bound ".len())
-                    .ok_or_else(invalid_native_string_length)?;
-                let mut bound_name = self.guest_string_with_capacity(name_len)?;
-                bound_name.push_str("bound ");
-                bound_name.push_str(&tname);
-                let nv = self.alloc_str(bound_name);
+                // "bound " + the target's name. A short name is copied flat, as
+                // it always was; a long one is joined by ordinary string
+                // concatenation, which makes a rope node over the target's
+                // (possibly itself rope) name rather than a fresh flat copy, so
+                // a chain of n binds costs O(n), not O(n²) time and memory.
+                let name_units = if name_get.is_heap() {
+                    self.heap.str_units(name_get.heap_index())
+                } else {
+                    None
+                };
+                let nv = match name_units {
+                    Some(n) if n > 64 => {
+                        let prefix = self.alloc_str("bound ".to_string());
+                        self.add_values(prefix, name_get)?
+                    }
+                    _ => {
+                        let tname = if name_units.is_some() {
+                            self.to_js_string(name_get)?
+                        } else {
+                            String::new()
+                        };
+                        let mut bound_name = self.guest_string_with_capacity(tname.len() + 6)?;
+                        bound_name.push_str("bound ");
+                        bound_name.push_str(&tname);
+                        self.alloc_str(bound_name)
+                    }
+                };
                 let lv = if len.is_finite()
                     && len >= 0.0
                     && len <= i32::MAX as f64
@@ -3785,7 +3968,13 @@ impl<'p> Vm<'p> {
                         | HeapObj::Symbol { .. }
                         | HeapObj::BigInt(_)
                         | HeapObj::BigIntBig(_) => {}
-                        HeapObj::Object(_) => {
+                        HeapObj::Object(m) => {
+                            // Freezing a class's prototype makes its declared
+                            // members non-writable, which governs instance
+                            // writes: retire the class's member tables.
+                            if id == OBJ_FREEZE && m.class_proto {
+                                self.note_class_proto_mutation(idx, None);
+                            }
                             if let HeapObj::Object(m) = self.heap.get_mut(idx) {
                                 match id {
                                     OBJ_FREEZE => m.freeze(),
@@ -3856,6 +4045,13 @@ impl<'p> Vm<'p> {
                             if id == OBJ_FREEZE && matches!(self.heap.get(idx), HeapObj::Array(_)) {
                                 self.array_length_nonwritable.insert(idx);
                             }
+                            // The integrity level lives only in side tables, which
+                            // a compiled dense-Array store never reads: bump the
+                            // version (for an Array this also dirties the raw
+                            // snapshot epoch) so a pinned pre-freeze snapshot is
+                            // re-validated — `jit_ta_snapshot` declines an array
+                            // with an `arr_props` entry — before the next store.
+                            self.heap.bump_version(idx);
                             // A callable's own properties live in the fn_props
                             // side map — freeze/seal their ATTRIBUTES there too
                             // (the extensible flag stays in arr_props).
@@ -3928,10 +4124,35 @@ impl<'p> Vm<'p> {
                                     }
                                 })
                         }
-                        // An exotic object (Array / Map / Set / …) whose elements
-                        // live outside arr_props: the explicit seal/freeze markers
-                        // are authoritative (the vacuous attrs-based check can't see
-                        // the dense elements).
+                        // An Array: TestIntegrityLevel over its real own
+                        // properties. The markers settle it when present. Else a
+                        // present dense element is configurable and writable
+                        // unless a defineProperty'd override (a side-table key)
+                        // says otherwise, so a non-extensible array is sealed
+                        // exactly when every present element has an override and
+                        // all side-table properties are non-configurable
+                        // (`length` itself never is), and frozen when, beyond
+                        // that, they are non-writable and so is `length`.
+                        HeapObj::Array(items) => match self.arr_props.get(&o.heap_index()) {
+                            None => (false, false, true),
+                            Some(m) if m.extensible => (false, false, true),
+                            Some(m) => {
+                                let elems_overridden = items
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(i, v)| v.is_hole() || m.element_pos(i).is_some());
+                                let sealed =
+                                    m.sealed || m.frozen || (elems_overridden && m.is_sealed());
+                                let len_ro = m.frozen
+                                    || self.array_length_nonwritable.contains(&o.heap_index());
+                                let frozen = m.frozen
+                                    || (sealed && elems_overridden && len_ro && m.is_frozen());
+                                (frozen, sealed, false)
+                            }
+                        },
+                        // An exotic object (Map / Set / …) whose own properties
+                        // live in arr_props: the explicit seal/freeze markers are
+                        // authoritative.
                         _ => self
                             .arr_props
                             .get(&o.heap_index())
@@ -3961,18 +4182,28 @@ impl<'p> Vm<'p> {
                 if !src.is_heap() {
                     return Err(Thrown("TypeError: groupBy items is not iterable".into()));
                 }
-                let items = self.iterate_to_vec(src)?;
+                // GroupBy steps one element at a time — IteratorStepValue, the
+                // callback, then (Object.groupBy) ToPropertyKey — and an abrupt
+                // callback or key coercion closes the iterator. An Array whose
+                // iteration is pristine is walked in place with the same live
+                // length/element reads its %ArrayIteratorPrototype%.next does
+                // (that iterator has no `return`, so closing it is a no-op).
+                let mut walker = GroupByWalk::new(self, src)?;
                 if id == OBJ_GROUP_BY {
                     let mut map = ObjMap::new();
-                    for (i, item) in items.into_iter().enumerate() {
-                        let key =
-                            self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
+                    let mut i = 0usize;
+                    while let Some(item) = walker.step(self, i)? {
+                        let key = walker.close_on_err(self, |vm| {
+                            vm.call_value(cb, Value::UNDEFINED, &[item, Value::num(i as f64)])
+                        })?;
+                        i += 1;
                         // ToPropertyKey(key) — runs ToPrimitive, so a key whose
                         // toString/@@toPrimitive throws propagates (and a Symbol key
                         // groups under its symbol key), unlike the non-throwing display().
-                        let ks = self.to_property_key(key)?;
+                        let ks = walker.close_on_err(self, |vm| vm.to_property_key(key))?;
                         match map.get(&ks) {
                             Some(arr) => {
+                                self.heap.write_barrier_val(arr.heap_index(), item);
                                 if let HeapObj::Array(a) = self.heap.get_mut(arr.heap_index()) {
                                     a.push(item);
                                 }
@@ -3992,9 +4223,12 @@ impl<'p> Vm<'p> {
                     // Key lookup via the incremental SameValueZero finder
                     // (linear for few groups, hash-indexed past the threshold).
                     let mut finder = super::collections::LocalFinder::new();
-                    for (i, item) in items.into_iter().enumerate() {
-                        let mut key =
-                            self.call_value(cb, Value::UNDEFINED, &[item, Value::int(i as i32)])?;
+                    let mut i = 0usize;
+                    while let Some(item) = walker.step(self, i)? {
+                        let mut key = walker.close_on_err(self, |vm| {
+                            vm.call_value(cb, Value::UNDEFINED, &[item, Value::num(i as f64)])
+                        })?;
+                        i += 1;
                         if key.is_number() && key.as_f64() == 0.0 {
                             key = Value::int(0); // Map normalizes -0 to +0
                         }
@@ -4429,8 +4663,16 @@ impl<'p> Vm<'p> {
                         "SyntaxError: JSON.rawJSON text must be non-empty without leading/trailing whitespace".into(),
                     ));
                 }
-                // Validate it parses as one complete JSON value (checks trailing).
+                // Validate it parses as one complete JSON value (checks trailing)
+                // — and a PRIMITIVE one: object and array text is a SyntaxError.
+                // (Valid JSON with no leading whitespace is an object/array
+                // exactly when it starts with `{`/`[`.)
                 self.json_parse(s.as_bytes())?;
+                if matches!(bytes[0], b'{' | b'[') {
+                    return Err(Thrown(
+                        "SyntaxError: JSON.rawJSON text must be a primitive JSON value".into(),
+                    ));
+                }
                 let _gc = self.gc_lock_guard();
                 let sval = self.alloc_str(s);
                 let mut m = crate::heap::ObjMap::new();
@@ -6472,9 +6714,9 @@ impl<'p> Vm<'p> {
                 Value::num(self.collator_compare(resolved, &a, &b)?)
             }
             INTL_PLURAL_SELECT => {
-                let _ = self.intl_this(this, INTL_PLURALRULES, "select")?;
+                let resolved = self.intl_this(this, INTL_PLURALRULES, "select")?;
                 let n = self.to_number_strict(a0)?;
-                let cat = if n == 1.0 { "one" } else { "other" };
+                let cat = self.plural_category_en(resolved, n)?;
                 self.alloc_str(cat.to_string())
             }
             INTL_PLURAL_SELECT_RANGE => {

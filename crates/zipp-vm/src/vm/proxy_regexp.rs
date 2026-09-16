@@ -1305,12 +1305,13 @@ impl<'p> Vm<'p> {
     /// Reconstruct a property KEY as a Value (a Symbol for an `@@`-encoded key,
     /// else a string) — so a Proxy trap / Reflect receives the real key.
     pub(crate) fn key_to_value(&mut self, key: &str) -> Value {
-        if key.starts_with("@@") {
+        if key.starts_with("@@") && is_hidden_key(key) {
             if let Some(&sym) = self.symbol_keys.get(key) {
                 return sym;
             }
         }
-        self.alloc_str(key.to_string())
+        // An escaped guest string key reads back as the string it was.
+        self.alloc_str(guest_key_text(key).to_string())
     }
 
     /// Look up a Proxy handler trap by name; `Ok(Some(fn))` if it's callable,

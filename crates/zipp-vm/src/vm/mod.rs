@@ -394,7 +394,38 @@ pub(crate) struct ArgsMap {
     mapped_count: usize,
     /// Bit i set = formal i SEVERED from the map (delete / accessor redefine /
     /// writable:false redefine) — permanently back to ordinary semantics.
+    /// Formals 0..64 live in `unmapped`; any past that (a sloppy function may
+    /// declare more) in `unmapped_hi`, which stays unallocated until needed.
     unmapped: u64,
+    unmapped_hi: Vec<u64>,
+}
+
+impl ArgsMap {
+    /// Has formal `i` been severed from the map?
+    #[inline]
+    fn is_unmapped(&self, i: usize) -> bool {
+        if i < 64 {
+            (self.unmapped >> i) & 1 == 1
+        } else {
+            let j = i - 64;
+            self.unmapped_hi
+                .get(j / 64)
+                .is_some_and(|w| (w >> (j % 64)) & 1 == 1)
+        }
+    }
+
+    /// Sever formal `i` from the map.
+    fn set_unmapped(&mut self, i: usize) {
+        if i < 64 {
+            self.unmapped |= 1 << i;
+        } else {
+            let j = i - 64;
+            if self.unmapped_hi.len() <= j / 64 {
+                self.unmapped_hi.resize(j / 64 + 1, 0);
+            }
+            self.unmapped_hi[j / 64] |= 1 << (j % 64);
+        }
+    }
 }
 
 /// One in-flight `AsyncDisposableStack.prototype.disposeAsync`: the spec's
@@ -1254,6 +1285,14 @@ pub struct Vm<'p> {
     /// the discriminator that makes the inline match the interpreter's live
     /// `class_values[id]` resolution (a mismatch falls to the helper).
     mi_class_epoch: u32,
+    /// Bumped whenever a class's member tables stop describing live objects:
+    /// the first divergence of its `C.prototype` (`ClassData::proto_dirty`) or
+    /// the first instance given an explicit `[[Prototype]]`
+    /// (`ClassData::reproto_instances`). Both flags are sticky, so this moves at
+    /// most twice per class. Every cache that resolved a member through the
+    /// tables — the interpreter's `Class*` IC ways and the JIT's class
+    /// method/accessor inline arms — bakes it and misses once it moves.
+    pub(crate) class_proto_epoch: u32,
     /// Q7 method/accessor-inline receiver recording: per `(func_id<<32)|ip`
     /// CallMethod/GetProp/SetProp site that resolved a Class method/getter/setter,
     /// the ≤8 distinct receiver Value-bits seen at IC-fill time (warmup). The JIT
@@ -1639,6 +1678,16 @@ pub struct Vm<'p> {
     /// first access and cached here. For a class it carries the own methods +
     /// `constructor`; for a plain function just `constructor`.
     prototypes: std::collections::HashMap<u32, u32>,
+    /// Reverse of `prototypes` for CLASS values only: materialized prototype
+    /// object → its class. Consulted (behind `ObjMap::class_proto`) when such a
+    /// prototype is mutated; an entry is trusted only while `prototypes` still
+    /// pairs the two. Pruned with the other slot-keyed tables.
+    class_proto_owner: rustc_hash::FxHashMap<u32, u32>,
+    /// A built-in constructor object's `name` as created ([[InitialName]]),
+    /// captured just before the first redefinition or deletion of its own
+    /// `name` so `Function.prototype.toString` keeps rendering a well-formed
+    /// NativeFunction. Pruned with the other slot-keyed tables.
+    ctor_initial_name: rustc_hash::FxHashMap<u32, String>,
     /// Explicit `[[Prototype]]` recorded for an `Object.create(proto)` object,
     /// keyed by the new object's heap index (read by `Object.getPrototypeOf`).
     proto_of: crate::slot_table::SlotTable<Value>,
@@ -2768,7 +2817,7 @@ mod helpers_datetime;
 mod helpers_json;
 mod helpers_misc;
 pub(crate) mod helpers_num2;
-mod helpers_numeric;
+pub(crate) mod helpers_numeric;
 mod intl;
 #[cfg(all(feature = "jit", target_arch = "x86_64"))]
 mod iter_jit;
