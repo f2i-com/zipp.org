@@ -1,5 +1,5 @@
 import {createRuntime} from '../src/runtime.mjs';
-import {opCases, mlpTrainingStep} from './ml-cases.mjs';
+import {opCases, mlpTrainingStep, mlpSessionProgram, seeded} from './ml-cases.mjs';
 const input=(id,data,shape=[data.length])=>({id,op:'input',shape,data});
 const program=nodes=>({version:1,nodes,outputs:[{name:'result',id:nodes.length-1}]});
 function cases(){
@@ -56,6 +56,13 @@ export async function checkBackend(backend,options={}){
  * One MLP classification training step (forward, cross-entropy, backward and
  * Adam in one graph) on `backend`: per-output max abs error against cpu-js,
  * then cold and warm wall-clock times. `steps` chains real updates.
+ *
+ * Then the same step through prepared sessions, all with typed outputs: (a)
+ * `execute()` reading every output back, (b) a session run one step at a
+ * time (parameters and moments resident, x and targets fed, the loss read
+ * back) and (c) a session run eight steps per `run`, plus the largest
+ * difference between five session steps and five chained executes on this
+ * backend fed the same batches.
  */
 export async function benchmarkTraining(backend,{sizes=[784,256,10],batch=64,warm=10,steps=5,...options}={}){
   const runtime=await createRuntime({backend,...options}),reference=await createRuntime({backend:'cpu-js'});
@@ -80,9 +87,43 @@ export async function benchmarkTraining(backend,{sizes=[784,256,10],batch=64,war
       const next=mlpTrainingStep({sizes,batch,params,state,step,lr:0.002}).program,out=(await runtime.execute(next)).outputs;
       losses.push(out.loss.data[0]);params=Array.from({length:parameters},(_,i)=>out[`p${i}`].data);state=params.map((_,i)=>[out[`m${i}`].data,out[`v${i}`].data]);
     }
+    const sessions=await benchmarkSessions(runtime,{sizes,batch,warm,parameters});
     return {backend,info:runtime.info(),sizes,batch,estimatedWork:first.stats.estimatedWork,uploadElements:first.stats.uploadElements,
       readbackElements:first.stats.readbackElements,maxAbsErrorVsCpuJs:errors,maxAbsError:Math.max(...Object.values(errors)),
       coldMs,warmMedianMs:times[Math.floor(times.length/2)],warmMinMs:times[0],lossOnlyWarmMedianMs:lossOnly[Math.floor(lossOnly.length/2)],
-      batch512LossOnlyWarmMedianMs:batch512,losses};
+      batch512LossOnlyWarmMedianMs:batch512,losses,...sessions};
   }finally{reference.dispose();runtime.dispose();}
+}
+
+const medianOf=times=>{const t=[...times].sort((x,y)=>x-y);return t[Math.floor(t.length/2)];};
+/** The typed-output timings and the session-versus-chained check `benchmarkTraining` reports. */
+async function benchmarkSessions(runtime,{sizes,batch,warm,parameters}){
+  const spec=mlpSessionProgram({sizes,batch,lr:0.002}),rnd=seeded(11),classes=sizes[sizes.length-1];
+  const batchOf=()=>({inputs:{0:Float32Array.from({length:batch*sizes[0]},()=>rnd(0,1)),1:Float32Array.from({length:batch},()=>Math.floor(rnd(0,classes)))}});
+  // (a) execute() as today, but with typed outputs: every output (weights, m, v) read back per step.
+  const step=mlpTrainingStep({sizes,batch,lr:0.002}).program,typed=[];
+  await runtime.execute(step,{typedOutputs:true});
+  for(let i=0;i<warm;i++){const t=performance.now();await runtime.execute(step,{typedOutputs:true});typed.push(performance.now()-t);}
+  // (b) one step per run: only x and the targets go up, only the loss comes back.
+  const session=await runtime.prepare(spec.program,{resident:spec.resident}),one=[],eight=[];
+  await session.run(batchOf(),{readback:['loss']});
+  for(let i=0;i<warm;i++){const b=batchOf();const t=performance.now();await session.run(b,{readback:['loss']});one.push(performance.now()-t);}
+  // (c) eight steps per run in one submission, eight losses read back at the end.
+  for(let i=0;i<Math.max(3,Math.ceil(warm/2));i++){const bs=Array.from({length:8},batchOf);const t=performance.now();await session.run(bs,{readback:['loss']});eight.push((performance.now()-t)/8);}
+  const residentBytes=session.residentBytes;session.dispose();
+  // Five session steps against five chained executes on this backend, fed the same batches.
+  const data=Array.from({length:5},batchOf),check=await runtime.prepare(spec.program,{resident:spec.resident});
+  const run=await check.run(data,{readback:['loss']}),sessionLoss=run.steps.map(s=>s.outputs.loss.data[0]),sessionP0=(await check.download(['p0'])).outputs.p0.data;
+  check.dispose();
+  let params=null,state=spec.state,chainedP0=null;const chainedLoss=[];
+  for(let s=1;s<=5;s++){
+    const next=mlpTrainingStep({sizes,batch,seed:spec.seed,lr:0.002,params,state,step:s,x:Array.from(data[s-1].inputs[0]),targets:Array.from(data[s-1].inputs[1])}).program;
+    const out=(await runtime.execute(next,{typedOutputs:true})).outputs;
+    chainedLoss.push(out.loss.data[0]);params=Array.from({length:parameters},(_,i)=>out[`p${i}`].data);state=params.map((_,i)=>[out[`m${i}`].data,out[`v${i}`].data]);chainedP0=out.p0.data;
+  }
+  let sessionVsChainedMaxAbsError=0;
+  sessionLoss.forEach((v,i)=>{sessionVsChainedMaxAbsError=Math.max(sessionVsChainedMaxAbsError,Math.abs(v-chainedLoss[i]));});
+  chainedP0.forEach((v,i)=>{sessionVsChainedMaxAbsError=Math.max(sessionVsChainedMaxAbsError,Math.abs(v-sessionP0[i]));});
+  return {executeTypedWarmMedianMs:medianOf(typed),sessionOneStepWarmMedianMs:medianOf(one),sessionEightStepsPerStepMedianMs:medianOf(eight),
+    sessionResidentBytes:residentBytes,sessionLosses:sessionLoss,sessionVsChainedMaxAbsError};
 }

@@ -108,3 +108,64 @@ test('Python adapter: the real Engine stays usable and disposable after 17 submi
   assert.equal(engine.disposed,false);engine.dispose();assert.equal(engine.disposed,true);
   adapter.invalidate();rt.dispose();
 });
+
+// ---- sessions through the host boundary --------------------------------------------------
+import {GPU_KINDS} from '../src/zipp-adapter.mjs';
+const counter={version:2,nodes:[{id:0,op:'input',shape:[2],data:[1,2],carry:'next'},{id:1,op:'input',shape:[2]},{id:2,op:'add',a:0,b:1}],outputs:[{name:'next',id:2}]};
+test('session kinds: create returns an opaque id, run feeds inputs and carries, download reads residents, dispose frees',async()=>{
+  const rt=await createRuntime({backend:'cpu-js'}),h=createZippGPUHandler(rt,{allowExecute:true});
+  const created=await h.handle('gpu.session.create',[{program:counter,resident:['next']}]);
+  assert.match(created.session,/^s[0-9a-f]{32}$/);assert.equal(created.backend,'cpu-js');assert.deepEqual(created.inputs[1],{id:1,shape:[2],fed:true});
+  assert.equal(h.sessions,1);assert.equal(rt.sessions.size,1);
+  const run=await h.handle('gpu.session.run',[{session:created.session,steps:[{inputs:{1:new Float32Array([10,20])}},{inputs:{'1':[1,1]}}],readback:['next']}]);
+  assert.deepEqual(run.steps.map(s=>Array.from(s.outputs.next.data)),[[11,22],[12,23]]);assert.equal(run.step,3);
+  assert.deepEqual(Array.from((await h.handle('gpu.session.download',[{session:created.session,names:['next']}])).outputs.next.data),[12,23]);
+  await assert.rejects(()=>h.handle('gpu.session.run',[{session:created.session,steps:[{inputs:{1:[1,1]}}],extra:1}]),e=>e.code==='PROTOCOL');
+  await assert.rejects(()=>h.handle('gpu.session.run',[{session:created.session}]),e=>e.code==='PROTOCOL');
+  assert.deepEqual(await h.handle('gpu.session.dispose',[{session:created.session}]),{version:1,disposed:true});
+  assert.equal(h.sessions,0);assert.equal(rt.sessions.size,0);
+  await assert.rejects(()=>h.handle('gpu.session.run',[{session:created.session,steps:[{}]}]),e=>e.code==='REFERENCE');
+  h.invalidate();rt.dispose();
+});
+test('a guest can only name sessions its own handler minted; invalidation disposes them; the count is bounded',async()=>{
+  const rt=await createRuntime({backend:'cpu-js'}),mine=createZippGPUHandler(rt,{allowExecute:true,maxSessions:2}),theirs=createZippGPUHandler(rt,{allowExecute:true});
+  const a=await mine.handle('gpu.session.create',[{program:counter}]),b=await theirs.handle('gpu.session.create',[{program:counter}]);
+  await assert.rejects(()=>mine.handle('gpu.session.run',[{session:b.session,steps:[{inputs:{1:[1,1]}}]}]),e=>e.code==='REFERENCE');
+  await assert.rejects(()=>mine.handle('gpu.session.dispose',[{session:b.session}]),e=>e.code==='REFERENCE');
+  for(const id of [1,null,{},'s'+'0'.repeat(32)])await assert.rejects(()=>mine.handle('gpu.session.run',[{session:id,steps:[{}]}]),e=>e.code==='REFERENCE');
+  await mine.handle('gpu.session.create',[{program:counter}]);
+  await assert.rejects(()=>mine.handle('gpu.session.create',[{program:counter}]),e=>e.code==='LIMIT');
+  await assert.rejects(()=>theirs.handle('gpu.session.create',[{program:counter,backend:'webgpu'}]),e=>e.code==='BACKEND');
+  await assert.rejects(()=>mine.handle('gpu.session.create',[{program:counter,nodes:[]}]),e=>e.code==='PROTOCOL');
+  assert.equal(rt.sessions.size,3);
+  mine.invalidate();assert.equal(rt.sessions.size,1);assert.equal(mine.sessions,0);
+  await assert.rejects(()=>theirs.handle('gpu.session.run',[{session:a.session,steps:[{}]}]),e=>e.code==='REFERENCE');
+  theirs.invalidate();assert.equal(rt.sessions.size,0);rt.dispose();
+});
+test('the JavaScript adapter accepts every GPU kind and delivers session replies to exact callback IDs',async()=>{
+  const rt=await createRuntime({backend:'cpu-js'}),e=engine(),a=createZippGPUAdapter(e,rt,{allowExecute:true});
+  assert.ok(GPU_KINDS.every(k=>a.accepts(k))&&!a.accepts('file.read'));
+  await a.dispatch({id:1,kind:'gpu.session.create',args:[{program:counter,resident:['next']}]});
+  const id=e.replies[0][1].value.session;assert.equal(typeof id,'string');
+  await a.dispatch({id:2,kind:'gpu.session.run',args:[{session:id,steps:[{inputs:{1:new Float32Array([5,5])}}],readback:['next']}]});
+  assert.deepEqual(Array.from(e.replies[1][1].value.outputs.next.data),[6,7]);
+  await a.dispatch({id:3,kind:'gpu.session.download',args:[{session:id,names:['next']}]});
+  assert.deepEqual(Array.from(e.replies[2][1].value.outputs.next.data),[6,7]);
+  await a.dispatch({id:4,kind:'gpu.session.run',args:[{session:'nope',steps:[{}]}]});
+  assert.equal(e.replies[3][1].error.code,'REFERENCE');
+  assert.equal(a.sessions,1);a.invalidate();assert.equal(a.sessions,0);await a.idle();rt.dispose();
+});
+test('the Python adapter admits session requests from the drained queue and typed outputs come back',async()=>{
+  const rt=await createRuntime({backend:'cpu-js'}),events=[];
+  const e={disposed:false,queue:[],next:0,takeHostRequests(){const q=this.queue;this.queue=[];return q;},pythonCall(name,[id,reply]){events.push([id,reply]);return true;}};
+  const a=createPythonGPUAdapter(e,rt,{allowExecute:true,maxSessions:1});
+  e.queue.push({id:1,kind:'gpu.session.create',payload:{program:counter,resident:['next']}},{id:2,kind:'file.read',payload:{}});
+  assert.deepEqual(a.drain().map(r=>r.kind),['file.read']);await a.idle();
+  const id=events[0][1].value.session;
+  e.queue.push({id:3,kind:'gpu.session.run',payload:{session:id,steps:[{inputs:{'1':[1,2]}},{inputs:{'1':[1,2]}}],readback:['next']}},
+    {id:4,kind:'gpu.session.create',payload:{program:counter}},{id:5,kind:'gpu.session.dispose',payload:{session:id}});
+  a.drain();await a.idle();
+  assert.equal(events[1][1].value.steps.length,2);assert.ok(events[1][1].value.outputs.next.data instanceof Float32Array);
+  assert.equal(events[2][1].error.code,'LIMIT');assert.equal(events[3][1].value.disposed,true);
+  a.invalidate();rt.dispose();
+});

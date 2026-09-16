@@ -132,11 +132,64 @@ Numerical rules that all four backends share:
 Integer class targets are validated as data (an `input` node holding integers in
 `[0, C)`) before any kernel indexes with them.
 
+## Prepared sessions
+
+`execute()` pays for everything every time: it validates and copies every input
+(1.3 ms of a 6.6 ms MNIST-scale Adam step on an RTX 5090), records every bind
+group, uploads the weights it was just handed back, and reads 2.4 MB of weights
+and moments it will upload again next step. `runtime.prepare(program, {resident})`
+does that work once and returns a **Session**:
+
+- **Fed inputs.** An `input` node without `data` is fed at each
+  `session.run({inputs: {id: Float32Array}})`; every other input keeps the data
+  it was validated with and is uploaded once, at `prepare`. A fed
+  cross-entropy target is checked at each upload (integer class indices in
+  `[0, C)`), where a static one is checked at validation.
+- **Carried tensors.** `{id, op: 'input', shape, carry: 'p0'}` takes the value
+  of output `p0` for the *next* step. The shapes are checked against the outputs
+  at `prepare`; the source must be a computed node. Weights and optimizer state
+  therefore never leave the device: on WebGPU the step's output is copied into
+  the input's fixed buffer in stream order (`copyBufferToBuffer`), so every
+  buffer of the plan is fixed and every bind group is reused; elsewhere the
+  handles are swapped.
+- **Resident outputs.** `resident: ['p0', ...]` names outputs kept on the device
+  and excluded from the default readback; `session.download(names)` fetches
+  them (one round trip of its own).
+- **Multi-step runs.** `session.run([{inputs}, {inputs}, ...], {readback})`
+  submits the steps back to back — one command buffer on WebGPU, one arena pass
+  per step on WASM — and reads the named outputs of *every* step in one
+  readback at the end (a per-step loss is eight scalars in one staging buffer).
+  `adam_update` nodes advance their `step` per executed step from the program's
+  own doubles (`adamStep`), so one prepared step trains a run; `{step}` restarts
+  the count. Sessions return typed outputs.
+- **One round trip.** A session run ends in `complete()`: the map of the
+  staging buffer, both error scopes and the queue are awaited together, where
+  `execute()` awaits the map, then the scopes and `onSubmittedWorkDone`
+  (two round trips of roughly a millisecond each to Chrome's GPU process).
+  The staging buffer is kept across runs.
+- **Ownership and budgets.** Handles that outlive a step are reference counted
+  (a static input, a carried input, a resident output and a pending readback
+  each hold one) and never reach a backend pool; a WASM handle that outlives a
+  step is a host copy, re-uploaded where the next step reads it. A runtime
+  keeps at most `maxSessions` sessions, a run at most `maxStepsPerRun` steps and
+  `maxOutputElements` read-back elements across them, and every live session's
+  resident bytes plus the plan's own allocation count against
+  `maxLogicalBytes`. `session.dispose()` releases the tensors (deferred past a
+  run in flight); disposing the runtime disposes its sessions first.
+
+Every backend has the same Session semantics: cpu-js and WASM keep arrays,
+WebGL2 keeps textures, WebGPU keeps buffers. `tests/sessions.test.mjs` pins that
+five Adam steps through a session equal five chained `execute()` calls bit for
+bit on cpu-js and WASM, one step per run and five per run alike; the GPUs are
+held to the differential tolerance in the browser harness.
+
 ## Memory ownership
 
 `validateProgram()` owns a float32 copy of each input before the first asynchronous
 yield. Later caller mutation cannot change that execution. GPU buffers and textures
-are local to one runtime execution and never escape to guest code.
+are local to one runtime execution and never escape to guest code; a session's
+resident tensors belong to that session and its runtime, reachable by a guest only
+through the opaque id its own adapter minted.
 
 Reference counts identify each node's last consumer. GPU resources can be released
 when no consumer or output still needs them. Runtime cleanup also runs on failures.
@@ -155,10 +208,14 @@ executions, so a repeated training step stops calling `createBuffer`. A buffer
 freed *during* an execution is only reused for an output, never re-uploaded as an
 input, because a `writeBuffer` would land ahead of commands already recorded
 against it. Shapes and scalars travel in a 96-byte uniform block written into
-256-byte slots of a per-execution chunk buffer, uploaded once at submit; pipelines
+256-byte slots of one uniform buffer (16,384 slots, the bound on dispatches per
+submission), uploaded once at submit and bound through a dynamic offset; pipelines
 are therefore keyed by kernel name, not by shape, and no graph value ever enters
-shader text. Validation and out-of-memory error scopes are pushed once per
-execution (per node in `debug` mode) and awaited together with the queue drain.
+shader text. Bind groups depend only on their kernel and storage buffers and are
+cached (idle buffers are kept sorted, so a session run that starts from the same
+pool allocates the same buffers and rebuilds nothing). Validation and out-of-memory
+error scopes are pushed once per execution (per node in `debug` mode) and awaited
+together with the queue drain.
 
 The WebGL2 backend stores one scalar per texel: R32F (4 bytes) where the driver
 reports it renderable, falling back to RGBA32F (16 bytes) where it does not, with
@@ -274,10 +331,13 @@ no workgroup memory and the equivalent needs multiple render targets and scissor
 tiling. Still unmeasured: workgroup-memory and register-pressure tuning against
 non-square and edge-tile shapes. Do not generalize WebGPU-only features to WebGL.
 
-**Fifth: persistent device sessions.** Retain weights and simulation states across
-graph requests. Introduce opaque generation-scoped tensor handles, explicit close,
-per-tenant quotas, and a disposal path for lost devices/Workers. A current Graph is
-not a persistent GPU allocation: each `execute()` uploads its inputs afresh.
+**Fifth: persistent device sessions.** Done (see *Prepared sessions*): weights
+and optimizer state stay on the device as carried inputs and resident outputs,
+sessions are generation-scoped behind opaque ids with per-tenant quotas, and a
+lost device fails the next run closed. Still open: a resident tensor cannot be
+shared between two sessions or passed to a plain `execute()`, a session's program
+cannot change shape (prepare another), and per-step scalars other than Adam's
+`step` (a learning-rate schedule) still need a fed scalar input.
 
 **Sixth: a Python kernel subset.** Only after the above works, add a restricted
 Python AST -> typed kernel IR -> WGSL/GLSL pipeline. Specify float/int types,

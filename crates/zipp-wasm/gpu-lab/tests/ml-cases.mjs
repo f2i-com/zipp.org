@@ -128,3 +128,24 @@ export function mlpTrainingStep({sizes = [784, 256, 10], batch = 64, seed = 5, o
   });
   return {program: g.program(outputs), parameters: weights.length};
 }
+
+/**
+ * The training step as a prepared session: parameters and Adam moments are
+ * carried inputs (their data is the initial value), x (node 0) and the class
+ * targets (node 1) are fed per step. `resident` names every carried output.
+ * The seeded parameter draw matches `mlpTrainingStep({sizes, batch, seed, x,
+ * targets})`, so chained executes fed the same batches are its reference.
+ */
+export function mlpSessionProgram({sizes = [784, 256, 10], batch = 64, seed = 5, lr = 0.002} = {}) {
+  const zeros = shape => new Array(shape.reduce((x, y) => x * y, 1)).fill(0);
+  const shapes = []; for (let l = 0; l < sizes.length - 1; l++) shapes.push([sizes[l], sizes[l + 1]], [sizes[l + 1]]);
+  const state = shapes.map(s => [zeros(s), zeros(s)]);
+  const {program, parameters} = mlpTrainingStep({sizes, batch, seed, lr, state, step: 1, x: zeros([batch, sizes[0]]), targets: zeros([batch])});
+  const nodes = program.nodes.map(n => ({...n})), byName = new Map(program.outputs.map(o => [o.name, o.id]));
+  delete nodes[0].data; delete nodes[1].data;
+  const resident = [];
+  for (let i = 0; i < parameters; i++) for (const k of ['p', 'm', 'v']) {
+    nodes[nodes[byName.get(`${k}${i}`)].a].carry = `${k}${i}`; resident.push(`${k}${i}`);
+  }
+  return {program: {...program, nodes}, parameters, state, resident, sizes, batch, seed, lr};
+}
