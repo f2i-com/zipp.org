@@ -136,6 +136,10 @@ test('WebGPU session mock: download is a round trip of its own and a failed map 
   await s.run({inputs:{0:x,1:y}},{readback:['loss']});
   d.submits=0;const got=await s.download(['p0']);assert.equal(d.submits,1);assert.equal(got.outputs.p0.data.length,320);assert.equal(d.scopes,0);
   d.failMap=true;await assert.rejects(()=>s.run({inputs:{0:x,1:y}},{readback:['loss']}),/map rejected/);assert.equal(d.scopes,0);assert.equal(rt.busy,false);
-  d.failMap=false;assert.equal((await s.run({inputs:{0:x,1:y}},{readback:['loss']})).steps.length,1);
+  // The map failed after the step advanced its carries on the device, so this session is poisoned
+  // and refuses further work; the backend itself is unharmed, so a fresh session on it still runs.
+  assert.equal(s.poisoned,true);await assert.rejects(()=>s.run({inputs:{0:x,1:y}},{readback:['loss']}),e=>e.code==='STATE');
+  d.failMap=false;const fresh=await rt.prepare(spec.program,{resident:['p0']});
+  assert.equal((await fresh.run({inputs:{0:x,1:y}},{readback:['loss']})).steps.length,1);
   rt.dispose();
 });

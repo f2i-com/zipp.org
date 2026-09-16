@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFile} from 'node:fs/promises';
-import {createRuntime} from '../src/runtime.mjs';
+import {createRuntime, ComputeRuntime} from '../src/runtime.mjs';
+import {CPUBackend} from '../src/backends/cpu.mjs';
+import {ComputeError} from '../src/graph.mjs';
 import {createZippGPUAdapter,createZippGPUHandler} from '../src/zipp-adapter.mjs';
 import {createPythonGPUAdapter} from '../src/zipp-python-adapter.mjs';
 import {existsSync} from 'node:fs';
@@ -168,4 +170,17 @@ test('the Python adapter admits session requests from the drained queue and type
   assert.equal(events[1][1].value.steps.length,2);assert.ok(events[1][1].value.outputs.next.data instanceof Float32Array);
   assert.equal(events[2][1].error.code,'LIMIT');assert.equal(events[3][1].value.disposed,true);
   a.invalidate();rt.dispose();
+});
+
+test('session kinds: a run that fails after device work began marks the error poisoned and only dispose remains',async()=>{
+  class Fail extends CPUBackend{constructor(){super();this.adds=0;}async run(n,r){if(n.op==='add'&&++this.adds===2)throw new ComputeError('BACKEND','device lost');return super.run(n,r);}}
+  const rt=new ComputeRuntime(new Fail()),h=createZippGPUHandler(rt,{allowExecute:true});
+  const created=await h.handle('gpu.session.create',[{program:counter}]);
+  // Validation failures carry no flag and leave the session usable.
+  await assert.rejects(()=>h.handle('gpu.session.run',[{session:created.session,steps:[{inputs:{1:[1]}}]}]),e=>e.code==='SHAPE'&&e.poisoned===undefined);
+  await assert.rejects(()=>h.handle('gpu.session.run',[{session:created.session,steps:[{inputs:{1:[1,1]}},{inputs:{1:[1,1]}}]}]),e=>e.code==='BACKEND'&&e.poisoned===true);
+  await assert.rejects(()=>h.handle('gpu.session.run',[{session:created.session,steps:[{inputs:{1:[1,1]}}]}]),e=>e.code==='STATE'&&e.poisoned===true);
+  await assert.rejects(()=>h.handle('gpu.session.download',[{session:created.session,names:['next']}]),e=>e.code==='STATE');
+  assert.deepEqual(await h.handle('gpu.session.dispose',[{session:created.session}]),{version:1,disposed:true});
+  assert.equal(h.sessions,0);rt.dispose();
 });

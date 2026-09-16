@@ -6,8 +6,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
-import {createRuntime} from '../src/runtime.mjs';
-import {validateProgram, DEFAULT_LIMITS} from '../src/graph.mjs';
+import {createRuntime, ComputeRuntime} from '../src/runtime.mjs';
+import {validateProgram, DEFAULT_LIMITS, ComputeError} from '../src/graph.mjs';
+import {CPUBackend} from '../src/backends/cpu.mjs';
 import {mlpTrainingStep, mlpSessionProgram, seeded} from './ml-cases.mjs';
 const wasmBytes=await readFile(new URL('../wasm/kernels.wasm',import.meta.url));
 const code=c=>e=>e.code===c;
@@ -183,4 +184,41 @@ test('describe() tells a host what the plan feeds, carries and keeps',async()=>{
   assert.ok(d.outputs.find(o=>o.name==='p0').resident&&!d.outputs.find(o=>o.name==='loss').resident);
   assert.equal(DEFAULT_LIMITS.maxSessions,16);
   rt.dispose();
+});
+
+// ---- failure semantics ---------------------------------------------------------------------
+// Before `begin` a run only validates; after it, carries and residents advance step by step.
+// A failure past that point leaves them at no step in particular while stepNumber stays, so
+// the session must refuse everything but dispose() rather than let a retry run the wrong step.
+test('a failure after device work began poisons the session; a validation failure does not',async()=>{
+  const program={version:2,nodes:[{id:0,op:'input',shape:[2],data:[1,1],carry:'next'},{id:1,op:'input',shape:[2]},{id:2,op:'add',a:0,b:1}],outputs:[{name:'next',id:2}]};
+  class Fail extends CPUBackend{constructor(){super();this.adds=0;}async run(n,r){if(n.op==='add'&&++this.adds===3)throw new ComputeError('BACKEND','device lost');return super.run(n,r);}}
+  const backend=new Fail(),rt=new ComputeRuntime(backend),s=await rt.prepare(program);
+  await assert.rejects(()=>s.run({inputs:{1:[1,1]}},{readback:['nope']}),code('REFERENCE'));
+  await assert.rejects(()=>s.run({inputs:{1:[1]}}),code('SHAPE'));
+  assert.equal(s.poisoned,false);assert.equal(s.describe().poisoned,false);
+  // The third add is step 3 of a three-step run: steps 1 and 2 already advanced the carry.
+  await assert.rejects(()=>s.run([{inputs:{1:[1,1]}},{inputs:{1:[1,1]}},{inputs:{1:[1,1]}}]),code('BACKEND'));
+  assert.equal(s.poisoned,true);assert.equal(s.describe().poisoned,true);assert.equal(s.stepNumber,1);
+  assert.equal(s.busy,false);assert.equal(rt.busy,false);
+  await assert.rejects(()=>s.run({inputs:{1:[1,1]}}),code('STATE'));
+  await assert.rejects(()=>s.download(['next']),code('STATE'));
+  s.dispose();assert.equal(s.disposed,true);assert.equal(rt.sessions.size,0);
+  // The runtime is unharmed: a fresh session carries as it should.
+  backend.adds=-1000;
+  const fresh=await rt.prepare(program),r=await fresh.run([{inputs:{1:[1,1]}},{inputs:{1:[1,1]}}]);
+  assert.deepEqual(r.steps.map(x=>Array.from(x.outputs.next.data)),[[2,2],[3,3]]);assert.equal(fresh.poisoned,false);
+  fresh.dispose();rt.dispose();
+});
+test('a non-finite readback in a later step poisons the session too',async()=>{
+  // next = a - x carries; log(next) is read back. Step 1 is fine, step 2 makes next negative.
+  const program={version:2,nodes:[{id:0,op:'input',shape:[2],data:[1,1],carry:'next'},{id:1,op:'input',shape:[2]},{id:2,op:'sub',a:0,b:1},{id:3,op:'log',a:2}],outputs:[{name:'next',id:2},{name:'lg',id:3}]};
+  for(const backend of ['cpu-js','wasm']){
+    const rt=await createRuntime({backend,wasmBytes}),s=await rt.prepare(program,{resident:['next']});
+    await assert.rejects(()=>s.run([{inputs:{1:[0,0]}},{inputs:{1:[2,2]}}],{readback:['lg']}),code('NUMBER'));
+    assert.equal(s.poisoned,true,backend);
+    await assert.rejects(()=>s.run({inputs:{1:[0,0]}},{readback:['lg']}),code('STATE'));
+    await assert.rejects(()=>s.download(['next']),code('STATE'));
+    s.dispose();rt.dispose();
+  }
 });

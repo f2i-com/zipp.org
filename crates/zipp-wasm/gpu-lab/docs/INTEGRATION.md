@@ -20,7 +20,7 @@ module raises no other):
 |---|---|---|
 | `gpu.execute` | a graph | `{outputs, stats}` |
 | `gpu.session.create` | `{program, resident?, backend?}` | `{session, backend, inputs, outputs, step}` — `session` is an opaque id |
-| `gpu.session.run` | `{session, steps: [{inputs: {nodeId: data}}], readback?, step?}` | `{steps: [{step, outputs}], outputs, step, stats}` |
+| `gpu.session.run` | `{session, steps: [{inputs: {nodeId: data}}], readback?, step?}` | `{steps: [{step, outputs}], outputs, step, stats}`; an error reply carries `poisoned: true` when the failure came after device work began, after which only `gpu.session.dispose` is accepted (`STATE`) |
 | `gpu.session.download` | `{session, names}` | `{outputs}` |
 | `gpu.session.dispose` | `{session}` | `{disposed: true}` |
 

@@ -72,7 +72,7 @@ export function createPythonGPUAdapter(engine, runtime, {allowExecute = false, m
       if (!live()) return {delivered: false, cancelled: true};
       let reply;
       try { reply = {ok: true, value: await handler.handle(kind, [payload], {typedOutputs})}; }
-      catch (error) { reply = {ok: false, error: {code: error.code || 'GPU', message: String(error.message || error).slice(0, 512)}}; }
+      catch (error) { reply = {ok: false, error: {code: error.code || 'GPU', message: String(error.message || error).slice(0, 512), ...(error?.poisoned ? {poisoned: true} : {})}}; }
       if (!live()) return {delivered: false, cancelled: true};
       // After the asynchronous host work, outside any engine call.
       return {delivered: deliver(id, reply), cancelled: false};

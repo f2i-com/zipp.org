@@ -28,6 +28,9 @@ export class Session {
     this.residents=new Map();  // output name -> persisted handle
     this.retained=new Map();   // persisted handle -> holders
     this.stepNumber=1;this.busy=false;this.disposed=false;this.disposeRequested=false;this.runs=0;
+    // Set when a run failed after `begin`: carries and residents may hold any step's values
+    // while stepNumber did not advance, so nothing but dispose() may touch them again.
+    this.poisoned=false;
     const bytes=new Map();
     for(const n of this.inputs)if(!n.fed||n.carry!==undefined)bytes.set(`in${n.id}`,n.size*4);
     for(const name of resident)bytes.set(`out${name}`,plan.nodes[this.byName.get(name).id].size*4);
@@ -36,7 +39,7 @@ export class Session {
   get backend(){return this.impl.name;}
   /** What the plan expects and keeps: for a host relaying the session to a guest. */
   describe(){
-    return {backend:this.backend,step:this.stepNumber,residentBytes:this.residentBytes,
+    return {backend:this.backend,step:this.stepNumber,residentBytes:this.residentBytes,poisoned:this.poisoned,
       inputs:this.inputs.map(n=>({id:n.id,shape:[...n.shape],fed:!!n.fed,...(n.carry!==undefined?{carry:n.carry}:{}),...(n.classes!==undefined?{classes:n.classes}:{})})),
       outputs:this.plan.outputs.map(o=>({name:o.name,shape:[...this.plan.nodes[o.id].shape],resident:this.resident.has(o.name)}))};
   }
@@ -89,6 +92,7 @@ export class Session {
   async run(steps,{readback,step}={}){
     check(!this.disposed,'DISPOSED','Session has been disposed');
     check(!this.runtime.disposed,'DISPOSED','Runtime has been disposed');
+    check(!this.poisoned,'STATE','Session state is undefined after a failed run; dispose it');
     check(!this.busy&&!this.runtime.busy,'BUSY','Runtime supports one graph at a time; await the previous execution');
     const list=Array.isArray(steps)?steps:[steps],plan=this.plan,limits=plan.limits,root=plan.root,nodes=plan.nodes;
     check(list.length>=1&&list.length<=limits.maxStepsPerRun,'LIMIT',`A run submits between 1 and ${limits.maxStepsPerRun} steps`);
@@ -158,6 +162,10 @@ export class Session {
       for(const p of pending){try{this.release(p.h);}catch(e){error??=e;}}
       for(const id of [...handles.keys()]){try{freeLocal(id);}catch(e){error??=e;}}
       if(began)try{await this.impl.finish();}catch(e){finishError=e;}
+      // Everything up to `begin` only validated; after it, carries and residents advance step by
+      // step, so a failure leaves them at no step in particular and a retry would run the wrong
+      // Adam step on them. Validation failures leave the session as it was.
+      if(began&&(error||finishError))this.poisoned=true;
       this.busy=this.runtime.busy=false;
       if(this.disposeRequested)this.dispose();
     }
@@ -172,6 +180,7 @@ export class Session {
   /** Reads resident outputs (and carried inputs, by node id) on demand: `{name: {shape, dtype, data}}`. */
   async download(names){
     check(!this.disposed,'DISPOSED','Session has been disposed');
+    check(!this.poisoned,'STATE','Session state is undefined after a failed run; dispose it');
     check(!this.busy&&!this.runtime.busy,'BUSY','Runtime supports one graph at a time; await the previous execution');
     check(Array.isArray(names)&&names.length>0,'PROTOCOL','download lists resident output names');
     const picks=names.map(name=>{

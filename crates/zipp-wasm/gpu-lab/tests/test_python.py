@@ -334,6 +334,52 @@ class SessionTests(unittest.TestCase):
         session.dispose(); session.dispose()
         with self.assertRaises(ComputeError): session.run(print, x=xs, y=ys)
 
+    def test_failure_after_a_step_ran_poisons_the_session(self):
+        # next = a - x carries; log(next) is read back. Step 1 is fine; step 2 turns
+        # next negative, so the read-back log is NaN after step 1 already advanced the carry.
+        g = Graph(); a = g.tensor([1.0, 1.0]); x = g.tensor([0.0, 0.0]); nxt = a - x
+        s = g.prepare(feeds={"x": x}, carry={a: nxt}, resident=[nxt], next=nxt, lg=nxt.log())
+        with self.assertRaises(GraphError): s.run(print, x=[1.0])  # validation: untouched
+        with self.assertRaises(ComputeError) as failed: s.run_steps(print, [{"x": [0.0, 0.0]}, {"x": [2.0, 2.0]}], readback=["lg"])
+        self.assertEqual(failed.exception.code, "NUMBER")
+        self.assertEqual(s.step, 1)
+        with self.assertRaises(ComputeError) as refused: s.run(print, x=[0.0, 0.0], readback=["lg"])
+        self.assertEqual(refused.exception.code, "STATE")
+        with self.assertRaises(ComputeError) as refused: s.download(print, "next")
+        self.assertEqual(refused.exception.code, "STATE")
+        s.dispose()
+        # A session whose first step is the one that fails is poisoned as well (conservative).
+        h = Graph(); b = h.tensor([-1.0]); y = h.tensor([0.0]); n2 = b - y
+        t = h.prepare(feeds={"y": y}, carry={b: n2}, next=n2, lg=n2.log())
+        with self.assertRaises(ComputeError): t.run(print, y=[0.0], readback=["lg"])
+        with self.assertRaises(ComputeError) as refused: t.run(print, y=[0.0])
+        self.assertEqual(refused.exception.code, "STATE")
+        # A validation failure alone never poisons: the next run carries normally.
+        k = Graph(); c = k.tensor([0.0, 0.0]); z = k.tensor([0.0, 0.0]); n3 = c + z
+        u = k.prepare(feeds={"z": z}, carry={c: n3}, next=n3)
+        with self.assertRaises(GraphError): u.run(print, z=[1.0, 2.0, 3.0])
+        got = []
+        u.run_steps(got.append, [{"z": [1.0, 1.0]}, {"z": [1.0, 1.0]}])
+        self.assertEqual([r["outputs"]["next"]["data"] for r in got[0]["steps"]], [[1.0, 1.0], [2.0, 2.0]])
+
+    def test_hosted_reply_marked_poisoned_refuses_further_runs(self):
+        g = Graph(); a = g.tensor([0.0, 0.0]); nxt = a + 1
+        s = g.prepare(feeds={"a": a}, carry={a: nxt}, next=nxt)
+        seen = []
+        s._reply({"ok": False, "error": {"code": "BACKEND", "message": "device lost", "poisoned": True}}, print, seen.append, None)
+        self.assertEqual(seen[0].code, "BACKEND")
+        with self.assertRaises(ComputeError) as refused: s.run(print, a=[1.0, 2.0])
+        self.assertEqual(refused.exception.code, "STATE")
+        self.assertIn("device lost", str(refused.exception))
+        s.dispose()
+        # Without the flag the session stays usable (the host refused before any work).
+        h = Graph(); b = h.tensor([0.0]); n2 = b + 1
+        t = h.prepare(feeds={"b": b}, carry={b: n2}, next=n2)
+        t._reply({"ok": False, "error": {"code": "SHAPE", "message": "bad"}}, print, seen.append, None)
+        got = []
+        t.run(got.append, b=[1.0])
+        self.assertEqual(got[0]["outputs"]["next"]["data"], [2.0])
+
     def test_carried_input_fed_once_then_carried(self):
         g = Graph(); a = g.tensor([0.0, 0.0, 0.0]); nxt = a + 1
         s = g.prepare(feeds={"a": a}, carry={a: nxt}, next=nxt)

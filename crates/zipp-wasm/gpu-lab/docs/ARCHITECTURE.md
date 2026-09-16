@@ -176,6 +176,14 @@ does that work once and returns a **Session**:
   resident bytes plus the plan's own allocation count against
   `maxLogicalBytes`. `session.dispose()` releases the tensors (deferred past a
   run in flight); disposing the runtime disposes its sessions first.
+- **Failure.** Everything before `begin` only validates, so a rejected run
+  (`SHAPE`, `REFERENCE`, `LIMIT`, ...) leaves the session usable. Once device
+  work has begun, carries and residents advance step by step, so a backend,
+  readback or `finish` failure leaves them at no step in particular while
+  `stepNumber` did not advance: the session is *poisoned* (`describe().poisoned`),
+  `run` and `download` refuse with `STATE`, and only `dispose()` remains. The
+  error reply of `gpu.session.run` carries `poisoned: true` in that case, and
+  the Python `Session` (hosted or on the reference) applies the same rule.
 
 Every backend has the same Session semantics: cpu-js and WASM keep arrays,
 WebGL2 keeps textures, WebGPU keeps buffers. `tests/sessions.test.mjs` pins that

@@ -52,7 +52,8 @@ export function createZippGPUHandler(runtime, {allowExecute=false,maxSessions=16
       } else if(kind==='gpu.session.run'){
         fields(payload,kind);
         const session=lookup(payload.session);
-        result=await session.run(payload.steps,{readback:payload.readback,step:payload.step});
+        try{result=await session.run(payload.steps,{readback:payload.readback,step:payload.step});}
+        catch(error){if(session.poisoned&&error!==null&&typeof error==='object')error.poisoned=true;throw error;}
         result.step=session.stepNumber;
       } else if(kind==='gpu.session.download'){
         fields(payload,kind);result=await lookup(payload.session).download(payload.names);
@@ -99,7 +100,7 @@ export function createZippGPUAdapter(engine,runtime,{allowExecute=false,maxReque
         if(!live())return {delivered:false,cancelled:true};
         let reply;
         try{reply={ok:true,value:await handler.handle(kind,args)};}
-        catch(error){reply={ok:false,error:{code:error.code||'GPU',message:String(error.message||error).slice(0,512)}};}
+        catch(error){reply={ok:false,error:{code:error.code||'GPU',message:String(error.message||error).slice(0,512),...(error?.poisoned?{poisoned:true}:{})}};}
         if(!live())return {delivered:false,cancelled:true};
         // This is after asynchronous host work and outside an active Engine export.
         const delivered=engine.resolveHostCallback(id,reply);

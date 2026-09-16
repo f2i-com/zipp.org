@@ -1048,6 +1048,11 @@ def _as_list(values):
     return _k.to_list(values) if _k is not None and isinstance(values, _k.Storage) else list(values)
 
 
+def _poisoned(cause):
+    return ComputeError("STATE", "Session state is undefined after a failed run (%s: %s); dispose it"
+                        % (getattr(cause, "code", type(cause).__name__), cause))
+
+
 class Session:
     """A prepared program whose tensors stay on the device between runs (see `Graph.prepare`)."""
 
@@ -1063,6 +1068,7 @@ class Session:
         self.step = 1
         self._id = None
         self._failed = None
+        self._began = False
         self._disposed = False
         self._queue = []
         self._hosted = _zipp_gpu is not None and _zipp_gpu.hosted()
@@ -1142,6 +1148,10 @@ class Session:
             return
         error = reply.get("error") or {}
         exc = ComputeError(error.get("code", "GPU"), error.get("message", "GPU request failed"))
+        if error.get("poisoned"):
+            # The host's session failed after device work began: its carried
+            # state is no particular step's. Only dispose() remains.
+            self._failed = _poisoned(exc)
         if on_error is None:
             raise exc
         on_error(exc)
@@ -1247,6 +1257,17 @@ class Session:
         return None
 
     def _run_locally(self, payload_steps, names, step, storage=False):
+        try:
+            return self._run_locally_steps(payload_steps, names, step, storage)
+        except Exception as exc:
+            if self._began:
+                # As the host does: once a step has run, carries and residents
+                # may hold any step's values while self.step did not advance.
+                self._failed = _poisoned(exc)
+            raise
+
+    def _run_locally_steps(self, payload_steps, names, step, storage):
+        self._began = False
         first = self.step if step is None else step
         base = self._program
         carries = {node["carry"]: node["id"] for node in base["nodes"] if node.get("carry") is not None}
@@ -1269,6 +1290,7 @@ class Session:
                     node["step"] = node["step"] + step_no - 1
                 nodes.append(node)
             program = dict(base, nodes=nodes)
+            self._began = True
             # Under Zipp the kernels keep every output as tensor storage, so a
             # carried value enters the next step as it came out (no list in
             # between); the numbers are the reference's bit for bit.
