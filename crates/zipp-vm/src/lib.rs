@@ -706,14 +706,14 @@ pub fn run_module_file(
     // globals every module can reference — then the entry loads through the
     // module loader: imports link before evaluation and the module's own
     // declarations stay MODULE-scoped (never globalThis properties).
-    let host_src = harness.clone().unwrap_or_default();
+    let host_src = harness.unwrap_or_default();
     // The harness runs as a realm SCRIPT (its declarations become realm
     // globals), so it parses script-first — which is also what it compiled as
     // before the front-end swap, oxc's module-flavoured default notwithstanding.
     let host_ast = front::parse_auto(&host_src)?;
     let host = compile::compile_main_program(&host_ast, &host_src)?;
     let mut vm = vm::Vm::new(&host);
-    vm.set_module_base_dir(base_dir.clone());
+    vm.set_module_base_dir(base_dir);
     if let Err(thrown) = vm.run() {
         vm.report_unhandled_errors();
         return Ok(Outcome {
@@ -732,44 +732,6 @@ pub fn run_module_file(
             errput: vm.errput,
             error: None,
         }),
-        Err(thrown) if thrown.0.contains("top-level await is not supported") => {
-            // ENTRY top-level await: rerun on a fresh Vm via the direct
-            // async-capable module path, with the harness prepended (the
-            // single-module concatenation).
-            let combined;
-            let text: &str = match &harness {
-                Some(h) => {
-                    // A hashbang is only valid at position 0 — strip it (it is
-                    // a comment) before prepending the harness.
-                    let body = if src.starts_with("#!") {
-                        src.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
-                    } else {
-                        src.as_str()
-                    };
-                    combined = format!("{h}\n{body}");
-                    combined.as_str()
-                }
-                None => src.as_str(),
-            };
-            let ast2 = front::parse_module(text)?;
-            let program2 = compile::compile_main_module(&ast2, text)?;
-            let mut vm = vm::Vm::new(&program2);
-            vm.set_module_base_dir(base_dir);
-            let result = vm.run_module();
-            vm.report_unhandled_errors();
-            match result {
-                Ok(_) => Ok(Outcome {
-                    output: vm.output,
-                    errput: vm.errput,
-                    error: None,
-                }),
-                Err(thrown) => Ok(Outcome {
-                    output: std::mem::take(&mut vm.output),
-                    errput: std::mem::take(&mut vm.errput),
-                    error: Some(thrown.0),
-                }),
-            }
-        }
         Err(thrown) => Ok(Outcome {
             output: std::mem::take(&mut vm.output),
             errput: std::mem::take(&mut vm.errput),

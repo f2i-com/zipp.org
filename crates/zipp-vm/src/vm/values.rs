@@ -527,6 +527,23 @@ impl<'p> Vm<'p> {
     /// function VALUE recorded in `method_brand`) runs. `current_private_brands`
     /// asks this for the running frame; a frame-free JIT activation asks it for
     /// its own callee, because the top frame then belongs to a caller.
+    /// A function defined INSIDE a class body shares that body's private
+    /// scope: `method(){ const self = this; function inner(){ self.#m = 1; } }`
+    /// is legal, and so is an arrow doing the same, because a private name is
+    /// lexically scoped rather than tied to being a method. Copy the defining
+    /// code's chain onto the new function value, so `resolve_private` finds
+    /// the declaring class from inside it (the textual fall-back it used
+    /// instead could not see a private ACCESSOR at all, and would have
+    /// accepted another class's same-named private).
+    pub(crate) fn inherit_private_brands(&mut self, defining: Value, closure: u32) {
+        if self.method_brand.is_empty() || !defining.is_heap() {
+            return;
+        }
+        if let Some(chain) = self.method_brand.get(&defining.heap_index()).cloned() {
+            self.method_brand.insert(closure, chain);
+        }
+    }
+
     pub(crate) fn private_brands_of(&self, callee: Value) -> Option<&Vec<u64>> {
         if !callee.is_heap() {
             return None;

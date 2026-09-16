@@ -4883,6 +4883,10 @@ impl<'p> Vm<'p> {
                         if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
                             self.closure_eval_scope.insert(v.heap_index(), sc);
                         }
+                        // A function declared inside a class body keeps that
+                        // body private scope.
+                        let defining = self.frames[frame_idx].callee;
+                        self.inherit_private_brands(defining, v.heap_index());
                         self.realm_tag_new(v.heap_index());
                         self.set(base, dst, v);
                         ip += 1;
@@ -4942,6 +4946,8 @@ impl<'p> Vm<'p> {
                         if nt != Value::UNDEFINED {
                             self.record_closure_new_target(v.heap_index(), nt);
                         }
+                        // ... the enclosing class body private scope ...
+                        self.inherit_private_brands(callee, v.heap_index());
                         // ... and any dynamic EvalScope of the defining frame.
                         if let Some(sc) = self.ensure_frame_eval_scope(frame_idx) {
                             self.closure_eval_scope.insert(v.heap_index(), sc);

@@ -3136,13 +3136,17 @@ impl<'p> Vm<'p> {
                                     "TypeError: concat result length exceeds 2**53 - 1".into(),
                                 ));
                             }
-                            if species_target.is_none() {
-                                let len = usize::try_from(len).unwrap_or(usize::MAX);
-                                self.reserve_array_result(&mut out, len, true)?;
-                            } else {
-                                self.preflight_native_iteration_work(len as u64)?;
-                            }
+                            // NOT admitted up front: a `length` of 2^53-1 says
+                            // nothing about how many indices EXIST, and the
+                            // first Get can throw (test262's poisoned index 0).
+                            // The walk is charged as it goes, so an element read
+                            // happens before any refusal and a length nothing
+                            // backs stops at the work bound rather than looping.
                             for k in 0..len {
+                                self.preflight_native_iteration_work(k as u64 + 1)?;
+                                if species_target.is_none() {
+                                    self.reserve_array_result(&mut out, 1, true)?;
+                                }
                                 // Step 5.c.iv: only a PRESENT index is copied
                                 // (HasProperty, a Proxy `has` trap included); an
                                 // absent one stays a hole in the result.
