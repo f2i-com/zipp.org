@@ -29,10 +29,19 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag (for example, v0.0.18)
+        description: Existing release tag (for example, v0.0.19)
         required: true
-        default: v0.0.18
+        default: v0.0.19
         type: string
+      skip_heavy:
+        description: >-
+          Skip the native workspace test suite and the pinned Test262 run.
+          Only for re-tagging a DOCS-ONLY change onto an engine revision whose
+          identical code the full gate already ran; the run log shows the skip.
+          A tag push never skips anything.
+        required: false
+        default: false
+        type: boolean
 
 # Build jobs can only read the repository. The release job raises this to
 # contents:write for the one step that publishes the already-built assets.
@@ -172,6 +181,9 @@ jobs:
     uses: ./.github/workflows/security.yml
     with:
       ref: ${{ needs.validate.outputs.commit }}
+      # False for every tag push; a dispatch may opt out of the two longest
+      # jobs for a docs-only retag (see the input's description).
+      skip_heavy: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_heavy == true }}
 
   native:
     name: Native CLI (${{ matrix.rust_target }})

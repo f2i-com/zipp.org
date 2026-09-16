@@ -47,6 +47,11 @@ on:
         required: false
         type: string
         default: "1.92.0"
+      skip_heavy:
+        description: Skip the native workspace suite and Test262 (a dispatched docs-only retag; see release.yml)
+        required: false
+        type: boolean
+        default: false
       canary:
         description: Run the stable-toolchain canary too (off for a release gate)
         required: false
@@ -97,6 +102,7 @@ jobs:
 
   native-workspace:
     name: Native workspace tests
+    if: ${{ !inputs.skip_heavy }}
     # The full native workspace is the expensive lane: on demand and at
     # release (there is no schedule while automatic CI is paused).
     runs-on: ubuntu-24.04
@@ -337,6 +343,7 @@ jobs:
 
   test262:
     name: Pinned Test262 conformance
+    if: ${{ !inputs.skip_heavy }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:

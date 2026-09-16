@@ -46,12 +46,14 @@ frontends use the same engine, with native and WebAssembly builds.
   and data, with an editor, virtual files, console and graphics in one place.
 - **Start with familiar ML code.** The bundled Torch subset supports eager CPU
   tensors, autograd and training. Experimental `torch.compile(model)` records
-  supported inference and training for WebGPU, WebGL2, WebAssembly SIMD kernels
-  or an explicit CPU fallback. The graph protocol carries rank-4 broadcasting,
-  batched matmul, stable softmax, a fused cross-entropy with its gradient, and
-  SGD, momentum or Adam updates that keep optimizer state on the device, so an
-  MNIST-scale step runs in one submission (7.8 ms on WebGPU, 3.9 ms on the
-  WebAssembly kernels, for 784-256-10 at batch 64).
+  dense inference and plain-SGD training for WebGPU, WebGL2, WebAssembly SIMD
+  kernels or an explicit CPU fallback. Underneath it, the `zipp_gpu` graph
+  protocol (version 2) carries rank-4 broadcasting, batched matmul, stable
+  softmax, a fused cross-entropy with its gradient, and SGD, momentum or Adam
+  updates that keep optimizer state on the device, so an MNIST-scale step
+  written as a graph runs in one submission (7.8 ms on WebGPU, 3.9 ms on the
+  WebAssembly kernels, for 784-256-10 at batch 64). `torch.compile` does not
+  yet emit those newer operations itself.
 - **Keep the host in control.** Execution budgets and explicit host capabilities
   let embedders decide which resources a program can use.
 - **Explore one engine across languages.** An optional trusted-code build adds
@@ -141,9 +143,12 @@ provides asynchronous scheduling and graphics.
 
 [![Torch training on WebGL2: Python source, learned curve and falling loss](landing/public/demos/torch-training.png)](examples/python/torch_training/model.py)
 
-This path supports float32 dense layers with relu, gelu, sigmoid and tanh, MSE
-or a fused cross-entropy against integer class targets, and SGD, momentum or
-Adam updates whose optimizer state stays on the device for the step.
+What `torch.compile` captures today is float32 dense layers, `relu`, `sum`/`mean`
+losses such as MSE, and plain SGD (no momentum, dampening or Nesterov, and no
+Adam). The graph protocol it targets is wider — gelu, sigmoid, tanh, softmax, a
+fused cross-entropy, and SGD, momentum or Adam updates — and a `zipp_gpu` graph
+can use all of it now; wiring the compiler's capture to those operations is the
+next step.
 **Each call captures a new graph, uploads inputs and weights, and reads back the
 loss, gradients and updated weights.** There is no `compiled.prepare()` API,
 resident model/optimizer state, graph cache or multi-GPU training yet. Small
