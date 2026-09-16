@@ -46,14 +46,13 @@ frontends use the same engine, with native and WebAssembly builds.
   and data, with an editor, virtual files, console and graphics in one place.
 - **Start with familiar ML code.** The bundled Torch subset supports eager CPU
   tensors, autograd and training. Experimental `torch.compile(model)` records
-  dense inference and plain-SGD training for WebGPU, WebGL2, WebAssembly SIMD
-  kernels or an explicit CPU fallback. Underneath it, the `zipp_gpu` graph
-  protocol (version 2) carries rank-4 broadcasting, batched matmul, stable
-  softmax, a fused cross-entropy with its gradient, and SGD, momentum or Adam
-  updates that keep optimizer state on the device, so an MNIST-scale step
-  written as a graph runs in one submission (7.8 ms on WebGPU, 3.9 ms on the
-  WebAssembly kernels, for 784-256-10 at batch 64). `torch.compile` does not
-  yet emit those newer operations itself.
+  dense inference and training steps for WebGPU, WebGL2, WebAssembly SIMD
+  kernels or an explicit CPU fallback: relu, gelu, sigmoid or tanh layers,
+  softmax, MSE or a fused cross-entropy, and SGD, momentum or Adam updates in
+  one graph. The `zipp_gpu` graph protocol (version 2) underneath also carries
+  rank-4 broadcasting and batched matmul, so an MNIST-scale step written as a
+  graph runs in one submission (7.8 ms on WebGPU, 3.9 ms on the WebAssembly
+  kernels, for 784-256-10 at batch 64).
 - **Keep the host in control.** Execution budgets and explicit host capabilities
   let embedders decide which resources a program can use.
 - **Explore one engine across languages.** An optional trusted-code build adds
@@ -143,12 +142,14 @@ provides asynchronous scheduling and graphics.
 
 [![Torch training on WebGL2: Python source, learned curve and falling loss](landing/public/demos/torch-training.png)](examples/python/torch_training/model.py)
 
-What `torch.compile` captures today is float32 dense layers, `relu`, `sum`/`mean`
-losses such as MSE, and plain SGD (no momentum, dampening or Nesterov, and no
-Adam). The graph protocol it targets is wider — gelu, sigmoid, tanh, softmax, a
-fused cross-entropy, and SGD, momentum or Adam updates — and a `zipp_gpu` graph
-can use all of it now; wiring the compiler's capture to those operations is the
-next step.
+What `torch.compile` captures today is float32 dense layers with `relu`, `gelu`,
+`sigmoid` or `tanh`, `softmax`/`log_softmax` over the last dimension, `sum`/`mean`
+over all elements or one dimension, MSE-style losses and `F.cross_entropy`
+against integer class targets (the protocol's fused operation), trained with
+SGD (momentum, dampening, Nesterov, weight decay), Adam or AdamW. Momentum
+buffers and Adam moments are read from `optimizer.state`, updated in the graph
+and written back with the weights, so the next step continues where this one
+left off.
 **Each call captures a new graph, uploads inputs and weights, and reads back the
 loss, gradients and updated weights.** There is no `compiled.prepare()` API,
 resident model/optimizer state, graph cache or multi-GPU training yet. Small
@@ -404,7 +405,7 @@ library also includes a `torch` subset (tensors over typed arrays with
 reverse-mode autograd, `nn`, `nn.functional`, `optim`, `save`/`load` in
 supported PyTorch checkpoint layouts) that runs on the engine's CPU kernels, so
 supported ML code can train and evaluate inside Zipp. Eager execution is CPU;
-`torch.compile` adds supported asynchronous GPU inference and dense-model SGD training. The scope
+`torch.compile` adds supported asynchronous GPU inference and dense-model training (SGD, momentum or Adam). The scope
 matrix, limits and the bytecode design are in
 [docs/PYTHON_FRONTEND_EXPERIMENT.md](docs/PYTHON_FRONTEND_EXPERIMENT.md). The
 feature is on by default in the CLI (`--no-default-features` builds the

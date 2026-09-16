@@ -1,7 +1,8 @@
-"""Bounded asynchronous inference and first-order SGD training graphs.
+"""Bounded asynchronous inference and first-order training graphs.
 
-The host executes float32 forward, backward and update nodes. Parameters live
-on the CPU between submissions; this is not TorchInductor or a CUDA device.
+The host executes float32 forward, backward and update nodes. Parameters and
+optimizer state live on the CPU between submissions; this is not TorchInductor
+or a CUDA device.
 """
 import torch
 import _zipp_tensor as _k
@@ -35,16 +36,38 @@ def _any_requires_grad(parents):
     return False
 
 
-def _sgd_configuration(optimizer):
+# The options each captured optimizer reads, all snapshotted with `step()`.
+_OPTIONS = {
+    "sgd": ("lr", "weight_decay", "maximize", "momentum", "dampening", "nesterov"),
+    "adam": ("lr", "betas", "eps", "weight_decay", "amsgrad", "maximize"),
+}
+
+
+def _optimizer_configuration(optimizer, kind):
     # Keep values and parameter identities, never aliases to mutable groups/lists.
-    options = ("lr", "weight_decay", "maximize", "momentum", "dampening", "nesterov")
+    # The step counts come along: an eager step between capture and readback
+    # is a change of optimizer state, not a continuation of this one.
     groups = []
     for group in optimizer.param_groups:
-        values = tuple(group[name] for name in options)
-        if any(type(value) not in (int, float, bool) for value in values):
-            raise NotImplementedError("GPU SGD options must be numeric or boolean scalars")
-        groups.append((tuple(id(p) for p in group["params"]), values))
-    return (id(optimizer), tuple(groups))
+        values = []
+        for name in _OPTIONS[kind]:
+            value = group[name]
+            items = tuple(value) if name == "betas" and type(value) in (tuple, list) else (value,)
+            if any(type(item) not in (int, float, bool) for item in items):
+                raise NotImplementedError("GPU optimizer options must be numeric or boolean scalars")
+            values.append(items if name == "betas" else value)
+        params = group["params"]
+        steps = tuple(_step_count(optimizer, p) for p in params)
+        groups.append((tuple(id(p) for p in params), tuple(values), steps))
+    return (id(optimizer), kind, bool(getattr(optimizer, "_decoupled", False)), tuple(groups))
+
+
+def _step_count(optimizer, parameter):
+    state = optimizer.state.get(id(parameter))
+    step = 0 if state is None else state.get("step", 0)
+    if type(step) is not int or step < 0:
+        raise NotImplementedError("GPU optimizers need an integer step count in their state")
+    return step
 
 
 class _Capture:
@@ -52,12 +75,17 @@ class _Capture:
         self.graph = Graph()
         self.training = training
         self.inputs = {}
+        self.targets = {}
         self.tape = []
         self.previous_grads = {}
         self.input_metadata = {}
         self.grads = {}
         self.updates = []
+        self.state_updates = []
+        self.state_snapshots = []
+        self.step_counts = {}
         self.optimizer = None
+        self.optimizer_kind = None
         self.optimizer_snapshot = None
         self.optimizer_params = ()
         self.did_backward = False
@@ -72,7 +100,7 @@ class _Capture:
             if len(value.shape) > 2:
                 raise NotImplementedError("Compiled GPU calls support scalar, vector and matrix tensors only")
             if value.dtype != torch.float32:
-                raise TypeError("GPU compilation requires float32 tensors")
+                raise TypeError("GPU compilation requires float32 tensors; integer tensors are accepted only as cross_entropy class targets")
             key = id(value)
             shape = (1, value.shape[0]) if row else tuple(value.shape)
             if key not in self.inputs:
@@ -90,6 +118,28 @@ class _Capture:
                 raise NotImplementedError("A captured tensor cannot have two different layouts")
             return symbolic
         return _Tensor(self, self.graph.tensor(value))
+
+    def class_targets(self, value):
+        """Integer class indices for the fused cross-entropy, recorded once.
+
+        The graph's only dtype is float32, so the int64 (or int32) storage
+        is converted exactly (class indices are small integers) and the
+        graph checks every value is an integer in [0, C). Targets are data,
+        not leaves: no gradient, but the same staleness rules as inputs.
+        """
+        if isinstance(value, _Tensor):
+            raise NotImplementedError("GPU cross_entropy needs integer class targets from the CPU, not a computed graph tensor")
+        if not isinstance(value, torch.Tensor):
+            raise TypeError("cross_entropy targets must be a tensor")
+        if value.dtype.is_floating_point or value.dtype is torch.bool:
+            raise TypeError("GPU cross_entropy class targets must be an integer tensor")
+        if len(value.shape) != 1:
+            raise NotImplementedError("GPU cross_entropy supports class targets of shape [N] for logits [N, C]")
+        key = id(value)
+        if key not in self.targets:
+            symbolic = self.graph.tensor(_k.astype(value._s, "float32"), tuple(value.shape))
+            self.targets[key] = (value, symbolic, (value._s, _k.version(value._s)), value.dtype)
+        return self.targets[key][1]
 
     def zero_grad(self, optimizer, set_to_none):
         if not set_to_none:
@@ -114,36 +164,129 @@ class _Capture:
                     old = self.grads.get(id(parent))
                     self.grads[id(parent)] = value if old is None else old + value
 
-    def sgd(self, optimizer, closure):
+    # ---- optimizer steps ----------------------------------------------------------------
+    # Each mirrors torch.optim's single-tensor loop, in its order: negate for
+    # maximize, add weight decay, update the state buffers, then the parameter.
+
+    def _begin_step(self, optimizer, closure, kind, name):
         if closure is not None:
-            raise NotImplementedError("GPU SGD does not support closures")
+            raise NotImplementedError("GPU %s does not support closures" % name)
         if optimizer is not self.optimizer or not self.did_backward or self.did_step:
-            raise RuntimeError("GPU training requires one zero_grad/backward/step with the same SGD optimizer")
-        self.optimizer_snapshot = _sgd_configuration(optimizer)
+            raise RuntimeError("GPU training requires one zero_grad/backward/step with the same optimizer")
+        self.optimizer_kind = kind
+        self.optimizer_snapshot = _optimizer_configuration(optimizer, kind)
         self.optimizer_params = tuple(p for group in optimizer.param_groups for p in group["params"])
+
+    def _trainable(self, optimizer, name):
         seen = set()
         for group in optimizer.param_groups:
-            if group["momentum"] or group["dampening"] or group["nesterov"]:
-                raise NotImplementedError("GPU SGD currently supports no momentum, dampening or Nesterov")
             for parameter in group["params"]:
                 if id(parameter) in seen:
-                    raise ValueError("GPU SGD rejects duplicate parameters")
+                    raise ValueError("GPU %s rejects duplicate parameters" % name)
                 seen.add(id(parameter))
                 if not parameter.requires_grad:
                     continue
                 entry = self.inputs.get(id(parameter))
                 if entry is None or id(entry[1]) not in self.grads:
-                    raise NotImplementedError("Every trainable SGD parameter must participate in the captured loss")
+                    raise NotImplementedError("Every trainable %s parameter must participate in the captured loss" % name)
                 leaf = entry[1]
                 gradient = self.grads[id(leaf)]
                 if group["maximize"]:
                     gradient = gradient * -1.0
-                if group["weight_decay"]:
-                    gradient = gradient + leaf._value * group["weight_decay"]
-                self.updates.append((parameter, leaf._value - gradient * group["lr"]))
+                yield group, parameter, leaf, gradient
+
+    def _state_tensor(self, optimizer, parameter, leaf, key):
+        """The optimizer's `key` buffer for `parameter` as a graph input, or None.
+
+        The buffer takes the leaf's captured layout (a bias is a row), so the
+        update ops see one shape; it is read back in the parameter's shape.
+        """
+        state = optimizer.state.get(id(parameter))
+        buffer = None if state is None else state.get(key)
+        if buffer is not None and (not isinstance(buffer, torch.Tensor) or buffer.dtype != torch.float32
+                                   or tuple(buffer.shape) != tuple(parameter.shape)):
+            raise NotImplementedError("GPU optimizer state %r must be a float32 tensor shaped like its parameter" % key)
+        self.state_snapshots.append((parameter, key, _snapshot(buffer)))
+        return None if buffer is None else self.graph.tensor(buffer._s, tuple(leaf.shape))
+
+    def _end_step(self):
         if not self.updates:
             raise RuntimeError("GPU training requires at least one trainable parameter")
         self.did_step = True
+
+    def sgd(self, optimizer, closure):
+        self._begin_step(optimizer, closure, "sgd", "SGD")
+        for group, parameter, leaf, gradient in self._trainable(optimizer, "SGD"):
+            if group["weight_decay"]:
+                gradient = gradient + leaf._value * group["weight_decay"]
+            if not group["momentum"]:
+                # Plain SGD stays within protocol version 1 (see zipp_gpu).
+                self.updates.append((parameter, leaf._value - gradient * group["lr"]))
+                continue
+            buffer = self._state_tensor(optimizer, parameter, leaf, "momentum_buffer")
+            # PyTorch clones the first gradient into the buffer; the momentum
+            # and dampening weights apply from the second step on.
+            if buffer is None:
+                buffer = gradient
+            else:
+                buffer = self.graph.momentum_update(buffer, gradient, group["momentum"], group["dampening"])
+            self.state_updates.append((parameter, "momentum_buffer", buffer))
+            direction = gradient + buffer * group["momentum"] if group["nesterov"] else buffer
+            self.updates.append((parameter, self.graph.sgd_update(leaf._value, direction, group["lr"])))
+        self._end_step()
+
+    def adam(self, optimizer, closure):
+        self._begin_step(optimizer, closure, "adam", "Adam")
+        decoupled = bool(getattr(optimizer, "_decoupled", False))
+        for group, parameter, leaf, gradient in self._trainable(optimizer, "Adam"):
+            if group["amsgrad"]:
+                raise NotImplementedError("GPU Adam does not support amsgrad")
+            value = leaf._value
+            lr, weight_decay = group["lr"], group["weight_decay"]
+            if weight_decay:
+                if decoupled:
+                    value = value * (1.0 - lr * weight_decay)
+                else:
+                    gradient = gradient + value * weight_decay
+            shape = tuple(leaf.shape)
+            m = self._state_tensor(optimizer, parameter, leaf, "exp_avg")
+            v = self._state_tensor(optimizer, parameter, leaf, "exp_avg_sq")
+            step = _step_count(optimizer, parameter) + 1
+            new_value, new_m, new_v = self.graph.adam(
+                value, gradient,
+                self.graph.zeros(shape) if m is None else m,
+                self.graph.zeros(shape) if v is None else v,
+                lr, group["betas"], group["eps"], step)
+            self.updates.append((parameter, new_value))
+            self.state_updates.append((parameter, "exp_avg", new_m))
+            self.state_updates.append((parameter, "exp_avg_sq", new_v))
+            self.step_counts[id(parameter)] = step
+        self._end_step()
+
+
+def _unbroadcast(g, tensor):
+    """Reduce a broadcast gradient back to the operand's shape."""
+    shape = tuple(tensor.shape)
+    if tuple(g.shape) == shape:
+        return g
+    if not shape:
+        return g.sum()
+    for _ in range(len(g.shape) - len(shape)):
+        g = g.sum(0)
+    for axis, size in enumerate(shape):
+        if size == 1 and g.shape[axis] != 1:
+            g = g.sum(axis, keepdim=True)
+    return g
+
+
+def _one_dim(dim, rank, name):
+    if isinstance(dim, (tuple, list)):
+        if len(dim) != 1:
+            raise NotImplementedError("GPU %s reduces all elements or one dimension" % name)
+        dim = dim[0]
+    if isinstance(dim, bool) or not isinstance(dim, int) or not -rank <= dim < rank:
+        raise IndexError("Dimension out of range (expected to be in range of [%d, %d], but got %r)" % (-rank, rank - 1, dim))
+    return dim + rank if dim < 0 else dim
 
 
 class _Tensor:
@@ -166,6 +309,8 @@ class _Tensor:
 
     def _binary(self, operation, other, reverse=False):
         if isinstance(other, torch.Tensor) and len(self.shape) == 2 and tuple(other.shape) == (self.shape[1],):
+            # A bias row broadcast by a ones-matmul keeps dense layers within
+            # protocol version 1; other broadcasting uses the graph's own.
             other = self._capture.tensor(other, row=True)
             ones = _Tensor(self._capture, self._capture.graph.full((self.shape[0], 1), 1.0))
             other = ones @ other
@@ -176,8 +321,11 @@ class _Tensor:
         def backward(g):
             ga = g * bv if operation == "mul" else g
             gb = g * av if operation == "mul" else g * -1.0 if operation == "sub" else g
-            return (ga.sum() if not a.shape and result.shape else ga, gb.sum() if not b.shape and result.shape else gb)
+            return (_unbroadcast(ga, a), _unbroadcast(gb, b))
         return _Tensor(self._capture, result, (a, b), backward)
+
+    def _unary(self, value, pullback):
+        return _Tensor(self._capture, value, (self,), pullback)
 
     def __add__(self, other): return self._binary("add", other)
     def __radd__(self, other): return self._binary("add", other, True)
@@ -202,20 +350,93 @@ class _Tensor:
     def transpose(self, dim0, dim1):
         if len(self.shape) != 2 or (dim0 % 2, dim1 % 2) not in ((0, 1), (1, 0)) or not -2 <= dim0 < 2 or not -2 <= dim1 < 2:
             raise NotImplementedError("GPU transpose supports swapping the two matrix dimensions")
-        return _Tensor(self._capture, self._value.transpose(), (self,), lambda g: (g.transpose(),))
+        return self._unary(self._value.transpose(), lambda g: (g.transpose(),))
     @property
     def T(self): return self.transpose(0, 1)
     def linear(self, weight, bias):
         result = self @ self._capture.tensor(weight).T
         return result if bias is None else result + bias
+
+    # ---- activations: each pullback is composed from graph operations -------------
     def relu(self):
-        return _Tensor(self._capture, self._value.relu(), (self,), lambda g: (g * self._value.positive(),))
+        return self._unary(self._value.relu(), lambda g: (g * self._value.positive(),))
+    def gelu(self, approximate="none"):
+        if approximate != "none":
+            raise NotImplementedError("GPU gelu supports approximate='none' (the exact erf form)")
+        x = self._value
+        return self._unary(x.gelu(), lambda g: (g * x.gelu_grad(),))
+    def sigmoid(self):
+        s = self._value.sigmoid()
+        return self._unary(s, lambda g: (g * (s * (1.0 - s)),))
+    def tanh(self):
+        t = self._value.tanh()
+        return self._unary(t, lambda g: (g * (1.0 - t * t),))
+    def exp(self):
+        e = self._value.exp()
+        return self._unary(e, lambda g: (g * e,))
+    def log(self):
+        x = self._value
+        return self._unary(x.log(), lambda g: (g / x,))
+    def _last_axis(self, dim, name):
+        if not self.shape or _one_dim(dim, len(self.shape), name) != len(self.shape) - 1:
+            raise NotImplementedError("GPU %s supports the last dimension of a tensor with at least one dimension" % name)
+    def softmax(self, dim=-1, dtype=None):
+        self._last_axis(dim, "softmax")
+        if dtype is not None and dtype != torch.float32:
+            raise NotImplementedError("GPU softmax computes float32 only")
+        s = self._value.softmax()
+        return self._unary(s, lambda g: (s * (g - (g * s).sum(-1, keepdim=True)),))
+    def log_softmax(self, dim=-1, dtype=None):
+        self._last_axis(dim, "log_softmax")
+        if dtype is not None and dtype != torch.float32:
+            raise NotImplementedError("GPU log_softmax computes float32 only")
+        ls = self._value.log_softmax()
+        return self._unary(ls, lambda g: (g - ls.exp() * g.sum(-1, keepdim=True),))
+
+    # ---- reductions ------------------------------------------------------------------
+    def _reduce(self, op, dim, keepdim, dtype):
+        if dtype is not None and dtype != torch.float32:
+            raise NotImplementedError("GPU %s computes float32 only" % op)
+        if not isinstance(keepdim, bool):
+            raise TypeError("keepdim must be a bool")
+        shape = tuple(self.shape)
+        graph = self._capture.graph
+        if dim is None:
+            if not keepdim and op == "sum":
+                # Whole-tensor sum, the protocol version 1 form (mean is sum / n).
+                return self._unary(self._value.sum(), lambda g: (graph.full(shape, 1.0) * g,))
+            if not keepdim:
+                return self.sum() / self.shape.numel()
+            axis, count, kept = None, self.shape.numel(), tuple(1 for _ in shape)
+        else:
+            axis = _one_dim(dim, len(shape), op)
+            count = shape[axis]
+            kept = tuple(1 if i == axis else d for i, d in enumerate(shape))
+        value = self._value.sum(axis, keepdim) if op == "sum" else self._value.mean(axis, keepdim)
+        scale = 1.0 if op == "sum" else 1.0 / count
+        def backward(g):
+            spread = g if keepdim else g.reshape(kept)
+            return (graph.full(shape, scale) * spread,)
+        return self._unary(value, backward)
     def sum(self, dim=None, keepdim=False, dtype=None):
-        if dim is not None or keepdim or dtype is not None:
-            raise NotImplementedError("GPU sum currently reduces all elements")
-        return _Tensor(self._capture, self._value.sum(), (self,), lambda g: (self._capture.graph.full(tuple(self.shape), 1.0) * g,))
+        return self._reduce("sum", dim, keepdim, dtype)
     def mean(self, dim=None, keepdim=False, dtype=None):
-        return self.sum(dim, keepdim, dtype) / self.shape.numel()
+        return self._reduce("mean", dim, keepdim, dtype)
+
+    # ---- losses ------------------------------------------------------------------------
+    def cross_entropy(self, target, weight=None, reduction="mean", label_smoothing=0.0):
+        """The fused mean cross-entropy of logits [N, C] against class indices [N]."""
+        if weight is not None or label_smoothing:
+            raise NotImplementedError("GPU cross_entropy supports no class weights or label smoothing")
+        if reduction not in ("mean", "sum"):
+            raise NotImplementedError("GPU cross_entropy supports reduction='mean' or 'sum'")
+        if len(self.shape) != 2:
+            raise NotImplementedError("GPU cross_entropy needs logits of shape [N, C]")
+        targets = self._capture.class_targets(target)
+        logits = self._value
+        loss = self._unary(logits.cross_entropy(targets), lambda g: (g * logits.cross_entropy_grad(targets),))
+        return loss if reduction == "mean" else loss * float(self.shape[0])
+
     def backward(self, gradient=None, retain_graph=False, create_graph=False):
         if gradient is not None or retain_graph or create_graph:
             raise NotImplementedError("GPU backward supports first-order scalar losses only")
@@ -225,7 +446,7 @@ class _Tensor:
 
 
 class GPUResult:
-    """A recorded call. Training commits gradients/weights after successful readback."""
+    """A recorded call. Training commits gradients, weights and optimizer state after successful readback."""
     def __init__(self, value):
         self.shape = value.shape
         self._value = value
@@ -250,6 +471,8 @@ class GPUResult:
             outputs["grad" + str(i)] = gradient
         for i, entry in enumerate(capture.updates):
             outputs["weight" + str(i)] = entry[1]
+        for i, entry in enumerate(capture.state_updates):
+            outputs["state" + str(i)] = entry[2]
         # Validate output/node budgets before claiming the single-use submission.
         program = capture.graph._program(outputs)
         self._submitted = True
@@ -266,7 +489,7 @@ class GPUResult:
             try:
                 if capture.training:
                     try:
-                        optimizer_changed = _sgd_configuration(capture.optimizer) != capture.optimizer_snapshot
+                        optimizer_changed = _optimizer_configuration(capture.optimizer, capture.optimizer_kind) != capture.optimizer_snapshot
                     except Exception:
                         optimizer_changed = True
                     if optimizer_changed:
@@ -274,6 +497,7 @@ class GPUResult:
                 value = read("result", tuple(self.shape))
                 gradients = [(entry[0], read("grad" + str(i), tuple(entry[0].shape))) for i, entry in enumerate(leaves)]
                 updates = [(entry[0], read("weight" + str(i), tuple(entry[0].shape))) for i, entry in enumerate(capture.updates)]
+                states = [(entry[0], entry[1], read("state" + str(i), tuple(entry[0].shape))) for i, entry in enumerate(capture.state_updates)]
                 if capture.training:
                     for original, symbolic, snapshot in capture.inputs.values():
                         if original.dtype != torch.float32 or original._s is not snapshot[0] or _k.version(original._s) != snapshot[1]:
@@ -282,8 +506,19 @@ class GPUResult:
                             raise RuntimeError("GPU training result is stale; a captured gradient changed before completion")
                         if (tuple(original.shape), original.requires_grad) != capture.input_metadata[id(original)]:
                             raise RuntimeError("GPU training result is stale; a captured tensor changed before completion")
+                    for original, symbolic, snapshot, dtype in capture.targets.values():
+                        if original.dtype is not dtype or original._s is not snapshot[0] or _k.version(original._s) != snapshot[1]:
+                            raise RuntimeError("GPU training result is stale; captured class targets changed before completion")
+                    for parameter, key, snapshot in capture.state_snapshots:
+                        state = capture.optimizer.state.get(id(parameter))
+                        if _changed(None if state is None else state.get(key), snapshot):
+                            raise RuntimeError("GPU training result is stale; optimizer state changed before completion")
                     for parameter, new_value in updates:
                         parameter.data = new_value
+                    for parameter, key, new_value in states:
+                        capture.optimizer.state.setdefault(id(parameter), {})[key] = new_value
+                    for parameter, step in capture.step_counts.items():
+                        capture.optimizer.state[parameter]["step"] = step
                     for parameter in capture.optimizer_params:
                         parameter.grad = None
                     for parameter, gradient in gradients:
@@ -314,7 +549,9 @@ def compile(model=None, *, backend="zipp_gpu", training=False):
         if _active is not None:
             raise RuntimeError("Nested compiled training calls are unsupported")
         capture = _Capture(training)
-        convert = lambda value: capture.tensor(value) if isinstance(value, torch.Tensor) else value
+        # Float tensors become graph leaves; integer tensors stay on the CPU
+        # (cross_entropy records its class targets from there).
+        convert = lambda value: capture.tensor(value) if isinstance(value, torch.Tensor) and value.dtype.is_floating_point else value
         # Eager ops look for graph tensors only while a call records.
         torch._recording(1)
         try:
@@ -324,7 +561,7 @@ def compile(model=None, *, backend="zipp_gpu", training=False):
             if not isinstance(output, _Tensor):
                 raise TypeError("Compiled GPU calls must return one supported graph tensor")
             if training and not capture.did_step:
-                raise RuntimeError("Compiled GPU training must call zero_grad(), backward() and SGD.step()")
+                raise RuntimeError("Compiled GPU training must call zero_grad(), backward() and optimizer.step()")
             return GPUResult(output)
         finally:
             _active = None

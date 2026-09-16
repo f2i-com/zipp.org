@@ -1,0 +1,8 @@
+momentum matches torch loop True params [0.906488, -1.904537, 0.018175, 4.255032] buffer [0.89775, -0.27675, 2.5515, -2.244375]
+nesterov matches torch loop True params [0.863339, -1.896584, -0.103642, 4.370778] buffer [0.89775, -0.27675, 2.5515, -2.244375]
+softmax grad x1000 [-38, -28, 66, -123, 68, 55] within 1e-4 of finite differences True
+log_softmax grad x1000 [177, -227, 50, -544, 59, 485] within 1e-4 of finite differences True
+mean_keepdim grad x1000 [233, 233, 233, 67, 67, 67] within 1e-4 of finite differences True
+centered grad x1000 [67, -433, 367, -467, 33, 433] within 1e-4 of finite differences True
+(2,) (2, 1) (1, 3) (1, 1)
+back [6.0, 6.0, 6.0, 15.0, 15.0, 15.0] whole [10.5, 10.5, 10.5, 10.5, 10.5, 10.5]

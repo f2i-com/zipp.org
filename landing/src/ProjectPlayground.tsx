@@ -15,7 +15,7 @@ export function ProjectPlayground() {
       <iframe className="project-playground-frame" src="/playground/" title="Zipp folder playground: Python, JavaScript and browser GPU" loading="lazy" />
       <p className="project-playground-note">The Python-enabled engine runs inside a Worker with execution deadlines.
         Browser GPU support depends on your hardware and browser; the console reports the actual backend.
-        Eager Torch supports CPU training. Experimental <code>torch.compile</code> supports GPU inference and dense-model SGD training; results arrive through a callback. Try Samples → Python: Torch ML training (GPU) to watch the loss fall.</p>
+        Eager Torch supports CPU training. Experimental <code>torch.compile</code> supports GPU inference and dense training steps with SGD, momentum, Adam or AdamW; results arrive through a callback. Try Samples → Python: Torch ML training (GPU) to watch the loss fall.</p>
     </section>
   )
 }

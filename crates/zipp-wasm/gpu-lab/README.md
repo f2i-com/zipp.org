@@ -16,8 +16,9 @@ Python compiles to Zipp bytecode and executes inside the WASM Worker. Its built-
 `zipp_gpu` module records graphs; `src/zipp-python-adapter.mjs` drains
 `takeHostRequests()` and calls `pythonCall("__zipp_py_deliver", ...)` with results.
 The bundled `torch` subset is eager CPU-only; experimental `torch.compile` records
-supported GPU inference and dense-model SGD training. General Python is not
-compiled to shaders. See the [Torch compatibility guide](../../../docs/TORCH_COMPATIBILITY.md).
+supported GPU inference and training steps (dense layers with relu, gelu, sigmoid
+or tanh, softmax, MSE or fused cross-entropy, SGD with momentum, Adam or AdamW).
+General Python is not compiled to shaders. See the [Torch compatibility guide](../../../docs/TORCH_COMPATIBILITY.md).
 
 ## Use JavaScript directly
 

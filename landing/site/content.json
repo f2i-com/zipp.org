@@ -1142,7 +1142,7 @@
             },
             {
               "type": "p",
-              "text": "`torch.compile(step, training=True)` captures one training step: exactly one `zero_grad()`, a scalar `loss.backward()` and `optimizer.step()` with plain SGD (learning rate, weight decay, `maximize` and parameter groups; momentum, Nesterov, Adam and higher-order gradients are rejected). Parameters are uploaded and read back on every call; there is no resident model state on the device. A five-step fixture matches CPU PyTorch 2.11."
+              "text": "`torch.compile(step, training=True)` captures one training step: exactly one `zero_grad()`, a scalar `loss.backward()` and `optimizer.step()` with SGD (learning rate, momentum, dampening, Nesterov, weight decay, `maximize` and parameter groups), Adam or AdamW; optimizer state is read from `optimizer.state`, updated in the graph and written back. Higher-order gradients, RMSprop and `amsgrad` are rejected. Parameters are uploaded and read back on every call; there is no resident model state on the device. A five-step fixture matches CPU PyTorch 2.11."
             },
             {
               "type": "callout",

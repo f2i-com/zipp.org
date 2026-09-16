@@ -505,8 +505,13 @@ class ReLU(_Activation):
     _fn = staticmethod(F.relu)
 
 
-class GELU(_Activation):
-    _fn = staticmethod(F.gelu)
+class GELU(Module):
+    def __init__(self, approximate="none"):
+        super().__init__()
+        self.approximate = approximate
+
+    def forward(self, x):
+        return F.gelu(x, self.approximate)
 
 
 class Tanh(_Activation):

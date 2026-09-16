@@ -108,6 +108,9 @@ def relu(x, inplace=False):
 
 
 def gelu(x, approximate="none"):
+    if approximate == "none" and torch._graph_recording and getattr(x, "_zipp_graph", False):
+        return x.gelu()
+    # The tanh form; a graph tensor composes it from recorded operations.
     return 0.5 * x * (1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x * x * x)))
 
 
@@ -186,6 +189,8 @@ def l1_loss(a, b, reduction="mean"):
 
 
 def nll_loss(log_probs, target, reduction="mean"):
+    if torch._graph_recording and getattr(log_probs, "_zipp_graph", False):
+        raise NotImplementedError("GPU nll_loss is not captured; use F.cross_entropy on the logits with integer class targets")
     if len(log_probs.shape) != 2:
         raise ValueError("nll_loss expects [N, C] log-probabilities")
     picked = log_probs[torch.arange(log_probs.shape[0]), target]
@@ -194,6 +199,10 @@ def nll_loss(log_probs, target, reduction="mean"):
 
 
 def cross_entropy(logits, target, weight=None, reduction="mean", label_smoothing=0.0):
+    if torch._graph_recording and getattr(logits, "_zipp_graph", False) and not target.dtype.is_floating_point:
+        # Integer class targets take the fused graph operation; probability
+        # targets compose from log_softmax below.
+        return logits.cross_entropy(target, weight, reduction, label_smoothing)
     if target.dtype.is_floating_point:
         lp = log_softmax(logits, -1)
         loss = -(target * lp).sum(-1)

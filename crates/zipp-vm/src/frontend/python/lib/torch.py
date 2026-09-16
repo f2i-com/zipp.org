@@ -1238,22 +1238,32 @@ def _unary(op, a, name, backward, p1=None, p2=None):
 
 
 def neg(a):
+    if _graph_recording and getattr(a, "_zipp_graph", False):
+        return -a
     return _unary("neg", a, "Neg", lambda g, x, o: neg(g))
 
 
 def exp(a):
+    if _graph_recording and getattr(a, "_zipp_graph", False):
+        return a.exp()
     return _unary("exp", a, "Exp", lambda g, x, o: mul(g, o))
 
 
 def log(a):
+    if _graph_recording and getattr(a, "_zipp_graph", False):
+        return a.log()
     return _unary("log", a, "Log", lambda g, x, o: div(g, x))
 
 
 def tanh(a):
+    if _graph_recording and getattr(a, "_zipp_graph", False):
+        return a.tanh()
     return _unary("tanh", a, "Tanh", lambda g, x, o: mul(g, sub(1, square(o))))
 
 
 def sigmoid(a):
+    if _graph_recording and getattr(a, "_zipp_graph", False):
+        return a.sigmoid()
     return _unary("sigmoid", a, "Sigmoid", lambda g, x, o: mul(g, mul(o, sub(1, o))))
 
 
@@ -2140,6 +2150,8 @@ def isclose(a, b, rtol=1e-05, atol=1e-08):
 
 
 def softmax(a, dim=-1, dtype=None):
+    if _graph_recording and getattr(a, "_zipp_graph", False):
+        return a.softmax(dim, dtype)
     if dtype is not None:
         a = a.to(dtype)
     d = _norm_dim(dim, _len(a.shape))
@@ -2156,6 +2168,8 @@ def softmax(a, dim=-1, dtype=None):
 
 
 def log_softmax(a, dim=-1, dtype=None):
+    if _graph_recording and getattr(a, "_zipp_graph", False):
+        return a.log_softmax(dim, dtype)
     if dtype is not None:
         a = a.to(dtype)
     d = _norm_dim(dim, _len(a.shape))

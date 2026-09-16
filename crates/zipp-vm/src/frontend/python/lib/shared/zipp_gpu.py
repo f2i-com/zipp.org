@@ -366,7 +366,12 @@ class Graph:
         node = self._nodes[t._id]
         if len(a.shape) != 2 or t.shape != (a.shape[0],):
             raise GraphError("%s requires logits [N, C] and targets [N]" % op)
-        if node["op"] != "input" or any(v != int(v) or not 0 <= v < a.shape[1] for v in node["data"]):
+        # Targets are input data (under Zipp, tensor storage), checked here so
+        # every backend may index with them.
+        data = node.get("data")
+        if _k is not None and isinstance(data, _k.Storage):
+            data = _k.to_list(data)
+        if node["op"] != "input" or any(v != int(v) or not 0 <= v < a.shape[1] for v in data):
             raise GraphError("%s targets must be a tensor of integer class indices in [0, C)" % op)
         return self._append(op, () if op == "cross_entropy" else a.shape, a=a._id, b=t._id)
 

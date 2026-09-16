@@ -46,39 +46,64 @@ accepted for explicit code. Backend selection belongs to the host/playground.
 Use `torch.compile(train_step, training=True)` and call `.submit(callback, on_error)`
 on the returned result. The function must perform exactly one
 `optimizer.zero_grad()`, scalar `loss.backward()` and `optimizer.step()`, in that
-order with the same SGD optimizer, and return a supported graph tensor (normally
+order with the same SGD, Adam or AdamW optimizer, and return a supported graph tensor (normally
 that loss). The [model example](../examples/python/torch_training/model.py) uses
 ordinary Torch syntax; its [driver](../examples/python/torch_training/main.py)
 schedules one completed step at a time and plots the loss.
 
-The graph contains the forward pass, first-order reverse-mode gradients and SGD
-updates. Float32 scalar/vector/matrix elementwise add/subtract/multiply, square,
-scalar division, matrix multiplication/transpose, ReLU, whole-tensor sum/mean and
-matrix-batched `nn.Linear` are supported. This covers small dense ReLU networks
-with MSE. ReLU's derivative at zero is zero. Shared parameters accumulate gradients
-from every captured use. Bias gradients reduce across the batch. A leaf first used inside `no_grad()`
-retains its `requires_grad` flag; only operations inside that context are excluded
-from the backward graph. SGD supports
-learning rate, weight decay, maximize and parameter groups; momentum, dampening,
-Nesterov, closures, Adam/AdamW/RMSprop, higher-order gradients and retained graphs
-are rejected. Every trainable optimizer parameter must participate in the loss.
+The graph contains the forward pass, first-order reverse-mode gradients and the
+optimizer update. Float32 scalar/vector/matrix elementwise add/subtract/multiply
+(NumPy-style broadcasting, with gradients reduced back to each operand's shape),
+square, scalar division, matrix multiplication/transpose, `nn.Linear`, the
+activations `relu`, `gelu` (the exact erf form is one graph operation; the tanh
+form composes from recorded operations), `sigmoid`, `tanh`, `exp` and `log`,
+`softmax`/`log_softmax` over the last dimension, `sum`/`mean` over all elements
+or one dimension with `keepdim`, and `F.cross_entropy` are supported.
+`F.cross_entropy` with integer class targets (`int64`/`int32`, shape `[N]` for
+logits `[N, C]`) records the protocol's fused cross-entropy and its gradient;
+the targets are converted exactly to float32 for the graph and checked to be
+class indices in `[0, C)`. Probability targets compose from `log_softmax`.
+`reduction='mean'` or `'sum'` are supported; class weights, label smoothing,
+`reduction='none'` and `F.nll_loss` are rejected. ReLU's derivative at zero is
+zero. Shared parameters accumulate gradients from every captured use. Bias
+gradients reduce across the batch. A leaf first used inside `no_grad()` retains
+its `requires_grad` flag; only operations inside that context are excluded from
+the backward graph.
+
+Optimizers follow `torch.optim`'s single-tensor update order. SGD supports
+learning rate, weight decay, maximize, parameter groups, momentum, dampening
+and Nesterov (the first step's buffer is the gradient itself, as in PyTorch).
+Adam and AdamW support learning rate, betas, eps, weight decay (coupled or
+decoupled), maximize and parameter groups; bias correction uses the incremented
+step. Optimizer state round-trips through the CPU: momentum buffers, Adam
+moments and the step count are read from `optimizer.state` when `step()` is
+captured, their next values are read back with the weights and written under
+the eager keys (`momentum_buffer`, `exp_avg`, `exp_avg_sq`, `step`), so compiled
+and eager steps can alternate. `amsgrad`, RMSprop, closures, higher-order
+gradients and retained graphs are rejected. Every trainable optimizer parameter
+must participate in the loss. Dense relu networks with MSE and plain SGD still
+record a protocol version 1 graph, which natively runs on the tensor kernels;
+anything newer records version 2, which natively runs on `zipp_gpu`'s
+pure-Python float32 reference (the same numbers, not fast).
 
 Weights and gradients stay unchanged while a supported step is recorded or pending.
-After successful readback, finite results are checked before committing weights
-and gradients. A backend error or changed captured tensor rejects the result and
+After successful readback, finite results are checked before committing weights,
+optimizer state and gradients. A backend error or changed captured tensor rejects the result and
 leaves the model unchanged by that submission. "Changed" means written in place
 (`fill_`, `copy_`, `zero_`, indexed assignment, an optimizer) or rebound (`.data =`,
 in-place arithmetic) after capture, even back to equal values: each tensor
 storage carries a version counter, and a result is judged against the storage
 and version it was recorded from rather than by comparing values. Changes to
-captured gradients, shape, dtype or `requires_grad` also invalidate a pending step. SGD parameter
-identities, group membership/order and all supported SGD options are snapshotted
-when `step()` is captured; changing them before completion rejects that step.
-SGD options must be numeric or boolean scalars; mutable option values are rejected.
+captured gradients, shape, dtype or `requires_grad` also invalidate a pending step,
+as does a change to captured class targets. Optimizer parameter identities,
+group membership/order, all supported options and each parameter's step count
+are snapshotted when `step()` is captured; changing them, or replacing a state
+buffer, before completion rejects that step. Options must be numeric or boolean
+scalars (`betas` a pair of them); mutable option values are rejected.
 Gradient cleanup uses the captured parameter set, so newly added parameters
 cannot have their gradients cleared by an older request. Each training result is single-use.
 Wait for completion before preparing the next step: overlapping captures generally
-become stale after the first update. These guarantees cover recorded tensor/SGD
+become stale after the first update. These guarantees cover recorded tensor/optimizer
 updates, not arbitrary Python side effects inside a user function.
 
 **This is capture per call, with uploads and readbacks per call.** There is no

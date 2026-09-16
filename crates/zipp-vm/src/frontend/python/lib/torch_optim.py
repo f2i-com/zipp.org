@@ -85,7 +85,7 @@ class Adam(Optimizer):
         from torch._gpu import active_capture
         capture = active_capture()
         if capture is not None:
-            raise NotImplementedError("Compiled GPU training currently supports SGD only")
+            return capture.adam(self, closure)
         loss = closure() if closure is not None else None
         for g, p in self._params():
             grad = p.grad
@@ -132,7 +132,7 @@ class RMSprop(Optimizer):
         from torch._gpu import active_capture
         capture = active_capture()
         if capture is not None:
-            raise NotImplementedError("Compiled GPU training currently supports SGD only")
+            raise NotImplementedError("Compiled GPU training supports SGD, Adam and AdamW; RMSprop is not captured")
         loss = closure() if closure is not None else None
         for g, p in self._params():
             grad = p.grad

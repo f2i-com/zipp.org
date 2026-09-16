@@ -27,7 +27,8 @@ local folder/file loading, samples, source editor, entry selection, arguments,
 canvas, console, autosave, run/stop, and WebGL2/WebGPU selection for Python graphs.
 Files are read into a browser virtual filesystem, not sent to a server to execute.
 The page runs a Python-enabled Zipp WASM engine. Eager `torch` runs on the CPU;
-experimental `torch.compile` runs GPU inference and dense-model SGD training, and
+experimental `torch.compile` runs GPU inference and dense training steps (SGD with
+momentum, Adam or AdamW; relu, gelu, sigmoid, tanh, softmax and cross-entropy), and
 browser GPU graphs use `zipp_gpu`. JavaScript guest GPU requests are not yet wired
 into the stock playground, as described in the main README.
 
