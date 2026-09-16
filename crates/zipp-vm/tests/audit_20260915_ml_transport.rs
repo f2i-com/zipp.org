@@ -650,6 +650,7 @@ for label, action in [
     ("int", lambda: Graph().tensor(torch.tensor([1, 2])._s)),
     ("shape", lambda: Graph().tensor(t._s, (3,))),
     ("rank", lambda: Graph().tensor(t._s, (1, 2, 2))),
+    ("rank5", lambda: Graph().tensor(t._s, (1, 1, 1, 2, 2))),
 ]:
     try:
         action()
@@ -676,7 +677,10 @@ print([isinstance(o[n]["data"], k.Storage) for n in "xyz"], o["x"]["data"] is o[
                 "inf Only finite float32 values are supported",
                 "int Tensor storage must be float32",
                 "shape Input length does not match shape",
-                "rank Use a scalar (), vector (N,), or matrix (M, N)",
+                // Protocol version 2 carries rank up to four, so a 3-D
+                // shape is a graph the host can run; rank five is not.
+                "rank accepted",
+                "rank5 Shapes have at most four dimensions",
                 "[True, True, True] False False [18.0, 18.0, 18.0, 18.0] [9.0, 9.0, 9.0, 9.0]",
             ]
         );
