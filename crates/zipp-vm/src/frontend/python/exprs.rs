@@ -46,6 +46,20 @@ pub(super) fn known(e: &ast::Expr) -> Known {
     }
 }
 
+/// Whether `e` is an int literal greater than zero (of any size).
+pub(super) fn positive_int_literal(e: &ast::Expr) -> bool {
+    match e {
+        ast::Expr::Constant(c) => match &c.value {
+            ast::Constant::Int(i) => {
+                let text = i.to_string();
+                !text.starts_with('-') && text != "0"
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// The value of a small int literal (optionally negated), for the
 /// immediate forms of `+` and `-`.
 pub(super) fn small_int_literal(e: &ast::Expr) -> Option<i32> {
@@ -519,7 +533,7 @@ impl<'a> Emitter<'a> {
             }
         }
         let b = self.expr(right, depth)?;
-        self.arith_known(op, a, ka, b, known(right), inplace)
+        self.arith_known(op, a, ka, b, known(right), positive_int_literal(right), inplace)
     }
 
     /// `a + k` / `a - k` for a small int literal `k`: one `AddInt` under an
@@ -597,7 +611,7 @@ impl<'a> Emitter<'a> {
     /// arithmetic, which is Python's, signed zeros and NaN included; str + str
     /// concatenates below the runtime's text limit. Everything else, mixed
     /// int/float operands included, goes through the runtime's dispatch.
-    pub fn arith_known(&mut self, op: &ast::Operator, a: Reg, ka: Known, b: Reg, kb: Known, inplace: bool) -> R<Reg> {
+    pub fn arith_known(&mut self, op: &ast::Operator, a: Reg, ka: Known, b: Reg, kb: Known, b_positive: bool, inplace: bool) -> R<Reg> {
         let dst = self.alloc()?;
         let mut slow_jumps = Vec::new();
         let mut end_jumps = Vec::new();
@@ -628,7 +642,7 @@ impl<'a> Emitter<'a> {
             slow_jumps.extend(to_slow);
             match (tier, op) {
                 ("bigint", ast::Operator::Mod | ast::Operator::FloorDiv) => {
-                    self.int_floor_op(op, dst, a, b, &mut slow_jumps, &mut end_jumps)?;
+                    self.int_floor_op(op, dst, a, b, b_positive, &mut slow_jumps, &mut end_jumps)?;
                     continue;
                 }
                 ("number", ast::Operator::Div) => {
@@ -693,21 +707,27 @@ impl<'a> Emitter<'a> {
 
     /// Int `//` or `%` on two BigInts: the VM's truncating result, corrected
     /// to floor semantics when the remainder is non-zero and the signs
-    /// differ. A zero divisor goes to the helper, which raises.
+    /// differ. A zero divisor goes to the helper, which raises. With
+    /// `b_positive` (a literal divisor above zero) the divisor is neither
+    /// zero nor negative, so the zero test goes and only the dividend's sign
+    /// decides the correction.
     fn int_floor_op(
         &mut self,
         op: &ast::Operator,
         dst: Reg,
         a: Reg,
         b: Reg,
+        b_positive: bool,
         slow_jumps: &mut Vec<usize>,
         end_jumps: &mut Vec<usize>,
     ) -> R<()> {
         let zero = self.alloc()?;
         self.emit(Instr::LoadBigInt { dst: zero, value: 0 })?;
-        let is_zero = self.alloc()?;
-        self.emit(Instr::Eq { dst: is_zero, a: b, b: zero })?;
-        slow_jumps.push(self.jump_if_true(is_zero)?);
+        if !b_positive {
+            let is_zero = self.alloc()?;
+            self.emit(Instr::Eq { dst: is_zero, a: b, b: zero })?;
+            slow_jumps.push(self.jump_if_true(is_zero)?);
+        }
         let r = self.alloc()?;
         self.emit(Instr::Mod { dst: r, a, b })?;
         if matches!(op, ast::Operator::Mod) {
@@ -720,11 +740,15 @@ impl<'a> Emitter<'a> {
         end_jumps.push(self.jump_if_false(nonzero)?);
         let sa = self.alloc()?;
         self.emit(Instr::Lt { dst: sa, a, b: zero })?;
-        let sb = self.alloc()?;
-        self.emit(Instr::Lt { dst: sb, a: b, b: zero })?;
-        let same = self.alloc()?;
-        self.emit(Instr::Eq { dst: same, a: sa, b: sb })?;
-        end_jumps.push(self.jump_if_true(same)?);
+        if b_positive {
+            end_jumps.push(self.jump_if_false(sa)?);
+        } else {
+            let sb = self.alloc()?;
+            self.emit(Instr::Lt { dst: sb, a: b, b: zero })?;
+            let same = self.alloc()?;
+            self.emit(Instr::Eq { dst: same, a: sa, b: sb })?;
+            end_jumps.push(self.jump_if_true(same)?);
+        }
         if matches!(op, ast::Operator::Mod) {
             self.emit(Instr::Add { dst, a: r, b })?;
         } else {

@@ -1290,6 +1290,7 @@ impl<'a> Emitter<'a> {
             if let Some(count) = simple {
                 e.arity_guard(count)?;
             }
+            e.hoist_ints(body)?;
             e.frame_guard(line, |e| {
                 e.suite(body, depth)?;
                 let none = e.none()?;

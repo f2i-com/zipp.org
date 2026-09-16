@@ -123,6 +123,9 @@ pub(super) struct Emitter<'a> {
     string_ids: HashMap<String, u32>,
     string_consts: HashMap<u32, u32>,
     float_consts: HashMap<u64, u32>,
+    /// Int literals loaded once ahead of the body ([`Emitter::hoist_ints`]),
+    /// by value: [`Emitter::integer`] answers with the register.
+    hoisted: HashMap<i128, Reg>,
 }
 
 impl<'a> Emitter<'a> {
@@ -176,6 +179,7 @@ impl<'a> Emitter<'a> {
             string_ids: HashMap::new(),
             string_consts: HashMap::new(),
             float_consts: HashMap::new(),
+            hoisted: HashMap::new(),
         };
         e.prologue()?;
         Ok(e)
@@ -478,6 +482,11 @@ impl<'a> Emitter<'a> {
         if text.len() > 4096 {
             return Err("Python: integer literal too large".into());
         }
+        if let Ok(value) = text.parse::<i128>() {
+            if let Some(&reg) = self.hoisted.get(&value) {
+                return Ok(reg);
+            }
+        }
         let dst = self.alloc()?;
         if let Ok(value) = text.parse::<i128>() {
             self.emit(Instr::LoadBigInt { dst, value })?;
@@ -489,6 +498,33 @@ impl<'a> Emitter<'a> {
             self.emit(Instr::LoadBigIntBig { dst, idx })?;
         }
         Ok(dst)
+    }
+    /// Load the int literals the body's loops use into registers of their
+    /// own, ahead of the body (a fast path: off under `ZIPP_PY_NOFAST`).
+    /// `LoadBigInt` allocates for every value outside the VM's interned
+    /// range on every execution, so a literal in a loop otherwise costs an
+    /// allocation per iteration; the interned ones are left where they are.
+    /// A BigInt is immutable and every use reads the register, so sharing it
+    /// changes nothing. Bounded, so a literal-heavy body keeps its register
+    /// budget.
+    pub fn hoist_ints(&mut self, stmts: &[ast::Stmt]) -> R<()> {
+        if !self.fast {
+            return Ok(());
+        }
+        const MAX_HOISTED: usize = 32;
+        let interned = crate::heap::INTERN_BIGINT_MIN..=crate::heap::INTERN_BIGINT_MAX;
+        for value in super::nesting::loop_int_literals(stmts) {
+            if interned.contains(&value) || self.hoisted.contains_key(&value) {
+                continue;
+            }
+            if self.hoisted.len() >= MAX_HOISTED {
+                break;
+            }
+            let dst = self.alloc()?;
+            self.emit(Instr::LoadBigInt { dst, value })?;
+            self.hoisted.insert(value, dst);
+        }
+        Ok(())
     }
     /// A runtime-internal count or index (a JS number, not a Python int).
     pub fn small_int(&mut self, val: i32) -> R<Reg> {
@@ -821,9 +857,40 @@ impl<'a> Emitter<'a> {
             SymKind::Global => {
                 let globals = self.globals()?;
                 let key = self.string(name)?;
-                self.helper("gload", &[globals, key])
+                if !self.fast {
+                    return self.helper("gload", &[globals, key]);
+                }
+                self.global_read(globals, key)
             }
         }
+    }
+    /// A global read with fast paths on: the module dictionary's `get`,
+    /// then the builtins', as the VM's own Map method calls (no runtime
+    /// frame), and the `gload` helper only when both miss (it raises the
+    /// NameError, and answers `__builtins__`). `get` returns `undefined`
+    /// for a missing key and never for a bound name, so the miss test is
+    /// exact; the lookups are the same two the helper starts with, in the
+    /// same order, so shadowing a builtin at module level is seen at once.
+    fn global_read(&mut self, globals: Reg, key: Reg) -> R<Reg> {
+        let dst = self.alloc()?;
+        let get = self.string_index("get");
+        let undefined = self.undefined()?;
+        let found = self.alloc()?;
+        let (arg_base, argc) = self.arguments(&[key])?;
+        self.emit(Instr::CallMethod { dst, obj: globals, name: get, arg_base, argc })?;
+        self.emit(Instr::Ne { dst: found, a: dst, b: undefined })?;
+        let hit = self.jump_if_true(found)?;
+        let builtins = self.prop(self.r_rt, "BUILTINS")?;
+        let (arg_base, argc) = self.arguments(&[key])?;
+        self.emit(Instr::CallMethod { dst, obj: builtins, name: get, arg_base, argc })?;
+        self.emit(Instr::Ne { dst: found, a: dst, b: undefined })?;
+        let hit2 = self.jump_if_true(found)?;
+        let r = self.helper("gload", &[globals, key])?;
+        self.emit(Instr::Move { dst, src: r })?;
+        let here = self.here();
+        self.patch(hit, here)?;
+        self.patch(hit2, here)?;
+        Ok(dst)
     }
     pub fn cell_reg(&self, name: &str) -> R<Reg> {
         self.cells

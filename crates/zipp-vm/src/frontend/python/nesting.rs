@@ -73,6 +73,59 @@ pub(super) fn check(stmts: Vec<ast::Stmt>, file: &str, source: &str) -> R<Suite>
     Ok(suite)
 }
 
+/// The int literals (negated ones included) inside the loop bodies of
+/// `stmts`, without entering nested function, class or lambda bodies, which
+/// are their own code objects: the emitter loads each one once ahead of the
+/// body instead of on every iteration. Order is first appearance.
+pub(super) fn loop_int_literals(stmts: &[ast::Stmt]) -> Vec<i128> {
+    let mut loops: Vec<&[ast::Stmt]> = Vec::new();
+    let mut stack: Vec<(Node<'_>, usize, usize)> = stmts.iter().map(|s| (Node::Stmt(s), 0, 0)).collect();
+    while let Some((node, depth, raw)) = stack.pop() {
+        match node {
+            Node::Stmt(ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) | ast::Stmt::ClassDef(_))
+            | Node::Expr(ast::Expr::Lambda(_)) => continue,
+            Node::Stmt(ast::Stmt::For(f)) => loops.push(&f.body),
+            Node::Stmt(ast::Stmt::While(w)) => loops.push(&w.body),
+            _ => {}
+        }
+        children(node, depth, raw, &mut stack);
+    }
+    let mut out = Vec::new();
+    let mut stack: Vec<(Node<'_>, usize, usize)> = Vec::new();
+    for body in loops {
+        stack.extend(body.iter().map(|s| (Node::Stmt(s), 0, 0)));
+    }
+    let literal = |c: &ast::ExprConstant| match &c.value {
+        ast::Constant::Int(i) => i.to_string().parse::<i128>().ok(),
+        _ => None,
+    };
+    while let Some((node, depth, raw)) = stack.pop() {
+        match node {
+            Node::Stmt(ast::Stmt::FunctionDef(_) | ast::Stmt::AsyncFunctionDef(_) | ast::Stmt::ClassDef(_))
+            | Node::Expr(ast::Expr::Lambda(_)) => continue,
+            Node::Expr(ast::Expr::Constant(c)) => {
+                if let Some(v) = literal(c) {
+                    if !out.contains(&v) {
+                        out.push(v);
+                    }
+                }
+            }
+            Node::Expr(ast::Expr::UnaryOp(u)) if matches!(u.op, ast::UnaryOp::USub) => {
+                if let ast::Expr::Constant(c) = u.operand.as_ref() {
+                    if let Some(v) = literal(c).and_then(i128::checked_neg) {
+                        if !out.contains(&v) {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        children(node, depth, raw, &mut stack);
+    }
+    out
+}
+
 /// Push `node`'s children with their effective and raw depths.
 fn children<'a>(node: Node<'a>, depth: usize, raw: usize, stack: &mut Vec<(Node<'a>, usize, usize)>) {
     let next = depth + 1;

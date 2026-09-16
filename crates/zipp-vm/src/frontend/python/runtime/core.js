@@ -313,12 +313,17 @@ var __zipp_py = (function () {
     let typeEpoch = 1;
     const MISSING_ATTR = { missing: true };
     const CTOR_PLAN = { ctorPlan: true };  // the `lcache` key of `ctorPlan`
+    // The `lcache` key of the instance-attribute store plan: true when a
+    // plain `obj.dict.set` is exactly what `setattr` ends up doing for this
+    // class (no `__setattr__` override, an instance dict), false otherwise.
+    const SET_PLAN = { setPlan: true };
     rt.bumpEpoch = function () { typeEpoch++; };
     function forgetName(t, name) {
         const cache = t.lcache;
         if (cache === undefined) return;
         cache.delete(name);
         if (name === "__init__" || name === "__new__") cache.delete(CTOR_PLAN);
+        else if (name === "__setattr__") cache.delete(SET_PLAN);
     }
     function typeChanged(t, name) {
         forgetName(t, name);
@@ -335,6 +340,33 @@ var __zipp_py = (function () {
         return found;
     }
     rt.lookupType = lookupType;
+    // `lookupType`'s answer through a valid cache without the call: the
+    // attribute, `undefined` for a cached miss, or MISSING_ATTR when the
+    // cache has no entry (or is stale) and `lookupType` must run. The hot
+    // attribute paths below start with this, and one call per lookup is
+    // what an interpreted frame costs here.
+    function cachedType(t, name) {
+        const cache = t.lcache;
+        if (cache === undefined || t.lepoch !== typeEpoch) return MISSING_ATTR;
+        const hit = cache.get(name);
+        if (hit === undefined) return MISSING_ATTR;
+        return hit === MISSING_ATTR ? undefined : hit;
+    }
+    // Whether `setattr` on an instance of `t` is exactly `obj.dict.set`
+    // once the name is known to be no data descriptor: no `__setattr__`
+    // other than object's, and instances carry a dict. Cached in `lcache`
+    // (`forgetName` drops it with `__setattr__`).
+    function setPlan(t) {
+        let cache = t.lcache;
+        if (cache === undefined || t.lepoch !== typeEpoch) { cache = t.lcache = new Map(); t.lepoch = typeEpoch; }
+        let plain = cache.get(SET_PLAN);
+        if (plain === undefined) {
+            const sa = lookupType(t, "__setattr__");
+            plain = (sa === undefined || sa === ObjectType.dict.get("__setattr__")) && t.noDict !== true;
+            cache.set(SET_PLAN, plain);
+        }
+        return plain;
+    }
     function isFunction(v) { return v !== null && typeof v === "object" && (v.cls === T.function || v.cls === T.builtin_function_or_method); }
     rt.isFunction = isFunction;
     function bound(func, self) { return { cls: T.method, func: func, self: self }; }
@@ -355,8 +387,12 @@ var __zipp_py = (function () {
         if (c === T.staticmethod) return attr.func;
         if (c === T.property) {
             if (obj === null) return attr;
-            if (attr.fget === null) fail(E.AttributeError, "property has no getter");
-            return rt.call(attr.fget, [obj], null);
+            const fget = attr.fget;
+            if (fget === null) fail(E.AttributeError, "property has no getter");
+            // The positional entry the emitter's own calls use; `rt.call`
+            // binds the same single argument for anything without one.
+            if (fget !== undefined && typeof fget === "object" && fget.fast !== undefined) return fget.fast([obj]);
+            return rt.call(fget, [obj], null);
         }
         // A user-defined descriptor: __get__ on its type (a class-valued
         // attribute is not itself looked up on `type`).
@@ -392,21 +428,28 @@ var __zipp_py = (function () {
     // exception. An AttributeError raised by a descriptor or __getattr__
     // still propagates.
     function getattr(obj, name, missing) {
-        let t;
+        let t, dict;
         if (obj !== null && typeof obj === "object") {
             if (obj.isType) return typeAttr(obj, name, missing);
             t = obj.cls || ObjectType;
             if (t === T.module) return rt.moduleAttr(obj, name, missing);
             if (t === T.super) return rt.superAttr(obj, name);
             if (t === TypeType) return typeAttr(obj, name, missing);
+            dict = obj.dict;
         } else {
             t = typeOf(obj);
         }
         if (name === "__class__") return t;
-        const attr = lookupType(t, name);
-        if (attr !== undefined && isDataDescriptor(attr)) return descrGet(attr, obj, t);
-        if (obj !== null && typeof obj === "object" && obj.dict !== undefined) {
-            const v = obj.dict.get(name);
+        let attr = cachedType(t, name);
+        if (attr === MISSING_ATTR) attr = lookupType(t, name);
+        // `isDataDescriptor`, inline: a property, or a class-valued
+        // attribute other than a function whose type defines `__set__`.
+        if (attr !== undefined && attr !== null && typeof attr === "object") {
+            const ac = attr.cls;
+            if (ac === T.property || (ac !== undefined && ac !== T.function && lookupType(ac, "__set__") !== undefined)) return descrGet(attr, obj, t);
+        }
+        if (dict !== undefined) {
+            const v = dict.get(name);
             if (v !== undefined) return v;
             if (name === "__dict__" && t.noDict !== true) return rt.instanceDict(obj);
         }
@@ -419,11 +462,29 @@ var __zipp_py = (function () {
         fail(E.AttributeError, "'" + t.name + "' object has no attribute '" + name + "'");
     }
     function setattr(obj, name, value) {
-        if (obj !== null && typeof obj === "object" && obj.isType) {
-            if (name === "__name__") { obj.name = str(value); return null; }
-            // An enum class's members are fixed.
-            if (obj.members !== undefined && obj.members.includes(obj.dict.get(name))) fail(E.AttributeError, "cannot reassign member '" + name + "'");
-            obj.dict.set(name, value); typeChanged(obj, name); return null;
+        if (obj !== null && typeof obj === "object") {
+            if (obj.isType) {
+                if (name === "__name__") { obj.name = str(value); return null; }
+                // An enum class's members are fixed.
+                if (obj.members !== undefined && obj.members.includes(obj.dict.get(name))) fail(E.AttributeError, "cannot reassign member '" + name + "'");
+                obj.dict.set(name, value); typeChanged(obj, name); return null;
+            }
+            // The common store: an instance whose class has no attribute of
+            // that name, or one that is no data descriptor (a primitive, None
+            // or a plain function), and no `__setattr__` of its own. The
+            // general path below reaches the same `dict.set` after the same
+            // two lookups; MISSING_ATTR (nothing cached yet) takes it.
+            const dict = obj.dict;
+            if (dict !== undefined && dict !== null) {
+                const t = obj.cls || ObjectType;
+                if (t !== T.module) {
+                    const attr = cachedType(t, name);
+                    if ((attr === undefined || attr === null || typeof attr !== "object" || attr.cls === T.function) && setPlan(t)) {
+                        dict.set(name, value);
+                        return null;
+                    }
+                }
+            }
         }
         const t = typeOf(obj);
         if (obj === null || typeof obj !== "object" || obj.dict === undefined || obj.dict === null) {
@@ -720,7 +781,8 @@ var __zipp_py = (function () {
         } else {
             t = typeOf(obj);
         }
-        const attr = lookupType(t, name);
+        let attr = cachedType(t, name);
+        if (attr === MISSING_ATTR) attr = lookupType(t, name);
         if (attr !== undefined && attr !== null && typeof attr === "object") {
             const ac = attr.cls;
             if (ac === T.function || ac === T.builtin_function_or_method) {
@@ -732,6 +794,12 @@ var __zipp_py = (function () {
                         return attr.code(bindArgs(attr, withSelf, kwargs));
                     }
                     if (attr.unboxSelf === true && typeof obj === "object") withSelf[0] = unbox(obj);
+                    // `builtinArgs` with no keywords and a count the arity
+                    // admits returns the array itself.
+                    if (kwargs === null) {
+                        const arity = attr.arity;
+                        if (arity < 0 || (withSelf.length <= arity && withSelf.length >= attr.minArity)) return attr.code(withSelf);
+                    }
                     return attr.code(builtinArgs(attr, withSelf, kwargs));
                 }
             }
