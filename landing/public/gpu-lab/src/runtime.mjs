@@ -1,4 +1,5 @@
 import {validateProgram, check, ComputeError, DEFAULT_LIMITS} from './graph.mjs';
+import {Session} from './session.mjs';
 import {CPUBackend} from './backends/cpu.mjs';
 import {WasmBackend} from './backends/wasm.mjs';
 import {WebGPUBackend} from './backends/webgpu.mjs';
@@ -23,7 +24,7 @@ export async function createRuntime({backend='auto', limits={}, wasmBytes, wasmU
 }
 
 export class ComputeRuntime {
-  constructor(backend,limits={},attempts=[]){this.impl=backend;this.limits=limits;this.attempts=attempts;this.busy=false;this.disposed=false;}
+  constructor(backend,limits={},attempts=[]){this.impl=backend;this.limits=limits;this.attempts=attempts;this.busy=false;this.disposed=false;this.sessions=new Set();}
   get backend(){return this.impl.name;}
   info(){return {backend:this.backend,description:this.impl.description,adapter:this.impl.info??null,fallbackAttempts:this.attempts,limits:this.effectiveLimits()};}
   /**
@@ -80,5 +81,34 @@ export class ComputeRuntime {
     value.stats.totalWallMs=clock()-start;
     return value;
   }
-  dispose(){check(!this.busy,'BUSY','Await execution before disposing');if(!this.disposed){this.disposed=true;this.impl.dispose();}}
+  /** Device bytes every live session keeps between runs. */
+  residentBytes(){let bytes=0;for(const s of this.sessions)bytes+=s.residentBytes;return bytes;}
+  /**
+   * Validates `program` once and returns a Session whose inputs with data are
+   * uploaded now. `resident` names outputs that stay on the device (fetched by
+   * `session.download`); inputs marked `carry` are resident by construction.
+   * Sessions are bounded in number (`maxSessions`) and their resident bytes,
+   * with the plan's own allocation, count against `maxLogicalBytes`.
+   */
+  async prepare(program,{resident=[],typedOutputs=true}={}){
+    check(!this.disposed,'DISPOSED','Runtime has been disposed');
+    check(!this.busy,'BUSY','Runtime supports one graph at a time; await the previous execution');
+    const plan=validateProgram(program,{...(this.impl.limitHints?.()??{}),...this.limits},{session:true}),limits=plan.limits;
+    check(this.sessions.size<limits.maxSessions,'LIMIT',`At most ${limits.maxSessions} sessions per runtime; dispose one first`);
+    check(Array.isArray(resident)&&resident.every(n=>typeof n==='string'),'PROTOCOL','resident must list output names');
+    const names=new Set(plan.outputs.map(o=>o.name));
+    for(const name of resident)check(names.has(name),'REFERENCE',`resident names no output: ${name}`);
+    const session=new Session(this,plan,{resident:new Set(resident),typedOutputs:typedOutputs!==false});
+    check(this.residentBytes()+session.residentBytes+plan.logicalBytes<=limits.maxLogicalBytes,'LIMIT','Resident tensors exceed the allocation budget');
+    this.busy=true;
+    try{await session.init();}finally{this.busy=false;}
+    this.sessions.add(session);
+    return session;
+  }
+  dispose(){
+    check(!this.busy,'BUSY','Await execution before disposing');
+    if(this.disposed)return;
+    for(const s of [...this.sessions])s.dispose();
+    this.disposed=true;this.impl.dispose();
+  }
 }
