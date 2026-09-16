@@ -1603,8 +1603,23 @@ impl<'p> Vm<'p> {
             }
             return Ok(match key {
                 "byteLength" => Value::num(len as f64),
-                // An immutable buffer is fixed-size and never resizable.
-                "maxByteLength" => Value::num(max.unwrap_or(len) as f64),
+                // Step 4 of the getter: a DETACHED buffer reports +0, not the
+                // maximum it was created with. `len` is already 0 for a
+                // detached buffer, so only the resizable arm needed this.
+                // (An immutable buffer is fixed-size and never resizable.)
+                "maxByteLength" => Value::num(match max {
+                    Some(_)
+                        if !shared
+                            && matches!(
+                                self.heap.get(ai),
+                                HeapObj::ArrayBuffer { detached: true, .. }
+                            ) =>
+                    {
+                        0.0
+                    }
+                    Some(m) => m as f64,
+                    None => len as f64,
+                }),
                 "immutable" if !shared => Value::bool(immut),
                 "growable" if shared => Value::bool(max.is_some()),
                 "resizable" if !shared => Value::bool(max.is_some() && !immut),

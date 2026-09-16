@@ -153,7 +153,7 @@ impl<'p> Vm<'p> {
     /// deleted a later one or made it non-enumerable, and such a key is
     /// skipped. Only an ordinary object's ObjMap can change under the walk; a
     /// string source's index keys are fixed.
-    fn rest_key_still_enumerable(&self, src: Value, key: &str) -> bool {
+    pub(crate) fn rest_key_still_enumerable(&self, src: Value, key: &str) -> bool {
         match self.heap.get(src.heap_index()) {
             HeapObj::Object(map) => map.pos(key).is_some_and(|i| map.attr_at(i).enumerable),
             _ => true,
@@ -1797,23 +1797,25 @@ impl<'p> Vm<'p> {
                             if vv.is_heap() {
                                 self.args_sync_dense(vv.heap_index());
                             }
-                            // An array whose Array.prototype[Symbol.iterator] or
-                            // %ArrayIteratorPrototype%.next was replaced spreads via
-                            // the iterator protocol (the inline fast path below
-                            // assumes the default iterator), as for-of does.
-                            if vv.is_heap()
-                                && matches!(self.heap.get(vv.heap_index()), HeapObj::Array(_))
-                                && !self.builtin_iter_pristine_fast(vv)
-                            {
+                            // Everything that is NOT one of the four inline fast
+                            // paths below (Array / Set / Str|Cons / Map) is drained
+                            // through the iterator protocol, which raises the
+                            // TypeError when the value has genuinely no
+                            // @@iterator. Naming the kinds explicitly instead left
+                            // `[...new Proxy([1,2],{})]`, `[...new String("ab")]`
+                            // and any object with a user-installed @@iterator
+                            // reporting "not iterable".
+                            // The inline paths stand in for the iterator only
+                            // while it is unobservable: the @@iterator read here
+                            // (GetIterator's one Get) is the kind's intrinsic and
+                            // its %XIteratorPrototype%.next is pristine. A
+                            // replaced @@iterator (own, subclass, patched
+                            // prototype) or a patched `next` spreads through the
+                            // protocol with the method already read.
+                            if vv.is_heap() && !self.builtin_iter_fast(vv, false) {
                                 let m = self.get_prop(vv, "@@iterator")?;
-                                if m.bits() != self.default_array_iter.bits()
-                                    || !self.array_iter_next_intact()
-                                {
-                                    // Call the method already read: a second
-                                    // @@iterator Get would be observable (and a
-                                    // deleted / non-callable one is GetIterator's
-                                    // TypeError, not a positional walk).
-                                    let elems = self.iterate_to_vec_via(vv, m)?;
+                                if !self.builtin_iter_pristine(vv, m, false) {
+                                    let elems = self.iterate_with_method(vv, m)?;
                                     if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
                                         dst_items.extend(elems);
                                     }
@@ -1821,45 +1823,26 @@ impl<'p> Vm<'p> {
                                     continue;
                                 }
                             }
-                            // Everything that is NOT one of the four inline fast
-                            // paths below (Array / Set / Str|Cons / Map) is drained
-                            // through the iterator protocol; iterate_to_vec →
-                            // get_iterator raises the TypeError when the value has
-                            // genuinely no @@iterator. Naming the kinds explicitly
-                            // instead left `[...new Proxy([1,2],{})]`,
-                            // `[...new String("ab")]` and any object with a
-                            // user-installed @@iterator reporting "not iterable".
-                            // A Set / string / Map takes its inline path only under
-                            // its pristine protocol: a subclass, instance or
-                            // prototype @@iterator (or iterator `next`) override
-                            // is honoured, as for-of honours it.
-                            // `Some(Some(m))`: an overridden @@iterator `m`,
-                            // already read (called without a second Get);
-                            // `Some(None)`: the full protocol.
-                            let drain = if vv.is_heap() {
-                                match self.heap.get(vv.heap_index()) {
-                                    HeapObj::Array(_) => None,
-                                    HeapObj::Set(_)
-                                    | HeapObj::Str(_)
-                                    | HeapObj::Cons { .. }
-                                    | HeapObj::Map { .. } => {
-                                        if self.builtin_iter_pristine_fast(vv) {
-                                            None
-                                        } else {
-                                            let m = self.get_prop(vv, "@@iterator")?;
-                                            (!self.builtin_iter_pristine(vv, m)).then_some(Some(m))
-                                        }
-                                    }
-                                    _ => Some(None),
+                            // A string spreads by CODE POINT, exactly: a lone
+                            // surrogate is its own one-unit string (the lossy
+                            // `char` view made it U+FFFD).
+                            if let Some(elems) = self.string_iter_values(vv, usize::MAX) {
+                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
+                                    dst_items.extend(elems);
                                 }
-                            } else {
-                                None
-                            };
-                            if let Some(m) = drain {
-                                let elems = match m {
-                                    Some(m) => self.iterate_to_vec_via(vv, m)?,
-                                    None => self.iterate_to_vec(vv)?,
-                                };
+                                ip += 1;
+                                continue;
+                            }
+                            // A TypedArray has no inline arm below: its element
+                            // count is the view's LIVE length (a length-tracking
+                            // view over a grown buffer yields the new elements)
+                            // and a detached or out-of-bounds view is the
+                            // iterator's TypeError, both of which the positional
+                            // walk behind `iterate_to_vec` already gets right.
+                            if vv.is_heap()
+                                && matches!(self.heap.get(vv.heap_index()), HeapObj::TypedArray { .. })
+                            {
+                                let elems = self.positional_iteration_elements(vv)?;
                                 if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
                                     dst_items.extend(elems);
                                 }
@@ -1867,14 +1850,8 @@ impl<'p> Vm<'p> {
                                 continue;
                             }
                             // Materialize the spread source's elements (array/set â†’
-                            // elements; string â†’ code points; map â†’ [k,v] entries)
-                            // WITHOUT holding a heap borrow across the fresh
-                            // allocations. A rope is flattened first so its code
-                            // points can be read off the exact WTF-8 bytes.
-                            if vv.is_heap() {
-                                self.heap.flatten(vv.heap_index());
-                            }
-                            let mut chars: Option<Vec<u32>> = None;
+                            // elements; map â†’ [k,v] entries) WITHOUT holding a heap
+                            // borrow across the fresh allocations.
                             let mut map_pairs: Option<Vec<(Value, Value)>> = None;
                             let mut array_src: Option<u32> = None;
                             if vv.is_heap() {
@@ -1894,13 +1871,6 @@ impl<'p> Vm<'p> {
                                         if let HeapObj::Array(d) = self.heap.get_mut(aidx) {
                                             d.extend(elems);
                                         }
-                                    }
-                                    // Code points as for-of steps them: a lone
-                                    // surrogate stays a 1-unit surrogate string
-                                    // (the lossy UTF-8 view made it U+FFFD).
-                                    HeapObj::Str(s) => chars = Some(s.code_points().collect()),
-                                    HeapObj::Cons { .. } => {
-                                        unreachable!("spread source flattened above")
                                     }
                                     HeapObj::Map { keys, vals } => {
                                         // Skip tombstoned (deleted) entries.
@@ -1929,13 +1899,6 @@ impl<'p> Vm<'p> {
                                     dst_items.extend(elems);
                                 }
                             }
-                            if let Some(chars) = chars {
-                                let elems: Vec<Value> =
-                                    chars.into_iter().map(|cp| self.str_from_cp(cp)).collect();
-                                if let HeapObj::Array(dst_items) = self.heap.get_mut(aidx) {
-                                    dst_items.extend(elems);
-                                }
-                            }
                             if let Some(pairs) = map_pairs {
                                 let elems: Vec<Value> = pairs
                                     .into_iter()
@@ -1954,20 +1917,10 @@ impl<'p> Vm<'p> {
                     }
                     Instr::ArrayRest { dst, src, start } => {
                         let sv = self.get(base, src);
-                        // `src` is IterToArray's result: the destructured value
-                        // itself when positional reads match its iterator (an
-                        // array only under the pristine protocol), or a fresh
-                        // array of the values the protocol already produced.
-                        // Either way an ARRAY is sliced positionally: iterating a
-                        // drained array again ran a patched @@iterator / next a
-                        // second time over values it had already produced.
-                        let mut elems = if sv.is_heap()
-                            && matches!(self.heap.get(sv.heap_index()), HeapObj::Array(_))
-                        {
-                            self.spread_array_elements(sv.heap_index())?
-                        } else {
-                            self.iterate_to_vec(sv)?
-                        };
+                        // `src` is IterToArray's normalized value (the only
+                        // producer of this op's operand), whose GetIterator
+                        // already ran: walk it without a second one.
+                        let mut elems = self.destructure_rest(sv)?;
                         let start = (start as usize).min(elems.len());
                         let rest = elems.split_off(start);
                         let arr = Value::heap(self.heap.alloc(HeapObj::Array(rest)));
@@ -2035,14 +1988,7 @@ impl<'p> Vm<'p> {
                         } else {
                             Vec::new()
                         };
-                        let mut m = ObjMap::new();
-                        for k in keys {
-                            if !self.rest_key_still_enumerable(s, &k) {
-                                continue;
-                            }
-                            let v = self.get_prop(s, &k)?;
-                            m.set(&k, v);
-                        }
+                        let m = self.object_rest_plain(s, keys)?;
                         let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                         self.set(base, dst, v);
                         ip += 1;
@@ -2095,14 +2041,7 @@ impl<'p> Vm<'p> {
                         } else {
                             Vec::new()
                         };
-                        let mut m = ObjMap::new();
-                        for k in keys {
-                            if !self.rest_key_still_enumerable(s, &k) {
-                                continue;
-                            }
-                            let v = self.get_prop(s, &k)?;
-                            m.set(&k, v);
-                        }
+                        let m = self.object_rest_plain(s, keys)?;
                         let v = Value::heap(self.heap.alloc(HeapObj::Object(Box::new(m))));
                         self.set(base, dst, v);
                         ip += 1;
@@ -4191,8 +4130,8 @@ impl<'p> Vm<'p> {
                                 }
                                 if let Some(props) = args.get(1).copied() {
                                     if props != Value::UNDEFINED {
-                                        // `o` is reachable only from this local while
-                                        // the descriptor getters run guest code.
+                                        // `o` is a Rust local across the descriptor
+                                        // getters (as in the OBJ_CREATE native).
                                         self.with_host_roots(&[o], |vm| {
                                             vm.object_define_properties(o, props)
                                         })?;
@@ -5312,22 +5251,11 @@ impl<'p> Vm<'p> {
                         // InstallErrorCause (ES2022): an options object with a `cause`
                         // gives the error a non-enumerable own `cause` property.
                         // HasProperty walks the proto chain AND fires a Proxy
-                        // `has` trap (observable; its throw propagates).
+                        // `has` trap (observable; its throw propagates). The
+                        // error is rooted across that guest code.
                         if let Some(or) = opts {
                             let options = self.get(base, or);
-                            let kc = self.alloc_str("cause".to_string());
-                            // The error lives only in `v` until `dst` is written,
-                            // and the `has` trap / `cause` getter run guest code
-                            // that can collect: root it (and the key) across them.
-                            self.with_host_roots(&[v, kc], |vm| -> Result<(), Thrown> {
-                                if vm.is_object_value(options)
-                                    && vm.has_property_dyn(options, kc)?
-                                {
-                                    let cause = vm.get_prop(options, "cause")?;
-                                    vm.install_error_cause(v, cause);
-                                }
-                                Ok(())
-                            })?;
+                            self.install_error_cause(v, options)?;
                         }
                         // AggregateError installs `errors` LAST (after message + cause):
                         // a non-enumerable own array of IterableToList(firstArg). It runs

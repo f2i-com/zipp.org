@@ -1308,6 +1308,18 @@ impl<'p> Vm<'p> {
         result
     }
 
+    /// Root one more temporary in the innermost [`Vm::with_host_roots`]
+    /// scope. Native built-ins that collect guest-produced Values (getter and
+    /// trap results) into a Rust `Vec`/`ObjMap` while later getters or traps
+    /// run push each Value here as it is read; the enclosing scope releases
+    /// them on every exit. Only call it inside such a scope.
+    #[inline]
+    pub(crate) fn push_host_root(&mut self, value: Value) {
+        if value.is_heap() {
+            self.host_result_roots.push(value);
+        }
+    }
+
     /// Host-created arguments are Rust locals until the target's frame is
     /// pushed. An exotic callee can run an allocating getter before then, so
     /// root both the callee and its arguments across the entire invocation.

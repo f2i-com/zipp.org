@@ -1508,6 +1508,17 @@ impl<'a> FnCompiler<'a> {
                         )) => (head, Some(&**inner)),
                         _ => (&elems[..], None),
                     };
+                // An element with a default or a nested pattern runs guest code
+                // BETWEEN iterator steps (IteratorBindingInitialization steps once
+                // per element), so draining up front is observable on a generator
+                // or a custom iterator: it ran ahead of the default, and a
+                // throwing default found later elements already pulled.
+                if fixed
+                    .iter()
+                    .any(|el| matches!(el, Some(e) if !matches!(e.pat, P::Ident(_))))
+                {
+                    return self.extract_array_pattern_stepwise(fixed, rest, src);
+                }
                 // JS array destructuring uses the iterator protocol; positional
                 // GetIndex matches it for arrays/strings/Map/Set, so we only need
                 // to drain a generator / custom iterable into an array first.
@@ -1566,6 +1577,203 @@ impl<'a> FnCompiler<'a> {
             // element count that precedes it.
             P::Rest(inner) => self.extract_pattern(inner, src),
         }
+    }
+
+    /// A binding array pattern whose elements carry defaults or nested
+    /// patterns, driven one IteratorStep per element exactly as
+    /// `assign_array_target` drives an assignment pattern: each element's
+    /// default / nested pattern runs right after its own step, an abrupt
+    /// completion closes a non-exhausted iterator QUIETLY (the original throw
+    /// wins, and a `yield`-suspended pattern closes on `.return()`), and a
+    /// normal completion closes it STRICTLY. A built-in iterable whose
+    /// iteration is unobservable is still walked positionally by
+    /// GetIterator / IterNext. Patterns of plain identifiers and holes keep
+    /// the `IterToArray` path: nothing runs between their steps.
+    fn extract_array_pattern_stepwise(
+        &mut self,
+        fixed: &[Option<ast::PatternElem>],
+        rest: Option<&ast::Pattern>,
+        src: Reg,
+    ) -> R<()> {
+        let save_top = self.next_reg;
+        let iter_reg = self.alloc_reg();
+        self.emit(Instr::GetIterator {
+            dst: iter_reg,
+            src,
+        });
+        // The iterator record's [[NextMethod]], read once before any element.
+        let next_reg = self.alloc_reg();
+        self.emit(Instr::IterPrime {
+            dst: next_reg,
+            iter: iter_reg,
+        });
+        let idx_reg = self.alloc_reg();
+        self.emit(Instr::LoadInt {
+            dst: idx_reg,
+            val: 0,
+        });
+        let done = self.alloc_reg();
+        self.emit(Instr::LoadBool {
+            dst: done,
+            val: false,
+        });
+        let kind_reg = self.alloc_reg();
+        let val_reg = self.alloc_reg();
+        let push_at = self.here();
+        self.emit(Instr::PushFinally {
+            target: 0,
+            kind_reg,
+            val_reg,
+        });
+        self.handler_depth += 1;
+        for el in fixed {
+            let save = self.next_reg;
+            let val = self.alloc_reg();
+            let dflag = self.alloc_reg();
+            // Step (skipped once exhausted; exhausted elements read undefined).
+            // `done` is set BEFORE the step so an abrupt completion from the
+            // iterator itself skips IteratorClose; a value clears it.
+            let jdone = self.here();
+            self.emit(Instr::JumpIfTrue {
+                cond: done,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: true,
+            });
+            self.emit(Instr::IterNext {
+                value_dst: val,
+                done_dst: dflag,
+                iter: iter_reg,
+                idx: idx_reg,
+                next: next_reg,
+            });
+            let jexh = self.here();
+            self.emit(Instr::JumpIfTrue {
+                cond: dflag,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: false,
+            });
+            let jgot = self.here();
+            self.emit(Instr::Jump { target: 0 });
+            let at_undef = self.here();
+            self.patch_jump(jdone, at_undef);
+            self.patch_jump(jexh, at_undef);
+            self.emit(Instr::LoadUndefined { dst: val });
+            let got = self.here();
+            self.patch_jump(jgot, got);
+            // A hole (`[, x]`) steps and binds nothing.
+            if let Some(p) = el {
+                self.extract_pattern(&p.pat, val)?;
+            }
+            self.set_next_reg(save);
+        }
+        if let Some(rest) = rest {
+            let save = self.next_reg;
+            let out = self.alloc_reg();
+            self.emit(Instr::ArrayCtor {
+                dst: out,
+                callee: None,
+                arg_base: 0,
+                argc: 0,
+                is_construct: false,
+            });
+            let v = self.alloc_reg();
+            let dflag = self.alloc_reg();
+            let loop_top = self.here();
+            let jrest_done = self.here();
+            self.emit(Instr::JumpIfTrue {
+                cond: done,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: true,
+            });
+            self.emit(Instr::IterNext {
+                value_dst: v,
+                done_dst: dflag,
+                iter: iter_reg,
+                idx: idx_reg,
+                next: next_reg,
+            });
+            let jout = self.here();
+            self.emit(Instr::JumpIfTrue {
+                cond: dflag,
+                target: 0,
+            });
+            self.emit(Instr::LoadBool {
+                dst: done,
+                val: false,
+            });
+            self.emit(Instr::ArrayAppend {
+                arr: out,
+                val: v,
+                spread: false,
+            });
+            self.emit(Instr::Jump { target: loop_top });
+            let rest_done = self.here();
+            self.patch_jump(jrest_done, rest_done);
+            self.patch_jump(jout, rest_done);
+            self.extract_pattern(rest, out)?;
+            self.set_next_reg(save);
+        }
+        self.emit(Instr::PopFinally);
+        self.handler_depth -= 1;
+        // Normal completion: close iff not exhausted (strict result checks).
+        let jskip = self.here();
+        self.emit(Instr::JumpIfTrue {
+            cond: done,
+            target: 0,
+        });
+        self.emit(Instr::IterClose { iter: iter_reg });
+        let jend = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        // Abrupt exits: an exhausted iterator or one whose own step threw is
+        // not closed; a THROW closes QUIETLY, a RETURN (a `.return()` injected
+        // at a `yield` inside a default) closes STRICTLY, then EndFinally
+        // resumes the pending completion.
+        let fin_start = self.here();
+        if let Instr::PushFinally { target, .. } = &mut self.code[push_at as usize] {
+            *target = fin_start;
+        }
+        let jresume = self.here();
+        self.emit(Instr::JumpIfTrue {
+            cond: done,
+            target: 0,
+        });
+        let two = self.alloc_reg();
+        self.emit(Instr::LoadInt { dst: two, val: 2 });
+        let isthrow = self.alloc_reg();
+        self.emit(Instr::Eq {
+            dst: isthrow,
+            a: kind_reg,
+            b: two,
+        });
+        let jnotthrow = self.here();
+        self.emit(Instr::JumpIfFalse {
+            cond: isthrow,
+            target: 0,
+        });
+        self.emit(Instr::IterCloseQuiet { iter: iter_reg });
+        let jresume2 = self.here();
+        self.emit(Instr::Jump { target: 0 });
+        let at_ret = self.here();
+        self.patch_jump(jnotthrow, at_ret);
+        self.emit(Instr::IterClose { iter: iter_reg });
+        let resume = self.here();
+        self.patch_jump(jresume, resume);
+        self.patch_jump(jresume2, resume);
+        self.emit(Instr::EndFinally { kind_reg, val_reg });
+        let end = self.here();
+        self.patch_jump(jskip, end);
+        self.patch_jump(jend, end);
+        self.set_next_reg(save_top);
+        Ok(())
     }
 
     /// Read `obj[key]` into `dst` for a destructuring property. A static key

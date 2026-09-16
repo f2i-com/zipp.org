@@ -13,8 +13,12 @@
 //!      running program is enumerated here or reachable by tracing from it. A
 //!      missed root would free a live object; `ZIPP_GC_STRESS` (collect at every
 //!      safe point) turns any such miss into an immediate corpus/test262 failure.
-//!   3. Collection only happens at a dispatch-loop safe point with `gc_lock == 0`,
-//!      so no native built-in is holding an un-rooted `Vec<Value>` working set.
+//!   3. Collection only happens at a dispatch-loop safe point with `gc_lock == 0`.
+//!      A native built-in that re-enters guest code (a getter, a Proxy trap, a
+//!      callback) while it holds a Rust-side `Vec<Value>` working set must keep
+//!      that set traced across the re-entry: park each Value on the
+//!      `with_host_roots` stack (`push_host_root`), or take `gc_lock_guard`
+//!      when the re-entry is bounded.
 //!
 //! Two collection kinds since the nursery (NURSERY_DESIGN.md §§1-2;
 //! `ZIPP_NO_NURSERY=1` restores majors-only exactly):

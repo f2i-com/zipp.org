@@ -979,7 +979,7 @@ impl<'p> Vm<'p> {
     /// GC is suspended for the scope so `out`'s values survive the species ctor call.
     ///
     /// `set_length`: slice/splice end with Set(A,'length',n,true) per spec;
-    /// map/filter/flat/flatMap only define elements.
+    /// map/filter only define elements.
     pub(crate) fn array_from_species_len(
         &mut self,
         original: Value,
@@ -1025,6 +1025,55 @@ impl<'p> Vm<'p> {
         self.flatten_into_array_at(out, source, source_len, depth, mapper, 0, &mut work)
     }
 
+    /// `flat` / `flatMap`: FlattenIntoArray into `target` (the ArraySpeciesCreate
+    /// result, or `None` for a plain current-realm array).
+    ///
+    /// The walk collects into a Rust `Vec` while element getters, Proxy traps
+    /// and the mapper run, and a species `target` receives the elements only
+    /// afterwards through CreateDataPropertyOrThrow (a setter or a
+    /// defineProperty trap). The receiver may be a Rust-owned apply argument
+    /// and the target a fresh constructor result, so every collected value,
+    /// the receiver and the target stay on the host-root stack throughout.
+    fn flatten_into_array_result(
+        &mut self,
+        source: Value,
+        source_len: usize,
+        depth: i64,
+        mapper: Option<(Value, Value)>,
+        target: Option<Value>,
+    ) -> Result<Value, Thrown> {
+        let target_root = target.unwrap_or(Value::UNDEFINED);
+        self.with_host_roots(&[source, target_root], |vm| {
+            let mut out = Vec::new();
+            vm.flatten_into_array(&mut out, source, source_len, depth, mapper)?;
+            match target {
+                Some(a) => {
+                    for (i, v) in out.into_iter().enumerate() {
+                        vm.create_data_property_or_throw(a, i, v)?;
+                    }
+                    Ok(a)
+                }
+                None => Ok(vm.alloc_array_current_realm(out)),
+            }
+        })
+    }
+
+    /// Is every `HasProperty`+`Get` the flatten walk does on `v` exactly "the
+    /// dense slot at that index, when it is not a hole"? True only for a real
+    /// Array (an arguments object records a `proto_of`) with no side table to
+    /// shadow an element or `length`, its default [[Prototype]], and no integer
+    /// key on the shared prototypes — the same proof `array_iter_get`'s two
+    /// fast paths make per call. Re-proved after anything that can run guest
+    /// code, since that code can add any of them.
+    fn flatten_dense(&self, v: Value) -> bool {
+        crate::codegen::hole_absent_fast_enabled()
+            && !self.array_proto_has_index
+            && v.is_heap()
+            && !self.arr_props.contains_key(&v.heap_index())
+            && !self.proto_of.contains_key(&v.heap_index())
+            && matches!(self.heap.get(v.heap_index()), HeapObj::Array(_))
+    }
+
     fn flatten_into_array_at(
         &mut self,
         out: &mut Vec<Value>,
@@ -1039,34 +1088,60 @@ impl<'p> Vm<'p> {
             .checked_add(source_len as u64)
             .ok_or_else(|| Thrown("RangeError: native builtin iteration limit exceeded".into()))?;
         self.preflight_native_iteration_work(*work)?;
-        // A plain array flattened no further, with every index present and no
-        // side table to shadow one: its elements go in as one block. (Every
-        // Get and HasProperty the walk below would do is unobservable here.)
-        if depth <= 0 && mapper.is_none() && source.is_heap() {
-            let si = source.heap_index();
-            let clean = !self.arr_props.contains_key(&si)
-                && matches!(self.heap.get(si), HeapObj::Array(items)
+        // Hoisted out of the loop: `array_iter_get`'s per-element side-table
+        // probe is the whole cost of a plain `[1,2,3].flat()`.
+        let mut dense = self.flatten_dense(source);
+        let sidx = if source.is_heap() { source.heap_index() } else { 0 };
+        // A plain array flattened no further, with every index present: its
+        // elements go in as one block. (Every Get and HasProperty the walk
+        // below would do is unobservable here.)
+        if depth <= 0 && mapper.is_none() && dense {
+            let clean = matches!(self.heap.get(sidx), HeapObj::Array(items)
                     if items.len() == source_len && !items.iter().any(|v| v.is_hole()));
             if clean {
                 self.reserve_array_result(out, source_len, false)?;
-                if let HeapObj::Array(items) = self.heap.get(si) {
+                let from = out.len();
+                if let HeapObj::Array(items) = self.heap.get(sidx) {
                     out.extend_from_slice(items);
                 }
+                // `out` is a Rust Vec, and a later element's guest code can
+                // detach these from the source (`src.length = 0`) before the
+                // result is allocated: root the block in the caller's scope
+                // (`flatten_into_array_result` truncates it).
+                self.host_result_roots.extend(out[from..].iter().copied());
                 return Ok(());
             }
         }
         for k in 0..source_len {
-            let Some(got) = self.array_iter_get(source, k)? else {
+            let got = if dense {
+                match self.heap.get(sidx) {
+                    HeapObj::Array(items) => items.get(k).copied().filter(|v| !v.is_hole()),
+                    _ => None,
+                }
+            } else {
+                self.array_iter_get(source, k)?
+            };
+            let Some(got) = got else {
                 continue;
             };
             let v = match mapper {
-                Some((cb, ta)) => self.call_value(cb, ta, &[got, Value::num(k as f64), source])?,
+                Some((cb, ta)) => {
+                    let r = self.call_value(cb, ta, &[got, Value::num(k as f64), source])?;
+                    dense = self.flatten_dense(source);
+                    r
+                }
                 None => got,
             };
-            if depth > 0 && self.value_is_array_throwing(v)? {
-                // A real array's `length` is its own data property, so reading
-                // it directly is the Get; a Proxy's goes through its trap.
-                let n = if matches!(self.heap.get(v.heap_index()), HeapObj::Array(_)) {
+            // `is_heap` first: IsArray is a chain walk, and the elements of a
+            // numeric array are never spreadable.
+            if depth > 0 && v.is_heap() && self.value_is_array_throwing(v)? {
+                // A mapper-made nested array is only a Rust local while its
+                // own length/element Gets run.
+                self.push_host_root(v);
+                // A plain Array's `length` is an own non-configurable data
+                // property no overlay redefines, so `js_array_len` IS its Get.
+                // (The walk's work budget bounds how much of it is read.)
+                let n = if self.flatten_dense(v) {
                     self.js_array_len(v.heap_index())
                 } else {
                     let lv = self.get_prop(v, "length")?;
@@ -1087,11 +1162,17 @@ impl<'p> Vm<'p> {
                     ));
                 }
                 self.flatten_into_array_at(out, v, n, depth - 1, None, next_depth, work)?;
+                // The nested walk's Gets can be Proxy traps or accessors.
+                dense = self.flatten_dense(source);
             } else {
                 // Admit the result's growth before the store reallocates: its
                 // size is the sum of the elements visited, which for an array
                 // of N references to one big array is N times that array.
                 self.reserve_array_result(out, 1, false)?;
+                // Inside `flatten_into_array_result`'s host-root scope: `out`
+                // is a Rust Vec, so a later element's guest code could
+                // otherwise see this one collected.
+                self.push_host_root(v);
                 out.push(v);
             }
         }
@@ -2397,17 +2478,9 @@ impl<'p> Vm<'p> {
                         (self.to_integer_or_zero(arg0)?.max(0), None)
                     };
                     let target = self.array_species_create(Value::heap(idx), 0)?;
-                    let mut out = Vec::new();
-                    self.flatten_into_array(&mut out, Value::heap(idx), source_len, depth, mapper)?;
-                    return match target {
-                        Some(a) => {
-                            for (i, v) in out.into_iter().enumerate() {
-                                self.create_data_property_or_throw(a, i, v)?;
-                            }
-                            Ok(Some(a))
-                        }
-                        None => Ok(Some(Value::heap(self.heap.alloc(HeapObj::Array(out))))),
-                    };
+                    return self
+                        .flatten_into_array_result(Value::heap(idx), source_len, depth, mapper, target)
+                        .map(Some);
                 }
                 // join/toString/toLocaleString run LIVE against the receiver:
                 // len = ToLength(Get(O,'length')) FIRST, then (join) the
@@ -3135,27 +3208,16 @@ impl<'p> Vm<'p> {
                 let receiver = Value::heap(idx);
                 let source_len = self.js_array_len(idx);
                 // An absent OR explicitly-`undefined` depth defaults to 1
-                // (ToIntegerOrInfinity is only applied to a provided depth).
+                // (ToIntegerOrInfinity is only applied to a provided depth;
+                // Infinity saturates -> deep flatten).
                 let depth = if args.is_empty() || arg0 == Value::UNDEFINED {
                     1
                 } else {
-                    // ToInteger (Infinity saturates to i64::MAX -> deep flatten).
                     self.to_integer_or_zero(arg0)?.max(0)
                 };
-                // flat builds the result via ArraySpeciesCreate(O, 0), before
-                // the walk.
                 let target = self.array_species_create(receiver, 0)?;
-                let mut out = Vec::new();
-                self.flatten_into_array(&mut out, receiver, source_len, depth, None)?;
-                match target {
-                    Some(a) => {
-                        for (i, v) in out.into_iter().enumerate() {
-                            self.create_data_property_or_throw(a, i, v)?;
-                        }
-                        Ok(Some(a))
-                    }
-                    None => Ok(Some(self.alloc_array_current_realm(out))),
-                }
+                self.flatten_into_array_result(receiver, source_len, depth, None, target)
+                    .map(Some)
             }
             "fill" => {
                 let val = arg0;
@@ -3644,17 +3706,8 @@ impl<'p> Vm<'p> {
                 // ArraySpeciesCreate(O, 0) is step 4 — before the walk, and its
                 // `constructor` / @@species Gets are observable there.
                 let target = self.array_species_create(receiver, 0)?;
-                let mut out = Vec::new();
-                self.flatten_into_array(&mut out, receiver, source_len, 1, Some((cb, this_arg)))?;
-                match target {
-                    Some(a) => {
-                        for (i, v) in out.into_iter().enumerate() {
-                            self.create_data_property_or_throw(a, i, v)?;
-                        }
-                        Ok(Some(a))
-                    }
-                    None => Ok(Some(self.alloc_array_current_realm(out))),
-                }
+                self.flatten_into_array_result(receiver, source_len, 1, Some((cb, this_arg)), target)
+                    .map(Some)
             }
             "findLast" | "findLastIndex" => {
                 let cb = arg0;

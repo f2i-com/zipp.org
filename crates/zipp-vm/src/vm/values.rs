@@ -1444,16 +1444,52 @@ impl<'p> Vm<'p> {
     /// non-enumerable, writable, configurable own array built from
     /// IterableToList(errorsArg) (spec 20.5.7.1 steps 4-5). `iterate_to_vec` runs the
     /// argument's iterator (user code) under a GC lock, so `err` stays live across it.
+    /// InstallErrorCause (ES2022): an `options` object with a `cause` (HasProperty:
+    /// proto chain + a Proxy `has` trap, observable) gives the error a
+    /// non-enumerable own `cause` data property.
+    ///
+    /// The `has` trap and the `cause` getter are guest code, and a freshly made
+    /// error is still only a Rust local here, so it stays rooted across them.
+    pub(crate) fn install_error_cause(&mut self, err: Value, options: Value) -> Result<(), Thrown> {
+        if !self.is_object_value(options) {
+            return Ok(());
+        }
+        self.with_host_roots(&[err, options], |vm| {
+            let kc = vm.alloc_str("cause".to_string());
+            if vm.has_property_dyn(options, kc)? {
+                let cause = vm.get_prop(options, "cause")?;
+                // The trap/getter reached safe points: `err` may be old now.
+                vm.heap.write_barrier_val(err.heap_index(), cause);
+                if let HeapObj::Object(m) = vm.heap.get_mut(err.heap_index()) {
+                    m.define(
+                        "cause",
+                        cause,
+                        PropAttr {
+                            writable: true,
+                            enumerable: false,
+                            configurable: true,
+                            accessor: false,
+                            setter: Value::UNDEFINED,
+                        },
+                    );
+                }
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) fn install_agg_errors(
         &mut self,
         err: Value,
         errors_arg: Value,
     ) -> Result<(), Thrown> {
-        let list = self.iterate_to_vec(errors_arg)?;
+        // The iteration runs guest code while `err` can still be a Rust local.
+        let list = self.with_host_roots(&[err], |vm| vm.iterate_to_vec(errors_arg))?;
         // CreateArrayFromList allocates in the CONSTRUCTOR's realm — the errors
         // array of `new otherRealm.AggregateError([e])` carries the other realm's
         // %Array.prototype% (staging/sm/Error/AggregateError.js line 85).
         let arr = self.alloc_array_current_realm(list);
+        self.heap.write_barrier_val(err.heap_index(), arr);
         if let HeapObj::Object(m) = self.heap.get_mut(err.heap_index()) {
             m.define(
                 "errors",
@@ -1471,27 +1507,6 @@ impl<'p> Vm<'p> {
         // the error; the fresh array is then an old->young store.
         self.heap.write_barrier_val(err.heap_index(), arr);
         Ok(())
-    }
-
-    /// InstallErrorCause's define: the non-enumerable, writable, configurable
-    /// own `cause`. Callers root `err` across the guest `has`/getter that
-    /// produced `cause`; a collection there may have promoted it, so the store
-    /// is barriered.
-    pub(crate) fn install_error_cause(&mut self, err: Value, cause: Value) {
-        if let HeapObj::Object(m) = self.heap.get_mut(err.heap_index()) {
-            m.define(
-                "cause",
-                cause,
-                PropAttr {
-                    writable: true,
-                    enumerable: false,
-                    configurable: true,
-                    accessor: false,
-                    setter: Value::UNDEFINED,
-                },
-            );
-        }
-        self.heap.write_barrier_val(err.heap_index(), cause);
     }
 
     /// Build the `arguments` object for a (non-arrow) function activation. The
@@ -1837,8 +1852,7 @@ impl<'p> Vm<'p> {
         }
         if v.is_heap() && self.heap.is_str_like(v.heap_index()) {
             let s = self.heap.str_cow(v.heap_index()).unwrap().into_owned();
-            // StringToBigInt trims StrWhiteSpaceChar (U+FEFF yes, U+0085 no).
-            let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
+            let t = s.trim_matches(str_white_space);
             if t.is_empty() {
                 return Ok(BigVal::Small(0));
             }

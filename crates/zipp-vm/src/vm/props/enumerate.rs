@@ -25,7 +25,39 @@ fn enum_hoist_enabled() -> bool {
 }
 
 impl<'p> Vm<'p> {
+    /// EnumerableOwnProperties (Object.keys / values / entries).
+    ///
+    /// Values and entries read each property with [[Get]], which can run a
+    /// getter or a Proxy trap — guest code that allocates and reaches safe
+    /// points. The result array is only allocated at the end, so every value
+    /// and `[key, value]` pair produced so far (and a Proxy's key list) is
+    /// parked on the host-root stack for the whole walk; `obj` itself may be a
+    /// fresh ToObject wrapper.
     pub(crate) fn object_enum_own(&mut self, obj: Value, what: EnumWhat) -> Result<Value, Thrown> {
+        self.with_host_roots(&[obj], |vm| vm.object_enum_own_inner(obj, what))
+    }
+
+    /// Is `k` (the canonical index `n`, when it is one below 2^32-1) still an
+    /// own ENUMERABLE property of the array at `idx`? The Array arm of
+    /// `object_enum_own` snapshots its keys once and asks this again before
+    /// each value read, as EnumerableOwnProperties does — but only when the
+    /// array HAS a side table, because without one no Get in that loop can run
+    /// guest code (see the `recheck` hoist at its call site).
+    fn array_key_still_enumerable(&self, idx: u32, n: Option<usize>, k: &str) -> bool {
+        if let Some(n) = n.filter(|n| *n < 4_294_967_295) {
+            if let Some((attr, _)) = self.array_index_override(idx, n) {
+                return attr.enumerable;
+            }
+            return matches!(self.heap.get(idx), HeapObj::Array(items)
+                if items.get(n).is_some_and(|v| !v.is_hole()));
+        }
+        self.arr_props
+            .get(&idx)
+            .and_then(|m| m.pos(k).map(|i| m.attr_at(i).enumerable))
+            .unwrap_or_else(|| self.regexp_result_prop(idx, k).is_some())
+    }
+
+    fn object_enum_own_inner(&mut self, obj: Value, what: EnumWhat) -> Result<Value, Thrown> {
         self.defer_check_all(obj)?;
         // A namespace with a still-uninitialized export throws from the per-key
         // [[GetOwnProperty]] walk (Object.keys/values/entries + for-in).
@@ -38,6 +70,10 @@ impl<'p> Vm<'p> {
         // A Proxy enumerates via its ownKeys trap, keeping the STRING keys whose
         // [[GetOwnProperty]] (the gopd trap) reports enumerable.
         if let Some(keys) = self.proxy_own_keys(obj)? {
+            // The trap's key strings are traced only through this list.
+            for &k in &keys {
+                self.push_host_root(k);
+            }
             let mut out: Vec<Value> = Vec::new();
             for k in keys {
                 if !(k.is_heap() && self.heap.is_str_like(k.heap_index())) {
@@ -64,11 +100,14 @@ impl<'p> Vm<'p> {
                     EnumWhat::Keys => out.push(k),
                     EnumWhat::Values => {
                         let v = self.get_member(obj, &ks, obj)?;
+                        self.push_host_root(v);
                         out.push(v);
                     }
                     EnumWhat::Entries => {
                         let v = self.get_member(obj, &ks, obj)?;
-                        out.push(self.alloc_array_current_realm(vec![k, v]));
+                        let pair = self.alloc_array_current_realm(vec![k, v]);
+                        self.push_host_root(pair);
+                        out.push(pair);
                     }
                 }
             }
@@ -146,7 +185,9 @@ impl<'p> Vm<'p> {
                             .iter()
                             .any(|k| canonical_index_str(k).is_some_and(|n| n < len))
                 });
-            let mut ks: Vec<String> = Vec::new();
+            // Each key carries the canonical index it came from, so the value
+            // read below needs no re-parse (and neither does the re-check).
+            let mut ks: Vec<(Option<usize>, String)> = Vec::new();
             for i in 0..len {
                 let overridden = if dense_overlaid {
                     self.array_index_override(idx, i)
@@ -161,7 +202,7 @@ impl<'p> Vm<'p> {
                     continue;
                 }
                 if overridden.map_or(true, |(a, _)| a.enumerable) {
-                    ks.push(i.to_string());
+                    ks.push((Some(i), i.to_string()));
                 }
             }
             if let Some(m) = self.arr_props.get(&idx) {
@@ -183,7 +224,7 @@ impl<'p> Vm<'p> {
                     }
                 }
                 sparse.sort_unstable();
-                ks.extend(sparse.into_iter().map(|n| n.to_string()));
+                ks.extend(sparse.into_iter().map(|n| (Some(n), n.to_string())));
                 for (j, k) in m.keys.iter().enumerate() {
                     if !m.attr_at(j).enumerable || is_hidden_key(k) {
                         continue;
@@ -192,27 +233,45 @@ impl<'p> Vm<'p> {
                     if canonical_index_str(k).is_some_and(|n| n < 4_294_967_295) {
                         continue;
                     }
-                    ks.push(k.clone());
+                    // A canonical integer at or above 2^32-1 is a NAMED key, but
+                    // it is still read positionally (unchanged classification).
+                    let n = k.parse::<usize>().ok().filter(|n| n.to_string() == *k);
+                    ks.push((n, k.clone()));
                 }
             }
+            // Without a side table every key above is a present dense element,
+            // so no Get below can run guest code: nothing can delete a key,
+            // shrink `length` or flip an attribute between reads, and the
+            // per-key [[GetOwnProperty]] re-check can only ever answer yes.
+            let recheck = self.arr_props.contains_key(&idx);
             let mut out: Vec<Value> = Vec::with_capacity(ks.len());
-            for k in ks {
+            for (n, k) in ks {
                 if matches!(what, EnumWhat::Keys) {
                     let kv = self.alloc_key_str(k);
                     out.push(kv);
                     continue;
                 }
-                let v = match k.parse::<usize>() {
-                    Ok(n) if n.to_string() == k.as_str() => {
-                        self.get_index(obj, Value::num(n as f64))?
-                    }
-                    _ => self.get_member(obj, &k, obj)?,
+                // EnumerableOwnProperties re-reads [[GetOwnProperty]] per key
+                // before the Get: an earlier getter may have deleted the
+                // element, shrunk `length`, or made the key non-enumerable, and
+                // that key is then skipped rather than read as `undefined`.
+                if recheck && !self.array_key_still_enumerable(idx, n, &k) {
+                    continue;
+                }
+                let v = match n {
+                    Some(n) => self.get_index(obj, Value::num(n as f64))?,
+                    None => self.get_member(obj, &k, obj)?,
                 };
                 match what {
-                    EnumWhat::Values => out.push(v),
+                    EnumWhat::Values => {
+                        self.push_host_root(v);
+                        out.push(v);
+                    }
                     EnumWhat::Entries => {
                         let kv = self.alloc_key_str(k);
-                        out.push(self.alloc_array_current_realm(vec![kv, v]));
+                        let pair = self.alloc_array_current_realm(vec![kv, v]);
+                        self.push_host_root(pair);
+                        out.push(pair);
                     }
                     EnumWhat::Keys => {}
                 }
@@ -240,25 +299,34 @@ impl<'p> Vm<'p> {
                     }
                 }
             }
-            // Enumerable named own props assigned to the wrapper (`s.foo = …`).
+            // Enumerable own props assigned to the wrapper (`s.foo = …`): an
+            // index past the string's length still sorts ahead of the named
+            // keys, ascending (OrdinaryOwnPropertyKeys).
             let extra: Vec<String> = match self.arr_props.get(&obj.heap_index()) {
-                Some(m) => m
-                    .keys
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, k)| m.attr_at(*i).enumerable && !is_hidden_key(k))
-                    .map(|(_, k)| k.clone())
+                Some(m) => spec_key_order(&m.keys)
+                    .into_iter()
+                    .filter(|&i| m.attr_at(i).enumerable && !is_hidden_key(&m.keys[i]))
+                    .map(|i| m.keys[i].clone())
                     .collect(),
                 None => Vec::new(),
             };
+            if !extra.is_empty() {
+                // The named props below can be accessors: the character
+                // strings and pairs built so far must survive their getters.
+                for &v in &out {
+                    self.push_host_root(v);
+                }
+            }
             for k in extra {
                 let v = self.get_member(obj, &k, obj)?;
                 let kv = self.alloc_key_str(k);
-                match what {
-                    EnumWhat::Keys => out.push(kv),
-                    EnumWhat::Values => out.push(v),
-                    EnumWhat::Entries => out.push(self.alloc_array_current_realm(vec![kv, v])),
-                }
+                let item = match what {
+                    EnumWhat::Keys => kv,
+                    EnumWhat::Values => v,
+                    EnumWhat::Entries => self.alloc_array_current_realm(vec![kv, v]),
+                };
+                self.push_host_root(item);
+                out.push(item);
             }
             return Ok(self.alloc_array_current_realm(out));
         }
@@ -313,12 +381,15 @@ impl<'p> Vm<'p> {
                         }
                         EnumWhat::Values => {
                             let v = self.get_member(obj, &k, obj)?;
+                            self.push_host_root(v);
                             out.push(v);
                         }
                         EnumWhat::Entries => {
                             let v = self.get_member(obj, &k, obj)?;
                             let kv = self.alloc_key_str(k);
-                            out.push(self.alloc_array_current_realm(vec![kv, v]));
+                            let pair = self.alloc_array_current_realm(vec![kv, v]);
+                            self.push_host_root(pair);
+                            out.push(pair);
                         }
                     }
                 }
@@ -370,12 +441,15 @@ impl<'p> Vm<'p> {
                     }
                     EnumWhat::Values => {
                         let v = self.get_member(obj, &k, obj)?;
+                        self.push_host_root(v);
                         out.push(v);
                     }
                     EnumWhat::Entries => {
                         let v = self.get_member(obj, &k, obj)?;
                         let kv = self.alloc_key_str(k);
-                        out.push(self.alloc_array_current_realm(vec![kv, v]));
+                        let pair = self.alloc_array_current_realm(vec![kv, v]);
+                        self.push_host_root(pair);
+                        out.push(pair);
                     }
                 }
             }
@@ -409,12 +483,15 @@ impl<'p> Vm<'p> {
                     }
                     EnumWhat::Values => {
                         let v = self.get_member(obj, &k, obj)?;
+                        self.push_host_root(v);
                         out.push(v);
                     }
                     EnumWhat::Entries => {
                         let v = self.get_member(obj, &k, obj)?;
                         let kv = self.alloc_key_str(k);
-                        out.push(self.alloc_array_current_realm(vec![kv, v]));
+                        let pair = self.alloc_array_current_realm(vec![kv, v]);
+                        self.push_host_root(pair);
+                        out.push(pair);
                     }
                 }
             }

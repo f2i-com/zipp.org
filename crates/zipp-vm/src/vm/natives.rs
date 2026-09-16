@@ -2093,8 +2093,8 @@ impl<'p> Vm<'p> {
                     self.proto_of.insert(o.heap_index(), a0);
                 }
                 if a1 != Value::UNDEFINED {
-                    // `o` is reachable from nothing but this local while the
-                    // descriptor getters run guest code: root it.
+                    // `o` is only a Rust local while the descriptor bag's getters
+                    // and ToPropertyDescriptor field getters run.
                     self.with_host_roots(&[o], |vm| vm.object_define_properties(o, a1))?;
                 }
                 o
@@ -3080,7 +3080,10 @@ impl<'p> Vm<'p> {
                 } else {
                     self.create_list_from_array_like(a1)?
                 };
-                self.call_value(this, a0, &callargs)?
+                // The list is Rust-owned until the callee's frame copies it; an
+                // exotic callee (a native, a bound or wrapped function) can run
+                // guest code first.
+                self.with_host_roots(&callargs, |vm| vm.call_value(this, a0, &callargs))?
             }
             FN_BIND => {
                 if !self.is_callable(this) {
@@ -4359,7 +4362,7 @@ impl<'p> Vm<'p> {
                 }
                 // Reflect.apply requires an array-like argumentsList (CreateListFromArrayLike).
                 let arg_vec = self.create_list_from_array_like(args_list)?;
-                self.call_value(target, this_arg, &arg_vec)?
+                self.with_host_roots(&arg_vec, |vm| vm.call_value(target, this_arg, &arg_vec))?
             }
             REFLECT_CONSTRUCT => {
                 let target = a0;
@@ -4384,7 +4387,11 @@ impl<'p> Vm<'p> {
                 // newTarget defaults to target when the 3rd arg is absent; thread it
                 // so a Proxy construct trap (and a trap-less forward) sees the real one.
                 let new_target = args.get(2).copied().unwrap_or(target);
-                self.construct_with_newtarget(target, &arg_vec, new_target)?
+                // The argument list stays Rust-owned across newTarget.prototype
+                // reads and field initializers that run before the ctor frame.
+                self.with_host_roots(&arg_vec, |vm| {
+                    vm.construct_with_newtarget(target, &arg_vec, new_target)
+                })?
             }
             REFLECT_GET => {
                 if !self.is_object_value(a0) {

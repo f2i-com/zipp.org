@@ -1059,12 +1059,29 @@ impl<'p> Vm<'p> {
                     let arr = args.get(1).copied().unwrap_or(Value::UNDEFINED);
                     // argArray null/undefined -> no args; else CreateListFromArrayLike
                     // (an array-like — `{length, 0, …}` — not necessarily iterable).
+                    // A hole-free dense array with no side table hands over its
+                    // own elements, which stay reachable through `arr` (a
+                    // caller register) until the callee's frame owns the list —
+                    // no guest code runs in between. Anything the walk could
+                    // have MADE instead (an array-like's Gets, a hole's
+                    // prototype getter, a Proxy trap) is a Rust local until
+                    // then, so that list is rooted across the call.
+                    let elements_are_arrs = arr.is_heap()
+                        && !self.arr_props.contains_key(&arr.heap_index())
+                        && matches!(self.heap.get(arr.heap_index()),
+                            HeapObj::Array(items) if !items.iter().any(|v| v.is_hole()));
                     let callargs = if arr.is_nullish() {
                         Vec::new()
                     } else {
                         self.create_list_from_array_like(arr)?
                     };
-                    return Ok(Some(self.call_value(recv, this, &callargs)?));
+                    if elements_are_arrs {
+                        return Ok(Some(self.call_value(recv, this, &callargs)?));
+                    }
+                    // Rooted until the callee's frame owns the list (FN_APPLY).
+                    return Ok(Some(
+                        self.with_host_roots(&callargs, |vm| vm.call_value(recv, this, &callargs))?,
+                    ));
                 }
                 // Bind snapshots target length/name and may reject a sandbox-cap
                 // overflow while composing "bound ". Keep that fallible work in

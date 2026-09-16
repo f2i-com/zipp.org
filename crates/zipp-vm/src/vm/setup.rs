@@ -844,14 +844,6 @@ impl<'p> Vm<'p> {
             }
             self.default_string_iter = it;
         }
-        // The pristine iterator-prototype `next`s, as for arrays above.
-        let proto_next = |vm: &Self, proto: u32| match vm.heap.get(proto) {
-            HeapObj::Object(m) => m.get("next").unwrap_or(Value::UNDEFINED),
-            _ => Value::UNDEFINED,
-        };
-        self.default_map_iter_next = proto_next(self, self.map_iter_proto);
-        self.default_set_iter_next = proto_next(self, self.set_iter_proto);
-        self.default_string_iter_next = proto_next(self, self.string_iter_proto);
         // ── ES2025 Iterator Helpers ──
         // %Iterator.prototype% (the shared root holding the helper methods).
         let iter_root = build(

@@ -470,9 +470,9 @@ impl<'p> Vm<'p> {
 /// allocating the capture string. `Vm::to_number` delegates its ordinary
 /// string arm here, so the two paths cannot drift.
 pub(crate) fn string_to_number(s: &str) -> f64 {
-    // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not — and
-    // excludes U+0085 (NEL), which Rust's does.
-    let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
+    // StrWhiteSpace includes U+FEFF (BOM), which Rust's trim does not, and
+    // excludes U+0085 (NEL), which Rust's does — `str_white_space` is the set.
+    let t = s.trim_matches(str_white_space);
     if t.is_empty() {
         return 0.0;
     }
@@ -1006,20 +1006,37 @@ impl<'p> Vm<'p> {
                 return Ok(out); // dense fast path
             }
         }
-        let len_v = self.get_prop(obj, "length")?;
-        let len_u64 = self.to_integer_or_zero(len_v)?.clamp(0, (1i64 << 53) - 1) as u64;
-        // Do not narrow ToLength before applying the safe-profile work cap:
-        // on wasm32 an attacker-controlled 2^32 used to wrap to an empty list.
-        self.preflight_native_iteration_work(len_u64)?;
-        let len = usize::try_from(len_u64)
-            .map_err(|_| Thrown("RangeError: argument list is too large".into()))?;
-        let mut out = Vec::new();
-        out.try_reserve_exact(len)
-            .map_err(|_| Thrown("RangeError: argument-list allocation failed".into()))?;
-        for i in 0..len {
-            out.push(self.get_index(obj, Value::num(i as f64))?);
-        }
-        Ok(out)
+        // The generic path reads `length` and every index with [[Get]], so a
+        // getter or Proxy trap runs between elements. `obj` can be a fresh
+        // trap result (a Proxy ownKeys list) and the elements read so far live
+        // only in `out` until the caller hands them to a frame: park both.
+        self.with_host_roots(&[obj], |vm| {
+            let len_v = vm.get_prop(obj, "length")?;
+            let len_u64 = vm.to_integer_or_zero(len_v)?.clamp(0, (1i64 << 53) - 1) as u64;
+            // Do not narrow ToLength before applying the safe-profile work cap:
+            // on wasm32 an attacker-controlled 2^32 used to wrap to an empty list.
+            vm.preflight_native_iteration_work(len_u64)?;
+            // A profile-independent ceiling: the work cap above is unbounded in
+            // the default profile, where `f.apply(null, {length: 2**32 - 1})`
+            // used to commit ~32 GB for the list and then spin through four
+            // billion element reads. No list this long can become a call.
+            const MAX_ARRAY_LIKE_LIST: u64 = 1 << 24;
+            if len_u64 > MAX_ARRAY_LIKE_LIST {
+                return Err(Thrown("RangeError: Invalid array length".into()));
+            }
+            let len = usize::try_from(len_u64)
+                .map_err(|_| Thrown("RangeError: argument list is too large".into()))?;
+            let mut out = Vec::new();
+            // Reserve a bounded prefix and let the list grow as it is read.
+            out.try_reserve_exact(len.min(1 << 16))
+                .map_err(|_| Thrown("RangeError: argument-list allocation failed".into()))?;
+            for i in 0..len {
+                let v = vm.get_index(obj, Value::num(i as f64))?;
+                vm.push_host_root(v);
+                out.push(v);
+            }
+            Ok(out)
+        })
     }
 
     /// IsConcatSpreadable(O) (ES 23.1.3.1.1): a `Symbol.isConcatSpreadable`
@@ -1394,9 +1411,8 @@ impl<'p> Vm<'p> {
         }
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
-                // StrWhiteSpace: U+FEFF (BOM) yes, U+0085 (NEL) no — unlike
-                // Rust's trim.
-                let t = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
+                // StrWhiteSpace: U+FEFF in, U+0085 out (unlike Rust's trim).
+                let t = s.trim_matches(str_white_space);
                 if t.is_empty() {
                     return *x == BigVal::Small(0);
                 }
@@ -2388,10 +2404,7 @@ impl<'p> Vm<'p> {
     ) -> Result<Option<std::cmp::Ordering>, Thrown> {
         if other.is_heap() && self.heap.is_str_like(other.heap_index()) {
             if let Some(s) = self.heap.str_cow(other.heap_index()) {
-                let y = if s
-                    .trim_matches(crate::vm::helpers_numeric::str_white_space)
-                    .is_empty()
-                {
+                let y = if s.trim_matches(str_white_space).is_empty() {
                     Some(BigVal::Small(0))
                 } else {
                     parse_bigint_str(&s)

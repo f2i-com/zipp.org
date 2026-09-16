@@ -6851,7 +6851,8 @@ pub(crate) enum BigOp {
 /// fail for any other reason).
 pub(crate) fn parse_bigint_str(s: &str) -> Option<crate::vm::bigint::BigVal> {
     use crate::vm::bigint::BigVal;
-    let s = s.trim_matches(crate::vm::helpers_numeric::str_white_space);
+    // StringToBigInt trims StrWhiteSpace (U+FEFF in, U+0085 out).
+    let s = s.trim_matches(crate::vm::str_white_space);
     let (neg, body, signed) = match s.strip_prefix('-') {
         Some(r) => (true, r, true),
         None => match s.strip_prefix('+') {

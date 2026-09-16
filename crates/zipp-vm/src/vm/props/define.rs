@@ -168,83 +168,12 @@ impl<'p> Vm<'p> {
                             "TypeError: proxy 'defineProperty' trap returned falsish for property '{key}'"
                         )));
                     }
-                    // [[DefineOwnProperty]] invariant (10.5.6 steps 16-21): validate
-                    // the truthy trap result against the target's descriptor —
-                    // ? target.[[GetOwnProperty]](P), so a Proxy target recurses
-                    // through ITS trap rather than reading past it.
-                    let target_desc = match self.proxy_gopd(target, key)? {
-                        Some(d) => d,
-                        None => self.object_get_own_property_descriptor(target, key),
-                    };
-                    let extensible = self.is_extensible(target)?;
-                    let setting_config_false = cf == Some(false);
-                    if target_desc == Value::UNDEFINED {
-                        if !extensible {
-                            return Err(Thrown(
-                                "TypeError: proxy can't define a property on a non-extensible target".into(),
-                            ));
-                        }
-                        if setting_config_false {
-                            return Err(Thrown(
-                                "TypeError: proxy can't define a non-configurable property absent from the target".into(),
-                            ));
-                        }
-                    } else {
-                        let t_cfg = self.get_prop(target_desc, "configurable")?;
-                        let t_configurable = self.truthy(t_cfg);
-                        if setting_config_false && t_configurable {
-                            return Err(Thrown(
-                                "TypeError: proxy can't redefine a configurable target property as non-configurable".into(),
-                            ));
-                        }
-                        if !t_configurable {
-                            if cf == Some(true) {
-                                return Err(Thrown(
-                                    "TypeError: proxy can't redefine a non-configurable target property as configurable".into(),
-                                ));
-                            }
-                            let t_wr = self.get_prop(target_desc, "writable")?;
-                            let t_writable = self.truthy(t_wr);
-                            // Step 16.c: a non-configurable WRITABLE data prop
-                            // cannot be reported non-writable by the trap.
-                            let t_is_data = self.has_property_str(target_desc, "writable");
-                            if t_is_data && t_writable && wr == Some(false) {
-                                return Err(Thrown(
-                                    "TypeError: proxy can't report a non-configurable writable target property as non-writable".into(),
-                                ));
-                            }
-                            if !t_writable {
-                                if wr == Some(true) {
-                                    return Err(Thrown(
-                                        "TypeError: proxy can't make a non-configurable non-writable target property writable".into(),
-                                    ));
-                                }
-                                if let Some(v) = value {
-                                    let t_val = self.get_prop(target_desc, "value")?;
-                                    if !self.same_value(v, t_val) {
-                                        return Err(Thrown(
-                                            "TypeError: proxy can't change the value of a non-configurable non-writable target property".into(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        // Step 17.a proper: the clauses above are the frequently-hit
-                        // subset (they keep their precise messages); the general
-                        // IsCompatiblePropertyDescriptor catches what they miss — an
-                        // enumerable flip, a data/accessor kind change, and a
-                        // getter/setter swap on a non-configurable target property.
-                        if !self.is_compatible_property_descriptor(
-                            extensible,
-                            (value, get, set, wr, en, cf),
-                            target_desc,
-                        )? {
-                            return Err(Thrown(
-                                "TypeError: proxy 'defineProperty' reported a descriptor incompatible with the target's".into(),
-                            ));
-                        }
-                    }
-                    Ok(())
+                    // The descriptor object references the trap-visible value and
+                    // accessors; after the trap returns it is reachable from nothing
+                    // the collector traces, while the target's own traps run below.
+                    self.with_host_roots(&[desc_obj], |vm| {
+                        vm.proxy_define_property_invariants(target, key, (value, get, set, wr, en, cf))
+                    })
                 }
             };
         }
@@ -284,20 +213,19 @@ impl<'p> Vm<'p> {
                             "TypeError: Cannot define property {i}: array length is not writable"
                         )));
                     }
-                    // A dense element's descriptor is the default data one, as
-                    // adjusted by the array's integrity level (seal: every
-                    // element non-configurable; freeze: also non-writable) —
-                    // what getOwnPropertyDescriptor reports. A HOLE is no
-                    // property at all, so defining it on a non-extensible
-                    // array is rejected like any new property.
-                    let (sealed, frozen) = self
+                    // A dense slot's attributes are implicit: the default data
+                    // property, narrowed by Object.seal/freeze — which record only
+                    // the arr_props integrity flags, never a per-index entry. The
+                    // current descriptor must match what getOwnPropertyDescriptor
+                    // reports, or a frozen array accepts a redefinition.
+                    let (frozen, sealed) = self
                         .arr_props
                         .get(&idx)
-                        .map_or((false, false), |m| (m.sealed || m.frozen, m.frozen));
+                        .map_or((false, false), |m| (m.frozen, m.sealed));
                     let plain = PropAttr {
                         writable: !frozen,
                         enumerable: true,
-                        configurable: !sealed,
+                        configurable: !(frozen || sealed),
                         accessor: false,
                         setter: Value::UNDEFINED,
                     };
@@ -740,17 +668,17 @@ impl<'p> Vm<'p> {
             && self.callable_has_intrinsic(obj, key)
         {
             if let Some(v) = self.callable_intrinsic_value(obj, key) {
-                // Sealing/freezing the callable made it non-configurable (the
-                // flags live in arr_props; getOwnPropertyDescriptor reads them).
-                let sealed = self
+                // Configurable unless the callable was sealed/frozen — the same
+                // arr_props flags object_get_own_property_descriptor reports.
+                let locked = self
                     .arr_props
                     .get(&idx)
-                    .is_some_and(|m| m.sealed || m.frozen);
+                    .map_or(false, |m| m.frozen || m.sealed);
                 existing = Some((
                     PropAttr {
                         writable: false,
                         enumerable: false,
-                        configurable: !sealed,
+                        configurable: !locked,
                         accessor: false,
                         setter: Value::UNDEFINED,
                     },
@@ -956,5 +884,104 @@ impl<'p> Vm<'p> {
                 .unwrap_or(Value::UNDEFINED)
         };
         Ok((attr, stored))
+    }
+
+    /// [[DefineOwnProperty]] steps 16-21 for a Proxy whose `defineProperty` trap
+    /// reported success: validate the requested descriptor `parts` against the
+    /// target's own descriptor. Runs inside the caller's host-root scope.
+    fn proxy_define_property_invariants(
+        &mut self,
+        target: Value,
+        key: &str,
+        parts: (
+            Option<Value>,
+            Option<Value>,
+            Option<Value>,
+            Option<bool>,
+            Option<bool>,
+            Option<bool>,
+        ),
+    ) -> Result<(), Thrown> {
+        let (value, get, set, wr, en, cf) = parts;
+        // [[DefineOwnProperty]] invariant (10.5.6 steps 16-21): validate
+        // the truthy trap result against the target's descriptor —
+        // ? target.[[GetOwnProperty]](P), so a Proxy target recurses
+        // through ITS trap rather than reading past it.
+        let target_desc = match self.proxy_gopd(target, key)? {
+            Some(d) => d,
+            None => self.object_get_own_property_descriptor(target, key),
+        };
+        // A fresh descriptor (the target's own gopd trap result, or the
+        // ordinary snapshot) is read across the isExtensible trap below.
+        self.push_host_root(target_desc);
+        let extensible = self.is_extensible(target)?;
+        let setting_config_false = cf == Some(false);
+        if target_desc == Value::UNDEFINED {
+            if !extensible {
+                return Err(Thrown(
+                    "TypeError: proxy can't define a property on a non-extensible target".into(),
+                ));
+            }
+            if setting_config_false {
+                return Err(Thrown(
+                    "TypeError: proxy can't define a non-configurable property absent from the target".into(),
+                ));
+            }
+        } else {
+            let t_cfg = self.get_prop(target_desc, "configurable")?;
+            let t_configurable = self.truthy(t_cfg);
+            if setting_config_false && t_configurable {
+                return Err(Thrown(
+                    "TypeError: proxy can't redefine a configurable target property as non-configurable".into(),
+                ));
+            }
+            if !t_configurable {
+                if cf == Some(true) {
+                    return Err(Thrown(
+                        "TypeError: proxy can't redefine a non-configurable target property as configurable".into(),
+                    ));
+                }
+                let t_wr = self.get_prop(target_desc, "writable")?;
+                let t_writable = self.truthy(t_wr);
+                // Step 16.c: a non-configurable WRITABLE data prop
+                // cannot be reported non-writable by the trap.
+                let t_is_data = self.has_property_str(target_desc, "writable");
+                if t_is_data && t_writable && wr == Some(false) {
+                    return Err(Thrown(
+                        "TypeError: proxy can't report a non-configurable writable target property as non-writable".into(),
+                    ));
+                }
+                if !t_writable {
+                    if wr == Some(true) {
+                        return Err(Thrown(
+                            "TypeError: proxy can't make a non-configurable non-writable target property writable".into(),
+                        ));
+                    }
+                    if let Some(v) = value {
+                        let t_val = self.get_prop(target_desc, "value")?;
+                        if !self.same_value(v, t_val) {
+                            return Err(Thrown(
+                                "TypeError: proxy can't change the value of a non-configurable non-writable target property".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            // Step 17.a proper: the clauses above are the frequently-hit
+            // subset (they keep their precise messages); the general
+            // IsCompatiblePropertyDescriptor catches what they miss — an
+            // enumerable flip, a data/accessor kind change, and a
+            // getter/setter swap on a non-configurable target property.
+            if !self.is_compatible_property_descriptor(
+                extensible,
+                (value, get, set, wr, en, cf),
+                target_desc,
+            )? {
+                return Err(Thrown(
+                    "TypeError: proxy 'defineProperty' reported a descriptor incompatible with the target's".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 }

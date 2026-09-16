@@ -2624,16 +2624,25 @@ pub struct Vm<'p> {
     /// Set.prototype.values / %TypedArray%.prototype.values) and the pristine
     /// `next` of the String/Map/Set iterator prototypes (a TypedArray's
     /// iterator is an Array Iterator). See `Vm::builtin_iter_pristine`.
-    default_string_iter: Value,
-    default_map_iter: Value,
+    /// The default `@@iterator` of Set.prototype (`values`), Map.prototype
+    /// (`entries`), String.prototype and %TypedArray%.prototype (`values`): the
+    /// positional for-of / spread / destructuring shortcuts for those kinds are
+    /// taken only while the method GetIterator reads is still this one
+    /// (`builtin_iter_pristine`).
     default_set_iter: Value,
+    default_map_iter: Value,
+    default_string_iter: Value,
     default_ta_iter: Value,
-    default_string_iter_next: Value,
-    default_map_iter_next: Value,
-    default_set_iter_next: Value,
-    /// The key-index tag of `"@@iterator"`, so `builtin_iter_pristine_fast`
-    /// probes a prototype without re-hashing the key at every iteration start.
-    iterator_key_tag: u32,
+    /// Memo for the prototype half of `builtin_iter_pristine`, per built-in
+    /// iterator prototype (Array, Set, Map, String): the heap versions and the
+    /// `next` slot/bits of the last successful proof. Pure cache — a hit
+    /// re-checks every version and the live `next` bits (an in-place
+    /// overwrite bumps no version), so nothing has to invalidate it.
+    iter_proto_memo: [std::cell::Cell<construct::IterProtoProof>; 4],
+    /// The same kind of memo for `builtin_iter_fast`'s holder half: per
+    /// Array / Set / Map / String prototype, `(heap version + 1, slot)` of
+    /// the own `@@iterator` data property last proven to be the default.
+    iter_method_memo: [std::cell::Cell<(u32, u32)>; 4],
     /// The single canonical %ThrowTypeError% intrinsic — shared by
     /// Function.prototype.{caller,arguments} and a strict (unmapped) arguments
     /// object's `callee` poison-pill, so all references compare `===`.
@@ -2765,6 +2774,9 @@ pub struct Vm<'p> {
     /// drain after it is gone. The collector traces this stack while guest
     /// getters and queued jobs run (ZA-05 and the 12 September input-root
     /// regression). Nested entries preserve their caller's stack prefix.
+    /// Native built-ins also park their working sets here (getter and trap
+    /// results collected across later guest re-entry — spread, rest,
+    /// Object.values/entries, CreateListFromArrayLike; 15 September audit).
     host_result_roots: Vec<Value>,
     /// The first exception a `setTimeout` callback let escape. It ends the
     /// event loop and becomes the program's error when the main job itself
