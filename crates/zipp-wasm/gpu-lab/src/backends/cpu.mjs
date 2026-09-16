@@ -90,7 +90,7 @@ export class CPUBackend {
           const [m, s] = rowStats(a, r, n.cols), t = b[r];
           if (n.op === 'cross_entropy') { losses[r] = f(Math.log(s)) - f(a[r*n.cols + t] - m); continue; }
           for (let j = 0, k = r*n.cols; j < n.cols; j++, k++)
-            out[k] = f(f(Math.exp(f(a[k] - m))) / s - (j === t ? 1 : 0)) / n.rows;
+            out[k] = f(f(f(Math.exp(f(a[k] - m))) / s) - (j === t ? 1 : 0)) / n.rows;
         }
         if (n.op === 'cross_entropy') out[0] = pairwiseSum(losses) / n.rows;
         break;
