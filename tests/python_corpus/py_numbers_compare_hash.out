@@ -1,0 +1,33 @@
+eq-none True True True True True 1 0
+eq-other True True True 0 True True True False
+bytes-order True
+bytes-order True
+bytes-order True
+bytes-order True
+bytes-order True
+bytes-order [b'', b'a', b'ab', b'b']
+bytes-order b'xz'
+bytes-order True
+bytes-order b'y'
+TypeError '<' not supported between instances of 'bytes' and 'str'
+sort-error '<' not supported between instances of 'str' and 'int'
+sort-error '<' not supported between instances of 'NoneType' and 'int'
+sort-error '<' not supported between instances of 'float' and 'str'
+sort-error '<' not supported between instances of 'str' and 'int'
+sort-error '<' not supported between instances of 'NoneType' and 'int'
+sort-error-rev '<' not supported between instances of 'int' and 'str'
+sort-error-rev '<' not supported between instances of 'str' and 'int'
+sort-stable [(0, 'z'), (0, 'y'), (1, 'b'), (1, 'a')] [3, 2, 1] ['b', 'B', 'A', 'a']
+subclass-reflected-first Derived.__radd__ Derived.__gt__ Base.__add__ Base.__add__ Base.__gt__
+radd-sum Money(3) Money(6) Money(3.5)
+pow3 ('pow', 7, 2, 5) ('pow', 7, 2, None) ('pow', 3, 4, None) ('rpow', 2, 3) ('rpow', 2, 5)
+pow3-none ('pow', 1, 2, None)
+cross-type-key int-one True n True True
+cross-type-merge 1 ['float'] float
+cross-type-set True True True 3 1
+hash-eq True -2 -2 0 1 -2 549755813888
+hash-float 1152921504606846976 -1152921504606846976 1152921504606846977 1224995262755759164 314159 -314159 True True
+hash-tuple 5740354900026072187 -3550055125485641917 7267574591690527098 -9002791676578425913 True 308769099631933579
+hash-subclass True p True
+bucket-order True [1152921504606846976, 2305843009213693952, 4611686018427387904, 9223372036854775808] [1, 'x', 2305843009213693952, 2.5]
+bucket-order-user ['int', 'tagged', 'six', 'again'] [(Tagged(5), 'tagged'), (6, 'six')] ('s', 'again') 3

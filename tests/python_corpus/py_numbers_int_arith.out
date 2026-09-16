@@ -1,0 +1,59 @@
+bool-bitops True True False False bool bool bool
+bool-int-bitops 0 1 3 int -1 -2 -1
+bool-aug False True False bool bool bool
+ZeroDivisionError 0.0 cannot be raised to a negative power
+ZeroDivisionError 0.0 cannot be raised to a negative power
+ZeroDivisionError 0.0 cannot be raised to a negative power
+ZeroDivisionError 0.0 cannot be raised to a negative power
+neg-pow 0.5 -0.125 0.01 float 1.0 -1.0
+modinv 5 23 7 4 2
+modpow 24 2 -2 1 0 0
+ValueError base is not invertible for the given modulus
+ValueError base is not invertible for the given modulus
+ValueError base is not invertible for the given modulus
+ValueError pow() 3rd argument cannot be 0
+TypeError pow() 3rd argument not allowed unless all arguments are integers
+shifts 1267650600228229401496703205376 -1 0 2 -147573952589676412928 0
+ValueError negative shift count
+truediv 1e+20 9007199254740992.0 -3.5 -3.5 10.0
+OverflowError integer division result too large for a float
+int-parse '1_000' 10 1000
+int-parse '0x_ff' 16 255
+int-parse '0b1_01' 0 5
+int-parse '0o17' 0 15
+int-parse '0' 0 0
+int-parse '000' 0 0
+int-parse '  -42  ' 10 -42
+int-parse '+7' 10 7
+int-parse 'z' 36 35
+int-parse 'Zz' 36 1295
+int-parse '0XAB' 0 171
+ValueError invalid literal for int() with base 0: '08'
+ValueError invalid literal for int() with base 10: '1__0'
+ValueError invalid literal for int() with base 10: '_1'
+ValueError invalid literal for int() with base 10: '1_'
+ValueError invalid literal for int() with base 16: '0x'
+ValueError invalid literal for int() with base 10: ''
+ValueError invalid literal for int() with base 10: '12a'
+ValueError invalid literal for int() with base 0: '0b2'
+ValueError invalid literal for int() with base 8: '9'
+ValueError invalid literal for int() with base 10: '- 1'
+ValueError int() base must be >= 2 and <= 36, or 0
+float-parse '1_0.5' 10.5
+float-parse '1e1_0' 10000000000.0
+float-parse '.5' 0.5
+float-parse '5.' 5.0
+float-parse '-1_000.25e-2' -10.0025
+ValueError could not convert string to float: '1__0.5'
+ValueError could not convert string to float: '_1.0'
+ValueError could not convert string to float: '1._5'
+ValueError could not convert string to float: '1.0_'
+ValueError could not convert string to float: '1e'
+ValueError could not convert string to float: 'e5'
+ValueError could not convert string to float: '.'
+exact-int 9007199254740993 27021597764222979 3002399751580331 5 -3002399751580331 (-1286742750677285, 2)
+bit-length 3001 997 101
+sum-int -1099511627773 -25769803776 332833500 36893488147419103231 1180591620717411303434
+big-shift 3000000 3000002 3000000 3000001 3000001
+big-pow 1100001 1109474 3321929 0
+huge-counts -1 0 0 0 1 -1 -1 1

@@ -69,6 +69,32 @@
     method(E.BaseException, "__str__", 1, function (args) { const a = args[0].args.items; return a.length === 0 ? "" : a.length === 1 ? str(a[0]) : repr(args[0].args); });
     method(E.KeyError, "__str__", 1, function (args) { const a = args[0].args.items; return a.length === 1 ? repr(a[0]) : a.length === 0 ? "" : repr(args[0].args); });
     method(E.BaseException, "__repr__", 1, function (args) { return typeOf(args[0]).name + "(" + args[0].args.items.map(repr).join(", ") + ")"; });
+    // OSError(errno, strerror[, filename[, winerror[, filename2]]]): the
+    // errno attributes, "[Errno N] message" text, and (constructed as OSError
+    // itself) the subclass for that errno.
+    const ERRNO_CLASS = new Map([[1n, E.PermissionError], [2n, E.FileNotFoundError], [13n, E.PermissionError], [17n, E.FileExistsError], [20n, E.NotADirectoryError], [21n, E.IsADirectoryError], [110n, E.TimeoutError]]);
+    method(E.OSError, "__init__", -1, function (args) {
+        const self = args[0], a = args.slice(1);
+        const d = self.dict;
+        for (const k of ["errno", "strerror", "filename", "filename2"]) d.set(k, null);
+        if (a.length >= 2 && a.length <= 5) {
+            d.set("errno", a[0]); d.set("strerror", a[1]);
+            if (a.length >= 3) d.set("filename", a[2]);
+            if (a.length === 5) d.set("filename2", a[4]);
+            if (self.cls === E.OSError && isInt(a[0])) { const sub = ERRNO_CLASS.get(asInt(a[0])); if (sub !== undefined) self.cls = sub; }
+            self.args = tuple(a.slice(0, 2));
+        } else self.args = tuple(a);
+        rt.refreshExc(self);
+        if (a.length >= 2 && a.length <= 5) self.message = str(self) + (self.traceback || "");
+        return null;
+    });
+    method(E.OSError, "__str__", 1, function (args) {
+        const self = args[0], d = self.dict;
+        const filename = d.get("filename"), filename2 = d.get("filename2");
+        if (filename !== undefined && filename !== null) return "[Errno " + str(d.get("errno")) + "] " + str(d.get("strerror")) + ": " + repr(filename) + (filename2 !== undefined && filename2 !== null ? " -> " + repr(filename2) : "");
+        if (d.get("errno") !== undefined && d.get("errno") !== null && self.args.items.length === 2) return "[Errno " + str(d.get("errno")) + "] " + str(d.get("strerror"));
+        const it = self.args.items; return it.length === 0 ? "" : it.length === 1 ? str(it[0]) : repr(self.args);
+    });
     method(E.BaseException, "with_traceback", 2, function (args) { return args[0]; });
     method(E.BaseException, "add_note", 2, function (args) { return null; });
     for (const [name, exc] of Object.entries(E)) {
@@ -129,23 +155,37 @@
     method(T.super, "__repr__", 1, (a) => "<super: <class '" + a[0].type.name + "'>, <" + typeOf(a[0].obj).name + " object>>");
 
     // ---- numbers ---------------------------------------------------------------------------------------------------
+    // int(str, base) as CPython parses it: an optional sign, an optional
+    // base prefix (when base is 0 or matches), single underscores only
+    // between digits or right after the prefix, and no leading zeros in a
+    // base-0 decimal other than zero itself.
     function parseIntLiteral(s, base) {
-        let t = s.trim().replace(/_/g, "");
+        const bad = () => fail(E.ValueError, "invalid literal for int() with base " + base + ": " + repr(s));
+        let t = s.trim();
         let neg = false;
         if (t[0] === "+" || t[0] === "-") { neg = t[0] === "-"; t = t.slice(1); }
+        const p = t.slice(0, 2).toLowerCase();
+        let radix = base, prefixed = false;
         if (base === 0) {
-            const p = t.slice(0, 2).toLowerCase();
-            base = p === "0x" ? 16 : p === "0o" ? 8 : p === "0b" ? 2 : 10;
-            if (base !== 10) t = t.slice(2);
-        } else if (base === 16 && /^0x/i.test(t)) t = t.slice(2);
-        else if (base === 8 && /^0o/i.test(t)) t = t.slice(2);
-        else if (base === 2 && /^0b/i.test(t)) t = t.slice(2);
-        if (t.length === 0 || !/^[0-9a-z]+$/i.test(t)) fail(E.ValueError, "invalid literal for int() with base " + base + ": " + repr(s));
-        let v = 0n; const big = BigInt(base);
-        for (const ch of t.toLowerCase()) {
-            const d = parseInt(ch, 36);
-            if (Number.isNaN(d) || d >= base) fail(E.ValueError, "invalid literal for int() with base " + base + ": " + repr(s));
-            v = v * big + BigInt(d);
+            radix = p === "0x" ? 16 : p === "0o" ? 8 : p === "0b" ? 2 : 10;
+            prefixed = radix !== 10;
+        } else prefixed = (base === 16 && p === "0x") || (base === 8 && p === "0o") || (base === 2 && p === "0b");
+        if (prefixed) { t = t.slice(2); if (t[0] === "_") t = t.slice(1); }
+        if (!/^[0-9a-z]+(?:_[0-9a-z]+)*$/i.test(t)) bad();
+        t = t.replace(/_/g, "").toLowerCase();
+        if (base === 0 && radix === 10 && t.length > 1 && t[0] === "0" && /[^0]/.test(t)) bad();
+        let v;
+        if (radix === 10 || radix === 16 || radix === 8 || radix === 2) {
+            const digits = radix === 10 ? /^[0-9]+$/ : radix === 16 ? /^[0-9a-f]+$/ : radix === 8 ? /^[0-7]+$/ : /^[01]+$/;
+            if (!digits.test(t)) bad();
+            v = BigInt(radix === 10 ? t : (radix === 16 ? "0x" : radix === 8 ? "0o" : "0b") + t);
+        } else {
+            v = 0n; const big = BigInt(radix);
+            for (const ch of t) {
+                const d = parseInt(ch, 36);
+                if (d >= radix) bad();
+                v = v * big + BigInt(d);
+            }
         }
         return neg ? -v : v;
     }
@@ -154,29 +194,31 @@
         if (k && k.has("base")) base = Number(needInt(k.get("base")));
         if (args.length === 0) return 0n;
         if (args.length === 2) base = Number(needInt(args[1]));
+        if (base !== 0 && (base < 2 || base > 36)) fail(E.ValueError, "int() base must be >= 2 and <= 36, or 0");
         const v = args[0];
         if (typeof v === "string") return parseIntLiteral(v, base);
         if (args.length === 2 || (k && k.has("base"))) fail(E.TypeError, "int() can't convert non-string with explicit base");
         if (isInt(v)) return asInt(v);
-        if (typeof v === "number") { if (!Number.isFinite(v)) fail(Number.isNaN(v) ? E.ValueError : E.OverflowError, Number.isNaN(v) ? "cannot convert float NaN to integer" : "cannot convert float infinity to integer"); return BigInt(Math.trunc(v)); }
+        if (typeof v === "number") return rt.floatToInt(v);
         if (v !== null && typeof v === "object" && v.cls === T.bytes) return parseIntLiteral(String.fromCharCode(...v.items), base);
         const m = typeMethod(v, "__int__") || typeMethod(v, "__index__") || typeMethod(v, "__trunc__");
         if (m !== undefined) return call(descrGet(m, v, typeOf(v)), [], null);
         fail(E.TypeError, "int() argument must be a string, a bytes-like object or a real number, not '" + typeOf(v).name + "'");
     });
     function parseFloatLiteral(s) {
-        const t = s.trim().replace(/_/g, "").toLowerCase();
+        const t = s.trim().toLowerCase();
         if (t === "inf" || t === "+inf" || t === "infinity" || t === "+infinity") return Infinity;
         if (t === "-inf" || t === "-infinity") return -Infinity;
         if (t === "nan" || t === "+nan" || t === "-nan") return NaN;
-        if (!/^[+-]?(\d+\.?\d*(e[+-]?\d+)?|\.\d+(e[+-]?\d+)?)$/.test(t)) fail(E.ValueError, "could not convert string to float: " + repr(s));
-        return Number(t);
+        // Underscores only between digits.
+        if (!/^[+-]?(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)(?:e[+-]?\d(?:_?\d)*)?$/.test(t)) fail(E.ValueError, "could not convert string to float: " + repr(s));
+        return Number(t.replace(/_/g, ""));
     }
     rt.constructors.set(T.float, (args) => {
         if (args.length === 0) return 0.0;
         const v = args[0];
         if (typeof v === "number") return v;
-        if (isInt(v)) return Number(asInt(v));
+        if (isInt(v)) return toFloat(v);
         if (typeof v === "string") return parseFloatLiteral(v);
         const m = typeMethod(v, "__float__");
         if (m !== undefined) return call(descrGet(m, v, typeOf(v)), [], null);
@@ -191,7 +233,7 @@
     for (const t of [T.int, T.float, T.str, T.bool]) rt.allocators.set(t, null), rt.allocators.delete(t);
     method(T.int, "__index__", 1, (a) => asInt(a[0]));
     method(T.int, "__int__", 1, (a) => asInt(a[0]));
-    method(T.int, "__float__", 1, (a) => Number(asInt(a[0])));
+    method(T.int, "__float__", 1, (a) => toFloat(a[0]));
     for (const [t, base] of [[T.int, true], [T.float, false]]) {
         for (const [name, op] of [["add", "add"], ["sub", "sub"], ["mul", "mul"], ["truediv", "truediv"], ["floordiv", "floordiv"], ["mod", "mod"], ["pow", "pow"], ["and", "and"], ["or", "or"], ["xor", "xor"], ["lshift", "lshift"], ["rshift", "rshift"]]) {
             if (!base && ["and", "or", "xor", "lshift", "rshift"].includes(op)) continue;
@@ -258,26 +300,33 @@
         }
         if (typeof x !== "number") { const m = typeMethod(x, "__round__"); if (m !== undefined) return call(descrGet(m, x, typeOf(x)), n === undefined ? [] : [n], null); fail(E.TypeError, "type " + typeOf(x).name + " doesn't define __round__ method"); }
         if (n === undefined || n === null) {
-            if (!Number.isFinite(x)) fail(Number.isNaN(x) ? E.ValueError : E.OverflowError, "cannot convert float " + rt.floatRepr(x) + " to integer");
+            if (!Number.isFinite(x)) rt.floatToInt(x);
             const f = Math.floor(x), diff = x - f;
             let r = diff < 0.5 ? f : diff > 0.5 ? f + 1 : (f % 2 === 0 ? f : f + 1);
             return BigInt(r);
         }
         const d = Number(needInt(n));
         if (!Number.isFinite(x)) return x;
-        if (d > 0) return Number(fixedHalfEven(x, Math.min(d, 100)));
+        // `fixedHalfEven` formats through a decimal string, which has no
+        // negative zero: round(-0.0, 2) and round(-0.001, 1) are -0.0.
+        if (d > 0) { const r = Number(fixedHalfEven(x, Math.min(d, 100))); return r === 0 && (x < 0 || Object.is(x, -0)) ? -0 : r; }
         const factor = Math.pow(10, -d);
         const scaled = x / factor;
         let r = Math.floor(scaled);
         const diff = scaled - r;
         if (diff > 0.5 || (diff === 0.5 && r % 2 !== 0)) r += 1;
-        return r * factor;
+        // A zero result keeps the sign of x (round(-0.3) is -0.0).
+        const out = r * factor;
+        return out === 0 && (x < 0 || Object.is(x, -0)) ? -0 : out;
     }
     rt.roundValue = roundValue;
     // `x` to `n` decimals, correctly rounded with ties to even on the EXACT
     // binary value (JS's toFixed rounds exact ties away from zero).
     function fixedHalfEven(x, n) {
         if (!Number.isFinite(x)) return String(x);
+        // toFixed switches to exponent form from 1e21; such doubles are
+        // integers, so their exact digits come from BigInt.
+        if (Math.abs(x) >= 1e21) return (x < 0 ? "-" : "") + BigInt(Math.abs(x)).toString() + (n > 0 ? "." + "0".repeat(n) : "");
         const exact = Math.abs(x).toFixed(Math.min(n + 30, 100));
         const tail = exact.slice(exact.indexOf(".") + 1 + n);
         let s = Math.abs(x).toFixed(n);
@@ -319,8 +368,28 @@
     method(S, "lower", 1, (a) => strSelf(a).toLowerCase());
     method(S, "casefold", 1, (a) => strSelf(a).toLowerCase().replace(/ß/g, "ss").replace(/ſ/g, "s").replace(/ﬁ/g, "fi").replace(/ﬂ/g, "fl"));
     method(S, "swapcase", 1, (a) => Array.from(strSelf(a), (c) => c === c.toUpperCase() ? c.toLowerCase() : c.toUpperCase()).join(""));
-    method(S, "capitalize", 1, (a) => { const s = strSelf(a); return s.length ? Array.from(s)[0].toUpperCase() + Array.from(s).slice(1).join("").toLowerCase() : s; });
-    method(S, "title", 1, (a) => strSelf(a).replace(/[A-Za-zÀ-ɏ]+/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase()));
+    // Titlecase mappings that differ from uppercase (Unicode's Lt digraphs,
+    // SpecialCasing titlecase forms, and Georgian, whose letters titlecase to
+    // themselves); everything else titlecases like toUpperCase.
+    const TITLE = new Map([["Ǆ", "ǅ"], ["ǅ", "ǅ"], ["ǆ", "ǅ"], ["Ǉ", "ǈ"], ["ǈ", "ǈ"], ["ǉ", "ǈ"], ["Ǌ", "ǋ"], ["ǋ", "ǋ"], ["ǌ", "ǋ"], ["Ǳ", "ǲ"], ["ǲ", "ǲ"], ["ǳ", "ǲ"],
+        ["ß", "Ss"], ["ﬀ", "Ff"], ["ﬁ", "Fi"], ["ﬂ", "Fl"], ["ﬃ", "Ffi"], ["ﬄ", "Ffl"], ["ﬅ", "St"], ["ﬆ", "St"], ["և", "Եւ"], ["ﬓ", "Մն"], ["ﬔ", "Մե"], ["ﬕ", "Մի"], ["ﬖ", "Վն"], ["ﬗ", "Մխ"]]);
+    for (let cp = 0x1f80; cp < 0x1fb0; cp++) TITLE.set(String.fromCodePoint(cp), String.fromCodePoint(cp | 8));
+    for (const [from, to] of [[0x1fb3, 0x1fbc], [0x1fbc, 0x1fbc], [0x1fc3, 0x1fcc], [0x1fcc, 0x1fcc], [0x1ff3, 0x1ffc], [0x1ffc, 0x1ffc]]) TITLE.set(String.fromCodePoint(from), String.fromCodePoint(to));
+    function titleChar(ch) {
+        const t = TITLE.get(ch);
+        if (t !== undefined) return t;
+        const cp = ch.codePointAt(0);
+        return (cp >= 0x10d0 && cp <= 0x10fa) || (cp >= 0x10fd && cp <= 0x10ff) ? ch : ch.toUpperCase();
+    }
+    const CASED_CHAR = /^[\p{Lowercase}\p{Uppercase}\p{Lt}]$/u;
+    method(S, "capitalize", 1, (a) => { const s = strSelf(a); if (!s.length) return s; const cps = codepoints(s); return titleChar(cps[0]) + cps.slice(1).join("").toLowerCase(); });
+    method(S, "title", 1, (a) => {
+        const s = strSelf(a);
+        if (/^[\x00-\x7f]*$/.test(s)) return s.replace(/[A-Za-z]+/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase());
+        let out = "", prevCased = false;
+        for (const ch of s) { out += prevCased ? ch.toLowerCase() : titleChar(ch); prevCased = CASED_CHAR.test(ch); }
+        return out;
+    });
     function stripChars(s, chars, mode) {
         if (chars === undefined || chars === null) { if (mode === 0) return s.trim(); return mode < 0 ? s.replace(/^\s+/, "") : s.replace(/\s+$/, ""); }
         const set = new Set(Array.from(needStr(chars)));
@@ -366,24 +435,46 @@
         if (maxsplit >= 0 && parts.length > maxsplit + 1) { const tail = parts.slice(parts.length - maxsplit); tail.unshift(parts.slice(0, parts.length - maxsplit).join(sep)); return list(tail); }
         return list(parts);
     });
-    method(S, "splitlines", 2, (a) => { const keep = a[1] !== undefined && truth(a[1]); const s = strSelf(a); const out = []; const re = /([^\r\n]*)(\r\n|\r|\n|$)/g; let m; while ((m = re.exec(s)) !== null && (m[1].length || m[2].length)) { out.push(keep ? m[1] + m[2] : m[1]); if (m[2] === "") break; } return list(out); }, 1);
+    // Every line boundary str.splitlines recognizes.
+    method(S, "splitlines", 2, (a) => { const keep = a[1] !== undefined && truth(a[1]); const s = strSelf(a); const out = []; const re = /([^\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]*)(\r\n|[\n\r\x0b\x0c\x1c-\x1e\x85\u2028\u2029]|$)/g; let m; while ((m = re.exec(s)) !== null && (m[1].length || m[2].length)) { out.push(keep ? m[1] + m[2] : m[1]); if (m[2] === "") break; } return list(out); }, 1);
     method(S, "join", 2, (a) => { const parts = drain(a[1]); for (const p of parts) if (typeof p !== "string") fail(E.TypeError, "sequence item: expected str instance, " + typeOf(p).name + " found"); return rt.checkedText(parts.join(strSelf(a))); });
-    method(S, "replace", 4, (a) => { const s = strSelf(a), from = needStr(a[1]), to = needStr(a[2]); const count = a[3] === undefined ? -1 : Number(needInt(a[3])); if (count < 0) return s.split(from).join(to); let out = "", rest = s, n = 0; while (n < count) { const i = from === "" ? (rest.length ? 0 : -1) : rest.indexOf(from); if (i < 0) break; if (from === "") { out += to + rest[0]; rest = rest.slice(1); } else { out += rest.slice(0, i) + to; rest = rest.slice(i + from.length); } n++; } return out + rest; }, 3);
+    method(S, "replace", 4, (a) => {
+        const s = strSelf(a), from = needStr(a[1]), to = needStr(a[2]); const count = a[3] === undefined ? -1 : Number(needInt(a[3]));
+        if (from === "") {
+            // An empty pattern matches before every code point and at the end.
+            const cps = codepoints(s); const n = count < 0 ? cps.length + 1 : Math.min(count, cps.length + 1);
+            if (n === 0) return s;
+            if (cps.length === 0) return to;
+            if (n > cps.length) return rt.checkedText(to + cps.join(to) + to);
+            let out = ""; for (let i = 0; i < n; i++) out += to + cps[i];
+            return rt.checkedText(out + cps.slice(n).join(""));
+        }
+        if (count < 0) return rt.checkedText(s.split(from).join(to));
+        let out = "", rest = s, n = 0; while (n < count) { const i = rest.indexOf(from); if (i < 0) break; out += rest.slice(0, i) + to; rest = rest.slice(i + from.length); n++; } return rt.checkedText(out + rest);
+    }, 3);
+    // start/end of find/index/count, clamped like a slice; null when the
+    // start lies past the end (then even an empty needle is not found).
+    function searchRange(a, s) {
+        const noBounds = (a[2] === undefined || a[2] === null) && (a[3] === undefined || a[3] === null);
+        if (noBounds) return { hay: s, start: 0, cps: null };
+        const cps = codepoints(s);
+        let start = a[2] === undefined || a[2] === null ? 0 : Number(rt.indexOf(a[2])), end = a[3] === undefined || a[3] === null ? cps.length : Number(rt.indexOf(a[3]));
+        if (start < 0) start = Math.max(0, start + cps.length); if (end < 0) end = Math.max(0, end + cps.length); end = Math.min(end, cps.length);
+        if (start > cps.length) return null;
+        return { hay: cps.slice(start, Math.max(start, end)).join(""), start: start, cps: cps };
+    }
     function findImpl(a, rev, raise) {
         const s = strSelf(a), sub = needStr(a[1]);
-        const cps = codepoints(s);
-        let start = a[2] === undefined || a[2] === null ? 0 : Number(needInt(a[2])), end = a[3] === undefined || a[3] === null ? cps.length : Number(needInt(a[3]));
-        if (start < 0) start = Math.max(0, start + cps.length); if (end < 0) end = Math.max(0, end + cps.length); end = Math.min(end, cps.length);
-        const hay = cps.slice(start, end).join("");
-        const i = rev ? hay.lastIndexOf(sub) : hay.indexOf(sub);
+        const r = searchRange(a, s);
+        const i = r === null ? -1 : rev ? r.hay.lastIndexOf(sub) : r.hay.indexOf(sub);
         if (i < 0) { if (raise) fail(E.ValueError, "substring not found"); return -1n; }
-        return BigInt(start + codepoints(hay.slice(0, i)).length);
+        return BigInt(r.start + (rt.hasSurrogate(r.hay) ? rt.strLen(r.hay.slice(0, i)) : i));
     }
     method(S, "find", 4, (a) => findImpl(a, false, false), 2);
     method(S, "rfind", 4, (a) => findImpl(a, true, false), 2);
     method(S, "index", 4, (a) => findImpl(a, false, true), 2);
     method(S, "rindex", 4, (a) => findImpl(a, true, true), 2);
-    method(S, "count", 4, (a) => { const s = strSelf(a), sub = needStr(a[1]); if (sub === "") return BigInt(rt.strLen(s) + 1); return BigInt(s.split(sub).length - 1); }, 2);
+    method(S, "count", 4, (a) => { const s = strSelf(a), sub = needStr(a[1]); const r = searchRange(a, s); if (r === null) return 0n; if (sub === "") return BigInt(rt.strLen(r.hay) + 1); return BigInt(r.hay.split(sub).length - 1); }, 2);
     function affix(a, end) {
         const s = strSelf(a); const p = a[1];
         const test = (x) => end ? s.endsWith(needStr(x)) : s.startsWith(needStr(x));
@@ -398,12 +489,22 @@
     method(S, "isalpha", 1, (a) => /^[\p{L}]+$/u.test(strSelf(a)));
     method(S, "isalnum", 1, (a) => /^[\p{L}\p{N}]+$/u.test(strSelf(a)));
     method(S, "isspace", 1, (a) => /^\s+$/.test(strSelf(a)));
-    method(S, "isupper", 1, (a) => { const s = strSelf(a); return /[A-Za-z]/.test(s) && s === s.toUpperCase(); });
-    method(S, "islower", 1, (a) => { const s = strSelf(a); return /[A-Za-z]/.test(s) && s === s.toLowerCase(); });
-    method(S, "istitle", 1, (a) => { const s = strSelf(a); return /[A-Za-z]/.test(s) && s === s.replace(/[A-Za-z]+/g, (w) => w[0].toUpperCase() + w.slice(1).toLowerCase()); });
+    // Cased characters are those with the Lowercase or Uppercase property or
+    // the titlecase category, as in CPython's unicode ctype table.
+    method(S, "isupper", 1, (a) => { const s = strSelf(a); return /\p{Uppercase}/u.test(s) && !/[\p{Lowercase}\p{Lt}]/u.test(s); });
+    method(S, "islower", 1, (a) => { const s = strSelf(a); return /\p{Lowercase}/u.test(s) && !/[\p{Uppercase}\p{Lt}]/u.test(s); });
+    method(S, "istitle", 1, (a) => {
+        let cased = false, prevCased = false;
+        for (const ch of strSelf(a)) {
+            if (/^[\p{Uppercase}\p{Lt}]$/u.test(ch)) { if (prevCased) return false; prevCased = cased = true; }
+            else if (/^\p{Lowercase}$/u.test(ch)) { if (!prevCased) return false; prevCased = cased = true; }
+            else prevCased = false;
+        }
+        return cased;
+    });
     method(S, "isidentifier", 1, (a) => /^[\p{L}\p{Nl}_][\p{L}\p{Nl}\p{Mn}\p{Mc}\p{Nd}\p{Pc}_]*$/u.test(strSelf(a)));
     method(S, "isascii", 1, (a) => { const s = strSelf(a); for (let i = 0; i < s.length; i++) if (s.charCodeAt(i) > 0x7f) return false; return true; });
-    method(S, "isprintable", 1, (a) => !/[\x00-\x1f\x7f]/.test(strSelf(a)));
+    method(S, "isprintable", 1, (a) => !rt.NONPRINTABLE.test(strSelf(a)));
     function pad(a, mode) {
         const s = strSelf(a); const width = Number(needInt(a[1])); const fill = a[2] === undefined ? " " : needStr(a[2]);
         if (codepoints(fill).length !== 1) fail(E.TypeError, "The fill character must be exactly one character long");
@@ -417,7 +518,7 @@
     method(S, "ljust", 3, (a) => pad(a, -1), 2);
     method(S, "rjust", 3, (a) => pad(a, 1), 2);
     method(S, "center", 3, (a) => pad(a, 0), 2);
-    method(S, "zfill", 2, (a) => { const s = strSelf(a); const width = Number(needInt(a[1])); if (s.length >= width) return s; const sign = s[0] === "-" || s[0] === "+" ? s[0] : ""; return sign + "0".repeat(width - s.length) + s.slice(sign.length); });
+    method(S, "zfill", 2, (a) => { const s = strSelf(a); const width = Number(needInt(a[1])); const n = rt.strLen(s); if (n >= width) return s; const sign = s[0] === "-" || s[0] === "+" ? s[0] : ""; return sign + "0".repeat(width - n) + s.slice(sign.length); });
     method(S, "partition", 2, (a) => { const s = strSelf(a), sep = needStr(a[1]); const i = s.indexOf(sep); return i < 0 ? tuple([s, "", ""]) : tuple([s.slice(0, i), sep, s.slice(i + sep.length)]); });
     method(S, "rpartition", 2, (a) => { const s = strSelf(a), sep = needStr(a[1]); const i = s.lastIndexOf(sep); return i < 0 ? tuple(["", "", s]) : tuple([s.slice(0, i), sep, s.slice(i + sep.length)]); });
     method(S, "encode", -1, (a) => { const kw = kwOf(a, ["encoding", "errors"]); return rt.encodeStr(strSelf(a), a[1] === undefined ? kwget(kw, "encoding", "utf-8") : a[1], a[2] === undefined ? kwget(kw, "errors", "strict") : a[2]); });
@@ -576,7 +677,7 @@
     rt.constructors.set(T.list, (args, kw, cls) => { const out = cls === T.list ? list([]) : rt.allocInstance(cls); if (args.length) out.items = drain(args[0]); return out; });
     rt.allocators.set(T.list, (cls) => ({ cls: cls, items: [] }));
     rt.allocators.set(T.tuple, (cls) => ({ cls: cls, items: [] }));
-    rt.allocators.set(T.dict, (cls) => ({ cls: cls, map: new Map(), size: 0 }));
+    rt.allocators.set(T.dict, (cls) => ({ cls: cls, map: new Map(), size: 0, str: true }));
     rt.allocators.set(T.set, (cls) => ({ cls: cls, map: new Map(), size: 0 }));
     method(L, "__init__", -1, (a) => { const self = a[0]; self.items = a.length > 1 ? drain(a[1]) : []; return null; });
     method(L, "append", 2, (a) => { const l = listSelf(a); if (l.items.length >= rt.MAX_ITEMS) fail(E.MemoryError, "list limit exceeded"); l.items.push(a[1]); return null; });
@@ -610,11 +711,57 @@
     method(L, "__repr__", 1, (a) => rt.baseRepr(a[0]));
     L.dict.set("__hash__", null);
     function sortItems(items, key, reverse) {
-        const keyed = key === null ? rt.amap(items, (x) => [x, x]) : rt.amap(items, (x) => [call(key, [x], null), x]);
-        // A stable merge sort using Python ordering (`<` only, as CPython).
-        const lt = (a, b) => cmp("lt", a[0], b[0]);
-        const sorted = mergeSort(keyed, reverse ? (a, b) => lt(b, a) : lt);
-        return rt.amap(sorted, (p) => p[1]);
+        // As CPython: reverse=True reverses, sorts stably and reverses back,
+        // so equal items keep their order and `<` sees the same operands.
+        const keys = key === null ? items.slice() : rt.amap(items, (x) => call(key, [x], null));
+        const values = key === null ? null : items.slice();
+        if (reverse) { keys.reverse(); if (values !== null) values.reverse(); }
+        const lt = (a, b) => cmp("lt", a, b);
+        if (keys.length < 64) smallSort(keys, values, lt);
+        else {
+            const keyed = rt.amap(keys, (k, i) => [k, values === null ? k : values[i]]);
+            const sorted = mergeSort(keyed, (a, b) => lt(a[0], b[0]));
+            for (let i = 0; i < sorted.length; i++) { keys[i] = sorted[i][0]; if (values !== null) values[i] = sorted[i][1]; }
+        }
+        const out = values === null ? keys : values;
+        if (reverse) out.reverse();
+        return out;
+    }
+    // CPython 3.13's sort of a short list, comparison for comparison: the
+    // leading run (count_run, a descending run reversed in place), then
+    // binary insertion of the rest.
+    function smallSort(keys, values, lt) {
+        const n = keys.length;
+        if (n < 2) return;
+        const rev = (lo, hi) => { for (let i = lo, j = hi - 1; i < j; i++, j--) { [keys[i], keys[j]] = [keys[j], keys[i]]; if (values !== null) [values[i], values[j]] = [values[j], values[i]]; } };
+        let run = 1;
+        while (run < n && !lt(keys[run], keys[run - 1])) run++;
+        if (run < n) {
+            // A strictly ascending run ends here; a run of equal items turns
+            // into the start of a descending one.
+            let ascending = false;
+            if (run > 1) { if (lt(keys[0], keys[run - 1])) ascending = true; else rev(0, run); }
+            if (!ascending) {
+                run++;
+                let neq = 0;
+                for (; run < n; run++) {
+                    if (lt(keys[run], keys[run - 1])) { if (neq) { rev(run - neq - 1, run); neq = 0; } }
+                    else if (lt(keys[run - 1], keys[run])) break;
+                    else neq++;
+                }
+                if (neq) rev(run - neq - 1, run);
+                rev(0, run);
+                while (run < n && !lt(keys[run], keys[run - 1])) run++;
+            }
+        }
+        for (let i = run; i < n; i++) {
+            const pivot = keys[i]; let l = 0, r = i;
+            while (l < r) { const m = (l + r) >> 1; if (lt(pivot, keys[m])) r = m; else l = m + 1; }
+            if (l < i) {
+                keys.copyWithin(l + 1, l, i); keys[l] = pivot;
+                if (values !== null) { const pv = values[i]; values.copyWithin(l + 1, l, i); values[l] = pv; }
+            }
+        }
     }
     function mergeSort(arr, lt) {
         if (arr.length <= 1) return arr;
@@ -672,7 +819,7 @@
     method(D, "pop", 3, (a) => { const d = dictSelf(a); const v = dictGet(d, a[1]); if (v === undefined) { if (a[2] === undefined) throw rt.makeExc(E.KeyError, [a[1]]); return a[2]; } dictDel(d, a[1]); return v; }, 2);
     method(D, "popitem", 1, (a) => { const d = dictSelf(a); const entries = dictEntryList(d); if (!entries.length) fail(E.KeyError, "popitem(): dictionary is empty"); const [k, v] = entries[entries.length - 1]; dictDel(d, k); return tuple([k, v]); });
     methodkw(D, "update", (a) => { const kw = kwOf(a, null); fillDict(dictSelf(a), a[1], kw); return null; });
-    method(D, "clear", 1, (a) => { const d = dictSelf(a); d.map.clear(); d.size = 0; return null; });
+    method(D, "clear", 1, (a) => { rt.dictClear(dictSelf(a)); return null; });
     method(D, "copy", 1, (a) => rt.dictCopy(dictSelf(a)));
     function view(type, d, pick) {
         return { cls: type, dict: d, iter: () => { const entries = dictEntryList(d); let i = 0; return { cls: T.iterator, next: () => i < entries.length ? pick(entries[i++]) : STOP }; } };
@@ -813,8 +960,9 @@
     rt.flushOut = function () { if (outBuf.length) { console.log(outBuf); outBuf = ""; } if (errBuf.length) { console.error(errBuf); errBuf = ""; } };
     def("len", 1, (a) => len(a[0]));
     def("repr", 1, (a) => repr(a[0]));
-    rt.ascii = (v) => repr(v).replace(/[^\x00-\x7f]/g, (c) => { const cp = c.codePointAt(0); return cp < 0x100 ? "\\x" + cp.toString(16).padStart(2, "0") : cp < 0x10000 ? "\\u" + cp.toString(16).padStart(4, "0") : "\\U" + cp.toString(16).padStart(8, "0"); });
-    def("ascii", 1, (a) => repr(a[0]).replace(/[^\x00-\x7f]/g, (c) => { const cp = c.codePointAt(0); return cp < 0x100 ? "\\x" + cp.toString(16).padStart(2, "0") : cp < 0x10000 ? "\\u" + cp.toString(16).padStart(4, "0") : "\\U" + cp.toString(16).padStart(8, "0"); }));
+    // One escape per code point: an astral character is \U0001xxxx, not a surrogate pair.
+    rt.ascii = (v) => repr(v).replace(/[^\x00-\x7f]/gu, (c) => rt.hexEscape(c.codePointAt(0)));
+    def("ascii", 1, (a) => rt.ascii(a[0]));
     def("abs", 1, (a) => { const v = a[0]; if (isInt(v)) { const i = asInt(v); return i < 0n ? -i : i; } if (typeof v === "number") return Math.abs(v); const r = callMethod(v, "__abs__", []); if (r !== undefined) return r; fail(E.TypeError, "bad operand type for abs(): '" + typeOf(v).name + "'"); });
     defkw("min", (a) => minmax(a, "lt", "min"));
     defkw("max", (a) => minmax(a, "gt", "max"));
@@ -844,10 +992,10 @@
                 continue;
             }
             if (floating) {
-                if (isInt(v)) { const t = fsum + Number(asInt(v)); comp += Math.abs(fsum) >= Math.abs(t - fsum) ? (fsum - t) + Number(asInt(v)) : (Number(asInt(v)) - t) + fsum; fsum = t; continue; }
+                if (isInt(v)) { const x = toFloat(v), t = fsum + x; comp += Math.abs(fsum) >= Math.abs(t - fsum) ? (fsum - t) + x : (x - t) + fsum; fsum = t; continue; }
                 acc = fsum + comp; floating = false;
             }
-            acc = R.binop("add", acc, v);
+            acc = R.add(acc, v);
         }
         return floating ? fsum + comp : acc;
     });
@@ -873,8 +1021,44 @@
     def("chr", 1, (a) => { const n = Number(needInt(a[0])); if (n < 0 || n > 0x10FFFF) fail(E.ValueError, "chr() arg not in range(0x110000)"); return String.fromCodePoint(n); });
     def("ord", 1, (a) => { const s = needStr(a[0], "ord() expected string of length 1, but"); const cps = codepoints(s); if (cps.length !== 1) fail(E.TypeError, "ord() expected a character, but string of length " + cps.length + " found"); return BigInt(cps[0].codePointAt(0)); });
     def("round", 2, (a) => roundValue(a[0], a[1]), 1);
-    def("divmod", 2, (a) => tuple([R.binop("floordiv", a[0], a[1]), R.binop("mod", a[0], a[1])]));
-    def("pow", 3, (a) => { if (a.length === 3 && a[2] !== null) { let b = needInt(a[0]), e = needInt(a[1]), m = needInt(a[2]); if (m === 0n) fail(E.ValueError, "pow() 3rd argument cannot be 0"); if (e < 0n) fail(E.ValueError, "negative exponent with modulus is not supported"); let r = 1n; b = ((b % m) + m) % m; while (e > 0n) { if (e & 1n) r = (r * b) % m; e >>= 1n; b = (b * b) % m; } return r; } return R.binop("pow", a[0], a[1]); }, 2);
+    def("divmod", 2, (a) => {
+        const x = a[0], y = a[1];
+        if (isNum(x) && isNum(y)) {
+            if (typeof x === "number" || typeof y === "number") return tuple(rt.floatDivmod(toFloat(x), toFloat(y)));
+            return tuple([R.binop("floordiv", x, y), R.binop("mod", x, y)]);
+        }
+        const m = typeMethod(x, "__divmod__");
+        if (m !== undefined && !m.isBase) { const r = call(descrGet(m, x, typeOf(x)), [y], null); if (r !== NOTIMPL) return r; }
+        const rm = typeMethod(y, "__rdivmod__");
+        if (rm !== undefined && !rm.isBase) { const r = call(descrGet(rm, y, typeOf(y)), [x], null); if (r !== NOTIMPL) return r; }
+        return tuple([R.binop("floordiv", x, y), R.binop("mod", x, y)]);
+    });
+    def("pow", 3, (a) => {
+        if (a.length === 3 && a[2] !== null) {
+            if (!isInt(a[0]) || !isInt(a[1]) || !isInt(a[2])) {
+                // pow(x, y, z) on an instance calls its __pow__ with the modulus.
+                const m = a[0] !== null && typeof a[0] === "object" ? typeMethod(a[0], "__pow__") : undefined;
+                if (m !== undefined && !m.isBase) { const r = call(descrGet(m, a[0], typeOf(a[0])), [a[1], a[2]], null); if (r !== NOTIMPL) return r; }
+                if (isNum(a[0]) && isNum(a[1]) && isNum(a[2])) fail(E.TypeError, "pow() 3rd argument not allowed unless all arguments are integers");
+                fail(E.TypeError, "unsupported operand type(s) for ** or pow(): '" + typeOf(a[0]).name + "', '" + typeOf(a[1]).name + "', '" + typeOf(a[2]).name + "'");
+            }
+            let b = asInt(a[0]), e = asInt(a[1]); const m = asInt(a[2]);
+            if (m === 0n) fail(E.ValueError, "pow() 3rd argument cannot be 0");
+            const mm = m < 0n ? -m : m;
+            b = ((b % mm) + mm) % mm;
+            if (e < 0n) {
+                // A negative exponent uses the modular inverse (extended Euclid).
+                let r0 = mm, r1 = b, t0 = 0n, t1 = 1n;
+                while (r1 !== 0n) { const q = r0 / r1; [r0, r1] = [r1, r0 - q * r1]; [t0, t1] = [t1, t0 - q * t1]; }
+                if (r0 !== 1n) fail(E.ValueError, "base is not invertible for the given modulus");
+                b = ((t0 % mm) + mm) % mm; e = -e;
+            }
+            let r = 1n % mm;
+            while (e > 0n) { if (e & 1n) r = (r * b) % mm; e >>= 1n; if (e > 0n) b = (b * b) % mm; }
+            return m < 0n && r !== 0n ? r - mm : r;
+        }
+        return R.binop("pow", a[0], a[1]);
+    }, 2);
     def("bin", 1, (a) => { const v = rt.indexOf(a[0]); return (v < 0n ? "-0b" : "0b") + (v < 0n ? -v : v).toString(2); });
     def("oct", 1, (a) => { const v = rt.indexOf(a[0]); return (v < 0n ? "-0o" : "0o") + (v < 0n ? -v : v).toString(8); });
     def("hex", 1, (a) => { const v = rt.indexOf(a[0]); return (v < 0n ? "-0x" : "0x") + (v < 0n ? -v : v).toString(16); });

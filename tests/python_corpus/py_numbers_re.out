@@ -1,0 +1,36 @@
+group-span (0, 1) (2, 3) 2 3 (2, 3)
+unmatched (-1, -1) -1 -1 None (None, 'b') ('-', 'b') 2 (0, 1)
+optional -1 (1, 2) c ((1, 2), (-1, -1))
+astral (2, 7) hello 1 [(2, 7), (10, 15)]
+astral-sub -a-😀- ['', '😀', 'x', ''] ['a', '😀', 'b']
+repr <re.Match object; span=(2, 4), match='ll'> None <re.Match object; span=(6, 7), match='o'>
+fullmatch <re.Match object; span=(0, 2), match='ab'> <re.Match object; span=(0, 3), match='aaa'> None <re.Match object; span=(1, 4), match='123'>
+match-pos <re.Match object; span=(1, 3), match='ac'> None None None None
+dollar <re.Match object; span=(0, 3), match='foo'> True ['a', 'b'] None
+anchors ['a'] ['a', 'b'] x
+y!
+! x!
+y!
+inline (4, 9) ['a\nb'] ['a b'] 34
+scoped ['Ab', 'ab'] ['a\nbc'] ['ab', 'aB']
+flags 32 42 256 re.compile('a', re.IGNORECASE|re.DOTALL)
+unicode ['naïve', 'café', 'x_1'] ['na', 've', 'caf'] ['4', '٤'] ['é', 'à', 'x']
+spaces ['a', 'b', 'c\ufeffd'] [' ', '\t'] ['ab-c', 'dé']
+literals [']', 'a'] ['a{b'] ['xx', 'x', ''] ['aa', 'aa'] ['x'] ['-#&']
+verbose-class [' x'] ['#1', '#2']
+escape a\.b\*c x\-y\ z\# é! 1+1=2
+named Jane Doe {'first': 'Jane', 'last': 'Doe'} (5, 8) last 2 Doe, Jane {'x': 1}
+backref ['a', 'b'] the cat 1
+split ['', 'a', '', 'b', 'c', ''] ['', 'a', ' ', 'b', ''] ['a', ',', 'b'] ['a', 'b,c'] ['a', 'b,c'] ['a', 'b', 'c', '']
+sub -a-b--d- ('bba', 2) 1a2b True [a][]
+sub-error (a)
+sub-error a
+reentrant x B y C z 3hi 3yo * *
+scan-spans [((4, 5), (-1, -1), 1, ((4, 6), (4, 5), (-1, -1))), ((7, 8), (9, 10), 2, ((7, 10), (7, 8), (9, 10)))]
+sub-spans (0, 3)21 (4, 6)-15 (7, 11)98
+lookbehind [(1, 2), (7, 9)] (5, 6) (2, 4)
+re.error (
+re.error a)
+re.error [a
+re.error a**
+re.error (?<n>x)

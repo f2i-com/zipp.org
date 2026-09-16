@@ -379,6 +379,8 @@ var __zipp_py = (function () {
     function setattr(obj, name, value) {
         if (obj !== null && typeof obj === "object" && obj.isType) {
             if (name === "__name__") { obj.name = str(value); return null; }
+            // An enum class's members are fixed.
+            if (obj.members !== undefined && obj.members.includes(obj.dict.get(name))) fail(E.AttributeError, "cannot reassign member '" + name + "'");
             obj.dict.set(name, value); typeEpoch++; return null;
         }
         const t = typeOf(obj);
@@ -877,10 +879,15 @@ var __zipp_py = (function () {
     };
 
     // ---- iteration ----------------------------------------------------------------------------------
-    // A class-level dunder (a classmethod such as Enum.__iter__), bound to the class.
+    // A class-level dunder (a classmethod such as Enum.__iter__), bound to the
+    // class: the nearest classmethod on the MRO. An instance method of the
+    // same name nearer the class (Flag.__iter__) serves the instances and
+    // does not hide it.
     function classDunder(t, name) {
-        const m = lookupType(t, name);
-        if (m !== undefined && m !== null && typeof m === "object" && m.cls === T.classmethod) return bound(m.func, t);
+        for (const c of t.mro) {
+            const m = c.dict.get(name);
+            if (m !== undefined && m !== null && typeof m === "object" && m.cls === T.classmethod) return bound(m.func, t);
+        }
         return undefined;
     }
     rt.classDunder = classDunder;

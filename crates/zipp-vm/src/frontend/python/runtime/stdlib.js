@@ -40,6 +40,9 @@
         const ax = Math.abs(x);
         let body;
         if (!Number.isFinite(ax)) body = Number.isNaN(ax) ? "nan" : "inf";
+        // No presentation type and no precision: repr's shortest digits,
+        // including its exponent form.
+        else if (type === undefined && s.precision === null) body = rt.floatRepr(ax);
         else switch (type) {
             case "f": case "F": body = rt.fixedHalfEven(ax, Math.min(p, 100)); break;
             case "e": case "E": body = expForm(ax, p); break;
@@ -50,7 +53,9 @@
                 const exp = Math.floor(Math.log10(ax));
                 let e2 = exp;
                 let r = expForm(ax, p - 1); const em = /e([+-]\d+)$/.exec(r); if (em) e2 = parseInt(em[1], 10);
-                if (e2 < -4 || e2 >= (type === undefined && s.precision === null ? 16 : p)) {
+                // With no type (a precision but no presentation letter) the
+                // switch to exponent form comes one digit earlier than 'g'.
+                if (e2 < -4 || e2 >= (type === undefined ? p - 1 : p)) {
                     body = expForm(ax, p - 1);
                     if (!s.alt) body = body.replace(/\.?0+e/, "e");
                 } else {
@@ -81,7 +86,7 @@
             case "x": body = (s.alt ? "0x" : "") + av.toString(16); break;
             case "X": body = (s.alt ? "0X" : "") + av.toString(16).toUpperCase(); break;
             case "c": return applyAlign(String.fromCodePoint(Number(v)), s, "<", "");
-            case "e": case "E": case "f": case "F": case "g": case "G": case "%": return formatFloat(Number(v), s, s.type);
+            case "e": case "E": case "f": case "F": case "g": case "G": case "%": return formatFloat(toFloat(v), s, s.type);
             default: fail(E.ValueError, "Unknown format code '" + s.type + "' for object of type 'int'");
         }
         const prefix = /^0[boxBOX]/.test(body) ? body.slice(0, 2) : "";
@@ -238,15 +243,81 @@
         const f = (v) => { if (isNum(v)) return toFloat(v); const m = typeMethod(v, "__float__"); if (m) return call(descrGet(m, v, typeOf(v)), [], null); fail(E.TypeError, "must be real number, not " + typeOf(v).name); };
         const dom = (x) => { if (Number.isNaN(x)) fail(E.ValueError, "math domain error"); return x; };
         g.set("pi", Math.PI); g.set("e", Math.E); g.set("tau", 2 * Math.PI); g.set("inf", Infinity); g.set("nan", NaN);
-        for (const [name, impl] of [["sin", Math.sin], ["cos", Math.cos], ["tan", Math.tan], ["asin", Math.asin], ["acos", Math.acos], ["atan", Math.atan], ["sinh", Math.sinh], ["cosh", Math.cosh], ["tanh", Math.tanh], ["asinh", Math.asinh], ["acosh", Math.acosh], ["atanh", Math.atanh], ["exp", Math.exp], ["expm1", Math.expm1], ["log1p", Math.log1p], ["log2", Math.log2], ["log10", Math.log10], ["fabs", Math.abs], ["cbrt", Math.cbrt], ["erf", (x) => erfExact(x)], ["erfc", (x) => 1 - erfExact(x)], ["gamma", (x) => gammaExact(x)], ["lgamma", (x) => lgammaExact(x)], ["exp2", (x) => Math.pow(2, x)]]) fn(g, name, 1, (a) => dom(impl(f(a[0]))));
+        // CPython's math_1: a NaN from a non-NaN argument is a domain error;
+        // an infinity from a finite argument is a range error for functions
+        // that can overflow and a domain error for the rest (log1p(-1)).
+        const unary = (x, r, canOverflow) => {
+            if (r !== r) { if (x === x) fail(E.ValueError, "math domain error"); }
+            else if ((r === Infinity || r === -Infinity) && Number.isFinite(x)) fail(canOverflow ? E.OverflowError : E.ValueError, canOverflow ? "math range error" : "math domain error");
+            return r;
+        };
+        for (const [name, impl, canOverflow] of [["sin", Math.sin], ["cos", Math.cos], ["tan", Math.tan], ["asin", Math.asin], ["acos", Math.acos], ["atan", Math.atan], ["sinh", Math.sinh, true], ["cosh", Math.cosh, true], ["tanh", Math.tanh], ["asinh", Math.asinh], ["acosh", Math.acosh], ["atanh", Math.atanh], ["exp", Math.exp, true], ["expm1", Math.expm1, true], ["log1p", Math.log1p], ["fabs", Math.abs], ["cbrt", Math.cbrt], ["erf", (x) => erfExact(x)], ["erfc", (x) => 1 - erfExact(x)], ["gamma", (x) => gammaExact(x), true], ["lgamma", (x) => lgammaExact(x), true], ["exp2", (x) => Math.pow(2, x), true]]) fn(g, name, 1, (a) => { const x = f(a[0]); return unary(x, impl(x), canOverflow === true); });
         fn(g, "sqrt", 1, (a) => { const x = f(a[0]); if (x < 0) fail(E.ValueError, "math domain error"); return Math.sqrt(x); });
-        fn(g, "log", 2, (a) => { const x = f(a[0]); if (x <= 0) fail(E.ValueError, "math domain error"); if (isInt(a[0]) && asInt(a[0]) > 0n && !Number.isFinite(x)) { const s = asInt(a[0]).toString(); return (Math.log(Number("0." + s)) + s.length * Math.LN10) / (a[1] === undefined ? 1 : Math.log(f(a[1]))); } return a[1] === undefined ? Math.log(x) : Math.log(x) / Math.log(f(a[1])); }, 1);
-        fn(g, "pow", 2, (a) => Math.pow(f(a[0]), f(a[1])));
+        // CPython's loghelper: an int too large for a float is m * 2**e with
+        // m the correctly rounded frexp mantissa, so log(m) + log(2) * e.
+        const logOf = (v, impl) => {
+            if (isInt(v)) {
+                const i = asInt(v);
+                if (i <= 0n) fail(E.ValueError, "math domain error");
+                const x = Number(i);
+                if (x !== Infinity) return impl(x);
+                const bits = i.toString(16).length * 4 - 4 + (32 - Math.clz32(parseInt(i.toString(16)[0], 16)));
+                const shift = BigInt(bits - 1000);
+                // A sticky low bit keeps the conversion's rounding exact.
+                let top = i >> shift; if ((top << shift) !== i) top |= 1n;
+                let m = Number(top) / Math.pow(2, 1000), e = bits;
+                if (m === 1) { m = 0.5; e += 1; }
+                return impl(m) + impl(2) * e;
+            }
+            const x = f(v);
+            if (x !== x) return x;
+            if (x <= 0) fail(E.ValueError, "math domain error");
+            return impl(x);
+        };
+        fn(g, "log", 2, (a) => {
+            const num = logOf(a[0], Math.log);
+            if (a[1] === undefined) return num;
+            const den = logOf(a[1], Math.log);
+            if (den === 0) fail(E.ZeroDivisionError, "float division by zero");
+            return num / den;
+        }, 1);
+        fn(g, "log2", 1, (a) => logOf(a[0], Math.log2));
+        fn(g, "log10", 1, (a) => logOf(a[0], Math.log10));
+        // math.pow: C99 pow on the IEEE specials, then a domain error for a
+        // NaN result or 0 ** negative and a range error for an overflow.
+        fn(g, "pow", 2, (a) => {
+            const x = f(a[0]), y = f(a[1]);
+            if (!Number.isFinite(x) || !Number.isFinite(y)) {
+                if (x !== x) return y === 0 ? 1 : x;
+                if (y !== y) return x === 1 ? 1 : y;
+                if (x === Infinity || x === -Infinity) {
+                    const odd = Number.isFinite(y) && Math.abs(y) % 2 === 1;
+                    if (y > 0) return odd ? x : Infinity;
+                    if (y === 0) return 1;
+                    return odd ? (x < 0 ? -0 : 0) : 0;
+                }
+                const ax = Math.abs(x);
+                if (ax === 1) return 1;
+                if (y > 0 && ax > 1) return y;
+                if (y < 0 && ax < 1) return -y;
+                return 0;
+            }
+            const r = Math.pow(x, y);
+            if (r !== r) fail(E.ValueError, "math domain error");
+            if (r === Infinity || r === -Infinity) fail(x === 0 ? E.ValueError : E.OverflowError, x === 0 ? "math domain error" : "math range error");
+            return r;
+        });
         fn(g, "atan2", 2, (a) => Math.atan2(f(a[0]), f(a[1])));
-        fn(g, "hypot", -1, (a) => Math.hypot(...a.map(f)));
-        fn(g, "floor", 1, (a) => { if (isInt(a[0])) return asInt(a[0]); const m = typeMethod(a[0], "__floor__"); if (m) return call(descrGet(m, a[0], typeOf(a[0])), [], null); const x = f(a[0]); if (!Number.isFinite(x)) fail(Number.isNaN(x) ? E.ValueError : E.OverflowError, "cannot convert float " + rt.floatRepr(x) + " to integer"); return BigInt(Math.floor(x)); });
-        fn(g, "ceil", 1, (a) => { if (isInt(a[0])) return asInt(a[0]); const m = typeMethod(a[0], "__ceil__"); if (m) return call(descrGet(m, a[0], typeOf(a[0])), [], null); const x = f(a[0]); if (!Number.isFinite(x)) fail(Number.isNaN(x) ? E.ValueError : E.OverflowError, "cannot convert float " + rt.floatRepr(x) + " to integer"); return BigInt(Math.ceil(x)); });
-        fn(g, "trunc", 1, (a) => { if (isInt(a[0])) return asInt(a[0]); const x = f(a[0]); if (!Number.isFinite(x)) fail(E.ValueError, "cannot convert float to integer"); return BigInt(Math.trunc(x)); });
+        fn(g, "hypot", -1, (a) => {
+            const xs = a.map(f); const r = Math.hypot(...xs);
+            if (r !== Infinity || xs.some((x) => !Number.isFinite(x))) return r;
+            // The squares overflowed: scale by the largest magnitude.
+            const m = Math.max(...xs.map(Math.abs));
+            return m * Math.sqrt(xs.reduce((s, x) => s + (x / m) * (x / m), 0));
+        });
+        fn(g, "floor", 1, (a) => { if (isInt(a[0])) return asInt(a[0]); const m = typeMethod(a[0], "__floor__"); if (m) return call(descrGet(m, a[0], typeOf(a[0])), [], null); return rt.floatToInt(Math.floor(f(a[0]))); });
+        fn(g, "ceil", 1, (a) => { if (isInt(a[0])) return asInt(a[0]); const m = typeMethod(a[0], "__ceil__"); if (m) return call(descrGet(m, a[0], typeOf(a[0])), [], null); return rt.floatToInt(Math.ceil(f(a[0]))); });
+        fn(g, "trunc", 1, (a) => { if (isInt(a[0])) return asInt(a[0]); const m = typeMethod(a[0], "__trunc__"); if (m) return call(descrGet(m, a[0], typeOf(a[0])), [], null); return rt.floatToInt(f(a[0])); });
         fn(g, "isnan", 1, (a) => Number.isNaN(f(a[0])));
         fn(g, "isinf", 1, (a) => { const x = f(a[0]); return x === Infinity || x === -Infinity; });
         fn(g, "isfinite", 1, (a) => Number.isFinite(f(a[0])));
@@ -254,17 +325,53 @@
         fn(g, "degrees", 1, (a) => f(a[0]) * 180 / Math.PI);
         fn(g, "radians", 1, (a) => f(a[0]) * Math.PI / 180);
         fn(g, "copysign", 2, (a) => { const x = Math.abs(f(a[0])), y = f(a[1]); return y < 0 || Object.is(y, -0) ? -x : x; });
-        fn(g, "fmod", 2, (a) => { const y = f(a[1]); if (y === 0) fail(E.ValueError, "math domain error"); return f(a[0]) % y; });
+        fn(g, "fmod", 2, (a) => { const x = f(a[0]), y = f(a[1]); const r = x % y; if (r !== r && x === x && y === y) fail(E.ValueError, "math domain error"); return r; });
         fn(g, "modf", 1, (a) => { const x = f(a[0]); const i = Math.trunc(x); return tuple([x - i, i]); });
         fn(g, "frexp", 1, (a) => { let x = f(a[0]); if (x === 0 || !Number.isFinite(x)) return tuple([x, 0n]); let e = Math.ceil(Math.log2(Math.abs(x))); let m = x / Math.pow(2, e); if (Math.abs(m) >= 1) { m /= 2; e++; } if (Math.abs(m) < 0.5) { m *= 2; e--; } return tuple([m, BigInt(e)]); });
-        fn(g, "ldexp", 2, (a) => f(a[0]) * Math.pow(2, Number(needInt(a[1]))));
+        // x * 2**e with one rounding: split x into its exact mantissa and
+        // exponent, then scale through powers of two that are representable.
+        fn(g, "ldexp", 2, (a) => {
+            const x = f(a[0]);
+            if (!isInt(a[1])) fail(E.TypeError, "Expected an int as second argument to ldexp.");
+            if (x === 0 || !Number.isFinite(x)) return x;
+            const e = asInt(a[1]);
+            const [m, ex] = frexpExact(x);
+            if (e > 2200n) fail(E.OverflowError, "math range error");
+            if (e < -2200n) return x < 0 ? -0 : 0;
+            const n = ex + Number(e);
+            if (n > 1024) fail(E.OverflowError, "math range error");
+            if (n >= -1021) return (m * 2) * Math.pow(2, n - 1);
+            if (n + 1000 < -1074) return x < 0 ? -0 : 0;
+            return (m * Math.pow(2, -1000)) * Math.pow(2, n + 1000);
+        });
+        // x == m * 2**e exactly, 0.5 <= |m| < 1, from the IEEE fields.
+        const F64 = new Float64Array(1), W = new Uint32Array(F64.buffer);
+        function frexpExact(x) {
+            F64[0] = x;
+            let bits = (W[1] >>> 20) & 0x7ff, extra = 0;
+            if (bits === 0) { F64[0] = x * 18014398509481984; bits = (W[1] >>> 20) & 0x7ff; extra = 54; }
+            const e = bits - 1022;
+            W[1] = (W[1] & 0x800fffff) | (1022 << 20);
+            return [F64[0], e - extra];
+        }
         fn(g, "gcd", -1, (a) => { let r = 0n; for (const v of a) { let x = asInt(needInt(v)); if (x < 0n) x = -x; let y = r; while (y) { [x, y] = [y, x % y]; } r = x; } return r; });
         fn(g, "lcm", -1, (a) => { let r = 1n; for (const v of a) { let x = asInt(needInt(v)); if (x < 0n) x = -x; if (x === 0n) return 0n; let p = r, q = x; while (q) { [p, q] = [q, p % q]; } r = r / p * x; } return r; });
         fn(g, "factorial", 1, (a) => { const n = needInt(a[0]); if (n < 0n) fail(E.ValueError, "factorial() not defined for negative values"); let r = 1n; for (let i = 2n; i <= n; i++) r *= i; return r; });
         fn(g, "comb", 2, (a) => { const n = needInt(a[0]), k = needInt(a[1]); if (n < 0n || k < 0n) fail(E.ValueError, "n must be a non-negative integer"); if (k > n) return 0n; let r = 1n; const kk = k < n - k ? k : n - k; for (let i = 1n; i <= kk; i++) r = r * (n - kk + i) / i; return r; });
         fn(g, "perm", 2, (a) => { const n = needInt(a[0]); const k = a[1] === undefined || a[1] === null ? n : needInt(a[1]); if (k > n) return 0n; let r = 1n; for (let i = 0n; i < k; i++) r *= n - i; return r; }, 1);
-        fn(g, "isqrt", 1, (a) => { const n = needInt(a[0]); if (n < 0n) fail(E.ValueError, "isqrt() argument must be nonnegative"); if (n < 2n) return n; let x = BigInt(Math.floor(Math.sqrt(Number(n)))); while (x * x > n) x--; while ((x + 1n) * (x + 1n) <= n) x++; return x; });
-        fn(g, "fsum", 1, (a) => { let s = 0, c = 0; for (const v of drain(a[0])) { const x = f(v); const y = x - c; const t = s + y; c = (t - s) - y; s = t; } return s; });
+        fn(g, "isqrt", 1, (a) => {
+            const n = needInt(a[0]); if (n < 0n) fail(E.ValueError, "isqrt() argument must be nonnegative"); if (n < 2n) return n;
+            const approx = Math.sqrt(Number(n));
+            let x;
+            if (approx < 9007199254740992) x = BigInt(Math.floor(approx));
+            else {
+                // Newton's iteration from a power of two above the root.
+                x = 1n << BigInt(Math.ceil(n.toString(16).length * 2) + 1);
+                for (;;) { const y = (x + n / x) >> 1n; if (y >= x) break; x = y; }
+            }
+            while (x * x > n) x--; while ((x + 1n) * (x + 1n) <= n) x++; return x;
+        });
+        fn(g, "fsum", 1, (a) => { let s = 0, c = 0, finite = true; for (const v of drain(a[0])) { const x = f(v); if (!Number.isFinite(x)) finite = false; const y = x - c; const t = s + y; c = (t - s) - y; s = t; } if (finite && !Number.isFinite(s)) fail(E.OverflowError, "intermediate overflow in fsum"); return s; });
         fn(g, "prod", -1, (a) => { let r = 1n; for (const v of drain(a[0])) r = R.binop("mul", r, v); return r; });
         fn(g, "dist", 2, (a) => { const p = drain(a[0]).map(f), q = drain(a[1]).map(f); return Math.hypot(...p.map((x, i) => x - q[i])); });
         // erf via its Maclaurin series near zero and a continued fraction of
@@ -287,6 +394,7 @@
         }
         const LANCZOS = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
         function gammaExact(x) {
+            if (x === Infinity) return x;
             if (Number.isInteger(x)) {
                 if (x <= 0) fail(E.ValueError, "math domain error");
                 if (x <= 171) { let r = 1; for (let i = 2; i < x; i++) r *= i; return r; }
@@ -296,9 +404,14 @@
             x -= 1;
             let a = LANCZOS[0]; const t = x + 7.5;
             for (let i = 1; i < 9; i++) a += LANCZOS[i] / (x + i);
-            return Math.sqrt(2 * Math.PI) * Math.pow(t, x + 0.5) * Math.exp(-t) * a;
+            const p = Math.pow(t, x + 0.5);
+            if (p !== Infinity) return Math.sqrt(2 * Math.PI) * p * Math.exp(-t) * a;
+            // t ** (x + 0.5) overflowed before exp(-t) could scale it down: in two halves.
+            const half = Math.pow(t, (x + 0.5) / 2);
+            return Math.sqrt(2 * Math.PI) * half * (half * Math.exp(-t)) * a;
         }
         function lgammaExact(x) {
+            if (!Number.isFinite(x)) return x === x ? Infinity : x;
             if (Number.isInteger(x) && x <= 0) fail(E.ValueError, "math domain error");
             if (x < 0.5) return Math.log(Math.PI / Math.abs(Math.sin(Math.PI * x))) - lgammaExact(1 - x);
             x -= 1;
@@ -333,14 +446,31 @@
 
     // ---- time / sys / os / io ---------------------------------------------------------------------------------------------------------
     mod("time", (g) => {
-        const start = Date.now();
         fn(g, "time", 0, () => Date.now() / 1000);
         fn(g, "time_ns", 0, () => BigInt(Date.now()) * 1000000n);
-        fn(g, "perf_counter", 0, () => (Date.now() - start) / 1000);
-        fn(g, "perf_counter_ns", 0, () => BigInt(Date.now() - start) * 1000000n);
-        fn(g, "monotonic", 0, () => (Date.now() - start) / 1000);
-        fn(g, "process_time", 0, () => (Date.now() - start) / 1000);
-        fn(g, "sleep", 1, () => null);
+        // The interval clocks read the engine's monotonic high-resolution
+        // clock (performance.now(): fractional milliseconds since start).
+        for (const name of ["perf_counter", "monotonic", "process_time"]) {
+            fn(g, name, 0, () => performance.now() / 1000);
+            fn(g, name + "_ns", 0, () => BigInt(Math.round(performance.now() * 1e6)));
+        }
+        // A standalone run really blocks (a wait on a private cell nothing
+        // notifies); under an embedding host sleep stays a no-op so the
+        // host's worker is never held.
+        let sleepCell = null;
+        fn(g, "sleep", 1, (a) => {
+            if (!isNum(a[0])) fail(E.TypeError, "'" + typeOf(a[0]).name + "' object cannot be interpreted as an integer");
+            const secs = toFloat(a[0]);
+            if (secs !== secs) fail(E.ValueError, "Invalid value NaN (not a number)");
+            if (secs < 0) fail(E.ValueError, "sleep length must be non-negative");
+            if (secs > 0 && !rt.hosted) {
+                try {
+                    if (sleepCell === null) sleepCell = new Int32Array(new SharedArrayBuffer(4));
+                    Atomics.wait(sleepCell, 0, 0, secs * 1000);
+                } catch (e) { /* no blocking wait on this target */ }
+            }
+            return null;
+        });
         fn(g, "strftime", 2, (a) => { const d = new Date(); const pad = (n) => String(n).padStart(2, "0"); return needStr(a[0]).replace(/%([YmdHMSyjp%])/g, (_, c) => ({ Y: d.getFullYear(), m: pad(d.getMonth() + 1), d: pad(d.getDate()), H: pad(d.getHours()), M: pad(d.getMinutes()), S: pad(d.getSeconds()), y: pad(d.getFullYear() % 100), j: String(Math.floor((d - new Date(d.getFullYear(), 0, 0)) / 86400000)).padStart(3, "0"), p: d.getHours() < 12 ? "AM" : "PM", "%": "%" })[c]); }, 1);
         fn(g, "localtime", 1, () => { const d = new Date(); return tuple([BigInt(d.getFullYear()), BigInt(d.getMonth() + 1), BigInt(d.getDate()), BigInt(d.getHours()), BigInt(d.getMinutes()), BigInt(d.getSeconds()), BigInt((d.getDay() + 6) % 7), 1n, 0n]); }, 0);
         g.set("gmtime", g.get("localtime"));
@@ -427,80 +557,170 @@
 
     // ---- json ------------------------------------------------------------------------------------------------------------------------
     mod("json", (g) => {
-        function toJs(v, seen) {
-            if (v === null || typeof v === "boolean" || typeof v === "string") return v;
-            if (isInt(v)) { const i = asInt(v); return i >= -9007199254740991n && i <= 9007199254740991n ? Number(i) : { __big: i.toString() }; }
-            if (typeof v === "number") { if (!Number.isFinite(v)) return { __special: Number.isNaN(v) ? "NaN" : v > 0 ? "Infinity" : "-Infinity" }; return v; }
-            if (v.cls === T.list || v.cls === T.tuple) { if (seen.has(v)) fail(E.ValueError, "Circular reference detected"); seen.add(v); const out = v.items.map((x) => toJs(x, seen)); seen.delete(v); return out; }
-            if (v.cls === T.dict) { if (seen.has(v)) fail(E.ValueError, "Circular reference detected"); seen.add(v); const out = {}; for (const [k, x] of dictEntries(v)) { const key = typeof k === "string" ? k : k === null ? "null" : typeof k === "boolean" ? (k ? "true" : "false") : isNum(k) ? str(k) : fail(E.TypeError, "keys must be str, int, float, bool or None, not " + typeOf(k).name); out[key] = toJs(x, seen); } seen.delete(v); return out; }
-            fail(E.TypeError, "Object of type " + typeOf(v).name + " is not JSON serializable");
+        // The encoder renders straight from the Python values: ints and
+        // floats stay distinct (1.0 is "1.0"), a dict is its entries in
+        // insertion order (so any key text is just a key), and `default`
+        // is the fallback for anything else.
+        function quote(s, ensureAscii) {
+            const q = JSON.stringify(s);
+            return ensureAscii ? q.replace(/[^\x20-\x7e]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0")) : q;
         }
-        function render(js, indent, level, sep, kv, sortKeys) {
-            if (js === null) return "null";
-            if (typeof js === "boolean") return js ? "true" : "false";
-            if (typeof js === "number") return Number.isInteger(js) ? String(js) : rt.floatRepr(js);
-            if (typeof js === "string") return JSON.stringify(js).replace(/[-￿]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
-            if (Array.isArray(js)) { if (!js.length) return "[]"; if (indent === null) return "[" + js.map((x) => render(x, indent, level, sep, kv, sortKeys)).join(sep) + "]"; const pad = "\n" + " ".repeat(indent * (level + 1)); return "[" + pad + js.map((x) => render(x, indent, level + 1, sep, kv, sortKeys)).join("," + pad) + "\n" + " ".repeat(indent * level) + "]"; }
-            if (js.__big !== undefined) return js.__big;
-            if (js.__special !== undefined) return js.__special;
-            const keys = Object.keys(js); if (sortKeys) keys.sort(rt.compareStrings);
-            if (!keys.length) return "{}";
-            const items = keys.map((k) => render(k, indent, level, sep, kv, sortKeys) + kv + render(js[k], indent, level + 1, sep, kv, sortKeys));
-            if (indent === null) return "{" + items.join(sep) + "}";
-            const pad = "\n" + " ".repeat(indent * (level + 1));
-            return "{" + pad + items.join("," + pad) + "\n" + " ".repeat(indent * level) + "}";
+        function floatText(x, o) {
+            if (Number.isFinite(x)) return rt.floatRepr(x);
+            const t = x !== x ? "NaN" : x > 0 ? "Infinity" : "-Infinity";
+            if (!o.allowNan) fail(E.ValueError, "Out of range float values are not JSON compliant: " + (x !== x ? "nan" : x > 0 ? "inf" : "-inf"));
+            return t;
+        }
+        function keyText(k, o) {
+            if (typeof k === "string") return k;
+            if (k === null) return "null";
+            if (typeof k === "boolean") return k ? "true" : "false";
+            if (typeof k === "bigint") return k.toString();
+            if (typeof k === "number") return floatText(k, o);
+            if (o.skipKeys) return undefined;
+            fail(E.TypeError, "keys must be str, int, float, bool or None, not " + typeOf(k).name);
+        }
+        function encode(v, o, level) {
+            if (v === null) return "null";
+            const t = typeof v;
+            if (t === "boolean") return v ? "true" : "false";
+            if (t === "string") return quote(v, o.ensureAscii);
+            if (t === "bigint") return v.toString();
+            if (t === "number") return floatText(v, o);
+            const c = v.cls;
+            if (c === T.list || c === T.tuple || (v.items !== undefined && (isInstance(v, T.list) || isInstance(v, T.tuple)))) {
+                if (!v.items.length) return "[]";
+                enter(v, o);
+                const parts = v.items.map((x) => encode(x, o, level + 1));
+                o.seen.delete(v);
+                return wrap("[", parts, "]", o, level);
+            }
+            if (c === T.dict || (v.map !== undefined && isInstance(v, T.dict))) {
+                let entries = rt.dictEntryList(v);
+                if (!entries.length) return "{}";
+                enter(v, o);
+                if (o.sortKeys) {
+                    // Python ordering of the keys. Str keys sort by code point,
+                    // which is the UTF-16 order of JS `<` unless a key has an
+                    // astral character.
+                    if (entries.every((e) => typeof e[0] === "string")) entries.sort(entries.some((e) => rt.hasSurrogate(e[0])) ? (x, y) => rt.compareStrings(x[0], y[0]) : (x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+                    else entries = rt.sortItems(entries.map((e) => e[0]), null, false).map((k) => [k, dictGet(v, k)]);
+                }
+                const parts = [];
+                for (const [k, x] of entries) {
+                    const kt = keyText(k, o);
+                    if (kt !== undefined) parts.push(quote(kt, o.ensureAscii) + o.kv + encode(x, o, level + 1));
+                }
+                o.seen.delete(v);
+                return parts.length ? wrap("{", parts, "}", o, level) : "{}";
+            }
+            if (o.dflt === null) fail(E.TypeError, "Object of type " + typeOf(v).name + " is not JSON serializable");
+            enter(v, o);
+            const r = encode(call(o.dflt, [v], null), o, level);
+            o.seen.delete(v);
+            return r;
+        }
+        function enter(v, o) { if (o.seen.has(v)) fail(E.ValueError, "Circular reference detected"); o.seen.add(v); }
+        function wrap(open, parts, close, o, level) {
+            if (o.indent === null) return open + parts.join(o.sep) + close;
+            const pad = "\n" + o.indent.repeat(level + 1);
+            return open + pad + parts.join(o.sep + pad) + "\n" + o.indent.repeat(level) + close;
         }
         function dumps(v, kw) {
-            const indentV = kwget(kw, "indent", null); const indent = indentV === null ? null : isInt(indentV) ? Number(asInt(indentV)) : indentV.length;
+            const indentV = kwget(kw, "indent", null);
+            // An int indent is that many spaces per level, a str is itself.
+            const indent = indentV === null ? null : isInt(indentV) ? " ".repeat(Math.max(0, Number(asInt(indentV)))) : needStr(indentV);
             const seps = kwget(kw, "separators", null);
-            const sep = seps !== null ? str(seps.items[0]) : indent === null ? ", " : ",";
-            const kv = seps !== null ? str(seps.items[1]) : ": ";
-            const dflt = kwget(kw, "default", null);
-            const conv = (x, seen) => { try { return toJs(x, seen); } catch (e) { if (dflt !== null && e && e.cls === E.TypeError) return toJs(call(dflt, [x], null), seen); throw e; } };
-            const js = dflt === null ? toJs(v, new Set()) : (function deep(x, seen) { if (x === null || typeof x !== "object" || isInt(x)) return conv(x, seen); if (x.cls === T.list || x.cls === T.tuple) return x.items.map((y) => deep(y, seen)); if (x.cls === T.dict) { const out = {}; for (const [k, y] of dictEntries(x)) out[str(k)] = deep(y, seen); return out; } return deep(call(dflt, [x], null), seen); })(v, new Set());
-            return render(js, indent, 0, sep, kv, truth(kwget(kw, "sort_keys", false)));
+            const o = {
+                indent: indent,
+                sep: seps !== null ? str(getitem(seps, 0n)) : indent === null ? ", " : ",",
+                kv: seps !== null ? str(getitem(seps, 1n)) : ": ",
+                dflt: kwget(kw, "default", null),
+                sortKeys: truth(kwget(kw, "sort_keys", false)),
+                ensureAscii: truth(kwget(kw, "ensure_ascii", true)),
+                allowNan: truth(kwget(kw, "allow_nan", true)),
+                skipKeys: truth(kwget(kw, "skipkeys", false)),
+                seen: new Set(),
+            };
+            return encode(v, o, 0);
         }
-        function fromJs(js) {
-            if (js === null || typeof js === "boolean" || typeof js === "string") return js;
-            if (typeof js === "number") return Number.isInteger(js) && !/[.eE]/.test(String(js)) ? BigInt(js) : js;
-            if (Array.isArray(js)) return list(js.map(fromJs));
-            const d = dict(); for (const k of Object.keys(js)) dictSet(d, k, fromJs(js[k])); return d;
-        }
+        // A JSON number at lastIndex (sticky: no copy of the rest of the text).
+        const NUMBER = /-?(?:0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?/y;
         // A small JSON reader producing Python values directly: ints stay
         // exact (BigInt) and `1.0` stays a float, which JSON.parse cannot do.
-        function loads(s) {
+        // object_hook / object_pairs_hook / parse_float / parse_int /
+        // parse_constant apply as in CPython.
+        function loads(s, kw) {
+            const objectHook = kwget(kw, "object_hook", null), pairsHook = kwget(kw, "object_pairs_hook", null);
+            const pFloat = kwget(kw, "parse_float", null), pInt = kwget(kw, "parse_int", null), pConst = kwget(kw, "parse_constant", null);
             let i = 0;
             const n = s.length;
-            const err = (msg) => { throw rt.makeExc(E.JSONDecodeError, [msg + ": line 1 column " + (i + 1) + " (char " + i + ")"]); };
+            const err = (msg, at) => {
+                const pos = at === undefined ? i : at;
+                const line = s.slice(0, pos).split("\n").length, col = pos === 0 ? 1 : pos - s.lastIndexOf("\n", pos - 1);
+                throw rt.makeExc(E.JSONDecodeError, [msg + ": line " + line + " column " + col + " (char " + pos + ")"]);
+            };
             const ws = () => { while (i < n && (s[i] === " " || s[i] === "\t" || s[i] === "\n" || s[i] === "\r")) i++; };
+            const constant = (text, v) => { i += text.length; return pConst === null ? v : call(pConst, [text], null); };
+            function object() {
+                // object_pairs_hook sees the (key, value) list; otherwise a dict.
+                const d = pairsHook === null ? dict() : null, pairs = d === null ? [] : null;
+                i++; ws();
+                if (s[i] !== "}") {
+                    for (;;) {
+                        ws(); if (s[i] !== '"') err("Expecting property name enclosed in double quotes");
+                        const k = string(); ws(); if (s[i] !== ":") err("Expecting ':' delimiter"); i++;
+                        const v = value();
+                        if (d !== null) dictSet(d, k, v); else pairs.push(tuple([k, v]));
+                        ws();
+                        if (s[i] === ",") { i++; continue; }
+                        if (s[i] === "}") break;
+                        err("Expecting ',' delimiter");
+                    }
+                }
+                i++;
+                if (d === null) return call(pairsHook, [list(pairs)], null);
+                return objectHook === null ? d : call(objectHook, [d], null);
+            }
             function value() {
                 ws();
                 if (i >= n) err("Expecting value");
                 const c = s[i];
-                if (c === "{") { i++; const d = dict(); ws(); if (s[i] === "}") { i++; return d; } for (;;) { ws(); if (s[i] !== '"') err("Expecting property name enclosed in double quotes"); const k = string(); ws(); if (s[i] !== ":") err("Expecting ':' delimiter"); i++; dictSet(d, k, value()); ws(); if (s[i] === ",") { i++; continue; } if (s[i] === "}") { i++; return d; } err("Expecting ',' delimiter"); } }
+                if (c === "{") return object();
                 if (c === "[") { i++; const items = []; ws(); if (s[i] === "]") { i++; return list(items); } for (;;) { items.push(value()); ws(); if (s[i] === ",") { i++; continue; } if (s[i] === "]") { i++; return list(items); } err("Expecting ',' delimiter"); } }
                 if (c === '"') return string();
                 if (s.startsWith("true", i)) { i += 4; return true; }
                 if (s.startsWith("false", i)) { i += 5; return false; }
                 if (s.startsWith("null", i)) { i += 4; return null; }
-                if (s.startsWith("NaN", i)) { i += 3; return NaN; }
-                if (s.startsWith("Infinity", i)) { i += 8; return Infinity; }
-                if (s.startsWith("-Infinity", i)) { i += 9; return -Infinity; }
-                const m = /^-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?/.exec(s.slice(i));
+                if (s.startsWith("NaN", i)) return constant("NaN", NaN);
+                if (s.startsWith("Infinity", i)) return constant("Infinity", Infinity);
+                if (s.startsWith("-Infinity", i)) return constant("-Infinity", -Infinity);
+                NUMBER.lastIndex = i;
+                const m = NUMBER.exec(s);
                 if (!m) err("Expecting value");
                 i += m[0].length;
-                return m[2] || m[3] ? Number(m[0]) : BigInt(m[0]);
+                if (m[1] || m[2]) return pFloat === null ? Number(m[0]) : call(pFloat, [m[0]], null);
+                return pInt === null ? BigInt(m[0]) : call(pInt, [m[0]], null);
             }
             function string() {
+                const start = i;
                 i++; let out = "";
                 for (;;) {
-                    if (i >= n) err("Unterminated string starting at");
+                    // Copy the run up to the next quote or backslash at once.
+                    let j = i;
+                    while (j < n) { const u = s.charCodeAt(j); if (u === 34 || u === 92) break; j++; }
+                    if (j > i) { out += s.slice(i, j); i = j; }
+                    if (i >= n) err("Unterminated string starting at", start);
                     const c = s[i++];
                     if (c === '"') return out;
                     if (c === "\\") {
                         const e = s[i++];
-                        if (e === "u") { out += String.fromCharCode(parseInt(s.slice(i, i + 4), 16)); i += 4; }
-                        else out += { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", "/": "/", "\\": "\\", '"': '"' }[e] || err("Invalid \\escape");
+                        if (e === "u") {
+                            const hex = s.slice(i, i + 4);
+                            if (!/^[0-9a-fA-F]{4}$/.test(hex)) err("Invalid \\uXXXX escape", i - 1);
+                            out += String.fromCharCode(parseInt(hex, 16)); i += 4;
+                        }
+                        else out += { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", "/": "/", "\\": "\\", '"': '"' }[e] || err("Invalid \\escape", i - 2);
                     } else out += c;
                 }
             }
@@ -508,10 +728,12 @@
             if (i < n) err("Extra data");
             return v;
         }
-        fnkw(g, "dumps", (a) => { const kw = kwOf(a, ["indent", "sort_keys", "separators", "default", "ensure_ascii"]); return dumps(a[0], kw); });
-        fnkw(g, "loads", (a) => { kwOf(a, ["object_hook"]); return loads(needStr(a[0])); });
-        fnkw(g, "dump", (a) => { const kw = kwOf(a, ["indent", "sort_keys", "separators", "default", "ensure_ascii"]); call(rt.getattr(a[1], "write"), [dumps(a[0], kw)], null); return null; });
-        fnkw(g, "load", (a) => { kwOf(a, ["object_hook"]); return loads(needStr(call(rt.getattr(a[0], "read"), [], null))); });
+        const DUMP_KW = ["indent", "sort_keys", "separators", "default", "ensure_ascii", "allow_nan", "skipkeys", "check_circular"];
+        const LOAD_KW = ["object_hook", "object_pairs_hook", "parse_float", "parse_int", "parse_constant", "strict"];
+        fnkw(g, "dumps", (a) => { const kw = kwOf(a, DUMP_KW); return dumps(a[0], kw); });
+        fnkw(g, "loads", (a) => { const kw = kwOf(a, LOAD_KW); return loads(needStr(a[0]), kw); });
+        fnkw(g, "dump", (a) => { const kw = kwOf(a, DUMP_KW); call(rt.getattr(a[1], "write"), [dumps(a[0], kw)], null); return null; });
+        fnkw(g, "load", (a) => { const kw = kwOf(a, LOAD_KW); return loads(needStr(call(rt.getattr(a[0], "read"), [], null)), kw); });
         g.set("JSONDecodeError", E.JSONDecodeError);
     });
 
@@ -569,7 +791,8 @@
         // typing.NamedTuple: the functional form is collections.namedtuple;
         // a subclass turns its annotations into fields (class attributes
         // with the same names are the defaults) and keeps its own methods.
-        const namedtuple = (name, fields, defaults) => call(rt.modules.get("collections").globals.get("namedtuple"), [name, list(fields)], new Map([["defaults", list(defaults)]]));
+        // collections loads on first use: the program need not import it.
+        const namedtuple = (name, fields, defaults) => call(R.import("collections", null).globals.get("namedtuple"), [name, list(fields)], new Map([["defaults", list(defaults)]]));
         const NT = rt.newType("NamedTuple", [], new Map(), "typing");
         NT.dict.set("__init_subclass__", { cls: T.classmethod, func: builtin("__init_subclass__", -1, (a) => {
             const cls = a[0];
@@ -620,7 +843,8 @@
         fn(g, "permutations", 2, (a) => { const pool = drain(a[0]); const r = a[1] === undefined || a[1] === null ? pool.length : Number(needInt(a[1])); const out = []; const rec = (cur, used) => { if (cur.length === r) { out.push(tuple(cur.slice())); return; } for (let i = 0; i < pool.length; i++) { if (used[i]) continue; used[i] = true; cur.push(pool[i]); rec(cur, used); cur.pop(); used[i] = false; } }; rec([], new Array(pool.length).fill(false)); let i = 0; return gen(() => i < out.length ? out[i++] : STOP); }, 1);
         fn(g, "combinations", 2, (a) => { const pool = drain(a[0]); const r = Number(needInt(a[1])); const out = []; const rec = (start, cur) => { if (cur.length === r) { out.push(tuple(cur.slice())); return; } for (let i = start; i < pool.length; i++) { cur.push(pool[i]); rec(i + 1, cur); cur.pop(); } }; rec(0, []); let i = 0; return gen(() => i < out.length ? out[i++] : STOP); });
         fn(g, "combinations_with_replacement", 2, (a) => { const pool = drain(a[0]); const r = Number(needInt(a[1])); const out = []; const rec = (start, cur) => { if (cur.length === r) { out.push(tuple(cur.slice())); return; } for (let i = start; i < pool.length; i++) { cur.push(pool[i]); rec(i, cur); cur.pop(); } }; rec(0, []); let i = 0; return gen(() => i < out.length ? out[i++] : STOP); });
-        fn(g, "accumulate", -1, (a) => { const kw = kwOf(a, ["initial", "func"]); const it = iter(a[0]); const f = a[1] !== undefined ? a[1] : kwget(kw, "func", null); let acc = kwget(kw, "initial", undefined); let first = acc === undefined; return gen(() => { if (first) { first = false; const v = fornext(it); if (v === STOP) return STOP; acc = v; return acc; } const v = fornext(it); if (v === STOP) return STOP; acc = f === null ? R.binop("add", acc, v) : call(f, [acc, v], null); return acc; }); });
+        // state 0: the first item starts the total; 1: yield `initial` first; 2: accumulate.
+        fn(g, "accumulate", -1, (a) => { const kw = kwOf(a, ["initial", "func"]); const it = iter(a[0]); const f = a[1] !== undefined ? a[1] : kwget(kw, "func", null); let acc = kwget(kw, "initial", null); let state = acc === null ? 0 : 1; return gen(() => { if (state === 1) { state = 2; return acc; } const v = fornext(it); if (v === STOP) return STOP; if (state === 0) { state = 2; acc = v; return acc; } acc = f === null ? R.binop("add", acc, v) : call(f, [acc, v], null); return acc; }); });
         g.get("accumulate").kwnames = true;
         fn(g, "groupby", 2, (a) => { const it = iter(a[0]); const key = a[1] === undefined ? null : a[1]; let pending = fornext(it); return gen(() => { if (pending === STOP) return STOP; const k = key === null ? pending : call(key, [pending], null); const group = []; while (pending !== STOP && eq(key === null ? pending : call(key, [pending], null), k)) { group.push(pending); pending = fornext(it); } return tuple([k, iter(list(group))]); }); }, 1);
         fn(g, "takewhile", 2, (a) => { const it = iter(a[1]); let done = false; return gen(() => { if (done) return STOP; const v = fornext(it); if (v === STOP || !truth(call(a[0], [v], null))) { done = true; return STOP; } return v; }); });
@@ -680,6 +904,13 @@
                 const v = values[vi++];
                 if (c === "s" || c === "p") {
                     if (v === null || typeof v !== "object" || v.cls !== T.bytes) fail(StructError, "argument for '" + c + "' must be a bytes object");
+                    if (c === "p") {
+                        // A Pascal string: a length byte, then at most count - 1 bytes.
+                        const n = Math.min(v.items.length, it.count - 1);
+                        for (let k = 0; k < n; k++) bytes[it.offset + 1 + k] = v.items[k];
+                        if (it.count > 0) bytes[it.offset] = Math.min(n, 255);
+                        continue;
+                    }
                     for (let k = 0; k < it.count && k < v.items.length; k++) bytes[it.offset + k] = v.items[k];
                     continue;
                 }
@@ -987,19 +1218,31 @@
         DefaultDict.dict.set("default_factory", { cls: T.property, fget: builtin("default_factory", 1, (a) => { const f = a[0].dict.get("default_factory"); return f === undefined ? null : f; }), fset: null, fdel: null, doc: null });
         g.set("defaultdict", DefaultDict);
         const OrderedDict = rt.newType("OrderedDict", [T.dict], new Map(), "collections");
-        OrderedDict.dict.set("move_to_end", builtin("move_to_end", 3, (a) => { const v = dictGet(a[0], a[1]); if (v === undefined) throw rt.makeExc(E.KeyError, [a[1]]); rt.dictDel(a[0], a[1]); if (a[2] === undefined || truth(a[2])) dictSet(a[0], a[1], v); else { const entries = rt.dictEntryList(a[0]); a[0].map.clear(); a[0].size = 0; dictSet(a[0], a[1], v); for (const [k, x] of entries) dictSet(a[0], k, x); } return null; }, 2));
+        OrderedDict.dict.set("move_to_end", builtin("move_to_end", -1, (a) => { const kw = kwOf(a, ["last"]); const last = a[2] !== undefined ? truth(a[2]) : truth(kwget(kw, "last", true)); const v = dictGet(a[0], a[1]); if (v === undefined) throw rt.makeExc(E.KeyError, [a[1]]); rt.dictDel(a[0], a[1]); if (last) dictSet(a[0], a[1], v); else { const entries = rt.dictEntryList(a[0]); rt.dictClear(a[0]); dictSet(a[0], a[1], v); for (const [k, x] of entries) dictSet(a[0], k, x); } return null; }));
+        OrderedDict.dict.get("move_to_end").kwnames = true;
         OrderedDict.dict.set("__repr__", builtin("__repr__", 1, (a) => a[0].size ? "OrderedDict(" + rt.baseRepr(a[0]) + ")" : "OrderedDict()"));
         OrderedDict.dict.set("popitem", (() => { const f = builtin("popitem", -1, (a) => { const kw = kwOf(a, ["last"]); const last = a[1] !== undefined ? truth(a[1]) : truth(kwget(kw, "last", true)); const entries = rt.dictEntryList(a[0]); if (!entries.length) fail(E.KeyError, "dictionary is empty"); const [k, v] = entries[last ? entries.length - 1 : 0]; rt.dictDel(a[0], k); return tuple([k, v]); }); f.kwnames = true; return f; })());
+        // Two OrderedDicts are equal only in the same order; against a plain
+        // dict the order does not matter.
+        OrderedDict.dict.set("__eq__", builtin("__eq__", 2, (a) => {
+            const x = a[0], y = a[1];
+            if (y === null || typeof y !== "object" || y.map === undefined || !isInstance(y, T.dict)) return NOTIMPL;
+            if (!rt.dictEq(x, y)) return false;
+            if (!isInstance(y, OrderedDict)) return true;
+            const kx = rt.dictEntryList(x), ky = rt.dictEntryList(y);
+            for (let i = 0; i < kx.length; i++) if (!eq(kx[i][0], ky[i][0])) return false;
+            return true;
+        }));
         g.set("OrderedDict", OrderedDict);
         const Counter = rt.newType("Counter", [T.dict], new Map(), "collections");
         Counter.dict.set("__init__", (() => { const f = builtin("__init__", -1, (a) => { const kw = a[a.length - 1] instanceof Map ? a.pop() : null; if (a[1] !== undefined && a[1] !== null) { if (a[1].cls === T.dict || isInstance(a[1], T.dict)) for (const [k, v] of dictEntries(a[1])) dictSet(a[0], k, v); else for (const x of drain(a[1])) { const c = dictGet(a[0], x); dictSet(a[0], x, c === undefined ? 1n : R.binop("add", c, 1n)); } } if (kw) for (const [k, v] of kw) dictSet(a[0], k, v); return null; }); f.kwnames = true; return f; })());
         Counter.dict.set("__missing__", builtin("__missing__", 2, () => 0n));
-        Counter.dict.set("most_common", builtin("most_common", 2, (a) => { const items = rt.dictEntryList(a[0]).map((e) => tuple(e)); const sorted = rt.sortItems(items, builtin("k", 1, (b) => b[0].items[1]), true); return list(a[1] === undefined || a[1] === null ? sorted : sorted.slice(0, Number(needInt(a[1])))); }, 1));
+        Counter.dict.set("most_common", builtin("most_common", 2, (a) => { const items = rt.dictEntryList(a[0]).map((e) => tuple([e[0], e[1]])); const sorted = rt.sortItems(items, builtin("k", 1, (b) => b[0].items[1]), true); return list(a[1] === undefined || a[1] === null ? sorted : sorted.slice(0, Number(needInt(a[1])))); }, 1));
         Counter.dict.set("elements", builtin("elements", 1, (a) => { const out = []; for (const [k, v] of dictEntries(a[0])) for (let i = 0n; i < asInt(v); i++) out.push(k); return iter(list(out)); }));
         Counter.dict.set("update", (() => { const f = builtin("update", -1, (a) => { const kw = a[a.length - 1] instanceof Map ? a.pop() : null; if (a[1] !== undefined) { if (a[1].cls === T.dict || isInstance(a[1], T.dict)) for (const [k, v] of dictEntries(a[1])) dictSet(a[0], k, R.binop("add", dictGet(a[0], k) || 0n, v)); else for (const x of drain(a[1])) dictSet(a[0], x, R.binop("add", dictGet(a[0], x) || 0n, 1n)); } if (kw) for (const [k, v] of kw) dictSet(a[0], k, R.binop("add", dictGet(a[0], k) || 0n, v)); return null; }); f.kwnames = true; return f; })());
         Counter.dict.set("subtract", builtin("subtract", 2, (a) => { const src = a[1].cls === T.dict || isInstance(a[1], T.dict) ? rt.dictEntryList(a[1]) : drain(a[1]).map((x) => [x, 1n]); for (const [k, v] of src) dictSet(a[0], k, R.binop("sub", dictGet(a[0], k) || 0n, v)); return null; }));
         Counter.dict.set("total", builtin("total", 1, (a) => { let t = 0n; for (const [, v] of dictEntries(a[0])) t = R.binop("add", t, v); return t; }));
-        Counter.dict.set("__repr__", builtin("__repr__", 1, (a) => { if (!a[0].size) return "Counter()"; const items = rt.sortItems(rt.dictEntryList(a[0]).map((e) => tuple(e)), builtin("k", 1, (b) => b[0].items[1]), true); return "Counter({" + items.map((t) => repr(t.items[0]) + ": " + repr(t.items[1])).join(", ") + "})"; }));
+        Counter.dict.set("__repr__", builtin("__repr__", 1, (a) => { if (!a[0].size) return "Counter()"; const items = rt.sortItems(rt.dictEntryList(a[0]).map((e) => tuple([e[0], e[1]])), builtin("k", 1, (b) => b[0].items[1]), true); return "Counter({" + items.map((t) => repr(t.items[0]) + ": " + repr(t.items[1])).join(", ") + "})"; }));
         Counter.dict.set("__pos__", builtin("__pos__", 1, (a) => { const out = rt.construct(Counter, [], null); for (const [k, v] of dictEntries(a[0])) if (cmp("gt", v, 0n)) dictSet(out, k, v); return out; }));
         Counter.dict.set("__neg__", builtin("__neg__", 1, (a) => { const out = rt.construct(Counter, [], null); for (const [k, v] of dictEntries(a[0])) if (cmp("lt", v, 0n)) dictSet(out, k, R.unop("neg", v)); return out; }));
         for (const [name, op] of [["__add__", "add"], ["__sub__", "sub"], ["__or__", "or"], ["__and__", "and"]]) Counter.dict.set(name, builtin(name, 2, (a) => { const out = rt.construct(Counter, [], null); const keys = new Set(); const all = []; for (const [k] of dictEntries(a[0])) { const kk = rt.keyOf(k); if (!keys.has(kk)) { keys.add(kk); all.push(k); } } for (const [k] of dictEntries(a[1])) { const kk = rt.keyOf(k); if (!keys.has(kk)) { keys.add(kk); all.push(k); } } for (const k of all) { const x = dictGet(a[0], k) || 0n, y = dictGet(a[1], k) || 0n; let v; if (op === "add") v = R.binop("add", x, y); else if (op === "sub") v = R.binop("sub", x, y); else if (op === "or") v = cmp("gt", x, y) ? x : y; else v = cmp("lt", x, y) ? x : y; if (cmp("gt", v, 0n)) dictSet(out, k, v); } return out; }));
@@ -1078,12 +1321,36 @@
         fnkw(g, "nsmallest", (a) => { const kw = kwOf(a, ["key"]); return list(rt.sortItems(drain(a[1]), kwget(kw, "key", null), false).slice(0, Number(needInt(a[0])))); });
     });
     mod("bisect", (g) => {
-        const bis = (a, x, right, key) => { const items = a.items; let lo = 0, hi = items.length; while (lo < hi) { const mid = (lo + hi) >> 1; const v = key === null ? items[mid] : call(key, [items[mid]], null); if (right ? !cmp("lt", x, v) : cmp("lt", v, x)) lo = mid + 1; else hi = mid; } return lo; };
-        fnkw(g, "bisect_left", (a) => { const kw = kwOf(a, ["lo", "hi", "key"]); return BigInt(bis(a[0], a[1], false, kwget(kw, "key", null))); });
-        fnkw(g, "bisect_right", (a) => { const kw = kwOf(a, ["lo", "hi", "key"]); return BigInt(bis(a[0], a[1], true, kwget(kw, "key", null))); });
+        // bisect_*(a, x, lo=0, hi=None, *, key=None) over any sequence;
+        // insort_* compares key(x) when a key is given.
+        const bounds = (a, kw) => {
+            const loV = a[2] !== undefined ? a[2] : kwget(kw, "lo", 0n), hiV = a[3] !== undefined ? a[3] : kwget(kw, "hi", null);
+            const lo = Number(needInt(loV)); if (lo < 0) fail(E.ValueError, "lo must be non-negative");
+            return [lo, hiV === null ? Number(len(a[0])) : Number(needInt(hiV))];
+        };
+        const bis = (seq, x, right, key, lo, hi) => {
+            const items = seq !== null && typeof seq === "object" && seq.items !== undefined && (seq.cls === T.list || seq.cls === T.tuple) ? seq.items : null;
+            while (lo < hi) {
+                const mid = Math.floor((lo + hi) / 2);
+                let v = items !== null ? items[mid] : getitem(seq, BigInt(mid));
+                if (key !== null) v = call(key, [v], null);
+                if (right ? cmp("lt", x, v) : !cmp("lt", v, x)) hi = mid; else lo = mid + 1;
+            }
+            return lo;
+        };
+        for (const [name, right] of [["bisect_left", false], ["bisect_right", true]]) {
+            fnkw(g, name, (a) => { const kw = kwOf(a, ["lo", "hi", "key"]); const [lo, hi] = bounds(a, kw); return BigInt(bis(a[0], a[1], right, kwget(kw, "key", null), lo, hi)); });
+        }
+        for (const [name, right] of [["insort_left", false], ["insort_right", true]]) {
+            fnkw(g, name, (a) => {
+                const kw = kwOf(a, ["lo", "hi", "key"]); const [lo, hi] = bounds(a, kw); const key = kwget(kw, "key", null);
+                const i = bis(a[0], key === null ? a[1] : call(key, [a[1]], null), right, key, lo, hi);
+                if (a[0] !== null && typeof a[0] === "object" && a[0].cls === T.list) a[0].items.splice(i, 0, a[1]);
+                else call(rt.getattr(a[0], "insert"), [BigInt(i), a[1]], null);
+                return null;
+            });
+        }
         g.set("bisect", g.get("bisect_right"));
-        fnkw(g, "insort_left", (a) => { const kw = kwOf(a, ["lo", "hi", "key"]); a[0].items.splice(bis(a[0], a[1], false, kwget(kw, "key", null)), 0, a[1]); return null; });
-        fnkw(g, "insort_right", (a) => { const kw = kwOf(a, ["lo", "hi", "key"]); a[0].items.splice(bis(a[0], a[1], true, kwget(kw, "key", null)), 0, a[1]); return null; });
         g.set("insort", g.get("insort_right"));
     });
     mod("statistics", (g) => {
@@ -1101,73 +1368,354 @@
 
     // ---- re: a JavaScript-backed subset ---------------------------------------------------------------------------------------------------------
     mod("re", (g) => {
-        const FLAGS = { IGNORECASE: 2n, I: 2n, MULTILINE: 8n, M: 8n, DOTALL: 16n, S: 16n, VERBOSE: 64n, X: 64n, ASCII: 256n, A: 256n, UNICODE: 32n, U: 32n };
+        const FLAGS = { IGNORECASE: 2n, I: 2n, LOCALE: 4n, L: 4n, MULTILINE: 8n, M: 8n, DOTALL: 16n, S: 16n, UNICODE: 32n, U: 32n, VERBOSE: 64n, X: 64n, ASCII: 256n, A: 256n, NOFLAG: 0n };
         for (const [k, v] of Object.entries(FLAGS)) g.set(k, v);
+        const error = E.ValueError;
+        const INLINE = { a: 256n, i: 2n, L: 4n, m: 8n, s: 16n, u: 32n, x: 64n };
+        // Python's str-pattern classes: \w is [\p{L}\p{N}_], \d is \p{Nd},
+        // \s is str.isspace(); under ASCII they are the [A-Za-z0-9_] forms.
+        const WORD = "\\p{L}\\p{N}_", SPACE = " \\t\\n\\r\\x0b\\x0c\\x1c-\\x1f\\x85\\xa0\\u{1680}\\u{2000}-\\u{200a}\\u{2028}\\u{2029}\\u{202f}\\u{205f}\\u{3000}";
+        const ASCII_SPACE = " \\t\\n\\r\\x0b\\x0c";
+        const SYNTAX = "^$\\.*+?()[]{}|/";
+        // Python pattern syntax -> a JavaScript `u` pattern. `.`, `^`, `$`,
+        // `\A`, `\Z`, `\b` and the classes are spelled out, so only IGNORECASE
+        // is left to a JS flag; scoped `(?flags:...)` groups keep a flag stack.
+        // Returns {source, flags (with the inline global flags), names}.
         function translate(pattern, flags) {
-            let p = pattern;
-            if (flags & 64n) p = p.replace(/\\#/g, " ").replace(/#.*$/gm, "").replace(/\s+/g, "").replace(/ /g, "\\#");
-            p = p.replace(/\(\?P<([A-Za-z_]\w*)>/g, "(?<$1>").replace(/\(\?P=([A-Za-z_]\w*)\)/g, "\\k<$1>").replace(/\\Z/g, "$(?![\\s\\S])").replace(/\\A/g, "^");
-            let js = "";
-            if (flags & 2n) js += "i"; if (flags & 8n) js += "m"; if (flags & 16n) js += "s";
-            try { return new RegExp(p, js + "gu"); } catch (e) { try { return new RegExp(p, js + "g"); } catch (e2) { fail(E.ValueError || E.RuntimeError, "bad pattern: " + e2.message); } }
+            const p = pattern, n = p.length;
+            let i = 0;
+            const bad = (msg) => fail(error, msg + " at position " + i);
+            // Leading global flags: (?aiLmsux)...
+            for (;;) {
+                const m = /^\(\?([aiLmsux]+)\)/.exec(p.slice(i));
+                if (!m) break;
+                for (const c of m[1]) flags |= INLINE[c];
+                i += m[0].length;
+            }
+            let st = { i: (flags & 2n) !== 0n, m: (flags & 8n) !== 0n, s: (flags & 16n) !== 0n, x: (flags & 64n) !== 0n, a: (flags & 256n) !== 0n };
+            const baseI = st.i;
+            const stack = [];
+            const names = new Map();
+            let groups = 0, out = "";
+            // {m}, {m,}, {,n}, {m,n}; any other brace is a literal.
+            const quant = () => {
+                const m = /^\{(\d*)(?:(,)(\d*))?\}/.exec(p.slice(i));
+                if (!m || (m[1] === "" && m[2] === undefined)) return null;
+                i += m[0].length;
+                return "{" + (m[1] === "" ? "0" : m[1]) + (m[2] ? "," + m[3] : "") + "}";
+            };
+            function escape(inClass) {
+                const c = p[i + 1];
+                if (c === undefined) bad("bad escape (end of pattern)");
+                i += 2;
+                switch (c) {
+                    case "w": return st.a ? (inClass ? "A-Za-z0-9_" : "[A-Za-z0-9_]") : (inClass ? WORD : "[" + WORD + "]");
+                    case "W": return st.a ? (inClass ? "\\W" : "[^A-Za-z0-9_]") : (inClass ? "\\W" : "[^" + WORD + "]");
+                    case "d": return st.a ? (inClass ? "0-9" : "[0-9]") : "\\p{Nd}";
+                    case "D": return st.a ? (inClass ? "\\D" : "[^0-9]") : "\\P{Nd}";
+                    case "s": return st.a ? (inClass ? ASCII_SPACE : "[" + ASCII_SPACE + "]") : (inClass ? SPACE : "[" + SPACE + "]");
+                    case "S": return st.a ? (inClass ? "\\S" : "[^" + ASCII_SPACE + "]") : (inClass ? "\\S" : "[^" + SPACE + "]");
+                    case "b": return inClass ? "\\x08" : st.a ? "\\b" : "(?:(?<=[" + WORD + "])(?![" + WORD + "])|(?<![" + WORD + "])(?=[" + WORD + "]))";
+                    case "B": if (inClass) bad("bad escape \\B"); return st.a ? "\\B" : "(?:(?<=[" + WORD + "])(?=[" + WORD + "])|(?<![" + WORD + "])(?![" + WORD + "]))";
+                    case "A": if (inClass) bad("bad escape \\A"); return "(?<![\\s\\S])";
+                    case "Z": if (inClass) bad("bad escape \\Z"); return "(?![\\s\\S])";
+                    case "n": return "\\n"; case "t": return "\\t"; case "r": return "\\r"; case "f": return "\\f"; case "v": return "\\v"; case "a": return "\\x07";
+                    case "x": { const m = /^[0-9a-fA-F]{2}/.exec(p.slice(i)); if (!m) bad("incomplete escape \\x"); i += 2; return "\\u{" + m[0] + "}"; }
+                    case "u": { const m = /^[0-9a-fA-F]{4}/.exec(p.slice(i)); if (!m) bad("incomplete escape \\u"); i += 4; return "\\u{" + m[0] + "}"; }
+                    case "U": { const m = /^[0-9a-fA-F]{8}/.exec(p.slice(i)); if (!m) bad("incomplete escape \\U"); i += 8; return "\\u{" + m[0].replace(/^0+(?=.)/, "") + "}"; }
+                }
+                if (c >= "0" && c <= "9") {
+                    // An octal escape (\0, \0nn, or three octal digits), else a group reference.
+                    const m = /^[0-7]{0,2}/.exec(p.slice(i));
+                    if (c === "0" || (c <= "7" && m[0].length === 2)) {
+                        const digits = c === "0" ? /^[0-7]{0,2}/.exec(p.slice(i))[0] : m[0];
+                        i += digits.length;
+                        return "\\u{" + parseInt(c + digits, 8).toString(16) + "}";
+                    }
+                    let num = c;
+                    if (p[i] >= "0" && p[i] <= "9") num += p[i++];
+                    if (inClass) bad("bad escape \\" + num);
+                    return "\\" + num;
+                }
+                if (/[A-Za-z]/.test(c)) { i -= 2; bad("bad escape \\" + c); }
+                // Escaped punctuation is the literal character.
+                if (SYNTAX.includes(c) || (inClass && c === "-")) return "\\" + c;
+                return c;
+            }
+            function charClass() {
+                let s = "[";
+                i++;
+                if (p[i] === "^") { s += "^"; i++; }
+                // A leading ']' is a literal member.
+                if (p[i] === "]") { s += "\\]"; i++; }
+                for (;;) {
+                    if (i >= n) bad("unterminated character set");
+                    const c = p[i];
+                    if (c === "]") { i++; return s + "]"; }
+                    if (c === "\\") { s += escape(true); continue; }
+                    if (c === "[") { s += "\\["; i++; continue; }
+                    s += c; i++;
+                }
+            }
+            while (i < n) {
+                const c = p[i];
+                if (st.x) {
+                    if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\x0b" || c === "\x0c") { i++; continue; }
+                    if (c === "#") { while (i < n && p[i] !== "\n") i++; continue; }
+                }
+                if (c === "\\") { out += escape(false); continue; }
+                if (c === "[") { out += charClass(); continue; }
+                if (c === "(") {
+                    const rest = p.slice(i);
+                    let m;
+                    if ((m = /^\(\?P<([A-Za-z_][A-Za-z0-9_]*)>/.exec(rest))) {
+                        groups++; if (names.has(m[1])) bad("redefinition of group name " + repr(m[1]));
+                        names.set(m[1], groups); out += "(?<" + m[1] + ">"; i += m[0].length; stack.push(st); continue;
+                    }
+                    if ((m = /^\(\?P=([A-Za-z_][A-Za-z0-9_]*)\)/.exec(rest))) { if (!names.has(m[1])) bad("unknown group name " + repr(m[1])); out += "\\k<" + m[1] + ">"; i += m[0].length; continue; }
+                    if (rest.startsWith("(?#")) { const e = p.indexOf(")", i); if (e < 0) bad("missing ), unterminated comment"); i = e + 1; continue; }
+                    if ((m = /^\(\?(<=|<!|=|!|:)/.exec(rest))) { out += m[0]; i += m[0].length; stack.push(st); continue; }
+                    if ((m = /^\(\?([aiLmsux]*)(?:-([imsx]+))?:/.exec(rest))) {
+                        // A scoped flag group: `.`/`^`/`$`/\w follow the new
+                        // state here; IGNORECASE becomes a JS modifier.
+                        stack.push(st);
+                        st = Object.assign({}, st);
+                        for (const f of m[1]) if (f in st) st[f] = true;
+                        if (m[2]) for (const f of m[2]) st[f] = false;
+                        const on = m[1].includes("i") ? "i" : "", off = m[2] && m[2].includes("i") ? "i" : "";
+                        out += on || off ? "(?" + on + (off ? "-" + off : "") + ":" : "(?:";
+                        i += m[0].length; continue;
+                    }
+                    if (/^\(\?[aiLmsux-]*\)/.test(rest)) bad("global flags not at the start of the expression");
+                    if (rest.startsWith("(?")) bad("unknown extension " + rest.slice(1, 3));
+                    groups++; out += "("; i++; stack.push(st); continue;
+                }
+                if (c === ")") { if (!stack.length) bad("unbalanced parenthesis"); st = stack.pop(); out += ")"; i++; continue; }
+                if (c === ".") { out += st.s ? "[\\s\\S]" : "[^\\n]"; i++; continue; }
+                if (c === "^") { out += st.m ? "(?<![^\\n])" : "(?<![\\s\\S])"; i++; continue; }
+                if (c === "$") { out += st.m ? "(?=\\n|(?![\\s\\S]))" : "(?=\\n?(?![\\s\\S]))"; i++; continue; }
+                if (c === "{") { const q = quant(); if (q !== null) out += q; else { out += "\\{"; i++; } continue; }
+                if (c === "}" || c === "]") { out += "\\" + c; i++; continue; }
+                out += c; i++;
+            }
+            if (stack.length) fail(error, "missing ), unterminated subpattern at position " + p.length);
+            return { source: out, flags: flags, ignoreCase: baseI, groups: groups, names: names };
+        }
+        // Code-point offsets over a string's UTF-16 ones (the same when the
+        // string has no astral characters).
+        const cpIndex = (M, off) => M.sur ? rt.strLen(M.s.slice(0, off)) : off;
+        // Whether the last string scanned has astral characters, and its
+        // length in code points: a loop matching one string at successive
+        // positions measures it once, not per call.
+        let infoS = "", infoSur = false, infoLen = 0;
+        function strInfo(s) { if (s !== infoS) { infoSur = rt.hasSurrogate(s); infoLen = infoSur ? rt.strLen(s) : s.length; infoS = s; } }
+        function utf16Index(s, cp) {
+            let u = 0;
+            for (let k = 0; k < cp && u < s.length; k++) u += charWidth(s, u);
+            return u;
+        }
+        function groupIdx(M, gi) {
+            if (gi === undefined) return 0;
+            if (typeof gi === "string") { const k = M.p.names.get(gi); if (k === undefined) fail(E.IndexError, "no such group"); return k; }
+            const k = isInt(gi) ? Number(asInt(gi)) : -1;
+            if (k < 0 || k > M.p.ngroups) fail(E.IndexError, "no such group");
+            return k;
+        }
+        const groupText = (M, gi) => { const v = M.m[groupIdx(M, gi)]; return v === undefined ? null : v; };
+        // Scans run without the `d` flag (it slows every match); a Match
+        // wanting group offsets reruns the pattern anchored where it matched
+        // on the same text, which reproduces the same match.
+        function indices(M) {
+            const m = M.m;
+            if (m.indices === undefined) { const r = dsticky(M.p); r.lastIndex = m.index; m.indices = r.exec(M.t).indices; }
+            return m.indices;
+        }
+        const span = (M, gi) => {
+            const k = groupIdx(M, gi);
+            if (k === 0) return [cpIndex(M, M.m.index), cpIndex(M, M.m.index + M.m[0].length)];
+            const r = indices(M)[k]; return r === undefined ? [-1, -1] : [cpIndex(M, r[0]), cpIndex(M, r[1])];
+        };
+        function lastIndex(M) {
+            let best = 0, end = -1;
+            if (M.m.length === 1) return 0;
+            const ix = indices(M);
+            for (let k = 1; k < ix.length; k++) { const r = ix[k]; if (r !== undefined && r[1] > end) { best = k; end = r[1]; } }
+            return best;
+        }
+        function expand(M, tpl) {
+            let out = "";
+            for (let k = 0; k < tpl.length; k++) {
+                const c = tpl[k];
+                if (c !== "\\") { out += c; continue; }
+                const d = tpl[++k];
+                if (d === undefined) fail(error, "bad escape (end of pattern)");
+                if (d === "g") {
+                    const m = /^<([^>]*)>/.exec(tpl.slice(k + 1));
+                    if (!m) fail(error, "missing <");
+                    k += m[0].length;
+                    const ref = /^\d+$/.test(m[1]) ? BigInt(m[1]) : m[1];
+                    if (typeof ref === "string" && !M.p.names.has(ref)) fail(E.IndexError, "unknown group name " + repr(ref));
+                    const v = groupText(M, ref); out += v === null ? "" : v; continue;
+                }
+                if (d >= "0" && d <= "9") {
+                    const m = /^[0-7]{2}/.exec(tpl.slice(k + 1));
+                    if (d === "0" || (d <= "7" && m)) { const digits = d === "0" ? /^[0-7]{0,2}/.exec(tpl.slice(k + 1))[0] : m[0]; k += digits.length; out += String.fromCodePoint(parseInt(d + digits, 8)); continue; }
+                    let num = d; if (tpl[k + 1] >= "0" && tpl[k + 1] <= "9") num += tpl[++k];
+                    if (Number(num) > M.p.ngroups) fail(error, "invalid group reference " + num);
+                    const v = groupText(M, BigInt(num)); out += v === null ? "" : v; continue;
+                }
+                const e = { n: "\n", t: "\t", r: "\r", f: "\f", v: "\x0b", a: "\x07", b: "\b", "\\": "\\" }[d];
+                if (e !== undefined) { out += e; continue; }
+                if (/[A-Za-z]/.test(d)) fail(error, "bad escape \\" + d);
+                out += "\\" + d;
+            }
+            return out;
         }
         const Match = pyClass("Match", "re", {
-            group: (a) => { const m = a[0].m; if (a.length === 1) return m[0]; const pick = (k) => { const v = typeof k === "string" ? (m.groups || {})[k] : m[Number(needInt(k))]; return v === undefined ? null : v; }; return a.length === 2 ? pick(a[1]) : tuple(a.slice(1).map(pick)); },
-            groups: (a) => tuple(a[0].m.slice(1).map((x) => x === undefined ? (a[1] === undefined ? null : a[1]) : x)),
-            groupdict: (a) => { const d = dict(); for (const [k, v] of Object.entries(a[0].m.groups || {})) dictSet(d, k, v === undefined ? null : v); return d; },
-            start: (a) => BigInt(a[0].m.index + (a[1] === undefined ? 0 : a[0].m[0].indexOf(a[0].m[Number(needInt(a[1]))]))),
-            end: (a) => { const m = a[0].m; if (a[1] === undefined) return BigInt(m.index + m[0].length); const gi = Number(needInt(a[1])); return BigInt(m.index + m[0].indexOf(m[gi]) + m[gi].length); },
-            span: (a) => { const m = a[0].m; if (a[1] === undefined) return tuple([BigInt(m.index), BigInt(m.index + m[0].length)]); const gi = Number(needInt(a[1])); const s = m.index + m[0].indexOf(m[gi]); return tuple([BigInt(s), BigInt(s + m[gi].length)]); },
-            __getitem__: (a) => { const v = typeof a[1] === "string" ? (a[0].m.groups || {})[a[1]] : a[0].m[Number(needInt(a[1]))]; return v === undefined ? null : v; },
+            group: (a) => { const M = a[0]; if (a.length === 1) return M.m[0]; return a.length === 2 ? groupText(M, a[1]) : tuple(a.slice(1).map((k) => groupText(M, k))); },
+            groups: (a) => { const d = a[1] === undefined ? null : a[1]; return tuple(a[0].m.slice(1).map((x) => x === undefined ? d : x)); },
+            groupdict: (a) => { const M = a[0], d = dict(); for (const [k, gi] of M.p.names) { const v = M.m[gi]; dictSet(d, k, v === undefined ? (a[1] === undefined ? null : a[1]) : v); } return d; },
+            start: (a) => BigInt(span(a[0], a[1])[0]),
+            end: (a) => BigInt(span(a[0], a[1])[1]),
+            span: (a) => tuple(span(a[0], a[1]).map(BigInt)),
+            expand: (a) => expand(a[0], needStr(a[1])),
+            __getitem__: (a) => groupText(a[0], a[1]),
             __bool__: () => true,
-            __repr__: (a) => "<re.Match object; span=(" + a[0].m.index + ", " + (a[0].m.index + a[0].m[0].length) + "), match=" + repr(a[0].m[0]) + ">",
+            __repr__: (a) => { const [s0, e0] = span(a[0], undefined); return "<re.Match object; span=(" + s0 + ", " + e0 + "), match=" + repr(a[0].m[0]) + ">"; },
         });
-        Match.dict.set("string", { cls: T.property, fget: builtin("string", 1, (a) => a[0].s), fset: null, fdel: null, doc: null });
-        Match.dict.set("lastindex", { cls: T.property, fget: builtin("lastindex", 1, (a) => { let n = 0; for (let i = 1; i < a[0].m.length; i++) if (a[0].m[i] !== undefined) n = i; return n ? BigInt(n) : null; }), fset: null, fdel: null, doc: null });
-        const mk = (m, s) => ({ cls: Match, dict: new Map(), m: m, s: s });
-        function exec(re, s, pos) { re.lastIndex = pos || 0; const m = re.exec(s); return m; }
+        const prop = (cls, name, get) => cls.dict.set(name, { cls: T.property, fget: builtin(name, 1, (a) => get(a[0])), fset: null, fdel: null, doc: null });
+        prop(Match, "string", (M) => M.s);
+        prop(Match, "re", (M) => M.p);
+        prop(Match, "pos", (M) => BigInt(M.pos));
+        prop(Match, "endpos", (M) => BigInt(M.endpos));
+        prop(Match, "lastindex", (M) => { const k = lastIndex(M); return k ? BigInt(k) : null; });
+        prop(Match, "lastgroup", (M) => { const k = lastIndex(M); for (const [name, gi] of M.p.names) if (gi === k && k) return name; return null; });
+        prop(Match, "regs", (M) => tuple(M.m.map((x, k) => tuple(span(M, BigInt(k)).map(BigInt)))));
+        // t: the text the pattern ran on (the string cut at endpos).
+        const mk = (m, s, p, pos, endpos, sur, t) => ({ cls: Match, dict: new Map(), m: m, s: s, t: t, p: p, pos: pos, endpos: endpos, sur: sur });
+        // pos/endpos (code points) -> the string to scan (cut at endpos, as
+        // if it ended there) and the UTF-16 start.
+        function window(s, a, kw) {
+            strInfo(s);
+            const n = infoLen, sur = infoSur;
+            let pos = a[2] !== undefined ? a[2] : kwget(kw, "pos", 0n), end = a[3] !== undefined ? a[3] : kwget(kw, "endpos", null);
+            pos = Number(needInt(pos)); end = end === null ? n : Number(needInt(end));
+            if (pos < 0) pos = 0; if (pos > n) pos = n; if (end > n) end = n; if (end < 0) end = 0;
+            const u0 = sur ? utf16Index(s, pos) : pos, u1 = end < n ? (sur ? utf16Index(s, end) : end) : s.length;
+            return { text: u1 < s.length ? s.slice(0, u1) : s, start: u0, pos: pos, end: end, ok: end >= pos, sur: sur };
+        }
+        // The regex objects are shared per pattern; each call sets lastIndex
+        // right before its exec, and a scan keeps its own position, so a
+        // callback that runs the same pattern cannot disturb it.
+        function execAt(re, text, at) { re.lastIndex = at; return re.exec(text); }
+        const sticky = (P) => P.sticky || (P.sticky = new RegExp(P.re.source, P.re.flags.replace("g", "y")));
+        const dsticky = (P) => P.dsticky || (P.dsticky = new RegExp(P.re.source, P.re.flags.replace("g", "dy")));
+        const full = (P) => P.full || (P.full = new RegExp("(?:" + P.re.source + ")(?![\\s\\S])", P.re.flags.replace("g", "dy")));
+        function scan(P, text, start, each) {
+            let pos = start, m;
+            while (pos <= text.length && (m = execAt(P.re, text, pos)) !== null) {
+                each(m);
+                pos = m[0] === "" ? m.index + (m.index < text.length ? charWidth(text, m.index) : 1) : m.index + m[0].length;
+            }
+        }
+        const findItem = (m) => m.length === 1 ? m[0] : m.length === 2 ? (m[1] === undefined ? "" : m[1]) : tuple(m.slice(1).map((x) => x === undefined ? "" : x));
         const Pattern = pyClass("Pattern", "re", {
-            search: (a) => { const m = exec(a[0].re, needStr(a[1]), a[2] === undefined ? 0 : Number(needInt(a[2]))); return m === null ? null : mk(m, a[1]); },
-            match: (a) => { const m = exec(a[0].re, needStr(a[1]), a[2] === undefined ? 0 : Number(needInt(a[2]))); return m === null || m.index !== (a[2] === undefined ? 0 : Number(needInt(a[2]))) ? null : mk(m, a[1]); },
-            fullmatch: (a) => { const s = needStr(a[1]); const m = exec(a[0].re, s, 0); return m === null || m.index !== 0 || m[0].length !== s.length ? null : mk(m, s); },
-            findall: (a) => { const s = needStr(a[1]); const out = []; a[0].re.lastIndex = 0; let m; while ((m = a[0].re.exec(s)) !== null) { if (m[0] === "") a[0].re.lastIndex++; out.push(m.length === 1 ? m[0] : m.length === 2 ? (m[1] === undefined ? "" : m[1]) : tuple(m.slice(1).map((x) => x === undefined ? "" : x))); } return list(out); },
-            finditer: (a) => { const s = needStr(a[1]); const out = []; a[0].re.lastIndex = 0; let m; while ((m = a[0].re.exec(s)) !== null) { if (m[0] === "") a[0].re.lastIndex++; out.push(mk(m, s)); } return iter(list(out)); },
-            sub: (a) => subImpl(a[0].re, a[1], needStr(a[2]), a[3] === undefined ? 0 : Number(needInt(a[3])), false),
-            subn: (a) => subImpl(a[0].re, a[1], needStr(a[2]), a[3] === undefined ? 0 : Number(needInt(a[3])), true),
-            split: (a) => { const s = needStr(a[1]); const max = a[2] === undefined ? 0 : Number(needInt(a[2])); const out = []; let last = 0, n = 0; a[0].re.lastIndex = 0; let m; while ((m = a[0].re.exec(s)) !== null) { if (m[0] === "") { a[0].re.lastIndex++; if (m.index >= s.length) break; if (m.index === last && n === 0 && m.index === 0) continue; } out.push(s.slice(last, m.index)); for (let i = 1; i < m.length; i++) out.push(m[i] === undefined ? null : m[i]); last = m.index + m[0].length; n++; if (max && n >= max) break; } out.push(s.slice(last)); return list(out); },
-            __repr__: (a) => "re.compile(" + repr(a[0].dict.get("pattern")) + ")",
+            search: (a) => { const kw = kwOf(a, ["pos", "endpos"]); const s = needStr(a[1]); const w = window(s, a, kw); if (!w.ok) return null; const m = execAt(a[0].re, w.text, w.start); return m === null ? null : mk(m, s, a[0], w.pos, w.end, w.sur, w.text); },
+            match: (a) => { const kw = kwOf(a, ["pos", "endpos"]); const s = needStr(a[1]); const w = window(s, a, kw); if (!w.ok) return null; const m = execAt(sticky(a[0]), w.text, w.start); return m === null ? null : mk(m, s, a[0], w.pos, w.end, w.sur, w.text); },
+            fullmatch: (a) => { const kw = kwOf(a, ["pos", "endpos"]); const s = needStr(a[1]); const w = window(s, a, kw); if (!w.ok) return null; const m = execAt(full(a[0]), w.text, w.start); return m === null ? null : mk(m, s, a[0], w.pos, w.end, w.sur, w.text); },
+            findall: (a) => { const kw = kwOf(a, ["pos", "endpos"]); const s = needStr(a[1]); const w = window(s, a, kw); const out = []; if (w.ok) scan(a[0], w.text, w.start, (m) => out.push(findItem(m))); return list(out); },
+            finditer: (a) => { const kw = kwOf(a, ["pos", "endpos"]); const s = needStr(a[1]); const w = window(s, a, kw); const out = []; if (w.ok) scan(a[0], w.text, w.start, (m) => out.push(mk(m, s, a[0], w.pos, w.end, w.sur, w.text))); return iter(list(out)); },
+            sub: (a) => { const kw = kwOf(a, ["count"]); return subImpl(a[0], a[1], needStr(a[2]), Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), false); },
+            subn: (a) => { const kw = kwOf(a, ["count"]); return subImpl(a[0], a[1], needStr(a[2]), Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), true); },
+            // CPython 3.7+: every match splits, empty ones included, but the
+            // search after an empty match must move past its position.
+            split: (a) => {
+                const kw = kwOf(a, ["maxsplit"]);
+                const s = needStr(a[1]); const max = Number(needInt(a[2] !== undefined ? a[2] : kwget(kw, "maxsplit", 0n)));
+                const re = a[0].re, out = []; let last = 0, pos = 0, n = 0, mustAdvance = false;
+                while (max <= 0 || n < max) {
+                    let m = execAt(re, s, pos);
+                    if (m !== null && mustAdvance && m[0] === "" && m.index === pos) {
+                        if (pos >= s.length) break;
+                        m = execAt(re, s, pos + charWidth(s, pos));
+                    }
+                    if (m === null) break;
+                    out.push(s.slice(last, m.index));
+                    for (let k = 1; k < m.length; k++) out.push(m[k] === undefined ? null : m[k]);
+                    n++;
+                    const end = m.index + m[0].length;
+                    mustAdvance = end === m.index;
+                    last = pos = end;
+                }
+                out.push(s.slice(last));
+                return list(out);
+            },
+            __repr__: (a) => {
+                const f = a[0].flagsOut, names = [];
+                for (const [bit, name] of [[2n, "IGNORECASE"], [4n, "LOCALE"], [8n, "MULTILINE"], [16n, "DOTALL"], [64n, "VERBOSE"], [256n, "ASCII"]]) if (f & bit) names.push("re." + name);
+                return "re.compile(" + repr(a[0].src) + (names.length ? ", " + names.join("|") : "") + ")";
+            },
         });
-        Pattern.dict.set("pattern", { cls: T.property, fget: builtin("pattern", 1, (a) => a[0].src), fset: null, fdel: null, doc: null });
-        Pattern.dict.set("groups", { cls: T.property, fget: builtin("groups", 1, (a) => BigInt(new RegExp(a[0].re.source + "|").exec("").length - 1)), fset: null, fdel: null, doc: null });
-        function subImpl(re, repl, s, count, withCount) {
-            let n = 0; re.lastIndex = 0; let out = "", last = 0, m;
-            while ((m = re.exec(s)) !== null) {
-                if (count && n >= count) break;
+        for (const name of ["search", "match", "fullmatch", "findall", "finditer", "sub", "subn", "split"]) Pattern.dict.get(name).kwnames = true;
+        prop(Pattern, "pattern", (P) => P.src);
+        prop(Pattern, "flags", (P) => P.flagsOut);
+        prop(Pattern, "groups", (P) => BigInt(P.ngroups));
+        prop(Pattern, "groupindex", (P) => { const d = dict(); for (const [k, gi] of P.names) dictSet(d, k, BigInt(gi)); return d; });
+        function subImpl(P, repl, s, count, withCount) {
+            const re = P.re;
+            let n = 0, out = "", last = 0, pos = 0, m;
+            // A string template without backslashes is used as is.
+            const literal = typeof repl === "string" && !repl.includes("\\");
+            let sur = false, n0 = 0;
+            if (!literal) { strInfo(s); sur = infoSur; n0 = infoLen; }
+            while (pos <= s.length) {
+                if ((m = execAt(re, s, pos)) === null) break;
+                pos = re.lastIndex;
+                if (count > 0 && n >= count) break;
                 out += s.slice(last, m.index);
-                if (typeof repl === "string") out += repl.replace(/\\(\d+)|\\g<([^>]+)>|\\n|\\t|\\\\/g, (x, d, name) => { if (d !== undefined) return m[Number(d)] === undefined ? "" : m[Number(d)]; if (name !== undefined) return /^\d+$/.test(name) ? (m[Number(name)] || "") : ((m.groups || {})[name] || ""); return x === "\\n" ? "\n" : x === "\\t" ? "\t" : "\\"; });
-                else out += needStr(call(repl, [mk(m, s)], null));
+                if (literal) out += repl;
+                else {
+                    const M = mk(m, s, P, 0, n0, sur, s);
+                    out += typeof repl === "string" ? expand(M, repl) : needStr(call(repl, [M], null));
+                }
                 last = m.index + m[0].length; n++;
-                if (m[0] === "") { if (m.index < s.length) out += s[m.index]; last = m.index + 1; re.lastIndex = m.index + 1; if (m.index >= s.length) break; }
+                if (m[0] === "") { if (m.index >= s.length) break; const w = charWidth(s, m.index); out += s.slice(m.index, m.index + w); last = pos = m.index + w; }
             }
             out += s.slice(last);
-            return withCount ? tuple([out, BigInt(n)]) : out;
+            return withCount ? tuple([rt.checkedText(out), BigInt(n)]) : rt.checkedText(out);
         }
+        // UTF-16 units of the code point at i: an empty match steps over a
+        // whole astral character, never into the middle of its pair.
+        function charWidth(s, i) { const c = s.charCodeAt(i); return c >= 0xd800 && c < 0xdc00 && i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00 ? 2 : 1; }
         const cache = new Map();
         function compile(pattern, flags) {
-            if (pattern !== null && typeof pattern === "object" && pattern.cls === Pattern) return pattern;
-            const key = pattern + " " + flags;
-            if (cache.has(key)) return cache.get(key);
-            const p = { cls: Pattern, dict: new Map([["pattern", pattern], ["flags", flags]]), re: translate(needStr(pattern), flags), src: pattern };
+            if (pattern !== null && typeof pattern === "object" && pattern.cls === Pattern) {
+                if (flags !== 0n) fail(E.ValueError, "cannot process flags argument with a compiled pattern");
+                return pattern;
+            }
+            const src = needStr(pattern, "first argument");
+            const key = src + " " + flags;
+            const hit = cache.get(key);
+            if (hit !== undefined) return hit;
+            const t = translate(src, flags);
+            let re;
+            try { re = new RegExp(t.source, (t.ignoreCase ? "i" : "") + "gu"); } catch (e) { fail(error, "bad pattern: " + (e && e.message)); }
+            const flagsOut = t.flags & 256n ? t.flags : t.flags | 32n;
+            const p = { cls: Pattern, dict: new Map(), re: re, src: src, flagsOut: flagsOut, ngroups: t.groups, names: t.names, sticky: null, dsticky: null, full: null };
             if (cache.size > 512) cache.clear();
             cache.set(key, p); return p;
         }
-        fn(g, "compile", 2, (a) => compile(a[0], a[1] === undefined ? 0n : asInt(a[1])), 1);
-        for (const name of ["search", "match", "fullmatch", "findall", "finditer", "split"]) fn(g, name, 3, (a) => call(Pattern.dict.get(name), [compile(a[0], a[2] === undefined ? 0n : asInt(a[2])), a[1]], null), 2);
-        fnkw(g, "sub", (a) => { const kw = kwOf(a, ["count", "flags"]); const flags = a[4] !== undefined ? asInt(a[4]) : asInt(kwget(kw, "flags", 0n)); return subImpl(compile(a[0], flags).re, a[1], needStr(a[2]), a[3] !== undefined ? Number(needInt(a[3])) : Number(kwget(kw, "count", 0n)), false); });
-        fnkw(g, "subn", (a) => { const kw = kwOf(a, ["count", "flags"]); const flags = a[4] !== undefined ? asInt(a[4]) : asInt(kwget(kw, "flags", 0n)); return subImpl(compile(a[0], flags).re, a[1], needStr(a[2]), a[3] !== undefined ? Number(needInt(a[3])) : Number(kwget(kw, "count", 0n)), true); });
-        fn(g, "escape", 1, (a) => needStr(a[0]).replace(/[.*+?^${}()|[\]\\\-#&~\s]/g, (c) => "\\" + c));
+        const flagsOf = (a, k, kw) => { const f = a[k] !== undefined ? a[k] : kwget(kw, "flags", 0n); return isInt(f) ? asInt(f) : fail(E.TypeError, "flags must be an int"); };
+        fnkw(g, "compile", (a) => { const kw = kwOf(a, ["flags"]); return compile(a[0], flagsOf(a, 1, kw)); });
+        for (const name of ["search", "match", "fullmatch", "findall", "finditer"]) fnkw(g, name, (a) => { const kw = kwOf(a, ["flags"]); return call(Pattern.dict.get(name), [compile(a[0], flagsOf(a, 2, kw)), a[1]], null); });
+        fnkw(g, "sub", (a) => { const kw = kwOf(a, ["count", "flags"]); return subImpl(compile(a[0], flagsOf(a, 4, kw)), a[1], needStr(a[2]), Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), false); });
+        fnkw(g, "subn", (a) => { const kw = kwOf(a, ["count", "flags"]); return subImpl(compile(a[0], flagsOf(a, 4, kw)), a[1], needStr(a[2]), Number(needInt(a[3] !== undefined ? a[3] : kwget(kw, "count", 0n))), true); });
+        // re.split(pattern, string, maxsplit=0, flags=0)
+        fnkw(g, "split", (a) => { const kw = kwOf(a, ["maxsplit", "flags"]); return call(Pattern.dict.get("split"), [compile(a[0], flagsOf(a, 3, kw)), a[1], a[2] !== undefined ? a[2] : kwget(kw, "maxsplit", 0n)], null); });
+        // Only the characters special in a pattern are escaped (3.7+).
+        fn(g, "escape", 1, (a) => needStr(a[0]).replace(/[()[\]{}?*+\-|^$\\.&~# \t\n\r\x0b\x0c]/g, (c) => "\\" + c));
         fn(g, "purge", 0, () => { cache.clear(); return null; });
-        g.set("error", E.ValueError); g.set("Pattern", Pattern); g.set("Match", Match);
+        g.set("error", error); g.set("Pattern", Pattern); g.set("Match", Match);
     });
 
     // ---- dataclasses / enum (the common subsets) --------------------------------------------------------------------------------------------------
@@ -1178,6 +1726,17 @@
         rt.allocators.set(FrozenInstanceError, (cls) => rt.makeExc(cls, []));
         g.set("FrozenInstanceError", FrozenInstanceError);
         const Field = pyClass("Field", "dataclasses", { __repr__: (a) => "Field(" + repr(a[0].dict.get("name")) + ")" });
+        // InitVar[T] marks an init-only parameter.
+        const InitVar = pyClass("InitVar", "dataclasses", {});
+        InitVar.dict.set("__class_getitem__", { cls: T.classmethod, func: builtin("__class_getitem__", 2, (a) => ({ cls: InitVar, dict: new Map([["type", a[1]]]) })) });
+        g.set("InitVar", InitVar);
+        // `ClassVar` / `ClassVar[int]` (a typing alias) or its string form.
+        function annotationIs(a, module, name) {
+            if (typeof a === "string") return new RegExp("^\\s*(?:" + module + "\\.)?" + name + "\\b").test(a);
+            if (a === null || typeof a !== "object") return false;
+            if (a.cls === InitVar) return name === "InitVar";
+            return a.cls !== undefined && a.cls.module === module && a.dict !== undefined && a.dict.get("name") === name;
+        }
         fnkw(g, "field", (a) => { const kw = kwOf(a, ["default", "default_factory", "init", "repr", "compare", "hash", "metadata", "kw_only"]); const f = { cls: Field, dict: new Map([["default", kwget(kw, "default", MISSING)], ["default_factory", kwget(kw, "default_factory", MISSING)], ["init", kwget(kw, "init", true)], ["repr", kwget(kw, "repr", true)], ["compare", kwget(kw, "compare", true)], ["name", null]]) }; return f; });
         function process(cls, kw) {
             const ann = cls.dict.get("__annotations__");
@@ -1186,22 +1745,39 @@
             const annotated = ann && ann.cls === T.dict ? rt.dictEntryList(ann).map((e) => e[0]) : [];
             const fields = [];
             for (const c of cls.mro.slice().reverse()) { const fs = c.dict.get("__dataclass_fields__"); if (fs && c !== cls) for (const [n, f] of rt.dictEntryList(fs)) if (!fields.find((x) => x.name === n)) fields.push({ name: n, dflt: f.dict.get("default"), factory: f.dict.get("default_factory"), init: truth(f.dict.get("init")), repr: truth(f.dict.get("repr")), compare: truth(f.dict.get("compare")) }); }
+            // __init__'s parameters: the fields plus InitVar pseudo-fields,
+            // which go to __post_init__ instead of the instance.
+            const params = fields.slice();
             for (const n of annotated) {
                 if (n === "__slots__") continue;
+                const a = dictGet(ann, n);
+                if (annotationIs(a, "typing", "ClassVar")) continue; // stays a class attribute
                 const v = cls.dict.get(n);
-                let entry = { name: n, dflt: MISSING, factory: MISSING, init: true, repr: true, compare: true };
+                let entry = { name: n, dflt: MISSING, factory: MISSING, init: true, repr: true, compare: true, initVar: a === InitVar || annotationIs(a, "dataclasses", "InitVar") };
                 if (v !== undefined && v !== null && typeof v === "object" && v.cls === Field) { entry.dflt = v.dict.get("default"); entry.factory = v.dict.get("default_factory"); entry.init = truth(v.dict.get("init")); entry.repr = truth(v.dict.get("repr")); entry.compare = truth(v.dict.get("compare")); v.dict.set("name", n); cls.dict.delete(n); if (entry.dflt !== MISSING) cls.dict.set(n, entry.dflt); }
                 else if (v !== undefined) entry.dflt = v;
-                const i = fields.findIndex((x) => x.name === n); if (i >= 0) fields[i] = entry; else fields.push(entry);
+                // An unhashable default (list, dict, set) would be shared by every instance.
+                const d = entry.dflt;
+                if (!entry.initVar && d !== MISSING && d !== null && typeof d === "object" && !isType(d) && typeMethod(d, "__hash__") === null) fail(E.ValueError, "mutable default " + repr(typeOf(d)) + " for field " + n + " is not allowed: use default_factory");
+                if (entry.initVar) { cls.dict.delete(n); if (entry.dflt !== MISSING) cls.dict.set(n, entry.dflt); }
+                const i = params.findIndex((x) => x.name === n); if (i >= 0) params[i] = entry; else params.push(entry);
             }
+            fields.length = 0; for (const f of params) if (!f.initVar) fields.push(f);
             const fieldMap = dict(); for (const f of fields) dictSet(fieldMap, f.name, { cls: Field, dict: new Map([["name", f.name], ["default", f.dflt], ["default_factory", f.factory], ["init", f.init], ["repr", f.repr], ["compare", f.compare]]) });
             cls.dict.set("__dataclass_fields__", fieldMap);
             const frozen = truth(kwget(kw, "frozen", false));
             if (truth(kwget(kw, "init", true)) && !cls.dict.has("__init__")) {
+                let seenDefault = null;
+                for (const f of params) {
+                    if (!f.init) continue;
+                    if (f.dflt !== MISSING || f.factory !== MISSING) seenDefault = f;
+                    else if (seenDefault !== null) fail(E.TypeError, "non-default argument " + repr(f.name) + " follows default argument " + repr(seenDefault.name));
+                }
                 const init = builtin("__init__", -1, (a) => {
                     const kwm = a[a.length - 1] instanceof Map ? a.pop() : null;
                     const self = a[0]; let pi = 1;
-                    for (const f of fields) {
+                    const initVars = [];
+                    for (const f of params) {
                         let v;
                         if (!f.init) v = f.factory !== MISSING ? call(f.factory, [], null) : f.dflt;
                         else if (kwm && kwm.has(f.name)) v = kwm.get(f.name);
@@ -1209,10 +1785,10 @@
                         else if (f.factory !== MISSING) v = call(f.factory, [], null);
                         else if (f.dflt !== MISSING) v = f.dflt;
                         else fail(E.TypeError, cls.name + ".__init__() missing required argument: '" + f.name + "'");
-                        self.dict.set(f.name, v);
+                        if (f.initVar) initVars.push(v); else self.dict.set(f.name, v);
                     }
-                    if (pi < a.length) fail(E.TypeError, cls.name + ".__init__() takes " + (fields.filter((f) => f.init).length + 1) + " positional arguments but " + a.length + " were given");
-                    const post = rt.lookupType(cls, "__post_init__"); if (post !== undefined) call(descrGet(post, self, cls), [], null);
+                    if (pi < a.length) fail(E.TypeError, cls.name + ".__init__() takes " + (params.filter((f) => f.init).length + 1) + " positional arguments but " + a.length + " were given");
+                    const post = rt.lookupType(cls, "__post_init__"); if (post !== undefined) call(descrGet(post, self, cls), initVars, null);
                     return null;
                 });
                 init.kwnames = true; cls.dict.set("__init__", init);
@@ -1236,26 +1812,44 @@
     mod("enum", (g) => {
         const EnumMeta = rt.TypeType;
         const Enum = rt.newType("Enum", [], new Map(), "enum");
-        Enum.dict.set("__repr__", builtin("__repr__", 1, (a) => "<" + typeOf(a[0]).name + "." + a[0].dict.get("name") + ": " + repr(a[0].dict.get("value")) + ">"));
-        Enum.dict.set("__str__", builtin("__str__", 1, (a) => typeOf(a[0]).name + "." + a[0].dict.get("name")));
+        // A Flag pseudo-member without named bits has no name: <P: 0>, P(0).
+        Enum.dict.set("__repr__", builtin("__repr__", 1, (a) => { const n = a[0].dict.get("name"); return "<" + typeOf(a[0]).name + (n === null ? "" : "." + n) + ": " + repr(a[0].dict.get("value")) + ">"; }));
+        Enum.dict.set("__str__", builtin("__str__", 1, (a) => { const n = a[0].dict.get("name"); return typeOf(a[0]).name + (n === null ? "(" + repr(a[0].dict.get("value")) + ")" : "." + n); }));
         Enum.dict.set("__hash__", builtin("__hash__", 1, (a) => rt.hashInt(a[0].dict.get("name"))));
         Enum.dict.set("name", { cls: T.property, fget: builtin("name", 1, (a) => a[0].dict.get("name")), fset: null, fdel: null, doc: null });
         Enum.dict.set("value", { cls: T.property, fget: builtin("value", 1, (a) => a[0].dict.get("value")), fset: null, fdel: null, doc: null });
         Enum.dict.set("__init_subclass__", { cls: T.classmethod, func: builtin("__init_subclass__", -1, (a) => {
             const cls = a[0];
-            const members = [];
-            let auto = 1n;
+            const members = [], named = [];
+            // auto(): one past the largest int value so far; for a Flag, the
+            // next power of two above every value so far.
+            const isFlag = rt.isSubclass(cls, Flag);
+            let high = 0n;
             for (const [k, v] of Array.from(cls.dict)) {
                 if (k.startsWith("_") || (v !== null && typeof v === "object" && (v.cls === T.function || v.cls === T.property || v.cls === T.staticmethod || v.cls === T.classmethod || v.cls === T.builtin_function_or_method))) continue;
                 let value = v;
-                if (v !== null && typeof v === "object" && v.isAuto) { value = auto++; } else if (isInt(v)) auto = asInt(v) + 1n;
+                if (v !== null && typeof v === "object" && v.isAuto) {
+                    if (isFlag) { value = 1n; while (value <= high) value <<= 1n; }
+                    else value = members.length || high > 0n ? high + 1n : 1n;
+                }
+                if (isInt(value) && (members.length === 0 || asInt(value) > high)) high = asInt(value);
                 const existing = members.find((m) => eq(m.dict.get("value"), value));
-                if (existing) { cls.dict.set(k, existing); continue; }
+                if (existing) { cls.dict.set(k, existing); named.push([k, existing]); continue; }
                 const m = { cls: cls, dict: new Map([["name", k], ["value", value]]) };
-                members.push(m); cls.dict.set(k, m);
+                members.push(m); named.push([k, m]); cls.dict.set(k, m);
             }
             cls.members = members;
-            cls.dict.set("__members__", (() => { const d = dict(); for (const m of members) dictSet(d, m.dict.get("name"), m); return d; })());
+            // A user __init__ (the Planet pattern) sets each member up from
+            // its value, a tuple value unpacked into the arguments.
+            const init = rt.lookupType(cls, "__init__");
+            if (init !== undefined && init !== null && typeof init === "object" && init.cls === T.function) {
+                for (const m of members) { const v = m.dict.get("value"); call(descrGet(init, m, cls), v !== null && typeof v === "object" && v.cls === T.tuple ? v.items.slice() : [v], null); }
+                // Enum(value) only looks a member up; the construction that
+                // returns it must not run __init__ on it again.
+                cls.dict.set("__init__", builtin("__init__", -1, () => null));
+            }
+            // __members__ lists aliases too, under their own names.
+            cls.dict.set("__members__", (() => { const d = dict(); for (const [k, m] of named) dictSet(d, k, m); return d; })());
             const mixin = cls.mro.find((c) => c !== rt.ObjectType && rt.constructors.has(c));
             if (mixin !== undefined) {
                 const enumIndex = cls.mro.indexOf(Enum), mixinIndex = cls.mro.indexOf(mixin);
@@ -1275,13 +1869,51 @@
             return null;
         }) });
         rt.constructors.set(Enum, null); rt.constructors.delete(Enum);
-        // Enum(value) looks a member up; iterating a class yields members.
-        const lookup = (cls, args) => { if (args.length !== 1) fail(E.TypeError, "Enum takes one argument"); for (const m of cls.members || []) if (eq(m.dict.get("value"), args[0])) return m; fail(E.ValueError, repr(args[0]) + " is not a valid " + cls.name); };
+        // Enum(value) looks a member up (an int naming a combination of a
+        // Flag's bits is its pseudo-member); Enum(name, names) is the
+        // functional API. Iterating a class yields members.
+        const lookup = (cls, args) => {
+            if (args.length === 2) return functional(cls, args[0], args[1]);
+            if (args.length !== 1) fail(E.TypeError, "Enum takes one argument");
+            const v = args[0], members = cls.members || [];
+            for (const m of members) if (eq(m.dict.get("value"), v)) return m;
+            if (isInt(v) && members.length && rt.isSubclass(cls, Flag)) {
+                let all = 0n; for (const m of members) { const b = m.dict.get("value"); if (isInt(b)) all |= asInt(b); }
+                const i = asInt(v);
+                if (rt.isSubclass(cls, IntFlag) || (i >= 0n && (i & ~all) === 0n)) return flagValue(cls, i);
+                if (i >= 0n) {
+                    // CPython's STRICT boundary message, bits aligned to the wider value.
+                    const width = Math.max(i.toString(2).length, all.toString(2).length);
+                    const bits = (x) => "0b0 " + x.toString(2).padStart(width, "0");
+                    fail(E.ValueError, "<flag '" + cls.name + "'> invalid value " + i + "\n    given " + bits(i) + "\n  allowed " + bits(all));
+                }
+            }
+            fail(E.ValueError, repr(v) + " is not a valid " + cls.name);
+        };
+        // Enum("E", "A B") / ["A", "B"] / [("A", 1), ...] / {"A": 1, ...}:
+        // names alone are numbered from 1 (powers of two for a Flag).
+        function functional(cls, name, names) {
+            if ((cls.members || []).length) fail(E.TypeError, "<enum '" + needStr(name) + "'> cannot extend <enum '" + cls.name + "'>");
+            const flag = rt.isSubclass(cls, Flag), ns = new Map();
+            if (typeof names === "string") names = list(names.replace(/,/g, " ").split(/\s+/).filter((s) => s.length));
+            if (names !== null && typeof names === "object" && names.map !== undefined && isInstance(names, T.dict)) {
+                for (const [k, v] of dictEntries(names)) ns.set(needStr(k), v);
+            } else {
+                const items = drain(names);
+                for (let i = 0; i < items.length; i++) {
+                    const x = items[i];
+                    if (typeof x === "string") ns.set(x, flag ? 1n << BigInt(i) : BigInt(i + 1));
+                    else { const p = drain(x); if (p.length !== 2) fail(E.TypeError, "enum member definitions must be names or (name, value) pairs"); ns.set(needStr(p[0]), p[1]); }
+                }
+            }
+            return rt.makeClass(rt.TypeType, needStr(name), [cls], ns, null);
+        }
         Enum.dict.set("__new__", { cls: T.staticmethod, func: builtin("__new__", -1, (a) => lookup(a[0], a.slice(1))) });
         rt.enumLookup = lookup;
         Enum.dict.set("__iter__", { cls: T.classmethod, func: builtin("__iter__", 1, (a) => iter(list((a[0].members || []).slice()))) });
+        Enum.dict.set("__contains__", { cls: T.classmethod, func: builtin("__contains__", 2, (a) => (a[0].members || []).includes(a[1])) });
         Enum.dict.set("__len__", { cls: T.classmethod, func: builtin("__len__", 1, (a) => BigInt((a[0].members || []).length)) });
-        Enum.dict.set("__getitem__", { cls: T.classmethod, func: builtin("__getitem__", 2, (a) => { for (const m of a[0].members || []) if (m.dict.get("name") === a[1]) return m; throw rt.makeExc(E.KeyError, [a[1]]); }) });
+        Enum.dict.set("__getitem__", { cls: T.classmethod, func: builtin("__getitem__", 2, (a) => { const ms = a[0].dict.get("__members__"); const m = ms === undefined || typeof a[1] !== "string" ? undefined : dictGet(ms, a[1]); if (m !== undefined) return m; throw rt.makeExc(E.KeyError, [a[1]]); }) });
         g.set("Enum", Enum);
         const IntEnum = rt.newType("IntEnum", [Enum], new Map(), "enum");
         IntEnum.dict.set("__int__", builtin("__int__", 1, (a) => asInt(a[0].dict.get("value"))));
@@ -1301,7 +1933,11 @@
             if (cls.composites === undefined) cls.composites = new Map();
             let m = cls.composites.get(v);
             if (m === undefined) {
-                const parts = (cls.members || []).filter((x) => { const b = x.dict.get("value"); return b !== 0n && (v & b) === b; }).map((x) => x.dict.get("name"));
+                const named = (cls.members || []).filter((x) => { const b = x.dict.get("value"); return b !== 0n && (v & b) === b; });
+                const parts = named.map((x) => x.dict.get("name"));
+                // Bits no member names (an IntFlag keeps them) end the name as a number.
+                let covered = 0n; for (const x of named) covered |= x.dict.get("value");
+                if (parts.length && (v & ~covered) !== 0n) parts.push(String(v & ~covered));
                 m = { cls: cls, dict: new Map([["name", parts.length ? parts.join("|") : null], ["value", v]]) };
                 cls.composites.set(v, m);
             }
@@ -1326,7 +1962,12 @@
         for (const n of ["__or__", "__and__", "__xor__", "__ror__", "__rand__", "__rxor__"]) IntFlag.dict.set(n, builtin(n, 2, (a) => { const other = a[1]; if (!isInt(other) && !(other !== null && typeof other === "object" && other.dict !== undefined && other.dict.has("value"))) return NOTIMPL; return call(Flag.dict.get(n), [a[0], other], null); }));
         g.set("IntFlag", IntFlag);
         fn(g, "auto", 0, () => ({ cls: rt.ObjectType, dict: new Map(), isAuto: true }));
-        fn(g, "unique", 1, (a) => a[0]);
+        fn(g, "unique", 1, (a) => {
+            const cls = a[0], dups = [];
+            for (const [k, m] of rt.dictEntryList(cls.dict.get("__members__") || dict())) if (m.dict.get("name") !== k) dups.push(k + " -> " + m.dict.get("name"));
+            if (dups.length) fail(E.ValueError, "duplicate values found in <enum '" + cls.name + "'>: " + dups.join(", "));
+            return cls;
+        });
     });
     mod("fractions", (g) => { g.set("Fraction", null); });
 })(__zipp_py);

@@ -1474,3 +1474,22 @@ pub(super) fn binop_name(op: &ast::Operator) -> &'static str {
         ast::Operator::FloorDiv => "floordiv",
     }
 }
+
+/// The runtime entry point of an augmented assignment (`R.iadd`, ...).
+pub(super) fn inplace_binop_name(op: &ast::Operator) -> &'static str {
+    match op {
+        ast::Operator::Add => "iadd",
+        ast::Operator::Sub => "isub",
+        ast::Operator::Mult => "imul",
+        ast::Operator::MatMult => "imatmul",
+        ast::Operator::Div => "itruediv",
+        ast::Operator::Mod => "imod",
+        ast::Operator::Pow => "ipow",
+        ast::Operator::LShift => "ilshift",
+        ast::Operator::RShift => "irshift",
+        ast::Operator::BitOr => "ior",
+        ast::Operator::BitXor => "ixor",
+        ast::Operator::BitAnd => "iand",
+        ast::Operator::FloorDiv => "ifloordiv",
+    }
+}

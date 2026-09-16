@@ -1,6 +1,6 @@
 //! Expression lowering for the Python emitter.
 use super::emitter::{Emitter, LoopCtx, R};
-use super::stmts::binop_name;
+use super::stmts::{binop_name, inplace_binop_name};
 use super::symtable::{ScopeKind, SymKind};
 use crate::bytecode::{Instr, Reg};
 use rustpython_parser::ast;
@@ -675,8 +675,14 @@ impl<'a> Emitter<'a> {
         for j in slow_jumps {
             self.patch(j, here)?;
         }
-        let name = self.string(binop_name(op))?;
-        let r = self.helper(if inplace { "iop" } else { "binop" }, &[name, a, b])?;
+        // One runtime entry point per operator (`R.add`, `R.iadd`, ...), so
+        // the primitive cases need no op-name dispatch.
+        let helper = if inplace {
+            inplace_binop_name(op)
+        } else {
+            binop_name(op)
+        };
+        let r = self.helper(helper, &[a, b])?;
         self.emit(Instr::Move { dst, src: r })?;
         let here = self.here();
         for j in end_jumps {
@@ -845,8 +851,7 @@ impl<'a> Emitter<'a> {
         for j in slow_jumps {
             self.patch(j, here)?;
         }
-        let name = self.string(cmpop_name(op))?;
-        let r = self.helper("richcmp", &[name, left, right])?;
+        let r = self.helper(cmpop_name(op), &[left, right])?;
         self.emit(Instr::Move { dst, src: r })?;
         let here = self.here();
         for j in end {
